@@ -26,9 +26,25 @@ export interface StageSpan {
   ms?: number;
 }
 
+export type TorrentPhase =
+  | 'fetching_source' | 'fetching_metadata' | 'queued' | 'checking'
+  | 'downloading' | 'seeding' | 'paused_download' | 'paused_seed'
+  | 'missing_files' | 'failed';
+
+export interface SeedPolicy {
+  stop_on_complete: boolean;
+  ratio_limit: number | null;
+  time_limit_secs: number | null;
+}
+
 export interface JobSummary {
   id: number;
   kind?: 'nzb' | 'torrent';
+  torrent_phase?: TorrentPhase | null;
+  torrent_control_intent?: 'running' | 'paused' | null;
+  seed_policy?: SeedPolicy | null;
+  seed_stop_reason?: 'manual' | 'download_complete' | 'ratio_limit' | 'time_limit' | 'storage_full' | null;
+  torrent_error?: string | null;
   name: string;
   status: JobStatus;
   category: string | null;

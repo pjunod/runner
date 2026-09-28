@@ -171,3 +171,74 @@ pub type SharedSnapshot = Arc<ArcSwap<QueueSnapshot>>;
 pub fn new_shared_snapshot() -> SharedSnapshot {
     Arc::new(ArcSwap::from_pointee(QueueSnapshot::default()))
 }
+
+#[cfg(test)]
+mod mobile_queue_contract_tests {
+    use super::JobSummary;
+
+    #[test]
+    fn torrent_mobile_queue_fixture_matches_summary_serialization() {
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../nzbd-types/fixtures/mobile-queue-parity.json"
+        ))
+        .unwrap();
+        for fixture in fixtures.as_array().unwrap() {
+            if fixture["wire"] == false {
+                continue;
+            }
+            let input = &fixture["job"];
+            // Construct the actual engine DTO, rather than adding Deserialize to it.
+            let summary = JobSummary {
+                id: serde_json::from_value(input["id"].clone()).unwrap(),
+                kind: serde_json::from_value(input["kind"].clone()).unwrap(),
+                name: serde_json::from_value(input["name"].clone()).unwrap(),
+                status: serde_json::from_value(input["status"].clone()).unwrap(),
+                category: serde_json::from_value(input["category"].clone()).unwrap(),
+                priority: serde_json::from_value(input["priority"].clone()).unwrap(),
+                size_bytes: serde_json::from_value(input["size_bytes"].clone()).unwrap(),
+                downloaded_bytes: serde_json::from_value(input["downloaded_bytes"].clone())
+                    .unwrap(),
+                failed_bytes: serde_json::from_value(input["failed_bytes"].clone()).unwrap(),
+                remaining_bytes: serde_json::from_value(input["remaining_bytes"].clone()).unwrap(),
+                total_articles: serde_json::from_value(input["total_articles"].clone()).unwrap(),
+                done_articles: serde_json::from_value(input["done_articles"].clone()).unwrap(),
+                failed_articles: serde_json::from_value(input["failed_articles"].clone()).unwrap(),
+                files_total: serde_json::from_value(input["files_total"].clone()).unwrap(),
+                files_done: serde_json::from_value(input["files_done"].clone()).unwrap(),
+                health: serde_json::from_value(input["health"].clone()).unwrap(),
+                critical_health: serde_json::from_value(input["critical_health"].clone()).unwrap(),
+                rate_bps: serde_json::from_value(input["rate_bps"].clone()).unwrap(),
+                retried_articles: serde_json::from_value(input["retried_articles"].clone())
+                    .unwrap(),
+                assigned_node: serde_json::from_value(input["assigned_node"].clone()).unwrap(),
+                pp_done: serde_json::from_value(input["pp_done"].clone()).unwrap(),
+                ready: serde_json::from_value(input["ready"].clone()).unwrap(),
+                ready_at_unix: serde_json::from_value(input["ready_at_unix"].clone()).unwrap(),
+                uploaded_bytes: serde_json::from_value(input["uploaded_bytes"].clone()).unwrap(),
+                upload_rate_bps: serde_json::from_value(input["upload_rate_bps"].clone()).unwrap(),
+                ratio: serde_json::from_value(input["ratio"].clone()).unwrap(),
+                seeding_seconds: serde_json::from_value(input["seeding_seconds"].clone()).unwrap(),
+                useful_peers: serde_json::from_value(input["useful_peers"].clone()).unwrap(),
+                torrent_phase: serde_json::from_value(input["torrent_phase"].clone()).unwrap(),
+                torrent_control_intent: serde_json::from_value(
+                    input["torrent_control_intent"].clone(),
+                )
+                .unwrap(),
+                seed_policy: serde_json::from_value(input["seed_policy"].clone()).unwrap(),
+                seed_stop_reason: serde_json::from_value(input["seed_stop_reason"].clone())
+                    .unwrap(),
+                torrent_error: serde_json::from_value(input["torrent_error"].clone()).unwrap(),
+                dupe_key: serde_json::from_value(input["dupe_key"].clone()).unwrap(),
+                dupe_score: serde_json::from_value(input["dupe_score"].clone()).unwrap(),
+                params: serde_json::from_value(input["params"].clone()).unwrap(),
+                stages: serde_json::from_value(input["stages"].clone()).unwrap(),
+            };
+            assert_eq!(
+                serde_json::to_value(summary).unwrap(),
+                *input,
+                "{}",
+                fixture["name"]
+            );
+        }
+    }
+}

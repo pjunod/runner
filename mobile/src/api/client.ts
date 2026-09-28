@@ -12,6 +12,7 @@ import {
   LogsPage,
   QueueSnapshot,
   StatusDto,
+  SeedPolicy,
 } from './types';
 
 const CLIENT_NAME = 'nzbd-mobile/1.0';
@@ -80,6 +81,12 @@ export class NzbdClient {
       | 'move-bottom',
   ): Promise<{ ok: boolean; parked?: boolean }> {
     return this.json(`/api/v1/jobs/${id}/actions/${action}`, { method: 'POST' });
+  }
+
+  async setSeedPolicy(id: number, policy: SeedPolicy & { use_defaults: boolean }): Promise<void> {
+    await this.json(`/api/v1/jobs/${id}/torrent/seed-policy`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(policy),
+    });
   }
 
   async setJobPriority(id: number, priority: number): Promise<void> {

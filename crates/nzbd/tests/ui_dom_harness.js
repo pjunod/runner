@@ -1439,6 +1439,33 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     ok(none.tip.includes("/api/v1/events"), "…with the explanation moved to its tooltip");
   }
 
+  // Wire fixtures are shared with the native renderer and engine serialization.
+  {
+    reset();
+    const fixtures = JSON.parse(fs.readFileSync(require("path").join(__dirname,
+      "../../nzbd-types/fixtures/mobile-queue-parity.json"), "utf8"));
+    for (const f of fixtures) {
+      eq(T.sectionOf(f.job), f.section, f.name + " section parity");
+      if (f.job.kind !== "torrent") continue;
+      eq(T.torrentStatus(f.job), f.statusLabel, f.name + " label parity");
+      const action = T.torrentPrimaryAction(f.job);
+      eq(action ? action.action : null, f.action, f.name + " action parity");
+      eq(action ? action.label : null, f.actionLabel, f.name + " action label parity");
+      const row = T.rowModel(f.job);
+      eq(row.pauseHidden, !action, f.name + " rendered action visibility");
+      if (f.phase === "failed") eq(row.moveHidden, true, "failed cannot move");
+      if (f.resume404) {
+        T.store.jobs = [f.job];
+        routes.set("/actions/resume", { status: 404, body: { error: "job not found" } });
+        routes.set("/api/v1/jobs", { status: 200, body: { jobs: [f.job] } });
+        await T.jobAction(f.job.id, "resume");
+        eq(T.store.jobs.length, 1, "refused seed resume retains row");
+        ok(T.store.jobs[0].ready, "refused seed retains authoritative readiness");
+        routes.clear();
+      }
+    }
+  }
+
   // Torrent lifecycle, section paging, and the stable seeding editor.
   {
     reset();

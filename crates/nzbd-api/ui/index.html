@@ -1676,9 +1676,24 @@ function seedStopText(j) {
 }
 function seedLimitReached(j) {
   const p = j.seed_policy;
+  if (!["seeding", "paused_seed"].includes(torrentPhase(j))) return false;
   return !!(j.ready && p && (p.stop_on_complete ||
     (p.ratio_limit != null && j.ratio >= p.ratio_limit) ||
     (p.time_limit_secs != null && j.seeding_seconds >= p.time_limit_secs)));
+}
+
+function torrentPrimaryAction(j) {
+  const phase = torrentPhase(j);
+  if (!phase || ["failed", "storage_hold"].includes(phase)) return null;
+  if (!["fetching_source", "fetching_metadata", "queued", "checking", "downloading",
+        "seeding", "paused_download", "paused_seed", "missing_files"].includes(phase)) return null;
+  if (phase === "missing_files") return j.status === "paused"
+    ? { action: "resume", label: "re-download missing files" } : null;
+  if (phase === "paused_seed" && seedLimitReached(j)) return { action: "seed-options", label: "seeding options" };
+  if (j.status === "paused") return { action: "resume", label: phase === "paused_seed" ? "start seeding" : "resume" };
+  if (j.status === "queued" || j.status === "downloading")
+    return { action: "pause", label: phase === "seeding" ? "stop seeding" : "pause" };
+  return null;
 }
 
 function sectionOf(j) {
@@ -1770,6 +1785,7 @@ function rowModel(j, ctx) {
   const phase = torrentPhase(j);
   const seed = phase === "seeding" || phase === "paused_seed";
   const seedPaused = phase === "paused_seed";
+  const torrentAction = torrent ? torrentPrimaryAction(j) : null;
 
   // A URL job has no articles until its NZB arrives — "0 B of 0 B" reads as
   // broken; say what it is actually doing instead.
@@ -1852,7 +1868,7 @@ function rowModel(j, ctx) {
     dBold: seed ? "Files ready" : fetching ? "" : fmtBytes(done),
     dRest: seed ? " · " + (seedPaused ? seedStopText(j) : "↑ " + fmtRate(j.upload_rate_bps || 0)) +
       " · " + fmtBytes(j.uploaded_bytes || 0) + " uploaded · " + (j.useful_peers || 0) + " peers"
-      : torrent && ["failed", "missing_files", "storage_hold"].includes(phase) ? " · " + (j.torrent_error || torrentStatus(j))
+      : torrent && ["failed", "missing_files", "storage_hold"].includes(phase) ? " · " + (phase === "storage_hold" ? "storage full · waiting for disk space · downloads recover automatically when space is available" : j.torrent_error || torrentStatus(j))
       : fetching ? "fetching the NZB from the indexer…" : rest.join(""),
     dRetry: j.retried_articles > 0
       ? " · " + j.retried_articles + " retries" : "",
@@ -1871,12 +1887,10 @@ function rowModel(j, ctx) {
     // `movable` defaults to true so a caller that renders a row outside
     // the sectioned queue (the DOM harness, a future flat view) keeps the
     // controls it always had.
-    moveHidden: seed || ctx.movable === false,
-    pauseHidden: fetching,
-    pauseLabel: seed ? (seedPaused ? (seedLimitReached(j) ? "seeding options" : "start seeding") : "stop seeding")
-      : (phase === "paused_download" || (over || st) === "paused") ? "resume" : "pause",
-    pauseAction: seedPaused && seedLimitReached(j) ? "seed-options" :
-      (seedPaused || phase === "paused_download" || (over || st) === "paused" ? "resume" : "pause"),
+    moveHidden: seed || phase === "failed" || ctx.movable === false,
+    pauseHidden: torrent ? !torrentAction : fetching,
+    pauseLabel: torrent ? (torrentAction ? torrentAction.label : "") : ((over || st) === "paused" ? "resume" : "pause"),
+    pauseAction: torrent ? (torrentAction ? torrentAction.action : "") : ((over || st) === "paused" ? "resume" : "pause"),
     deleteLabel: torrent ? "remove torrent" : "delete",
     deleteTip: torrent ? "Remove this torrent from the queue, keeping its downloaded files." :
       "Remove this job from the queue. One click — no dialog; you get 8 seconds to undo it.",
@@ -3782,10 +3796,33 @@ async function post(url, init) {
 /// `op` (optional) is the pending-op overlay entry to apply now and revert
 /// if the POST fails. Returns the parsed body on success, null on failure.
 async function jobAction(id, action, op) {
+  const original = store.jobs.find(j => j.id === id);
   if (op) { op.inflight = true; pending.apply(op); }
   const res = await post("/api/v1/jobs/" + id + "/actions/" + action);
   if (op) op.inflight = false;
   if (!res.ok) {
+    if (action === "resume" && res.status === 404 && original && original.kind === "torrent" && original.ready) {
+      if (op) pending.revert(op.key);
+      const fresh = await post("/api/v1/jobs", { method: "GET" });
+      if (!fresh.ok || !Array.isArray(fresh.body.jobs)) {
+        toast({ text: "Runner refused to start seeding. Its current state could not be checked.", kind: "error" });
+        return null;
+      }
+      store.jobs = fresh.body.jobs;
+      const current = store.jobs.find(j => j.id === id);
+      if (!current) {
+        if (openJob === id) openJob = null;
+        seedDrafts.delete(id);
+        toast({ text: "This torrent is no longer in the queue." });
+      } else if (["seeding", "paused_seed"].includes(torrentPhase(current))) {
+        if (openJob !== id) toggleJob(id);
+        toast({ text: "Runner refused to start seeding. Check this torrent's seeding policy.", kind: "error" });
+      } else {
+        toast({ text: "The torrent state changed. Check its current status before trying again." });
+      }
+      renderQueue();
+      return null;
+    }
     const why = (op && op.label ? op.label : action) + " failed — " + res.error;
     if (op) pending.revert(op.key, why);
     else toast({ text: why, kind: "error", ttlMs: 10000 });
@@ -5309,7 +5346,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     histModel, fileModel, statusModels, storageModels, queueModels, detailModel,
     statusName, statusLabel, healthColor, fmtBytes, fmtRate, fmtEta, fmtDur, ppSummary,
     sectionOf, currentPostStage, pipelineModels, stageElapsedMs, SECTIONS, ORDERED,
-    torrentPhase, torrentStatus, seedPolicyText, seedStopText, seedLimitReached, toggleSection, collapsedSections,
+    torrentPrimaryAction, torrentPhase, torrentStatus, seedPolicyText, seedStopText, seedLimitReached, toggleSection, collapsedSections,
     pending, satisfied, toast, connState, pollResult,
     connFromGaps, activeWire, applyTick, applyHb, pollPass,
     startStream, ensureStream,

@@ -700,6 +700,21 @@ fn push_diagnostic(plan: &mut RestorePlan, diagnostic: RestoreDiagnostic) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn torrent_mobile_queue_storage_full_sentinel_matches_fixture() {
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../nzbd-types/fixtures/mobile-queue-parity.json"
+        ))
+        .unwrap();
+        let hold = fixtures
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "storage hold")
+            .unwrap();
+        assert_eq!(hold["job"]["torrent_error"], super::STORAGE_FULL_ERROR);
+    }
+
     use super::*;
     use nzbd_types::{
         DupeInfo, JobTotals, SeedPolicy, TorrentFileRecord, TorrentRecord, TorrentSource,

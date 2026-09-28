@@ -2,6 +2,7 @@ import { File } from 'expo-file-system';
 import { AppState } from 'react-native';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import { JobActionResult, runJobAction } from '../api/jobActions';
 import { NzbdClient } from '../api/client';
 import { SseParser } from '../api/sse';
 import {
@@ -12,6 +13,7 @@ import {
   ConnectionConfig,
   ConnectionState,
   QueueSnapshot,
+  SeedPolicy,
 } from '../api/types';
 
 interface HookResult {
@@ -33,7 +35,8 @@ interface HookResult {
       | 'move-up'
       | 'move-down'
       | 'move-bottom',
-  ) => Promise<{ ok: boolean; parked?: boolean }>;
+  ) => Promise<JobActionResult>;
+  setSeedPolicy: (id: number, policy: SeedPolicy & { use_defaults: boolean }) => Promise<void>;
   setJobPriority: (id: number, priority: number) => Promise<void>;
   addNzb: (file: File, options: AddNzbOptions) => Promise<AddNzbResult>;
   addTorrentFile: (file: File, options: AddTorrentOptions) => Promise<AddTorrentResult>;
@@ -42,6 +45,9 @@ interface HookResult {
 
 export function useNzbd(config: ConnectionConfig): HookResult {
   const client = useMemo(() => new NzbdClient(config), [config]);
+  const activeClient = useRef<NzbdClient | null>(client);
+  activeClient.current = client;
+  useEffect(() => { activeClient.current = client; return () => { activeClient.current = null; }; }, [client]);
   const [snapshot, setSnapshot] = useState<QueueSnapshot | null>(null);
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
   const [error, setError] = useState<string | null>(null);
@@ -51,16 +57,19 @@ export function useNzbd(config: ConnectionConfig): HookResult {
   const lastFrameAt = useRef(0);
 
   const refresh = useCallback(async () => {
+    if (activeClient.current !== client) return;
     if (refreshPromise.current) return refreshPromise.current;
     const request = client
       .getSnapshot()
       .then((next) => {
+        if (activeClient.current !== client) return;
         setSnapshot(next);
         setLastUpdated(Date.now());
         setError(null);
         if (Date.now() - lastFrameAt.current > 7_000) setConnectionState('polling');
       })
       .catch((cause) => {
+        if (activeClient.current !== client) throw cause;
         const message = cause instanceof Error ? cause.message : 'Could not refresh Runner.';
         setError(message);
         setConnectionState('offline');
@@ -154,10 +163,10 @@ export function useNzbd(config: ConnectionConfig): HookResult {
         await refresh().catch(() => undefined);
         return result;
       } catch (cause) {
-        setError(cause instanceof Error ? cause.message : 'Runner rejected the action.');
+        if (activeClient.current === client) setError(cause instanceof Error ? cause.message : 'Runner rejected the action.');
         throw cause;
       } finally {
-        setBusyKey(null);
+        if (activeClient.current === client) setBusyKey(null);
       }
     },
     [refresh],
@@ -172,7 +181,11 @@ export function useNzbd(config: ConnectionConfig): HookResult {
     refresh,
     queueAction: (action) => mutate(`queue:${action}`, () => client.queueAction(action)),
     jobAction: (id, action) =>
-      mutate(`job:${id}:${action}`, () => client.jobAction(id, action)),
+      mutate(`job:${id}:${action}`, () => runJobAction(client,
+        snapshot?.jobs.find((job) => job.id === id), id, action, (jobs) => {
+          if (activeClient.current === client) setSnapshot((current) => current ? { ...current, jobs } : current);
+        })),
+    setSeedPolicy: (id, policy) => mutate(`job:${id}:seed-policy`, () => client.setSeedPolicy(id, policy)),
     setJobPriority: (id, priority) =>
       mutate(`job:${id}:priority`, () => client.setJobPriority(id, priority)),
     addNzb: (file, options) => mutate('add', () => client.addNzb(file, options)),

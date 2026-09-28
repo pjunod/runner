@@ -128,6 +128,9 @@ NZBGet configuration and prints a mapping report.
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | The complete annotated `nzbd.toml` reference |
 | [docs/USAGE.md](docs/USAGE.md) | CLI, web UI, connecting the *arr apps, RSS feeds + filter language, extension scripts, deobfuscation |
 | [docs/MOBILE.md](docs/MOBILE.md) | Building the iPhone/iPad/Android app, connecting it to nzbd, and its exact control/security boundaries |
+| [docs/MOBILE_QUEUE_PARITY_PLAN.md](docs/MOBILE_QUEUE_PARITY_PLAN.md) | Reviewed mobile torrent grouping and controls implementation plan |
+| [docs/MOBILE_QUEUE_PARITY_REVIEW.md](docs/MOBILE_QUEUE_PARITY_REVIEW.md) | Fable's source review and required corrections |
+| [docs/MOBILE_QUEUE_PARITY_STATUS.md](docs/MOBILE_QUEUE_PARITY_STATUS.md) | Implementation, review, validation, and delivery progress |
 | [docs/MOBILE_REVIEW.md](docs/MOBILE_REVIEW.md) | Independent review of the mobile app (2026-08): code, performance, UI, release readiness, and the Google TV / Apple TV gap |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | systemd, Docker Compose, Kubernetes, multi-node cluster deployment |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design: the whole system, phase by phase |

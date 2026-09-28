@@ -21,14 +21,14 @@ const statusCases: [JobStatus, string][] = [
 ];
 
 test.each(statusCases)('maps %p to the %s queue section', (status, expected) => {
-  expect(queueSectionKey(status)).toBe(expected);
+  expect(queueSectionKey(job(1, status))).toBe(expected);
 });
 
 test('an open stage keeps an inconsistent completed row in post-processing', () => {
-  expect(queueSectionKey('completed', [
+  expect(queueSectionKey({ ...job(1, 'completed'), stages: [
     { stage: 'par_rename', started_at_unix: 1000, ms: 2000 },
     { stage: 'par_verify', started_at_unix: 1002 },
-  ])).toBe('verifying');
+  ] })).toBe('verifying');
 });
 
 test('groups by activity while preserving queue positions within each section', () => {
