@@ -27,7 +27,16 @@ cards. Causes and fixes:
 - A missing scan root (the failed dir before any failure) no longer fails the
   scan.
 
-Tests: nzbd-state artifacts +6 · nzbd-api +1 · UI DOM harness 803 assertions.
+Adversarial review (10 findings) addressed: Runner-written payloads listed as
+unmeasured because the stripped row could not see its manifest (P1 — list rows
+now carry `measured` from SQL, and `finish`/`reconcile_startup` stamp
+`inspected_at`); a non-OK list threw on render; a kicked runner drained past
+`close()`; a folder whose walk failed was re-walked by every periodic scan;
+deletes queued behind scans; the column migration was not atomic; a slow older
+list response could overwrite a newer one; `compact()` zeroed the size of
+cleared payloads; a transport blip mid-poll reported a task failed.
+
+Tests: nzbd-state artifacts +10 · nzbd-api +1 · UI DOM harness 811 assertions.
 
 ## Incremental history ingestion — 2026-09-25
 

@@ -2305,6 +2305,26 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     // page never asks for more than one page of manifests.
     ok(!seen.some(r => r.url.includes("/files?")), "the list never fetches manifests it is not showing");
 
+    // 5b. A daemon that answers the list with an error renders an empty
+    //     state, not a TypeError on every 5 s poll.
+    routes.set("/api/v1/artifacts?", { status: 503, body: { error: "restarting" } });
+    T.store.files = null;
+    await T.refreshFiles(true);
+    eq(T.store.files, "off", "a non-OK list marks the inventory unavailable");
+    eq(body.children.length, 1, "…as one empty row");
+    ok(body.children[0].children[0].textContent.includes("unavailable"), "…that says so");
+    // 5c. A slow answer to an older query never overwrites a newer one.
+    let release;
+    routes.set("/api/v1/artifacts?", (url) => url.includes("q=slow")
+      ? new Promise(res => { release = () => res(page(1, 900, 1)); })
+      : page(2, 1, 2));
+    const slow = T.setFilesQuery("slow");
+    await T.setFilesQuery("fast");
+    eq(T.filesView.total, 2, "the newer query landed");
+    release(); await slow;
+    eq(T.filesView.total, 2, "…and the older, slower answer was dropped");
+    eq(body.children.length, 2, "rows are the newer query's");
+
     // 6. Scan and inspect are watched to completion, not fired and forgotten.
     const timers = [];
     const realTimeout = sandbox.setTimeout;
@@ -2331,10 +2351,16 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     const toasts = doc.getElementById("toasts");
     ok(toasts.children.some(t => t.children[0].textContent.startsWith("Scan finished")), "the result is announced");
     routes.set("/api/v1/artifacts/row1/inspect", { status: 202, body: { id: "insp-1", kind: "inspect", state: "queued" } });
-    routes.set("/api/v1/artifact-operations/insp-1", { status: 200, body: { id: "insp-1", kind: "inspect", state: "failed", error: "payload identity changed; review required" } });
+    let inspPolls = 0;
+    routes.set("/api/v1/artifact-operations/insp-1", () => ++inspPolls === 1
+      ? { status: 503, body: {} }
+      : { status: 200, body: { id: "insp-1", kind: "inspect", state: "failed", error: "payload identity changed; review required" } });
     timers.length = 0; toasts.children.length = 0;
     await T.filesClick("f-inspect", { dataset: { artifact: "row1" }, closest: () => null });
     eq(T.fileRowModel(entry("row1")).inspectLabel, "measuring…", "the row shows the walk in flight");
+    await timers.shift()();
+    eq(T.filesWatch.size, 1, "a transport error mid-poll keeps the watch alive");
+    ok(!toasts.children.length, "…and does not report the task as failed");
     await timers.shift()();
     ok(toasts.children.some(t => t.children[0].textContent.includes("payload identity changed")),
       "a failed walk says why, in the daemon's words");

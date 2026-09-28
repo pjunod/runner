@@ -193,9 +193,12 @@ pub struct ListQuery {
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct ListRow {
+    /// The record without its manifest; ask `measured` here, not
+    /// `artifact.measured()`, which cannot see the stripped file list.
     pub artifact: Artifact,
     pub files: u64,
     pub bytes: u64,
+    pub measured: bool,
 }
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct ListCounts {
@@ -325,7 +328,8 @@ impl Inventory {
         )?;
         if !has_summary {
             db.execute_batch(
-                "ALTER TABLE artifacts ADD COLUMN files INTEGER NOT NULL DEFAULT 0;
+                "BEGIN;
+                 ALTER TABLE artifacts ADD COLUMN files INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE artifacts ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0;
                  UPDATE artifacts SET
                    files=(SELECT COUNT(*) FROM json_each(json_extract(artifacts.data,'$.files')) f
@@ -333,7 +337,8 @@ impl Inventory {
                    bytes=(SELECT COALESCE(SUM(json_extract(f.value,'$.identity.bytes')),0)
                           FROM json_each(json_extract(artifacts.data,'$.files')) f
                           WHERE json_extract(f.value,'$.identity.directory')=0);
-                 CREATE INDEX IF NOT EXISTS artifacts_bytes ON artifacts(bytes DESC,updated_at DESC,id);",
+                 CREATE INDEX IF NOT EXISTS artifacts_bytes ON artifacts(bytes DESC,updated_at DESC,id);
+                 COMMIT;",
             )?;
         }
         fs::sync_directory(&fs::open_dir(state_dir)?)?;
@@ -464,7 +469,7 @@ impl Inventory {
             |r| r.get(0),
         )?;
         let mut stmt = db.prepare(&format!(
-            "SELECT json_remove(data,'$.files'),files,bytes FROM artifacts WHERE {where_sql} ORDER BY {order} LIMIT {limit} OFFSET {}",
+            "SELECT json_remove(data,'$.files'),files,bytes,json_array_length(json_extract(data,'$.files')) FROM artifacts WHERE {where_sql} ORDER BY {order} LIMIT {limit} OFFSET {}",
             q.offset as i64
         ))?;
         let rows = stmt
@@ -475,13 +480,16 @@ impl Inventory {
                         r.get::<_, String>(0)?,
                         r.get::<_, i64>(1)?,
                         r.get::<_, i64>(2)?,
+                        r.get::<_, Option<i64>>(3)?.unwrap_or(0),
                     ))
                 },
             )?
             .map(|r| {
-                let (raw, files, bytes) = r?;
+                let (raw, files, bytes, entries) = r?;
+                let artifact: Artifact = serde_json::from_str(&raw)?;
                 Ok(ListRow {
-                    artifact: serde_json::from_str(&raw)?,
+                    measured: artifact.inspected_at.is_some() || entries > 0,
+                    artifact,
                     files: files.max(0) as u64,
                     bytes: bytes.max(0) as u64,
                 })
@@ -680,6 +688,7 @@ impl Inventory {
                 }
             } else if let Ok(dir) = self.verify(&a) {
                 a.files = fs::manifest(&dir, 100_000)?;
+                a.inspected_at = Some(now());
                 a.state = "retained".into();
                 a.hold = if a.owned { None } else { Some("review".into()) };
             } else {
@@ -853,6 +862,7 @@ impl Inventory {
         a.root_identity = fs::identity(&root_file.metadata()?);
         a.identity = Some(fs::identity(&dir.metadata()?));
         a.files = fs::manifest(&dir, 100_000)?;
+        a.inspected_at = Some(now());
         if a.state == "retiring" {
             a.hold = if a.owned { None } else { Some("review".into()) };
         }
@@ -1384,7 +1394,8 @@ impl Inventory {
     /// maintenance tick, and kicked by the API once a requested delete's
     /// window expires so the files go when the toast said they would.
     pub fn run_due_deletes(&self) -> Result<()> {
-        let _runner = self.tasks.lock().unwrap();
+        // No runner lock: execute_delete is serialized by the mutation guard
+        // and idempotent, and a delete must not queue behind a scan drain.
         let pending = {
             let db = self.db.lock().unwrap();
             let mut stmt = db.prepare(
@@ -1432,7 +1443,12 @@ impl Inventory {
                 fs::unlink(&fs::open_dir(&identities)?, Path::new(&a.id), true)?;
             }
             a.files.clear();
-            save_artifact(&tx, &a)?;
+            // The manifest goes; the summary stays so the Cleared view still
+            // knows how big the payload was.
+            tx.execute(
+                "UPDATE artifacts SET data=?2, updated_at=?3 WHERE id=?1",
+                params![a.id, serde_json::to_string(&a)?, a.updated_at],
+            )?;
         }
         tx.execute(
             "DELETE FROM events WHERE seq IN (SELECT seq FROM events WHERE at<?1 LIMIT 1000)",

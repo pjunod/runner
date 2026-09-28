@@ -155,8 +155,11 @@ impl Inventory {
                         // A row that says "0 files · 0 B" for a folder nobody
                         // has walked is a lie. Measure what discovery found,
                         // and carry a walk failure on the record rather than
-                        // failing the whole scan for one bad folder.
-                        if a.state == "unknown" && !a.measured() {
+                        // failing the whole scan for one bad folder. A folder
+                        // whose walk already failed is not re-walked by every
+                        // periodic scan (a 100k-entry tree would stall the
+                        // runner every 15 minutes); its row's Inspect retries.
+                        if a.state == "unknown" && !a.measured() && a.error.is_none() {
                             if let Err(e) = self.inspect(&a.id) {
                                 tracing::warn!(path=%path.display(), error=%e, "discovered folder could not be measured");
                                 let _ = self.note_error(&a.id, &e.to_string());
@@ -191,6 +194,11 @@ impl Inventory {
     pub fn run_tasks(&self) -> Result<()> {
         let _runner = self.tasks.lock().unwrap();
         for _ in 0..400 {
+            // A kicked runner can outlive shutdown; leave the rest queued for
+            // the next boot instead of failing each one against a closed inventory.
+            if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(());
+            }
             let keys = {
                 let db = self.db.lock().unwrap();
                 let mut stmt=db.prepare("SELECT id FROM operations WHERE state IN ('queued','running') AND json_extract(data,'$.kind') IN ('inspect','scan','stage','prune') AND json_extract(data,'$.not_before')<=unixepoch() ORDER BY json_extract(data,'$.created_at') LIMIT 5")?;

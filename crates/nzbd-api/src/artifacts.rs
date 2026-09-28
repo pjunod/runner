@@ -140,7 +140,7 @@ async fn list(State(st): State<ApiState>, Query(p): Query<Page>) -> Response {
                 json!({
                     "files": row.files,
                     "bytes": row.bytes,
-                    "measured": row.artifact.measured(),
+                    "measured": row.measured,
                     "earliest_expiry": row.artifact.earliest_expiry(now),
                     "artifact": row.artifact,
                 })

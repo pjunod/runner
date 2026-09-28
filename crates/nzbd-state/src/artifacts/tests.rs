@@ -817,6 +817,116 @@ fn list_page_filters_sorts_searches_and_counts() {
     assert_eq!(paged.rows.len(), 2);
 }
 
+// Review finding: the list stripped the manifest in SQL and then asked the
+// stripped record whether it had been measured — every folder Runner itself
+// wrote (finalized, never "inspected") came back unmeasured.
+#[test]
+fn list_reports_runner_written_payloads_as_measured() {
+    let (_tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    assert!(
+        db.get(&a.id).unwrap().inspected_at.is_some(),
+        "finish measures the payload"
+    );
+    let page = db
+        .list_page(&ListQuery {
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(page.rows.len(), 1);
+    assert!(page.rows[0].measured);
+    assert_eq!(page.rows[0].files, 1);
+    // An older record: manifest present, no inspected_at. Still measured.
+    let mut old = db.get(&a.id).unwrap();
+    old.inspected_at = None;
+    save_artifact(&db.db.lock().unwrap(), &old).unwrap();
+    let page = db
+        .list_page(&ListQuery {
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        page.rows[0].measured,
+        "a manifest is measurement, whoever wrote it"
+    );
+}
+
+#[test]
+fn scan_does_not_rewalk_a_folder_whose_walk_already_failed() {
+    let (_tmp, db, root) = fixture();
+    let odd = root.join("odd");
+    std::fs::create_dir(&odd).unwrap();
+    let a = db.discover(&root, &odd, false).unwrap();
+    db.note_error(&a.id, "special file: ctl.sock").unwrap();
+    let before = db.get(&a.id).unwrap();
+    db.submit_task(
+        "scan",
+        "installation",
+        "again",
+        serde_json::json!({"roots":[root],"excluded":[],"active":[]}),
+    )
+    .unwrap();
+    db.run_tasks().unwrap();
+    let after = db.get(&a.id).unwrap();
+    assert_eq!(
+        after.revision, before.revision,
+        "the periodic scan leaves it to Inspect"
+    );
+    assert!(after.error.is_some());
+    db.inspect(&a.id).unwrap();
+    assert!(
+        db.get(&a.id).unwrap().error.is_none(),
+        "a manual inspect clears the error"
+    );
+}
+
+#[test]
+fn compact_keeps_the_size_of_a_cleared_payload() {
+    let (_tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    let op = db.request_delete(&a.id, a.revision, "gone", 0).unwrap();
+    db.execute_delete(&op.id).unwrap();
+    let mut old = db.get(&a.id).unwrap();
+    old.updated_at = now() - 100 * 86400;
+    save_artifact(&db.db.lock().unwrap(), &old).unwrap();
+    assert_eq!(db.compact().unwrap(), 1);
+    let page = db
+        .list_page(&ListQuery {
+            limit: 10,
+            filter: ListFilter::Cleared,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(page.rows[0].artifact.files.is_empty() || page.rows[0].files > 0);
+    assert!(
+        page.rows[0].bytes > 0,
+        "the summary survives manifest retirement"
+    );
+    assert_eq!(
+        db.get(&a.id).unwrap().files.len(),
+        0,
+        "…while the manifest is gone"
+    );
+}
+
+#[test]
+fn a_closed_inventory_leaves_queued_tasks_for_the_next_boot() {
+    let (_tmp, db, root) = fixture();
+    let op = db
+        .submit_task(
+            "scan",
+            "installation",
+            "later",
+            serde_json::json!({"roots":[root],"excluded":[],"active":[]}),
+        )
+        .unwrap();
+    db.close().unwrap();
+    db.run_tasks().unwrap();
+    assert_eq!(db.operation(&op.id).unwrap().state, "queued");
+}
+
 #[test]
 fn summary_columns_backfill_for_an_inventory_written_before_they_existed() {
     let (tmp, db, root) = fixture();

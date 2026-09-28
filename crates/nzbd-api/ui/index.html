@@ -4655,6 +4655,9 @@ const FILES_SORTS = ["updated", "size", "files", "name"];
 const FILES_DETAIL_PAGE = 200;
 const filesView = { filter: "live", sort: "updated", q: "", page: 0, size: FILES_PAGE_SIZE_DEFAULT, total: 0 };
 let filesBusy = false;
+// Every list fetch carries a sequence number; a slow answer to an earlier
+// query (you typed "ba", then "bat") must not overwrite the newer one.
+let filesSeq = 0;
 // The one open folder panel and what it is showing.
 let filesOpen = null;
 let filesDetail = null; // { artifact, files, total, offset, events, preview, previewRequest }
@@ -4987,7 +4990,7 @@ function renderFilesScan() {
 function renderFilesPager() {
   const pages = filesPages();
   const start = filesView.page * filesView.size;
-  const shown = store.files ? store.files.entries.length : 0;
+  const shown = store.files && store.files !== "off" ? store.files.entries.length : 0;
   // A search or a non-default view keeps the count visible even when the
   // result fits on one page: "3 folders" is the answer you searched for.
   const relevant = store.files != null && store.files !== "off" &&
@@ -5061,12 +5064,15 @@ function renderRecoveries() {
 async function refreshFiles(force = false) {
   if (filesBusy && !force) return;
   filesBusy = true;
+  const seq = ++filesSeq;
   try {
     const qs = "offset=" + filesView.page * filesView.size + "&limit=" + filesView.size +
       "&filter=" + filesView.filter + "&sort=" + filesView.sort + (filesView.q ? "&q=" + encodeURIComponent(filesView.q) : "");
     const response = await jfetch("/api/v1/artifacts?" + qs);
+    if (seq !== filesSeq) return; // superseded while in flight
     if (!response.ok) { store.files = "off"; renderFiles(); return; }
     const data = await response.json();
+    if (seq !== filesSeq) return;
     filesView.total = data.total || 0;
     // A page that emptied under us (delete on the last page): step back once.
     if (!data.entries.length && filesView.page > 0 && filesView.total > 0) {
@@ -5121,8 +5127,10 @@ function watchOperation(op, kind, artifact, onDone) {
   filesWatch.set(op.id, w);
   const poll = async () => {
     let cur;
+    // A daemon blip mid-poll is not a failed task: keep watching until the
+    // operation itself reports a terminal state (or the 20-minute cap).
     try { cur = await fileRequest("artifact-operations/" + op.id, null, "GET"); }
-    catch (e) { cur = { state: "failed", error: e.message }; }
+    catch (e) { cur = { state: "unreachable", error: e.message }; }
     if (["succeeded", "failed", "cancelled", "review"].includes(cur.state) || Date.now() - w.since > 20 * 60 * 1000) {
       filesWatch.delete(op.id);
       await onDone(cur);
