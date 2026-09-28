@@ -1,11 +1,13 @@
 # Mobile queue parity — implementation and delivery status
 
-**Status:** implementing · **Updated:** 2026-09-28 · **Branch:**
+**Status:** adversarial review in progress · **Updated:** 2026-09-28 · **Branch:**
 `codex/mobile-queue-parity` · **Base:** `5b683d6`
 
 Companion to [the implementation plan](MOBILE_QUEUE_PARITY_PLAN.md) and
 [Fable's plan review](MOBILE_QUEUE_PARITY_REVIEW.md). Work uses an independent
 clone at `/private/tmp/nzbd-mobile-queue-parity`; the original checkout is intact.
+
+**PR:** [#241](https://github.com/pjunod/runner/pull/241), draft until review corrections land.
 
 ## Progress
 
