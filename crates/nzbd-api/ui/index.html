@@ -580,6 +580,78 @@ try {
     .pager .spacer { display: none; }
     .pager { justify-content: center; }
   }
+  /* ---- Files tab ---------------------------------------------------------
+     One table, filtered and paged on the server; the detail opens as a row
+     UNDER the folder you clicked, never at the foot of the page. */
+  .files-intro .sub { color: var(--ink2); font-size: 12.5px; margin: 10px 0 0; max-width: 78ch; }
+  .files-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 12px 0 10px; }
+  .files-toolbar input[type=search] { background: var(--panel); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; font: inherit;
+    font-size: 13px; min-width: 14ch; flex: 1 1 160px; max-width: 320px; }
+  .files-toolbar input[type=search]:focus { outline: none; border-color: var(--accent); }
+  .files-sort { display: flex; align-items: center; gap: 6px; color: var(--ink2); font-size: 12.5px; }
+  .files-sort select { background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 7px; padding: 5px 6px; font: inherit; font-size: 12.5px; }
+  /* Segmented filter: one bordered strip, the live view lit. */
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+         background: var(--panel); }
+  .seg button { border: 0; border-radius: 0; padding: 5px 11px; font-size: 12.5px; color: var(--ink2);
+    background: transparent; display: inline-flex; align-items: center; gap: 6px; }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .seg button:hover { color: var(--ink); background: color-mix(in srgb, var(--accent) 6%, transparent); }
+  .seg button.on { color: var(--ink); font-weight: 600;
+    background: color-mix(in srgb, var(--accent) 14%, transparent); }
+  .seg .cnt { font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums;
+    color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 0 6px; min-width: 2ch; text-align: center; }
+  .seg button.on .cnt { color: var(--ink2); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+  .files-scan-state { color: var(--ink2); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .files-scan-state.busy { color: var(--accent); }
+  .files-scan-state.bad { color: var(--bad); }
+  #files-scan.busy { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
+  .files-pager { margin: 8px 0; }
+  #files-pager-top { margin-top: 0; }
+  .files-pager .files-pager-info { min-width: 14ch; text-align: center; }
+  .files-table td .name { -webkit-line-clamp: 2; }
+  .files-table td.num { white-space: nowrap; }
+  .files-table td .st { white-space: nowrap; }
+  .files-table td .sub { font-family: var(--font-mono); font-size: 11px; }
+  .files-table td .unmeasured { color: var(--muted); }
+  .files-table td .hold { color: var(--warn); font-size: 12px; }
+  .files-table td .ret { font-size: 12.5px; }
+  .files-table td .err { color: var(--bad); font-size: 11.5px; margin-top: 2px; word-break: break-word; }
+  .files-table tr.f-open > td { background: color-mix(in srgb, var(--accent) 5%, transparent); }
+  .files-table .acts button.details-open { color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  /* The folder panel, in the accent-bordered style the queue and history share. */
+  .fd { padding: 12px 16px 14px; border-left: 3px solid color-mix(in srgb, var(--accent) 58%, transparent); }
+  .fd-path { font-family: var(--font-mono); font-size: 12px; color: var(--ink); word-break: break-all; }
+  .fd-facts { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 8px 0 10px; font-size: 12px; color: var(--ink2); }
+  .fd-facts b { color: var(--ink); font-weight: 600; }
+  .fd-acts { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 10px; }
+  .fd-acts button.del:hover { border-color: var(--bad); color: var(--bad); }
+  .fd-note { font-size: 12px; color: var(--muted); margin: 0 0 8px; }
+  .fd-note.warn { color: var(--warn); }
+  .fd-note.bad { color: var(--bad); }
+  .fd-files { margin-top: 4px; }
+  .fd-files summary { cursor: pointer; font-size: 12.5px; color: var(--ink2); }
+  .fd-files table.subtable td.chk { width: 24px; padding-right: 0; }
+  .fd-files table.subtable td.path { font-family: var(--font-mono); font-size: 11.5px; word-break: break-all; }
+  .fd-files .fd-files-nav { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--ink2); }
+  .fd-stage { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .fd-stage-preview { font-size: 12.5px; color: var(--ink2); margin: 6px 0; }
+  .fd-events { margin-top: 10px; font-size: 12px; color: var(--muted); }
+  .fd-events div { font-variant-numeric: tabular-nums; }
+  .files-recoveries { margin-top: 18px; }
+  .files-recoveries summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--ink2); }
+  .files-recoveries .sub { color: var(--muted); font-size: 12px; margin: 6px 0 8px; }
+  .rec-row { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; padding: 6px 0;
+    border-bottom: 1px solid var(--line); font-size: 12.5px; }
+  .rec-row code { font-family: var(--font-mono); font-size: 11.5px; color: var(--ink2); }
+  @media (max-width: 640px) {
+    .files-table th:nth-child(5), .files-table td:nth-child(5) { display: none; }
+    .files-toolbar .files-sort { order: 5; }
+  }
   footer { color: var(--muted); font-size: 11.5px; margin-top: 22px; }
   /* Toasts: the replacement for both confirm() and silence. Every action
      that changed something says so; every action that failed says THAT,
@@ -1054,17 +1126,69 @@ try {
   </section>
 
   <section id="tab-files" hidden>
-    <h2>Files needing attention</h2>
-    <p>Owned payloads survive History cleanup. Unknown folders stay on review hold until you inspect and adopt them.</p>
-    <button onclick="scanFiles()">Scan configured folders</button>
-    <button onclick="refreshFiles()">Refresh inventory</button>
-    <span id="files-message" role="status"></span><p id="files-discovery"></p>
-    <label><input type="checkbox" id="files-show-terminal" onchange="filesOffset=0;refreshFiles()"> Show cleared payload records</label>
-    <div id="files-list"></div>
-    <button onclick="filesOffset=Math.max(0,filesOffset-100);refreshFiles()">Previous</button>
-    <button onclick="filesOffset+=100;refreshFiles()">Next</button>
-    <div id="files-detail"></div>
-    <button id="files-undo" hidden>Undo deletion</button><h3>Recovery handoffs</h3><button onclick="filesRecoveryOffset=Math.max(0,filesRecoveryOffset-100);refreshFiles()">Previous handoffs</button><button onclick="filesRecoveryOffset+=100;refreshFiles()">Next handoffs</button><div id="files-recoveries"></div>
+    <div class="files-intro">
+      <p class="sub">Every folder under the download roots: who owns it, what is in it, and what happens to it.
+        Runner keeps its own payloads through History cleanup; a folder it did not write stays on review hold
+        until you inspect and adopt it.</p>
+    </div>
+    <div class="files-toolbar">
+      <div class="seg" id="files-filter" role="group" aria-label="which folders">
+        <button data-action="f-filter" data-filter="live" class="on">All <span class="cnt" id="files-cnt-live">–</span></button>
+        <button data-action="f-filter" data-filter="attention">Needs review <span class="cnt" id="files-cnt-attention">–</span></button>
+        <button data-action="f-filter" data-filter="owned">Owned <span class="cnt" id="files-cnt-owned">–</span></button>
+        <button data-action="f-filter" data-filter="cleared">Cleared <span class="cnt" id="files-cnt-cleared">–</span></button>
+      </div>
+      <input type="search" id="files-q" placeholder="filter by name…" autocomplete="off" spellcheck="false">
+      <label class="files-sort">sort
+        <select id="files-sort">
+          <option value="updated">recently changed</option>
+          <option value="size">largest first</option>
+          <option value="files">most files</option>
+          <option value="name">name</option>
+        </select>
+      </label>
+      <span class="spacer" style="flex:1"></span>
+      <button data-action="f-scan" id="files-scan" title="walk the configured download roots for folders Runner does not know about, and measure them">Scan folders</button>
+      <span id="files-scan-state" class="files-scan-state"></span>
+    </div>
+    <div class="pager files-pager" id="files-pager-top" hidden>
+      <button class="small" data-action="f-page-first" title="first page">⤒</button>
+      <button class="small" data-action="f-page-prev" title="previous page">‹ prev</button>
+      <span class="files-pager-info"></span>
+      <button class="small" data-action="f-page-next" title="next page">next ›</button>
+      <button class="small" data-action="f-page-last" title="last page">⤓</button>
+    </div>
+    <table class="files-table">
+      <thead><tr><th>Folder</th><th>Status</th><th class="num">Files</th><th class="num">Size</th>
+        <th>Retention</th><th style="width:150px"></th></tr></thead>
+      <tbody id="files-body"><tr><td colspan="6" class="empty">loading…</td></tr></tbody>
+    </table>
+    <div class="pager files-pager" id="files-pager" hidden>
+      <button class="small" data-action="f-page-first" title="first page">⤒</button>
+      <button class="small" data-action="f-page-prev" title="previous page">‹ prev</button>
+      <span class="files-pager-info"></span>
+      <button class="small" data-action="f-page-next" title="next page">next ›</button>
+      <button class="small" data-action="f-page-last" title="last page">⤓</button>
+      <span class="spacer" style="flex:1"></span>
+      <label>rows per page
+        <select id="files-page-size">
+          <option value="25">25</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="200">200</option>
+        </select>
+      </label>
+    </div>
+    <details class="files-recoveries" id="files-recoveries-box">
+      <summary>Recovery handoffs <span class="sec-count" id="files-recoveries-count"></span></summary>
+      <p class="sub">Copies staged for Curator. Originals stay held until a complete import receipt arrives; a receipted source can then be deleted with an 8-second Undo.</p>
+      <div id="files-recoveries"></div>
+      <div class="pager" id="files-recoveries-pager" hidden>
+        <button class="small" data-action="f-rec-prev">‹ prev</button>
+        <span id="files-recoveries-info"></span>
+        <button class="small" data-action="f-rec-next">next ›</button>
+      </div>
+    </details>
   </section>
 
   <section id="tab-history" hidden>
@@ -3935,6 +4059,7 @@ document.addEventListener("click", (ev) => {
   if (!el) return;
   const action = el.dataset.action;
   if (action === "toggle-section") { toggleSection(el.dataset.section); return; }
+  if (action.startsWith("f-")) { filesClick(action, el); return; }
   const row = el.closest ? el.closest("[data-job-id]") : null;
   const id = Number(el.dataset.job || (row && row.dataset.jobId));
   const scope = row ? row.dataset.scope : "queue";
@@ -4514,86 +4639,634 @@ function applyHb() {
 }
 
 // ---- settings: a real form over nzbd.toml -------------------------------
-let filesOffset = 0, filesBusy = false, selectedArtifact = null, filesOperation = null;
+// ---- files: the folder inventory -----------------------------------------
+// One server-paged table (filter · search · sort · page size), the folder's
+// panel opening as a row directly under the one you clicked, and every
+// background walk watched to completion. Field report 2026-09-28: after a
+// scan the old list showed every folder as "0 entries · 0 B" (discovery
+// recorded folders without walking them, and rendered "unmeasured" as zero),
+// the panel opened at the FOOT of a 71-card page so Inspect looked dead,
+// and the walk itself waited for a 30 s tick. None of that survives here:
+// a row says "—" until it has been measured, the scan measures what it
+// finds, and a queued walk is polled and announced.
+const FILES_PAGE_SIZES = [25, 50, 100, 200], FILES_PAGE_SIZE_DEFAULT = 50;
+const FILES_FILTERS = ["live", "attention", "owned", "cleared"];
+const FILES_SORTS = ["updated", "size", "files", "name"];
+const FILES_DETAIL_PAGE = 200;
+const filesView = { filter: "live", sort: "updated", q: "", page: 0, size: FILES_PAGE_SIZE_DEFAULT, total: 0 };
+let filesBusy = false;
+// The one open folder panel and what it is showing.
+let filesOpen = null;
+let filesDetail = null; // { artifact, files, total, offset, events, preview, previewRequest }
+// Selected recovery files, per folder, surviving re-renders.
+const filesSelections = new Map();
+// Background operations we are watching: op id → { kind, artifact, since, timer }.
+const filesWatch = new Map();
+store.files = null; // { entries, total, counts, discovery, filter, sort, q }
+store.recoveries = null;
+let filesRecoveryOffset = 0;
+
 async function fileRequest(path, body, method = "POST") {
-  const response = await jfetch("/api/v1/" + path, {method, headers:{"Content-Type":"application/json"}, body: body == null ? undefined : JSON.stringify(body)});
-  const value = await response.json();
+  const response = await jfetch("/api/v1/" + path, {
+    method, headers: { "Content-Type": "application/json", ...CLIENT_HDRS },
+    body: body == null ? undefined : JSON.stringify(body),
+  });
+  let value = {};
+  try { value = await response.json(); } catch {}
   if (!response.ok) throw new Error(value.error || "File operation failed: " + response.status);
   return value;
 }
-function filesError(e) { $("files-message").textContent = e.message; }
-function reconcileInventoryRows(container, rows) {
-  const existing=new Map(Array.from(container.children).map(el=>[el.dataset.key,el]));
-  for(const row of rows){
-    let el=existing.get(row.id);
-    if(!el){el=document.createElement("article");el.dataset.key=row.id;el.className="cfg-card";el.append(document.createElement("strong"),document.createElement("p"),document.createElement("button"));}
-    el.children[0].textContent=row.title;el.children[1].textContent=row.detail;
-    const button=el.children[2];button.textContent=row.label;button.hidden=!row.action;button.onclick=row.action;
-    existing.delete(row.id);container.appendChild(el);
-  }
-  for(const el of existing.values())el.remove();
+function filesError(e) { toast({ text: e.message, kind: "error", ttlMs: 10000 }); }
+function uuid() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  return "k" + Date.now().toString(36) + Math.random().toString(36).slice(2);
 }
-async function refreshFiles() {
-  if (filesBusy) return;
+
+// ---- view state: page size, page, filter, sort, search -------------------
+function loadFilesPageSize() {
+  let n = FILES_PAGE_SIZE_DEFAULT;
+  try {
+    const v = localStorage.getItem("nzbd-files-page-size");
+    if (v && FILES_PAGE_SIZES.includes(Number(v))) n = Number(v);
+  } catch {}
+  filesView.size = n;
+  const sel = $("files-page-size");
+  if (sel) sel.value = String(n);
+}
+function setFilesPageSize(n) {
+  if (!FILES_PAGE_SIZES.includes(n)) n = FILES_PAGE_SIZE_DEFAULT;
+  const first = filesView.page * filesView.size;
+  filesView.size = n;
+  filesView.page = Math.floor(first / n);
+  try { localStorage.setItem("nzbd-files-page-size", String(n)); } catch {}
+  return refreshFiles(true);
+}
+function filesPages() { return Math.max(1, Math.ceil(filesView.total / filesView.size)); }
+function setFilesPage(n) {
+  filesView.page = Math.max(0, Math.min(n, filesPages() - 1));
+  return refreshFiles(true);
+}
+function setFilesFilter(f) {
+  if (!FILES_FILTERS.includes(f) || f === filesView.filter) return Promise.resolve();
+  filesView.filter = f; filesView.page = 0;
+  renderFilesToolbar();
+  return refreshFiles(true);
+}
+function setFilesSort(s) {
+  if (!FILES_SORTS.includes(s) || s === filesView.sort) return Promise.resolve();
+  filesView.sort = s; filesView.page = 0;
+  return refreshFiles(true);
+}
+let filesQueryTimer = null;
+function setFilesQuery(q) {
+  q = (q || "").trim();
+  if (q === filesView.q) return Promise.resolve();
+  filesView.q = q; filesView.page = 0;
+  return refreshFiles(true);
+}
+
+// ---- models: pure, so the DOM harness can pin them -----------------------
+const FILES_STATES = {
+  unknown: ["unknown", "warn"], active: ["downloading", "ok"], active_unverified: ["downloading", "ok"],
+  allocating: ["allocating", "dim"], transitioning: ["moving", "dim"], retiring: ["finishing", "dim"],
+  deleting: ["deleting", "dim"], delete_failed: ["delete failed", "bad"],
+  parked_failed: ["failed · parked", "bad"], retained: ["retained", "ok"], completed: ["completed", "ok"],
+  recovery_staged: ["staged for recovery", "warn"], recovery_imported: ["imported", "ok"],
+  deleted: ["deleted", "dim"], source_gone: ["gone", "dim"],
+};
+function filesStateModel(a) {
+  const m = FILES_STATES[a.state] || [a.state, "dim"];
+  return { label: m[0], cls: "st " + m[1] };
+}
+function fileIsTerminal(a) { return a.state === "deleted" || a.state === "source_gone"; }
+function fileHoldText(a) {
+  if (!a.hold) return "";
+  if (a.hold === "review") return "on review hold";
+  return a.hold.startsWith("review") ? "on review hold — " + a.hold.slice(7).replace(/^:\s*/, "") : a.hold;
+}
+/// What will happen to the files, in one line.
+function fileRetentionText(a, earliest) {
+  if (fileIsTerminal(a)) return (a.state === "deleted" ? "deleted " : "gone ") + fmtAgo(a.updated_at);
+  if (!a.owned) return "never deleted automatically";
+  if (a.keep) return "keep indefinitely";
+  if (a.hold) return "held";
+  if (earliest) return "expires " + fmtTime(earliest);
+  return "no automatic expiry";
+}
+function fileBaseName(p) {
+  const s = String(p || "").replace(/\/+$/, "");
+  const i = s.lastIndexOf("/");
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+function fileParent(p) {
+  const s = String(p || "").replace(/\/+$/, "");
+  const i = s.lastIndexOf("/");
+  return i > 0 ? s.slice(0, i) : "/";
+}
+function fileWatching(id, kind) {
+  for (const w of filesWatch.values()) if (w.artifact === id && w.kind === kind) return true;
+  return false;
+}
+function fileRowModel(e) {
+  const a = e.artifact;
+  const st = filesStateModel(a);
+  const open = a.id === filesOpen;
+  const measuring = fileWatching(a.id, "inspect");
+  const walkable = !["active", "active_unverified", "transitioning", "retiring", "deleting", "allocating"].includes(a.state) && !fileIsTerminal(a);
+  return {
+    key: "f" + a.id, kind: "frow", id: a.id,
+    name: fileBaseName(a.path), tip: a.path, sub: fileParent(a.path),
+    st: st.label, stCls: st.cls,
+    hold: fileHoldText(a),
+    err: a.error || "",
+    files: e.measured ? String(e.files) : "—",
+    size: e.measured ? fmtBytes(e.bytes) : "—",
+    measured: !!e.measured,
+    ret: fileRetentionText(a, e.earliest_expiry),
+    owner: a.owned ? "owned by Runner" : "not owned",
+    rowCls: open ? "f-open" : fileIsTerminal(a) ? "hidden-row" : "",
+    detailsLabel: open ? "close" : "details",
+    detailsCls: open ? "details-open" : "",
+    inspectLabel: measuring ? "measuring…" : e.measured ? "re-inspect" : "inspect",
+    inspectHidden: !walkable,
+    inspectDisabled: measuring,
+    inspectTip: e.measured
+      ? "walk the folder again and refresh its file list"
+      : "walk the folder: count its files and measure its size",
+  };
+}
+function buildFileRowKind(d) {
+  const tr = d.create("tr");
+  const c = {};
+  const td1 = d.append(tr, d.create("td"));
+  c.name = d.append(td1, d.create("div", "name"));
+  c.sub = d.append(td1, d.create("div", "sub"));
+  const td2 = d.append(tr, d.create("td"));
+  c.st = d.append(td2, d.create("span", "st"));
+  c.hold = d.append(td2, d.create("div", "hold"));
+  c.err = d.append(td2, d.create("div", "err"));
+  c.files = d.append(tr, d.create("td", "num"));
+  c.size = d.append(tr, d.create("td", "num"));
+  const td5 = d.append(tr, d.create("td"));
+  c.ret = d.append(td5, d.create("div", "ret"));
+  c.owner = d.append(td5, d.create("div", "sub"));
+  const td6 = d.append(tr, d.create("td"));
+  const acts = d.append(td6, d.create("div", "acts"));
+  c.details = d.append(acts, d.create("button", ""));
+  d.data(c.details, "action", "f-details");
+  d.prop(c.details, "title", "what is in this folder, and what can be done with it");
+  c.inspect = d.append(acts, d.create("button", ""));
+  d.data(c.inspect, "action", "f-inspect");
+  tr.__c = c;
+  return tr;
+}
+function applyFileRowKind(tr, m, d) {
+  d = d || dom;
+  const c = tr.__c, w = differ(tr);
+  w("id", m.id, v => d.data(tr, "artifact", v));
+  w("rowCls", m.rowCls, v => d.cls(tr, v));
+  w("name", m.name, v => d.text(c.name, v));
+  w("tip", m.tip, v => d.prop(c.name, "title", v));
+  w("sub", m.sub, v => d.text(c.sub, v));
+  w("st", m.st, v => d.text(c.st, v));
+  w("stCls", m.stCls, v => d.cls(c.st, v));
+  w("hold", m.hold, v => { d.text(c.hold, v); d.prop(c.hold, "hidden", !v); });
+  w("err", m.err, v => { d.text(c.err, v); d.prop(c.err, "hidden", !v); });
+  w("files", m.files, v => d.text(c.files, v));
+  w("size", m.size, v => d.text(c.size, v));
+  w("measured", m.measured, v => {
+    d.cls(c.files, v ? "num" : "num unmeasured"); d.cls(c.size, v ? "num" : "num unmeasured");
+    const tip = v ? "" : "not measured yet — inspect to walk this folder";
+    d.prop(c.files, "title", tip); d.prop(c.size, "title", tip);
+  });
+  w("ret", m.ret, v => d.text(c.ret, v));
+  w("owner", m.owner, v => d.text(c.owner, v));
+  w("detailsLabel", m.detailsLabel, v => d.text(c.details, v));
+  w("detailsCls", m.detailsCls, v => d.cls(c.details, v));
+  w("inspectLabel", m.inspectLabel, v => d.text(c.inspect, v));
+  w("inspectHidden", m.inspectHidden, v => d.prop(c.inspect, "hidden", v));
+  w("inspectDisabled", m.inspectDisabled, v => d.prop(c.inspect, "disabled", v));
+  w("inspectTip", m.inspectTip, v => d.prop(c.inspect, "title", v));
+}
+KINDS.frow = { build: buildFileRowKind, apply: applyFileRowKind };
+
+// ---- the folder panel -----------------------------------------------------
+// Rendered as one HTML fragment, but only when its signature changes — the
+// 5 s refresh must not wipe a half-ticked checkbox or a preview you are
+// reading. Selections live in `filesSelections`, so a re-render restores them.
+function fileDetailModel(dt) {
+  const a = dt.artifact;
+  const measured = dt.measured != null ? dt.measured : (a.inspected_at != null || dt.total > 0);
+  const fileCount = dt.fileCount != null ? dt.fileCount : dt.files.filter(f => !f.identity.directory).length;
+  const sel = filesSelections.get(a.id) || new Set();
+  const terminal = fileIsTerminal(a);
+  const walkable = !["active", "active_unverified", "transitioning", "retiring", "deleting", "allocating"].includes(a.state) && !terminal;
+  const adoptable = !a.owned && !terminal && measured && ["unknown", "retained", "parked_failed", "completed"].includes(a.state);
+  const releasable = !!a.hold && (a.hold.startsWith("review") || a.hold.startsWith("restored backup"));
+  const measuring = fileWatching(a.id, "inspect");
+  const deleting = fileWatching(a.id, "delete");
+  const bytes = dt.bytes != null ? dt.bytes : dt.files.reduce((s, f) => s + (f.identity.directory ? 0 : f.identity.bytes), 0);
+  let note = "";
+  if (a.error) note = a.error;
+  else if (!measured) note = "Not measured yet — inspect walks the folder and lists what is in it.";
+  else if (!a.owned && !terminal) note = "Runner did not write this folder, so it will never delete it. Adopting takes ownership and keeps it indefinitely; you can then let retention expire it or delete it here.";
+  else if (a.hold && !terminal) note = "A hold pauses retention until it is released.";
+  return {
+    key: "fd" + a.id, kind: "fdetail", id: a.id,
+    sig: [a.id, a.revision, dt.offset, dt.total, dt.files.length, a.error || "", a.hold || "", a.keep, a.owned,
+          a.state, sel.size, measuring, deleting, dt.events.length, dt.preview ? dt.preview.text : "", a.inspected_at || 0].join("|"),
+    path: a.path,
+    facts: [
+      ["state", filesStateModel(a).label],
+      ["ownership", a.owned ? "owned by Runner" : "not owned"],
+      ["hold", a.hold || "none"],
+      ["files", measured ? String(fileCount) : "—"],
+      ["size", measured ? fmtBytes(bytes) : "—"],
+      ["measured", a.inspected_at ? fmtAgo(a.inspected_at) : measured ? "at completion" : "never"],
+      ["job", a.job != null ? "#" + a.job : "—"],
+    ],
+    note, noteCls: a.error ? "bad" : !measured ? "warn" : "",
+    buttons: [
+      walkable ? { action: "f-inspect", label: measuring ? "measuring…" : "inspect", disabled: measuring,
+        title: "walk the folder now and refresh its file list" } : null,
+      adoptable ? { action: "f-adopt", label: "adopt & keep", title: "take ownership; kept indefinitely until you say otherwise" } : null,
+      releasable ? { action: "f-release", label: "release review hold", title: "the hold was set for a person to look; you looked" } : null,
+      a.owned && !terminal ? { action: "f-keep", label: a.keep ? "remove keep (fresh retention)" : "keep indefinitely",
+        title: a.keep ? "let the retention policy expire this payload; the timer starts fresh" : "never expire this payload" } : null,
+      a.owned && !terminal ? { action: "f-delete", cls: "del", label: deleting ? "deleting…" : "delete files", disabled: deleting,
+        title: "delete this folder from disk — 8 seconds to undo" } : null,
+    ].filter(Boolean),
+    files: dt.files.map(f => ({
+      path: f.path, size: f.identity.directory ? "" : fmtBytes(f.identity.bytes),
+      dir: !!f.identity.directory, checked: sel.has(f.path),
+    })),
+    filesLabel: measured ? fileCount + (fileCount === 1 ? " file" : " files") + (fileCount ? " · " + fmtBytes(bytes) : "") + (dt.total > fileCount ? " · " + (dt.total - fileCount) + (dt.total - fileCount === 1 ? " folder" : " folders") : "") : "no file list yet",
+    offset: dt.offset, total: dt.total, page: FILES_DETAIL_PAGE,
+    selected: sel.size,
+    canStage: sel.size > 0 && !terminal,
+    preview: dt.preview,
+    events: dt.events.map(ev => fmtTime(ev.at) + " · " + ev.kind + (ev.detail ? " — " + ev.detail : "")),
+  };
+}
+function fileDetailHtml(m) {
+  const facts = m.facts.map(([k, v]) => `<span>${esc(k)} <b>${esc(v)}</b></span>`).join("");
+  const buttons = m.buttons.map(b =>
+    `<button data-action="${b.action}" class="${b.cls || ""}" title="${esc(b.title || "")}" ${b.disabled ? "disabled" : ""}>${esc(b.label)}</button>`).join("");
+  const rows = m.files.map(f =>
+    `<tr><td class="chk"><input type="checkbox" class="recovery-file" value="${esc(f.path)}" ${f.dir ? "disabled" : ""} ${f.checked ? "checked" : ""}></td>` +
+    `<td class="path">${esc(f.path)}${f.dir ? "/" : ""}</td><td class="num">${esc(f.size)}</td></tr>`).join("");
+  const first = m.offset + 1, last = m.offset + m.files.length;
+  const nav = m.total > m.page
+    ? `<div class="fd-files-nav"><button class="small" data-action="f-files-prev" ${m.offset === 0 ? "disabled" : ""}>‹ prev</button>` +
+      `<span>${first}–${last} of ${m.total}</span><button class="small" data-action="f-files-next" ${last >= m.total ? "disabled" : ""}>next ›</button></div>`
+    : "";
+  const preview = m.preview
+    ? `<div class="fd-stage-preview">${esc(m.preview.text)} <button data-action="f-stage-confirm">Stage this selection</button></div>`
+    : "";
+  const events = m.events.length
+    ? `<div class="fd-events">${m.events.map(e => `<div>${esc(e)}</div>`).join("")}</div>` : "";
+  return `<div class="fd" data-artifact="${esc(m.id)}">
+    <div class="fd-path">${esc(m.path)}</div>
+    <div class="fd-facts">${facts}</div>
+    ${m.note ? `<p class="fd-note ${m.noteCls}">${esc(m.note)}</p>` : ""}
+    <div class="fd-acts">${buttons}</div>
+    <details class="fd-files" open><summary>${esc(m.filesLabel)}</summary>
+      ${m.files.length ? `<table class="subtable"><tbody>${rows}</tbody></table>${nav}` : ""}
+    </details>
+    ${m.files.length ? `<div class="fd-stage"><button data-action="f-stage" ${m.canStage ? "" : "disabled"}>Preview recovery copy${m.selected ? " (" + m.selected + " selected)" : ""}</button>
+      <span class="fd-note" style="margin:0">Select files to copy for Curator. Originals stay held until a complete import receipt.</span></div>${preview}` : ""}
+    ${events}
+  </div>`;
+}
+function buildFileDetailKind(d) {
+  const tr = d.create("tr", "detail-tr");
+  const td = d.append(tr, d.create("td"));
+  d.attr(td, "colspan", "6");
+  tr.__c = { td };
+  return tr;
+}
+function applyFileDetailKind(tr, m, d) {
+  d = d || dom;
+  differ(tr)("sig", m.sig, () => d.prop(tr.__c.td, "innerHTML", fileDetailHtml(m)));
+}
+KINDS.fdetail = { build: buildFileDetailKind, apply: applyFileDetailKind };
+
+// ---- render ----------------------------------------------------------------
+function renderFilesToolbar() {
+  const strip = $("files-filter");
+  if (strip && strip.children) {
+    for (const b of strip.children) {
+      if (b.dataset) b.classList.toggle("on", b.dataset.filter === filesView.filter);
+    }
+  }
+  const counts = (store.files && store.files.counts) || {};
+  for (const f of FILES_FILTERS) {
+    const el = $("files-cnt-" + f);
+    if (el) setText(el, counts[f] == null ? "–" : String(counts[f]));
+  }
+}
+function filesScanModel(disc, now) {
+  let watching = null;
+  for (const w of filesWatch.values()) if (w.kind === "scan") watching = w;
+  if (watching) {
+    return { text: "scanning… " + Math.round((now - watching.since) / 1000) + " s", cls: "files-scan-state busy", busy: true, tip: "" };
+  }
+  if (!disc) return { text: "never scanned", cls: "files-scan-state", busy: false, tip: "" };
+  if (disc.state === "queued" || disc.state === "running")
+    return { text: "scanning…", cls: "files-scan-state busy", busy: true, tip: "" };
+  if (disc.state === "failed")
+    return { text: "last scan failed " + fmtAgo(disc.created_at), cls: "files-scan-state bad", busy: false, tip: disc.error || "" };
+  return { text: "last scan " + fmtAgo(disc.created_at), cls: "files-scan-state", busy: false, tip: fmtTime(disc.created_at) };
+}
+function renderFilesScan() {
+  const m = filesScanModel(store.files && store.files.discovery, Date.now());
+  const pill = $("files-scan-state"), btn = $("files-scan");
+  if (pill) { setText(pill, m.text); if (pill.className !== m.cls) pill.className = m.cls; pill.title = m.tip; }
+  if (btn) { btn.disabled = m.busy; btn.classList.toggle("busy", m.busy); }
+}
+function renderFilesPager() {
+  const pages = filesPages();
+  const start = filesView.page * filesView.size;
+  const shown = store.files ? store.files.entries.length : 0;
+  // A search or a non-default view keeps the count visible even when the
+  // result fits on one page: "3 folders" is the answer you searched for.
+  const relevant = store.files != null && store.files !== "off" &&
+    (filesView.total > FILES_PAGE_SIZES[0] || filesView.size !== FILES_PAGE_SIZE_DEFAULT || !!filesView.q || filesView.filter !== "live");
+  const info = pages > 1
+    ? (filesView.total ? start + 1 : 0) + "–" + (start + shown) + " of " + filesView.total + " · page " + (filesView.page + 1) + "/" + pages
+    : filesView.total + (filesView.total === 1 ? " folder" : " folders");
+  const atFirst = filesView.page === 0, atLast = filesView.page >= pages - 1;
+  for (const id of ["files-pager-top", "files-pager"]) {
+    const bar = $(id);
+    if (!bar) continue;
+    bar.hidden = !relevant;
+    if (!relevant) continue;
+    const span = bar.querySelector(".files-pager-info");
+    if (span) setText(span, info);
+    for (const [sel, off] of [["f-page-first", atFirst], ["f-page-prev", atFirst], ["f-page-next", atLast], ["f-page-last", atLast]]) {
+      const b = bar.querySelector('[data-action="' + sel + '"]');
+      if (b) b.disabled = off;
+    }
+  }
+}
+function renderFiles() {
+  const f = store.files;
+  let models;
+  if (f == null) models = [{ key: "__loading", kind: "empty", span: 6, text: "loading…" }];
+  else if (f === "off") models = [{ key: "__off", kind: "empty", span: 6, text: "file inventory unavailable" }];
+  else if (!f.entries.length) {
+    const what = filesView.q ? "nothing matches “" + filesView.q + "”"
+      : filesView.filter === "attention" ? "nothing needs review"
+      : filesView.filter === "owned" ? "Runner owns no folders yet"
+      : filesView.filter === "cleared" ? "nothing has been cleared"
+      : f.discovery ? "no folders on this page" : "no folders yet — scan to find what is on disk";
+    models = [{ key: "__empty", kind: "empty", span: 6, text: what }];
+  } else {
+    models = [];
+    for (const e of f.entries) {
+      models.push(fileRowModel(e));
+      if (e.artifact.id === filesOpen && filesDetail && filesDetail.artifact.id === filesOpen)
+        models.push(fileDetailModel(filesDetail));
+    }
+  }
+  reconcileRows($("files-body"), models, dom);
+  renderFilesPager();
+  renderFilesToolbar();
+  renderFilesScan();
+  renderRecoveries();
+}
+function renderRecoveries() {
+  const box = $("files-recoveries"), count = $("files-recoveries-count");
+  const r = store.recoveries;
+  if (!box) return;
+  if (count) setText(count, r ? String(r.length) : "");
+  const sig = r ? r.map(x => x.id + ":" + x.state + ":" + (x.error || "")).join(",") : "";
+  if (box.__sig === sig) return;
+  box.__sig = sig;
+  if (!r || !r.length) { box.innerHTML = `<div class="sub">no handoffs</div>`; return; }
+  box.innerHTML = r.map(x => {
+    const prunable = ["imported", "partial"].includes(x.state);
+    return `<div class="rec-row"><code>${esc(x.id)}</code><span class="st ${x.state === "imported" ? "ok" : x.state === "cancelled" ? "dim" : "warn"}">${esc(x.state)}</span>` +
+      `<span>${x.files.length} files</span>${x.error ? `<span class="err">${esc(x.error)}</span>` : ""}` +
+      (prunable ? `<button class="small del" data-action="f-rec-prune" data-recovery="${esc(x.id)}">delete receipted source files</button>` : "") + `</div>`;
+  }).join("");
+  const pager = $("files-recoveries-pager");
+  if (pager) {
+    pager.hidden = r.length < 100 && filesRecoveryOffset === 0;
+    setText($("files-recoveries-info"), (filesRecoveryOffset + 1) + "–" + (filesRecoveryOffset + r.length));
+  }
+}
+
+// ---- fetch -------------------------------------------------------------------
+async function refreshFiles(force = false) {
+  if (filesBusy && !force) return;
   filesBusy = true;
   try {
-    if (filesOperation) {
-      const op = await fileRequest("artifact-operations/" + filesOperation, null, "GET");
-      $("files-message").textContent = op.kind + ": " + op.state + (op.error ? " — " + op.error : "");
-      const undo=$("files-undo");undo.hidden=op.state!=="queued"||!["delete","prune"].includes(op.kind);
-      undo.onclick=async()=>{try{await fileRequest("artifact-operations/"+op.id+"/cancel");undo.hidden=true;refreshFiles();}catch(e){filesError(e);}};
-      if (["succeeded", "failed", "cancelled", "review"].includes(op.state)) filesOperation = null;
-    }
-    const response = await jfetch("/api/v1/artifacts?offset=" + filesOffset + "&include_terminal=" + $("files-show-terminal").checked);
-    if (!response.ok) throw new Error("Inventory unavailable (" + response.status + ")");
+    const qs = "offset=" + filesView.page * filesView.size + "&limit=" + filesView.size +
+      "&filter=" + filesView.filter + "&sort=" + filesView.sort + (filesView.q ? "&q=" + encodeURIComponent(filesView.q) : "");
+    const response = await jfetch("/api/v1/artifacts?" + qs);
+    if (!response.ok) { store.files = "off"; renderFiles(); return; }
     const data = await response.json();
-    $("files-discovery").textContent=data.discovery?"Last discovery: "+data.discovery.state+" · "+new Date(data.discovery.created_at*1000).toLocaleString()+(data.discovery.error?" · "+data.discovery.error:""):"Discovery has not run yet.";
-    reconcileInventoryRows($("files-list"),data.entries.map(({artifact:a,files,bytes,earliest_expiry})=>({id:a.id,title:a.path,detail:a.state+" · "+files+" entries · "+fmtBytes(bytes)+" · "+(a.owned?"owned":"needs adoption")+" · "+(a.keep?"Keep":a.hold|| (earliest_expiry?"earliest expiry "+new Date(earliest_expiry*1000).toLocaleString():"no automatic expiry"))+(a.error?" · "+a.error:""),action:()=>openArtifact(a.id),label:"Inspect"})));
-    const recoveries=await fileRequest("recoveries?include_terminal=true&offset="+filesRecoveryOffset,null,"GET");
-    reconcileInventoryRows($("files-recoveries"),recoveries.map(r=>({id:r.id,title:r.id,detail:r.state+" · "+r.files.length+" files"+(r.error?" · "+r.error:""),label:"Delete receipted source files (8-second Undo)",action:["imported","partial"].includes(r.state)?async()=>{try{filesOperation=(await fileRequest("recoveries/"+r.id+"/delete-receipted-source")).id;await refreshFiles();}catch(e){filesError(e);}}:null})));
-  } catch(e) { filesError(e); } finally { filesBusy = false; }
+    filesView.total = data.total || 0;
+    // A page that emptied under us (delete on the last page): step back once.
+    if (!data.entries.length && filesView.page > 0 && filesView.total > 0) {
+      filesView.page = filesPages() - 1;
+      filesBusy = false;
+      return refreshFiles(true);
+    }
+    store.files = data;
+    if (filesOpen) await loadFileDetail(filesOpen, filesDetail ? filesDetail.offset : 0, false);
+    try {
+      const rec = await fileRequest("recoveries?include_terminal=true&offset=" + filesRecoveryOffset, null, "GET");
+      store.recoveries = Array.isArray(rec) ? rec : [];
+    } catch { store.recoveries = store.recoveries || []; }
+    renderFiles();
+  } catch (e) {
+    if (store.files == null) { store.files = "off"; renderFiles(); }
+    else filesError(e);
+  } finally { filesBusy = false; }
 }
-let filesRecoveryOffset=0;
-async function scanFiles() { try { filesOperation=(await fileRequest("artifacts/scan")).id; $("files-message").textContent="Scan requested. Refresh to see discovered folders; existing media remains held."; } catch(e) { filesError(e); } }
-let recoverySelections = new Set();
-async function openArtifact(id, offset=0) {
+async function loadFileDetail(id, offset = 0, render = true) {
   try {
-    const a = await fileRequest("artifacts/"+id,null,"GET");
-    const f = await fileRequest("artifacts/"+id+"/files?offset="+offset,null,"GET");
-    if(selectedArtifact?.id!==id || selectedArtifact?.revision!==a.revision) recoverySelections.clear();
-    selectedArtifact=a;
-    $("files-detail").innerHTML=`<h3>${esc(a.path)}</h3><p>${esc(a.hold || "No hold")} · revision ${a.revision}</p><button data-file-action="inspect">Inspect files</button><button data-file-action="adopt">Adopt and Keep</button><button data-file-action="release-review">Release reviewed hold</button><button data-file-action="keep">${a.keep ? "Remove Keep (fresh retention)" : "Keep indefinitely"}</button><button data-file-action="delete">Delete owned files (8-second Undo)</button><p>Select files to copy for Curator recovery. Originals remain held until a complete import receipt.</p>${f.files.map(x=>`<label style="display:block"><input type="checkbox" class="recovery-file" value="${esc(x.path)}" ${x.identity.directory ? "disabled" : ""} ${recoverySelections.has(x.path) ? "checked" : ""}> ${esc(x.path)} · ${fmtBytes(x.identity.bytes)}</label>`).join("")}<p>Entries ${offset+1}–${offset+f.files.length} of ${f.total}. <button id="file-prev" ${offset===0?"disabled":""}>Previous files</button><button id="file-next" ${offset+f.files.length>=f.total?"disabled":""}>Next files</button></p><button data-file-action="stage">Preview selected recovery files</button><span id="file-operation" role="status"></span>`;
-    $("file-prev").onclick=()=>openArtifact(id,Math.max(0,offset-200));
-    $("file-next").onclick=()=>openArtifact(id,offset+200);
-    $("files-detail").querySelectorAll(".recovery-file").forEach(box=>box.onchange=()=>{if(box.checked)recoverySelections.add(box.value);else recoverySelections.delete(box.value);});
-    $("files-detail").querySelectorAll("[data-file-action]").forEach(b=>b.onclick=()=>artifactAction(b.dataset.fileAction));
-  } catch(e){filesError(e);}
+    const [a, f, ev] = await Promise.all([
+      fileRequest("artifacts/" + id, null, "GET"),
+      fileRequest("artifacts/" + id + "/files?offset=" + offset, null, "GET"),
+      fileRequest("artifacts/" + id + "/events?after=0", null, "GET").catch(() => []),
+    ]);
+    if (filesOpen !== id) return;
+    const prev = filesDetail && filesDetail.artifact.id === id ? filesDetail : null;
+    // A revision change invalidates a selection and a staged preview alike.
+    if (prev && prev.artifact.revision !== a.revision) { filesSelections.delete(id); }
+    filesDetail = {
+      artifact: a, files: f.files || [], total: f.total || 0, offset,
+      fileCount: f.file_count, bytes: f.bytes, measured: f.measured,
+      events: Array.isArray(ev) ? ev.slice(-8) : [],
+      preview: prev && prev.artifact.revision === a.revision ? prev.preview : null,
+      previewRequest: prev && prev.artifact.revision === a.revision ? prev.previewRequest : null,
+    };
+    if (render) renderFiles();
+  } catch (e) { filesError(e); }
 }
-async function artifactAction(action) {
-  const a=selectedArtifact;if(!a)return;
-  try {
-    const base="artifacts/"+a.id;
-    if(action==="inspect"){filesOperation=(await fileRequest(base+"/inspect")).id;$("files-message").textContent="Inspection requested. Reopen the folder when the scan finishes.";return;}
-    if(action==="release-review") await fileRequest(base+"/release-review",{revision:a.revision});
-    if(action==="adopt") await fileRequest(base+"/adopt",{revision:a.revision});
-    if(action==="keep") await fileRequest(base+"/retention",{revision:a.revision,keep:!a.keep});
-    if(action==="delete") {
-      const op=await fileRequest(base+"/delete",{revision:a.revision,idempotency_key:crypto.randomUUID(),undo_seconds:8});
-      filesOperation=op.id;
-      $("file-operation").innerHTML=`Deletion queued. <button id="undo-file-delete">Undo</button>`;
-      $("undo-file-delete").onclick=async()=>{try{await fileRequest("artifact-operations/"+op.id+"/cancel");$("file-operation").textContent="Deletion cancelled";}catch(e){filesError(e);}};
+function toggleFile(id) {
+  if (filesOpen === id) { filesOpen = null; filesDetail = null; renderFiles(); return; }
+  filesOpen = id; filesDetail = null;
+  renderFiles(); // the row lights up now; the panel fills when the fetch lands
+  loadFileDetail(id, 0, true);
+}
+
+// ---- background operations: watched, never fire-and-forget ----------------
+function watchOperation(op, kind, artifact, onDone) {
+  if (!op || !op.id) return;
+  const w = { kind, artifact, since: Date.now(), timer: null };
+  filesWatch.set(op.id, w);
+  const poll = async () => {
+    let cur;
+    try { cur = await fileRequest("artifact-operations/" + op.id, null, "GET"); }
+    catch (e) { cur = { state: "failed", error: e.message }; }
+    if (["succeeded", "failed", "cancelled", "review"].includes(cur.state) || Date.now() - w.since > 20 * 60 * 1000) {
+      filesWatch.delete(op.id);
+      await onDone(cur);
       return;
     }
-    if(action==="stage") {
-      const files=[...recoverySelections];
-      const request={revision:a.revision,idempotency_key:crypto.randomUUID(),files};
-      const p=await fileRequest(base+"/recoveries",{...request,preview:true});
-      $("file-operation").innerHTML=`<p>Retain ${fmtBytes(p.source_bytes)} original bytes, add ${fmtBytes(p.additional_staging_bytes)} staging bytes and up to ${fmtBytes(p.additional_library_bytes)} library bytes. Staging has ${fmtBytes(p.staging_available_bytes)} available and needs a ${fmtBytes(p.reserve_bytes)} reserve. ${esc(p.library_capacity)}. ${esc(p.verification)}.</p><button id="confirm-recovery-stage">Stage this selection</button>`;
-      $("confirm-recovery-stage").onclick=async()=>{try{filesOperation=(await fileRequest(base+"/recoveries",request)).id;$("files-message").textContent="Recovery staging requested. Follow the handoff status below; claim and import it in Curator.";$("file-operation").textContent="Staging queued.";}catch(e){filesError(e);}};
+    renderFilesScan();
+    w.timer = setTimeout(poll, 1000);
+  };
+  w.timer = setTimeout(poll, 400);
+  renderFiles();
+}
+async function scanFiles() {
+  const before = (store.files && store.files.counts && store.files.counts.live) || 0;
+  try {
+    const op = await fileRequest("artifacts/scan");
+    watchOperation(op, "scan", null, async (done) => {
+      await refreshFiles(true);
+      const after = (store.files && store.files.counts && store.files.counts.live) || 0;
+      if (done.state === "succeeded")
+        toast({ text: "Scan finished — " + (after > before ? (after - before) + " new folder" + (after - before === 1 ? "" : "s") + " measured" : "nothing new on disk") });
+      else toast({ text: "Scan " + done.state + (done.error ? " — " + done.error : ""), kind: "error", ttlMs: 12000 });
+    });
+  } catch (e) { filesError(e); }
+}
+async function inspectFile(id) {
+  try {
+    const op = await fileRequest("artifacts/" + id + "/inspect");
+    watchOperation(op, "inspect", id, async (done) => {
+      if (done.state !== "succeeded")
+        toast({ text: "Inspect " + done.state + (done.error ? " — " + done.error : ""), kind: "error", ttlMs: 12000 });
+      await refreshFiles(true);
+    });
+  } catch (e) { filesError(e); }
+}
+async function fileAction(id, action) {
+  const dt = filesDetail && filesDetail.artifact.id === id ? filesDetail : null;
+  if (!dt) return;
+  const a = dt.artifact, base = "artifacts/" + id, name = fileBaseName(a.path);
+  try {
+    if (action === "f-adopt") { await fileRequest(base + "/adopt", { revision: a.revision }); toast({ text: "Adopted “" + name + "” — kept indefinitely" }); }
+    else if (action === "f-release") { await fileRequest(base + "/release-review", { revision: a.revision }); toast({ text: "Released the review hold on “" + name + "”" }); }
+    else if (action === "f-keep") {
+      await fileRequest(base + "/retention", { revision: a.revision, keep: !a.keep });
+      toast({ text: a.keep ? "“" + name + "” now follows retention — timer starts fresh" : "“" + name + "” kept indefinitely" });
+    } else if (action === "f-delete") {
+      const op = await fileRequest(base + "/delete", { revision: a.revision, idempotency_key: uuid(), undo_seconds: 8 });
+      const t = toast({
+        text: "Deleting “" + name + "” in 8 s", ttlMs: UNDO_MS,
+        action: { label: "Undo", fn: async () => {
+          try { await fileRequest("artifact-operations/" + op.id + "/cancel"); filesWatch.delete(op.id); toast({ text: "Kept “" + name + "”" }); }
+          catch (e) { filesError(e); }
+          return refreshFiles(true);
+        } },
+      });
+      watchOperation(op, "delete", id, async (done) => {
+        if (done.state === "succeeded") { t.dismiss(); toast({ text: "Deleted “" + name + "”" }); }
+        else if (done.state !== "cancelled") toast({ text: "Delete " + done.state + (done.error ? " — " + done.error : ""), kind: "error", ttlMs: 12000 });
+        await refreshFiles(true);
+      });
+      return;
+    } else if (action === "f-stage") {
+      const files = [...(filesSelections.get(id) || [])];
+      const request = { revision: a.revision, idempotency_key: uuid(), files };
+      const p = await fileRequest(base + "/recoveries", { ...request, preview: true });
+      dt.preview = { text: "Keeps " + fmtBytes(p.source_bytes) + " of originals, adds " + fmtBytes(p.additional_staging_bytes) +
+        " of staging and up to " + fmtBytes(p.additional_library_bytes) + " in the library. Staging has " + fmtBytes(p.staging_available_bytes) +
+        " free and needs a " + fmtBytes(p.reserve_bytes) + " reserve. " + p.library_capacity + ". " + p.verification + "." };
+      dt.previewRequest = request;
+      renderFiles();
+      return;
+    } else if (action === "f-stage-confirm") {
+      if (!dt.previewRequest) return;
+      const op = await fileRequest(base + "/recoveries", dt.previewRequest);
+      dt.preview = null; dt.previewRequest = null;
+      filesSelections.delete(id);
+      toast({ text: "Recovery copy staged for “" + name + "” — claim and import it in Curator" });
+      watchOperation(op, "stage", id, async (done) => {
+        if (done.state !== "succeeded") toast({ text: "Staging " + done.state + (done.error ? " — " + done.error : ""), kind: "error", ttlMs: 12000 });
+        await refreshFiles(true);
+      });
       return;
     }
-    await openArtifact(a.id);await refreshFiles();
-  }catch(e){filesError(e);}
+    await refreshFiles(true);
+  } catch (e) { filesError(e); await refreshFiles(true); }
+}
+async function pruneRecovery(rid) {
+  try {
+    const op = await fileRequest("recoveries/" + rid + "/delete-receipted-source");
+    const t = toast({
+      text: "Deleting receipted source files in 8 s", ttlMs: UNDO_MS,
+      action: { label: "Undo", fn: async () => {
+        try { await fileRequest("artifact-operations/" + op.id + "/cancel"); filesWatch.delete(op.id); toast({ text: "Kept the source files" }); }
+        catch (e) { filesError(e); }
+        return refreshFiles(true);
+      } },
+    });
+    watchOperation(op, "prune", null, async (done) => {
+      if (done.state === "succeeded") { t.dismiss(); toast({ text: "Receipted source files deleted" }); }
+      else if (done.state !== "cancelled") toast({ text: "Delete " + done.state + (done.error ? " — " + done.error : ""), kind: "error", ttlMs: 12000 });
+      await refreshFiles(true);
+    });
+  } catch (e) { filesError(e); }
+}
+// Every Files-tab click routes here from the page's one delegated listener.
+function filesClick(action, el) {
+  const row = el.closest ? el.closest("[data-artifact]") : null;
+  const id = el.dataset.artifact || (row && row.dataset.artifact);
+  if (action === "f-filter") return setFilesFilter(el.dataset.filter);
+  if (action === "f-scan") return scanFiles();
+  if (action === "f-page-first") return setFilesPage(0);
+  if (action === "f-page-prev") return setFilesPage(filesView.page - 1);
+  if (action === "f-page-next") return setFilesPage(filesView.page + 1);
+  if (action === "f-page-last") return setFilesPage(Number.MAX_SAFE_INTEGER);
+  if (action === "f-rec-prev") { filesRecoveryOffset = Math.max(0, filesRecoveryOffset - 100); return refreshFiles(true); }
+  if (action === "f-rec-next") { filesRecoveryOffset += 100; return refreshFiles(true); }
+  if (action === "f-rec-prune") return pruneRecovery(el.dataset.recovery);
+  if (!id) return;
+  if (action === "f-details") return toggleFile(id);
+  if (action === "f-inspect") return inspectFile(id);
+  if (action === "f-files-prev") return loadFileDetail(id, Math.max(0, (filesDetail ? filesDetail.offset : 0) - FILES_DETAIL_PAGE));
+  if (action === "f-files-next") return loadFileDetail(id, (filesDetail ? filesDetail.offset : 0) + FILES_DETAIL_PAGE);
+  return fileAction(id, action);
+}
+function filesSelectionChange(target) {
+  if (!target || !target.classList || !target.classList.contains("recovery-file")) return;
+  const wrap = target.closest ? target.closest("[data-artifact]") : null;
+  const id = wrap && wrap.dataset.artifact;
+  if (!id) return;
+  const sel = filesSelections.get(id) || new Set();
+  if (target.checked) sel.add(target.value); else sel.delete(target.value);
+  filesSelections.set(id, sel);
+  if (filesDetail && filesDetail.artifact.id === id) { filesDetail.preview = null; filesDetail.previewRequest = null; }
+  renderFiles();
+}
+loadFilesPageSize();
+{
+  const q = $("files-q");
+  if (q) q.oninput = () => { clearTimeout(filesQueryTimer); filesQueryTimer = setTimeout(() => setFilesQuery(q.value), 250); };
+  const s = $("files-sort");
+  if (s) s.onchange = () => setFilesSort(s.value);
+  const ps = $("files-page-size");
+  if (ps) ps.onchange = () => setFilesPageSize(Number(ps.value));
+  const body = $("files-body");
+  if (body && body.addEventListener) body.addEventListener("change", (ev) => filesSelectionChange(ev.target));
 }
 async function loadFileSettings(){
   if(!$("cfg-files-enable"))return;
@@ -5367,6 +6040,12 @@ if (typeof __nzbd_test_enable !== "undefined") {
       historyPage = p; historyPageSize = size; historyTotal = total;
     },
     clientLabel, clientChipModels, UA_MAX,
+    fileRowModel, fileDetailModel, fileDetailHtml, filesStateModel, fileRetentionText, filesScanModel,
+    fileBaseName, fileParent, renderFiles, refreshFiles, filesClick, toggleFile, watchOperation,
+    setFilesPage, setFilesPageSize, setFilesFilter, setFilesSort, setFilesQuery, filesPages,
+    filesView, filesWatch, filesSelections, FILES_PAGE_SIZES, FILES_PAGE_SIZE_DEFAULT,
+    getFilesDetail: () => filesDetail, getFilesOpen: () => filesOpen,
+    setFilesDetailForTest: (open, d) => { filesOpen = open; filesDetail = d; },
     pageSlice, setPage, setPageSize, renderPager, PAGE_SIZES, PAGE_SIZE_DEFAULT,
     pageState: () => ({ page, pageSize }),
     seedDraft, seedDrafts, seedBody, saveSeedPolicy,

@@ -74,12 +74,31 @@ pub struct Artifact {
     pub retention_seconds: u64,
     pub deadline: Option<i64>,
     pub eligible_seconds: u64,
+    #[serde(default)]
     pub files: Vec<FileEntry>,
     pub error: Option<String>,
+    /// When a walk last measured `files`. Discovery records a directory
+    /// without walking it, so an unknown folder with no entries is
+    /// "not measured yet" until this is set — never "empty".
+    #[serde(default)]
+    pub inspected_at: Option<i64>,
 }
 impl Artifact {
     pub fn terminal(&self) -> bool {
         matches!(self.state.as_str(), "deleted" | "source_gone")
+    }
+    /// Regular files and their bytes; directories are structure, not payload.
+    pub fn summary(&self) -> (u64, u64) {
+        let files = self.files.iter().filter(|f| !f.identity.directory);
+        (
+            files.clone().count() as u64,
+            files.map(|f| f.identity.bytes).sum(),
+        )
+    }
+    /// True once a walk has populated `files` (a finalized job, a restore,
+    /// or an inspection). A discovered-but-unmeasured folder reports false.
+    pub fn measured(&self) -> bool {
+        self.inspected_at.is_some() || !self.files.is_empty()
     }
     fn eligible(&self) -> bool {
         self.owned
@@ -128,6 +147,72 @@ impl Default for Settings {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListFilter {
+    /// Every record, cleared ones included.
+    All,
+    /// Everything still on disk (the default view).
+    #[default]
+    Live,
+    /// Live records that need a person: not owned, on hold, or in error.
+    Attention,
+    /// Live records Runner owns outright.
+    Owned,
+    /// Deleted / source-gone records kept for the audit trail.
+    Cleared,
+}
+impl ListFilter {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::All => "1=1",
+            Self::Live => "state NOT IN ('deleted','source_gone')",
+            Self::Attention => "state NOT IN ('deleted','source_gone') AND (json_extract(data,'$.owned')=0 OR json_extract(data,'$.hold') IS NOT NULL OR json_extract(data,'$.error') IS NOT NULL)",
+            Self::Owned => "state NOT IN ('deleted','source_gone') AND json_extract(data,'$.owned')=1",
+            Self::Cleared => "state IN ('deleted','source_gone')",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListSort {
+    #[default]
+    Updated,
+    Size,
+    Files,
+    Name,
+}
+#[derive(Clone, Debug, Default)]
+pub struct ListQuery {
+    pub offset: usize,
+    pub limit: usize,
+    pub filter: ListFilter,
+    pub sort: ListSort,
+    /// Case-insensitive substring of the path.
+    pub q: String,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct ListRow {
+    pub artifact: Artifact,
+    pub files: u64,
+    pub bytes: u64,
+}
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct ListCounts {
+    pub all: u64,
+    pub live: u64,
+    pub attention: u64,
+    pub owned: u64,
+    pub cleared: u64,
+    pub live_bytes: u64,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct ListPage {
+    pub rows: Vec<ListRow>,
+    pub total: u64,
+    pub counts: ListCounts,
+}
+
 pub struct Inventory {
     db: Mutex<Connection>,
     _process_lock: File,
@@ -138,6 +223,9 @@ pub struct Inventory {
     mutation: Mutex<()>,
     clocks: Mutex<std::collections::HashMap<String, (u64, Instant)>>,
     reconcile_cursor: Mutex<String>,
+    // One task runner at a time: the maintenance tick and an API kick can
+    // both drain the queue, and a task must never execute twice.
+    tasks: Mutex<()>,
 }
 
 pub fn now() -> i64 {
@@ -160,9 +248,10 @@ fn read<T: serde::de::DeserializeOwned>(db: &Connection, table: &str, key: &str)
     serde_json::from_str(&value.ok_or(Error::NotFound)?).map_err(Into::into)
 }
 fn save_artifact(db: &Connection, a: &Artifact) -> Result<()> {
-    db.execute("INSERT INTO artifacts(id,job,path,state,updated_at,data) VALUES(?1,?2,?3,?4,?5,?6)
-        ON CONFLICT(id) DO UPDATE SET job=excluded.job,path=excluded.path,state=excluded.state,updated_at=excluded.updated_at,data=excluded.data",
-        params![a.id, a.job, a.path.to_string_lossy(), a.state, a.updated_at, serde_json::to_string(a)?])?;
+    let (files, bytes) = a.summary();
+    db.execute("INSERT INTO artifacts(id,job,path,state,updated_at,data,files,bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+        ON CONFLICT(id) DO UPDATE SET job=excluded.job,path=excluded.path,state=excluded.state,updated_at=excluded.updated_at,data=excluded.data,files=excluded.files,bytes=excluded.bytes",
+        params![a.id, a.job, a.path.to_string_lossy(), a.state, a.updated_at, serde_json::to_string(a)?, files as i64, bytes as i64])?;
     Ok(())
 }
 fn save_operation(db: &Connection, op: &Operation) -> Result<()> {
@@ -225,6 +314,28 @@ impl Inventory {
             db.query_row("SELECT value FROM meta WHERE key='installation'", [], |r| {
                 r.get(0)
             })?;
+        // Summary columns (schema 1, additive): the list sorts and counts by
+        // size without deserializing every manifest. Backfilled once from
+        // the JSON so an inventory written before the columns existed is
+        // sortable the moment it opens.
+        let has_summary: bool = db.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('artifacts') WHERE name='bytes'",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n > 0),
+        )?;
+        if !has_summary {
+            db.execute_batch(
+                "ALTER TABLE artifacts ADD COLUMN files INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE artifacts ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0;
+                 UPDATE artifacts SET
+                   files=(SELECT COUNT(*) FROM json_each(json_extract(artifacts.data,'$.files')) f
+                          WHERE json_extract(f.value,'$.identity.directory')=0),
+                   bytes=(SELECT COALESCE(SUM(json_extract(f.value,'$.identity.bytes')),0)
+                          FROM json_each(json_extract(artifacts.data,'$.files')) f
+                          WHERE json_extract(f.value,'$.identity.directory')=0);
+                 CREATE INDEX IF NOT EXISTS artifacts_bytes ON artifacts(bytes DESC,updated_at DESC,id);",
+            )?;
+        }
         fs::sync_directory(&fs::open_dir(state_dir)?)?;
         Ok(Self {
             db: Mutex::new(db),
@@ -235,6 +346,7 @@ impl Inventory {
             mutation: Mutex::new(()),
             clocks: Mutex::new(std::collections::HashMap::new()),
             reconcile_cursor: Mutex::new(String::new()),
+            tasks: Mutex::new(()),
         })
     }
     fn mutation_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
@@ -322,6 +434,87 @@ impl Inventory {
         })?;
         rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
     }
+    /// One page of the inventory, shaped for a list: manifests are stripped
+    /// in SQL (`json_remove`) so a 100k-entry folder costs the same as an
+    /// empty one, and every filter has a count so the UI can say how many
+    /// rows sit behind each view instead of making the operator page to find out.
+    pub fn list_page(&self, q: &ListQuery) -> Result<ListPage> {
+        let db = self.db.lock().unwrap();
+        let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let mut where_sql = String::from(q.filter.sql());
+        let needle = q.q.trim();
+        if !needle.is_empty() {
+            let escaped = needle
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            where_sql.push_str(" AND path LIKE ?1 ESCAPE '\\'");
+            sql_params.push(Box::new(format!("%{escaped}%")));
+        }
+        let order = match q.sort {
+            ListSort::Updated => "updated_at DESC,id",
+            ListSort::Size => "bytes DESC,updated_at DESC,id",
+            ListSort::Files => "files DESC,updated_at DESC,id",
+            ListSort::Name => "path COLLATE NOCASE ASC,id",
+        };
+        let limit = q.limit.clamp(1, 200) as i64;
+        let total: i64 = db.query_row(
+            &format!("SELECT COUNT(*) FROM artifacts WHERE {where_sql}"),
+            rusqlite::params_from_iter(sql_params.iter().map(|p| p.as_ref())),
+            |r| r.get(0),
+        )?;
+        let mut stmt = db.prepare(&format!(
+            "SELECT json_remove(data,'$.files'),files,bytes FROM artifacts WHERE {where_sql} ORDER BY {order} LIMIT {limit} OFFSET {}",
+            q.offset as i64
+        ))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(sql_params.iter().map(|p| p.as_ref())),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )?
+            .map(|r| {
+                let (raw, files, bytes) = r?;
+                Ok(ListRow {
+                    artifact: serde_json::from_str(&raw)?,
+                    files: files.max(0) as u64,
+                    bytes: bytes.max(0) as u64,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut counts = ListCounts::default();
+        for (filter, slot) in [
+            (ListFilter::All, &mut counts.all),
+            (ListFilter::Live, &mut counts.live),
+            (ListFilter::Attention, &mut counts.attention),
+            (ListFilter::Owned, &mut counts.owned),
+            (ListFilter::Cleared, &mut counts.cleared),
+        ] {
+            *slot = db.query_row(
+                &format!("SELECT COUNT(*) FROM artifacts WHERE {}", filter.sql()),
+                [],
+                |r| r.get::<_, i64>(0),
+            )? as u64;
+        }
+        counts.live_bytes = db.query_row(
+            &format!(
+                "SELECT COALESCE(SUM(bytes),0) FROM artifacts WHERE {}",
+                ListFilter::Live.sql()
+            ),
+            [],
+            |r| r.get::<_, i64>(0),
+        )? as u64;
+        Ok(ListPage {
+            rows,
+            total: total as u64,
+            counts,
+        })
+    }
     pub fn events(&self, key: &str, after: i64) -> Result<Vec<serde_json::Value>> {
         let db = self.db.lock().unwrap();
         let mut stmt = db.prepare("SELECT seq,at,kind,detail FROM events WHERE artifact=?1 AND seq>?2 ORDER BY seq LIMIT 100")?;
@@ -406,6 +599,7 @@ impl Inventory {
             eligible_seconds: 0,
             files: Vec::new(),
             error: None,
+            inspected_at: None,
         };
         save_artifact(&db, &a)?;
         drop(db);
@@ -725,6 +919,7 @@ impl Inventory {
             eligible_seconds: 0,
             files: Vec::new(),
             error: None,
+            inspected_at: None,
         };
         save_artifact(&db, &a)?;
         Ok(a)
@@ -748,10 +943,21 @@ impl Inventory {
             a.hold = Some("review: files changed; adoption required".into());
         }
         a.files = files;
+        a.inspected_at = Some(now());
+        a.error = None;
         a.updated_at = now();
         a.revision += 1;
         save_artifact(&self.db.lock().unwrap(), &a)?;
         Ok(a)
+    }
+    /// Record why an automatic walk could not measure a folder. The record
+    /// stays; the operator sees the reason on the row instead of a zero.
+    pub fn note_error(&self, key: &str, message: &str) -> Result<()> {
+        let _guard = self.mutation_guard()?;
+        let mut a = self.get(key)?;
+        a.error = Some(message.into());
+        a.updated_at = now();
+        save_artifact(&self.db.lock().unwrap(), &a)
     }
     pub fn adopt(&self, key: &str, revision: u64) -> Result<Artifact> {
         if !cfg!(unix) {
@@ -1166,6 +1372,19 @@ impl Inventory {
                 tracing::warn!(artifact=%key,error=%e,"expiry changed before admission");
             }
         }
+        self.run_due_deletes()?;
+        self.reconcile_recoveries()?;
+        self.schedule_discovery()?;
+        self.run_tasks()?;
+        self.reconcile_missing()?;
+        self.compact()?;
+        Ok(())
+    }
+    /// Execute every delete whose undo window has closed. Part of the
+    /// maintenance tick, and kicked by the API once a requested delete's
+    /// window expires so the files go when the toast said they would.
+    pub fn run_due_deletes(&self) -> Result<()> {
+        let _runner = self.tasks.lock().unwrap();
         let pending = {
             let db = self.db.lock().unwrap();
             let mut stmt = db.prepare(
@@ -1179,11 +1398,6 @@ impl Inventory {
                 tracing::warn!(operation=%key,error=%e,"artifact deletion remains pending");
             }
         }
-        self.reconcile_recoveries()?;
-        self.schedule_discovery()?;
-        self.run_tasks()?;
-        self.reconcile_missing()?;
-        self.compact()?;
         Ok(())
     }
     pub fn compact(&self) -> Result<usize> {
@@ -1259,6 +1473,7 @@ impl Inventory {
             eligible_seconds: 0,
             files: fs::manifest(&dir, 100_000)?,
             error: None,
+            inspected_at: Some(now()),
         };
         self.sidecar(&a)?;
         save_artifact(&self.db.lock().unwrap(), &a)

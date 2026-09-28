@@ -125,9 +125,16 @@ impl Inventory {
                 let mut count = 0;
                 let mut failures = Vec::new();
                 for root in roots {
-                    if let Err(e) = fs::open_dir(&root) {
-                        failures.push(format!("{}: {e}", root.display()));
-                        continue;
+                    match fs::open_dir(&root) {
+                        Ok(_) => {}
+                        // A root that does not exist yet (the failed
+                        // directory before the first parked failure) has
+                        // nothing to find; it is not a scan failure.
+                        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => {
+                            failures.push(format!("{}: {e}", root.display()));
+                            continue;
+                        }
                     }
                     for entry in std::fs::read_dir(&root)? {
                         if count >= 2000 {
@@ -144,7 +151,17 @@ impl Inventory {
                             continue;
                         }
                         count += 1;
-                        self.discover(&root, &path, active.contains(&path))?;
+                        let a = self.discover(&root, &path, active.contains(&path))?;
+                        // A row that says "0 files · 0 B" for a folder nobody
+                        // has walked is a lie. Measure what discovery found,
+                        // and carry a walk failure on the record rather than
+                        // failing the whole scan for one bad folder.
+                        if a.state == "unknown" && !a.measured() {
+                            if let Err(e) = self.inspect(&a.id) {
+                                tracing::warn!(path=%path.display(), error=%e, "discovered folder could not be measured");
+                                let _ = self.note_error(&a.id, &e.to_string());
+                            }
+                        }
                     }
                 }
                 if !failures.is_empty() {
@@ -167,15 +184,25 @@ impl Inventory {
         save_operation(&self.db.lock().unwrap(), &op)?;
         Ok(op)
     }
+    /// Drain every runnable task. Called from the 30 s maintenance tick and
+    /// kicked directly by the API after admission, so a click does not wait
+    /// for the tick; the runner lock keeps the two from executing the same
+    /// task twice. Bounded so a task that re-queues itself cannot spin.
     pub fn run_tasks(&self) -> Result<()> {
-        let keys = {
-            let db = self.db.lock().unwrap();
-            let mut stmt=db.prepare("SELECT id FROM operations WHERE state IN ('queued','running') AND json_extract(data,'$.kind') IN ('inspect','scan','stage','prune') AND json_extract(data,'$.not_before')<=unixepoch() ORDER BY json_extract(data,'$.created_at') LIMIT 5")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        for key in keys {
-            self.execute_task(&key)?;
+        let _runner = self.tasks.lock().unwrap();
+        for _ in 0..400 {
+            let keys = {
+                let db = self.db.lock().unwrap();
+                let mut stmt=db.prepare("SELECT id FROM operations WHERE state IN ('queued','running') AND json_extract(data,'$.kind') IN ('inspect','scan','stage','prune') AND json_extract(data,'$.not_before')<=unixepoch() ORDER BY json_extract(data,'$.created_at') LIMIT 5")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            if keys.is_empty() {
+                return Ok(());
+            }
+            for key in keys {
+                self.execute_task(&key)?;
+            }
         }
         Ok(())
     }

@@ -1,5 +1,34 @@
 # nzbd — Project Status
 
+## Files tab rework — 2026-09-28
+
+**Status:** implemented; state, API and UI harness regressions added; verified
+against a local daemon in Chromium (scan → adopt → keep → delete → Undo →
+delete). Field report: after **Scan** every folder read `unknown · 0 entries ·
+0 B`, **Inspect** appeared to do nothing, and the list was one unpaged wall of
+cards. Causes and fixes:
+
+- Discovery recorded a folder without walking it and the UI rendered
+  "unmeasured" as zero → a scan now inspects every folder it discovers (a walk
+  failure lands on the row as its error, not as a failed scan); `Artifact`
+  carries `inspected_at`, the list reports `measured`, and an unmeasured row
+  shows `—`.
+- Scan/inspect ran only on the 30 s maintenance tick, five at a time → the API
+  kicks the task runner on admission, the runner drains the queue (one runner at
+  a time), and a delete/prune is kicked again when its Undo window closes.
+- No total, no filters, sort by last-updated only, panel rendered below the
+  list → `GET /api/v1/artifacts` takes `filter/sort/q/limit/offset` and returns
+  `total` + per-filter `counts` (summary `files`/`bytes` columns, backfilled on
+  open, so size sort never deserializes a manifest); the Files tab is one
+  server-paged table with filter chips, search, sort, pagers above and below,
+  and the folder panel as a row under the one you clicked, rendered in place so
+  the 5 s refresh never eats a click or a ticked checkbox; every background
+  operation is polled to completion and toasted.
+- A missing scan root (the failed dir before any failure) no longer fails the
+  scan.
+
+Tests: nzbd-state artifacts +6 · nzbd-api +1 · UI DOM harness 803 assertions.
+
 ## Incremental history ingestion — 2026-09-25
 
 **Status:** M6 implemented and adversarial review addressed; 73 state tests
