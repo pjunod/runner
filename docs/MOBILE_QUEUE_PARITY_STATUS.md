@@ -1,6 +1,6 @@
 # Mobile queue parity — implementation and delivery status
 
-**Status:** adversarial review in progress · **Updated:** 2026-09-28 · **Branch:**
+**Status:** final validation · **Updated:** 2026-09-28 · **Branch:**
 `codex/mobile-queue-parity` · **Base:** `5b683d6`
 
 Companion to [the implementation plan](MOBILE_QUEUE_PARITY_PLAN.md) and
@@ -16,7 +16,7 @@ clone at `/private/tmp/nzbd-mobile-queue-parity`; the original checkout is intac
 - [x] Implement lifecycle presentation, grouping, and collapse preferences.
 - [x] Implement policy controls and refused-resume recovery.
 - [x] Correct matching web actions and add shared regression fixtures.
-- [ ] Complete one combined PR and adversarial agent review.
+- [x] Complete one combined PR and adversarial agent review.
 - [ ] Address review findings, then run the final affected checks.
 - [ ] Merge after required checks pass.
 - [ ] Record iOS and Android artifact/distribution evidence.
@@ -53,3 +53,13 @@ Release metadata is prepared as **1.1.2 (10)** after rechecking main at build 9.
 Xcode and two signing identities are available. Android signing is absent from
 the standard local environment and Gradle properties; signed Android delivery
 remains unverified. No device/store distribution is claimed.
+
+## Final validation
+
+The adversarial reviewer approved the correction pass with no remaining
+findings. Local TypeScript checking passes. The mobile suite initially found
+four renderer-query failures; corrected the test queries and all ten tests in
+the affected renderer suite now pass (the other 107 tests passed on the full
+run). Web boot and **726 DOM assertions** pass. Expo exports both iOS and
+Android Hermes bundles successfully. Required CI will validate the final SHA;
+Rust validation is delegated to that CI run to avoid duplicate compilation.

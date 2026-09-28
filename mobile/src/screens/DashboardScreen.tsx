@@ -1139,7 +1139,7 @@ function formatAge(updatedAt: number): string {
   return seconds < 2 ? 'now' : `${seconds}s ago`;
 }
 
-const makeStyles = (theme: Theme) =>
+export const makeStyles = (theme: Theme) =>
   StyleSheet.create({
     safe: { flex: 1, backgroundColor: theme.background },
     header: {

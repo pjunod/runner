@@ -23,7 +23,7 @@ const styles = makeStyles(theme);
 let tree: any;
 afterEach(async () => { if (tree) await act(async () => tree.unmount()); tree = undefined; });
 function text() { return tree.root.findAllByType(Text).map((n: any) => n.props.children).flat(Infinity).join(' '); }
-function button(label: string) { return tree.root.findAllByType(Pressable).find((n: any) => n.props.accessibilityLabel === label); }
+function button(label: string) { return tree.root.findAll((n: any) => n.props.accessibilityLabel === label && typeof n.props.onPress === 'function')[0]; }
 
 test.each(['seeding idle', 'stopped seed', 'checking overrides ready', 'failed with stale ready', 'missing files with stale ready'])('card renders %s without NZB timers or health', async (name) => {
   const job = fixtures.find((f) => f.name === name)!.job as JobSummary;
@@ -49,7 +49,7 @@ test('collapsed groups retain heading and live totals while cards leave the tree
   (useNzbd as jest.Mock).mockImplementation(() => ({ snapshot: { jobs, status: null }, connectionState: 'live', busyKey: null }));
   const props = { config: { baseUrl: 'http://test', username: '', password: '', token: '' }, onEditConnection: jest.fn() };
   await act(async () => { tree = create(<DashboardScreen {...props} />); });
-  const heading = () => tree.root.findAllByType(Pressable).find((n: any) => n.props.accessibilityLabel?.startsWith('Seeding,'));
+  const heading = () => tree.root.findAll((n: any) => n.props.accessibilityLabel?.startsWith('Seeding,') && typeof n.props.onPress === 'function')[0];
   expect(tree.root.findAllByType(JobCard)).toHaveLength(1);
   await act(async () => heading().props.onPress());
   expect(heading().props.accessibilityState.expanded).toBe(false);

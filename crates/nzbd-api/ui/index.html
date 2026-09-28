@@ -1868,7 +1868,7 @@ function rowModel(j, ctx) {
     dBold: seed ? "Files ready" : fetching ? "" : fmtBytes(done),
     dRest: seed ? " · " + (seedPaused ? seedStopText(j) : "↑ " + fmtRate(j.upload_rate_bps || 0)) +
       " · " + fmtBytes(j.uploaded_bytes || 0) + " uploaded · " + (j.useful_peers || 0) + " peers"
-      : torrent && ["failed", "missing_files", "storage_hold"].includes(phase) ? " · " + (phase === "storage_hold" ? "Waiting for disk space · downloads recover automatically when space is available" : j.torrent_error || torrentStatus(j))
+      : torrent && ["failed", "missing_files", "storage_hold"].includes(phase) ? " · " + (phase === "storage_hold" ? "storage full · waiting for disk space · downloads recover automatically when space is available" : j.torrent_error || torrentStatus(j))
       : fetching ? "fetching the NZB from the indexer…" : rest.join(""),
     dRetry: j.retried_articles > 0
       ? " · " + j.retried_articles + " retries" : "",
