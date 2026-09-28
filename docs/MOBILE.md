@@ -19,7 +19,7 @@ web view and no service in between your device and the daemon.
 | Queue state | Reads the full status and job snapshot from the SSE stream; polls every 5 seconds when that stream is stale |
 | Whole queue | Pause and resume |
 | One job | Pause · resume · move top/up/down/bottom · remove from the queue |
-| Add | Picks one `.nzb` from the system document picker and posts the raw file to `/api/v1/jobs` |
+| Add | Picks an NZB or torrent file, or accepts a magnet / HTTP torrent URL |
 | Discovery | Scans the local network for nzbd's `_nzbd._tcp` DNS-SD service and fills the server address when selected |
 | History | Lists completed, failed, and removed jobs with size, health, completion time, pickup state, and retained job details |
 | Logs | Shows the recent system and job log, refreshes every 4 seconds, and can include per-file detail |
@@ -33,6 +33,40 @@ History tab is read-only; use the browser UI for restore, hide, record delete,
 and delete-files actions. Mobile requests carry `X-Nzbd-Role: operator`, so
 opening History does not claim that the app imported a job or replace its
 `picked_up_by` attribution.
+
+## Queue activity and torrent seeding
+
+The native queue uses the same lifecycle rules as the web: Downloading,
+Fetching NZB, Fetching torrent metadata, Checking torrent files, the NZB
+post-processing stages, Seeding, Completed, and Waiting. Completed means a
+verified torrent is retained with seeding stopped; it does not mean an import
+into a library or a move to History. Checking, missing files, and failures take
+precedence over stale readiness.
+
+Tap Seeding, Completed, or Waiting to collapse it. Counts and transfer totals
+continue updating while cards are hidden. The device remembers these display
+choices across connections and restarts; all groups initially open. A failed
+preference read defaults to expanded groups, and a failed save still keeps
+your choice for that session.
+
+Expand a torrent card for its upload, ratio, peer, readiness, and seed-duration
+facts. Seeding options can copy category/global defaults, stop after download,
+keep seeding, or stop at the first ratio/time limit reached. Saving a policy
+does not restart a stopped torrent: use Start seeding separately. A reached
+policy offers Seeding options directly. If a server refuses a restart with an
+ambiguous 404, the app refreshes that job before deciding whether to open
+options or report that it has left the queue.
+
+Missing files offers Re-download missing files. Failed torrents offer removal
+with the existing keep/delete-files choice. Disk holds explain automatic
+recovery when space is available; a resume button is not a disk-space remedy.
+The new sections do not expose NZB stage timers or health for torrents, nor
+queue-move and priority controls for seeds. Older daemons can omit lifecycle
+fields; the app falls back to generic status. Unknown states remain visible,
+and an unsupported policy endpoint reports an error without breaking the queue.
+
+[The parity status page](MOBILE_QUEUE_PARITY_STATUS.md) separates implementation
+and test evidence from iOS/Android distribution evidence.
 
 ## Run it locally
 

@@ -69,7 +69,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
   const { collapsed, toggle: toggleCollapsed } = useCollapsedSections();
   const activeConfig = useRef<Props['config'] | null>(config);
   activeConfig.current = config;
-  useEffect(() => () => { activeConfig.current = null; }, []);
+  useEffect(() => { activeConfig.current = config; return () => { activeConfig.current = null; }; }, [config]);
   const [notice, setNotice] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<AppSection>('queue');
   const {

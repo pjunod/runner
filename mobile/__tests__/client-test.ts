@@ -49,3 +49,13 @@ describe('NzbdClient authentication', () => {
     expect(headers.authorization).toBe('Bearer operator-token');
   });
 });
+
+test('seed policy uses the existing authenticated PUT endpoint with only accepted fields', async () => {
+  mockedFetch.mockReset();
+  mockedFetch.mockResolvedValue(okResponse());
+  const client = new NzbdClient({ baseUrl: 'https://nzbd.example.test', username: '', password: '', token: 'operator-token' });
+  const policy = { use_defaults: false, stop_on_complete: true, ratio_limit: null, time_limit_secs: null };
+  await client.setSeedPolicy(7, policy);
+  expect(mockedFetch.mock.calls[0][0]).toBe('https://nzbd.example.test/api/v1/jobs/7/torrent/seed-policy');
+  expect(mockedFetch.mock.calls[0][1]).toMatchObject({ method: 'PUT', body: JSON.stringify(policy) });
+});

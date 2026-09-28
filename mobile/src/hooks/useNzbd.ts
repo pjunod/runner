@@ -47,7 +47,7 @@ export function useNzbd(config: ConnectionConfig): HookResult {
   const client = useMemo(() => new NzbdClient(config), [config]);
   const activeClient = useRef<NzbdClient | null>(client);
   activeClient.current = client;
-  useEffect(() => () => { activeClient.current = null; }, []);
+  useEffect(() => { activeClient.current = client; return () => { activeClient.current = null; }; }, [client]);
   const [snapshot, setSnapshot] = useState<QueueSnapshot | null>(null);
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
   const [error, setError] = useState<string | null>(null);
@@ -57,6 +57,7 @@ export function useNzbd(config: ConnectionConfig): HookResult {
   const lastFrameAt = useRef(0);
 
   const refresh = useCallback(async () => {
+    if (activeClient.current !== client) return;
     if (refreshPromise.current) return refreshPromise.current;
     const request = client
       .getSnapshot()
