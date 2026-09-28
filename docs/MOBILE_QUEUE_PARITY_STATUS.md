@@ -40,3 +40,16 @@ checks and engine serialization/sentinel checks are written but not yet run.
 No dependency or native configuration change was needed. The existing Jest
 renderer is used. The source checkout remains untouched; only the reviewed
 plan and review were copied into this clone.
+
+## Adversarial review disposition
+
+The final agent review requested three P2 corrections, all addressed before
+unit tests: restrict the editor to the latest seed phase, show refused-resume
+context inside the native modal, and retain collapse choices in a session cache
+when secure storage fails across dashboard remounts. Added rendered regressions
+for stale decisions, changed connections, modal explanations, and failed writes.
+
+Release metadata is prepared as **1.1.2 (10)** after rechecking main at build 9.
+Xcode and two signing identities are available. Android signing is absent from
+the standard local environment and Gradle properties; signed Android delivery
+remains unverified. No device/store distribution is claimed.

@@ -40,3 +40,18 @@ test('early user toggle wins over delayed hydration and persists across remount'
   expect(hook.collapsed).toEqual(['waiting']);
   await act(async () => tree.unmount());
 });
+
+test('failed writes retain user choices through a connection-screen remount', async () => {
+  store.setItemAsync.mockRejectedValue(new Error('keychain unavailable'));
+  store.getItemAsync.mockResolvedValue('["seeding"]');
+  let hook!: ReturnType<typeof useCollapsedSections>;
+  function Harness() { hook = useCollapsedSections(); return null; }
+  let tree: any;
+  await act(async () => { tree = create(<Harness />); });
+  await act(async () => hook.toggle('completed'));
+  const expected = [...hook.collapsed];
+  await act(async () => tree.unmount());
+  await act(async () => { tree = create(<Harness />); });
+  expect(hook.collapsed).toEqual(expected);
+  await act(async () => tree.unmount());
+});

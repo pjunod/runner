@@ -5,9 +5,10 @@ import { seedDraft, SeedDraft, seedPolicyBody } from '../torrentPresentation';
 import { useTheme } from '../theme';
 import { ActionButton } from './ActionButton';
 
-export function SeedPolicyEditor({ job, busy, onSave, onClose }: {
+export function SeedPolicyEditor({ job, busy, explanation, onSave, onClose }: {
   job: JobSummary;
   busy: boolean;
+  explanation?: string | null;
   onSave: (body: SeedPolicy & { use_defaults: boolean }) => Promise<void>;
   onClose: () => void;
 }) {
@@ -24,6 +25,7 @@ export function SeedPolicyEditor({ job, busy, onSave, onClose }: {
     <ScrollView contentContainerStyle={{ padding: 24, paddingTop: 60, gap: 18, backgroundColor: theme.background, flexGrow: 1 }}>
       <Text accessibilityRole="header" style={{ color: theme.text, fontSize: 24 }}>Seeding options</Text>
       <Text style={{ color: theme.text }}>{job.name}</Text>
+      {explanation ? <Text accessibilityRole="alert" style={{ color: theme.text }}>{explanation}</Text> : null}
       {modes.map(([mode, label]) => <ActionButton key={mode} label={`${draft.mode === mode ? '✓ ' : ''}${label}`}
         disabled={busy} onPress={() => setDraft({ ...draft, mode })} />)}
       {draft.mode === 'limits' ? <View style={{ gap: 12 }}>

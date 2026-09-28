@@ -70,3 +70,46 @@ test('seed options preserves draft on save failure and sends no lifecycle action
   expect(text()).toContain('Server unavailable');
   expect(button('✓ Stop after download')).toBeDefined();
 });
+
+test('refusal message is visible inside the seed modal and newer non-seed state closes it', async () => {
+  const seed = fixtures.find((f) => f.name === 'stopped seed')!.job as JobSummary;
+  let jobs = [seed];
+  const message = 'Runner refused to start seeding. Check this torrent’s seeding policy.';
+  const jobAction = jest.fn(async () => ({ ok: false, seedOptions: seed.id, message }));
+  (useNzbd as jest.Mock).mockImplementation(() => ({ snapshot: { jobs, status: null }, jobAction, connectionState: 'live', busyKey: null }));
+  const props = { config: { baseUrl: 'http://test', username: '', password: '', token: '' }, onEditConnection: jest.fn() };
+  await act(async () => { tree = create(<DashboardScreen {...props} />); });
+  await act(async () => tree.root.findByType(JobCard).props.onAction('resume'));
+  const editor = tree.root.findByType(SeedPolicyEditor);
+  expect(editor.findAllByType(Text).some((n: any) => n.props.children === message)).toBe(true);
+  jobs = [{ ...seed, torrent_phase: 'missing_files' }];
+  await act(async () => tree.update(<DashboardScreen {...props} />));
+  expect(tree.root.findAllByType(SeedPolicyEditor)).toHaveLength(0);
+});
+test('a later refresh overrides an earlier seed-options decision', async () => {
+  const seed = fixtures.find((f) => f.name === 'stopped seed')!.job as JobSummary;
+  let jobs = [seed];
+  let finish!: (value: unknown) => void;
+  const jobAction = jest.fn(() => new Promise((resolve) => { finish = resolve; }));
+  (useNzbd as jest.Mock).mockImplementation(() => ({ snapshot: { jobs, status: null }, jobAction, connectionState: 'live', busyKey: null }));
+  const props = { config: { baseUrl: 'http://test', username: '', password: '', token: '' }, onEditConnection: jest.fn() };
+  await act(async () => { tree = create(<DashboardScreen {...props} />); });
+  await act(async () => { tree.root.findByType(JobCard).props.onAction('resume'); });
+  jobs = [{ ...seed, torrent_phase: 'missing_files' }];
+  await act(async () => { tree.update(<DashboardScreen {...props} />); });
+  await act(async () => finish({ ok: false, seedOptions: seed.id, message: 'Refused' }));
+  expect(tree.root.findAllByType(SeedPolicyEditor)).toHaveLength(0);
+});
+test('a pending response from a previous connection cannot open a same-ID editor', async () => {
+  const seed = fixtures.find((f) => f.name === 'stopped seed')!.job as JobSummary;
+  let finish!: (value: unknown) => void;
+  const jobAction = jest.fn(() => new Promise((resolve) => { finish = resolve; }));
+  (useNzbd as jest.Mock).mockReturnValue({ snapshot: { jobs: [seed], status: null }, jobAction, connectionState: 'live', busyKey: null });
+  const config = { baseUrl: 'http://old', username: '', password: '', token: '' };
+  await act(async () => { tree = create(<DashboardScreen config={config} onEditConnection={jest.fn()} />); });
+  await act(async () => { tree.root.findByType(JobCard).props.onAction('resume'); });
+  await act(async () => tree.update(<DashboardScreen config={{ ...config, baseUrl: 'http://new' }} onEditConnection={jest.fn()} />));
+  await act(async () => finish({ ok: false, seedOptions: seed.id, message: 'Old server refusal' }));
+  expect(tree.root.findAllByType(SeedPolicyEditor)).toHaveLength(0);
+  expect(text()).not.toContain('Old server refusal');
+});

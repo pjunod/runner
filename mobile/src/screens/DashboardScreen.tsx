@@ -66,6 +66,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
   const [addOpen, setAddOpen] = useState(false);
   const [expanded, setExpanded] = useState<number | null>(null);
   const [seedEditor, setSeedEditor] = useState<number | null>(null);
+  const [seedExplanation, setSeedExplanation] = useState<string | null>(null);
   const { collapsed, toggle: toggleCollapsed } = useCollapsedSections();
   const activeConfig = useRef<Props['config'] | null>(config);
   activeConfig.current = config;
@@ -90,7 +91,8 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
 
   const status = snapshot?.status;
   const jobs = snapshot?.jobs ?? [];
-  const seedJob = jobs.find((job) => job.id === seedEditor && job.kind === 'torrent');
+  const seedJob = jobs.find((job) => job.id === seedEditor
+    && ['seeding', 'paused_seed'].includes(torrentDisplayPhase(job) ?? ''));
   useEffect(() => { if (snapshot && seedEditor != null && !seedJob) setSeedEditor(null); }, [snapshot, seedEditor, seedJob]);
   const jobSections = useMemo(() => sectionQueueJobs(jobs), [jobs]);
   const mutateJob = async (
@@ -109,7 +111,9 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
       const result = await jobAction(job.id, action);
       if (activeConfig.current !== config) return;
       if (result.message) setNotice(result.message);
-      if (result.seedOptions != null) { setExpanded(result.seedOptions); setSeedEditor(result.seedOptions); }
+      if (result.seedOptions != null) {
+        setExpanded(result.seedOptions); setSeedExplanation(result.message ?? null); setSeedEditor(result.seedOptions);
+      }
       if (action === 'delete' || action === 'delete-files') {
         setExpanded(null);
         setNotice(result.parked ? `${job.name} removed. It can be restored from history.` : `${job.name} removed.`);
@@ -214,7 +218,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
   return (
     <SafeAreaView style={styles.safe} edges={['top', 'left', 'right']}>
       {seedJob ? <SeedPolicyEditor key={seedJob.id} job={seedJob} busy={busyKey !== null}
-        onClose={() => setSeedEditor(null)} onSave={async (body) => {
+        explanation={seedExplanation} onClose={() => { setSeedEditor(null); setSeedExplanation(null); }} onSave={async (body) => {
           await setSeedPolicy(seedJob.id, body);
           if (activeConfig.current !== config) return;
           setNotice('Seeding policy saved. Stopped torrents stay stopped until you start them.');
@@ -359,7 +363,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
                               movable={definition.ordered && torrentDisplayPhase(job) !== 'failed'}
                               onAction={(action) => void mutateJob(job, action)}
                               onDelete={() => confirmDelete(job)}
-                              onSeedOptions={() => setSeedEditor(job.id)}
+                              onSeedOptions={() => { setSeedExplanation(null); setSeedEditor(job.id); }}
                               onPriorityChange={(priority) => void mutatePriority(job, priority)}
                               onToggle={() => setExpanded(expanded === job.id ? null : job.id)}
                               sectionKey={definition.key}

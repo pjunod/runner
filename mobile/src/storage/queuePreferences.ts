@@ -25,11 +25,13 @@ export function saveCollapsed(value: readonly string[]): Promise<void> {
   }).catch(() => undefined);
   return writes;
 }
+let sessionChoice: string[] | null = null;
 export function useCollapsedSections() {
-  const [collapsed, setCollapsed] = useState<string[]>([]);
-  const current = useRef<string[]>([]);
+  const [collapsed, setCollapsed] = useState<string[]>(() => sessionChoice ?? []);
+  const current = useRef<string[]>(sessionChoice ?? []);
   const touched = useRef(false);
   useEffect(() => {
+    if (sessionChoice !== null) return;
     let alive = true;
     void writes.then(loadCollapsed).then((saved) => {
       if (alive && !touched.current) { current.current = saved; setCollapsed(saved); }
@@ -41,6 +43,7 @@ export function useCollapsedSections() {
     touched.current = true;
     const next = current.current.includes(key) ? current.current.filter((item) => item !== key) : [...current.current, key];
     current.current = next;
+    sessionChoice = next;
     setCollapsed(next);
     void saveCollapsed(next);
   };
