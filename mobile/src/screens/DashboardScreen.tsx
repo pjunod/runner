@@ -1,6 +1,6 @@
 import * as DocumentPicker from 'expo-document-picker';
 import { File } from 'expo-file-system';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Modal,
@@ -41,9 +41,12 @@ import {
 import { ActionButton } from '../components/ActionButton';
 import { ThemeSwitcher } from '../components/ThemeSwitcher';
 import { useNzbd } from '../hooks/useNzbd';
-import { QueueSectionKey, sectionQueueJobs } from '../queueSections';
+import { QueueSectionKey, sectionQueueJobs, sectionTotals, isPostProcessingSection } from '../queueSections';
 import { DOWNLOAD_PRIORITIES, downloadPriorityLabel } from '../priority';
 import { Theme, useDisplayPreferences, useTheme } from '../theme';
+import { useCollapsedSections } from '../storage/queuePreferences';
+import { SeedPolicyEditor } from '../components/SeedPolicyEditor';
+import { torrentDisplayPhase, torrentStatus, torrentPrimaryAction, seedPolicyText, seedStopText } from '../torrentPresentation';
 import { HistoryView } from './HistoryView';
 import { LogsView } from './LogsView';
 
@@ -62,6 +65,11 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
   const wide = width >= 820;
   const [addOpen, setAddOpen] = useState(false);
   const [expanded, setExpanded] = useState<number | null>(null);
+  const [seedEditor, setSeedEditor] = useState<number | null>(null);
+  const { collapsed, toggle: toggleCollapsed } = useCollapsedSections();
+  const activeConfig = useRef<Props['config'] | null>(config);
+  activeConfig.current = config;
+  useEffect(() => () => { activeConfig.current = null; }, []);
   const [notice, setNotice] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<AppSection>('queue');
   const {
@@ -74,6 +82,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
     queueAction,
     jobAction,
     setJobPriority,
+    setSeedPolicy,
     addNzb,
     addTorrentFile,
     addTorrentSource,
@@ -81,6 +90,8 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
 
   const status = snapshot?.status;
   const jobs = snapshot?.jobs ?? [];
+  const seedJob = jobs.find((job) => job.id === seedEditor && job.kind === 'torrent');
+  useEffect(() => { if (snapshot && seedEditor != null && !seedJob) setSeedEditor(null); }, [snapshot, seedEditor, seedJob]);
   const jobSections = useMemo(() => sectionQueueJobs(jobs), [jobs]);
   const mutateJob = async (
     job: JobSummary,
@@ -96,6 +107,9 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
   ) => {
     try {
       const result = await jobAction(job.id, action);
+      if (activeConfig.current !== config) return;
+      if (result.message) setNotice(result.message);
+      if (result.seedOptions != null) { setExpanded(result.seedOptions); setSeedEditor(result.seedOptions); }
       if (action === 'delete' || action === 'delete-files') {
         setExpanded(null);
         setNotice(result.parked ? `${job.name} removed. It can be restored from history.` : `${job.name} removed.`);
@@ -199,6 +213,13 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
 
   return (
     <SafeAreaView style={styles.safe} edges={['top', 'left', 'right']}>
+      {seedJob ? <SeedPolicyEditor key={seedJob.id} job={seedJob} busy={busyKey !== null}
+        onClose={() => setSeedEditor(null)} onSave={async (body) => {
+          await setSeedPolicy(seedJob.id, body);
+          if (activeConfig.current !== config) return;
+          setNotice('Seeding policy saved. Stopped torrents stay stopped until you start them.');
+          setSeedEditor(null);
+        }} /> : null}
       <View style={[styles.header, layout === 'theater' && styles.headerTheater]}>
         <View style={styles.brandRow}>
           <View style={styles.brandMark}>
@@ -309,14 +330,25 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
                 <View style={styles.jobList}>
                   {jobSections.map(({ definition, jobs: sectionJobs }) => {
                     const tone = queueSectionTone(definition.key, theme);
+                    const hidden = collapsed.includes(definition.key);
+                    const totals = sectionTotals(sectionJobs);
+                    const summary = definition.key === 'seeding'
+                      ? `↑ ${formatBytes(totals.uploadRate, '/s')} · ${formatBytes(totals.uploaded)} uploaded`
+                      : definition.collapsible ? `${formatBytes(totals.size)}${definition.key === 'completed' ? ' · files kept' : ''}` : '';
                     return (
                       <View key={definition.key} style={styles.queueGroup}>
-                        <View accessibilityRole="header" style={styles.queueGroupHeading}>
+                        <Pressable accessibilityRole={definition.collapsible ? 'button' : 'header'}
+                          accessibilityLabel={`${definition.label}, ${sectionJobs.length} jobs${summary ? ', ' + summary : ''}`}
+                          accessibilityState={definition.collapsible ? { expanded: !hidden } : undefined}
+                          onPress={definition.collapsible ? () => toggleCollapsed(definition.key) : undefined}
+                          style={[styles.queueGroupHeading, definition.collapsible && { minHeight: 44 }]}>
+                          {definition.collapsible ? <Text style={styles.queueGroupTitle}>{hidden ? '▸' : '▾'}</Text> : null}
                           <View style={[styles.queueGroupAccent, { backgroundColor: tone.accent }]} />
                           <Text style={styles.queueGroupTitle}>{definition.label}</Text>
                           <Text style={styles.queueGroupCount}>{sectionJobs.length}</Text>
-                        </View>
-                        <View style={styles.queueGroupJobs}>
+                          {summary ? <Text style={styles.metaText}>{summary}</Text> : null}
+                        </Pressable>
+                        {!hidden ? <View style={styles.queueGroupJobs}>
                           {sectionJobs.map(({ job, index }) => (
                             <JobCard
                               busy={busyKey !== null}
@@ -324,9 +356,10 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
                               index={index}
                               job={job}
                               key={job.id}
-                              movable={definition.ordered}
+                              movable={definition.ordered && torrentDisplayPhase(job) !== 'failed'}
                               onAction={(action) => void mutateJob(job, action)}
                               onDelete={() => confirmDelete(job)}
+                              onSeedOptions={() => setSeedEditor(job.id)}
                               onPriorityChange={(priority) => void mutatePriority(job, priority)}
                               onToggle={() => setExpanded(expanded === job.id ? null : job.id)}
                               sectionKey={definition.key}
@@ -336,7 +369,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
                               total={jobs.length}
                             />
                           ))}
-                        </View>
+                        </View> : null}
                       </View>
                     );
                   })}
@@ -540,7 +573,7 @@ function StorageVolume({
   );
 }
 
-function JobCard({
+export function JobCard({
   job,
   index,
   total,
@@ -550,6 +583,7 @@ function JobCard({
   onAction,
   onDelete,
   onPriorityChange,
+  onSeedOptions,
   movable,
   sectionKey,
   sectionLabel,
@@ -567,6 +601,7 @@ function JobCard({
   ) => void;
   onDelete: () => void;
   onPriorityChange: (priority: number) => void;
+  onSeedOptions: () => void;
   movable: boolean;
   sectionKey: QueueSectionKey;
   sectionLabel: string;
@@ -577,8 +612,12 @@ function JobCard({
   const statusKey = jobStatusKey(job.status);
   const canPause = ['queued', 'downloading', 'fetching'].includes(statusKey);
   const canResume = isJobPaused(job.status);
-  const postProcessing = !['downloading', 'fetching', 'waiting'].includes(sectionKey);
-  const showStatus = sectionKey === 'waiting';
+  const phase = torrentDisplayPhase(job);
+  const torrentAction = torrentPrimaryAction(job);
+  const seed = phase === 'seeding' || phase === 'paused_seed';
+  const postProcessing = job.kind !== 'torrent' && isPostProcessingSection(sectionKey);
+  const showStatus = !!phase || sectionKey === 'waiting';
+  const showProgress = !postProcessing && !seed && !['fetching_source', 'fetching_metadata', 'failed', 'missing_files'].includes(phase ?? '');
   return (
     <View
       style={[
@@ -598,26 +637,36 @@ function JobCard({
           <Text numberOfLines={2} style={styles.jobName}>
             {job.name}
           </Text>
-          {!postProcessing ? (
+          {showProgress ? (
             <Text style={styles.jobPercent}>{Math.floor(progress * 100)}%</Text>
           ) : null}
         </View>
         {job.kind === 'torrent' ? <Text style={styles.eyebrow}>BITTORRENT</Text> : null}
-        {!postProcessing ? (
+        {showProgress ? (
           <View style={styles.progressTrack}>
             <View style={[styles.progressFill, { width: `${Math.max(progress * 100, 1)}%` }]} />
           </View>
         ) : null}
         <View style={styles.jobMeta}>
           {showStatus ? (
-            <Text style={[styles.status, statusKey === 'failed' && styles.statusFailed]}>
-              {jobStatusLabel(job.status, job.ready)}
+            <Text style={[styles.status, (statusKey === 'failed' || phase === 'missing_files' || phase === 'failed') && styles.statusFailed]}>
+              {phase ? torrentStatus(job) : jobStatusLabel(job.status, job.ready)}
             </Text>
           ) : null}
           <Text style={styles.metaText}>
-            {formatBytes(job.downloaded_bytes)} / {formatBytes(job.size_bytes)}
+            {seed ? 'Files ready' : `${formatBytes(job.downloaded_bytes)} / ${formatBytes(job.size_bytes)}`}
           </Text>
-          {postProcessing ? (
+          {phase ? (
+            <>
+              {phase === 'downloading' ? <Text style={styles.metaText}>{formatBytes(job.rate_bps, '/s')} · ETA {jobEta(job)}</Text> : null}
+              <Text style={styles.metaText}>↑ {formatBytes(job.upload_rate_bps ?? 0, '/s')} · ratio {(job.ratio ?? 0).toFixed(2)} · {job.useful_peers ?? 0} peers</Text>
+              {seed ? <Text style={styles.metaText}>{formatBytes(job.uploaded_bytes ?? 0)} uploaded · {formatDuration(job.seeding_seconds ?? 0)} seeded</Text> : null}
+              {phase === 'paused_seed' ? <Text style={styles.metaText}>{seedStopText(job)}</Text> : null}
+              {seed ? <Text style={styles.metaText}>{seedPolicyText(job.seed_policy)}</Text> : null}
+              {['storage_hold', 'failed', 'missing_files'].includes(phase) && job.torrent_error ? <Text style={styles.statusFailed}>{job.torrent_error}</Text> : null}
+              {phase === 'storage_hold' ? <Text style={styles.metaText}>Downloads recover automatically when disk space is available.</Text> : null}
+            </>
+          ) : postProcessing ? (
             <Text style={[styles.metaText, { color: tone.accent }]}>
               {postProcessingDetail(job, sectionKey, sectionLabel)}
             </Text>
@@ -633,12 +682,13 @@ function JobCard({
       {expanded ? (
         <View style={styles.jobActions}>
           <View style={styles.jobFacts}>
-            <Fact label="Health" styles={styles} value={`${(job.health / 10).toFixed(1)}%`} />
+            {!phase ? <Fact label="Health" styles={styles} value={`${(job.health / 10).toFixed(1)}%`} /> : null}
             <Fact label="Files" styles={styles} value={`${job.files_done}/${job.files_total}`} />
             <Fact label="Priority" styles={styles} value={downloadPriorityLabel(job.priority)} />
             <Fact label="Category" styles={styles} value={job.category || '—'} />
             {job.kind === 'torrent' ? (
               <>
+                {job.ready_at_unix != null && seed ? <Fact label="Files ready since" styles={styles} value={new Date(job.ready_at_unix * 1000).toLocaleString()} /> : null}
                 <Fact label="Uploaded" styles={styles} value={formatBytes(job.uploaded_bytes ?? 0)} />
                 <Fact label="Ratio" styles={styles} value={(job.ratio ?? 0).toFixed(2)} />
                 <Fact label="Peers" styles={styles} value={String(job.useful_peers ?? 0)} />
@@ -646,7 +696,7 @@ function JobCard({
               </>
             ) : null}
           </View>
-          <View style={styles.jobPriorityEditor}>
+          {movable ? <View style={styles.jobPriorityEditor}>
             <Text style={styles.inputLabel}>Download priority</Text>
             <View style={styles.priorityRow}>
               {DOWNLOAD_PRIORITIES.map(({ value, label }) => (
@@ -663,12 +713,15 @@ function JobCard({
             {job.priority >= 900 ? (
               <Text style={styles.priorityHint}>Force can download through queue pauses and quota holds.</Text>
             ) : null}
-          </View>
+          </View> : null}
           <View style={styles.actionRow}>
-            {canPause ? (
+            {torrentAction ? <ActionButton compact disabled={busy} label={torrentAction.label}
+              onPress={() => torrentAction.action === 'seed-options' ? onSeedOptions() : onAction(torrentAction.action)} /> : null}
+            {seed && torrentAction?.action !== 'seed-options' ? <ActionButton compact disabled={busy} label="Seeding options" onPress={onSeedOptions} /> : null}
+            {!phase && canPause ? (
               <ActionButton compact disabled={busy} label="Pause" onPress={() => onAction('pause')} />
             ) : null}
-            {canResume ? (
+            {!phase && canResume ? (
               <ActionButton compact disabled={busy} label="Resume" onPress={() => onAction('resume')} />
             ) : null}
             {movable ? (
@@ -714,6 +767,10 @@ interface QueueSectionTone {
 
 const QUEUE_STAGE_ACCENTS: Partial<Record<QueueSectionKey, string>> = {
   fetching: '#42A5D5',
+  torrent_metadata: '#42A5D5',
+  checking: '#38A9AD',
+  seeding: '#6B9F74',
+  completed: '#6B9F74',
   renaming: '#A57BD8',
   verifying: '#38A9AD',
   repairing: '#DC7844',
@@ -1340,6 +1397,7 @@ const makeStyles = (theme: Theme) =>
     jobList: { gap: 14 },
     queueGroup: { gap: 6 },
     queueGroupHeading: {
+      flexWrap: 'wrap',
       minHeight: 20,
       paddingHorizontal: 4,
       flexDirection: 'row',
@@ -1348,6 +1406,7 @@ const makeStyles = (theme: Theme) =>
     },
     queueGroupAccent: { width: 3, height: 13, borderRadius: 2 },
     queueGroupTitle: {
+      flexShrink: 1,
       color: theme.textMuted,
       fontSize: 10,
       fontWeight: '900',
