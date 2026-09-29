@@ -954,3 +954,74 @@ fn summary_columns_backfill_for_an_inventory_written_before_they_existed() {
         .unwrap();
     assert_eq!((page.rows[0].files, page.rows[0].bytes), (files, bytes));
 }
+
+// ---- recovery staging copy (field report 2026-09-28 #3) --------------------
+// A 46.8 GiB staging copy across two network mounts ran 24 minutes and then
+// recorded "filesystem: Invalid argument (os error 22)": std::io::copy had
+// gone down copy_file_range and the error carried no operation and no path.
+#[test]
+fn staging_copies_hash_in_one_pass_and_publish_verifies_the_copy() {
+    let (tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    // Something bigger than one read buffer, so the loop actually loops.
+    let big: Vec<u8> = (0..9_000_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(a.path.join("big.bin"), &big).unwrap();
+    let a = db.inspect(&a.id).unwrap();
+    let a = db.adopt(&a.id, a.revision).unwrap();
+    let recovery_root = tmp.path().join("recovery");
+    let r = db
+        .stage_recovery(
+            &a.id,
+            a.revision,
+            "stage-big",
+            &["big.bin".into(), "episode.mkv".into()],
+            &recovery_root,
+        )
+        .unwrap();
+    assert_eq!(r.state, "published", "{:?}", r.error);
+    let copied = std::fs::read(r.published.join("payload/big.bin")).unwrap();
+    assert_eq!(copied, big, "the copy is byte-identical");
+    let big_entry = r.files.iter().find(|f| f.path == "big.bin").unwrap();
+    assert_eq!(big_entry.bytes, big.len() as u64);
+    use sha2::Digest;
+    assert_eq!(
+        big_entry.sha256,
+        format!("{:x}", sha2::Sha256::digest(&big)),
+        "the manifest digest is the source's digest"
+    );
+    assert_eq!(
+        db.get(&a.id).unwrap().hold.as_deref(),
+        Some(format!("recovery:{}", r.id).as_str())
+    );
+    assert_eq!(r.source, a.path, "a handoff names the folder it came from");
+    let listed = db.recoveries(0).unwrap();
+    assert_eq!(listed[0].source, a.path);
+}
+
+#[test]
+fn a_staging_failure_names_the_operation_and_the_path() {
+    let (tmp, db, root) = fixture();
+    let a = parked(&db, &root); // owned parked_failed, stageable as is
+                                // The recovery root is a FILE, so creating the staging tree under it fails.
+    let recovery_root = tmp.path().join("recovery");
+    std::fs::write(&recovery_root, b"not a directory").unwrap();
+    let r = db
+        .stage_recovery(
+            &a.id,
+            a.revision,
+            "stage-bad",
+            &["episode.mkv".into()],
+            &recovery_root,
+        )
+        .unwrap();
+    assert_eq!(r.state, "failed");
+    let err = r.error.unwrap();
+    assert!(
+        err.contains(&recovery_root.display().to_string()),
+        "the error names the path: {err}"
+    );
+    assert!(
+        err.contains("measure free space on") && err.contains("Not a directory"),
+        "…and the operation: {err}"
+    );
+}

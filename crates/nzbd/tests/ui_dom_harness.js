@@ -2251,7 +2251,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     T.store.recoveries = [{ id: "70a9015f567db76ce0183b149c371c84", artifact: "h", state: "published", files: [{}], error: null }];
     const held = T.fileDetailModel({ artifact: art("h", { owned: true, state: "retained", keep: true, hold: "recovery:70a9015f567db76ce0183b149c371c84", inspected_at: 5 }), files: mediaFile, total: 1, offset: 0, events: [], preview: null });
     eq(held.stageable, false, "a folder held by a handoff cannot be staged");
-    ok(held.stageBlock.includes("already staged as handoff 70a9015f…") && held.stageBlock.includes("(published)"),
+    ok((held.stageBlock || "").includes("already staged as handoff 70a9015f…") && (held.stageBlock || "").includes("(published)"),
       `…and the panel names the handoff and its state (got ${held.stageBlock})`);
     eq(held.handoffs.length, 1, "the folder's own handoff is listed in its panel");
     eq(held.handoffs[0].cancellable, true, "…with a cancel");
@@ -2259,7 +2259,18 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     ok(!heldHtml.includes("f-stage"), "no stage button on a held folder");
     ok(!heldHtml.includes("recovery-file"), "…and no checkboxes to tick for nothing");
     ok(heldHtml.includes('data-action="f-rec-cancel"') && heldHtml.includes("70a9015f567db76ce0183b149c371c84"), "cancel handoff is offered in place");
+    // The holding handoff may be off the listed page: the panel fetched it by
+    // id (dt.holding) and still lists it. A failed one says cancel, not import.
     T.store.recoveries = [];
+    const offPage = T.fileDetailModel({ artifact: art("h", { owned: true, state: "retained", hold: "recovery:70a9015f567db76ce0183b149c371c84", inspected_at: 5 }), files: mediaFile, total: 1, offset: 0, events: [], preview: null,
+      holding: { id: "70a9015f567db76ce0183b149c371c84", artifact: "h", state: "failed", files: [{}], error: "filesystem: write /processing/recovery/.staging/x/payload/a.mkv: Invalid argument (os error 22)" } });
+    eq(offPage.handoffs.length, 1, "a handoff fetched by id is listed even when the page does not carry it");
+    ok((offPage.stageBlock || "").startsWith("Staging handoff 70a9015f… failed — filesystem: write"), `a failed handoff says so and says cancel (got ${offPage.stageBlock})`);
+    ok(!(offPage.stageBlock || "").includes("Claim and import"), "…not import");
+    const pending = T.fileDetailModel({ artifact: art("h", { owned: true, state: "retained", hold: "recovery:70a9015f567db76ce0183b149c371c84", inspected_at: 5 }), files: mediaFile, total: 1, offset: 0, events: [], preview: null,
+      holding: { id: "70a9015f567db76ce0183b149c371c84", artifact: "h", state: "cancel_pending", files: [{}] } });
+    eq(pending.handoffs[0].cancellable, false, "a cancelling handoff cannot be cancelled twice");
+    ok(T.fileDetailHtml(pending).includes("cancelling…"), "…and says it is cancelling");
     const unowned = T.fileDetailModel({ artifact: art("u2", { inspected_at: 5 }), files: mediaFile, total: 1, offset: 0, events: [], preview: null });
     ok(unowned.stageBlock.startsWith("Only an owned folder"), "an unowned folder says adopt first");
     const reviewHeld = T.fileDetailModel({ artifact: art("r", { owned: true, state: "retained", hold: "review", inspected_at: 5 }), files: mediaFile, total: 1, offset: 0, events: [], preview: null });
