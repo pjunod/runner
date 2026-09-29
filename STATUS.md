@@ -38,6 +38,27 @@ cleared payloads; a transport blip mid-poll reported a task failed.
 
 Tests: nzbd-state artifacts +10 · nzbd-api +1 · UI DOM harness 811 assertions.
 
+Follow-up (same day, field report #2): the folder panel offered *Preview
+recovery copy* on a folder already held by an open recovery handoff, which the
+server refuses ("stale selection, unowned or held source"). The panel now
+mirrors `preview_recovery`'s preconditions (owned · unheld · parked_failed /
+retained / completed): it says which one is missing, lists the folder's own
+handoffs with their state, and offers **cancel handoff** in place. UI DOM
+harness 824 assertions; adopt → stage → held → cancel verified in Chromium.
+
+Same day, field report #3: handoff `70a9015f…` for a 46.8 GiB folder ran 24
+minutes and failed with a bare `filesystem: Invalid argument (os error 22)`.
+The staging copy went through `std::io::copy` → `copy_file_range` across two
+different network mounts (`/working` → `/processing`), which can fail with
+EINVAL after partial progress with no fallback; and no step carried an
+operation or a path. Staging now copies with a plain read/write loop that
+hashes the source in the same pass (three passes over the file became two),
+directory fsyncs tolerate filesystems that refuse them (EINVAL/ENOTSUP), every
+filesystem step names its operation and path, and each handoff records the
+folder it came from (`source`) so Curator can name it. The panel lists the
+holding handoff even when it is off the listed page, says "cancel" rather than
+"import" for a failed one, and cannot double-cancel. UI DOM harness 829.
+
 ## Incremental history ingestion — 2026-09-25
 
 **Status:** M6 implemented and adversarial review addressed; 73 state tests

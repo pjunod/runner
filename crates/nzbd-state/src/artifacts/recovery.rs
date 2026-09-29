@@ -1,6 +1,6 @@
 use super::*;
 use sha2::{Digest, Sha256};
-use std::io::Read;
+use std::io::{Read, Write};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecoveryFile {
@@ -27,6 +27,10 @@ pub struct Recovery {
     pub error: Option<String>,
     #[serde(default)]
     pub scratch_identity: Option<Identity>,
+    /// The folder the copy was taken from — what a person calls this handoff.
+    /// Rows staged before this field existed carry an empty path.
+    #[serde(default)]
+    pub source: PathBuf,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -58,6 +62,84 @@ fn digest(file: &mut File) -> Result<String> {
         hash.update(&buf[..n]);
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+/// A filesystem error that says what was being done to what. Field report
+/// 2026-09-28: a 46.8 GiB staging copy across two network mounts ran for 24
+/// minutes and then recorded "filesystem: Invalid argument (os error 22)" —
+/// no operation, no path, nothing to act on.
+fn at<T>(r: std::io::Result<T>, op: &str, path: &Path) -> Result<T> {
+    r.map_err(|e| {
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("{op} {}: {e}", path.display()),
+        ))
+    })
+}
+
+/// Same, for a step that already returns this module's `Result`.
+fn at_dir<T>(r: Result<T>, op: &str, path: &Path) -> Result<T> {
+    r.map_err(|e| match e {
+        Error::Io(io) => Error::Io(std::io::Error::new(
+            io.kind(),
+            format!("{op} {}: {io}", path.display()),
+        )),
+        other => other,
+    })
+}
+
+/// Copy `input` to a new file at `target` with a plain read/write loop,
+/// hashing the source bytes as they pass. `std::io::copy` reaches for
+/// `copy_file_range`, which across two different (network) filesystems can
+/// fail with EINVAL after partial progress, at which point std surfaces the
+/// error instead of falling back — the 24-minute failure above. A user-space
+/// loop is the same speed on a network mount and cannot take that path.
+/// Returns (bytes written, sha256 of the bytes read from the source).
+fn copy_hashing(input: &mut File, target: &Path) -> Result<(u64, String)> {
+    let mut out = at(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target),
+        "create",
+        target,
+    )?;
+    let mut hash = Sha256::new();
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    let mut written = 0u64;
+    loop {
+        let n = at(input.read(&mut buf), "read source for", target)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+        at(out.write_all(&buf[..n]), "write", target)?;
+        written += n as u64;
+    }
+    at(out.sync_all(), "fsync", target)?;
+    Ok((written, format!("{:x}", hash.finalize())))
+}
+
+/// fsync a directory where the filesystem allows it. CIFS, some FUSE
+/// filesystems and a few others answer EINVAL / ENOTSUP for a directory
+/// handle; the regular files inside were already flushed, and refusing to
+/// publish over that would leave a complete copy unusable.
+fn sync_dir_lenient(path: &Path) -> Result<()> {
+    let dir = at(File::open(path), "open directory", path)?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        // EINVAL → InvalidInput; ENOTSUP / EOPNOTSUPP / ENOSYS → Unsupported.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            tracing::debug!(path=%path.display(), error=%e, "directory fsync unsupported here; continuing");
+            Ok(())
+        }
+        Err(e) => at(Err(e), "fsync directory", path),
+    }
 }
 
 impl Inventory {
@@ -236,6 +318,7 @@ impl Inventory {
                 receipt: None,
                 error: None,
                 scratch_identity: None,
+                source: a.path.clone(),
                 created_at: now(),
                 updated_at: now(),
             };
@@ -256,51 +339,71 @@ impl Inventory {
                     .parent()
                     .ok_or_else(|| Error::Conflict("recovery volume unavailable".into()))?;
             }
-            let available = fs::available_bytes(&fs::open_dir(volume)?)?;
+            let available = at_dir(
+                fs::open_dir(volume).and_then(|d| fs::available_bytes(&d)),
+                "measure free space on",
+                volume,
+            )?;
             if available < required.saturating_add(1024 * 1024 * 1024) {
                 return Err(Error::Conflict(format!("recovery staging needs {required} bytes plus 1 GiB reserve; {available} available")));
             }
-            std::fs::create_dir_all(root)?;
-            fs::open_dir(root)?;
+            at(std::fs::create_dir_all(root), "create recovery root", root)?;
+            at_dir(fs::open_dir(root), "open recovery root", root)?;
             let staging = root.join(".staging");
             let published = root.join("published");
-            std::fs::create_dir_all(&staging)?;
-            std::fs::create_dir_all(&published)?;
-            let staging_dir = fs::open_dir(&staging)?;
+            at(std::fs::create_dir_all(&staging), "create", &staging)?;
+            at(std::fs::create_dir_all(&published), "create", &published)?;
+            let staging_dir = at_dir(fs::open_dir(&staging), "open", &staging)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                staging_dir.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+                // Owner-only scratch. A mount that cannot carry POSIX modes
+                // (CIFS without unix extensions) answers EPERM/ENOTSUP; the
+                // copy is still private to the daemon's user there.
+                if let Err(e) = staging_dir.set_permissions(std::fs::Permissions::from_mode(0o700))
+                {
+                    tracing::debug!(path=%staging.display(), error=%e, "staging directory mode not applied");
+                }
             }
-            staging_dir.sync_all()?;
-            fs::open_dir(&published)?;
+            sync_dir_lenient(&staging)?;
+            at_dir(fs::open_dir(&published), "open", &published)?;
             let scratch = staging.join(&r.id);
-            std::fs::create_dir(&scratch)?;
-            r.scratch_identity = Some(fs::identity(&fs::open_dir(&scratch)?.metadata()?));
-            File::open(&staging)?.sync_all()?;
+            at(std::fs::create_dir(&scratch), "create", &scratch)?;
+            r.scratch_identity = Some(fs::identity(&at(
+                at_dir(fs::open_dir(&scratch), "open", &scratch)?.metadata(),
+                "stat",
+                &scratch,
+            )?));
+            sync_dir_lenient(&staging)?;
             save(&self.db.lock().unwrap(), &r)?;
             let payload = scratch.join("payload");
-            std::fs::create_dir(&payload)?;
+            at(std::fs::create_dir(&payload), "create", &payload)?;
             for f in selected {
                 if self.recovery(&r.id)?.state == "cancel_pending" {
                     return Err(Error::Conflict("staging cancelled".into()));
                 }
-                let mut input = fs::open_relative(&source, &f.path)?;
-                if fs::identity(&input.metadata()?) != f.identity {
+                let mut input = at_dir(
+                    fs::open_relative(&source, &f.path),
+                    "open source file",
+                    Path::new(&f.path),
+                )?;
+                if fs::identity(&at(
+                    input.metadata(),
+                    "stat source file",
+                    Path::new(&f.path),
+                )?) != f.identity
+                {
                     return Err(Error::Conflict("source identity changed".into()));
                 }
                 let target = payload.join(&f.path);
                 if let Some(p) = target.parent() {
-                    std::fs::create_dir_all(p)?;
+                    at(std::fs::create_dir_all(p), "create", p)?;
                 }
-                let mut out = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&target)?;
-                let bytes = std::io::copy(&mut input, &mut out)?;
-                out.sync_all()?;
-                let sha256 = digest(&mut File::open(&target)?)?;
-                let source_hash = digest(&mut fs::open_relative(&source, &f.path)?)?;
+                // One pass over the source (copy + hash), one over the copy
+                // (verify what landed). The old path read the source twice
+                // and the copy once: three passes over a 46.8 GiB file.
+                let (bytes, source_hash) = copy_hashing(&mut input, &target)?;
+                let sha256 = digest(&mut at(File::open(&target), "open copy", &target)?)?;
                 if bytes != f.identity.bytes
                     || sha256 != source_hash
                     || fs::identity(&input.metadata()?) != f.identity
@@ -316,18 +419,27 @@ impl Inventory {
                     bytes,
                     sha256,
                 });
-                File::open(target.parent().unwrap())?.sync_all()?;
+                sync_dir_lenient(target.parent().unwrap())?;
             }
             r.manifest_digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&r.files)?));
-            let mut mf = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(scratch.join("manifest.json"))?;
-            mf.write_all(&serde_json::to_vec(&r)?)?;
-            mf.sync_all()?;
-            File::open(&payload)?.sync_all()?;
-            File::open(&scratch)?.sync_all()?;
-            File::open(&staging)?.sync_all()?;
+            let manifest_path = scratch.join("manifest.json");
+            let mut mf = at(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&manifest_path),
+                "create",
+                &manifest_path,
+            )?;
+            at(
+                mf.write_all(&serde_json::to_vec(&r)?),
+                "write",
+                &manifest_path,
+            )?;
+            at(mf.sync_all(), "fsync", &manifest_path)?;
+            sync_dir_lenient(&payload)?;
+            sync_dir_lenient(&scratch)?;
+            sync_dir_lenient(&staging)?;
             // Journal the complete manifest before publication. Crash recovery
             // may validate it and finish the acknowledgement without recopying.
             let _publication_guard = self.mutation_guard()?;
@@ -341,9 +453,13 @@ impl Inventory {
                     "recovery publication already exists".into(),
                 ));
             }
-            fs::rename_exclusive(&scratch, &r.published)?;
-            File::open(&published)?.sync_all()?;
-            File::open(&staging)?.sync_all()?;
+            at_dir(
+                fs::rename_exclusive(&scratch, &r.published),
+                "publish (rename) into",
+                &r.published,
+            )?;
+            sync_dir_lenient(&published)?;
+            sync_dir_lenient(&staging)?;
             self.register_publication(&r)?;
             Ok(())
         })();

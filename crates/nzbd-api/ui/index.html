@@ -640,6 +640,9 @@ try {
   .fd-files .fd-files-nav { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--ink2); }
   .fd-stage { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   .fd-stage-preview { font-size: 12.5px; color: var(--ink2); margin: 6px 0; }
+  .fd-handoffs { margin-top: 10px; }
+  .fd-handoffs-title { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin-bottom: 2px; }
+  .rec-row .rec-folder { color: var(--ink); font-weight: 550; max-width: 40ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .fd-events { margin-top: 10px; font-size: 12px; color: var(--muted); }
   .fd-events div { font-variant-numeric: tabular-nums; }
   .files-recoveries { margin-top: 18px; }
@@ -4751,8 +4754,10 @@ function fileHoldText(a) {
 function fileRetentionText(a, earliest) {
   if (fileIsTerminal(a)) return (a.state === "deleted" ? "deleted " : "gone ") + fmtAgo(a.updated_at);
   if (!a.owned) return "never deleted automatically";
+  // A hold outranks keep in the column: it is the thing stopping every
+  // action right now, keep only says what happens after it lifts.
+  if (a.hold) return a.keep ? "held · keep" : "held";
   if (a.keep) return "keep indefinitely";
-  if (a.hold) return "held";
   if (earliest) return "expires " + fmtTime(earliest);
   return "no automatic expiry";
 }
@@ -4869,6 +4874,36 @@ function fileDetailModel(dt) {
   const measuring = fileWatching(a.id, "inspect");
   const deleting = fileWatching(a.id, "delete");
   const bytes = dt.bytes != null ? dt.bytes : dt.files.reduce((s, f) => s + (f.identity.directory ? 0 : f.identity.bytes), 0);
+  // The server stages a recovery copy only from an owned, unheld folder in a
+  // settled state (recovery.rs preview_recovery). Offering the button
+  // otherwise just earns "stale selection, unowned or held source" — so say
+  // which precondition is missing instead, and show the handoff that holds it.
+  const known = (Array.isArray(store.recoveries) ? store.recoveries : []).filter(r => r.artifact === a.id);
+  if (dt.holding && !known.some(r => r.id === dt.holding.id)) known.unshift(dt.holding);
+  const handoffs = known.map(r => ({
+    id: r.id, state: r.state, files: (r.files || []).length, error: r.error || "",
+    cancellable: !["imported", "cancelled", "cancel_pending"].includes(r.state),
+    cancelling: r.state === "cancel_pending",
+    prunable: ["imported", "partial"].includes(r.state),
+  }));
+  const stageStates = ["parked_failed", "retained", "completed"];
+  let stageBlock = "";
+  if (terminal) stageBlock = "";
+  else if (!a.owned) stageBlock = "Only an owned folder can be staged — adopt it first.";
+  else if (a.hold && a.hold.startsWith("recovery:")) {
+    const live = handoffs.find(h => h.id === a.hold.slice(9));
+    const short = a.hold.slice(9, 17) + "…";
+    if (live && live.state === "failed")
+      stageBlock = "Staging handoff " + short + " failed" + (live.error ? " — " + live.error : "") + ". Cancel it below to release the folder, then stage again.";
+    else if (live && live.state === "cancel_pending")
+      stageBlock = "Handoff " + short + " is being cancelled; the folder is released once its worker stops.";
+    else
+      stageBlock = "A recovery copy of this folder is already staged as handoff " + short +
+        (live ? " (" + live.state + ")" : "") + ". Claim and import it in Curator, or cancel it below, before staging another.";
+  } else if (a.hold) stageBlock = "Held (" + a.hold + ") — release the hold before staging.";
+  else if (!stageStates.includes(a.state)) stageBlock = "A folder in state “" + filesStateModel(a).label + "” cannot be staged.";
+  else if (measuring) stageBlock = "Measuring — wait for the walk to finish.";
+  const stageable = !terminal && !stageBlock;
   let note = "";
   if (a.error) note = a.error;
   else if (!measured) note = "Not measured yet — inspect walks the folder and lists what is in it.";
@@ -4877,7 +4912,8 @@ function fileDetailModel(dt) {
   return {
     key: "fd" + a.id, kind: "fdetail", id: a.id,
     sig: [a.id, a.revision, dt.offset, dt.total, dt.files.length, a.error || "", a.hold || "", a.keep, a.owned,
-          a.state, sel.size, measuring, deleting, dt.events.length, dt.preview ? dt.preview.text : "", a.inspected_at || 0].join("|"),
+          a.state, sel.size, measuring, deleting, dt.events.length, dt.preview ? dt.preview.text : "", a.inspected_at || 0,
+          handoffs.map(h => h.id + ":" + h.state + ":" + h.error + ":" + h.cancelling).join(",")].join("|"),
     path: a.path,
     facts: [
       ["state", filesStateModel(a).label],
@@ -4906,7 +4942,8 @@ function fileDetailModel(dt) {
     filesLabel: measured ? fileCount + (fileCount === 1 ? " file" : " files") + (fileCount ? " · " + fmtBytes(bytes) : "") + (dt.total > fileCount ? " · " + (dt.total - fileCount) + (dt.total - fileCount === 1 ? " folder" : " folders") : "") : "no file list yet",
     offset: dt.offset, total: dt.total, page: FILES_DETAIL_PAGE,
     selected: sel.size,
-    canStage: sel.size > 0 && !terminal,
+    stageable, stageBlock, handoffs,
+    canStage: stageable && sel.size > 0,
     preview: dt.preview,
     events: dt.events.map(ev => fmtTime(ev.at) + " · " + ev.kind + (ev.detail ? " — " + ev.detail : "")),
   };
@@ -4915,16 +4952,30 @@ function fileDetailHtml(m) {
   const facts = m.facts.map(([k, v]) => `<span>${esc(k)} <b>${esc(v)}</b></span>`).join("");
   const buttons = m.buttons.map(b =>
     `<button data-action="${b.action}" class="${b.cls || ""}" title="${esc(b.title || "")}" ${b.disabled ? "disabled" : ""}>${esc(b.label)}</button>`).join("");
+  const preview = m.preview
+    ? `<div class="fd-stage-preview">${esc(m.preview.text)} <button data-action="f-stage-confirm">Stage this selection</button></div>`
+    : "";
   const rows = m.files.map(f =>
-    `<tr><td class="chk"><input type="checkbox" class="recovery-file" value="${esc(f.path)}" ${f.dir ? "disabled" : ""} ${f.checked ? "checked" : ""}></td>` +
+    `<tr>${m.stageable ? `<td class="chk"><input type="checkbox" class="recovery-file" value="${esc(f.path)}" ${f.dir ? "disabled" : ""} ${f.checked ? "checked" : ""}></td>` : ""}` +
     `<td class="path">${esc(f.path)}${f.dir ? "/" : ""}</td><td class="num">${esc(f.size)}</td></tr>`).join("");
+  const handoffs = m.handoffs.length
+    ? `<div class="fd-handoffs"><div class="fd-handoffs-title">Recovery handoffs for this folder</div>${m.handoffs.map(h =>
+        `<div class="rec-row"><code>${esc(h.id)}</code><span class="st ${h.state === "imported" ? "ok" : h.state === "cancelled" ? "dim" : "warn"}">${esc(h.state)}</span>` +
+        `<span>${h.files} files</span>${h.error ? `<span class="err">${esc(h.error)}</span>` : ""}` +
+        (h.cancellable ? `<button class="small" data-action="f-rec-cancel" data-recovery="${esc(h.id)}" title="withdraw this handoff; the folder returns to a review hold you can release">cancel handoff</button>` : "") +
+        (h.cancelling ? `<button class="small" disabled>cancelling…</button>` : "") +
+        (h.prunable ? `<button class="small del" data-action="f-rec-prune" data-recovery="${esc(h.id)}">delete receipted source files</button>` : "") +
+        `</div>`).join("")}</div>`
+    : "";
+  const stage = !m.files.length ? ""
+    : m.stageable
+      ? `<div class="fd-stage"><button data-action="f-stage" ${m.canStage ? "" : "disabled"}>Preview recovery copy${m.selected ? " (" + m.selected + " selected)" : ""}</button>
+      <span class="fd-note" style="margin:0">Select files to copy for Curator. Originals stay held until a complete import receipt.</span></div>${preview}`
+      : m.stageBlock ? `<p class="fd-note warn">${esc(m.stageBlock)}</p>` : "";
   const first = m.offset + 1, last = m.offset + m.files.length;
   const nav = m.total > m.page
     ? `<div class="fd-files-nav"><button class="small" data-action="f-files-prev" ${m.offset === 0 ? "disabled" : ""}>‹ prev</button>` +
       `<span>${first}–${last} of ${m.total}</span><button class="small" data-action="f-files-next" ${last >= m.total ? "disabled" : ""}>next ›</button></div>`
-    : "";
-  const preview = m.preview
-    ? `<div class="fd-stage-preview">${esc(m.preview.text)} <button data-action="f-stage-confirm">Stage this selection</button></div>`
     : "";
   const events = m.events.length
     ? `<div class="fd-events">${m.events.map(e => `<div>${esc(e)}</div>`).join("")}</div>` : "";
@@ -4936,8 +4987,8 @@ function fileDetailHtml(m) {
     <details class="fd-files" open><summary>${esc(m.filesLabel)}</summary>
       ${m.files.length ? `<table class="subtable"><tbody>${rows}</tbody></table>${nav}` : ""}
     </details>
-    ${m.files.length ? `<div class="fd-stage"><button data-action="f-stage" ${m.canStage ? "" : "disabled"}>Preview recovery copy${m.selected ? " (" + m.selected + " selected)" : ""}</button>
-      <span class="fd-note" style="margin:0">Select files to copy for Curator. Originals stay held until a complete import receipt.</span></div>${preview}` : ""}
+    ${stage}
+    ${handoffs}
     ${events}
   </div>`;
 }
@@ -5043,14 +5094,20 @@ function renderRecoveries() {
   const r = store.recoveries;
   if (!box) return;
   if (count) setText(count, r ? String(r.length) : "");
-  const sig = r ? r.map(x => x.id + ":" + x.state + ":" + (x.error || "")).join(",") : "";
+  const resolve = x => { const f = store.files && store.files !== "off" ? store.files.entries.find(e => e.artifact.id === x.artifact) : null; return f ? f.artifact.path : (x.source || ""); };
+  const sig = r ? r.map(x => x.id + ":" + x.state + ":" + (x.error || "") + ":" + resolve(x)).join(",") : "";
   if (box.__sig === sig) return;
   box.__sig = sig;
   if (!r || !r.length) { box.innerHTML = `<div class="sub">no handoffs</div>`; return; }
   box.innerHTML = r.map(x => {
     const prunable = ["imported", "partial"].includes(x.state);
+    const cancellable = !["imported", "cancelled", "cancel_pending"].includes(x.state);
+    const folder = store.files && store.files !== "off" ? store.files.entries.find(e => e.artifact.id === x.artifact) : null;
     return `<div class="rec-row"><code>${esc(x.id)}</code><span class="st ${x.state === "imported" ? "ok" : x.state === "cancelled" ? "dim" : "warn"}">${esc(x.state)}</span>` +
+      (folder || x.source ? `<span class="rec-folder" title="${esc(folder ? folder.artifact.path : x.source)}">${esc(fileBaseName(folder ? folder.artifact.path : x.source))}</span>` : "") +
       `<span>${x.files.length} files</span>${x.error ? `<span class="err">${esc(x.error)}</span>` : ""}` +
+      (cancellable ? `<button class="small" data-action="f-rec-cancel" data-recovery="${esc(x.id)}">cancel handoff</button>` : "") +
+      (x.state === "cancel_pending" ? `<button class="small" disabled>cancelling…</button>` : "") +
       (prunable ? `<button class="small del" data-action="f-rec-prune" data-recovery="${esc(x.id)}">delete receipted source files</button>` : "") + `</div>`;
   }).join("");
   const pager = $("files-recoveries-pager");
@@ -5100,12 +5157,18 @@ async function loadFileDetail(id, offset = 0, render = true) {
       fileRequest("artifacts/" + id + "/events?after=0", null, "GET").catch(() => []),
     ]);
     if (filesOpen !== id) return;
+    // The handoff that holds this folder may sit on another page of the
+    // handoff list; fetch it by id so the panel can always show and cancel it.
+    let holding = null;
+    if (a.hold && a.hold.startsWith("recovery:"))
+      holding = await fileRequest("recoveries/" + a.hold.slice(9), null, "GET").catch(() => null);
+    if (filesOpen !== id) return;
     const prev = filesDetail && filesDetail.artifact.id === id ? filesDetail : null;
     // A revision change invalidates a selection and a staged preview alike.
     if (prev && prev.artifact.revision !== a.revision) { filesSelections.delete(id); }
     filesDetail = {
       artifact: a, files: f.files || [], total: f.total || 0, offset,
-      fileCount: f.file_count, bytes: f.bytes, measured: f.measured,
+      fileCount: f.file_count, bytes: f.bytes, measured: f.measured, holding,
       events: Array.isArray(ev) ? ev.slice(-8) : [],
       preview: prev && prev.artifact.revision === a.revision ? prev.preview : null,
       previewRequest: prev && prev.artifact.revision === a.revision ? prev.previewRequest : null,
@@ -5216,6 +5279,15 @@ async function fileAction(id, action) {
     await refreshFiles(true);
   } catch (e) { filesError(e); await refreshFiles(true); }
 }
+async function cancelRecovery(rid) {
+  try {
+    const r = await fileRequest("recoveries/" + rid + "/cancel");
+    toast({ text: r.state === "cancel_pending"
+      ? "Handoff " + rid.slice(0, 8) + "… will cancel once its worker stops"
+      : "Handoff " + rid.slice(0, 8) + "… cancelled — the folder is on a review hold you can release" });
+    await refreshFiles(true);
+  } catch (e) { filesError(e); }
+}
 async function pruneRecovery(rid) {
   try {
     const op = await fileRequest("recoveries/" + rid + "/delete-receipted-source");
@@ -5247,6 +5319,7 @@ function filesClick(action, el) {
   if (action === "f-rec-prev") { filesRecoveryOffset = Math.max(0, filesRecoveryOffset - 100); return refreshFiles(true); }
   if (action === "f-rec-next") { filesRecoveryOffset += 100; return refreshFiles(true); }
   if (action === "f-rec-prune") return pruneRecovery(el.dataset.recovery);
+  if (action === "f-rec-cancel") return cancelRecovery(el.dataset.recovery);
   if (!id) return;
   if (action === "f-details") return toggleFile(id);
   if (action === "f-inspect") return inspectFile(id);

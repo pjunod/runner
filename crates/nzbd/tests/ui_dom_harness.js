@@ -2243,6 +2243,50 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     const paged = T.fileDetailModel({ artifact: art("p", { inspected_at: 5 }), files: Array.from({ length: 200 }, (_, i) => ({ path: "f" + i, identity: { bytes: 1, directory: false } })), total: 450, offset: 200, events: [], preview: null });
     ok(T.fileDetailHtml(paged).includes("201–400 of 450"), "the file list pages inside the panel");
 
+    // 3b. Staging is offered only when the server would accept it
+    //     (owned · unheld · settled state). Field report 2026-09-28 #2: a
+    //     folder held by an open recovery handoff offered "Preview recovery
+    //     copy" and earned "stale selection, unowned or held source".
+    const mediaFile = [{ path: "x.mkv", identity: { bytes: 5, directory: false } }];
+    T.store.recoveries = [{ id: "70a9015f567db76ce0183b149c371c84", artifact: "h", state: "published", files: [{}], error: null }];
+    const held = T.fileDetailModel({ artifact: art("h", { owned: true, state: "retained", keep: true, hold: "recovery:70a9015f567db76ce0183b149c371c84", inspected_at: 5 }), files: mediaFile, total: 1, offset: 0, events: [], preview: null });
+    eq(held.stageable, false, "a folder held by a handoff cannot be staged");
+    ok((held.stageBlock || "").includes("already staged as handoff 70a9015f…") && (held.stageBlock || "").includes("(published)"),
+      `…and the panel names the handoff and its state (got ${held.stageBlock})`);
+    eq(held.handoffs.length, 1, "the folder's own handoff is listed in its panel");
+    eq(held.handoffs[0].cancellable, true, "…with a cancel");
+    const heldHtml = T.fileDetailHtml(held);
+    ok(!heldHtml.includes("f-stage"), "no stage button on a held folder");
+    ok(!heldHtml.includes("recovery-file"), "…and no checkboxes to tick for nothing");
+    ok(heldHtml.includes('data-action="f-rec-cancel"') && heldHtml.includes("70a9015f567db76ce0183b149c371c84"), "cancel handoff is offered in place");
+    // The holding handoff may be off the listed page: the panel fetched it by
+    // id (dt.holding) and still lists it. A failed one says cancel, not import.
+    T.store.recoveries = [];
+    const offPage = T.fileDetailModel({ artifact: art("h", { owned: true, state: "retained", hold: "recovery:70a9015f567db76ce0183b149c371c84", inspected_at: 5 }), files: mediaFile, total: 1, offset: 0, events: [], preview: null,
+      holding: { id: "70a9015f567db76ce0183b149c371c84", artifact: "h", state: "failed", files: [{}], error: "filesystem: write /processing/recovery/.staging/x/payload/a.mkv: Invalid argument (os error 22)" } });
+    eq(offPage.handoffs.length, 1, "a handoff fetched by id is listed even when the page does not carry it");
+    ok((offPage.stageBlock || "").startsWith("Staging handoff 70a9015f… failed — filesystem: write"), `a failed handoff says so and says cancel (got ${offPage.stageBlock})`);
+    ok(!(offPage.stageBlock || "").includes("Claim and import"), "…not import");
+    const pending = T.fileDetailModel({ artifact: art("h", { owned: true, state: "retained", hold: "recovery:70a9015f567db76ce0183b149c371c84", inspected_at: 5 }), files: mediaFile, total: 1, offset: 0, events: [], preview: null,
+      holding: { id: "70a9015f567db76ce0183b149c371c84", artifact: "h", state: "cancel_pending", files: [{}] } });
+    eq(pending.handoffs[0].cancellable, false, "a cancelling handoff cannot be cancelled twice");
+    ok(T.fileDetailHtml(pending).includes("cancelling…"), "…and says it is cancelling");
+    const unowned = T.fileDetailModel({ artifact: art("u2", { inspected_at: 5 }), files: mediaFile, total: 1, offset: 0, events: [], preview: null });
+    ok(unowned.stageBlock.startsWith("Only an owned folder"), "an unowned folder says adopt first");
+    const reviewHeld = T.fileDetailModel({ artifact: art("r", { owned: true, state: "retained", hold: "review", inspected_at: 5 }), files: mediaFile, total: 1, offset: 0, events: [], preview: null });
+    ok(reviewHeld.stageBlock.includes("release the hold"), "a review hold says release it");
+    const fine = T.fileDetailModel({ artifact: art("ok", { owned: true, state: "retained", hold: null, inspected_at: 5 }), files: mediaFile, total: 1, offset: 0, events: [], preview: null });
+    eq(fine.stageable, true, "owned · unheld · retained can be staged");
+    ok(T.fileDetailHtml(fine).includes('data-action="f-stage"') && T.fileDetailHtml(fine).includes("recovery-file"), "…with checkboxes and the button");
+    routes.set("/api/v1/recoveries/70a9015f567db76ce0183b149c371c84/cancel", { status: 200, body: { id: "70a9015f567db76ce0183b149c371c84", state: "cancelled" } });
+    routes.set("/api/v1/recoveries", { status: 200, body: [] });
+    routes.set("/api/v1/artifacts?", { status: 200, body: { entries: [], total: 0, counts: {}, discovery: null } });
+    doc.getElementById("toasts").children.length = 0;
+    await T.filesClick("f-rec-cancel", { dataset: { recovery: "70a9015f567db76ce0183b149c371c84" }, closest: () => null });
+    ok(seen.some(r => r.url.endsWith("/recoveries/70a9015f567db76ce0183b149c371c84/cancel") && r.method === "POST"), "cancel posts to the handoff");
+    ok(doc.getElementById("toasts").children.some(t => t.children[0].textContent.includes("cancelled")), "…and says so");
+    routes.clear(); seen.length = 0;
+
     // 4. The scan pill: never "queued" forever.
     const now = Date.now();
     eq(T.filesScanModel(null, now).text, "never scanned", "no discovery yet");
