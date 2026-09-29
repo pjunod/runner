@@ -542,3 +542,415 @@ fn stopped_inventory_releases_lock_but_old_handles_cannot_mutate() {
     assert!(db.set_settings(&Settings::default()).is_err());
     assert_eq!(restarted.get(&a.id).unwrap().path, a.path);
 }
+
+// ---- Files tab regressions (field report 2026-09-28) ---------------------
+// A scan used to record a directory and stop: the row said "0 entries · 0 B"
+// for a folder nobody had walked, and the walk itself waited for the 30 s
+// maintenance tick, five folders at a time.
+#[test]
+fn scan_measures_every_discovered_folder_in_one_run() {
+    let (_tmp, db, root) = fixture();
+    for (name, size) in [("alpha", 3usize), ("bravo", 5), ("charlie", 7)] {
+        let dir = root.join(name);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("episode.mkv"), vec![b'x'; size * 1000]).unwrap();
+        std::fs::create_dir(dir.join("subs")).unwrap();
+        std::fs::write(dir.join("subs/en.srt"), b"1\n").unwrap();
+    }
+    let op = db
+        .submit_task(
+            "scan",
+            "installation",
+            "",
+            serde_json::json!({"roots":[root],"excluded":[],"active":[]}),
+        )
+        .unwrap();
+    assert_eq!(op.state, "queued");
+    db.run_tasks().unwrap();
+    assert_eq!(db.operation(&op.id).unwrap().state, "succeeded");
+    let page = db
+        .list_page(&ListQuery {
+            limit: 50,
+            sort: ListSort::Size,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(page.total, 3);
+    let names: Vec<_> = page
+        .rows
+        .iter()
+        .map(|r| {
+            r.artifact
+                .path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        ["charlie", "bravo", "alpha"],
+        "size sort, largest first"
+    );
+    for row in &page.rows {
+        assert!(
+            row.artifact.measured(),
+            "{}: walked at discovery",
+            row.artifact.path.display()
+        );
+        assert!(row.artifact.inspected_at.is_some());
+        assert_eq!(
+            row.files, 2,
+            "regular files only; the subs directory is structure"
+        );
+        assert!(row.bytes >= 3000);
+        assert_eq!(row.artifact.state, "unknown");
+        assert!(
+            row.artifact.files.is_empty(),
+            "the list strips manifests in SQL"
+        );
+    }
+    let full = db.get(&page.rows[0].artifact.id).unwrap();
+    assert_eq!(
+        full.files.len(),
+        3,
+        "the record itself keeps the whole manifest"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_reports_a_folder_it_cannot_measure_without_failing_the_scan() {
+    let (_tmp, db, root) = fixture();
+    let good = root.join("good");
+    std::fs::create_dir(&good).unwrap();
+    std::fs::write(good.join("a.mkv"), b"media").unwrap();
+    let odd = root.join("odd");
+    std::fs::create_dir(&odd).unwrap();
+    // A socket is a special file: the manifest walk refuses it.
+    let _sock = std::os::unix::net::UnixListener::bind(odd.join("ctl.sock")).unwrap();
+    let op = db
+        .submit_task(
+            "scan",
+            "installation",
+            "",
+            serde_json::json!({"roots":[root],"excluded":[],"active":[]}),
+        )
+        .unwrap();
+    db.run_tasks().unwrap();
+    assert_eq!(db.operation(&op.id).unwrap().state, "succeeded");
+    let odd_row = db.for_path(&odd).unwrap().unwrap();
+    assert!(!odd_row.measured());
+    // open(2) refuses a socket (ENXIO) before the walk can even classify it;
+    // whichever layer objects, the reason lands on the record.
+    assert!(
+        !odd_row.error.as_deref().unwrap_or("").is_empty(),
+        "{:?}",
+        odd_row.error
+    );
+    let good_row = db.for_path(&good).unwrap().unwrap();
+    assert!(good_row.measured() && good_row.error.is_none());
+    let attention = db
+        .list_page(&ListQuery {
+            limit: 10,
+            filter: ListFilter::Attention,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        attention.total, 2,
+        "unknown folders need a person either way"
+    );
+}
+
+#[test]
+fn scan_skips_a_root_that_does_not_exist_yet() {
+    let (_tmp, db, root) = fixture();
+    std::fs::create_dir(root.join("present")).unwrap();
+    let op = db
+        .submit_task(
+            "scan",
+            "installation",
+            "",
+            serde_json::json!({"roots":[root.clone(), root.join("failed")],"excluded":[],"active":[]}),
+        )
+        .unwrap();
+    db.run_tasks().unwrap();
+    let op = db.operation(&op.id).unwrap();
+    assert_eq!(op.state, "succeeded", "{:?}", op.error);
+    assert!(db.for_path(&root.join("present")).unwrap().is_some());
+}
+
+#[test]
+fn run_tasks_drains_the_whole_queue_not_five_per_tick() {
+    let (_tmp, db, root) = fixture();
+    let mut ops = Vec::new();
+    for i in 0..12 {
+        ops.push(
+            db.submit_task(
+                "scan",
+                "installation",
+                &format!("scan-{i}"),
+                serde_json::json!({"roots":[root],"excluded":[],"active":[]}),
+            )
+            .unwrap(),
+        );
+    }
+    db.run_tasks().unwrap();
+    for op in ops {
+        assert_eq!(
+            db.operation(&op.id).unwrap().state,
+            "succeeded",
+            "{}",
+            op.id
+        );
+    }
+}
+
+#[test]
+fn list_page_filters_sorts_searches_and_counts() {
+    let (_tmp, db, root) = fixture();
+    let owned = parked(&db, &root); // parked_failed, owned
+    for name in ["Archer.S01", "Bates.Motel.S05", "Fright.Night"] {
+        let dir = root.join(name);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("x.mkv"), vec![b'x'; name.len() * 100]).unwrap();
+        let a = db.discover(&root, &dir, false).unwrap();
+        db.inspect(&a.id).unwrap();
+    }
+    let gone = root.join("gone");
+    std::fs::create_dir(&gone).unwrap();
+    let gone_a = db.discover(&root, &gone, false).unwrap();
+    std::fs::remove_dir(&gone).unwrap();
+    db.reconcile_missing().unwrap();
+    assert_eq!(db.get(&gone_a.id).unwrap().state, "source_gone");
+
+    let live = db
+        .list_page(&ListQuery {
+            limit: 100,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(live.total, 4);
+    assert_eq!(
+        live.counts,
+        ListCounts {
+            all: 5,
+            live: 4,
+            attention: 3,
+            owned: 1,
+            cleared: 1,
+            live_bytes: live.counts.live_bytes
+        }
+    );
+    assert!(live.counts.live_bytes > 0);
+    let by_name = db
+        .list_page(&ListQuery {
+            limit: 100,
+            sort: ListSort::Name,
+            ..Default::default()
+        })
+        .unwrap();
+    let names: Vec<_> = by_name
+        .rows
+        .iter()
+        .map(|r| {
+            r.artifact
+                .path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        ["Archer.S01", "Bates.Motel.S05", "Fright.Night", "job"]
+    );
+    let owned_only = db
+        .list_page(&ListQuery {
+            limit: 100,
+            filter: ListFilter::Owned,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(owned_only.rows.len(), 1);
+    assert_eq!(owned_only.rows[0].artifact.id, owned.id);
+    let cleared = db
+        .list_page(&ListQuery {
+            limit: 100,
+            filter: ListFilter::Cleared,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(cleared.rows[0].artifact.id, gone_a.id);
+    let search = db
+        .list_page(&ListQuery {
+            limit: 100,
+            filter: ListFilter::All,
+            q: "bates".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(search.total, 1, "case-insensitive substring");
+    let wild = db
+        .list_page(&ListQuery {
+            limit: 100,
+            filter: ListFilter::All,
+            q: "%".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(wild.total, 0, "LIKE metacharacters are literal");
+    let paged = db
+        .list_page(&ListQuery {
+            limit: 2,
+            offset: 2,
+            sort: ListSort::Name,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(paged.total, 4);
+    assert_eq!(paged.rows.len(), 2);
+}
+
+// Review finding: the list stripped the manifest in SQL and then asked the
+// stripped record whether it had been measured — every folder Runner itself
+// wrote (finalized, never "inspected") came back unmeasured.
+#[test]
+fn list_reports_runner_written_payloads_as_measured() {
+    let (_tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    assert!(
+        db.get(&a.id).unwrap().inspected_at.is_some(),
+        "finish measures the payload"
+    );
+    let page = db
+        .list_page(&ListQuery {
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(page.rows.len(), 1);
+    assert!(page.rows[0].measured);
+    assert_eq!(page.rows[0].files, 1);
+    // An older record: manifest present, no inspected_at. Still measured.
+    let mut old = db.get(&a.id).unwrap();
+    old.inspected_at = None;
+    save_artifact(&db.db.lock().unwrap(), &old).unwrap();
+    let page = db
+        .list_page(&ListQuery {
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        page.rows[0].measured,
+        "a manifest is measurement, whoever wrote it"
+    );
+}
+
+#[test]
+fn scan_does_not_rewalk_a_folder_whose_walk_already_failed() {
+    let (_tmp, db, root) = fixture();
+    let odd = root.join("odd");
+    std::fs::create_dir(&odd).unwrap();
+    let a = db.discover(&root, &odd, false).unwrap();
+    db.note_error(&a.id, "special file: ctl.sock").unwrap();
+    let before = db.get(&a.id).unwrap();
+    db.submit_task(
+        "scan",
+        "installation",
+        "again",
+        serde_json::json!({"roots":[root],"excluded":[],"active":[]}),
+    )
+    .unwrap();
+    db.run_tasks().unwrap();
+    let after = db.get(&a.id).unwrap();
+    assert_eq!(
+        after.revision, before.revision,
+        "the periodic scan leaves it to Inspect"
+    );
+    assert!(after.error.is_some());
+    db.inspect(&a.id).unwrap();
+    assert!(
+        db.get(&a.id).unwrap().error.is_none(),
+        "a manual inspect clears the error"
+    );
+}
+
+#[test]
+fn compact_keeps_the_size_of_a_cleared_payload() {
+    let (_tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    let op = db.request_delete(&a.id, a.revision, "gone", 0).unwrap();
+    db.execute_delete(&op.id).unwrap();
+    let mut old = db.get(&a.id).unwrap();
+    old.updated_at = now() - 100 * 86400;
+    save_artifact(&db.db.lock().unwrap(), &old).unwrap();
+    assert_eq!(db.compact().unwrap(), 1);
+    let page = db
+        .list_page(&ListQuery {
+            limit: 10,
+            filter: ListFilter::Cleared,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(page.rows[0].artifact.files.is_empty() || page.rows[0].files > 0);
+    assert!(
+        page.rows[0].bytes > 0,
+        "the summary survives manifest retirement"
+    );
+    assert_eq!(
+        db.get(&a.id).unwrap().files.len(),
+        0,
+        "…while the manifest is gone"
+    );
+}
+
+#[test]
+fn a_closed_inventory_leaves_queued_tasks_for_the_next_boot() {
+    let (_tmp, db, root) = fixture();
+    let op = db
+        .submit_task(
+            "scan",
+            "installation",
+            "later",
+            serde_json::json!({"roots":[root],"excluded":[],"active":[]}),
+        )
+        .unwrap();
+    db.close().unwrap();
+    db.run_tasks().unwrap();
+    assert_eq!(db.operation(&op.id).unwrap().state, "queued");
+}
+
+#[test]
+fn summary_columns_backfill_for_an_inventory_written_before_they_existed() {
+    let (tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    let (files, bytes) = db.get(&a.id).unwrap().summary();
+    assert!(files == 1 && bytes > 0);
+    db.close().unwrap();
+    drop(db);
+    let path = tmp.path().join("state/artifacts.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS artifacts_bytes;
+             ALTER TABLE artifacts DROP COLUMN files;
+             ALTER TABLE artifacts DROP COLUMN bytes;",
+        )
+        .unwrap();
+    }
+    let reopened = Inventory::open(&tmp.path().join("state")).unwrap();
+    let page = reopened
+        .list_page(&ListQuery {
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!((page.rows[0].files, page.rows[0].bytes), (files, bytes));
+}

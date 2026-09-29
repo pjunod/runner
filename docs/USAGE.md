@@ -52,6 +52,23 @@ switch. Save and restart to apply enable changes; normal configuration
 validation still rejects unsupported combinations such as torrent and cluster
 execution together. Seeding controls and queue sections have no extra gate.
 
+**Files.** One table of every folder under the download roots — the
+folders Runner wrote and the ones it found — filtered by **All / Needs
+review / Owned / Cleared** (each chip carries the server's count), searched
+by name, sorted by recent change, size, file count or name, and paged on the
+server (25–200 rows; the pager sits above and below the table). **Scan
+folders** walks the configured roots for folders Runner does not know about
+and measures each one as it is found; the button holds and the pill counts
+up until the scan finishes, then the result is announced. A row whose files
+and size read `—` has not been measured yet — inspect walks it — and a row
+never shows a zero it did not measure. **details** opens the folder's panel
+as a row directly beneath it: full path, state, ownership, hold, the file
+list (paged, with checkboxes for a Curator recovery copy), and the actions
+its state allows — inspect, adopt & keep, release review hold, keep /
+remove keep, delete (8-second Undo). Every background walk, delete and
+staging run is watched to completion and its outcome toasted; nothing
+waits for the daemon's 30-second maintenance tick.
+
 **Torrent lifecycle.** Ready torrents share in **Seeding** and move to
 **Completed** when seeding stops. An idle seed is still available to peers;
 zero upload speed does not put it back in Waiting. Metadata retrieval and
@@ -328,6 +345,14 @@ GET  /api/v1/history
 POST /api/v1/history/{id}/actions/{action}  hide|restore|delete|delete-files|requeue
 GET  /api/v1/events                 SSE stream of queue changes
 GET  /api/v1/logs                   recent daemon log
+GET  /api/v1/artifacts              folder inventory: ?filter=live|attention|owned|cleared|all
+                                    &sort=updated|size|files|name &q=<name> &offset &limit(≤200)
+                                    → entries[{artifact,files,bytes,measured,earliest_expiry}],
+                                      total, counts{live,attention,owned,cleared,all,live_bytes}, discovery
+POST /api/v1/artifacts/scan         walk the configured roots (202, runs immediately)
+GET  /api/v1/artifacts/{id}/files   manifest page (200 entries) + file_count, bytes, measured
+POST /api/v1/artifacts/{id}/inspect|adopt|release-review|retention|delete
+GET  /api/v1/artifact-operations/{id}   state of a scan/inspect/delete/stage operation
 GET  /metrics                       Prometheus metrics
 GET  /healthz                       liveness (always unauthenticated)
 ```

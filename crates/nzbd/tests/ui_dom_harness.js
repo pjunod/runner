@@ -2145,6 +2145,231 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     routes.clear();
   }
 
+  // --- Files tab (field report 2026-09-28) ------------------------------------
+  // After a scan the old list showed "0 entries · 0 B" for folders nobody had
+  // walked, Inspect rendered its panel at the foot of the page, and the queued
+  // walk waited for a 30 s tick. Each of those is pinned here.
+  {
+    const doc = sandbox.document;
+    const art = (id, extra) => ({
+      id, generation: "g", revision: 1, job: null,
+      path: "/working/monarr/completed/" + id, root: "/working/monarr/completed",
+      root_identity: {}, identity: {}, state: "unknown", owned: false, keep: true, hold: "review",
+      created_at: 1790636080, updated_at: 1790636080, retention_seconds: 0, deadline: null,
+      eligible_seconds: 0, files: [], error: null, inspected_at: null, ...extra,
+    });
+    const entry = (id, extra, files = 0, bytes = 0, measured = false) =>
+      ({ artifact: art(id, extra), files, bytes, measured, earliest_expiry: null });
+
+    // 1. A folder that has not been walked is "—", never a zero.
+    const raw = T.fileRowModel(entry("Fright.Night.1985"));
+    eq(raw.files, "—", "unmeasured file count is a dash");
+    eq(raw.size, "—", "unmeasured size is a dash");
+    eq(raw.measured, false, "…and the model says why");
+    eq(raw.name, "Fright.Night.1985", "the row shows the folder name");
+    eq(raw.sub, "/working/monarr/completed", "…with its parent underneath");
+    eq(raw.st, "unknown", "state pill");
+    eq(raw.stCls, "st warn", "an unknown folder needs a person, so it is amber");
+    eq(raw.hold, "on review hold", "the hold is spelled out");
+    eq(raw.ret, "never deleted automatically", "retention explains what will NOT happen");
+    eq(raw.owner, "not owned", "…and whose it is");
+    eq(raw.inspectLabel, "inspect", "a fresh folder offers inspect");
+    const walked = T.fileRowModel(entry("Archer.S03E04", { inspected_at: 1790636100 }, 2, 6347221425, true));
+    eq(walked.files, "2", "measured count");
+    eq(walked.size, "5.9 GiB", "measured size");
+    eq(walked.inspectLabel, "re-inspect", "a measured folder offers a re-walk");
+    const empty = T.fileRowModel(entry("Empty.Dir", { inspected_at: 1790636100 }, 0, 0, true));
+    eq(empty.files, "0", "a measured empty folder is honestly zero");
+    const owned = T.fileRowModel({ ...entry("Just.Friends.2018", { state: "completed", owned: true, keep: false, hold: null }, 2, 100, true), earliest_expiry: 1790700000 });
+    eq(owned.stCls, "st ok", "an owned completed payload is green");
+    ok(owned.ret.startsWith("expires "), `retention names the expiry (got ${owned.ret})`);
+    const kept = T.fileRowModel(entry("Kept", { state: "retained", owned: true, keep: true, hold: null }, 1, 1, true));
+    eq(kept.ret, "keep indefinitely", "keep reads as keep");
+    const active = T.fileRowModel(entry("Live", { state: "active" }));
+    eq(active.inspectHidden, true, "a folder still being written cannot be walked");
+    eq(active.st, "downloading", "active reads as downloading");
+    const gone = T.fileRowModel(entry("Gone", { state: "source_gone", updated_at: Math.floor(Date.now() / 1000) - 120 }));
+    eq(gone.rowCls, "hidden-row", "cleared records are dimmed");
+    ok(gone.ret.startsWith("gone "), "…and say when they went");
+    const broken = T.fileRowModel(entry("Odd", { error: "special file: ctl.sock" }));
+    eq(broken.err, "special file: ctl.sock", "a walk failure rides on the row instead of a zero");
+
+    // 2. Rendering: rows keep identity across refreshes, and the panel opens
+    //    UNDER its row, not at the end of the list.
+    const body = doc.getElementById("files-body");
+    body.children.length = 0; body.__rows = undefined;
+    const entries = ["a", "b", "c", "d"].map(id => entry(id, { inspected_at: 1 }, 1, 1024, true));
+    T.store.files = { entries, total: 4, counts: { live: 4, attention: 4, owned: 0, cleared: 0, all: 4 }, discovery: null };
+    T.filesView.total = 4; T.filesView.page = 0;
+    T.renderFiles();
+    eq(body.children.length, 4, "one row per folder");
+    eq(body.children[0].children[2].className, "num", "a measured count keeps its numeric column class");
+    const rowsBefore = body.children.slice();
+    resetCounts();
+    T.renderFiles();
+    eq(body.children.length, 4, "a second render adds nothing");
+    ok(rowsBefore.every((n, i) => body.children[i] === n), "rows keep identity across refreshes (clicks survive)");
+    T.setFilesDetailForTest("b", { artifact: art("b", { inspected_at: 1 }), files: [{ path: "ep.mkv", identity: { bytes: 1024, directory: false } }], total: 1, offset: 0, events: [], preview: null });
+    T.renderFiles();
+    eq(body.children.length, 5, "the open folder adds exactly one panel row");
+    eq(body.children[1].dataset.artifact, "b", "…under the row you clicked");
+    eq(body.children[2].className, "detail-tr", "…as a detail row, not at the foot of the page");
+    ok(body.children[1].className.includes("f-open"), "the open row is lit");
+    const panel = body.children[2].children[0];
+    ok(panel.innerHTML.includes("adopt &amp; keep"), "a measured unowned folder can be adopted");
+    ok(panel.innerHTML.includes("ep.mkv"), "the file list is in the panel");
+    const html1 = panel.innerHTML;
+    T.renderFiles();
+    eq(panel.innerHTML, html1, "an unchanged panel is not re-rendered (checkboxes survive the 5 s tick)");
+    ok(body.children[2] === panel.parentNode, "…and it is the same node");
+    T.setFilesDetailForTest(null, null);
+    T.renderFiles();
+    eq(body.children.length, 4, "closing removes the panel");
+
+    // 3. The panel model: what is offered depends on state.
+    const unmeasuredPanel = T.fileDetailModel({ artifact: art("u"), files: [], total: 0, offset: 0, events: [], preview: null });
+    ok(!unmeasuredPanel.buttons.some(b => b.action === "f-adopt"), "an unmeasured folder cannot be adopted yet");
+    eq(unmeasuredPanel.noteCls, "warn", "…and the panel says so");
+    ok(unmeasuredPanel.buttons.some(b => b.action === "f-inspect"), "…but it can be inspected");
+    const ownedPanel = T.fileDetailModel({ artifact: art("o", { owned: true, state: "retained", hold: null, keep: true, inspected_at: 5 }), files: [], total: 0, offset: 0, events: [], preview: null });
+    const acts = ownedPanel.buttons.map(b => b.action);
+    ok(acts.includes("f-delete") && acts.includes("f-keep"), `an owned folder can be kept or deleted (got ${acts})`);
+    ok(!acts.includes("f-adopt"), "…and not adopted twice");
+    T.filesSelections.set("o", new Set(["x.mkv"]));
+    const selPanel = T.fileDetailModel({ artifact: art("o", { owned: true, state: "retained", hold: null, keep: true, inspected_at: 5 }), files: [{ path: "x.mkv", identity: { bytes: 5, directory: false } }], total: 1, offset: 0, events: [], preview: null });
+    eq(selPanel.selected, 1, "a ticked file counts as selected");
+    ok(T.fileDetailHtml(selPanel).includes('value="x.mkv" ' + ' checked'), "…and re-renders ticked");
+    T.filesSelections.clear();
+    const paged = T.fileDetailModel({ artifact: art("p", { inspected_at: 5 }), files: Array.from({ length: 200 }, (_, i) => ({ path: "f" + i, identity: { bytes: 1, directory: false } })), total: 450, offset: 200, events: [], preview: null });
+    ok(T.fileDetailHtml(paged).includes("201–400 of 450"), "the file list pages inside the panel");
+
+    // 4. The scan pill: never "queued" forever.
+    const now = Date.now();
+    eq(T.filesScanModel(null, now).text, "never scanned", "no discovery yet");
+    ok(T.filesScanModel({ state: "queued", created_at: 1 }, now).busy, "a queued scan is busy");
+    const failed = T.filesScanModel({ state: "failed", created_at: Math.floor(now / 1000) - 60, error: "/x: not found" }, now);
+    ok(failed.cls.includes("bad") && failed.tip === "/x: not found", "a failed scan is red and carries its reason");
+    T.filesWatch.set("op1", { kind: "scan", artifact: null, since: now - 12000 });
+    eq(T.filesScanModel({ state: "succeeded", created_at: 1 }, now).text, "scanning… 12 s", "a watched scan counts up");
+    T.filesWatch.set("op2", { kind: "inspect", artifact: "a", since: now });
+    const measuring = T.fileRowModel(entry("a"));
+    eq(measuring.inspectLabel, "measuring…", "a watched inspect shows on its row");
+    eq(measuring.inspectDisabled, true, "…and cannot be double-clicked");
+    T.filesWatch.clear();
+
+    // 5. The list is server-paged: filter, sort, search and size are on the wire.
+    routes.clear(); seen.length = 0;
+    const page = (n, first, total) => ({ status: 200, body: {
+      entries: Array.from({ length: n }, (_, i) => entry("row" + (first + i), { inspected_at: 1 }, 1, 1, true)),
+      total, counts: { live: total, attention: 0, owned: total, cleared: 0, all: total }, discovery: { state: "succeeded", created_at: 1 },
+    } });
+    routes.set("/api/v1/recoveries", { status: 200, body: [] });
+    routes.set("/api/v1/artifacts?", page(50, 1, 186));
+    T.setFilesDetailForTest(null, null);
+    T.filesView.page = 0; T.filesView.filter = "live"; T.filesView.sort = "updated"; T.filesView.q = "";
+    await T.setFilesPageSize(50);
+    let asked = seen.filter(r => r.url.includes("/api/v1/artifacts?")).map(r => r.url);
+    eq(asked.length, 1, "one list request");
+    ok(asked[0].includes("limit=50") && asked[0].includes("offset=0") && asked[0].includes("filter=live") && asked[0].includes("sort=updated"),
+      `size, offset, filter and sort are on the wire (got ${asked[0]})`);
+    eq(T.filesView.total, 186, "total comes from the server");
+    eq(T.filesPages(), 4, "186 at 50/page is four pages");
+    eq(body.children.length, 50, "fifty rows, no more");
+    const cnt = doc.getElementById("files-cnt-live");
+    eq(cnt.textContent, "186", "the filter chip carries the server's count");
+    seen.length = 0;
+    routes.set("/api/v1/artifacts?", page(50, 101, 186));
+    await T.setFilesPage(2);
+    asked = seen.filter(r => r.url.includes("/api/v1/artifacts?")).map(r => r.url);
+    ok(asked[0].includes("offset=100"), `page 3 asks for offset 100 (got ${asked[0]})`);
+    seen.length = 0;
+    await T.setFilesFilter("attention");
+    asked = seen.filter(r => r.url.includes("/api/v1/artifacts?")).map(r => r.url);
+    ok(asked[0].includes("filter=attention") && asked[0].includes("offset=0"), "a filter change restarts at page 1");
+    seen.length = 0;
+    await T.setFilesQuery("bates motel");
+    asked = seen.filter(r => r.url.includes("/api/v1/artifacts?")).map(r => r.url);
+    ok(asked[0].includes("q=bates%20motel"), `the search is on the wire, encoded (got ${asked[0]})`);
+    seen.length = 0;
+    await T.setFilesSort("size");
+    asked = seen.filter(r => r.url.includes("/api/v1/artifacts?")).map(r => r.url);
+    ok(asked[0].includes("sort=size"), "sort is on the wire");
+    // A page that empties under you (the last folder on it was deleted) steps back.
+    let call = 0;
+    routes.set("/api/v1/artifacts?", () => { call++; return call === 1 ? page(0, 0, 30) : page(30, 1, 30); });
+    T.filesView.page = 5;
+    await T.refreshFiles(true);
+    eq(call, 2, "an empty page past the end is retried");
+    eq(T.filesView.page, 0, "…from the last page that exists");
+    // Nothing is inspected in a way that lets a stale click through: the
+    // page never asks for more than one page of manifests.
+    ok(!seen.some(r => r.url.includes("/files?")), "the list never fetches manifests it is not showing");
+
+    // 5b. A daemon that answers the list with an error renders an empty
+    //     state, not a TypeError on every 5 s poll.
+    routes.set("/api/v1/artifacts?", { status: 503, body: { error: "restarting" } });
+    T.store.files = null;
+    await T.refreshFiles(true);
+    eq(T.store.files, "off", "a non-OK list marks the inventory unavailable");
+    eq(body.children.length, 1, "…as one empty row");
+    ok(body.children[0].children[0].textContent.includes("unavailable"), "…that says so");
+    // 5c. A slow answer to an older query never overwrites a newer one.
+    let release;
+    routes.set("/api/v1/artifacts?", (url) => url.includes("q=slow")
+      ? new Promise(res => { release = () => res(page(1, 900, 1)); })
+      : page(2, 1, 2));
+    const slow = T.setFilesQuery("slow");
+    await T.setFilesQuery("fast");
+    eq(T.filesView.total, 2, "the newer query landed");
+    release(); await slow;
+    eq(T.filesView.total, 2, "…and the older, slower answer was dropped");
+    eq(body.children.length, 2, "rows are the newer query's");
+
+    // 6. Scan and inspect are watched to completion, not fired and forgotten.
+    const timers = [];
+    const realTimeout = sandbox.setTimeout;
+    sandbox.setTimeout = (fn, ms) => { timers.push(fn); return timers.length; };
+    let opState = "queued";
+    routes.set("/api/v1/artifacts/scan", { status: 202, body: { id: "scan-1", kind: "scan", state: "queued" } });
+    routes.set("/api/v1/artifact-operations/scan-1", () => ({ status: 200, body: { id: "scan-1", kind: "scan", state: opState } }));
+    routes.set("/api/v1/artifacts?", page(3, 1, 3));
+    seen.length = 0; timers.length = 0;
+    await T.filesClick("f-scan", { dataset: {}, closest: () => null });
+    ok(seen.some(r => r.url.endsWith("/api/v1/artifacts/scan") && r.method === "POST"), "scan is requested");
+    eq(T.filesWatch.size, 1, "…and watched");
+    eq(doc.getElementById("files-scan").disabled, true, "the scan button is held while a scan runs");
+    ok(doc.getElementById("files-scan-state").textContent.startsWith("scanning"), "the pill says scanning");
+    eq(timers.length, 1, "a poll is scheduled");
+    await timers.shift()();
+    eq(T.filesWatch.size, 1, "still queued: still watched");
+    eq(timers.length, 1, "…and polled again");
+    opState = "succeeded"; seen.length = 0;
+    await timers.shift()();
+    eq(T.filesWatch.size, 0, "a finished scan is no longer watched");
+    ok(seen.some(r => r.url.includes("/api/v1/artifacts?")), "…and the list refreshes itself");
+    eq(doc.getElementById("files-scan").disabled, false, "the button is released");
+    const toasts = doc.getElementById("toasts");
+    ok(toasts.children.some(t => t.children[0].textContent.startsWith("Scan finished")), "the result is announced");
+    routes.set("/api/v1/artifacts/row1/inspect", { status: 202, body: { id: "insp-1", kind: "inspect", state: "queued" } });
+    let inspPolls = 0;
+    routes.set("/api/v1/artifact-operations/insp-1", () => ++inspPolls === 1
+      ? { status: 503, body: {} }
+      : { status: 200, body: { id: "insp-1", kind: "inspect", state: "failed", error: "payload identity changed; review required" } });
+    timers.length = 0; toasts.children.length = 0;
+    await T.filesClick("f-inspect", { dataset: { artifact: "row1" }, closest: () => null });
+    eq(T.fileRowModel(entry("row1")).inspectLabel, "measuring…", "the row shows the walk in flight");
+    await timers.shift()();
+    eq(T.filesWatch.size, 1, "a transport error mid-poll keeps the watch alive");
+    ok(!toasts.children.length, "…and does not report the task as failed");
+    await timers.shift()();
+    ok(toasts.children.some(t => t.children[0].textContent.includes("payload identity changed")),
+      "a failed walk says why, in the daemon's words");
+    eq(T.filesWatch.size, 0, "…and stops being watched");
+    sandbox.setTimeout = realTimeout;
+    routes.clear(); seen.length = 0;
+    T.store.files = null; T.setFilesDetailForTest(null, null);
+  }
+
   if (failures.length) {
     console.error("UI DOM FAILURES:");
     for (const f of failures) console.error("  - " + f);

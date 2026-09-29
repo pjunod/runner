@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use nzbd_state::artifacts::{Error, Inventory, Receipt, Settings};
+use nzbd_state::artifacts::{Error, Inventory, ListFilter, ListQuery, ListSort, Receipt, Settings};
 use serde::Deserialize;
 use serde_json::json;
 use std::{path::PathBuf, sync::Arc};
@@ -78,10 +78,86 @@ struct Page {
     offset: usize,
     #[serde(default)]
     after: i64,
+    /// Page size, 1..=200 (default 50).
+    limit: Option<usize>,
+    /// `live` (default) · `attention` · `owned` · `cleared` · `all`.
+    filter: Option<ListFilter>,
+    /// `updated` (default) · `size` · `files` · `name`.
+    sort: Option<ListSort>,
+    /// Case-insensitive substring of the folder path.
+    #[serde(default)]
+    q: String,
+}
+/// Run whatever is queued right now, off the request thread. The 30 s
+/// maintenance tick remains the safety net; a click should not wait for it.
+fn kick(db: Arc<Inventory>) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = db.run_tasks() {
+            tracing::warn!(error = %e, "file inventory task run failed");
+        }
+    });
+}
+/// A delete or prune admitted with an undo window is runnable only once the
+/// window closes; run it then, not at the next tick up to 30 s later.
+fn kick_after(db: Arc<Inventory>, seconds: u64) {
+    tokio::spawn(async move {
+        tokio::time::sleep(
+            std::time::Duration::from_secs(seconds) + std::time::Duration::from_millis(250),
+        )
+        .await;
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = db.run_due_deletes() {
+                tracing::warn!(error = %e, "file inventory delete run failed");
+            }
+            if let Err(e) = db.run_tasks() {
+                tracing::warn!(error = %e, "file inventory task run failed");
+            }
+        })
+        .await;
+    });
 }
 async fn list(State(st): State<ApiState>, Query(p): Query<Page>) -> Response {
     let db = st.engine.artifacts();
-    work(move||{let mut rows=db.list_visible(p.offset,100,p.include_terminal)?;let now=nzbd_state::artifacts::now();let mut out=Vec::new();for a in &mut rows {let total=a.files.len();let bytes=a.files.iter().filter(|f|!f.identity.directory).map(|f|f.identity.bytes).sum::<u64>();a.files.clear();out.push(json!({"artifact":a,"files":total,"bytes":bytes,"earliest_expiry":a.earliest_expiry(now)}));}Ok(json!({"entries":out,"offset":p.offset,"limit":100,"discovery":db.discovery_status()?}))}).await
+    let query = ListQuery {
+        offset: p.offset,
+        limit: p.limit.unwrap_or(50).clamp(1, 200),
+        // `include_terminal` is the pre-filter spelling; an explicit filter wins.
+        filter: p.filter.unwrap_or(if p.include_terminal {
+            ListFilter::All
+        } else {
+            ListFilter::Live
+        }),
+        sort: p.sort.unwrap_or_default(),
+        q: p.q,
+    };
+    work(move || {
+        let page = db.list_page(&query)?;
+        let now = nzbd_state::artifacts::now();
+        let entries: Vec<_> = page
+            .rows
+            .into_iter()
+            .map(|row| {
+                json!({
+                    "files": row.files,
+                    "bytes": row.bytes,
+                    "measured": row.measured,
+                    "earliest_expiry": row.artifact.earliest_expiry(now),
+                    "artifact": row.artifact,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "entries": entries,
+            "offset": query.offset,
+            "limit": query.limit,
+            "total": page.total,
+            "counts": page.counts,
+            "filter": query.filter,
+            "sort": query.sort,
+            "discovery": db.discovery_status()?,
+        }))
+    })
+    .await
 }
 async fn detail(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
     let db = st.engine.artifacts();
@@ -98,7 +174,21 @@ async fn files(
     Query(p): Query<Page>,
 ) -> Response {
     let db = st.engine.artifacts();
-    work(move||{let a=db.get(&id)?;Ok(json!({"revision":a.revision,"total":a.files.len(),"files":a.files.into_iter().skip(p.offset).take(200).collect::<Vec<_>>()}))}).await
+    work(move || {
+        let a = db.get(&id)?;
+        let (files, bytes) = a.summary();
+        Ok(json!({
+            "revision": a.revision,
+            // `total` counts manifest entries (directories included) and pages
+            // the list; `files`/`bytes` are the payload the row reports.
+            "total": a.files.len(),
+            "file_count": files,
+            "bytes": bytes,
+            "measured": a.measured(),
+            "files": a.files.into_iter().skip(p.offset).take(200).collect::<Vec<_>>(),
+        }))
+    })
+    .await
 }
 async fn events(
     State(st): State<ApiState>,
@@ -119,7 +209,10 @@ async fn cancel(State(st): State<ApiState>, Path(id): Path<String>) -> Response 
 async fn inspect(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
     let db = st.engine.artifacts();
     match db.submit_task("inspect", &id, "", json!({})) {
-        Ok(op) => (StatusCode::ACCEPTED, Json(op)).into_response(),
+        Ok(op) => {
+            kick(db);
+            (StatusCode::ACCEPTED, Json(op)).into_response()
+        }
         Err(e) => failure(e),
     }
 }
@@ -176,12 +269,17 @@ async fn delete(
         return response;
     }
     let db = st.engine.artifacts();
+    let runner = db.clone();
+    let undo = body.undo_seconds;
     match tokio::task::spawn_blocking(move || {
         db.request_delete(&id, body.revision, &body.idempotency_key, body.undo_seconds)
     })
     .await
     {
-        Ok(Ok(op)) => (StatusCode::ACCEPTED, Json(op)).into_response(),
+        Ok(Ok(op)) => {
+            kick_after(runner, undo);
+            (StatusCode::ACCEPTED, Json(op)).into_response()
+        }
         Ok(Err(e)) => failure(e),
         Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
     }
@@ -283,7 +381,10 @@ async fn scan(State(st): State<ApiState>) -> Response {
     }
     let request = scan_request(&cfg, &db, active);
     match db.submit_task("scan", "installation", "", request) {
-        Ok(op) => (StatusCode::ACCEPTED, Json(op)).into_response(),
+        Ok(op) => {
+            kick(db);
+            (StatusCode::ACCEPTED, Json(op)).into_response()
+        }
         Err(e) => failure(e),
     }
 }
@@ -430,7 +531,119 @@ async fn prune_source(State(st): State<ApiState>, Path(id): Path<String>) -> Res
         return response;
     }
     match db.submit_task("prune", &r.artifact, "", json!({"recovery":id})) {
-        Ok(op) => (StatusCode::ACCEPTED, Json(op)).into_response(),
+        Ok(op) => {
+            // Prune carries a fixed 8 s undo window (tasks.rs).
+            kick_after(
+                db,
+                op.not_before.saturating_sub(op.created_at).max(0) as u64,
+            );
+            (StatusCode::ACCEPTED, Json(op)).into_response()
+        }
         Err(e) => failure(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http_body_util::BodyExt;
+    use nzbd_engine::{Engine, EngineConfig, Tuning};
+    use tower::util::ServiceExt;
+
+    async fn get(engine: &nzbd_engine::EngineHandle, uri: &str) -> (u16, serde_json::Value) {
+        let response = crate::router(engine.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    // Field report 2026-09-28: after a scan the Files tab showed every folder
+    // as "0 entries · 0 B", and Inspect queued work for a 30 s tick. The list
+    // now says whether a row was measured, carries totals and per-view
+    // counts, and an inspect runs as soon as it is admitted.
+    #[tokio::test]
+    async fn list_reports_measurement_counts_and_inspect_runs_without_the_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            tmp.path().join("state"),
+            tmp.path().join("dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let root = tmp.path().join("dest");
+        std::fs::create_dir_all(&root).unwrap();
+        let folder = root.join("Some.Show.S01E01");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("ep.mkv"), vec![b'x'; 4096]).unwrap();
+        let a = engine.artifacts().discover(&root, &folder, false).unwrap();
+
+        let (status, page) = get(&engine, "/api/v1/artifacts?filter=attention&limit=10").await;
+        assert_eq!(status, 200);
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["limit"], 10);
+        assert_eq!(page["counts"]["attention"], 1);
+        assert_eq!(page["counts"]["owned"], 0);
+        assert_eq!(
+            page["entries"][0]["measured"], false,
+            "discovered, not walked"
+        );
+        assert_eq!(page["entries"][0]["files"], 0);
+        assert_eq!(
+            page["entries"][0]["artifact"]["files"]
+                .as_array()
+                .map(Vec::len),
+            Some(0),
+            "manifest stripped in SQL"
+        );
+
+        let response = crate::router(engine.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/artifacts/{}/inspect", a.id))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 202);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let op: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let op_id = op["id"].as_str().unwrap().to_owned();
+        // The kick runs off-thread; well under a second, never 30 of them.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (_, op) = get(&engine, &format!("/api/v1/artifact-operations/{op_id}")).await;
+            if op["state"] == "succeeded" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "inspect never ran: {op}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let (_, page) = get(&engine, "/api/v1/artifacts?sort=size&q=some.show").await;
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["entries"][0]["measured"], true);
+        assert_eq!(page["entries"][0]["files"], 1);
+        assert_eq!(page["entries"][0]["bytes"], 4096);
+        let (_, none) = get(&engine, "/api/v1/artifacts?q=nomatch").await;
+        assert_eq!(none["total"], 0);
+        assert_eq!(
+            none["counts"]["live"], 1,
+            "counts describe the inventory, not the search"
+        );
+        engine.shutdown().await;
     }
 }

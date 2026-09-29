@@ -21,18 +21,28 @@ holds extend retention. Zero days means indefinitely. Removing Keep or applying
 a changed policy starts a fresh period. Existing unknown folders never acquire
 retroactive expiry merely because automation is enabled.
 
-In **Files**, request a scan, open a folder and inspect it. Scans run as durable
-operations; failures and limits remain visible. Adopt unknown files only after
-reviewing the file list. Adoption enables Keep. Newly added or replaced content
-revokes ownership when inspected. A reviewed hold can be released explicitly;
-active recovery claims cannot be released that way.
+In **Files**, request a scan. Scans run as durable operations and start the
+moment they are admitted (the 30-second maintenance tick is only the safety
+net); a scan measures every folder it discovers, so a discovered row carries
+its file count and size straight away. A row showing `—` has not been
+measured — a walk failed and the reason sits on the row, or the folder was
+recorded by an older build — and **inspect** walks it. A root that does not
+exist yet (the failed directory before the first parked failure) is skipped,
+not a scan failure. Open a folder's **details**; adopt unknown files only
+after reviewing the file list. Adoption enables Keep. Newly added or replaced
+content revokes ownership when inspected. A reviewed hold can be released
+explicitly; active recovery claims cannot be released that way. The list is
+filtered (**Needs review** = live rows that are unowned, held or in error),
+searched, sorted and paged on the server; the counts on the filter chips
+describe the whole inventory, not the current search.
 
 **Preview retention for existing failures** shows up to 1,000 exact IDs and
 revisions. Apply checks the whole selection in one transaction. A changed row
 requires another preview. Kept, held, unknown and unchanged rows are excluded.
 Repeat the preview to process another batch if necessary.
 
-Manual Files deletion has an eight-second Undo window. Native and compatibility
+Manual Files deletion has an eight-second Undo window, and the deletion runs
+as soon as the window closes. Native and compatibility
 callers that request terminal deletion do not add that delay. An existing UI
 Undo window is preserved. A pending operation is never reported as HTTP success;
 retry the same request. Transient deletion failures retry after 1 minute,
