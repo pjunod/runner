@@ -67,7 +67,14 @@ list (paged, with checkboxes for a Curator recovery copy), and the actions
 its state allows — inspect, adopt & keep, release review hold, keep /
 remove keep, delete (8-second Undo). Every background walk, delete and
 staging run is watched to completion and its outcome toasted; nothing
-waits for the daemon's 30-second maintenance tick.
+waits for the daemon's 30-second maintenance tick. A recovery copy for
+Curator can be staged only from an owned, unheld folder in a settled state;
+when that is not the case the panel says which precondition is missing
+instead of offering the button, and lists the folder's own handoffs (with
+**cancel handoff**) — a folder with an open handoff is held until Curator's
+import receipt arrives or the handoff is cancelled. See
+[FILE_LIFECYCLE_OPERATIONS.md §2](FILE_LIFECYCLE_OPERATIONS.md) for the
+whole recovery flow.
 
 **Torrent lifecycle.** Ready torrents share in **Seeding** and move to
 **Completed** when seeding stops. An idle seed is still available to peers;

@@ -38,6 +38,14 @@ cleared payloads; a transport blip mid-poll reported a task failed.
 
 Tests: nzbd-state artifacts +10 · nzbd-api +1 · UI DOM harness 811 assertions.
 
+Follow-up (same day, field report #2): the folder panel offered *Preview
+recovery copy* on a folder already held by an open recovery handoff, which the
+server refuses ("stale selection, unowned or held source"). The panel now
+mirrors `preview_recovery`'s preconditions (owned · unheld · parked_failed /
+retained / completed): it says which one is missing, lists the folder's own
+handoffs with their state, and offers **cancel handoff** in place. UI DOM
+harness 824 assertions; adopt → stage → held → cancel verified in Chromium.
+
 ## Incremental history ingestion — 2026-09-25
 
 **Status:** M6 implemented and adversarial review addressed; 73 state tests
