@@ -171,6 +171,13 @@ full checkpoint CRC. Authenticated cluster segment leases may seal private
 sparse checkpoints; the authoritative assembler validates their complete union.
 These checkpoints carry no media-ready or successful post-processing stamp.
 
+Multipart posts may use a different obfuscated yEnc filename in every article.
+Runner keeps the first safe confirmed filename for that NZB file, including any
+collision suffix, while requiring all articles to declare the same total size.
+Unsafe names, missing sizes and conflicting sizes still hold the job. The
+`multipart_articles_with_different_yenc_names_download_bit_identically` engine
+regression checks the assembled bytes with varying article names.
+
 PAR restoration records source/target identities in the existing operation
 journal. Damaged candidates repair in separate operation-owned workspaces.
 Full size and MD5 are checked before output publication, and originals remain
@@ -212,6 +219,20 @@ Attempts and exponential backoff survive restart (eight attempts; initial
 30-second backoff). Quota release is explicitly operator-triggered because
 `statvfs` supplies no authoritative quota headroom. Manual pause and review
 holds survive resource release.
+
+The web queue labels these jobs **HELD** and shows their recorded reason.
+Resource holds keep **resume**, which requests the recovery probe. Review holds
+show **needs review** without offering an ineffective resume. The native job
+action API returns HTTP 409 with the hold reason when resume is refused; HTTP
+404 means the job is actually absent. New holds also appear in Logs.
+
+An upgrade preserves existing holds. If an older build stopped an obfuscated
+post with `conflicting yEnc name or declared size`, inspect the article metadata
+before retrying: that old message does not distinguish a harmless name change
+from a real size conflict. After confirming the name-only case and upgrading,
+delete the queue job and requeue it from History to start a fresh allocation.
+This repeats the download; it does not reuse the held partial payload. Existing
+partial files remain subject to the normal Files retention and review policy.
 
 The identical `job-control-v1.json` fixtures preserve a revision larger than
 JavaScript's exact integer range and include an unknown future field.
