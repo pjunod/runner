@@ -1238,7 +1238,20 @@ async fn job_action(
     };
     match result {
         Ok(true) => Json(json!({ "ok": true })).into_response(),
-        Ok(false) => not_found(),
+        Ok(false) => match engine.export_job(job).await {
+            Ok(Some(record)) => {
+                let message = record
+                    .control()
+                    .filter(|c| c.lifecycle == "held")
+                    .map(|c| format!("job is held: {} ({})", c.message, c.cause))
+                    .unwrap_or_else(|| {
+                        format!("{action} is not available in the job's current state")
+                    });
+                error(StatusCode::CONFLICT, &message)
+            }
+            Ok(None) => not_found(),
+            Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+        },
         Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
     }
 }
@@ -3126,6 +3139,52 @@ mod tests {
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn resume_reports_a_hold_as_conflict_and_missing_job_as_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let id = engine
+            .add_nzb("held", NZB.as_bytes(), None, 0)
+            .await
+            .unwrap();
+        engine
+            .hold_job(
+                id,
+                "identity_conflict",
+                "download_write",
+                "conflicting yEnc declared size",
+            )
+            .await
+            .unwrap();
+        let app = router(engine.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post(format!("/api/v1/jobs/{}/actions/resume", id.0))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_json(response).await;
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("conflicting yEnc declared size"));
+        assert!(engine.export_job(id).await.unwrap().unwrap().held());
+        let response = app
+            .oneshot(
+                axum::http::Request::post("/api/v1/jobs/999999/actions/resume")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        engine.shutdown().await;
     }
 
     /// With no history store there is nowhere to park, so delete says so

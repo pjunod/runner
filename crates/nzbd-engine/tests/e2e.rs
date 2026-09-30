@@ -859,6 +859,45 @@ async fn recovered_snapshot_is_visible_immediately_after_spawn() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multipart_articles_with_different_yenc_names_download_bit_identically() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = prng_bytes(42, 150_000);
+    let mut post = build_post("obfuscated", &[("payload.bin", data.clone())], 10_000);
+    for (i, article) in post.files[0].articles.iter_mut().enumerate() {
+        let wire = article.wire.as_ref();
+        let header_end = wire.windows(2).position(|w| w == b"\r\n").unwrap();
+        let header = std::str::from_utf8(&wire[..header_end]).unwrap();
+        let mut changed = header
+            .replace("name=payload.bin", &format!("name=obfuscated-part-{i}"))
+            .into_bytes();
+        changed.extend_from_slice(&wire[header_end..]);
+        article.wire = std::sync::Arc::new(changed);
+    }
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+    let engine = spawn_engine(tmp.path(), vec![server_def(1, ns.port(), 0, 4, 3)]).await;
+    let mut rx = engine.subscribe();
+    let job = engine
+        .add_nzb("obfuscated", post.nzb.as_bytes(), None, 0)
+        .await
+        .unwrap();
+    let (status, health) = wait_finished(&mut rx, job, 10).await;
+    assert_eq!((status, health), (JobStatus::Completed, 1000));
+    let record = engine.export_job(job).await.unwrap().unwrap();
+    assert!(!record.held());
+    assert!(record.files[0].filename.starts_with("obfuscated-part-"));
+    assert_eq!(
+        std::fs::read(
+            tmp.path()
+                .join("dest/obfuscated")
+                .join(&record.files[0].filename)
+        )
+        .unwrap(),
+        data
+    );
+    engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn downloads_bit_identical_with_auth_and_pipelining() {
     let tmp = tempfile::tempdir().unwrap();
     let files = vec![

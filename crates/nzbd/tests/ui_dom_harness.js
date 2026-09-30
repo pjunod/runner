@@ -382,6 +382,19 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(doomed.hNote, "unrepairable · aborting", "armed health-abort is stated on the row");
   const doomed2 = T.rowModel(job(1, { health: 700 }), { idx: 0, count: 1, healthAbortArmed: false });
   eq(doomed2.hNote, "unrepairable · will fail at end", "…and so is the un-armed case");
+  const held = job(1, { status: "paused", control: {
+    lifecycle: "held", cause: "identity_conflict", retry_policy: "review",
+    message: "conflicting yEnc declared size",
+  } });
+  const heldRow = T.rowModel(held, { mixedSection: false });
+  eq(heldRow.st, "HELD", "a hold is distinct from a manual pause");
+  eq(heldRow.stHidden, false, "the hold remains visible in a single-state section");
+  ok(heldRow.dRest.includes("conflicting yEnc declared size"), "the hold reason appears in the row");
+  eq(heldRow.pauseHidden, true, "review holds do not offer a resume that cannot work");
+  const capacityRow = T.rowModel({ ...held, control: { ...held.control,
+    cause: "capacity", retry_policy: "resume_same_job", message: "storage full" } });
+  eq(capacityRow.pauseHidden, false, "resource holds retain the resume probe");
+  eq(capacityRow.pauseAction, "resume", "resource holds can request recovery");
 }
 
 // --- 8b. storage paths: capacity, warning levels, stable rows ------------
