@@ -16,7 +16,7 @@ nzbd touches exactly three kinds of places, all set in `nzbd.toml`:
 
 In containers the convention is one volume, `/data`, holding both:
 `main_dir = "/data"`, `dest_dir = "/data/complete"`, with the config
-mounted read-only at `/etc/nzbd/nzbd.toml`.
+directory mounted read-write at `/etc/nzbd`.
 
 **The path-alignment rule (the one people trip on):** Sonarr/Radarr must
 see finished downloads at the *same path* nzbd reports. Mount the same
@@ -242,7 +242,7 @@ config to copy:
 ```sh
 git clone https://github.com/pjunod/nzbd.git
 cd nzbd/examples/docker-compose
-mkdir -p config && sudo chown -R 1000:1000 config
+mkdir -p config
 cp nzbd.toml.example config/nzbd.toml
 $EDITOR config/nzbd.toml     # server credentials + [api] password
 
@@ -255,6 +255,39 @@ Edit the `volumes:` in the compose file if your downloads live somewhere
 other than `/data/usenet`. `config/` is bind-mounted read-write, so the
 Settings tab writes straight back to `config/nzbd.toml`; skip the `cp`
 and the first-run wizard creates it instead.
+
+The `nzbd-init` service runs as root and sets the config and data directory
+owners, plus an existing regular `nzbd.toml`, to `1000:1000`. The daemon
+waits for this service to finish successfully and runs unprivileged. This
+also repairs directories Docker created as `root:root` when the bind sources
+did not exist. Initialization does not recurse into downloads or follow a
+config-file symlink. Read-only mounts or filesystems that reject `chown`
+cause initialization to fail; inspect `docker compose logs nzbd-init`.
+
+The helper shares the daemon's volume list through a YAML anchor. Change
+host paths in that list so both services see the same directories. If you
+maintain your own Compose file, copy both `nzbd-init` and the daemon's
+`depends_on` entry from the example. Updating the image alone does not add
+the helper to an existing Compose deployment.
+
+For an existing root-owned config directory, you can repair it immediately
+from the directory containing your Compose file (replace `nzbd` if your
+service has another name):
+
+```sh
+docker compose run --rm --no-deps --user 0:0 --entrypoint /bin/sh nzbd -ec '
+  chown -h 1000:1000 /etc/nzbd
+  if [ -f /etc/nzbd/nzbd.toml ] && [ ! -L /etc/nzbd/nzbd.toml ]; then
+    chown -h 1000:1000 /etc/nzbd/nzbd.toml
+  fi'
+```
+
+Verify the initialization and write access with a locally built image:
+
+```sh
+make docker-build
+python3 scripts/check-compose-permissions.py
+```
 
 Compose applies a config-file change on `docker compose up -d`, not on
 `restart`.
