@@ -710,31 +710,18 @@ async fn folding_a_foreign_journal_recovers_progress_and_surfaces_missing_disk_d
 
     let mut events = engine.subscribe();
     engine.fold_job_journals(JobId(80)).await.unwrap();
-    let finished = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Event::FileFinished {
-                job: JobId(80), ok, ..
-            } = events.recv().await.unwrap()
-            {
-                break ok;
-            }
-        }
-    })
-    .await
-    .expect("recovered file must reach a terminal writer result");
-    assert!(!finished, "the journal cannot invent the missing part file");
-
+    engine.export_job(JobId(80)).await.unwrap();
     let job = engine.export_job(JobId(80)).await.unwrap().unwrap();
-    assert_eq!(
-        job.files[0].segments[0].state,
-        SegmentState::Done {
-            offset: 0,
-            len: 100,
-            crc: 0x1234_5678,
-        }
-    );
-    assert!(job.files[0].finalized);
-    assert_eq!(job.status, JobStatus::Failed);
+    assert_eq!(job.files[0].segments[0].state, SegmentState::Pending);
+    assert!(!job.files[0].finalized);
+    assert_eq!(job.status, JobStatus::Paused);
+    assert!(job.held());
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(
+            event,
+            Event::FileFinished { .. } | Event::JobFinished { .. }
+        ));
+    }
     engine.shutdown().await;
 }
 
@@ -1034,7 +1021,7 @@ async fn dropped_connections_retry_without_losing_the_article() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unrecoverable_articles_gate_health_and_zero_fill_gaps() {
+async fn unverified_holes_remain_partial_and_nonterminal() {
     let tmp = tempfile::tempdir().unwrap();
     let data = prng_bytes(31, 10 * 5000);
     let post = build_post("damaged", &[("dmg.bin", data.clone())], 5000);
@@ -1052,17 +1039,36 @@ async fn unrecoverable_articles_gate_health_and_zero_fill_gaps() {
         .add_nzb("damaged", post.nzb.as_bytes(), None, 0)
         .await
         .unwrap();
-    let (status, health) = wait_finished(&mut rx, job, 30).await;
-    assert_eq!(status, JobStatus::Failed, "below critical health");
-    assert_eq!(health, 600);
-
-    // The partial file is still assembled: good parts intact, gaps zeroed
-    // (par repair operates on exactly this in phase 2).
-    let got = std::fs::read(tmp.path().join("dest/damaged/dmg.bin")).unwrap();
+    for _ in 0..1200 {
+        if engine
+            .snapshot()
+            .jobs
+            .iter()
+            .any(|j| j.id == job && j.control.as_ref().is_some_and(|c| c.lifecycle == "held"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let snap = engine.snapshot();
+    let held = snap.jobs.iter().find(|j| j.id == job).unwrap();
+    assert_eq!(held.status, JobStatus::Paused);
+    assert_eq!(held.control.as_ref().unwrap().stage, "finalize");
+    assert!(!held.ready && !held.pp_done);
+    while let Ok(event) = rx.try_recv() {
+        assert!(!matches!(event, Event::JobFinished {job: id, ..} if id == job));
+    }
+    let exported = engine.export_job(job).await.unwrap().unwrap();
+    let file = &exported.files[0];
+    let got = std::fs::read(
+        tmp.path()
+            .join(format!("dest/damaged/.runner-file-{}.part", file.id.0)),
+    )
+    .unwrap();
     let mut expected = data.clone();
     expected[2 * 5000..6 * 5000].fill(0);
-    assert_eq!(got.len(), expected.len());
     assert_eq!(got, expected);
+    assert!(!tmp.path().join("dest/damaged/dmg.bin").exists());
 
     engine.shutdown().await;
 }
@@ -1638,15 +1644,23 @@ async fn an_observed_enospc_latches_the_disk_guard() {
 /// Minimal par2 file carrying only what naming needs: a Main packet (so it
 /// is a well-formed set) and one FileDesc per real filename.
 fn par2_bytes(names: &[&str]) -> Vec<u8> {
+    use md5::Digest;
     fn packet(ptype: &[u8; 16], body: &[u8]) -> Vec<u8> {
         let len = 64 + body.len();
         let mut p = Vec::with_capacity(len);
         p.extend_from_slice(b"PAR2\0PKT");
         p.extend_from_slice(&(len as u64).to_le_bytes());
-        p.extend_from_slice(&[0u8; 16]); // packet md5 (unchecked by the scanner)
+        p.extend_from_slice(&[0u8; 16]); // packet digest filled below
         p.extend_from_slice(&[0u8; 16]); // recovery set id
         p.extend_from_slice(ptype);
         p.extend_from_slice(body);
+        while p.len() % 4 != 0 {
+            p.push(0);
+        }
+        let length = p.len() as u64;
+        p[8..16].copy_from_slice(&length.to_le_bytes());
+        let digest = md5::Md5::digest(&p[32..]);
+        p[16..32].copy_from_slice(&digest);
         p
     }
     let mut main = 384_000u64.to_le_bytes().to_vec();

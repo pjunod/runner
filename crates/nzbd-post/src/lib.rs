@@ -21,8 +21,10 @@ use std::path::PathBuf;
 
 pub mod deobfuscate;
 pub mod manager;
+pub mod namespace;
 pub mod par2;
 pub mod rename;
+pub mod repair_workspace;
 pub mod script;
 pub mod tools;
 
@@ -79,11 +81,20 @@ pub enum ArchiveKind {
 
 #[derive(Debug, Clone)]
 pub struct ExtractOutcome {
+    pub attempts: Vec<ExtractAttempt>,
+    pub quota_error: bool,
     pub success: bool,
     /// Password was wrong / required (drives the password-file retry loop).
     pub password_error: bool,
     /// Out of disk space (unrar exit code 5).
     pub disk_space_error: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtractAttempt {
+    pub executable: String,
+    pub exit_code: i32,
+    pub diagnostic: String,
 }
 
 /// NZBGet extension-script exit codes (post-processing scripts).

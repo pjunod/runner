@@ -169,27 +169,6 @@ pub fn is_probably_obfuscated(stem: &str) -> bool {
     true
 }
 
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    if depth > 5 {
-        return;
-    }
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue; // hidden files + fenced .pp.* staging dirs
-        }
-        if p.is_dir() {
-            collect_files(&p, out, depth + 1);
-        } else {
-            out.push(p);
-        }
-    }
-}
-
 fn unique_target(parent: &Path, stem: &str, suffix: &str) -> PathBuf {
     let first = parent.join(format!("{stem}{suffix}"));
     if !first.exists() {
@@ -224,7 +203,7 @@ fn rename_with_companions(
             continue;
         };
         let target = unique_target(parent, new_stem, suffix);
-        if std::fs::rename(f, &target).is_ok() {
+        if nzbd_state::fileops::rename_exclusive(f, &target).is_ok() {
             out.push((f.clone(), target));
         }
     }
@@ -247,11 +226,25 @@ pub fn deobfuscate_dir(
         return Vec::new();
     }
 
-    let mut files = Vec::new();
-    collect_files(dir, &mut files, 0);
+    let Ok(files) = crate::namespace::files(dir) else {
+        return Vec::new();
+    };
+    // Discovery shares the validated namespace; heuristic renaming remains
+    // deliberately shallow and excludes every hidden path component.
+    let files: Vec<_> = files
+        .into_iter()
+        .filter(|p| {
+            p.strip_prefix(dir).is_ok_and(|relative| {
+                relative.components().count() <= 6
+                    && !relative
+                        .components()
+                        .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+            })
+        })
+        .collect();
     let is_protected = |p: &PathBuf| {
-        p.file_name()
-            .is_some_and(|n| protected.contains(&n.to_string_lossy().into_owned()))
+        p.strip_prefix(dir)
+            .is_ok_and(|n| protected.contains(&n.to_string_lossy().into_owned()))
     };
     // Protected files stay in the candidate list — they anchor the
     // dominance math (a junk sidecar must not inherit the job name just

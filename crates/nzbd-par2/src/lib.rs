@@ -24,6 +24,7 @@ pub const MAGIC: &[u8] = b"PAR2\0PKT";
 /// One source file, as the recovery set describes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDesc {
+    pub md5_full: [u8; 16],
     pub id: [u8; 16],
     /// The file's REAL name — the thing an obfuscated post hides.
     pub name: String,
@@ -34,6 +35,8 @@ pub struct FileDesc {
 /// What one par2 file had to say.
 #[derive(Debug, Clone, Default)]
 pub struct Scan {
+    pub set_id: Option<[u8; 16]>,
+    pub invalid: bool,
     /// From the Main packet; `0` when this file had none (a `.volNNN+MM`
     /// recovery volume on its own, for instance).
     pub slice_size: u64,
@@ -68,6 +71,7 @@ pub fn is_par2(head: &[u8]) -> bool {
 /// before that point is returned. Callers get partial truth or no truth,
 /// never a wrong answer.
 pub fn scan(bytes: &[u8]) -> Scan {
+    use md5::{Digest, Md5};
     let mut out = Scan::default();
     let mut seen_ids: Vec<[u8; 16]> = Vec::new();
     let mut pos = 0usize;
@@ -79,9 +83,20 @@ pub fn scan(bytes: &[u8]) -> Scan {
             continue;
         }
         let len = u64::from_le_bytes(bytes[pos + 8..pos + 16].try_into().unwrap()) as usize;
-        if len < 64 || pos + len > bytes.len() {
+        if len < 64 || !len.is_multiple_of(4) || len > bytes.len().saturating_sub(pos) {
             break; // torn / partial file
         }
+        let digest: [u8; 16] = Md5::digest(&bytes[pos + 32..pos + len]).into();
+        if digest.as_slice() != &bytes[pos + 16..pos + 32] {
+            out.invalid = true;
+            break;
+        }
+        let set_id: [u8; 16] = bytes[pos + 32..pos + 48].try_into().unwrap();
+        if out.set_id.is_some_and(|id| id != set_id) {
+            out.invalid = true;
+            break;
+        }
+        out.set_id = Some(set_id);
         let ptype = &bytes[pos + 48..pos + 64];
         let body = &bytes[pos + 64..pos + len];
         match ptype {
@@ -96,6 +111,7 @@ pub fn scan(bytes: &[u8]) -> Scan {
                     let mut md5_16k = [0u8; 16];
                     md5_16k.copy_from_slice(&body[32..48]);
                     out.descs.push(FileDesc {
+                        md5_full: body[16..32].try_into().unwrap(),
                         id,
                         name: String::from_utf8_lossy(&body[56..])
                             .trim_end_matches('\0')
@@ -134,14 +150,15 @@ mod tests {
     use super::*;
 
     fn packet(ptype: &[u8; 16], body: &[u8]) -> Vec<u8> {
-        let len = 64 + body.len();
-        let mut p = Vec::with_capacity(len);
-        p.extend_from_slice(MAGIC);
-        p.extend_from_slice(&(len as u64).to_le_bytes());
-        p.extend_from_slice(&[0u8; 16]); // packet md5, unchecked here
-        p.extend_from_slice(&[0u8; 16]); // recovery set id
-        p.extend_from_slice(ptype);
-        p.extend_from_slice(body);
+        use md5::{Digest, Md5};
+        let len = (64 + body.len()).next_multiple_of(4);
+        let mut p = vec![0; len];
+        p[..8].copy_from_slice(MAGIC);
+        p[8..16].copy_from_slice(&(len as u64).to_le_bytes());
+        p[48..64].copy_from_slice(ptype);
+        p[64..64 + body.len()].copy_from_slice(body);
+        let digest = Md5::digest(&p[32..]);
+        p[16..32].copy_from_slice(&digest);
         p
     }
 

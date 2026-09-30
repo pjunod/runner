@@ -1670,6 +1670,10 @@ async fn wait_shutdown(rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
 fn event_json(ev: &nzbd_engine::Event) -> (&'static str, serde_json::Value) {
     use nzbd_engine::Event as E;
     match ev {
+        E::JobControlChanged { job, control } => (
+            "job_control_changed",
+            json!({"job": job.0, "control": control}),
+        ),
         E::JobAdded { job, name } => ("job_added", json!({"job": job.0, "name": name})),
         E::JobFinished {
             job,
@@ -2884,6 +2888,7 @@ mod tests {
 
     fn summary(id: u32, status: JobStatus) -> JobSummary {
         JobSummary {
+            control: None,
             id: nzbd_types::JobId(id),
             kind: nzbd_types::JobKind::Nzb,
             name: format!("job {id}"),

@@ -160,3 +160,57 @@ records remain. Files reported removed outside Runner are quiet tombstones.
 During a filesystem outage, retry or review states remain visible. An unavailable
 root is not proof that a payload is gone. Resolve mounts/permissions, then retry
 or inspect the named operation. Keep is the immediate retention override.
+
+## Resource holds and transform generations
+
+Writer exhaustion preserves stable `.runner-file-<FileId>.part` storage and
+pauses the same job. Each acknowledged segment has passed a data flush; restart
+revalidates recorded ranges against CRCs rather than trusting sparse length.
+Final media publication requires contiguous coverage, expected yEnc size and
+full checkpoint CRC. Authenticated cluster segment leases may seal private
+sparse checkpoints; the authoritative assembler validates their complete union.
+These checkpoints carry no media-ready or successful post-processing stamp.
+
+PAR restoration records source/target identities in the existing operation
+journal. Damaged candidates repair in separate operation-owned workspaces.
+Full size and MD5 are checked before output publication, and originals remain
+retained. Extraction publishes individual verified files without replacing
+shared parent directories. Original archives and transform workspaces remain
+retained pending independently admitted retirement. A directory name alone
+never grants stale-staging deletion authority.
+
+Relocation probes exclusive publication before payload copying and fences
+repeated running/reviewed attempts. The synthetic registry-generation path
+returns its actual published path and retains source bytes under a durability
+hold. Ordinary relocation cannot enable that fallback. Native mount/remount,
+server power-loss durability and every consumer mapping remain release gates.
+
+## Durable job control contract (v1)
+
+Runner queue snapshots and `job_control_changed` events carry an additive
+`control` object: integer `version`; decimal-string `revision`; `instance`;
+`lifecycle`; `cause`; `stage`; `retry_policy`; bounded `message`. Optional
+`previous_status` and `manual_pause` preserve Runner resume intent. Version 1
+resource holds use `lifecycle=held`, `cause=capacity|quota` and
+`retry_policy=resume_same_job`. Review holds use `retry_policy=review`. Stage
+names identify the failed operation, including `download_write`, `finalize`,
+`extract`, `par_repair` and existing post-stage strings.
+
+Compatibility projection is `status=paused`, `pp_done=false`, `ready=false`.
+The authoritative control is stored in the Runner queue snapshot under
+`*Control:v1`; it is persisted before events. Monarr stores it atomically with
+active acquisition state. Missing facts cannot clear a held row; unknown
+versions remain nonterminal, duplicate/stale revisions have no effects, and
+instance changes require explicit reconciliation. The SSE cursor is independent
+of the durable revision. Polling held facts take precedence over older history.
+
+`POST /api/v1/queue/{id}/resume` in Monarr calls Runner's existing
+`POST /api/v1/jobs/{id}/actions/resume`; it does not add an NZB. Runner requires
+writer quiescence, capacity reservation and a bounded 64 KiB write/flush probe.
+Attempts and exponential backoff survive restart (eight attempts; initial
+30-second backoff). Quota release is explicitly operator-triggered because
+`statvfs` supplies no authoritative quota headroom. Manual pause and review
+holds survive resource release.
+
+The identical `job-control-v1.json` fixtures preserve a revision larger than
+JavaScript's exact integer range and include an unknown future field.

@@ -259,7 +259,7 @@ async fn intact_quick_path_then_script() {
 /// Damaged download: quick check spots the bad CRC, par2 verifies + repairs,
 /// and the original bytes come back.
 #[tokio::test]
-async fn corrupt_payload_gets_repaired() {
+async fn corrupt_nested_payload_after_prefix_gets_repaired_without_losing_original() {
     if !require_tool("par2") {
         return;
     }
@@ -269,8 +269,15 @@ async fn corrupt_payload_gets_repaired() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let data: Vec<u8> = (0..60_000u32).map(|i| ((i * 7) % 253) as u8).collect();
-    std::fs::write(dir.join("payload.bin"), &data).unwrap();
-    par2_create(&dir, 16, &["payload.bin"]);
+    std::fs::create_dir(dir.join("Episode01")).unwrap();
+    std::fs::write(dir.join("Episode01/payload.bin"), &data).unwrap();
+    par2_create(&dir, 16, &["Episode01/payload.bin"]);
+    assert_eq!(
+        nzbd_post::par2::load_dir(&dir).unwrap().unwrap().files[0].name,
+        "Episode01/payload.bin"
+    );
+    std::fs::rename(dir.join("Episode01/payload.bin"), dir.join("payload.bin")).unwrap();
+    std::fs::remove_dir(dir.join("Episode01")).unwrap();
 
     // Corrupt one block's worth of bytes *as downloaded* (the engine's
     // whole-file CRC reflects the corruption).
@@ -294,7 +301,7 @@ async fn corrupt_payload_gets_repaired() {
         .unwrap();
     assert_eq!(out, PpFinal::Success);
     assert_eq!(
-        std::fs::read(dir.join("payload.bin")).unwrap(),
+        std::fs::read(dir.join("Episode01/payload.bin")).unwrap(),
         data,
         "repair must restore the original bytes"
     );
@@ -305,7 +312,7 @@ async fn corrupt_payload_gets_repaired() {
 /// Damage beyond the recovery blocks on hand and nothing left to unpause:
 /// PAR_FAILURE, job marked Failed.
 #[tokio::test]
-async fn unrepairable_is_par_failure() {
+async fn insufficient_parity_holds_originals_without_terminal_history() {
     if !require_tool("par2") {
         return;
     }
@@ -338,32 +345,21 @@ async fn unrepairable_is_par_failure() {
         .unwrap();
 
     let hist = history(tmp.path());
-    let out = process_job(
+    assert!(process_job(
         &engine,
         &PostConfig::default(),
         &hist,
         &tmp.path().join("dest"),
-        JobId(3),
+        JobId(3)
     )
     .await
-    .unwrap();
-    assert_eq!(out, PpFinal::ParFailure);
-
+    .is_err());
     let job = engine.export_job(JobId(3)).await.unwrap().unwrap();
-    assert_eq!(job.status, JobStatus::Failed);
-    let row = hist.list(10).unwrap()[0].clone();
-    assert_eq!(row.status, "PAR_FAILURE");
-    // D2: the default disposes of the corpse, and the row says so. Five
-    // failed grabs of one movie used to leave 336 GB behind them.
-    assert!(!dir.exists(), "a failed job's files must not survive it");
-    assert_eq!(row.final_dir, None, "deleted files have no final dir");
-    assert!(
-        row.params
-            .iter()
-            .any(|(k, v)| k == "Failure:Files" && v == "deleted"),
-        "the history row must say where the files went: {:?}",
-        row.params
-    );
+    assert!(job.held());
+    assert_eq!(job.control().unwrap().stage, "par_repair");
+    assert!(hist.list(10).unwrap().is_empty());
+    assert_eq!(std::fs::read(dir.join("payload.bin")).unwrap(), bad);
+    assert!(!job.params.iter().any(|(k, _)| k == PP_DONE_PARAM));
     engine.shutdown().await;
 }
 
@@ -372,7 +368,7 @@ async fn unrepairable_is_par_failure() {
 /// old behaviour and stays available for an operator who wants the
 /// forensics.
 #[tokio::test]
-async fn par_failure_parks_or_keeps_per_config() {
+async fn insufficient_parity_cannot_trigger_destructive_failure_disposition() {
     if !require_tool("par2") {
         return;
     }
@@ -408,7 +404,7 @@ async fn par_failure_parks_or_keeps_per_config() {
 
         let parked_root = tmp.path().join("failed");
         let hist = history(tmp.path());
-        let out = process_job(
+        assert!(process_job(
             &engine,
             &PostConfig {
                 failure_action: action,
@@ -417,25 +413,19 @@ async fn par_failure_parks_or_keeps_per_config() {
             },
             &hist,
             &tmp.path().join("dest"),
-            JobId(job_id),
+            JobId(job_id)
         )
         .await
-        .unwrap();
-        assert_eq!(out, PpFinal::ParFailure);
-        let row = hist.list(10).unwrap()[0].clone();
-
-        match action {
-            nzbd_post::manager::FailureAction::Park => {
-                assert!(!dir.exists(), "parked means moved, not copied");
-                let moved = parked_root.join("hopeless");
-                assert!(moved.join("payload.bin").is_file(), "the tree moves intact");
-                assert_eq!(row.final_dir.as_deref(), moved.to_str());
-            }
-            _ => {
-                assert!(dir.join("payload.bin").is_file(), "`none` keeps the files");
-                assert_eq!(row.final_dir.as_deref(), dir.to_str());
-            }
-        }
+        .is_err());
+        assert!(engine
+            .export_job(JobId(job_id))
+            .await
+            .unwrap()
+            .unwrap()
+            .held());
+        assert_eq!(std::fs::read(dir.join("payload.bin")).unwrap(), bad);
+        assert!(hist.list(10).unwrap().is_empty());
+        assert!(!parked_root.exists());
         engine.shutdown().await;
     }
 }
@@ -482,8 +472,8 @@ async fn unpack_then_cleanup() {
     assert_eq!(out, PpFinal::Success);
     assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), inner);
     assert!(
-        !dir.join("release.zip").exists(),
-        "cleanup must remove the extracted archive"
+        dir.join("release.zip").exists(),
+        "original archive remains held until independently journaled retirement is admitted"
     );
     engine.shutdown().await;
 }

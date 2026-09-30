@@ -48,16 +48,26 @@ fn md5_16k(path: &Path) -> Option<[u8; 16]> {
 }
 
 fn files_of(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .collect();
-    out.sort();
-    out
+    crate::namespace::files(dir).unwrap_or_default()
+}
+
+pub(crate) fn full_md5(path: &Path) -> Option<[u8; 16]> {
+    let mut file = nzbd_state::fileops::open(path).ok()?;
+    let mut digest = Md5::new();
+    let mut buf = [0; 65536];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buf[..n]);
+    }
+    Some(digest.finalize().into())
+}
+
+fn create_parents(root: &Path, target: &Path) -> std::io::Result<()> {
+    let relative = target.strip_prefix(root).map_err(std::io::Error::other)?;
+    nzbd_state::fileops::parents(root, relative).map_err(std::io::Error::other)
 }
 
 fn ext_is(p: &Path, ext: &str) -> bool {
@@ -71,7 +81,7 @@ fn safe_rename(from: &Path, to: PathBuf) -> Option<(PathBuf, PathBuf)> {
     if from == to.as_path() || to.exists() {
         return None;
     }
-    match std::fs::rename(from, &to) {
+    match nzbd_state::fileops::rename_exclusive(from, &to) {
         Ok(()) => {
             tracing::info!(from = %from.display(), to = %to.display(), "renamed");
             Some((from.to_path_buf(), to))
@@ -86,6 +96,13 @@ fn safe_rename(from: &Path, to: PathBuf) -> Option<(PathBuf, PathBuf)> {
 /// par-rename. Returns `(old, new)` pairs so the caller can remap download
 /// evidence (whole-file CRCs are content-addressed; only paths change).
 pub fn par_rename(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+    par_rename_owned(dir, None)
+}
+
+pub fn par_rename_owned(
+    dir: &Path,
+    custody: Option<(&nzbd_state::artifacts::Inventory, u32)>,
+) -> Vec<(PathBuf, PathBuf)> {
     let mut renames = Vec::new();
 
     // 1. Give obfuscated par2 files their extension back (by magic).
@@ -101,26 +118,51 @@ pub fn par_rename(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
         }
     }
 
-    // 2. Match every remaining file's 16k-MD5 against the par2 catalog.
-    let Ok(Some(set)) = crate::par2::load_dir(dir) else {
+    // Prefixes narrow candidates; size and full digest establish intact identity.
+    let Ok(sets) = crate::par2::load_sets(dir) else {
         return renames;
     };
-    let wanted: HashMap<[u8; 16], &str> = set
-        .files
-        .iter()
-        .map(|f| (f.md5_16k, f.name.as_str()))
-        .collect();
-    for p in files_of(dir) {
-        if ext_is(&p, "par2") {
-            continue;
+    for set in sets {
+        let mut wanted: HashMap<[u8; 16], Vec<&crate::par2::Par2File>> = HashMap::new();
+        for f in &set.files {
+            wanted.entry(f.md5_16k).or_default().push(f);
         }
-        let name = p.file_name().unwrap_or_default().to_string_lossy();
-        if set.files.iter().any(|f| f.name == name) {
-            continue; // already correctly named
-        }
-        let Some(hash) = md5_16k(&p) else { continue };
-        if let Some(true_name) = wanted.get(&hash) {
-            if let Some(pair) = safe_rename(&p, dir.join(true_name)) {
+        for p in files_of(dir) {
+            if ext_is(&p, "par2") || p.extension().is_some_and(|e| e == "part") {
+                continue;
+            }
+            let Some(hash) = md5_16k(&p) else {
+                continue;
+            };
+            let Some(catalog) = wanted.get(&hash) else {
+                continue;
+            };
+            let matches: Vec<_> = catalog
+                .iter()
+                .filter(|f| {
+                    std::fs::metadata(&p).is_ok_and(|m| m.len() == f.length)
+                        && full_md5(&p) == Some(f.md5_full)
+                })
+                .collect();
+            if matches.len() != 1 {
+                continue;
+            }
+            let f = matches[0];
+            let Ok(relative) = crate::namespace::relative(&f.name) else {
+                continue;
+            };
+            let target = dir.join(relative);
+            if p == target {
+                continue;
+            }
+            if create_parents(dir, target.parent().unwrap()).is_err() {
+                continue;
+            }
+            if let Some((inventory, job)) = custody {
+                if inventory.restore_file(job, &p, &target).is_ok() {
+                    renames.push((p, target));
+                }
+            } else if let Some(pair) = safe_rename(&p, target) {
                 renames.push(pair);
             }
         }

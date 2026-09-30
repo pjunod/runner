@@ -2574,6 +2574,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(i, n)| nzbd_par2::FileDesc {
+                    md5_full: [0; 16],
                     id: [i as u8; 16],
                     name: (*n).to_string(),
                     length: 100,

@@ -6,7 +6,7 @@
 //! recording the outcome in history and stamping the job so restarts never
 //! re-process. Stage parallelism follows `PostStrategy`.
 
-use crate::rename::{par_rename, rar_rename};
+use crate::rename::{par_rename_owned, rar_rename};
 use crate::script::{discover, ScriptHost};
 use crate::tools::{detect_archives, Extractors, Par2Tool};
 use crate::{par2, DownloadEvidence, PostError, RepairResult, VerifyResult};
@@ -1025,6 +1025,30 @@ fn spawn_job(
                     }
                 }
                 Some(Err(e)) => {
+                    let detail = e.to_string();
+                    let cause = if nzbd_engine::is_out_of_space(&detail) {
+                        if detail.to_lowercase().contains("quota") {
+                            "quota"
+                        } else {
+                            "capacity"
+                        }
+                    } else if detail.contains("identity")
+                        || detail.contains("collision")
+                        || detail.contains("unsafe")
+                    {
+                        "identity_conflict"
+                    } else {
+                        "unknown"
+                    };
+                    let stage = engine
+                        .snapshot()
+                        .jobs
+                        .iter()
+                        .find(|j| j.id == job)
+                        .and_then(|j| j.stages.last())
+                        .map(|s| s.stage.as_str().to_string())
+                        .unwrap_or_else(|| "extract".into());
+                    let _ = engine.hold_job(job, cause, &stage, &detail).await;
                     // PP writes as much as the downloader does — unpack,
                     // move, script output. An ENOSPC here is the same ground
                     // truth about the volume and must stop intake too, not
@@ -1389,7 +1413,7 @@ async fn process_job_ctx_from(
     let mut renames = Vec::new();
     if from == RestartPoint::Beginning {
         stages.enter(PostStage::ParRename).await;
-        renames = par_rename(&dir);
+        renames = par_rename_owned(&dir, Some((&engine.artifacts(), job_id.0)));
         if unpack_enabled {
             stages.enter(PostStage::RarRename).await;
             renames.extend(rar_rename(&dir));
@@ -1409,22 +1433,40 @@ async fn process_job_ctx_from(
     // heuristic deobfuscation pass at the end.
     let mut par2_names: std::collections::HashSet<String> = Default::default();
     if from.includes(RestartPoint::Cleanup) {
-        if let Some(set) = par2::load_dir(&dir)? {
-            par2_names = set.files.iter().map(|f| f.name.clone()).collect();
+        for set in par2::load_sets(&dir)? {
+            par2_names.extend(set.files.iter().map(|f| f.name.clone()));
             if from.includes(RestartPoint::Verify) {
                 stages.enter(PostStage::ParVerify).await;
                 let quick = par2::quick_verify(&set, &evidence_of(&job, &dir, &rename_map));
                 if quick == VerifyResult::Intact {
                     tracing::info!(job = job_id.0, "par quick-verify: intact (no data re-read)");
-                } else if let Some(main) = set.main_path.clone() {
-                    par_ok =
-                        repair_loop(engine, cfg, &par_tool, &mut stages, job_id, &main).await?;
-                    par_did_repair = par_ok;
+                } else if set.main_path.is_some() {
+                    let repaired = crate::repair_workspace::repair(
+                        &engine.artifacts(),
+                        job_id.0,
+                        &set,
+                        &par_tool,
+                    )
+                    .await?;
+                    par_ok &= repaired;
+                    par_did_repair |= repaired;
                 } else {
                     par_ok = false;
                 }
             }
         }
+    }
+
+    if !par_ok {
+        let _ = engine
+            .hold_job(
+                job_id,
+                "unknown",
+                "par_repair",
+                "PAR mapping or parity is insufficient; inputs retained for review",
+            )
+            .await;
+        return Err(PostError::Subprocess("PAR recovery held".into()));
     }
 
     // ---- UNPACK stage ------------------------------------------------------
@@ -1445,12 +1487,33 @@ async fn process_job_ctx_from(
                 .iter()
                 .find(|(k, _)| k == "*Unpack:Password")
                 .map(|(_, v)| v.as_str());
+            let _capacity = nzbd_state::capacity::reserve(&dir, job.totals.size)?;
             for (archive, kind) in &archives {
+                use sha2::{Digest, Sha256};
+                let token = format!("{:x}", Sha256::digest(archive.to_string_lossy().as_bytes()));
+                let workspace = engine
+                    .artifacts()
+                    .workspace(job_id.0, "extract", &token)
+                    .map_err(|e| PostError::Subprocess(e.to_string()))?;
+                let _workspace_capacity =
+                    nzbd_state::capacity::reserve(&workspace.scratch.path, job.totals.size)?;
+                let mut staging = workspace.scratch.path.join("output");
                 // Extraction is fenced: everything lands in the lease's
                 // staging dir and is renamed into place only on success
                 // with the lease still live (double-unpack can't happen).
-                let _ = std::fs::remove_dir_all(&staging);
+                std::fs::create_dir_all(&staging)?;
                 let mut r = ex.extract(archive, *kind, &staging, password).await?;
+                if r.disk_space_error {
+                    let cause = if r.quota_error { "quota" } else { "capacity" };
+                    let detail = r
+                        .attempts
+                        .iter()
+                        .map(|a| format!("{} exit {}: {}", a.executable, a.exit_code, a.diagnostic))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    let _ = engine.hold_job(job_id, cause, "extract", &detail).await;
+                    return Err(PostError::Subprocess(format!("resource hold: {cause}")));
+                }
                 if !r.success && !par_did_repair && par_ok {
                     // The unpack↔repair loop: a broken archive that quick
                     // verification couldn't see; force a repair and retry once.
@@ -1466,11 +1529,23 @@ async fn process_job_ctx_from(
                             {
                                 par_did_repair = true;
                                 stages.enter(PostStage::Unpack).await;
-                                let _ = std::fs::remove_dir_all(&staging);
+                                staging = workspace.scratch.path.join("retry-output");
                                 r = ex.extract(archive, *kind, &staging, password).await?;
                             }
                         }
                     }
+                }
+                if r.disk_space_error {
+                    let cause = if r.quota_error { "quota" } else { "capacity" };
+                    let _ = engine
+                        .hold_job(
+                            job_id,
+                            cause,
+                            "extract",
+                            "extractor retry exhausted storage",
+                        )
+                        .await;
+                    return Err(PostError::Subprocess("resource hold".into()));
                 }
                 // "It said OK" is not the same as "it read the whole set".
                 // Checked BEFORE the commit, so a short extraction is thrown
@@ -1491,10 +1566,15 @@ async fn process_job_ctx_from(
                 }
                 if r.success && short.is_none() {
                     if !(ctx.commit_ok)() {
-                        let _ = std::fs::remove_dir_all(&staging);
-                        return Err(PostError::Subprocess("pp lease lost before commit".into()));
+                        return Err(PostError::Subprocess(
+                            "pp lease lost before commit; workspace retained".into(),
+                        ));
                     }
                     commit_staging(&staging, &dir)?;
+                    engine
+                        .artifacts()
+                        .finish_workspace(&workspace)
+                        .map_err(|e| PostError::Subprocess(e.to_string()))?;
                     unpacked_any = true;
                 } else {
                     tracing::warn!(
@@ -1505,7 +1585,7 @@ async fn process_job_ctx_from(
                     );
                     unpack_ok = false;
                 }
-                let _ = std::fs::remove_dir_all(&staging);
+                // Retained workspace belongs to the operation journal.
             }
         }
     }
@@ -1513,7 +1593,10 @@ async fn process_job_ctx_from(
     // ---- CLEANUP stage -----------------------------------------------------
     if from.includes(RestartPoint::Cleanup) && cfg.cleanup && par_ok && unpack_ok && unpacked_any {
         stages.enter(PostStage::Cleanup).await;
-        cleanup_dir(&dir);
+        tracing::info!(
+            job = job_id.0,
+            "archive inputs retained pending manifest retirement"
+        );
     }
 
     // ---- DEOBFUSCATE stage -------------------------------------------------
@@ -1568,14 +1651,14 @@ async fn process_job_ctx_from(
                     .await
                     .unwrap_or_else(|e| Err(nzbd_state::artifacts::Error::Conflict(e.to_string())));
                 match moved {
-                    Ok(()) => {
+                    Ok(result) => {
                         tracing::info!(
                             job = job_id.0,
                             category = job.category.as_deref().unwrap_or(""),
                             to = %target.display(),
                             "moved to the category destination"
                         );
-                        dir = target;
+                        dir = result.published_path;
                     }
                     Err(e) => {
                         // Report where the files ARE, not where they were
@@ -2069,9 +2152,9 @@ async fn dispose_failed(
             .join(name);
         let to = target.clone();
         return match tokio::task::spawn_blocking(move || inventory.relocate(job.0, &to)).await {
-            Ok(Ok(())) => Disposition {
-                note: format!("parked at {}", target.display()),
-                files_at: Some(target),
+            Ok(Ok(result)) => Disposition {
+                note: format!("parked at {}", result.published_path.display()),
+                files_at: Some(result.published_path),
             },
             other => Disposition {
                 note: format!("checked move pending: {other:?}"),
@@ -2144,33 +2227,71 @@ async fn wait_par_files(engine: &EngineHandle, job_id: JobId, timeout: Duration)
 }
 
 /// Remove every `.pp.*` staging dir except this lease's own.
-fn remove_stale_staging(dir: &Path, own: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() && p != own && e.file_name().to_string_lossy().starts_with(".pp.") {
-            tracing::info!(dir = %p.display(), "removing superseded pp staging dir");
-            let _ = std::fs::remove_dir_all(&p);
-        }
-    }
+fn remove_stale_staging(_dir: &Path, _own: &Path) {
+    // A name is not ownership. Retain abandoned generations for reconciliation.
 }
 
 /// Publish staged extraction output: rename each entry into the job dir,
 /// replacing existing targets (identical content by construction — same
 /// archive, same extractor).
 fn commit_staging(staging: &Path, dir: &Path) -> std::io::Result<()> {
-    for e in std::fs::read_dir(staging)?.flatten() {
-        let target = dir.join(e.file_name());
-        if target.is_dir() {
-            std::fs::remove_dir_all(&target)?;
+    fn publish(source: &Path, target: &Path) -> std::io::Result<()> {
+        let meta = std::fs::symlink_metadata(source)?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::other("symlink extraction output"));
         }
-        std::fs::rename(e.path(), &target)?;
+        if meta.is_dir() {
+            match std::fs::create_dir(target) {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if !std::fs::symlink_metadata(target)?.is_dir() {
+                        return Err(e);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+            for entry in std::fs::read_dir(source)? {
+                let entry = entry?;
+                publish(&entry.path(), &target.join(entry.file_name()))?;
+            }
+        } else if meta.is_file() {
+            // Hard-link publication is exclusive. Replays can reuse equal bytes;
+            // different existing bytes are never overwritten.
+            match nzbd_state::fileops::copy_publish(source, target).map_err(|e| match e {
+                nzbd_state::artifacts::Error::Io(io) => io,
+                other => std::io::Error::other(other),
+            }) {
+                Ok(()) => {
+                    std::fs::File::open(source)?.sync_all()?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let target_meta = std::fs::symlink_metadata(target)?;
+                    if !target_meta.is_file()
+                        || target_meta.file_type().is_symlink()
+                        || !crate::namespace::equal_files(source, target)?
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "extraction output conflict; review required",
+                        ));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            return Err(std::io::Error::other("unsupported extraction output"));
+        }
+        Ok(())
     }
+    for entry in std::fs::read_dir(staging)? {
+        let entry = entry?;
+        publish(&entry.path(), &dir.join(entry.file_name()))?;
+    }
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
+#[cfg(test)]
 fn cleanup_dir(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -2787,7 +2908,7 @@ mod decision_tests {
     /// Staged output is published by rename, replacing whatever the earlier
     /// attempt left at the target.
     #[test]
-    fn commit_staging_replaces_existing_targets() {
+    fn extraction_shared_parent_preserves_siblings_and_conflicts() {
         let tmp = tempfile::tempdir().unwrap();
         let staging = tmp.path().join("staging");
         let dir = tmp.path().join("job");
@@ -2797,16 +2918,19 @@ mod decision_tests {
         // Stale output from an earlier attempt, both shapes.
         std::fs::create_dir_all(dir.join("Subs")).unwrap();
         std::fs::write(dir.join("Subs/old.srt"), b"stale").unwrap();
-        std::fs::write(dir.join("film.mkv"), b"stale").unwrap();
+        std::fs::write(dir.join("film.mkv"), b"new film").unwrap();
 
         commit_staging(&staging, &dir).unwrap();
 
         assert_eq!(std::fs::read(dir.join("film.mkv")).unwrap(), b"new film");
         assert_eq!(std::fs::read(dir.join("Subs/en.srt")).unwrap(), b"new subs");
         assert!(
-            !dir.join("Subs/old.srt").exists(),
-            "a replaced directory must not keep the old attempt's entries"
+            dir.join("Subs/old.srt").exists(),
+            "publication must preserve pre-existing siblings"
         );
+        std::fs::write(staging.join("film.mkv"), b"conflicting film").unwrap();
+        assert!(commit_staging(&staging, &dir).is_err());
+        assert_eq!(std::fs::read(dir.join("film.mkv")).unwrap(), b"new film");
         assert!(commit_staging(&tmp.path().join("absent"), &dir).is_err());
     }
 

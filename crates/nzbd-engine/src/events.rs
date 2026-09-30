@@ -6,6 +6,10 @@ use serde::Serialize;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
+    JobControlChanged {
+        job: JobId,
+        control: nzbd_types::JobControl,
+    },
     JobAdded {
         job: JobId,
         name: String,

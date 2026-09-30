@@ -109,6 +109,9 @@ impl Par2Tool {
         let name = main_par2.file_name().unwrap().to_string_lossy();
         let out = run_tool(&self.cmd, &["verify", "-q", &name], dir, self.timeout).await?;
         let text = format!("{}\n{}", out.stdout, out.stderr);
+        if nzbd_engine::is_out_of_space(&text) {
+            return Err(PostError::Subprocess(text.chars().take(4096).collect()));
+        }
         Ok(parse_verify_output(&text, out.code))
     }
 
@@ -117,6 +120,9 @@ impl Par2Tool {
         let name = main_par2.file_name().unwrap().to_string_lossy();
         let out = run_tool(&self.cmd, &["repair", "-q", &name], dir, self.timeout).await?;
         let text = format!("{}\n{}", out.stdout, out.stderr);
+        if nzbd_engine::is_out_of_space(&text) {
+            return Err(PostError::Subprocess(text.chars().take(4096).collect()));
+        }
         if out.code == 0
             && (text.contains("Repair complete")
                 || text.contains("repair is not required")
@@ -223,6 +229,9 @@ pub fn missing_volumes(dir: &Path, first: &Path) -> Vec<u32> {
     };
     let mut seen: Vec<u32> = Vec::new();
     for p in files_of(dir) {
+        if p.parent() != first.parent() {
+            continue;
+        }
         let name = p
             .file_name()
             .unwrap_or_default()
@@ -251,16 +260,7 @@ pub fn missing_volumes(dir: &Path, first: &Path) -> Vec<u32> {
 
 /// Files (not directories) directly in `dir`.
 fn files_of(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .collect();
-    out.sort();
-    out
+    crate::namespace::files(dir).unwrap_or_default()
 }
 
 /// Every file belonging to the same volume set as `first`, and their total
@@ -281,6 +281,9 @@ fn volume_set(dir: &Path, first: &Path) -> (usize, u64) {
     let mut count = 0usize;
     let mut bytes = 0u64;
     for p in files_of(dir) {
+        if p.parent() != first.parent() {
+            continue;
+        }
         let name = p
             .file_name()
             .unwrap_or_default()
@@ -421,7 +424,7 @@ impl Extractors {
             // Password failures are about the credential, not the tool, and
             // retrying with another extractor cannot help.
             if let Ok(o) = &first {
-                if o.password_error {
+                if o.password_error || o.disk_space_error {
                     return first;
                 }
             }
@@ -429,8 +432,15 @@ impl Extractors {
                 archive = %archive.display(),
                 "unrar did not deliver the whole archive; retrying with 7-Zip"
             );
-            let _ = std::fs::remove_dir_all(dest);
-            std::fs::create_dir_all(dest)?;
+            let failed = dest.with_extension("first-attempt");
+            if failed.exists() {
+                return Err(PostError::Subprocess(
+                    "previous extractor attempt requires review".into(),
+                ));
+            }
+            nzbd_state::fileops::rename_exclusive(dest, &failed)
+                .map_err(|e| PostError::Subprocess(e.to_string()))?;
+            std::fs::create_dir(dest)?;
             let second = self
                 .extract_once(archive, ArchiveKind::SevenZip, dest, password)
                 .await;
@@ -445,16 +455,33 @@ impl Extractors {
                 Err(_) => false,
             };
             if delivered {
-                return second;
+                let mut outcome = second?;
+                if let Ok(first) = first {
+                    outcome.attempts.splice(0..0, first.attempts);
+                }
+                return Ok(outcome);
             }
-            // Neither delivered. Report the first attempt's outcome, which
-            // is the one whose password/disk flags mean something, but never
-            // as a success: no tool produced the set.
-            return match first.or(second) {
-                Ok(o) => Ok(ExtractOutcome {
-                    success: false,
-                    ..o
-                }),
+            // Keep both attempts; the fallback is the actual last failing tool.
+            return match second {
+                Ok(mut o) => {
+                    o.success = false;
+                    match first {
+                        Ok(first) => {
+                            o.attempts.splice(0..0, first.attempts);
+                        }
+                        Err(e) => {
+                            o.attempts.insert(
+                                0,
+                                crate::ExtractAttempt {
+                                    executable: self.unrar_cmd.clone(),
+                                    exit_code: -1,
+                                    diagnostic: e.to_string().chars().take(4096).collect(),
+                                },
+                            );
+                        }
+                    }
+                    Ok(o)
+                }
                 Err(e) => Err(e),
             };
         }
@@ -507,12 +534,34 @@ impl Extractors {
                 let broke_the_chain = ["Cannot find volume", "You need to start extraction"]
                     .iter()
                     .any(|m| all.contains(m));
+                let lower = all.to_lowercase();
+                let quota_error = lower.contains("quota exceeded") || lower.contains("disk quota");
+                let capacity = nzbd_engine::is_out_of_space(&all)
+                    || lower.contains("there is not enough space")
+                    || lower.contains("disk full");
+                let diagnostic = match password {
+                    Some(secret) if !secret.is_empty() => all.replace(secret, "[redacted]"),
+                    _ => all.clone(),
+                }
+                .chars()
+                .take(4096)
+                .collect();
                 Ok(ExtractOutcome {
+                    attempts: vec![crate::ExtractAttempt {
+                        executable: if matches!(kind, ArchiveKind::Rar) {
+                            self.unrar_cmd.clone()
+                        } else {
+                            self.sevenzip_cmd.clone()
+                        },
+                        exit_code: out.code,
+                        diagnostic,
+                    }],
+                    quota_error,
                     success: out.code == 0 && all.contains("All OK") && !broke_the_chain,
                     password_error: out.code == 11
                         || out.stderr.contains("password")
                         || out.stdout.contains("password is incorrect"),
-                    disk_space_error: out.code == 5,
+                    disk_space_error: capacity || quota_error || out.code == 5,
                 })
             }
             ArchiveKind::SevenZip | ArchiveKind::Zip | ArchiveKind::Split => {
@@ -522,10 +571,32 @@ impl Extractors {
                 let out = run_tool(&self.sevenzip_cmd, &args, dir, self.timeout).await?;
                 let all = format!("{}\n{}", out.stdout, out.stderr);
                 // 7z requires the literal success line (nzbget does the same).
+                let lower = all.to_lowercase();
+                let quota_error = lower.contains("quota exceeded") || lower.contains("disk quota");
+                let capacity = nzbd_engine::is_out_of_space(&all)
+                    || lower.contains("there is not enough space")
+                    || lower.contains("disk full");
+                let diagnostic = match password {
+                    Some(secret) if !secret.is_empty() => all.replace(secret, "[redacted]"),
+                    _ => all.clone(),
+                }
+                .chars()
+                .take(4096)
+                .collect();
                 Ok(ExtractOutcome {
+                    attempts: vec![crate::ExtractAttempt {
+                        executable: if matches!(kind, ArchiveKind::Rar) {
+                            self.unrar_cmd.clone()
+                        } else {
+                            self.sevenzip_cmd.clone()
+                        },
+                        exit_code: out.code,
+                        diagnostic,
+                    }],
+                    quota_error,
                     success: out.code == 0 && all.contains("Everything is Ok"),
                     password_error: all.contains("Wrong password"),
-                    disk_space_error: all.contains("There is not enough space"),
+                    disk_space_error: capacity || quota_error,
                 })
             }
         }

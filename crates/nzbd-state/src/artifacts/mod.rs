@@ -2,12 +2,14 @@
 //!
 //! SQLite owns intent and policy; external sidecars own allocation identity.
 //! Nothing in a media payload is a marker or grants permission to remove it.
-mod fs;
+pub(crate) mod fs;
 mod policy;
 pub use policy::{RetentionChange, RetentionPreview};
 mod recovery;
 mod relocation;
+pub use relocation::{RegistryPolicy, RelocationResult};
 mod tasks;
+mod transforms;
 pub use recovery::{Receipt, ReceiptFile, Recovery, RecoveryFile};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -18,6 +20,7 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+pub use transforms::Workspace;
 
 pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
@@ -652,6 +655,7 @@ impl Inventory {
     /// Called once before queue writers start, never from the periodic worker.
     pub fn reconcile_startup(&self, live_jobs: &[u32]) -> Result<()> {
         self.reconcile_relocations()?;
+        self.reconcile_transforms()?;
         let _guard = self.mutation_guard()?;
         let rows = {
             let db = self.db.lock().unwrap();
@@ -1544,3 +1548,6 @@ impl Inventory {
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(test)]
+mod relocation_failure_tests;

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "revision": "9007199254740993",
+  "lifecycle": "held",
+  "cause": "capacity",
+  "stage": "download_write",
+  "retry_policy": "resume_same_job",
+  "message": "Waiting for storage capacity",
+  "instance": "synthetic-runner-instance",
+  "future_field": {"ignored": true}
+}

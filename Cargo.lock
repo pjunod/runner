@@ -2699,10 +2699,12 @@ name = "nzbd-engine"
 version = "0.2.0"
 dependencies = [
  "arc-swap",
+ "crc32fast",
  "http-body-util",
  "hyper",
  "hyper-util",
  "libc",
+ "md-5",
  "nzbd-nntp",
  "nzbd-nserv",
  "nzbd-nzb",
@@ -2769,6 +2771,9 @@ dependencies = [
 [[package]]
 name = "nzbd-par2"
 version = "0.2.0"
+dependencies = [
+ "md-5",
+]
 
 [[package]]
 name = "nzbd-post"
