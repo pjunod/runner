@@ -200,8 +200,9 @@ Compatibility projection is `status=paused`, `pp_done=false`, `ready=false`.
 The authoritative control is stored in the Runner queue snapshot under
 `*Control:v1`; it is persisted before events. Monarr stores it atomically with
 active acquisition state. Missing facts cannot clear a held row; unknown
-versions remain nonterminal, duplicate/stale revisions have no effects, and
-instance changes require explicit reconciliation. The SSE cursor is independent
+versions remain nonterminal, stale or conflicting control revisions are rejected,
+and instance changes require explicit reconciliation. Identical running control
+revisions still accept fresh transfer progress and stage observations. The SSE cursor is independent
 of the durable revision. Polling held facts take precedence over older history.
 
 `POST /api/v1/queue/{id}/resume` in Monarr calls Runner's existing
@@ -214,3 +215,19 @@ holds survive resource release.
 
 The identical `job-control-v1.json` fixtures preserve a revision larger than
 JavaScript's exact integer range and include an unknown future field.
+
+### Review regressions (2026-09-30)
+
+The post-processing manager preserves a stage's already-persisted hold instead
+of reclassifying its error wrapper. Extraction retries allocate new generations
+in the ownership journal, verify prior directory identities after restart, and
+retain previous outputs. Allocation interruptions and identity changes require
+review; directory names alone never grant reuse or cleanup authority.
+
+Isolated PAR repair requests missing delayed recovery blocks, waits for writers,
+and refreshes the same set before retrying. Restored filenames and protected
+catalog names remain relative to each set root, keeping nested episodes apart.
+Terminal history and `job_pp_finished` params preserve `*Control:v1` so a
+consumer can recover a missed resume transition after the queue row retires.
+The review probes in `failure_regressions.rs`, `pp_pipeline.rs`, and the
+workspace restart test in `transforms.rs` cover these paths.

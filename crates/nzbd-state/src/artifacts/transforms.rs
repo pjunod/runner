@@ -8,6 +8,13 @@ pub struct Workspace {
     pub scratch: Artifact,
     #[serde(default)]
     pub retained: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub attempts: Vec<WorkspaceAttempt>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceAttempt {
+    pub directory: String,
+    pub identity: Option<Identity>,
 }
 impl Inventory {
     pub fn workspace(&self, job: u32, kind: &str, token: &str) -> Result<Workspace> {
@@ -26,6 +33,7 @@ impl Inventory {
         if let Ok(op) = self.operation(&key) {
             let workspace: Workspace = serde_json::from_str(&op.request)?;
             self.verify(&workspace.scratch)?;
+            self.verify_workspace_attempts(&workspace)?;
             // The operation identity, not a directory name, grants reuse.
             return Ok(workspace);
         }
@@ -53,6 +61,7 @@ impl Inventory {
             source: source.clone(),
             scratch,
             retained: Default::default(),
+            attempts: Vec::new(),
         };
         let mut op = Operation {
             id: key,
@@ -89,6 +98,50 @@ impl Inventory {
         save_operation(&tx, &op)?;
         tx.commit()?;
         Ok(workspace)
+    }
+
+    fn verify_workspace_attempts(&self, workspace: &Workspace) -> Result<()> {
+        let root = self.verify(&workspace.scratch)?;
+        for attempt in &workspace.attempts {
+            let expected = attempt.identity.as_ref().ok_or_else(|| {
+                Error::Conflict("interrupted extraction attempt allocation requires review".into())
+            })?;
+            let observed = fs::open_relative(&root, &attempt.directory)?;
+            if !expected.same_object(&fs::identity(&observed.metadata()?)) {
+                return Err(Error::Conflict(
+                    "extraction attempt identity changed".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Journal a new extraction generation; prior bytes are never reused or deleted.
+    pub fn begin_workspace_attempt(&self, workspace: &mut Workspace) -> Result<PathBuf> {
+        let _guard = self.mutation_guard()?;
+        let mut op = self.operation(&workspace.operation_id)?;
+        let mut current: Workspace = serde_json::from_str(&op.request)?;
+        self.verify_workspace_attempts(&current)?;
+        if op.kind != "extract" || op.state != "running" || current.attempts.len() >= 64 {
+            return Err(Error::Conflict("extraction attempt requires review".into()));
+        }
+        let directory = format!("attempt-{}", current.attempts.len() + 1);
+        current.attempts.push(WorkspaceAttempt {
+            directory: directory.clone(),
+            identity: None,
+        });
+        op.request = serde_json::to_string(&current)?;
+        save_operation(&self.db.lock().unwrap(), &op)?;
+        let path = current.scratch.path.join(&directory);
+        std::fs::create_dir(&path)?;
+        fs::sync_directory(&self.verify(&current.scratch)?)?;
+        current.attempts.last_mut().unwrap().identity =
+            Some(fs::identity(&fs::open_dir(&path)?.metadata()?));
+        op.request = serde_json::to_string(&current)?;
+        op.attempts = current.attempts.len() as u32;
+        save_operation(&self.db.lock().unwrap(), &op)?;
+        *workspace = current;
+        Ok(path)
     }
 
     pub fn retain_transform_original(
@@ -289,6 +342,7 @@ impl Inventory {
                 } else {
                     let workspace: Workspace = serde_json::from_str(&op.request)?;
                     self.verify(&workspace.scratch)?;
+                    self.verify_workspace_attempts(&workspace)?;
                     let root = self.verify(&workspace.source)?;
                     for entry in workspace
                         .source
@@ -328,6 +382,33 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn extraction_retry_generations_survive_restart_and_reject_changed_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("downloads");
+        std::fs::create_dir(&root).unwrap();
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        let source = root.join("job");
+        inventory.allocate(5, &root, &source).unwrap();
+        std::fs::write(source.join("archive.rar"), b"original").unwrap();
+        let mut workspace = inventory.workspace(5, "extract", "abc").unwrap();
+        let first = inventory.begin_workspace_attempt(&mut workspace).unwrap();
+        std::fs::write(first.join("partial.bin"), b"retained partial").unwrap();
+        drop(inventory);
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        inventory.reconcile_startup(&[5]).unwrap();
+        let mut workspace = inventory.workspace(5, "extract", "abc").unwrap();
+        let second = inventory.begin_workspace_attempt(&mut workspace).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            std::fs::read(first.join("partial.bin")).unwrap(),
+            b"retained partial"
+        );
+        assert_eq!(workspace.attempts.len(), 2);
+        std::fs::rename(&second, second.with_extension("retained")).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        assert!(inventory.begin_workspace_attempt(&mut workspace).is_err());
+    }
     #[test]
     fn transforms_reuse_owned_workspace_and_retain_originals() {
         let temp = tempfile::tempdir().unwrap();

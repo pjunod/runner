@@ -7,7 +7,7 @@ pub async fn repair(
     job: u32,
     set: &Par2Set,
     tool: &Par2Tool,
-) -> Result<bool, PostError> {
+) -> Result<VerifyResult, PostError> {
     let token = set
         .set_id
         .iter()
@@ -97,10 +97,10 @@ pub async fn repair(
     let repaired = match verified {
         VerifyResult::Intact => true,
         VerifyResult::Repairable { .. } => tool.repair(&main).await? == RepairResult::Repaired,
-        _ => false,
+        other => return Ok(other),
     };
     if !repaired {
-        return Ok(false);
+        return Ok(VerifyResult::Unrepairable);
     }
     for original in mappings {
         let relative = original
@@ -140,7 +140,7 @@ pub async fn repair(
     inventory
         .finish_workspace(&workspace)
         .map_err(|e| PostError::Subprocess(e.to_string()))?;
-    Ok(true)
+    Ok(VerifyResult::Intact)
 }
 
 fn matching_blocks(

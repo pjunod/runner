@@ -127,7 +127,7 @@ pub fn par_rename_owned(
         for f in &set.files {
             wanted.entry(f.md5_16k).or_default().push(f);
         }
-        for p in files_of(dir) {
+        for p in files_of(&set.root) {
             if ext_is(&p, "par2") || p.extension().is_some_and(|e| e == "part") {
                 continue;
             }
@@ -151,11 +151,11 @@ pub fn par_rename_owned(
             let Ok(relative) = crate::namespace::relative(&f.name) else {
                 continue;
             };
-            let target = dir.join(relative);
+            let target = set.root.join(relative);
             if p == target {
                 continue;
             }
-            if create_parents(dir, target.parent().unwrap()).is_err() {
+            if create_parents(&set.root, target.parent().unwrap()).is_err() {
                 continue;
             }
             if let Some((inventory, job)) = custody {

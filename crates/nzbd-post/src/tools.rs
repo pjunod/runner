@@ -432,14 +432,28 @@ impl Extractors {
                 archive = %archive.display(),
                 "unrar did not deliver the whole archive; retrying with 7-Zip"
             );
-            let failed = dest.with_extension("first-attempt");
-            if failed.exists() {
+            // Preserve prior outputs using exclusive names. Production callers
+            // additionally allocate each retry in a journal-owned generation.
+            let mut retained = false;
+            for generation in 0..64 {
+                let failed = dest.with_extension(if generation == 0 {
+                    "first-attempt".to_string()
+                } else {
+                    format!("first-attempt-{generation}")
+                });
+                if std::fs::symlink_metadata(&failed).is_ok() {
+                    continue;
+                }
+                nzbd_state::fileops::rename_exclusive(dest, &failed)
+                    .map_err(|e| PostError::Subprocess(e.to_string()))?;
+                retained = true;
+                break;
+            }
+            if !retained {
                 return Err(PostError::Subprocess(
-                    "previous extractor attempt requires review".into(),
+                    "extractor attempt limit requires review".into(),
                 ));
             }
-            nzbd_state::fileops::rename_exclusive(dest, &failed)
-                .map_err(|e| PostError::Subprocess(e.to_string()))?;
             std::fs::create_dir(dest)?;
             let second = self
                 .extract_once(archive, ArchiveKind::SevenZip, dest, password)

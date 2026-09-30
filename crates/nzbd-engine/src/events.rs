@@ -100,7 +100,7 @@ pub enum Event {
         final_dir: Option<String>,
         size_bytes: u64,
         health: u16,
-        /// The job's non-`*` params (the `monarr-transfer` id rides here).
+        /// Consumer params plus `*Control:v1`, preserving missed hold resolution.
         params: Vec<(String, String)>,
         /// Rowid of the history entry just written: the cursor value a
         /// consumer passes to `?since_seq=`. 0 when the write failed —

@@ -130,3 +130,76 @@ async fn resource_failure_never_runs_fallback() {
     assert!(!marker.exists());
     assert_eq!(out.attempts.len(), 1);
 }
+
+#[tokio::test]
+async fn review_diskfull_fallback_can_be_retried_in_same_workspace() {
+    let t = tempfile::tempdir().unwrap();
+    let seven = t.path().join("7z");
+    tool(
+        &seven,
+        "#!/bin/sh\nfor arg do case \"$arg\" in -o*) dest=${arg#-o};; esac; done\nprintf partial > \"$dest/partial.bin\"\necho 'ERROR: No space left on device' >&2\nexit 2\n",
+    );
+    let archive = t.path().join("payload.rar");
+    fs::write(&archive, b"fixture").unwrap();
+    let ex = Extractors {
+        unrar_cmd: t.path().join("missing-unrar").display().to_string(),
+        sevenzip_cmd: seven.display().to_string(),
+        timeout: Duration::from_secs(5),
+    };
+    let out = t.path().join("output");
+    let first = ex
+        .extract(&archive, ArchiveKind::Rar, &out, None)
+        .await
+        .unwrap();
+    assert!(first.disk_space_error);
+    let retry = ex.extract(&archive, ArchiveKind::Rar, &out, None).await;
+    assert!(
+        retry.is_ok(),
+        "same-workspace retry stopped before extractor: {retry:?}"
+    );
+
+    assert_eq!(
+        fs::read(out.with_extension("first-attempt-1").join("partial.bin")).unwrap(),
+        b"partial"
+    );
+    tool(&seven, "#!/bin/sh\nfor arg do case \"$arg\" in -o*) dest=${arg#-o};; esac; done\nprintf recovered > \"$dest/media.bin\"\necho 'Everything is Ok'\n");
+    let restored = ex
+        .extract(&archive, ArchiveKind::Rar, &out, None)
+        .await
+        .unwrap();
+    assert!(restored.success, "restored capacity failed: {restored:?}");
+    assert_eq!(fs::read(out.join("media.bin")).unwrap(), b"recovered");
+    assert_eq!(
+        fs::read(out.with_extension("first-attempt-2").join("partial.bin")).unwrap(),
+        b"partial"
+    );
+}
+
+#[test]
+fn review_nested_par_set_keeps_its_catalog_root() {
+    let t = tempfile::tempdir().unwrap();
+    let episode = t.path().join("Episode01");
+    fs::create_dir(&episode).unwrap();
+    let payload = episode.join("payload.bin");
+    fs::write(&payload, vec![5u8; 50_000]).unwrap();
+    assert!(Command::new("par2")
+        .args([
+            "create",
+            "-q",
+            "-q",
+            "-s8192",
+            "-c4",
+            "set.par2",
+            "payload.bin"
+        ])
+        .current_dir(&episode)
+        .status()
+        .unwrap()
+        .success());
+    par_rename(t.path());
+    assert!(
+        payload.exists(),
+        "valid episode-local catalog file was incorrectly moved into the job root"
+    );
+    assert!(!t.path().join("payload.bin").exists());
+}

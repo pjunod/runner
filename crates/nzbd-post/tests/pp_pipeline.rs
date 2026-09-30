@@ -2467,3 +2467,204 @@ async fn the_stage_timeline_reaches_history() {
     assert_eq!(job.stages.len(), stages.len());
     engine.shutdown().await;
 }
+
+#[tokio::test]
+async fn review_manager_preserves_extractor_capacity_hold() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/capacity-review");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bytes = b"synthetic archive";
+    std::fs::write(dir.join("payload.zip"), bytes).unwrap();
+    let tool = tmp.path().join("seven");
+    std::fs::write(
+        &tool,
+        "#!/bin/sh\necho 'ERROR: No space left on device' >&2\nexit 2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    spawn_post_manager(
+        engine.clone(),
+        PostConfig {
+            sevenzip_cmd: tool.display().to_string(),
+            deobfuscate_final: false,
+            ..Default::default()
+        },
+        history(tmp.path()),
+        tmp.path().join("dest"),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+    engine
+        .import_fixture_job(
+            tmp.path(),
+            completed_job(
+                998,
+                "capacity-review",
+                vec![file_entry(998, "payload.zip", Some(crc(bytes)), false)],
+            ),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let control = loop {
+        if let Some(c) = engine
+            .export_job(JobId(998))
+            .await
+            .unwrap()
+            .and_then(|j| j.control())
+        {
+            break c;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no control after extractor failure"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+    let control = engine
+        .export_job(JobId(998))
+        .await
+        .unwrap()
+        .unwrap()
+        .control()
+        .unwrap_or(control);
+    engine.shutdown().await;
+    assert_eq!(
+        control.cause, "capacity",
+        "outer manager overwrote typed hold: {control:?}"
+    );
+    assert_eq!(control.retry_policy, "resume_same_job");
+}
+
+#[tokio::test]
+async fn review_missing_parity_requests_available_paused_volume() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/delayed-review");
+    std::fs::create_dir_all(&dir).unwrap();
+    let data: Vec<u8> = (0..50_000u32).map(|i| ((i * 7) % 253) as u8).collect();
+    std::fs::write(dir.join("payload.bin"), &data).unwrap();
+    par2_create(&dir, 4, &["payload.bin"]);
+    let mut pars = par2_entries(&dir, 910);
+    for f in &mut pars {
+        if f.filename.contains(".vol") {
+            std::fs::remove_file(dir.join(&f.filename)).unwrap();
+            f.paused = true;
+            f.finalized = false;
+        }
+    }
+    let paused: Vec<_> = pars.iter().filter(|f| f.paused).map(|f| f.id).collect();
+    assert!(!paused.is_empty());
+    let mut bad = data;
+    bad[25_000] ^= 0xff;
+    std::fs::write(dir.join("payload.bin"), &bad).unwrap();
+    let mut files = vec![file_entry(909, "payload.bin", Some(crc(&bad)), false)];
+    files.extend(pars);
+    engine
+        .import_fixture_job(
+            tmp.path(),
+            completed_job(997, "delayed-review", files),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    let _ = process_job(
+        &engine,
+        &PostConfig {
+            unpack: false,
+            par_fetch_timeout: Duration::from_millis(20),
+            ..Default::default()
+        },
+        &history(tmp.path()),
+        &tmp.path().join("dest"),
+        JobId(997),
+    )
+    .await;
+    let job = engine.export_job(JobId(997)).await.unwrap().unwrap();
+    engine.shutdown().await;
+    assert!(
+        job.files
+            .iter()
+            .any(|f| paused.contains(&f.id) && !f.paused),
+        "repair gave up while all available recovery volumes remained paused; control={:?}",
+        job.control()
+    );
+}
+
+#[tokio::test]
+async fn review_terminal_history_and_event_keep_resolved_control() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/resolved-review");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("payload.bin"), b"payload").unwrap();
+    let control: nzbd_types::JobControl = serde_json::from_value(serde_json::json!({
+     "version":1,"revision":"43","lifecycle":"running","cause":"capacity",
+     "stage":"extract","retry_policy":"resume_same_job","message":"resumed","instance":"same"
+    }))
+    .unwrap();
+    let mut job = completed_job(
+        996,
+        "resolved-review",
+        vec![file_entry(996, "payload.bin", Some(crc(b"payload")), false)],
+    );
+    job.params.push((
+        nzbd_types::CONTROL_PARAM.into(),
+        serde_json::to_string(&control).unwrap(),
+    ));
+    engine
+        .import_fixture_job(tmp.path(), job, false, false)
+        .await
+        .unwrap();
+    let hist = history(tmp.path());
+    let mut events = engine.subscribe();
+    let result = process_job(
+        &engine,
+        &PostConfig {
+            unpack: false,
+            deobfuscate_final: false,
+            ..Default::default()
+        },
+        &hist,
+        &tmp.path().join("dest"),
+        JobId(996),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, PpFinal::Success);
+    let row = hist.get(JobId(996)).unwrap().unwrap();
+    let saved = row
+        .params
+        .iter()
+        .find(|(key, _)| key == nzbd_types::CONTROL_PARAM)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<nzbd_types::JobControl>(&saved.1).unwrap(),
+        control
+    );
+    let mut observed = false;
+    while let Ok(event) = events.try_recv() {
+        if let nzbd_engine::Event::JobPpFinished {
+            job: JobId(996),
+            params,
+            ..
+        } = event
+        {
+            assert!(params.contains(saved));
+            observed = true;
+        }
+    }
+    assert!(observed, "completion event omitted the resolving control");
+    engine.shutdown().await;
+}

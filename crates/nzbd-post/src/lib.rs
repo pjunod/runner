@@ -30,6 +30,9 @@ pub mod tools;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PostError {
+    /// The stage already persisted its authoritative control fact.
+    #[error("post-processing held")]
+    Held,
     #[error("tool not found: {0}")]
     ToolMissing(String),
     #[error("subprocess failed: {0}")]

@@ -23,8 +23,8 @@ nzbd --version
 Install the post-processing tools if you want repair/unpack:
 
 ```sh
-# Debian/Ubuntu
-sudo apt-get install par2 unrar-free p7zip-full
+# Debian/Ubuntu (enable the non-free/multiverse component for real UnRAR)
+sudo apt-get install par2 unrar p7zip-full 7zip
 # Fedora
 sudo dnf install par2cmdline p7zip p7zip-plugins
 # macOS
@@ -48,12 +48,22 @@ setup UI write `nzbd.toml` for you, and the Settings tab can save later.
 A read-only mount (`:ro`, a compose `configs:` entry, a ConfigMap) makes
 every save fail — see [DEPLOY.md](DEPLOY.md) for that shape.
 
-The image bundles `par2`, `unrar-free` and `7z`, runs unprivileged as UID
+The image bundles `par2`, real `unrar`, `7z` and `7zz`, runs unprivileged as UID
 1000 under `tini`, exposes `6789`, and expects its config at
 `/etc/nzbd/nzbd.toml` with `/data` as the conventional download volume.
-Build locally with `docker build -t nzbd .` — the repo's
+Build locally with `make docker-build` to embed the source revision — the repo's
 [`Dockerfile`](../Dockerfile) is a two-stage build (rust:1-bookworm →
 debian:bookworm-slim).
+
+The runtime-tools stage enables Debian's `non-free` component and installs the
+real UnRAR package alongside both 7-Zip commands. Image builds fail if any
+configured default tool or `tini` is missing. Check the tool layer separately:
+
+```sh
+docker build --target runtime-tools -t nzbd-runtime-tools .
+docker run --rm nzbd-runtime-tools sh -ec \
+  'command -v par2; command -v unrar; command -v 7z; command -v 7zz; command -v tini'
+```
 
 Compose and Kubernetes deployments: see [DEPLOY.md](DEPLOY.md).
 

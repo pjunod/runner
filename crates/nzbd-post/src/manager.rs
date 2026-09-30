@@ -731,7 +731,7 @@ async fn handle_failed_job(
     if gate.as_ref().is_some_and(|claim| !claim(job)) {
         return;
     }
-    let mut fail_params = exported.as_ref().map(user_params).unwrap_or_default();
+    let mut fail_params = exported.as_ref().map(terminal_params).unwrap_or_default();
     if let Some(d) = disposition.as_ref() {
         fail_params.push(("Failure:Files".into(), d.note.clone()));
     }
@@ -1024,6 +1024,9 @@ fn spawn_job(
                         let _ = engine.remove_job_silent(job).await;
                     }
                 }
+                Some(Err(PostError::Held)) => {
+                    // The stage owns the persisted cause, revision and retry policy.
+                }
                 Some(Err(e)) => {
                     let detail = e.to_string();
                     let cause = if nzbd_engine::is_out_of_space(&detail) {
@@ -1155,6 +1158,18 @@ fn user_params(job: &Job) -> Vec<(String, String)> {
         .filter(|(k, _)| !k.starts_with('*'))
         .cloned()
         .collect()
+}
+
+/// Terminal history/events retain the last authoritative control revision.
+fn terminal_params(job: &Job) -> Vec<(String, String)> {
+    let mut params = user_params(job);
+    params.extend(
+        job.params
+            .iter()
+            .filter(|(key, _)| key == nzbd_types::CONTROL_PARAM)
+            .cloned(),
+    );
+    params
 }
 
 fn now() -> i64 {
@@ -1434,20 +1449,22 @@ async fn process_job_ctx_from(
     let mut par2_names: std::collections::HashSet<String> = Default::default();
     if from.includes(RestartPoint::Cleanup) {
         for set in par2::load_sets(&dir)? {
-            par2_names.extend(set.files.iter().map(|f| f.name.clone()));
+            par2_names.extend(set.files.iter().filter_map(|f| {
+                set.root
+                    .join(&f.name)
+                    .strip_prefix(&dir)
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned())
+            }));
             if from.includes(RestartPoint::Verify) {
                 stages.enter(PostStage::ParVerify).await;
                 let quick = par2::quick_verify(&set, &evidence_of(&job, &dir, &rename_map));
                 if quick == VerifyResult::Intact {
                     tracing::info!(job = job_id.0, "par quick-verify: intact (no data re-read)");
                 } else if set.main_path.is_some() {
-                    let repaired = crate::repair_workspace::repair(
-                        &engine.artifacts(),
-                        job_id.0,
-                        &set,
-                        &par_tool,
-                    )
-                    .await?;
+                    let repaired =
+                        repair_isolated_loop(engine, cfg, &par_tool, &mut stages, job_id, set)
+                            .await?;
                     par_ok &= repaired;
                     par_did_repair |= repaired;
                 } else {
@@ -1466,7 +1483,7 @@ async fn process_job_ctx_from(
                 "PAR mapping or parity is insufficient; inputs retained for review",
             )
             .await;
-        return Err(PostError::Subprocess("PAR recovery held".into()));
+        return Err(PostError::Held);
     }
 
     // ---- UNPACK stage ------------------------------------------------------
@@ -1491,13 +1508,17 @@ async fn process_job_ctx_from(
             for (archive, kind) in &archives {
                 use sha2::{Digest, Sha256};
                 let token = format!("{:x}", Sha256::digest(archive.to_string_lossy().as_bytes()));
-                let workspace = engine
+                let mut workspace = engine
                     .artifacts()
                     .workspace(job_id.0, "extract", &token)
                     .map_err(|e| PostError::Subprocess(e.to_string()))?;
                 let _workspace_capacity =
                     nzbd_state::capacity::reserve(&workspace.scratch.path, job.totals.size)?;
-                let mut staging = workspace.scratch.path.join("output");
+                let attempt = engine
+                    .artifacts()
+                    .begin_workspace_attempt(&mut workspace)
+                    .map_err(|e| PostError::Subprocess(e.to_string()))?;
+                let mut staging = attempt.join("output");
                 // Extraction is fenced: everything lands in the lease's
                 // staging dir and is renamed into place only on success
                 // with the lease still live (double-unpack can't happen).
@@ -1512,7 +1533,7 @@ async fn process_job_ctx_from(
                         .collect::<Vec<_>>()
                         .join("; ");
                     let _ = engine.hold_job(job_id, cause, "extract", &detail).await;
-                    return Err(PostError::Subprocess(format!("resource hold: {cause}")));
+                    return Err(PostError::Held);
                 }
                 if !r.success && !par_did_repair && par_ok {
                     // The unpack↔repair loop: a broken archive that quick
@@ -1529,7 +1550,11 @@ async fn process_job_ctx_from(
                             {
                                 par_did_repair = true;
                                 stages.enter(PostStage::Unpack).await;
-                                staging = workspace.scratch.path.join("retry-output");
+                                let attempt = engine
+                                    .artifacts()
+                                    .begin_workspace_attempt(&mut workspace)
+                                    .map_err(|e| PostError::Subprocess(e.to_string()))?;
+                                staging = attempt.join("output");
                                 r = ex.extract(archive, *kind, &staging, password).await?;
                             }
                         }
@@ -1545,7 +1570,7 @@ async fn process_job_ctx_from(
                             "extractor retry exhausted storage",
                         )
                         .await;
-                    return Err(PostError::Subprocess("resource hold".into()));
+                    return Err(PostError::Held);
                 }
                 // "It said OK" is not the same as "it read the whole set".
                 // Checked BEFORE the commit, so a short extraction is thrown
@@ -1935,7 +1960,7 @@ async fn process_job_ctx_from(
             status: outcome.as_str().into(),
             size: fin.totals.size,
             health,
-            params: user_params(&fin),
+            params: terminal_params(&fin),
             dupe_key: fin.dupe.key.clone(),
             dupe_score: fin.dupe.score,
             completed_at_unix: now(),
@@ -1999,7 +2024,7 @@ async fn process_job_ctx_from(
             final_dir,
             size_bytes: fin.totals.size,
             health,
-            params: user_params(&fin),
+            params: terminal_params(&fin),
             history_seq,
         });
     }
@@ -2029,6 +2054,41 @@ fn select_scripts(found: Vec<PathBuf>, extensions: &[String]) -> Vec<PathBuf> {
                 .any(|e| e.eq_ignore_ascii_case(&file) || e.eq_ignore_ascii_case(&stem))
         })
         .collect()
+}
+
+/// Preserve isolated repair while fetching delayed recovery blocks for this set.
+async fn repair_isolated_loop(
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    par: &Par2Tool,
+    stages: &mut Stages<'_>,
+    job_id: JobId,
+    mut set: par2::Par2Set,
+) -> Result<bool, PostError> {
+    for _ in 0..8 {
+        stages.enter(PostStage::ParRepair).await;
+        match crate::repair_workspace::repair(&engine.artifacts(), job_id.0, &set, par).await? {
+            VerifyResult::Intact => return Ok(true),
+            VerifyResult::NeedMoreBlocks { blocks_needed } => {
+                let freed = engine
+                    .unpause_par_blocks(job_id, blocks_needed, Some(set.slice_size))
+                    .await
+                    .unwrap_or(0);
+                if freed == 0 || !wait_par_files(engine, job_id, cfg.par_fetch_timeout).await {
+                    return Ok(false);
+                }
+                let refreshed = par2::load_sets(&set.root)?
+                    .into_iter()
+                    .find(|candidate| candidate.set_id == set.set_id);
+                let Some(refreshed) = refreshed else {
+                    return Ok(false);
+                };
+                set = refreshed;
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(false)
 }
 
 /// verify_full → (unpause delayed pars → wait → re-verify)* → repair.
