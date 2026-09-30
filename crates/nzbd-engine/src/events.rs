@@ -6,6 +6,10 @@ use serde::Serialize;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
+    JobControlChanged {
+        job: JobId,
+        control: nzbd_types::JobControl,
+    },
     JobAdded {
         job: JobId,
         name: String,
@@ -96,7 +100,7 @@ pub enum Event {
         final_dir: Option<String>,
         size_bytes: u64,
         health: u16,
-        /// The job's non-`*` params (the `monarr-transfer` id rides here).
+        /// Consumer params plus `*Control:v1`, preserving missed hold resolution.
         params: Vec<(String, String)>,
         /// Rowid of the history entry just written: the cursor value a
         /// consumer passes to `?since_seq=`. 0 when the write failed —

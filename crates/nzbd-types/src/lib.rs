@@ -515,6 +515,24 @@ pub struct StageSpan {
 /// across restarts, leader failovers and lease reclaims.
 pub const PP_DONE_PARAM: &str = "*PP:done";
 
+/// Versioned nonterminal control. Revisions are decimal strings on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobControl {
+    pub version: u32,
+    pub revision: String,
+    pub lifecycle: String,
+    pub cause: String,
+    pub stage: String,
+    pub retry_policy: String,
+    pub message: String,
+    pub instance: String,
+    #[serde(default)]
+    pub previous_status: Option<JobStatus>,
+    #[serde(default)]
+    pub manual_pause: bool,
+}
+pub const CONTROL_PARAM: &str = "*Control:v1";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: JobId,
@@ -582,6 +600,24 @@ pub struct Job {
 }
 
 impl Job {
+    pub fn control(&self) -> Option<JobControl> {
+        self.params
+            .iter()
+            .find(|(k, _)| k == CONTROL_PARAM)
+            .and_then(|(_, v)| serde_json::from_str(v).ok())
+    }
+    pub fn held(&self) -> bool {
+        self.control()
+            .is_some_and(|c| c.lifecycle == "held" || c.version != 1)
+    }
+    pub fn set_control(&mut self, control: &JobControl) {
+        self.params.retain(|(k, _)| k != CONTROL_PARAM);
+        self.params.push((
+            CONTROL_PARAM.into(),
+            serde_json::to_string(control).expect("control serializes"),
+        ));
+    }
+
     pub fn force_priority(&self) -> bool {
         self.priority >= PRIORITY_FORCE
     }
@@ -597,6 +633,9 @@ impl Job {
     }
 
     pub fn ready(&self) -> bool {
+        if self.held() {
+            return false;
+        }
         match self.kind {
             JobKind::Torrent => self.ready_at_unix().is_some(),
             JobKind::Nzb | JobKind::Url => self
@@ -737,5 +776,24 @@ mod tests {
         );
         job.params = vec![(PP_DONE_PARAM.into(), "SUCCESS".into())];
         assert!(job.ready());
+    }
+    #[test]
+    fn control_v1_golden_keeps_decimal_revision_and_ignores_future_fields() {
+        let value: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/job-control-v1.json")).unwrap();
+        let control: JobControl = serde_json::from_value(value.clone()).unwrap();
+        let wire = serde_json::to_value(control).unwrap();
+        for key in [
+            "version",
+            "revision",
+            "lifecycle",
+            "cause",
+            "stage",
+            "retry_policy",
+            "message",
+            "instance",
+        ] {
+            assert_eq!(wire[key], value[key]);
+        }
     }
 }

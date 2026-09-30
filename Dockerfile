@@ -23,22 +23,23 @@ WORKDIR /src
 COPY . .
 RUN cargo build --release -p nzbd
 
-FROM debian:bookworm-slim
-# NOT unrar-free. It is a GPL clone that cannot handle multi-volume archives
-# and does not say so: handed volume 1 of a five-volume set with every volume
-# present, it extracts volume 1, prints "All OK" and exits 0. Nearly every
-# release above a few hundred megabytes is multi-volume, so an image built
-# with it delivers the first 500 MiB of each one and calls the download
-# complete. That cost two 40-60 GB remuxes before anyone caught it.
-#
-# 7-Zip reads RAR correctly, multi-volume included, and is what the RAR path
-# now uses. `p7zip-full` stays for the .7z/.zip/.NNN paths. Point
-# `post.unrar_cmd` at a real unrar if you have one — nothing here stops you —
-# but nothing requires it either.
-RUN apt-get update \
+FROM debian:bookworm-slim AS runtime-tools
+# The configured defaults require par2, real UnRAR and 7z. Debian's UnRAR
+# package is in non-free; unrar-free cannot reliably handle multi-volume RAR.
+# Keep both 7z and modern 7zz available for fallback and other archive formats.
+RUN sed -i 's/^Components: main$/Components: main non-free/' \
+      /etc/apt/sources.list.d/debian.sources \
+ && apt-get update \
  && apt-get install -y --no-install-recommends \
-      par2 p7zip-full 7zip ca-certificates tini \
+      par2 unrar p7zip-full 7zip ca-certificates tini \
+ && command -v par2 \
+ && command -v unrar \
+ && command -v 7z \
+ && command -v 7zz \
+ && command -v tini \
  && rm -rf /var/lib/apt/lists/*
+
+FROM runtime-tools AS runtime
 COPY --from=build /src/target/release/nzbd /usr/local/bin/nzbd
 
 # Unprivileged runtime user; /data is the conventional volume mount.

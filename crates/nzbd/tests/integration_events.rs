@@ -728,6 +728,12 @@ fn params_are_validated_and_native_consumers_are_visible() {
         &[("X-Nzbd-Client", "monarr/9.9.9")],
     );
     assert_eq!(code, 200);
+    // History observations are queued to the owned sync worker. HTTP reads
+    // intentionally do not wait behind that worker's filesystem transaction.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while seen_count(&d.addr) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(
         seen_count(&d.addr),
         1,

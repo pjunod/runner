@@ -700,6 +700,62 @@ impl EngineHandle {
     }
 
     pub async fn resume_job(&self, job: JobId) -> Result<bool, EngineError> {
+        if let Some(record) = self.export_job(job).await? {
+            if let Some(control) = record.control().filter(|c| c.lifecycle == "held") {
+                if !matches!(control.cause.as_str(), "capacity" | "quota") {
+                    return Ok(false);
+                }
+                let revision = control.revision.clone();
+                if !self
+                    .roundtrip_bool(|reply| QueueCommand::BeginResourceProbe {
+                        job,
+                        revision: revision.clone(),
+                        reply,
+                    })
+                    .await?
+                {
+                    return Ok(false);
+                }
+                let inventory = self.artifacts();
+                let path = inventory
+                    .for_job(job.0)
+                    .map_err(|e| EngineError::Lifecycle(e.to_string()))?
+                    .ok_or_else(|| {
+                        EngineError::Lifecycle("held payload identity unavailable".into())
+                    })?
+                    .path;
+                let bytes = record
+                    .files
+                    .iter()
+                    .map(|f| {
+                        let key = format!("*File:size:{}", f.id.0);
+                        record
+                            .params
+                            .iter()
+                            .find(|(k, _)| k == &key)
+                            .and_then(|(_, v)| v.parse::<u64>().ok())
+                            .unwrap_or_else(|| f.segments.iter().map(|s| s.size as u64).sum())
+                    })
+                    .sum();
+                let token = format!("{}-{}", job.0, revision);
+                // Explicit resume is the operator release for unavailable quota
+                // telemetry. Admission and a write/flush probe still must pass.
+                let health = tokio::task::spawn_blocking(move || {
+                    nzbd_state::capacity::health(&path, bytes, &token)
+                })
+                .await;
+                let Ok(Ok(_reservation)) = health else {
+                    return Ok(false);
+                };
+                return self
+                    .roundtrip_bool(|reply| QueueCommand::ReleaseResourceHold {
+                        job,
+                        revision,
+                        reply,
+                    })
+                    .await;
+            }
+        }
         self.roundtrip_bool(|reply| QueueCommand::Resume { job, reply })
             .await
     }
@@ -1079,6 +1135,24 @@ impl EngineHandle {
     pub async fn retain_jobs(&self, keep: Vec<JobId>) -> Result<(), EngineError> {
         self.roundtrip_unit(|reply| QueueCommand::RetainJobs { keep, reply })
             .await
+    }
+
+    /// Persist a nonterminal fence before exposing it to consumers.
+    pub async fn hold_job(
+        &self,
+        job: JobId,
+        cause: &str,
+        stage: &str,
+        message: &str,
+    ) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::HoldJob {
+            job,
+            cause: cause.into(),
+            stage: stage.into(),
+            message: message.into(),
+            reply,
+        })
+        .await
     }
 
     /// Post-processing status transition (PostQueued / Post{stage} / final).

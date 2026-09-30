@@ -71,6 +71,11 @@ pub fn work_view(mut job: Job, scope: &RangeScope, fence: u64) -> Result<Job, St
         ".nzbd-cluster/range-work/job-{}/file-{}/{}-{}-fence-{fence}",
         scope.job_id, scope.file_id, scope.first_article, scope.last_article
     );
+    job.params.retain(|(key, _)| key != "*Cluster:range");
+    job.params.push((
+        "*Cluster:range".into(),
+        serde_json::to_string(scope).map_err(|e| e.to_string())?,
+    ));
     job.status = JobStatus::Queued;
     nzbd_engine::queue::recompute_job_totals(&mut job);
     Ok(job)

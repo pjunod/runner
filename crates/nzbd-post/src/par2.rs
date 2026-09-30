@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Par2File {
+    pub md5_full: [u8; 16],
     pub id: [u8; 16],
     pub name: String,
     pub length: u64,
@@ -24,6 +25,9 @@ pub struct Par2File {
 
 #[derive(Debug, Clone, Default)]
 pub struct Par2Set {
+    pub par_paths: Vec<PathBuf>,
+    pub set_id: [u8; 16],
+    pub root: PathBuf,
     pub slice_size: u64,
     pub files: Vec<Par2File>,
     /// Distinct recovery blocks present across the parsed .par2 files.
@@ -40,22 +44,62 @@ pub struct Par2Set {
 /// One parser, two callers — the alternative was a second copy that would
 /// drift.
 pub fn load_dir(dir: &Path) -> Result<Option<Par2Set>, PostError> {
-    let mut par_files: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .map(|e| e.eq_ignore_ascii_case("par2"))
-                .unwrap_or(false)
-        })
-        .collect();
-    if par_files.is_empty() {
-        return Ok(None);
+    let mut sets = load_sets(dir)?;
+    if sets.len() > 1 {
+        return Err(PostError::Subprocess(
+            "multiple PAR sets require set-aware processing".into(),
+        ));
     }
-    par_files.sort();
+    Ok(sets.pop())
+}
 
+pub fn load_sets(dir: &Path) -> Result<Vec<Par2Set>, PostError> {
+    let mut groups: std::collections::BTreeMap<[u8; 16], Vec<PathBuf>> = Default::default();
+    for path in crate::namespace::files(dir)? {
+        if !path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("par2"))
+        {
+            continue;
+        }
+        if std::fs::metadata(&path)?.len() > 64 * 1024 * 1024 {
+            return Err(PostError::Subprocess("PAR metadata size limit".into()));
+        }
+        let scan = nzbd_par2::scan(&std::fs::read(&path)?);
+        if scan.invalid {
+            return Err(PostError::Subprocess(
+                "invalid PAR packet digest or mixed set".into(),
+            ));
+        }
+        if let Some(set_id) = scan.set_id {
+            groups.entry(set_id).or_default().push(path);
+        }
+    }
+    let mut sets = Vec::new();
+    for (set_id, paths) in groups {
+        let root = paths
+            .first()
+            .and_then(|p| p.parent())
+            .unwrap_or(dir)
+            .to_path_buf();
+        if paths.iter().any(|p| p.parent() != Some(root.as_path())) {
+            return Err(PostError::Subprocess(
+                "PAR set spans multiple catalog roots; review required".into(),
+            ));
+        }
+        if let Some(mut set) = load_one(&root, paths)? {
+            set.set_id = set_id;
+            sets.push(set);
+        }
+    }
+    Ok(sets)
+}
+
+fn load_one(dir: &Path, mut par_files: Vec<PathBuf>) -> Result<Option<Par2Set>, PostError> {
+    par_files.sort();
     let mut slice_size = 0u64;
-    let mut descs: HashMap<[u8; 16], (String, u64, [u8; 16])> = HashMap::new();
+    type Description = (String, u64, [u8; 16], [u8; 16]);
+    let mut descs: HashMap<[u8; 16], Description> = HashMap::new();
     let mut order: Vec<[u8; 16]> = Vec::new();
     let mut crcs: HashMap<[u8; 16], Vec<u32>> = HashMap::new();
     let mut exponents: BTreeSet<u32> = BTreeSet::new();
@@ -73,7 +117,7 @@ pub fn load_dir(dir: &Path) -> Result<Option<Par2Set>, PostError> {
         let has_descs = scan.has_descs();
         for d in &scan.descs {
             if descs
-                .insert(d.id, (d.name.clone(), d.length, d.md5_16k))
+                .insert(d.id, (d.name.clone(), d.length, d.md5_16k, d.md5_full))
                 .is_none()
             {
                 order.push(d.id);
@@ -96,8 +140,9 @@ pub fn load_dir(dir: &Path) -> Result<Option<Par2Set>, PostError> {
     let files = order
         .into_iter()
         .map(|id| {
-            let (name, length, md5_16k) = descs.remove(&id).expect("id came from descs");
+            let (name, length, md5_16k, md5_full) = descs.remove(&id).expect("id came from descs");
             Par2File {
+                md5_full,
                 id,
                 name,
                 length,
@@ -107,6 +152,9 @@ pub fn load_dir(dir: &Path) -> Result<Option<Par2Set>, PostError> {
         })
         .collect();
     Ok(Some(Par2Set {
+        par_paths: par_files,
+        set_id: [0; 16],
+        root: dir.into(),
         slice_size,
         files,
         recovery_blocks: exponents.len() as u32,
@@ -158,12 +206,7 @@ pub fn quick_check_file(f: &Par2File, slice_size: u64, disk_len: u64, whole_crc:
 pub fn quick_verify(set: &Par2Set, evidence: &[DownloadEvidence]) -> VerifyResult {
     let mut damaged = 0u32;
     for f in &set.files {
-        let ev = evidence.iter().find(|e| {
-            e.path
-                .file_name()
-                .map(|n| n.to_string_lossy() == f.name.as_str())
-                == Some(true)
-        });
+        let ev = evidence.iter().find(|e| e.path == set.root.join(&f.name));
         let ok = match ev {
             Some(e) => match e.crc32 {
                 Some(crc) => {
@@ -285,10 +328,11 @@ mod tests {
             tmp.path().join("unreadable.par2"),
         )
         .unwrap();
-        assert!(load_dir(tmp.path()).unwrap().is_none());
+        assert!(load_dir(tmp.path()).is_err());
 
         let data = b"abc";
         let file = Par2File {
+            md5_full: [0; 16],
             id: [1; 16],
             name: "payload.bin".into(),
             length: data.len() as u64,
@@ -303,6 +347,9 @@ mod tests {
         assert!(!quick_check_file(&wrong_slices, 3, 3, crc(data)));
 
         let set = Par2Set {
+            par_paths: vec![],
+            set_id: [0; 16],
+            root: tmp.path().into(),
             slice_size: 3,
             files: vec![file],
             recovery_blocks: 7,

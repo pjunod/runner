@@ -279,6 +279,23 @@ pub(crate) enum QueueCommand {
     // -- post-processing hooks (phase 2) ------------------------------------
     /// Post-processing state transitions (PostQueued / Post{stage} /
     /// terminal). Only meaningful on jobs whose download already finished.
+    BeginResourceProbe {
+        job: JobId,
+        revision: String,
+        reply: oneshot::Sender<bool>,
+    },
+    ReleaseResourceHold {
+        job: JobId,
+        revision: String,
+        reply: oneshot::Sender<bool>,
+    },
+    HoldJob {
+        job: JobId,
+        cause: String,
+        stage: String,
+        message: String,
+        reply: oneshot::Sender<bool>,
+    },
     SetJobStatus {
         job: JobId,
         status: JobStatus,
@@ -407,6 +424,12 @@ pub(crate) enum EngineMsg {
         server: ServerId,
         max: usize,
         reply: oneshot::Sender<Vec<Lease>>,
+    },
+    FileMetadata {
+        job: JobId,
+        file: FileId,
+        name: String,
+        size: u64,
     },
     SegmentWritten {
         job: JobId,
@@ -790,6 +813,42 @@ impl Owner {
                     }
                 }
             }
+            for j in &mut state.jobs {
+                let dir = dest_dir.join(job_dir_name(j));
+                for f in &mut j.files {
+                    let key = format!("*File:size:{}", f.id.0);
+                    if let Some(size) = j
+                        .params
+                        .iter()
+                        .find(|(k, _)| k == &key)
+                        .and_then(|(_, v)| v.parse::<u64>().ok())
+                    {
+                        file_sizes.insert(f.id, size);
+                    }
+                    // Revalidate even old page-cache acknowledgements. Sparse length
+                    // alone proves nothing; only matching range bytes retain Done.
+                    let stable = dir.join(format!(".runner-file-{}.part", f.id.0));
+                    let path = if f.finalized {
+                        dir.join(&f.filename)
+                    } else if stable.exists() {
+                        stable
+                    } else {
+                        dir.join(format!("{}.part", f.filename))
+                    };
+                    for segment in &mut f.segments {
+                        if let SegmentState::Done { offset, len, crc } = segment.state {
+                            if !crate::writer::validate_range(&path, offset, len as u64, crc) {
+                                segment.state = SegmentState::Pending;
+                                f.finalized = false;
+                                f.crc32 = None;
+                            }
+                        }
+                    }
+                }
+                if j.held() {
+                    j.status = JobStatus::Paused;
+                }
+            }
             state.recompute_all_totals();
         }
 
@@ -1082,6 +1141,12 @@ impl Owner {
                 server,
                 outcome,
             ),
+            EngineMsg::FileMetadata {
+                job,
+                file,
+                name,
+                size,
+            } => self.accept_file_metadata(job, file, &name, size),
             EngineMsg::ConnectFailed { server } => self.block_server(server),
             EngineMsg::WriterFinalized {
                 job,
@@ -1096,8 +1161,24 @@ impl Owner {
                 tracing::warn!(job = job.0, file = file.0, %error, "writer error; failing file");
                 if crate::is_out_of_space(&error) {
                     self.observe_out_of_space(&error);
+                    let cause = if error.to_lowercase().contains("quota") {
+                        "quota"
+                    } else {
+                        "capacity"
+                    };
+                    self.hold_job(
+                        job,
+                        cause,
+                        if error.starts_with("finalize") {
+                            "finalize"
+                        } else {
+                            "download_write"
+                        },
+                        &error,
+                    );
+                    return;
                 }
-                self.fail_whole_file(job, file);
+                self.hold_job(job, "io", "download_write", &error);
             }
         }
     }
@@ -1413,6 +1494,33 @@ impl Owner {
                 let _ = reply.send(ok);
             }
             QueueCommand::Pause { job, reply } => {
+                if let Some(mut control) = self
+                    .state
+                    .job(job)
+                    .and_then(|j| j.control())
+                    .filter(|c| c.lifecycle == "held")
+                {
+                    control.manual_pause = true;
+                    let Some(revision) = control
+                        .revision
+                        .parse::<u64>()
+                        .ok()
+                        .and_then(|r| r.checked_add(1))
+                    else {
+                        let _ = reply.send(false);
+                        return;
+                    };
+                    control.revision = revision.to_string();
+                    self.state.job_mut(job).unwrap().set_control(&control);
+                    self.dirty = true;
+                    let committed = !self.persist || self.save_snapshot();
+                    if committed {
+                        self.publish_now();
+                        self.emit(Event::JobControlChanged { job, control });
+                    }
+                    let _ = reply.send(committed);
+                    return;
+                }
                 let before = self.state.job(job).cloned();
                 let torrent = match self.state.job_mut(job) {
                     Some(j)
@@ -1457,6 +1565,12 @@ impl Owner {
                 let _ = reply.send(ok);
             }
             QueueCommand::Resume { job, reply } => {
+                // Resource/custody release has its own admission protocol. Manual
+                // resume cannot erase a hold merely because statvfs looks healthy.
+                if self.state.job(job).is_some_and(|j| j.held()) {
+                    let _ = reply.send(false);
+                    return;
+                }
                 if self.retiring_writers.contains_key(&job) {
                     let _ = reply.send(false);
                     return;
@@ -1925,7 +2039,138 @@ impl Owner {
                 self.bump_epoch();
                 let _ = reply.send(());
             }
+            QueueCommand::BeginResourceProbe {
+                job,
+                revision,
+                reply,
+            } => {
+                let quiescent = self.state.job(job).is_some_and(|j| {
+                    j.files
+                        .iter()
+                        .all(|f| self.writers.get(&f.id).is_none_or(|w| *w.stopped.borrow()))
+                });
+                let now = unix_now();
+                let mut ok = false;
+                if quiescent {
+                    if let Some(j) = self.state.job_mut(job) {
+                        let current = j.control();
+                        let after = j
+                            .params
+                            .iter()
+                            .find(|(k, _)| k == "*Control:probe_after")
+                            .and_then(|(_, v)| v.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        let count = j
+                            .params
+                            .iter()
+                            .find(|(k, _)| k == "*Control:attempts")
+                            .and_then(|(_, v)| v.parse::<u32>().ok())
+                            .unwrap_or(0);
+                        if current.is_some_and(|c| {
+                            c.revision == revision
+                                && c.lifecycle == "held"
+                                && matches!(c.cause.as_str(), "capacity" | "quota")
+                        }) && after <= now
+                            && count < 8
+                        {
+                            j.params.retain(|(k, _)| {
+                                k != "*Control:probe_after" && k != "*Control:attempts"
+                            });
+                            j.params.push((
+                                "*Control:probe_after".into(),
+                                (now + 30 * (1i64 << count.min(6))).to_string(),
+                            ));
+                            j.params
+                                .push(("*Control:attempts".into(), (count + 1).to_string()));
+                            self.dirty = true;
+                            ok = !self.persist || self.save_snapshot();
+                        }
+                    }
+                }
+                let _ = reply.send(ok);
+            }
+            QueueCommand::ReleaseResourceHold {
+                job,
+                revision,
+                reply,
+            } => {
+                let before = self.state.job(job).cloned();
+                let mut changed = None;
+                if let Some(j) = self.state.job_mut(job) {
+                    if let Some(mut control) = j.control().filter(|c| {
+                        c.revision == revision
+                            && c.lifecycle == "held"
+                            && matches!(c.cause.as_str(), "capacity" | "quota")
+                    }) {
+                        if let Some(next) = control
+                            .revision
+                            .parse::<u64>()
+                            .ok()
+                            .and_then(|r| r.checked_add(1))
+                        {
+                            control.revision = next.to_string();
+                            control.lifecycle = "running".into();
+                            control.message = "Storage admitted; resuming this job".into();
+                            j.status = if control.manual_pause {
+                                JobStatus::Paused
+                            } else {
+                                match control.previous_status {
+                                    Some(
+                                        JobStatus::Post { .. }
+                                        | JobStatus::PostQueued
+                                        | JobStatus::Completed,
+                                    ) => JobStatus::PostQueued,
+                                    _ => JobStatus::Queued,
+                                }
+                            };
+                            j.set_control(&control);
+                            for f in &j.files {
+                                self.writers.remove(&f.id);
+                            }
+                            changed = Some(control);
+                        }
+                    }
+                }
+                self.dirty |= changed.is_some();
+                let ok = changed.is_some() && (!self.persist || self.save_snapshot());
+                if ok {
+                    self.bump_epoch();
+                    self.publish_now();
+                    self.emit(Event::JobControlChanged {
+                        job,
+                        control: changed.unwrap(),
+                    });
+                    let files: Vec<_> = self
+                        .state
+                        .job(job)
+                        .unwrap()
+                        .files
+                        .iter()
+                        .map(|f| f.id)
+                        .collect();
+                    for file in files {
+                        self.after_file_change(job, file);
+                    }
+                } else if let Some(before) = before {
+                    *self.state.job_mut(job).unwrap() = before;
+                }
+                let _ = reply.send(ok);
+            }
+            QueueCommand::HoldJob {
+                job,
+                cause,
+                stage,
+                message,
+                reply,
+            } => {
+                let committed = self.hold_job(job, &cause, &stage, &message);
+                let _ = reply.send(committed);
+            }
             QueueCommand::SetJobStatus { job, status, reply } => {
+                if self.state.job(job).is_some_and(|j| j.held()) {
+                    let _ = reply.send(false);
+                    return;
+                }
                 if self.retiring_writers.contains_key(&job) {
                     let _ = reply.send(false);
                     return;
@@ -1959,7 +2204,7 @@ impl Owner {
                 reply,
             } => {
                 let ok = match self.state.job_mut(job) {
-                    Some(j) => {
+                    Some(j) if !j.held() => {
                         close_span(j, prev_ms, at_unix);
                         j.stages.push(StageSpan {
                             stage,
@@ -1974,7 +2219,7 @@ impl Owner {
                         j.status = JobStatus::Post { stage };
                         true
                     }
-                    None => false,
+                    _ => false,
                 };
                 if ok {
                     self.dirty = true;
@@ -2024,6 +2269,17 @@ impl Owner {
     // -- cluster: import / export / delegation / adoption --------------------
 
     fn import_job(&mut self, mut job: Job, fold_journals: bool, emit_finished: bool) -> bool {
+        if let Some(control) = self
+            .state
+            .job(job.id)
+            .and_then(|j| j.control())
+            .filter(|c| c.lifecycle == "held")
+        {
+            // Remote/exported legacy snapshots cannot erase a newer local fence.
+            job.set_control(&control);
+            job.status = JobStatus::Paused;
+            job.params.retain(|(k, _)| k != nzbd_types::PP_DONE_PARAM);
+        }
         // Normalize transient state from the wire.
         for f in &mut job.files {
             for s in &mut f.segments {
@@ -2163,6 +2419,28 @@ impl Owner {
             };
             if rec.file_size > 0 {
                 self.file_sizes.insert(rec.file, rec.file_size);
+            }
+            let path = self.state.job(job_id).and_then(|j| {
+                j.files.iter().find(|f| f.id == rec.file).map(|f| {
+                    let root = self.dest_dir.join(job_dir_name(j));
+                    let stable = root.join(format!(".runner-file-{}.part", rec.file.0));
+                    if stable.exists() {
+                        stable
+                    } else {
+                        root.join(&f.filename)
+                    }
+                })
+            });
+            if !path.is_some_and(|p| {
+                crate::writer::validate_range(&p, rec.offset, rec.len as u64, rec.crc32)
+            }) {
+                self.hold_job(
+                    job_id,
+                    "identity_conflict",
+                    "download_write",
+                    "foreign journal bytes require revalidation; evidence retained",
+                );
+                continue;
             }
             let Some(seg) = self.state.segment_mut(r) else {
                 continue;
@@ -2516,30 +2794,181 @@ impl Owner {
         self.bump_epoch();
     }
 
-    /// Writer reported an unrecoverable disk error: fail every non-done
-    /// segment of the file.
-    fn fail_whole_file(&mut self, job: JobId, file: FileId) {
-        let refs: Vec<SegRef> = match self.state.file_mut(job, file) {
-            Some(f) => f
-                .segments
-                .iter()
-                .filter(|s| !matches!(s.state, SegmentState::Done { .. }))
-                .map(|s| SegRef {
-                    job,
-                    file,
-                    seg_number: s.number,
-                })
-                .collect(),
-            None => return,
-        };
-        for r in refs {
-            self.fail_segment(r);
+    fn accept_file_metadata(&mut self, job: JobId, file: FileId, name: &str, size: u64) {
+        if name.is_empty()
+            || name.len() > 255
+            || name.contains(['/', '\\', ':', '\0'])
+            || name == "."
+            || name == ".."
+            || size == 0
+        {
+            self.hold_job(
+                job,
+                "identity_conflict",
+                "download_write",
+                "unsafe or incomplete yEnc metadata",
+            );
+            return;
         }
+        let Some(j) = self.state.job_mut(job) else {
+            return;
+        };
+        let Some(index) = j.files.iter().position(|f| f.id == file) else {
+            return;
+        };
+        let size_key = format!("*File:size:{}", file.0);
+        let previous_size = j
+            .params
+            .iter()
+            .find(|(k, _)| k == &size_key)
+            .and_then(|(_, v)| v.parse::<u64>().ok());
+        let name_key = format!("*File:name:{}", file.0);
+        let previous_name = j
+            .params
+            .iter()
+            .find(|(k, _)| k == &name_key)
+            .map(|(_, v)| v.as_str());
+        if previous_size.is_some_and(|s| s != size) || previous_name.is_some_and(|n| n != name) {
+            self.hold_job(
+                job,
+                "identity_conflict",
+                "download_write",
+                "conflicting yEnc name or declared size",
+            );
+            return;
+        }
+        if previous_size.is_some() && j.files[index].filename_confirmed {
+            return; // repeated segments carry identical already-persisted metadata
+        }
+        if previous_size.is_none() {
+            j.params.push((size_key, size.to_string()));
+            j.params.push((name_key, name.into()));
+        }
+        // Collision suffix precedes extension. The raw confirmed name is stored
+        // separately so later segments compare against source metadata.
+        let mut chosen = name.to_string();
+        if j.files.iter().any(|f| f.id != file && f.filename == chosen) {
+            let p = Path::new(name);
+            chosen = match p.extension() {
+                Some(ext) => format!(
+                    "{}-{}.{}",
+                    p.file_stem().unwrap_or_default().to_string_lossy(),
+                    file.0,
+                    ext.to_string_lossy()
+                ),
+                None => format!("{name}-{}", file.0),
+            };
+        }
+        j.files[index].filename = chosen;
+        j.files[index].filename_confirmed = true;
+        j.files[index].is_par2 = name.to_ascii_lowercase().ends_with(".par2");
+        self.file_sizes.insert(file, size);
+        self.dirty = true;
+        // Name authority is committed before any Finalize can publish it.
+        if self.persist && !self.save_snapshot() {
+            self.hold_job(
+                job,
+                "io",
+                "download_write",
+                "filename metadata could not be persisted",
+            );
+        }
+    }
+
+    fn hold_job(&mut self, job: JobId, cause: &str, stage: &str, message: &str) -> bool {
+        let Some(j) = self.state.job_mut(job) else {
+            return false;
+        };
+        if j.params.iter().any(|(k, _)| k == nzbd_types::PP_DONE_PARAM) {
+            return false;
+        }
+        let prior = j.control();
+        if prior.as_ref().is_some_and(|c| {
+            c.lifecycle == "held" && !matches!(c.cause.as_str(), "capacity" | "quota")
+        }) {
+            return true;
+        }
+        if prior
+            .as_ref()
+            .is_some_and(|c| c.lifecycle == "held" && c.cause == cause && c.stage == stage)
+        {
+            return true;
+        }
+        let revision = prior
+            .as_ref()
+            .and_then(|c| c.revision.parse::<u64>().ok())
+            .unwrap_or(0)
+            .checked_add(1);
+        let Some(revision) = revision else {
+            return false;
+        };
+        let control = nzbd_types::JobControl {
+            version: 1,
+            revision: revision.to_string(),
+            lifecycle: "held".into(),
+            cause: cause.into(),
+            stage: stage.into(),
+            retry_policy: if matches!(cause, "capacity" | "quota") {
+                "resume_same_job"
+            } else {
+                "review"
+            }
+            .into(),
+            message: message.chars().take(2048).collect(),
+            instance: prior
+                .as_ref()
+                .map(|c| c.instance.clone())
+                .unwrap_or_else(|| {
+                    format!(
+                        "{:x}-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos(),
+                        job.0
+                    )
+                }),
+            previous_status: prior
+                .as_ref()
+                .and_then(|c| c.previous_status)
+                .or(Some(j.status)),
+            manual_pause: prior
+                .as_ref()
+                .map_or(j.status == JobStatus::Paused, |c| c.manual_pause),
+        };
+        j.set_control(&control);
+        j.status = JobStatus::Paused;
+        for f in &mut j.files {
+            for s in &mut f.segments {
+                if matches!(s.state, SegmentState::Leased { .. }) {
+                    s.state = SegmentState::Pending;
+                }
+            }
+        }
+        for f in &j.files {
+            if let Some(w) = self.writers.get(&f.id) {
+                w.stop.cancel();
+            }
+            self.finalize_sent.remove(&f.id);
+        }
+        self.pending_finalize.retain(|(id, _)| *id != job);
+        self.dirty = true;
+        self.bump_epoch();
+        // Failed persistence leaves the local fence in place, but emits no fact.
+        if self.persist && !self.save_snapshot() {
+            return false;
+        }
+        self.publish_now();
+        self.emit(Event::JobControlChanged { job, control });
+        true
     }
 
     // -- completion cascade --------------------------------------------------
 
     fn after_file_change(&mut self, job: JobId, file: FileId) {
+        if self.state.job(job).is_some_and(|j| j.held()) {
+            return;
+        }
         let Some(f) = self.state.file_mut(job, file) else {
             return;
         };
@@ -2580,7 +3009,7 @@ impl Owner {
             }
         }
         segs.sort_by_key(|(off, _, _)| *off);
-        let combined_crc = if all_done { combine_crcs(&segs) } else { None };
+        let mut combined_crc = if all_done { combine_crcs(&segs) } else { None };
 
         // The yEnc-declared size, or nothing.
         //
@@ -2602,7 +3031,40 @@ impl Owner {
             .filter(|s| *s > 0)
             .unwrap_or(0);
 
+        let coverage: u64 = segs.iter().map(|(_, len, _)| *len as u64).sum();
+        // Segment leases seal private sparse checkpoints. Their authenticated
+        // scope is not media completeness; the cluster assembler validates the
+        // union before normal publication. Authority mode cannot use this lane.
+        let range_checkpoint = !self.persist
+            && all_done
+            && file_size > 0
+            && self.state.job(job).is_some_and(|j| {
+                j.dir_name.starts_with(".nzbd-cluster/range-work/")
+                    && j.params.iter().any(|(k, _)| k == "*Cluster:range")
+            });
+        if range_checkpoint {
+            combined_crc = None;
+        }
+        if !range_checkpoint && (combined_crc.is_none() || file_size == 0 || coverage != file_size)
+        {
+            self.hold_job(
+                job,
+                "identity_conflict",
+                "finalize",
+                "file coverage or expected size is unverified; partial retained",
+            );
+            return;
+        }
+        let filename = self
+            .state
+            .file_mut(job, file)
+            .map(|f| f.filename.clone())
+            .unwrap_or_default();
         let tx = self.writer_for(job, file);
+        if tx.try_send(WriteCmd::PublicationName(filename)).is_err() {
+            self.pending_finalize.push((job, file));
+            return;
+        }
         match tx.try_send(WriteCmd::Finalize {
             file_size,
             combined_crc,
@@ -2769,6 +3231,9 @@ impl Owner {
     }
 
     fn check_job_complete(&mut self, job_id: JobId) {
+        if self.state.job(job_id).is_some_and(|j| j.held()) {
+            return;
+        }
         if self.delegated.contains_key(&job_id) {
             return; // completes via the executor's report, not locally
         }
@@ -2972,6 +3437,9 @@ impl Owner {
     /// sitting in the queue says why — that branch was silent through
     /// months of PAR_FAILUREs on jobs with 5 GB of recovery blocks on hand.
     fn unpause_par_blocks(&mut self, job_id: JobId, blocks: u32, block_size: Option<u64>) -> u32 {
+        if self.state.job(job_id).is_some_and(|j| j.held()) {
+            return 0;
+        }
         let Some(job) = self.state.job_mut(job_id) else {
             tracing::warn!(
                 job = job_id.0,
@@ -3974,6 +4442,7 @@ impl Owner {
                     .map(|s| s.size as u64)
                     .sum();
                 let mut summary = JobSummary {
+                    control: j.control(),
                     id: j.id,
                     kind: j.kind,
                     name: j.name.clone(),
@@ -5158,7 +5627,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_errors_fail_pending_segments_and_latch_out_of_space() {
+    fn writer_resource_errors_hold_pending_segments_and_latch_out_of_space() {
         let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
         owner.state.jobs.push(pending_job(2));
 
@@ -5168,8 +5637,11 @@ mod tests {
             error: "write payload.bin: No space left on device (os error 28)".into(),
         });
         let job = owner.state.job(JobId(2)).unwrap();
-        assert_eq!(job.files[0].segments[0].state, SegmentState::Failed);
-        assert!(job.files[0].finalized);
+        assert_eq!(job.files[0].segments[0].state, SegmentState::Pending);
+        assert!(!job.files[0].finalized);
+        assert_eq!(job.status, JobStatus::Paused);
+        assert!(job.held());
+        assert!(!job.ready());
         assert!(owner.disk_low);
         assert!(owner.enospc_latched);
         assert_eq!(owner.enospc_observed, 1);

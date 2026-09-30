@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct JobSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control: Option<nzbd_types::JobControl>,
     pub id: JobId,
     pub kind: JobKind,
     pub name: String,
@@ -189,6 +191,7 @@ mod mobile_queue_contract_tests {
             let input = &fixture["job"];
             // Construct the actual engine DTO, rather than adding Deserialize to it.
             let summary = JobSummary {
+                control: None,
                 id: serde_json::from_value(input["id"].clone()).unwrap(),
                 kind: serde_json::from_value(input["kind"].clone()).unwrap(),
                 name: serde_json::from_value(input["name"].clone()).unwrap(),

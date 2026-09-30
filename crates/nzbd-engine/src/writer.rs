@@ -12,13 +12,16 @@ use crate::owner::EngineMsg;
 use nzbd_types::{FileId, JobId, ServerId};
 use std::io::SeekFrom;
 use std::path::PathBuf;
-use tokio::fs::{File, OpenOptions};
+use tokio::fs::File;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::task::TaskTracker;
 
 #[derive(Debug)]
 pub enum WriteCmd {
+    PublicationName(String),
+    #[cfg(test)]
+    InjectFailure(&'static str, i32),
     Segment {
         seg_number: u32,
         offset: u64,
@@ -75,10 +78,27 @@ async fn writer_task(
     engine_tx: mpsc::Sender<EngineMsg>,
     stop: tokio_util::sync::CancellationToken,
 ) {
-    let part_path = dir.join(format!("{final_name}.part"));
-    let final_path = dir.join(&final_name);
+    let part_path = dir.join(format!(".runner-file-{}.part", file_id.0));
+    let legacy = dir.join(format!("{final_name}.part"));
+    if !part_path.exists() && legacy.exists() {
+        // Exclusive alias migration retains the legacy entry as evidence.
+        if let Err(e) = nzbd_state::fileops::link(&legacy, &part_path) {
+            let _ = engine_tx
+                .send(EngineMsg::WriterError {
+                    job,
+                    file: file_id,
+                    error: format!("legacy partial migration: {e}"),
+                })
+                .await;
+            return;
+        }
+    }
+    let mut final_path = dir.join(&final_name);
     let mut out: Option<File> = None;
     let mut preallocated = false;
+    let mut reservation = None;
+    #[cfg(test)]
+    let mut fault = None;
 
     loop {
         let cmd = tokio::select! {
@@ -87,6 +107,20 @@ async fn writer_task(
             cmd = rx.recv() => match cmd { Some(cmd) => cmd, None => break },
         };
         match cmd {
+            #[cfg(test)]
+            WriteCmd::InjectFailure(stage, code) => {
+                fault = Some((stage, code));
+            }
+            WriteCmd::PublicationName(name) => {
+                if name.is_empty()
+                    || name.contains(['/', '\\', ':', '\0'])
+                    || name == "."
+                    || name == ".."
+                {
+                    return;
+                }
+                final_path = dir.join(name);
+            }
             WriteCmd::Segment {
                 seg_number,
                 offset,
@@ -95,6 +129,35 @@ async fn writer_task(
                 file_size,
                 server,
             } => {
+                if reservation.is_none() && file_size > 0 {
+                    let _ = tokio::fs::create_dir_all(&dir).await;
+                    match nzbd_state::capacity::reserve(&dir, file_size) {
+                        Ok(claim) => reservation = Some(claim),
+                        Err(e) => {
+                            let _ = engine_tx
+                                .send(EngineMsg::WriterError {
+                                    job,
+                                    file: file_id,
+                                    error: format!("write admission {}: {e}", dir.display()),
+                                })
+                                .await;
+                            return;
+                        }
+                    }
+                }
+                #[cfg(test)]
+                let injected = fault.take();
+                #[cfg(test)]
+                if let Some(("write", code)) = injected {
+                    let _ = engine_tx
+                        .send(EngineMsg::WriterError {
+                            job,
+                            file: file_id,
+                            error: format!("write: {}", std::io::Error::from_raw_os_error(code)),
+                        })
+                        .await;
+                    return;
+                }
                 let result = write_segment(
                     &dir,
                     &part_path,
@@ -105,6 +168,12 @@ async fn writer_task(
                     file_size,
                 )
                 .await;
+                #[cfg(test)]
+                let result = if let Some(("sync", code)) = injected {
+                    Err(std::io::Error::from_raw_os_error(code))
+                } else {
+                    result
+                };
                 let msg = match result {
                     Ok(()) => EngineMsg::SegmentWritten {
                         job,
@@ -116,11 +185,16 @@ async fn writer_task(
                         file_size,
                         server,
                     },
-                    Err(e) => EngineMsg::WriterError {
-                        job,
-                        file: file_id,
-                        error: format!("write {}: {e}", part_path.display()),
-                    },
+                    Err(e) => {
+                        let _ = engine_tx
+                            .send(EngineMsg::WriterError {
+                                job,
+                                file: file_id,
+                                error: format!("write {}: {e}", part_path.display()),
+                            })
+                            .await;
+                        return; // drop/drain the channel; no more writes after failure
+                    }
                 };
                 if engine_tx.send(msg).await.is_err() {
                     break; // engine gone
@@ -130,7 +204,19 @@ async fn writer_task(
                 file_size,
                 combined_crc,
             } => {
-                let result = finalize(&part_path, &final_path, &mut out, file_size).await;
+                #[cfg(test)]
+                if let Some(("finalize", code)) = fault.take() {
+                    let _ = engine_tx
+                        .send(EngineMsg::WriterError {
+                            job,
+                            file: file_id,
+                            error: format!("finalize: {}", std::io::Error::from_raw_os_error(code)),
+                        })
+                        .await;
+                    return;
+                }
+                let result =
+                    finalize(&part_path, &final_path, &mut out, file_size, combined_crc).await;
                 let msg = match result {
                     Ok(()) => EngineMsg::WriterFinalized {
                         job,
@@ -145,17 +231,18 @@ async fn writer_task(
                         // place that actually tried to use it.
                         if crate::is_out_of_space(&e.to_string()) {
                             let _ = engine_tx
-                                .send(EngineMsg::OutOfSpace {
-                                    whence: format!("finalize {}: {e}", final_path.display()),
+                                .send(EngineMsg::WriterError {
+                                    job,
+                                    file: file_id,
+                                    error: format!("finalize {}: {e}", final_path.display()),
                                 })
                                 .await;
+                            return;
                         }
-                        EngineMsg::WriterFinalized {
+                        EngineMsg::WriterError {
                             job,
                             file: file_id,
-                            ok: false,
-                            final_path: None,
-                            combined_crc,
+                            error: format!("finalize identity/publication: {e}"),
                         }
                     }
                 };
@@ -170,7 +257,7 @@ async fn writer_task(
 
 async fn write_segment(
     dir: &PathBuf,
-    part_path: &PathBuf,
+    part_path: &std::path::Path,
     out: &mut Option<File>,
     preallocated: &mut bool,
     offset: u64,
@@ -180,13 +267,9 @@ async fn write_segment(
     if out.is_none() {
         tokio::fs::create_dir_all(dir).await?;
         // No truncate: resume must keep already-written parts.
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(part_path)
-            .await?;
+        let f = File::from_std(
+            nzbd_state::fileops::writer(part_path, true).map_err(std::io::Error::other)?,
+        );
         *out = Some(f);
     }
     let f = out.as_mut().unwrap();
@@ -199,28 +282,42 @@ async fn write_segment(
         *preallocated = true;
     }
     f.seek(SeekFrom::Start(offset)).await?;
+    if file_size > 0
+        && offset
+            .checked_add(data.len() as u64)
+            .is_none_or(|end| end > file_size)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "segment exceeds declared size",
+        ));
+    }
     f.write_all(data).await?;
+    // Checkpoint boundary: one segment. Durability precedes journal/snapshot proof.
+    f.sync_data().await?;
     Ok(())
 }
 
 async fn finalize(
-    part_path: &PathBuf,
-    final_path: &PathBuf,
+    part_path: &std::path::Path,
+    final_path: &std::path::Path,
     out: &mut Option<File>,
     file_size: u64,
+    combined_crc: Option<u32>,
 ) -> std::io::Result<()> {
     if out.is_none() {
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(part_path)
-            .await
-        {
+        match nzbd_state::fileops::writer(part_path, false)
+            .map(File::from_std)
+            .map_err(|e| match e {
+                nzbd_state::artifacts::Error::Io(io) => io,
+                other => std::io::Error::other(other.to_string()),
+            }) {
             Ok(f) => *out = Some(f),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if tokio::fs::try_exists(final_path).await.unwrap_or(false) {
-                    return Ok(()); // already finalized (recovery re-run)
+                if file_size > 0
+                    && combined_crc.is_some_and(|crc| validate_range(final_path, 0, file_size, crc))
+                {
+                    return Ok(()); // size and complete checkpoint digest establish identity
                 }
                 return Err(e);
             }
@@ -264,8 +361,48 @@ async fn finalize(
         }
     }
 
-    tokio::fs::rename(part_path, final_path).await?;
+    if let Some(crc) = combined_crc {
+        if !validate_range(part_path, 0, file_size, crc) {
+            return Err(std::io::Error::other("complete checkpoint digest differs"));
+        }
+    }
+    nzbd_state::fileops::link(part_path, final_path).map_err(std::io::Error::other)?;
+    if let Some(parent) = final_path.parent() {
+        File::open(parent).await?.sync_all().await?;
+    }
+    tokio::fs::remove_file(part_path).await?;
     Ok(())
+}
+
+pub(crate) fn validate_range(path: &std::path::Path, offset: u64, len: u64, crc: u32) -> bool {
+    use std::io::{Read, Seek};
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_file()
+        || meta.file_type().is_symlink()
+        || offset.checked_add(len).is_none_or(|end| end > meta.len())
+    {
+        return false;
+    }
+    let Ok(mut file) = nzbd_state::fileops::open(path) else {
+        return false;
+    };
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return false;
+    }
+    let mut digest = crc32fast::Hasher::new();
+    let mut remaining = len;
+    let mut data = [0; 65536];
+    while remaining > 0 {
+        let amount = remaining.min(data.len() as u64) as usize;
+        if file.read_exact(&mut data[..amount]).is_err() {
+            return false;
+        }
+        digest.update(&data[..amount]);
+        remaining -= amount as u64;
+    }
+    digest.finalize() == crc
 }
 
 #[cfg(test)]
@@ -406,6 +543,7 @@ mod tests {
                  reporting success here is what called 500 MiB of a 48 GiB remux \
                  a completed download"
             ),
+            Some(EngineMsg::WriterError { .. }) => {}
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -501,7 +639,7 @@ mod tests {
             .tx
             .send(WriteCmd::Finalize {
                 file_size: 13,
-                combined_crc: Some(42),
+                combined_crc: Some(crc32fast::hash(b"durable bytes")),
             })
             .await
             .unwrap();
@@ -517,7 +655,7 @@ mod tests {
                     final_path.as_deref(),
                     Some(tmp.path().join("done.bin").as_path())
                 );
-                assert_eq!(combined_crc, Some(42));
+                assert_eq!(combined_crc, Some(crc32fast::hash(b"durable bytes")));
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -558,7 +696,7 @@ mod tests {
             Some(EngineMsg::WriterError { job, file, error }) => {
                 assert_eq!(job, JobId(1));
                 assert_eq!(file, FileId(2));
-                assert!(error.contains("x.bin.part"));
+                assert!(error.contains("write admission"));
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -594,7 +732,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_finalize_rejects_a_non_file_part_path() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join("bad.bin.part")).unwrap();
+        std::fs::create_dir(tmp.path().join(".runner-file-1.part")).unwrap();
         let tracker = TaskTracker::new();
         let (engine_tx, mut engine_rx) = channel(4);
         let writer = spawn_writer(
@@ -615,7 +753,100 @@ mod tests {
             .unwrap();
         assert!(matches!(
             engine_rx.recv().await,
-            Some(EngineMsg::WriterFinalized { ok: false, .. })
+            Some(EngineMsg::WriterFinalized { ok: false, .. } | EngineMsg::WriterError { .. })
         ));
+    }
+    #[tokio::test]
+    async fn write_sync_and_publication_exhaustion_preserve_same_file_for_resume() {
+        for stage in ["write", "sync", "finalize"] {
+            for code in [libc::ENOSPC, libc::EDQUOT] {
+                let tmp = tempfile::tempdir().unwrap();
+                let tracker = TaskTracker::new();
+                let (tx, mut events) = channel(8);
+                let writer = spawn_writer(
+                    &tracker,
+                    JobId(1),
+                    FileId(9),
+                    tmp.path().into(),
+                    "same.bin".into(),
+                    tx.clone(),
+                );
+                if stage != "finalize" {
+                    writer
+                        .tx
+                        .send(WriteCmd::InjectFailure(stage, code))
+                        .await
+                        .unwrap();
+                }
+                let segment = || WriteCmd::Segment {
+                    seg_number: 1,
+                    offset: 0,
+                    data: b"verified".to_vec(),
+                    crc: crc32fast::hash(b"verified"),
+                    file_size: 8,
+                    server: ServerId(1),
+                };
+                writer.tx.send(segment()).await.unwrap();
+                if stage == "finalize" {
+                    assert!(matches!(
+                        events.recv().await,
+                        Some(EngineMsg::SegmentWritten { .. })
+                    ));
+                    writer
+                        .tx
+                        .send(WriteCmd::InjectFailure(stage, code))
+                        .await
+                        .unwrap();
+                    writer
+                        .tx
+                        .send(WriteCmd::Finalize {
+                            file_size: 8,
+                            combined_crc: Some(crc32fast::hash(b"verified")),
+                        })
+                        .await
+                        .unwrap();
+                }
+                assert!(
+                    matches!(events.recv().await, Some(EngineMsg::WriterError { .. })),
+                    "{stage}"
+                );
+                assert!(!tmp.path().join("same.bin").exists());
+                if stage != "write" {
+                    assert_eq!(
+                        std::fs::read(tmp.path().join(".runner-file-9.part")).unwrap(),
+                        b"verified"
+                    );
+                }
+                let resumed = spawn_writer(
+                    &tracker,
+                    JobId(1),
+                    FileId(9),
+                    tmp.path().into(),
+                    "same.bin".into(),
+                    tx,
+                );
+                resumed.tx.send(segment()).await.unwrap();
+                assert!(matches!(
+                    events.recv().await,
+                    Some(EngineMsg::SegmentWritten { .. })
+                ));
+                resumed
+                    .tx
+                    .send(WriteCmd::Finalize {
+                        file_size: 8,
+                        combined_crc: Some(crc32fast::hash(b"verified")),
+                    })
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    events.recv().await,
+                    Some(EngineMsg::WriterFinalized { ok: true, .. })
+                ));
+                assert_eq!(
+                    std::fs::read(tmp.path().join("same.bin")).unwrap(),
+                    b"verified"
+                );
+            }
+        }
     }
 }

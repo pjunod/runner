@@ -419,6 +419,15 @@ async fn stream_body(
         return Ok(());
     }
 
+    let _ = ctx
+        .engine_tx
+        .send(EngineMsg::FileMetadata {
+            job: lease.r.job,
+            file: lease.r.file,
+            name: result.header.name.clone(),
+            size: result.header.size,
+        })
+        .await;
     // Hand the decoded part to the file's writer. A closed writer means the
     // job was deleted mid-flight — nothing to report.
     let _ = lease

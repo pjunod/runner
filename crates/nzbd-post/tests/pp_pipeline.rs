@@ -259,7 +259,7 @@ async fn intact_quick_path_then_script() {
 /// Damaged download: quick check spots the bad CRC, par2 verifies + repairs,
 /// and the original bytes come back.
 #[tokio::test]
-async fn corrupt_payload_gets_repaired() {
+async fn corrupt_nested_payload_after_prefix_gets_repaired_without_losing_original() {
     if !require_tool("par2") {
         return;
     }
@@ -269,8 +269,15 @@ async fn corrupt_payload_gets_repaired() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let data: Vec<u8> = (0..60_000u32).map(|i| ((i * 7) % 253) as u8).collect();
-    std::fs::write(dir.join("payload.bin"), &data).unwrap();
-    par2_create(&dir, 16, &["payload.bin"]);
+    std::fs::create_dir(dir.join("Episode01")).unwrap();
+    std::fs::write(dir.join("Episode01/payload.bin"), &data).unwrap();
+    par2_create(&dir, 16, &["Episode01/payload.bin"]);
+    assert_eq!(
+        nzbd_post::par2::load_dir(&dir).unwrap().unwrap().files[0].name,
+        "Episode01/payload.bin"
+    );
+    std::fs::rename(dir.join("Episode01/payload.bin"), dir.join("payload.bin")).unwrap();
+    std::fs::remove_dir(dir.join("Episode01")).unwrap();
 
     // Corrupt one block's worth of bytes *as downloaded* (the engine's
     // whole-file CRC reflects the corruption).
@@ -294,7 +301,7 @@ async fn corrupt_payload_gets_repaired() {
         .unwrap();
     assert_eq!(out, PpFinal::Success);
     assert_eq!(
-        std::fs::read(dir.join("payload.bin")).unwrap(),
+        std::fs::read(dir.join("Episode01/payload.bin")).unwrap(),
         data,
         "repair must restore the original bytes"
     );
@@ -305,7 +312,7 @@ async fn corrupt_payload_gets_repaired() {
 /// Damage beyond the recovery blocks on hand and nothing left to unpause:
 /// PAR_FAILURE, job marked Failed.
 #[tokio::test]
-async fn unrepairable_is_par_failure() {
+async fn insufficient_parity_holds_originals_without_terminal_history() {
     if !require_tool("par2") {
         return;
     }
@@ -338,32 +345,21 @@ async fn unrepairable_is_par_failure() {
         .unwrap();
 
     let hist = history(tmp.path());
-    let out = process_job(
+    assert!(process_job(
         &engine,
         &PostConfig::default(),
         &hist,
         &tmp.path().join("dest"),
-        JobId(3),
+        JobId(3)
     )
     .await
-    .unwrap();
-    assert_eq!(out, PpFinal::ParFailure);
-
+    .is_err());
     let job = engine.export_job(JobId(3)).await.unwrap().unwrap();
-    assert_eq!(job.status, JobStatus::Failed);
-    let row = hist.list(10).unwrap()[0].clone();
-    assert_eq!(row.status, "PAR_FAILURE");
-    // D2: the default disposes of the corpse, and the row says so. Five
-    // failed grabs of one movie used to leave 336 GB behind them.
-    assert!(!dir.exists(), "a failed job's files must not survive it");
-    assert_eq!(row.final_dir, None, "deleted files have no final dir");
-    assert!(
-        row.params
-            .iter()
-            .any(|(k, v)| k == "Failure:Files" && v == "deleted"),
-        "the history row must say where the files went: {:?}",
-        row.params
-    );
+    assert!(job.held());
+    assert_eq!(job.control().unwrap().stage, "par_repair");
+    assert!(hist.list(10).unwrap().is_empty());
+    assert_eq!(std::fs::read(dir.join("payload.bin")).unwrap(), bad);
+    assert!(!job.params.iter().any(|(k, _)| k == PP_DONE_PARAM));
     engine.shutdown().await;
 }
 
@@ -372,7 +368,7 @@ async fn unrepairable_is_par_failure() {
 /// old behaviour and stays available for an operator who wants the
 /// forensics.
 #[tokio::test]
-async fn par_failure_parks_or_keeps_per_config() {
+async fn insufficient_parity_cannot_trigger_destructive_failure_disposition() {
     if !require_tool("par2") {
         return;
     }
@@ -408,7 +404,7 @@ async fn par_failure_parks_or_keeps_per_config() {
 
         let parked_root = tmp.path().join("failed");
         let hist = history(tmp.path());
-        let out = process_job(
+        assert!(process_job(
             &engine,
             &PostConfig {
                 failure_action: action,
@@ -417,25 +413,19 @@ async fn par_failure_parks_or_keeps_per_config() {
             },
             &hist,
             &tmp.path().join("dest"),
-            JobId(job_id),
+            JobId(job_id)
         )
         .await
-        .unwrap();
-        assert_eq!(out, PpFinal::ParFailure);
-        let row = hist.list(10).unwrap()[0].clone();
-
-        match action {
-            nzbd_post::manager::FailureAction::Park => {
-                assert!(!dir.exists(), "parked means moved, not copied");
-                let moved = parked_root.join("hopeless");
-                assert!(moved.join("payload.bin").is_file(), "the tree moves intact");
-                assert_eq!(row.final_dir.as_deref(), moved.to_str());
-            }
-            _ => {
-                assert!(dir.join("payload.bin").is_file(), "`none` keeps the files");
-                assert_eq!(row.final_dir.as_deref(), dir.to_str());
-            }
-        }
+        .is_err());
+        assert!(engine
+            .export_job(JobId(job_id))
+            .await
+            .unwrap()
+            .unwrap()
+            .held());
+        assert_eq!(std::fs::read(dir.join("payload.bin")).unwrap(), bad);
+        assert!(hist.list(10).unwrap().is_empty());
+        assert!(!parked_root.exists());
         engine.shutdown().await;
     }
 }
@@ -482,8 +472,8 @@ async fn unpack_then_cleanup() {
     assert_eq!(out, PpFinal::Success);
     assert_eq!(std::fs::read(dir.join("movie.mkv")).unwrap(), inner);
     assert!(
-        !dir.join("release.zip").exists(),
-        "cleanup must remove the extracted archive"
+        dir.join("release.zip").exists(),
+        "original archive remains held until independently journaled retirement is admitted"
     );
     engine.shutdown().await;
 }
@@ -2475,5 +2465,206 @@ async fn the_stage_timeline_reaches_history() {
     // And the live queue view agrees with what history recorded.
     let job = engine.export_job(JobId(1)).await.unwrap().unwrap();
     assert_eq!(job.stages.len(), stages.len());
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn review_manager_preserves_extractor_capacity_hold() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/capacity-review");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bytes = b"synthetic archive";
+    std::fs::write(dir.join("payload.zip"), bytes).unwrap();
+    let tool = tmp.path().join("seven");
+    std::fs::write(
+        &tool,
+        "#!/bin/sh\necho 'ERROR: No space left on device' >&2\nexit 2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    spawn_post_manager(
+        engine.clone(),
+        PostConfig {
+            sevenzip_cmd: tool.display().to_string(),
+            deobfuscate_final: false,
+            ..Default::default()
+        },
+        history(tmp.path()),
+        tmp.path().join("dest"),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+    engine
+        .import_fixture_job(
+            tmp.path(),
+            completed_job(
+                998,
+                "capacity-review",
+                vec![file_entry(998, "payload.zip", Some(crc(bytes)), false)],
+            ),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let control = loop {
+        if let Some(c) = engine
+            .export_job(JobId(998))
+            .await
+            .unwrap()
+            .and_then(|j| j.control())
+        {
+            break c;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no control after extractor failure"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+    let control = engine
+        .export_job(JobId(998))
+        .await
+        .unwrap()
+        .unwrap()
+        .control()
+        .unwrap_or(control);
+    engine.shutdown().await;
+    assert_eq!(
+        control.cause, "capacity",
+        "outer manager overwrote typed hold: {control:?}"
+    );
+    assert_eq!(control.retry_policy, "resume_same_job");
+}
+
+#[tokio::test]
+async fn review_missing_parity_requests_available_paused_volume() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/delayed-review");
+    std::fs::create_dir_all(&dir).unwrap();
+    let data: Vec<u8> = (0..50_000u32).map(|i| ((i * 7) % 253) as u8).collect();
+    std::fs::write(dir.join("payload.bin"), &data).unwrap();
+    par2_create(&dir, 4, &["payload.bin"]);
+    let mut pars = par2_entries(&dir, 910);
+    for f in &mut pars {
+        if f.filename.contains(".vol") {
+            std::fs::remove_file(dir.join(&f.filename)).unwrap();
+            f.paused = true;
+            f.finalized = false;
+        }
+    }
+    let paused: Vec<_> = pars.iter().filter(|f| f.paused).map(|f| f.id).collect();
+    assert!(!paused.is_empty());
+    let mut bad = data;
+    bad[25_000] ^= 0xff;
+    std::fs::write(dir.join("payload.bin"), &bad).unwrap();
+    let mut files = vec![file_entry(909, "payload.bin", Some(crc(&bad)), false)];
+    files.extend(pars);
+    engine
+        .import_fixture_job(
+            tmp.path(),
+            completed_job(997, "delayed-review", files),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    let _ = process_job(
+        &engine,
+        &PostConfig {
+            unpack: false,
+            par_fetch_timeout: Duration::from_millis(20),
+            ..Default::default()
+        },
+        &history(tmp.path()),
+        &tmp.path().join("dest"),
+        JobId(997),
+    )
+    .await;
+    let job = engine.export_job(JobId(997)).await.unwrap().unwrap();
+    engine.shutdown().await;
+    assert!(
+        job.files
+            .iter()
+            .any(|f| paused.contains(&f.id) && !f.paused),
+        "repair gave up while all available recovery volumes remained paused; control={:?}",
+        job.control()
+    );
+}
+
+#[tokio::test]
+async fn review_terminal_history_and_event_keep_resolved_control() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/resolved-review");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("payload.bin"), b"payload").unwrap();
+    let control: nzbd_types::JobControl = serde_json::from_value(serde_json::json!({
+     "version":1,"revision":"43","lifecycle":"running","cause":"capacity",
+     "stage":"extract","retry_policy":"resume_same_job","message":"resumed","instance":"same"
+    }))
+    .unwrap();
+    let mut job = completed_job(
+        996,
+        "resolved-review",
+        vec![file_entry(996, "payload.bin", Some(crc(b"payload")), false)],
+    );
+    job.params.push((
+        nzbd_types::CONTROL_PARAM.into(),
+        serde_json::to_string(&control).unwrap(),
+    ));
+    engine
+        .import_fixture_job(tmp.path(), job, false, false)
+        .await
+        .unwrap();
+    let hist = history(tmp.path());
+    let mut events = engine.subscribe();
+    let result = process_job(
+        &engine,
+        &PostConfig {
+            unpack: false,
+            deobfuscate_final: false,
+            ..Default::default()
+        },
+        &hist,
+        &tmp.path().join("dest"),
+        JobId(996),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, PpFinal::Success);
+    let row = hist.get(JobId(996)).unwrap().unwrap();
+    let saved = row
+        .params
+        .iter()
+        .find(|(key, _)| key == nzbd_types::CONTROL_PARAM)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<nzbd_types::JobControl>(&saved.1).unwrap(),
+        control
+    );
+    let mut observed = false;
+    while let Ok(event) = events.try_recv() {
+        if let nzbd_engine::Event::JobPpFinished {
+            job: JobId(996),
+            params,
+            ..
+        } = event
+        {
+            assert!(params.contains(saved));
+            observed = true;
+        }
+    }
+    assert!(observed, "completion event omitted the resolving control");
     engine.shutdown().await;
 }

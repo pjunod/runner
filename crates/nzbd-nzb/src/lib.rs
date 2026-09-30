@@ -64,6 +64,25 @@ impl ParsedFile {
                 }
             }
         }
+        // Bounded bracketed form: only a safe, extension-bearing component
+        // before yEnc. The owner still confirms it against decoded metadata.
+        if self.subject.len() <= 8192 {
+            let prefix = self.subject.split("yEnc").next().unwrap_or("");
+            let candidates: Vec<&str> = prefix
+                .split('[')
+                .skip(1)
+                .filter_map(|part| part.split_once(']').map(|(name, _)| name))
+                .filter(|name| {
+                    name.len() <= 255
+                        && name.contains('.')
+                        && !name.contains(['/', '\\', ':', '\0'])
+                        && *name != ".."
+                })
+                .collect();
+            if candidates.len() == 1 {
+                return candidates[0].to_string();
+            }
+        }
         self.subject.trim().to_string()
     }
 
