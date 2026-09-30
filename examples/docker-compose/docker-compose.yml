@@ -1,20 +1,19 @@
 # nzbd — single-node Docker Compose deployment.
 #
 #   cd examples/docker-compose
-#   mkdir -p config
-#   sudo chown -R 1000:1000 config     # the container runs as UID 1000
-#   cp nzbd.toml.example config/nzbd.toml   # then edit: credentials, paths
 #   docker compose up -d
 #
-# Or skip the copy entirely: leave config/ empty and the first-run wizard
-# at http://localhost:6789/ writes config/nzbd.toml for you.
+# nzbd-init fixes bind-mount ownership before the unprivileged daemon starts.
+# The first-run wizard at http://localhost:6789/ writes config/nzbd.toml.
+# To pre-seed instead: mkdir -p config; cp nzbd.toml.example config/nzbd.toml,
+# then edit credentials and paths before starting Compose.
 #
 # Web UI on http://localhost:6789/ — point Sonarr/Radarr at the same
 # host/port as an "NZBGet" download client.
 
 services:
   nzbd:
-    image: ghcr.io/pjunod/nzbd:latest
+    image: &nzbd-image ghcr.io/pjunod/nzbd:latest
     # …or build from this checkout instead of pulling. The build context
     # excludes .git, so pass the commit in or the daemon reports
     # `<version>+unknown` in its footer and on /api/v1/status — run
@@ -26,9 +25,12 @@ services:
     #     NZBD_GIT_DESCRIBE: ${NZBD_GIT_DESCRIBE:-}
     container_name: nzbd
     restart: unless-stopped
+    depends_on:
+      nzbd-init:
+        condition: service_completed_successfully
     ports:
       - "6789:6789"
-    volumes:
+    volumes: &nzbd-volumes
       # Downloads + state. paths.main_dir/dest_dir in nzbd.toml must live
       # under /data for the *arr apps to see the same paths you map here.
       - /data/usenet:/data
@@ -49,6 +51,22 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  # Docker creates missing bind sources as root. Repair just the two mount
+  # roots and the config file; never recursively chown the download tree.
+  # Shared mounts keep this helper aligned when you change host paths above.
+  nzbd-init:
+    image: *nzbd-image
+    user: "0:0"
+    restart: "no"
+    volumes: *nzbd-volumes
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        chown -h 1000:1000 /etc/nzbd /data
+        if [ -f /etc/nzbd/nzbd.toml ] && [ ! -L /etc/nzbd/nzbd.toml ]; then
+          chown -h 1000:1000 /etc/nzbd/nzbd.toml
+        fi
 
   # mDNS does not cross a normal Docker bridge. This companion uses the
   # same image but runs only the DNS-SD advertiser on the Linux host network,
