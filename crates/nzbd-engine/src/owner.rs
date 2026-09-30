@@ -2823,29 +2823,27 @@ impl Owner {
             .find(|(k, _)| k == &size_key)
             .and_then(|(_, v)| v.parse::<u64>().ok());
         let name_key = format!("*File:name:{}", file.0);
-        let previous_name = j
-            .params
-            .iter()
-            .find(|(k, _)| k == &name_key)
-            .map(|(_, v)| v.as_str());
-        if previous_size.is_some_and(|s| s != size) || previous_name.is_some_and(|n| n != name) {
+        // Obfuscated multipart posts can carry a different yEnc name in
+        // every article. The NZB file/segment mapping identifies the file;
+        // keep the first safe name stable and require a consistent size.
+        if previous_size.is_some_and(|s| s != size) {
             self.hold_job(
                 job,
                 "identity_conflict",
                 "download_write",
-                "conflicting yEnc name or declared size",
+                "conflicting yEnc declared size",
             );
             return;
         }
         if previous_size.is_some() && j.files[index].filename_confirmed {
-            return; // repeated segments carry identical already-persisted metadata
+            return; // retain the first confirmed name, including collision suffixes
         }
         if previous_size.is_none() {
             j.params.push((size_key, size.to_string()));
             j.params.push((name_key, name.into()));
         }
         // Collision suffix precedes extension. The raw confirmed name is stored
-        // separately so later segments compare against source metadata.
+        // separately from the output name.
         let mut chosen = name.to_string();
         if j.files.iter().any(|f| f.id != file && f.filename == chosen) {
             let p = Path::new(name);
@@ -2959,6 +2957,7 @@ impl Owner {
             return false;
         }
         self.publish_now();
+        tracing::warn!(job = job.0, cause, stage, message = %control.message, "job held");
         self.emit(Event::JobControlChanged { job, control });
         true
     }
@@ -4988,6 +4987,32 @@ mod tests {
         )
         .unwrap();
         (tmp, owner, adapter)
+    }
+
+    #[tokio::test]
+    async fn yenc_name_variations_keep_the_first_name_but_size_and_path_conflicts_hold() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        for id in 1..=3 {
+            owner.state.jobs.push(pending_job(id));
+        }
+        let file = owner.state.job(JobId(1)).unwrap().files[0].id;
+        owner.accept_file_metadata(JobId(1), file, "first.bin", 100);
+        owner.accept_file_metadata(JobId(1), file, "different-obfuscated-name", 100);
+        assert!(!owner.state.job(JobId(1)).unwrap().held());
+        assert_eq!(
+            owner.state.job(JobId(1)).unwrap().files[0].filename,
+            "first.bin"
+        );
+        owner.accept_file_metadata(JobId(1), file, "third-name", 101);
+        let control = owner.state.job(JobId(1)).unwrap().control().unwrap();
+        assert_eq!(control.cause, "identity_conflict");
+        assert_eq!(control.message, "conflicting yEnc declared size");
+
+        for (id, name, size) in [(2, "../unsafe", 100), (3, "empty.bin", 0)] {
+            let file = owner.state.job(JobId(id)).unwrap().files[0].id;
+            owner.accept_file_metadata(JobId(id), file, name, size);
+            assert!(owner.state.job(JobId(id)).unwrap().held());
+        }
     }
 
     #[tokio::test]
