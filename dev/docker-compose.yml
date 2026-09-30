@@ -3,15 +3,8 @@
 # the faster inner loop for engine work is plain `cargo run -p nzbd`.
 #
 #   cd dev
-#   mkdir -p config data              # BEFORE up: if compose creates these
-#                                     # bind-mount dirs for you they're owned
-#                                     # by root, and the setup UI can't write
-#                                     # config/nzbd.toml. The container runs
-#                                     # as UID 1000, so the fix is
-#                                     # `sudo chown -R 1000:1000 config data`
-#                                     # — chowning to $USER only works if you
-#                                     # happen to be UID 1000.
 #   docker compose up --build         # build + run (foreground, logs)
+#   # nzbd-init sets config/data ownership to 1000:1000 before nzbd starts.
 #   # → http://localhost:6789/ serves the first-run setup UI, which
 #   #   writes config/nzbd.toml and restarts the daemon with it.
 #   # (Or pre-seed: cp nzbd.toml.example config/nzbd.toml)
@@ -19,7 +12,7 @@
 # Rebuild-on-change (Compose v2.22+): `docker compose watch` rebuilds the
 # image whenever crate sources or the Dockerfile change.
 
-# Both services run the same locally built image. Keep the build attached to
+# All services run the same locally built image. Keep the build attached to
 # each service: Compose resolves images before applying `depends_on`, so an
 # image-only discovery service would try to pull the private-looking `nzbd:dev`
 # tag while the main service was still building it.
@@ -39,11 +32,14 @@ services:
     build: *nzbd-build
     image: nzbd:dev
     container_name: nzbd-dev
+    depends_on:
+      nzbd-init:
+        condition: service_completed_successfully
     ports:
       - "6789:6789"
-    volumes:
+    volumes: &nzbd-volumes
       - ./data:/data             # throwaway downloads/state, easy to inspect
-      # Config DIRECTORY (mkdir -p config first). Start with it empty and
+      # Config DIRECTORY (created and owned by nzbd-init). Start empty and
       # the first-run setup UI at http://localhost:6789/ writes
       # config/nzbd.toml for you — or pre-seed it from nzbd.toml.example.
       - ./config:/etc/nzbd
@@ -66,6 +62,20 @@ services:
           path: ../Cargo.lock
         - action: rebuild
           path: ../Dockerfile
+
+  nzbd-init:
+    build: *nzbd-build
+    image: nzbd:dev
+    user: "0:0"
+    restart: "no"
+    volumes: *nzbd-volumes
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        chown -h 1000:1000 /etc/nzbd /data
+        if [ -f /etc/nzbd/nzbd.toml ] && [ ! -L /etc/nzbd/nzbd.toml ]; then
+          chown -h 1000:1000 /etc/nzbd/nzbd.toml
+        fi
 
   nzbd-discovery:
     build: *nzbd-build
