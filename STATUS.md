@@ -1,5 +1,9 @@
 # nzbd — Project Status
 
+## Download incident recovery — 2026-10-01
+
+Implementation in progress in an isolated agent clone. See [live progress and merge status](docs/DOWNLOAD_INCIDENT_STATUS.md). One combined PR; adversarial review at merge readiness, followed by required validation.
+
 ## Files tab rework — 2026-09-28
 
 **Status:** implemented; state, API and UI harness regressions added; verified
