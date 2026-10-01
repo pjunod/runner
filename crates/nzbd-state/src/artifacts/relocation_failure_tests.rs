@@ -1,4 +1,4 @@
-use super::relocation::{RegistryPolicy, FAULTS};
+use super::relocation::FAULTS;
 use super::*;
 fn fixture() -> (tempfile::TempDir, Inventory, PathBuf, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
@@ -16,7 +16,7 @@ fn fixture() -> (tempfile::TempDir, Inventory, PathBuf, PathBuf) {
 fn unsupported_publication_copies_zero_payload_and_repeated_review_is_one_claim() {
     for code in [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP] {
         let (temp, inventory, source, target) = fixture();
-        FAULTS.with(|f| f.borrow_mut().insert("capability", code));
+        FAULTS.with(|f| f.borrow_mut().insert("before_move", code));
         assert!(inventory.relocate(91, &target).is_err());
         assert!(source.join("media.mkv").exists());
         assert!(!target.exists());
@@ -46,35 +46,19 @@ fn unsupported_publication_copies_zero_payload_and_repeated_review_is_one_claim(
     }
 }
 #[test]
-fn registry_generation_is_stable_retains_source_and_failed_media_status() {
-    let (temp, inventory, source, target) = fixture();
-    let managed = temp.path().join("registry");
-    std::fs::create_dir(&managed).unwrap();
-    let policy = RegistryPolicy {
-        managed_root: managed,
-        consumers_isolated: true,
-    };
-    FAULTS.with(|f| f.borrow_mut().insert("capability", libc::EINVAL));
-    let result = inventory
-        .relocate_with_registry(91, &target, Some(&policy))
-        .unwrap();
-    assert!(result.published_path.join("media.mkv").exists());
-    assert!(source.join("media.mkv").exists());
-    assert!(!target.exists());
-    let repeated = inventory
-        .relocate_with_registry(91, &target, Some(&policy))
-        .unwrap();
+fn unsupported_flagged_rename_publishes_without_a_registry_or_feature_gate() {
+    let (_temp, inventory, source, target) = fixture();
+    fs::RENAME_FAILURE.with(|f| f.set(Some(libc::EINVAL)));
+    let result = inventory.relocate(91, &target).unwrap();
+    assert_eq!(result.published_path, target);
+    assert_eq!(
+        std::fs::read(target.join("media.mkv")).unwrap(),
+        b"PAR_FAILURE retained input"
+    );
+    assert!(!source.exists(), "verified duplicate source is retired");
+    let repeated = inventory.relocate(91, &target).unwrap();
     assert_eq!(result.operation_id, repeated.operation_id);
-    assert_eq!(result.published_path, repeated.published_path);
-    let parked = inventory
-        .finish(
-            91,
-            &result.published_path,
-            result.published_path.parent().unwrap(),
-            "parked_failed",
-        )
-        .unwrap();
-    assert_eq!(parked.state, "parked_failed");
+    assert_eq!(result.generation, repeated.generation);
 }
 #[test]
 fn lost_commit_acknowledgement_reconciles_same_publication() {
@@ -95,7 +79,7 @@ fn deleted_move_source_stays_deleted_when_its_path_is_reused() {
     // Keep the old inode allocated so reuse of the pathname cannot disguise
     // the generation change on filesystems that recycle inodes immediately.
     let _old_directory = File::open(&source).unwrap();
-    FAULTS.with(|f| f.borrow_mut().insert("capability", libc::EINVAL));
+    FAULTS.with(|f| f.borrow_mut().insert("before_move", libc::EINVAL));
     assert!(inventory.relocate(91, &target).is_err());
     let old = inventory
         .finish(91, &source, source.parent().unwrap(), "retained")
@@ -132,7 +116,7 @@ fn deleted_move_source_stays_deleted_when_its_path_is_reused() {
 #[test]
 fn startup_restores_a_deletion_over_a_legacy_resurrected_move_source() {
     let (temp, inventory, source, target) = fixture();
-    FAULTS.with(|f| f.borrow_mut().insert("capability", libc::EINVAL));
+    FAULTS.with(|f| f.borrow_mut().insert("before_move", libc::EINVAL));
     assert!(inventory.relocate(91, &target).is_err());
     let old = inventory
         .finish(91, &source, source.parent().unwrap(), "retained")
@@ -221,7 +205,7 @@ fn relocation_cannot_commit_after_source_authority_has_ended() {
 fn pending_deletion_survives_relocation_reconciliation_without_losing_authorization() {
     for cancel in [false, true] {
         let (_temp, inventory, source, target) = fixture();
-        FAULTS.with(|f| f.borrow_mut().insert("capability", libc::EINVAL));
+        FAULTS.with(|f| f.borrow_mut().insert("before_move", libc::EINVAL));
         assert!(inventory.relocate(91, &target).is_err());
         let old = inventory
             .finish(91, &source, source.parent().unwrap(), "retained")

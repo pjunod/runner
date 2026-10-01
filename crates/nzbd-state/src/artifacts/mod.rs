@@ -4,10 +4,11 @@
 //! Nothing in a media payload is a marker or grants permission to remove it.
 pub(crate) mod fs;
 mod policy;
+mod publication;
 pub use policy::{RetentionChange, RetentionPreview};
 mod recovery;
 mod relocation;
-pub use relocation::{RegistryPolicy, RelocationResult};
+pub use relocation::RelocationResult;
 mod tasks;
 mod transforms;
 pub use recovery::{Receipt, ReceiptFile, Recovery, RecoveryFile};
@@ -1507,6 +1508,17 @@ impl Inventory {
             .parent()
             .ok_or_else(|| Error::Conflict("invalid publication root".into()))?;
         let dir = fs::open_dir(&recovery.published)?;
+        let observed = fs::identity(&dir.metadata()?);
+        if !recovery
+            .publication_identity
+            .as_ref()
+            .or(recovery.scratch_identity.as_ref())
+            .is_some_and(|expected| expected.same_object(&observed))
+        {
+            return Err(Error::Conflict(
+                "recovery publication identity changed".into(),
+            ));
+        }
         let root_dir = fs::open_dir(root)?;
         let a = Artifact {
             id: format!("recovery-{}", recovery.id),

@@ -27,6 +27,8 @@ pub struct Recovery {
     pub error: Option<String>,
     #[serde(default)]
     pub scratch_identity: Option<Identity>,
+    #[serde(default)]
+    pub publication_identity: Option<Identity>,
     /// The folder the copy was taken from — what a person calls this handoff.
     /// Rows staged before this field existed carry an empty path.
     #[serde(default)]
@@ -318,6 +320,7 @@ impl Inventory {
                 receipt: None,
                 error: None,
                 scratch_identity: None,
+                publication_identity: None,
                 source: a.path.clone(),
                 created_at: now(),
                 updated_at: now(),
@@ -448,19 +451,24 @@ impl Inventory {
             }
             r.state = "publishing".into();
             save(&self.db.lock().unwrap(), &r)?;
-            if r.published.exists() {
-                return Err(Error::Conflict(
-                    "recovery publication already exists".into(),
-                ));
-            }
-            at_dir(
-                fs::rename_exclusive(&scratch, &r.published),
-                "publish (rename) into",
+            let publication_key = format!("recovery-{}", r.id);
+            let published_tree = self.publish_directory_unlocked(
+                &scratch,
                 &r.published,
+                &r.artifact,
+                &publication_key,
             )?;
+            r.publication_identity = Some(published_tree.identity);
+            save(&self.db.lock().unwrap(), &r)?;
             sync_dir_lenient(&published)?;
             sync_dir_lenient(&staging)?;
             self.register_publication(&r)?;
+            if self
+                .operation(&format!("publish-recovery-{}", r.id))
+                .is_ok()
+            {
+                self.retire_publication_source_unlocked(&format!("recovery-{}", r.id))?;
+            }
             Ok(())
         })();
         let _guard = self.mutation_guard()?;
@@ -524,6 +532,21 @@ impl Inventory {
             if r.state != "publishing" {
                 return Err(Error::Conflict("copy interrupted before its complete manifest was durable; inspect retained staging".into()));
             }
+            let publication_key = format!("recovery-{}", r.id);
+            if self
+                .operation(&format!("publish-{publication_key}"))
+                .is_ok()
+                || !r.published.try_exists()?
+            {
+                let tree = self.publish_directory_unlocked(
+                    &scratch,
+                    &r.published,
+                    &r.artifact,
+                    &publication_key,
+                )?;
+                r.publication_identity = Some(tree.identity);
+                save(&self.db.lock().unwrap(), &r)?;
+            }
             let location = if r.published.try_exists()? {
                 &r.published
             } else {
@@ -532,8 +555,9 @@ impl Inventory {
             let dir = fs::open_dir(location)?;
             let observed = fs::identity(&dir.metadata()?);
             if !r
-                .scratch_identity
+                .publication_identity
                 .as_ref()
+                .or(r.scratch_identity.as_ref())
                 .is_some_and(|i| i.same_object(&observed))
             {
                 return Err(Error::Conflict(
@@ -559,9 +583,17 @@ impl Inventory {
                 }
             }
             if location == &scratch {
-                fs::rename_exclusive(&scratch, &r.published)?;
+                return Err(Error::Conflict(
+                    "recovery publication did not reach its destination".into(),
+                ));
             }
             self.register_publication(&r)?;
+            if self
+                .operation(&format!("publish-recovery-{}", r.id))
+                .is_ok()
+            {
+                self.retire_publication_source_unlocked(&format!("recovery-{}", r.id))?;
+            }
             Ok(())
         })();
         match result {
