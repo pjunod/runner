@@ -17,7 +17,7 @@ causes, evidence, and design decisions. This page tracks execution.
 - [x] Fresh extraction retry destinations; stop invented season-pack numbering.
 - [x] Generation-bound deletion and conservative legacy resurrection repair.
 - [x] Select-all and terminal recovery-history controls.
-- [ ] Directory publication and recovery on filesystems without flagged rename.
+- [~] Directory publication and recovery implemented with journaled mkdir/link fallback; interruption regressions are being completed.
 - [ ] Known-extension RAR stem normalization with proven order/membership.
 - [ ] Safe PP-hold retry and relocation abandonment through existing actions/UI.
 - [ ] Honor configured intermediate directory, preserving empty-value semantics.
@@ -37,6 +37,14 @@ No more unit tests will run during implementation.
 
 Use the existing settings and architecture. Add no feature flags or periodic
 watchdogs. Ordinary identity/collision validation remains part of correctness.
+Decision: keep atomic directory rename where supported; otherwise use the
+existing custody journal to checkpoint exclusive mkdir/link publication.
+Target entries become visible incrementally, but completion is published only
+after manifest verification and fsync. Uncheckpointed creations require explicit
+review. No feature flag or coordinated-writer assumption is introduced.
+Duplicate sources are retired only after the owning custody commit. Consumers
+and the final adversarial review must verify the completion boundary.
+
 Make routine decisions autonomously and record consequential choices here and
 in the final review document. Production data recovery is separate from merging
 code; do not silently retry or rename live payloads.
