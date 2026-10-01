@@ -1,22 +1,8 @@
-//! Final-filename deobfuscation (SABnzbd-style, plus season packs).
+//! Final-filename deobfuscation after evidence-based name recovery.
 //!
-//! Runs after par-rename, rar-rename, unpack and cleanup. A file that
-//! still carries a meaningless name at that point has no recovery
-//! evidence left — no par2 16k-hash mapping, no archive header — so the
-//! job name (which came from the NZB / the indexer and is the real
-//! release title) is the last source of truth.
-//!
-//! Two behaviors, both deliberately conservative:
-//!
-//! - **Dominant file** (SABnzbd rule: the biggest candidate is ≥ 3× the
-//!   second-biggest, or is the only one): renamed to the job name when
-//!   its own name looks obfuscated. Same-stem companions (`.srt`,
-//!   `-sample.*`, …) follow the rename.
-//! - **Season pack** (several similar-sized video files — a case SABnzbd
-//!   skips entirely): renamed to `<job> - NN` in stable filename order,
-//!   but only when *every* big video is *definitely* obfuscated
-//!   (hex/uuid-grade, not merely unusual). Episode order cannot be proven
-//!   from ciphertext names, so this is logged loudly as a heuristic.
+//! A single dominant file may inherit the job name. Multiple similarly sized
+//! files retain their names: lexical order of obfuscated names establishes
+//! neither archive order nor episode identity.
 
 use std::path::{Path, PathBuf};
 
@@ -25,10 +11,6 @@ use std::path::{Path, PathBuf};
 const SKIP_EXTS: &[&str] = &[
     "vob", "rar", "par2", "mts", "m2ts", "cpi", "clpi", "mpl", "mpls", "bdm", "bdmv", "nzb", "sfv",
     "srr",
-];
-
-const VIDEO_EXTS: &[&str] = &[
-    "mkv", "mp4", "avi", "m4v", "mpg", "mpeg", "wmv", "mov", "webm", "ts", "flv",
 ];
 
 fn ext_of(p: &Path) -> String {
@@ -53,10 +35,6 @@ fn skip_ext(p: &Path) -> bool {
     // is, and they did not. A set survived this one and was mangled by the
     // other.
     crate::rename::split_volume_ext(&e)
-}
-
-fn video_ext(p: &Path) -> bool {
-    VIDEO_EXTS.contains(&ext_of(p).as_str())
 }
 
 /// `S01E02` / `1x02`-style tokens mean the name maps to an episode — it
@@ -192,7 +170,7 @@ fn rename_with_companions(
     parent: &Path,
     all_files: &[PathBuf],
     out: &mut Vec<(PathBuf, PathBuf)>,
-) {
+) -> Result<(), crate::PostError> {
     for f in all_files {
         if f.parent() != Some(parent) {
             continue;
@@ -203,10 +181,16 @@ fn rename_with_companions(
             continue;
         };
         let target = unique_target(parent, new_stem, suffix);
-        if nzbd_state::fileops::rename_exclusive(f, &target).is_ok() {
-            out.push((f.clone(), target));
-        }
+        nzbd_state::fileops::rename_exclusive(f, &target).map_err(|e| {
+            crate::PostError::Subprocess(format!(
+                "deobfuscate {} to {}: {e}",
+                f.display(),
+                target.display()
+            ))
+        })?;
+        out.push((f.clone(), target));
     }
+    Ok(())
 }
 
 /// The final deobfuscation pass. Returns the applied `(from, to)` pairs.
@@ -219,15 +203,15 @@ pub fn deobfuscate_dir(
     dir: &Path,
     job_name: &str,
     protected: &std::collections::HashSet<String>,
-) -> Vec<(PathBuf, PathBuf)> {
+) -> Result<Vec<(PathBuf, PathBuf)>, crate::PostError> {
     let job_stem = job_name.trim().trim_end_matches(".nzb").trim();
     // A job whose *own* name is noise gives us nothing to rename toward.
     if job_stem.is_empty() || is_definitely_obfuscated(job_stem) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let Ok(files) = crate::namespace::files(dir) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     // Discovery shares the validated namespace; heuristic renaming remains
     // deliberately shallow and excludes every hidden path component.
@@ -259,7 +243,7 @@ pub fn deobfuscate_dir(
         })
         .collect();
     if cands.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     cands.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
@@ -273,44 +257,14 @@ pub fn deobfuscate_dir(
             && !stem.eq_ignore_ascii_case(job_stem)
         {
             if let Some(parent) = path.parent() {
-                rename_with_companions(&stem, job_stem, parent, &files, &mut renames);
+                rename_with_companions(&stem, job_stem, parent, &files, &mut renames)?;
             }
         }
-        return renames;
+        return Ok(renames);
     }
 
-    // No dominant file: a pack. Act only when every similar-sized video
-    // is hex/uuid-grade obfuscated — one real episode name in the set
-    // means the poster wasn't hiding names and we must not touch it.
-    // Any evidence-protected member means par2 already spoke for this
-    // job's names; the heuristic stays out entirely.
-    let floor = cands[0].1 / 4;
-    let mut pack: Vec<&PathBuf> = cands
-        .iter()
-        .filter(|(p, s)| *s >= floor && video_ext(p))
-        .map(|(p, _)| p)
-        .collect();
-    if pack.len() < 2
-        || pack.iter().any(|p| is_protected(p))
-        || !pack.iter().all(|p| is_definitely_obfuscated(&stem_of(p)))
-    {
-        return renames;
-    }
-    pack.sort();
-    tracing::warn!(
-        job = %job_stem,
-        count = pack.len(),
-        "fully obfuscated season pack: applying numbered renames \
-         (episode order is heuristic — names carried no evidence)"
-    );
-    for (i, path) in pack.iter().enumerate() {
-        let stem = stem_of(path);
-        let target_stem = format!("{job_stem} - {:02}", i + 1);
-        if let Some(parent) = path.parent() {
-            rename_with_companions(&stem, &target_stem, parent, &files, &mut renames);
-        }
-    }
-    renames
+    // A pack needs per-file evidence; never fabricate an episode sequence.
+    Ok(renames)
 }
 
 #[cfg(test)]
@@ -350,7 +304,8 @@ mod tests {
         std::fs::write(tmp.path().join("a1b2c3d4e5f6a7b8.dut.srt"), b"subs").unwrap();
         std::fs::write(tmp.path().join("readme.nfo"), b"nfo").unwrap();
 
-        let renames = deobfuscate_dir(tmp.path(), "Great.Show.S02.1080p.WEB", &Default::default());
+        let renames =
+            deobfuscate_dir(tmp.path(), "Great.Show.S02.1080p.WEB", &Default::default()).unwrap();
         assert_eq!(renames.len(), 2);
         assert!(tmp.path().join("Great.Show.S02.1080p.WEB.mkv").exists());
         assert!(tmp.path().join("Great.Show.S02.1080p.WEB.dut.srt").exists());
@@ -365,22 +320,23 @@ mod tests {
             vec![0u8; 9000],
         )
         .unwrap();
-        assert!(deobfuscate_dir(tmp.path(), "Job.Name", &Default::default()).is_empty());
+        assert!(deobfuscate_dir(tmp.path(), "Job.Name", &Default::default())
+            .unwrap()
+            .is_empty());
         assert!(tmp.path().join("Actual.Release.Name.2026.mkv").exists());
     }
 
     #[test]
-    fn season_pack_gets_numbered_names() {
+    fn season_pack_never_invents_episode_order() {
         let tmp = tempfile::tempdir().unwrap();
         for stem in ["9f8e7d6c5b4a3f2e", "1a2b3c4d5e6f7a8b", "deadbeefcafef00d"] {
             std::fs::write(tmp.path().join(format!("{stem}.mkv")), vec![0u8; 5000]).unwrap();
         }
-        let renames = deobfuscate_dir(tmp.path(), "Show.S03.1080p", &Default::default());
-        assert_eq!(renames.len(), 3);
-        // Stable order: sorted by original (obfuscated) name.
-        assert!(tmp.path().join("Show.S03.1080p - 01.mkv").exists());
-        assert!(tmp.path().join("Show.S03.1080p - 02.mkv").exists());
-        assert!(tmp.path().join("Show.S03.1080p - 03.mkv").exists());
+        let renames = deobfuscate_dir(tmp.path(), "Show.S03.1080p", &Default::default()).unwrap();
+        assert!(renames.is_empty());
+        for stem in ["9f8e7d6c5b4a3f2e", "1a2b3c4d5e6f7a8b", "deadbeefcafef00d"] {
+            assert!(tmp.path().join(format!("{stem}.mkv")).exists());
+        }
     }
 
     #[test]
@@ -390,7 +346,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("Show.S03E01.1080p.mkv"), vec![0u8; 5000]).unwrap();
         std::fs::write(tmp.path().join("9f8e7d6c5b4a3f2e.mkv"), vec![0u8; 5000]).unwrap();
-        assert!(deobfuscate_dir(tmp.path(), "Show.S03.1080p", &Default::default()).is_empty());
+        assert!(
+            deobfuscate_dir(tmp.path(), "Show.S03.1080p", &Default::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -399,7 +359,9 @@ mod tests {
         std::fs::write(tmp.path().join("a1b2c3d4e5f6a7b8.mkv"), vec![0u8; 9000]).unwrap();
         let protected: std::collections::HashSet<String> =
             ["a1b2c3d4e5f6a7b8.mkv".to_string()].into_iter().collect();
-        assert!(deobfuscate_dir(tmp.path(), "Job.Name", &protected).is_empty());
+        assert!(deobfuscate_dir(tmp.path(), "Job.Name", &protected)
+            .unwrap()
+            .is_empty());
         assert!(tmp.path().join("a1b2c3d4e5f6a7b8.mkv").exists());
     }
 
@@ -408,7 +370,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("a1b2c3d4e5f6a7b8.mkv"), vec![0u8; 9000]).unwrap();
         assert!(
-            deobfuscate_dir(tmp.path(), "cafebabecafebabecafebabe", &Default::default()).is_empty()
+            deobfuscate_dir(tmp.path(), "cafebabecafebabecafebabe", &Default::default())
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -437,7 +401,7 @@ mod tests {
         std::fs::write(tmp.path().join("root-note.txt"), b"different parent").unwrap();
         std::fs::write(tmp.path().join(".hidden.mkv"), vec![0u8; 20_000]).unwrap();
 
-        let renames = deobfuscate_dir(tmp.path(), "Job.Name.nzb", &Default::default());
+        let renames = deobfuscate_dir(tmp.path(), "Job.Name.nzb", &Default::default()).unwrap();
         assert_eq!(renames.len(), 2);
         assert!(nested.join("Job.Name (2).mkv").exists());
         assert!(nested.join("Job.Name.srt").exists());
@@ -449,15 +413,22 @@ mod tests {
     #[test]
     fn empty_or_unreadable_directories_are_noops() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(deobfuscate_dir(tmp.path(), "", &Default::default()).is_empty());
+        assert!(deobfuscate_dir(tmp.path(), "", &Default::default())
+            .unwrap()
+            .is_empty());
         assert!(deobfuscate_dir(
             &tmp.path().join("missing"),
             "Useful.Job.Name",
             &Default::default()
         )
+        .unwrap()
         .is_empty());
         std::fs::write(tmp.path().join("piece.001"), b"split volume").unwrap();
-        assert!(deobfuscate_dir(tmp.path(), "Useful.Job.Name", &Default::default()).is_empty());
+        assert!(
+            deobfuscate_dir(tmp.path(), "Useful.Job.Name", &Default::default())
+                .unwrap()
+                .is_empty()
+        );
 
         let mut deep = tmp.path().to_path_buf();
         for part in ["a", "b", "c", "d", "e", "f", "g"] {
@@ -465,7 +436,11 @@ mod tests {
             std::fs::create_dir(&deep).unwrap();
         }
         std::fs::write(deep.join("deadbeefdeadbeef.mkv"), b"too deep").unwrap();
-        assert!(deobfuscate_dir(tmp.path(), "Useful.Job.Name", &Default::default()).is_empty());
+        assert!(
+            deobfuscate_dir(tmp.path(), "Useful.Job.Name", &Default::default())
+                .unwrap()
+                .is_empty()
+        );
         assert!(deep.join("deadbeefdeadbeef.mkv").exists());
     }
 }

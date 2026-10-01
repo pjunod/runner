@@ -33,7 +33,7 @@ fn par_catalog_subdirectories_should_be_restored_before_verification() {
     fs::remove_dir(t.path().join("Episode01")).unwrap();
     let set = nzbd_post::par2::load_dir(t.path()).unwrap().unwrap();
     assert_eq!(set.files[0].name, "Episode01/episode.rar");
-    par_rename(t.path());
+    par_rename(t.path()).unwrap();
     assert!(
         nested.exists(),
         "matching flat file was not restored to its catalog path"
@@ -159,7 +159,7 @@ async fn review_diskfull_fallback_can_be_retried_in_same_workspace() {
     );
 
     assert_eq!(
-        fs::read(out.with_extension("first-attempt-1").join("partial.bin")).unwrap(),
+        fs::read(first.output_dir.join("partial.bin")).unwrap(),
         b"partial"
     );
     tool(&seven, "#!/bin/sh\nfor arg do case \"$arg\" in -o*) dest=${arg#-o};; esac; done\nprintf recovered > \"$dest/media.bin\"\necho 'Everything is Ok'\n");
@@ -168,9 +168,12 @@ async fn review_diskfull_fallback_can_be_retried_in_same_workspace() {
         .await
         .unwrap();
     assert!(restored.success, "restored capacity failed: {restored:?}");
-    assert_eq!(fs::read(out.join("media.bin")).unwrap(), b"recovered");
     assert_eq!(
-        fs::read(out.with_extension("first-attempt-2").join("partial.bin")).unwrap(),
+        fs::read(restored.output_dir.join("media.bin")).unwrap(),
+        b"recovered"
+    );
+    assert_eq!(
+        fs::read(out.with_extension("retry-1").join("partial.bin")).unwrap(),
         b"partial"
     );
 }
@@ -196,7 +199,7 @@ fn review_nested_par_set_keeps_its_catalog_root() {
         .status()
         .unwrap()
         .success());
-    par_rename(t.path());
+    par_rename(t.path()).unwrap();
     assert!(
         payload.exists(),
         "valid episode-local catalog file was incorrectly moved into the job root"

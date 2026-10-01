@@ -1428,10 +1428,10 @@ async fn process_job_ctx_from(
     let mut renames = Vec::new();
     if from == RestartPoint::Beginning {
         stages.enter(PostStage::ParRename).await;
-        renames = par_rename_owned(&dir, Some((&engine.artifacts(), job_id.0)));
+        renames = par_rename_owned(&dir, Some((&engine.artifacts(), job_id.0)))?;
         if unpack_enabled {
             stages.enter(PostStage::RarRename).await;
-            renames.extend(rar_rename(&dir));
+            renames.extend(rar_rename(&dir)?);
         }
     }
     let rename_map: std::collections::HashMap<PathBuf, PathBuf> = renames.into_iter().collect();
@@ -1524,6 +1524,7 @@ async fn process_job_ctx_from(
                 // with the lease still live (double-unpack can't happen).
                 std::fs::create_dir_all(&staging)?;
                 let mut r = ex.extract(archive, *kind, &staging, password).await?;
+                staging = r.output_dir.clone();
                 if r.disk_space_error {
                     let cause = if r.quota_error { "quota" } else { "capacity" };
                     let detail = r
@@ -1556,6 +1557,7 @@ async fn process_job_ctx_from(
                                     .map_err(|e| PostError::Subprocess(e.to_string()))?;
                                 staging = attempt.join("output");
                                 r = ex.extract(archive, *kind, &staging, password).await?;
+                                staging = r.output_dir.clone();
                             }
                         }
                     }
@@ -1625,9 +1627,9 @@ async fn process_job_ctx_from(
     }
 
     // ---- DEOBFUSCATE stage -------------------------------------------------
-    // Anything still meaninglessly named after par-rename, rar-rename and
-    // unpack has no recovery evidence left; the job name (from the NZB /
-    // indexer) is the last source of truth. Scripts run after this, so
+    // Exact PAR naming evidence outranks this final basename heuristic.
+    // Archives may contain additional naming metadata; this pass does not
+    // establish that such evidence is absent. Scripts run after this, so
     // they see the final names. Discrete status: the queue shows the
     // PostUnpackRename stage (compat: "RENAMING") while the pass runs, and
     // the applied renames are recorded on the job as `Deobfuscate:*`
@@ -1635,7 +1637,7 @@ async fn process_job_ctx_from(
     let mut deobfuscated: Vec<(PathBuf, PathBuf)> = Vec::new();
     if from.includes(RestartPoint::Cleanup) && cfg.deobfuscate_final && par_ok && unpack_ok {
         stages.enter(PostStage::PostUnpackRename).await;
-        deobfuscated = crate::deobfuscate::deobfuscate_dir(&dir, &sanitized, &par2_names);
+        deobfuscated = crate::deobfuscate::deobfuscate_dir(&dir, &sanitized, &par2_names)?;
         for (from, to) in &deobfuscated {
             tracing::info!(
                 job = job_id.0,

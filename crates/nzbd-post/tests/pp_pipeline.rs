@@ -835,10 +835,9 @@ async fn deobfuscate_final_renames_to_job_name() {
     engine.shutdown().await;
 }
 
-/// A fully obfuscated season pack (several similar-sized videos, all
-/// hex-named) gets stable numbered names — the case SABnzbd skips.
+/// A pack without per-file naming evidence must not acquire invented order.
 #[tokio::test]
-async fn deobfuscate_final_numbers_season_pack() {
+async fn deobfuscate_final_preserves_unmapped_season_pack() {
     let tmp = tempfile::tempdir().unwrap();
     let engine = spawn_engine(tmp.path()).await;
     let dir = tmp.path().join("dest/Show.S03.1080p.WEB");
@@ -878,12 +877,8 @@ async fn deobfuscate_final_numbers_season_pack() {
     .await
     .unwrap();
     assert_eq!(out, PpFinal::Success);
-    for n in 1..=3 {
-        assert!(
-            dir.join(format!("Show.S03.1080p.WEB - {n:02}.mkv"))
-                .exists(),
-            "episode {n} numbered"
-        );
+    for stem in ["9f8e7d6c5b4a3f2e", "1a2b3c4d5e6f7a8b", "deadbeefcafef00d"] {
+        assert!(dir.join(format!("{stem}.mkv")).exists());
     }
     engine.shutdown().await;
 }

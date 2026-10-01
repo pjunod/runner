@@ -84,6 +84,8 @@ pub enum ArchiveKind {
 
 #[derive(Debug, Clone)]
 pub struct ExtractOutcome {
+    /// Actual output directory; retries use a fresh sibling in the owned workspace.
+    pub output_dir: PathBuf,
     pub attempts: Vec<ExtractAttempt>,
     pub quota_error: bool,
     pub success: bool,
