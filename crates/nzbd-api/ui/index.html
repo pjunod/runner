@@ -635,6 +635,8 @@ try {
   .fd-note.bad { color: var(--bad); }
   .fd-files { margin-top: 4px; }
   .fd-files summary { cursor: pointer; font-size: 12.5px; color: var(--ink2); }
+  .fd-selection { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 8px 0; font-size: 12.5px; color: var(--ink2); }
+  .fd-selection label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
   .fd-files table.subtable td.chk { width: 24px; padding-right: 0; }
   .fd-files table.subtable td.path { font-family: var(--font-mono); font-size: 11.5px; word-break: break-all; }
   .fd-files .fd-files-nav { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--ink2); }
@@ -1185,6 +1187,7 @@ try {
     <details class="files-recoveries" id="files-recoveries-box">
       <summary>Recovery handoffs <span class="sec-count" id="files-recoveries-count"></span></summary>
       <p class="sub">Copies staged for Curator. Originals stay held until a complete import receipt arrives; a receipted source can then be deleted with an 8-second Undo.</p>
+      <label><input id="files-recoveries-terminal" type="checkbox"> Show completed and cancelled handoffs</label>
       <div id="files-recoveries"></div>
       <div class="pager" id="files-recoveries-pager" hidden>
         <button class="small" data-action="f-rec-prev">‹ prev</button>
@@ -4669,6 +4672,7 @@ let filesOpen = null;
 let filesDetail = null; // { artifact, files, total, offset, events, preview, previewRequest }
 // Selected recovery files, per folder, surviving re-renders.
 const filesSelections = new Map();
+const filesSelectingAll = new Set();
 // Background operations we are watching: op id → { kind, artifact, since, timer }.
 const filesWatch = new Map();
 store.files = null; // { entries, total, counts, discovery, filter, sort, q }
@@ -4739,11 +4743,12 @@ const FILES_STATES = {
   unknown: ["unknown", "warn"], active: ["downloading", "ok"], active_unverified: ["downloading", "ok"],
   allocating: ["allocating", "dim"], transitioning: ["moving", "dim"], retiring: ["finishing", "dim"],
   deleting: ["deleting", "dim"], delete_failed: ["delete failed", "bad"],
-  parked_failed: ["failed · parked", "bad"], retained: ["retained", "ok"], completed: ["completed", "ok"],
+  parked_failed: ["failed · parked", "bad"], retained: ["retained", "dim"], completed: ["completed", "ok"],
   recovery_staged: ["staged for recovery", "warn"], recovery_imported: ["imported", "ok"],
   deleted: ["deleted", "dim"], source_gone: ["gone", "dim"],
 };
 function filesStateModel(a) {
+  if (a.state === "retained" && a.error) return { label: "retained · needs attention", cls: "st bad" };
   const m = FILES_STATES[a.state] || [a.state, "dim"];
   return { label: m[0], cls: "st " + m[1] };
 }
@@ -4751,6 +4756,9 @@ function fileIsTerminal(a) { return a.state === "deleted" || a.state === "source
 function fileHoldText(a) {
   if (!a.hold) return "";
   if (a.hold === "review") return "on review hold";
+  if (a.hold === "review: interrupted move") return "Move interrupted — files are preserved until the source and destination are reviewed.";
+  if (a.hold === "review: relocation staging") return "Temporary copy from a move — preserved for review before cleanup.";
+  if (a.hold.startsWith("recovery:")) return "Recovery handoff in progress — originals are protected until import or cancellation finishes.";
   return a.hold.startsWith("review") ? "on review hold — " + a.hold.slice(7).replace(/^:\s*/, "") : a.hold;
 }
 /// What will happen to the files, in one line.
@@ -4870,6 +4878,8 @@ function fileDetailModel(dt) {
   const measured = dt.measured != null ? dt.measured : (a.inspected_at != null || dt.total > 0);
   const fileCount = dt.fileCount != null ? dt.fileCount : dt.files.filter(f => !f.identity.directory).length;
   const sel = filesSelections.get(a.id) || new Set();
+  const selectingAll = filesSelectingAll.has(a.id);
+  const allSelected = sel.size > 0 && sel.size === fileCount && (dt.fileCount != null || dt.total === dt.files.length);
   const terminal = fileIsTerminal(a);
   const walkable = !["active", "active_unverified", "transitioning", "retiring", "deleting", "allocating"].includes(a.state) && !terminal;
   const adoptable = !a.owned && !terminal && measured && ["unknown", "retained", "parked_failed", "completed"].includes(a.state);
@@ -4915,19 +4925,22 @@ function fileDetailModel(dt) {
   return {
     key: "fd" + a.id, kind: "fdetail", id: a.id,
     sig: [a.id, a.revision, dt.offset, dt.total, dt.files.length, a.error || "", a.hold || "", a.keep, a.owned,
-          a.state, sel.size, measuring, deleting, dt.events.length, dt.preview ? dt.preview.text : "", a.inspected_at || 0,
+          a.state, [...sel].sort().join("\n"), selectingAll, measuring, deleting, dt.events.length, dt.preview ? dt.preview.text : "", a.inspected_at || 0,
           handoffs.map(h => h.id + ":" + h.state + ":" + h.error + ":" + h.cancelling).join(",")].join("|"),
     path: a.path,
     facts: [
       ["state", filesStateModel(a).label],
       ["ownership", a.owned ? "owned by Runner" : "not owned"],
-      ["hold", a.hold || "none"],
+      ["hold", fileHoldText(a) || "none"],
       ["files", measured ? String(fileCount) : "—"],
       ["size", measured ? fmtBytes(bytes) : "—"],
       ["measured", a.inspected_at ? fmtAgo(a.inspected_at) : measured ? "at completion" : "never"],
       ["job", a.job != null ? "#" + a.job : "—"],
     ],
     note, noteCls: a.error ? "bad" : !measured ? "warn" : "",
+    retainedNote: a.state === "retained" ? "These files were preserved for recovery or review. Retained does not mean processing completed successfully." : "",
+    archiveNote: dt.files.some(f => !f.identity.directory && /\.(?:rar|r\d{2,3}|7z|zip)(?:\.\d+)?$/i.test(f.path))
+      ? "Archive files are present. Recovery copies files as-is; it does not unpack or repair them." : "",
     buttons: [
       walkable ? { action: "f-inspect", label: measuring ? "measuring…" : "inspect", disabled: measuring,
         title: "walk the folder now and refresh its file list" } : null,
@@ -4945,8 +4958,10 @@ function fileDetailModel(dt) {
     filesLabel: measured ? fileCount + (fileCount === 1 ? " file" : " files") + (fileCount ? " · " + fmtBytes(bytes) : "") + (dt.total > fileCount ? " · " + (dt.total - fileCount) + (dt.total - fileCount === 1 ? " folder" : " folders") : "") : "no file list yet",
     offset: dt.offset, total: dt.total, page: FILES_DETAIL_PAGE,
     selected: sel.size,
+    selectingAll, allSelected, someSelected: sel.size > 0 && !allSelected,
+    selectableCount: fileCount,
     stageable, stageBlock, handoffs,
-    canStage: stageable && sel.size > 0,
+    canStage: stageable && sel.size > 0 && !selectingAll,
     preview: dt.preview,
     events: dt.events.map(ev => fmtTime(ev.at) + " · " + ev.kind + (ev.detail ? " — " + ev.detail : "")),
   };
@@ -4959,7 +4974,7 @@ function fileDetailHtml(m) {
     ? `<div class="fd-stage-preview">${esc(m.preview.text)} <button data-action="f-stage-confirm">Stage this selection</button></div>`
     : "";
   const rows = m.files.map(f =>
-    `<tr>${m.stageable ? `<td class="chk"><input type="checkbox" class="recovery-file" value="${esc(f.path)}" ${f.dir ? "disabled" : ""} ${f.checked ? "checked" : ""}></td>` : ""}` +
+    `<tr>${m.stageable ? `<td class="chk"><input type="checkbox" class="recovery-file" aria-label="Select ${esc(f.path)}" value="${esc(f.path)}" ${f.dir || m.selectingAll ? "disabled" : ""} ${f.checked ? "checked" : ""}></td>` : ""}` +
     `<td class="path">${esc(f.path)}${f.dir ? "/" : ""}</td><td class="num">${esc(f.size)}</td></tr>`).join("");
   const handoffs = m.handoffs.length
     ? `<div class="fd-handoffs"><div class="fd-handoffs-title">Recovery handoffs for this folder</div>${m.handoffs.map(h =>
@@ -4982,12 +4997,19 @@ function fileDetailHtml(m) {
     : "";
   const events = m.events.length
     ? `<div class="fd-events">${m.events.map(e => `<div>${esc(e)}</div>`).join("")}</div>` : "";
+  const selection = m.stageable && m.selectableCount > 0
+    ? `<div class="fd-selection"><label><input type="checkbox" class="recovery-all" ${m.allSelected ? "checked" : ""} ${m.selectingAll ? "disabled" : ""}>Select all files</label>` +
+      `<span role="status">${m.selectingAll ? "Selecting files across all pages…" : m.selected + " selected"}</span>` +
+      `<button class="small" data-action="f-select-none" ${!m.selected || m.selectingAll ? "disabled" : ""}>Clear selection</button></div>` : "";
   return `<div class="fd" data-artifact="${esc(m.id)}">
     <div class="fd-path">${esc(m.path)}</div>
     <div class="fd-facts">${facts}</div>
+    ${m.retainedNote ? `<p class="fd-note">${esc(m.retainedNote)}</p>` : ""}
     ${m.note ? `<p class="fd-note ${m.noteCls}">${esc(m.note)}</p>` : ""}
     <div class="fd-acts">${buttons}</div>
     <details class="fd-files" open><summary>${esc(m.filesLabel)}</summary>
+      ${m.archiveNote ? `<p class="fd-note warn">${esc(m.archiveNote)}</p>` : ""}
+      ${selection}
       ${m.files.length ? `<table class="subtable"><tbody>${rows}</tbody></table>${nav}` : ""}
     </details>
     ${stage}
@@ -5005,6 +5027,8 @@ function buildFileDetailKind(d) {
 function applyFileDetailKind(tr, m, d) {
   d = d || dom;
   differ(tr)("sig", m.sig, () => d.prop(tr.__c.td, "innerHTML", fileDetailHtml(m)));
+  const all = tr.__c.td.querySelector && tr.__c.td.querySelector(".recovery-all");
+  if (all) all.indeterminate = m.someSelected;
 }
 KINDS.fdetail = { build: buildFileDetailKind, apply: applyFileDetailKind };
 
@@ -5143,7 +5167,7 @@ async function refreshFiles(force = false) {
     store.files = data;
     if (filesOpen) await loadFileDetail(filesOpen, filesDetail ? filesDetail.offset : 0, false);
     try {
-      const rec = await fileRequest("recoveries?include_terminal=true&offset=" + filesRecoveryOffset, null, "GET");
+      const rec = await fileRequest("recoveries?include_terminal=" + !!$("files-recoveries-terminal")?.checked + "&offset=" + filesRecoveryOffset, null, "GET");
       store.recoveries = Array.isArray(rec) ? rec : [];
     } catch { store.recoveries = store.recoveries || []; }
     renderFiles();
@@ -5326,20 +5350,58 @@ function filesClick(action, el) {
   if (!id) return;
   if (action === "f-details") return toggleFile(id);
   if (action === "f-inspect") return inspectFile(id);
+  if (action === "f-select-none") return selectAllFiles(id, false);
   if (action === "f-files-prev") return loadFileDetail(id, Math.max(0, (filesDetail ? filesDetail.offset : 0) - FILES_DETAIL_PAGE));
   if (action === "f-files-next") return loadFileDetail(id, (filesDetail ? filesDetail.offset : 0) + FILES_DETAIL_PAGE);
   return fileAction(id, action);
 }
-function filesSelectionChange(target) {
-  if (!target || !target.classList || !target.classList.contains("recovery-file")) return;
-  const wrap = target.closest ? target.closest("[data-artifact]") : null;
-  const id = wrap && wrap.dataset.artifact;
-  if (!id) return;
-  const sel = filesSelections.get(id) || new Set();
-  if (target.checked) sel.add(target.value); else sel.delete(target.value);
+function setFileSelection(id, sel) {
   filesSelections.set(id, sel);
   if (filesDetail && filesDetail.artifact.id === id) { filesDetail.preview = null; filesDetail.previewRequest = null; }
   renderFiles();
+}
+async function selectAllFiles(id, checked) {
+  const dt = filesDetail;
+  if (!dt || dt.artifact.id !== id || !fileDetailModel(dt).stageable || filesSelectingAll.has(id)) return;
+  if (!checked) { setFileSelection(id, new Set()); return; }
+  const revision = dt.artifact.revision;
+  const selected = new Set();
+  const add = files => files.forEach(f => { if (!f.identity.directory) selected.add(f.path); });
+  if (dt.offset === 0 && dt.files.length === dt.total) {
+    add(dt.files);
+    setFileSelection(id, selected);
+    return;
+  }
+  filesSelectingAll.add(id);
+  renderFiles();
+  try {
+    let offset = 0;
+    while (offset < dt.total) {
+      const page = await fileRequest("artifacts/" + id + "/files?offset=" + offset, null, "GET");
+      if (page.revision !== revision || page.total !== dt.total || !page.files || !page.files.length)
+        throw new Error("The folder changed while selecting files. Refresh its details and try again.");
+      add(page.files);
+      offset += page.files.length;
+    }
+    const current = await fileRequest("artifacts/" + id, null, "GET");
+    if (current.revision !== revision)
+      throw new Error("The folder changed while selecting files. Refresh its details and try again.");
+    if (filesOpen === id && filesDetail && filesDetail.artifact.revision === revision && fileDetailModel(filesDetail).stageable)
+      setFileSelection(id, selected);
+  } catch (e) { filesError(e); }
+  finally { filesSelectingAll.delete(id); renderFiles(); }
+}
+function filesSelectionChange(target) {
+  if (!target || !target.classList) return;
+  const all = target.classList.contains("recovery-all");
+  if (!all && !target.classList.contains("recovery-file")) return;
+  const wrap = target.closest ? target.closest("[data-artifact]") : null;
+  const id = wrap && wrap.dataset.artifact;
+  if (!id || filesSelectingAll.has(id)) return;
+  if (all) return selectAllFiles(id, target.checked);
+  const sel = filesSelections.get(id) || new Set();
+  if (target.checked) sel.add(target.value); else sel.delete(target.value);
+  setFileSelection(id, sel);
 }
 loadFilesPageSize();
 {
@@ -5347,6 +5409,11 @@ loadFilesPageSize();
   if (q) q.oninput = () => { clearTimeout(filesQueryTimer); filesQueryTimer = setTimeout(() => setFilesQuery(q.value), 250); };
   const s = $("files-sort");
   if (s) s.onchange = () => setFilesSort(s.value);
+  const terminal = $("files-recoveries-terminal");
+  if (terminal) terminal.addEventListener("change", () => {
+    filesRecoveryOffset = 0;
+    refreshFiles(true);
+  });
   const ps = $("files-page-size");
   if (ps) ps.onchange = () => setFilesPageSize(Number(ps.value));
   const body = $("files-body");
@@ -6125,7 +6192,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     },
     clientLabel, clientChipModels, UA_MAX,
     fileRowModel, fileDetailModel, fileDetailHtml, filesStateModel, fileRetentionText, filesScanModel,
-    fileBaseName, fileParent, renderFiles, refreshFiles, filesClick, toggleFile, watchOperation,
+    fileBaseName, fileParent, renderFiles, refreshFiles, filesClick, toggleFile, watchOperation, selectAllFiles, filesSelectionChange,
     setFilesPage, setFilesPageSize, setFilesFilter, setFilesSort, setFilesQuery, filesPages,
     filesView, filesWatch, filesSelections, FILES_PAGE_SIZES, FILES_PAGE_SIZE_DEFAULT,
     getFilesDetail: () => filesDetail, getFilesOpen: () => filesOpen,
