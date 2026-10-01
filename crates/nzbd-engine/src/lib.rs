@@ -702,6 +702,18 @@ impl EngineHandle {
     pub async fn resume_job(&self, job: JobId) -> Result<bool, EngineError> {
         if let Some(record) = self.export_job(job).await? {
             if let Some(control) = record.control().filter(|c| c.lifecycle == "held") {
+                // Allocation may have no owned payload yet: do not run the
+                // capacity probe, which requires one. The queue owner persists
+                // release and wakes normal allocation admission for this job.
+                if control.cause == "allocation" {
+                    return self
+                        .roundtrip_bool(|reply| QueueCommand::ReleaseResourceHold {
+                            job,
+                            revision: control.revision.clone(),
+                            reply,
+                        })
+                        .await;
+                }
                 if !matches!(control.cause.as_str(), "capacity" | "quota") {
                     return Ok(false);
                 }
