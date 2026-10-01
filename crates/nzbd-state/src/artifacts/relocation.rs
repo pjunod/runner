@@ -56,6 +56,133 @@ pub struct RegistryPolicy {
 }
 
 impl Inventory {
+    /// Called inside the transaction transferring authority to deletion.
+    /// Scratch has its own inventory identity and remains available for review.
+    pub(super) fn cancel_relocations(
+        db: &Connection,
+        artifact: &str,
+        generation: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let raws = {
+            let mut stmt = db.prepare("SELECT data FROM operations WHERE artifact=?1 AND state NOT IN ('succeeded','cancelled') AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.generation')=?2")?;
+            let rows = stmt.query_map([artifact, generation], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in raws {
+            let mut op: Operation = serde_json::from_str(&raw)?;
+            op.state = "cancelled".into();
+            op.error = Some(reason.into());
+            save_operation(db, &op)?;
+            event(db, artifact, "relocation_cancelled", &op.id)?;
+        }
+        Ok(())
+    }
+
+    /// A successful delete is terminal for its generation. Older reconcilers
+    /// could overwrite its tombstone with a stale move's review state. Restore
+    /// the journal's result before interpreting any unfinished operations;
+    /// never inspect or delete the bytes now occupying the old pathname.
+    pub(super) fn reconcile_deleted_artifacts(&self) -> Result<()> {
+        let _guard = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let raws = {
+            // For legacy journals require a still-uncommitted move that names
+            // this generation and predates even the deletion REQUEST. This is
+            // stricter than comparing with success time (old operations do not
+            // store that timestamp). Equal-second ordering is left for review.
+            let mut stmt = tx.prepare("SELECT DISTINCT a.data FROM artifacts a
+                JOIN operations d ON d.artifact=a.id
+                WHERE d.state='succeeded' AND json_extract(d.data,'$.kind')='delete'
+                AND (
+                    json_extract(json_extract(d.data,'$.request'),'$[4]')=json_extract(a.data,'$.generation')
+                    OR (json_array_length(json_extract(d.data,'$.request'))=4 AND EXISTS (
+                        SELECT 1 FROM operations proof WHERE proof.artifact=a.id
+                        AND proof.state IN ('running','review')
+                        AND json_extract(proof.data,'$.kind')='relocate'
+                        AND json_extract(proof.data,'$.created_at') < json_extract(d.data,'$.created_at')
+                        AND json_extract(json_extract(proof.data,'$.request'),'$.source.generation')=json_extract(a.data,'$.generation')
+                    ))
+                )
+                AND (a.state!='deleted' OR EXISTS (
+                    SELECT 1 FROM operations m WHERE m.artifact=a.id
+                    AND m.state NOT IN ('succeeded','cancelled')
+                    AND json_extract(m.data,'$.kind')='relocate'
+                ))")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in raws {
+            let mut a: Artifact = serde_json::from_str(&raw)?;
+            Self::cancel_relocations(
+                &tx,
+                &a.id,
+                &a.generation,
+                "source deletion already committed",
+            )?;
+            if a.state != "deleted" {
+                a.state = "deleted".into();
+                a.hold = None;
+                a.error = None;
+                a.updated_at = now();
+                a.revision += 1;
+                save_artifact(&tx, &a)?;
+                event(
+                    &tx,
+                    &a.id,
+                    "deletion_reconciled",
+                    "restored committed deletion",
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Revisions may advance during PP/review, but an operation only owns its
+    /// original generation and location while that generation remains live.
+    /// Both commit and error handling must obey the same authority check.
+    fn relocation_source(&self, op: &Operation, movement: &Relocation) -> Result<Option<Artifact>> {
+        let persisted = self.operation(&op.id)?;
+        let current = self.get(&op.artifact)?;
+        let source = &movement.source;
+        let same_identity = match (&current.identity, &source.identity) {
+            (Some(a), Some(b)) => a.same_object(b),
+            _ => false,
+        };
+        Ok((matches!(persisted.state.as_str(), "running" | "review")
+            && matches!(
+                current.state.as_str(),
+                "active" | "transitioning" | "retained"
+            )
+            && current.id == source.id
+            && current.generation == source.generation
+            && current.path == source.path
+            && current.root == source.root
+            && current.owned == source.owned
+            && same_identity)
+            .then_some(current))
+    }
+
+    fn cancel_obsolete_relocation(&self, op: &mut Operation) -> Result<()> {
+        // A concurrent deletion may have already cancelled this operation.
+        // Keep its recorded reason instead of overwriting that transition.
+        let saved = self.operation(&op.id)?;
+        if matches!(saved.state.as_str(), "succeeded" | "cancelled") {
+            *op = saved;
+            return Ok(());
+        }
+        op.state = "cancelled".into();
+        op.error = Some("relocation no longer owns the source generation".into());
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        save_operation(&tx, op)?;
+        event(&tx, &op.artifact, "relocation_cancelled", &op.id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Journal before moving. A cross-volume move publishes a verified copy,
     /// then retires only the exact source entries captured by this operation.
     pub fn relocate(&self, job: u32, destination: &Path) -> Result<RelocationResult> {
@@ -298,7 +425,11 @@ impl Inventory {
             self.commit_relocation(&mut op, &relocation)
         })();
         let guard = self.mutation_guard()?;
-        if let Err(e) = &result {
+        if let Err(e) = result {
+            if self.relocation_source(&op, &relocation)?.is_none() {
+                self.cancel_obsolete_relocation(&mut op)?;
+                return Err(e);
+            }
             op.state = "review".into();
             op.error = Some(e.to_string());
             save_operation(&self.db.lock().unwrap(), &op)?;
@@ -315,9 +446,9 @@ impl Inventory {
                 retained.error = Some(e.to_string());
                 save_artifact(&self.db.lock().unwrap(), &retained)?;
             }
+            return Err(e);
         }
         drop(guard);
-        result?;
         if let Err(e) = self.retire_relocation_source(&op.id) {
             tracing::warn!(operation=%op.id, error=%e, "relocation committed; source retirement pending");
         }
@@ -330,6 +461,9 @@ impl Inventory {
         })
     }
     fn commit_relocation(&self, op: &mut Operation, movement: &Relocation) -> Result<()> {
+        let mut current = self.relocation_source(op, movement)?.ok_or_else(|| {
+            Error::Conflict("relocation no longer owns the source generation".into())
+        })?;
         let root = movement.destination.parent().unwrap();
         let root_dir = fs::open_dir(root)?;
         if !movement
@@ -353,7 +487,6 @@ impl Inventory {
         if files != expected.files {
             return Err(Error::Conflict("move publication contents changed".into()));
         }
-        let mut current = self.get(&movement.source.id)?;
         current.path = movement.destination.clone();
         current.root = root.into();
         current.root_identity = movement.destination_root.clone();
@@ -390,7 +523,13 @@ impl Inventory {
                         artifact: old.id.clone(),
                         kind: "delete".into(),
                         state: "queued".into(),
-                        request: serde_json::to_string(&(&old.id, old.revision, 0u64, false))?,
+                        request: serde_json::to_string(&(
+                            &old.id,
+                            old.revision,
+                            0u64,
+                            false,
+                            &old.generation,
+                        ))?,
                         created_at: now(),
                         not_before: now(),
                         attempts: 0,
@@ -434,6 +573,20 @@ impl Inventory {
         for raw in raws {
             let mut op: Operation = serde_json::from_str(&raw)?;
             let movement: Relocation = serde_json::from_str(&op.request)?;
+            if self.relocation_source(&op, &movement)?.is_none() {
+                self.cancel_obsolete_relocation(&mut op)?;
+                continue;
+            }
+            // Preserve an admitted deletion's revision/hold through its undo
+            // window. Once it starts, execute_delete transfers authority;
+            // cancelling it leaves ordinary relocation recovery available.
+            let deletion_pending: bool = self.db.lock().unwrap().query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state='queued' AND json_extract(data,'$.kind')='delete')",
+                [&op.artifact], |r| r.get(0),
+            )?;
+            if deletion_pending {
+                continue;
+            }
             if let Err(e) = self.commit_relocation(&mut op, &movement) {
                 op.state = "review".into();
                 op.error = Some(format!("interrupted move: {e}"));
