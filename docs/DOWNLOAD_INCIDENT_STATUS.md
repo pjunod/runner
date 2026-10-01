@@ -6,7 +6,7 @@ causes, evidence, and design decisions. This page tracks execution.
 **Updated:** 2026-10-01 (America/New_York). **Phase:** implementation.
 **Branch:** `codex/download-incident-recovery`, based on `main` at `9d3288b`.
 **Agent checkout:** `/private/tmp/nzbd-incident-agent`.
-**PR:** pending creation as one combined draft. **Deployed:** no.
+**PR:** [#247](https://github.com/pjunod/runner/pull/247), draft. **Deployed:** no.
 
 ## Progress
 
