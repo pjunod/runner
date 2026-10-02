@@ -415,7 +415,7 @@ impl Extractors {
         if matches!(kind, ArchiveKind::Rar) {
             let first = self.extract_once(archive, kind, dest, password).await;
             let usable = match &first {
-                Ok(o) => o.success && unpack_shortfall(dir, archive, dest).is_none(),
+                Ok(o) => o.success && unpack_shortfall(dir, archive, &o.output_dir).is_none(),
                 Err(_) => false,
             };
             if usable {
@@ -432,31 +432,25 @@ impl Extractors {
                 archive = %archive.display(),
                 "unrar did not deliver the whole archive; retrying with 7-Zip"
             );
-            // Preserve prior outputs using exclusive names. Production callers
-            // additionally allocate each retry in a journal-owned generation.
-            let mut retained = false;
+            // Keep the failed attempt in place. Allocate a fresh destination
+            // within the same journal-owned attempt, without a directory rename.
+            let mut retry_dir = None;
             for generation in 0..64 {
-                let failed = dest.with_extension(if generation == 0 {
-                    "first-attempt".to_string()
-                } else {
-                    format!("first-attempt-{generation}")
-                });
-                if std::fs::symlink_metadata(&failed).is_ok() {
-                    continue;
+                let candidate = dest.with_extension(format!("retry-{generation}"));
+                match std::fs::create_dir(&candidate) {
+                    Ok(()) => {
+                        retry_dir = Some(candidate);
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e.into()),
                 }
-                nzbd_state::fileops::rename_exclusive(dest, &failed)
-                    .map_err(|e| PostError::Subprocess(e.to_string()))?;
-                retained = true;
-                break;
             }
-            if !retained {
-                return Err(PostError::Subprocess(
-                    "extractor attempt limit requires review".into(),
-                ));
-            }
-            std::fs::create_dir(dest)?;
+            let retry_dir = retry_dir.ok_or_else(|| {
+                PostError::Subprocess("extractor attempt limit requires review".into())
+            })?;
             let second = self
-                .extract_once(archive, ArchiveKind::SevenZip, dest, password)
+                .extract_once(archive, ArchiveKind::SevenZip, &retry_dir, password)
                 .await;
             // The fallback gets the same delivery check the first attempt
             // got. "Everything is Ok" over a short extraction is the exact
@@ -465,7 +459,7 @@ impl Extractors {
             // archive nothing read — the `unrar-free` failure again, one
             // tool along.
             let delivered = match &second {
-                Ok(o) => o.success && unpack_shortfall(dir, archive, dest).is_none(),
+                Ok(o) => o.success && unpack_shortfall(dir, archive, &o.output_dir).is_none(),
                 Err(_) => false,
             };
             if delivered {
@@ -561,6 +555,7 @@ impl Extractors {
                 .take(4096)
                 .collect();
                 Ok(ExtractOutcome {
+                    output_dir: dest.to_path_buf(),
                     attempts: vec![crate::ExtractAttempt {
                         executable: if matches!(kind, ArchiveKind::Rar) {
                             self.unrar_cmd.clone()
@@ -598,6 +593,7 @@ impl Extractors {
                 .take(4096)
                 .collect();
                 Ok(ExtractOutcome {
+                    output_dir: dest.to_path_buf(),
                     attempts: vec![crate::ExtractAttempt {
                         executable: if matches!(kind, ArchiveKind::Rar) {
                             self.unrar_cmd.clone()
@@ -984,13 +980,15 @@ mod tests {
             "7-Zip fallback must replace a short extraction"
         );
         assert_eq!(
-            std::fs::metadata(dest.join("whole.bin")).unwrap().len(),
+            std::fs::metadata(outcome.output_dir.join("whole.bin"))
+                .unwrap()
+                .len(),
             200,
             "the reported success must be the fallback's full-size output"
         );
         assert!(
-            !dest.join("partial.bin").exists(),
-            "the short first attempt's output was discarded before the retry"
+            dest.join("partial.bin").exists() && !outcome.output_dir.join("partial.bin").exists(),
+            "the failed output stays separate from the fresh retry destination"
         );
     }
 

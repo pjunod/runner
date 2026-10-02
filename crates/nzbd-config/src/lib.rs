@@ -622,6 +622,16 @@ impl Config {
         expand_home(&self.paths.dest_dir)
     }
 
+    /// NZBGet InterDir: an empty value keeps downloads in DestDir.
+    pub fn download_dir(&self) -> PathBuf {
+        self.paths
+            .inter_dir
+            .as_ref()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| expand_home(p))
+            .unwrap_or_else(|| self.dest_dir())
+    }
+
     /// Immutable torrent payload root, independent from the Usenet handoff.
     pub fn torrent_dir(&self) -> PathBuf {
         self.paths
@@ -1601,6 +1611,22 @@ article_cache_mb = 512
 [api]
 bind = "0.0.0.0:6789"
 "#;
+
+    #[test]
+    fn intermediate_directory_is_explicit_and_empty_preserves_destination() {
+        let mut cfg = Config::default();
+        cfg.paths.main_dir = "/state-only".into();
+        cfg.paths.dest_dir = "/complete".into();
+        assert_eq!(cfg.download_dir(), PathBuf::from("/complete"));
+        cfg.paths.inter_dir = Some(PathBuf::new());
+        assert_eq!(cfg.download_dir(), PathBuf::from("/complete"));
+        cfg.paths.inter_dir = Some("/configured-intermediate".into());
+        assert_eq!(
+            cfg.download_dir(),
+            PathBuf::from("/configured-intermediate")
+        );
+        assert_eq!(cfg.dest_dir(), PathBuf::from("/complete"));
+    }
 
     #[test]
     fn history_index_location_is_optional_and_requires_restart() {

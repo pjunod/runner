@@ -4,10 +4,11 @@
 //! Nothing in a media payload is a marker or grants permission to remove it.
 pub(crate) mod fs;
 mod policy;
+mod publication;
 pub use policy::{RetentionChange, RetentionPreview};
 mod recovery;
 mod relocation;
-pub use relocation::{RegistryPolicy, RelocationResult};
+pub use relocation::RelocationResult;
 mod tasks;
 mod transforms;
 pub use recovery::{Receipt, ReceiptFile, Recovery, RecoveryFile};
@@ -131,6 +132,26 @@ pub struct Operation {
     pub attempts: u32,
     pub next_retry: i64,
     pub error: Option<String>,
+}
+
+/// New deletes bind authorization to an allocation, never just its reusable
+/// row ID. Old journals remain readable but cannot authorize startup repair
+/// without generation evidence.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum DeleteRequest {
+    Scoped((String, u64, u64, bool, String)),
+    Legacy((String, u64, u64, bool)),
+}
+impl DeleteRequest {
+    fn fields(&self) -> (&str, u64, u64, bool, Option<&str>) {
+        match self {
+            Self::Scoped((id, rev, undo, auto, generation)) => {
+                (id, *rev, *undo, *auto, Some(generation))
+            }
+            Self::Legacy((id, rev, undo, auto)) => (id, *rev, *undo, *auto, None),
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
@@ -654,6 +675,7 @@ impl Inventory {
 
     /// Called once before queue writers start, never from the periodic worker.
     pub fn reconcile_startup(&self, live_jobs: &[u32]) -> Result<()> {
+        self.reconcile_deleted_artifacts()?;
         self.reconcile_relocations()?;
         self.reconcile_transforms()?;
         let _guard = self.mutation_guard()?;
@@ -1126,21 +1148,26 @@ impl Inventory {
                 "valid idempotency key and undo of 0–60 seconds required".into(),
             ));
         }
-        let request = serde_json::to_string(&(key, revision, undo_seconds, automatic))?;
+        let a = self.get(key)?;
+        let request =
+            serde_json::to_string(&(key, revision, undo_seconds, automatic, &a.generation))?;
         match self.operation(request_id) {
             Ok(op) => {
-                return if op.request == request {
+                let previous: DeleteRequest = serde_json::from_str(&op.request)?;
+                let (id, rev, undo, auto, generation) = previous.fields();
+                return if (id, rev, undo, auto) == (key, revision, undo_seconds, automatic)
+                    && generation.is_none_or(|g| g == a.generation)
+                {
                     Ok(op)
                 } else {
                     Err(Error::Conflict(
                         "idempotency key reused with different request".into(),
                     ))
-                }
+                };
             }
             Err(Error::NotFound) => {}
             Err(e) => return Err(e),
         }
-        let a = self.get(key)?;
         if a.revision != revision
             || !a.owned
             || a.keep
@@ -1206,8 +1233,14 @@ impl Inventory {
             return Ok(op);
         }
         let mut a = self.get(&op.artifact)?;
-        let (_, revision, _, automatic): (String, u64, u64, bool) =
-            serde_json::from_str(&op.request)?;
+        let request: DeleteRequest = serde_json::from_str(&op.request)?;
+        let (_, revision, _, automatic, generation) = request.fields();
+        if generation != Some(a.generation.as_str()) {
+            op.state = "review".into();
+            op.error = Some("deletion generation changed or legacy authorization lacks generation; request deletion again after review".into());
+            save_operation(&self.db.lock().unwrap(), &op)?;
+            return Ok(op);
+        }
         if op.attempts == 0
             && (a.revision != revision
                 || (automatic
@@ -1230,6 +1263,9 @@ impl Inventory {
         {
             let mut db = self.db.lock().unwrap();
             let tx = db.transaction()?;
+            // Deletion now owns this generation. A failed or interrupted move
+            // cannot regain authority on restart, even if deletion needs retry.
+            Self::cancel_relocations(&tx, &a.id, &a.generation, "source deletion started")?;
             save_operation(&tx, &op)?;
             save_artifact(&tx, &a)?;
             tx.commit()?;
@@ -1472,6 +1508,17 @@ impl Inventory {
             .parent()
             .ok_or_else(|| Error::Conflict("invalid publication root".into()))?;
         let dir = fs::open_dir(&recovery.published)?;
+        let observed = fs::identity(&dir.metadata()?);
+        if !recovery
+            .publication_identity
+            .as_ref()
+            .or(recovery.scratch_identity.as_ref())
+            .is_some_and(|expected| expected.same_object(&observed))
+        {
+            return Err(Error::Conflict(
+                "recovery publication identity changed".into(),
+            ));
+        }
         let root_dir = fs::open_dir(root)?;
         let a = Artifact {
             id: format!("recovery-{}", recovery.id),

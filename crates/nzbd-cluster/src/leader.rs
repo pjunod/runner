@@ -53,6 +53,7 @@ pub struct LeaderShared {
     pub engine: EngineHandle,
     pub layout: SharedLayout,
     pub dest_dir: PathBuf,
+    post: Option<nzbd_post::manager::PostConfig>,
     pub cfg: ClusterConfig,
     pub servers: Vec<ServerDef>,
     pub view: watch::Receiver<LeaderView>,
@@ -71,6 +72,7 @@ pub struct LeaderShared {
 }
 
 pub(crate) struct LeaderDurability {
+    post: Option<nzbd_post::manager::PostConfig>,
     control: Option<ControlStore>,
     history: Option<Arc<nzbd_state::history::HistoryDb>>,
     owner_incarnation: String,
@@ -83,10 +85,15 @@ impl LeaderDurability {
         owner_incarnation: String,
     ) -> Self {
         Self {
+            post: None,
             control,
             history,
             owner_incarnation,
         }
+    }
+    pub(crate) fn with_post(mut self, post: Option<nzbd_post::manager::PostConfig>) -> Self {
+        self.post = post;
+        self
     }
 }
 
@@ -104,6 +111,7 @@ impl LeaderShared {
             engine,
             layout,
             dest_dir,
+            post: durability.post,
             cfg,
             servers,
             view,
@@ -116,6 +124,25 @@ impl LeaderShared {
             mutation_serial: tokio::sync::Mutex::new(()),
             authority_ready: AtomicBool::new(false),
         })
+    }
+
+    fn publication_root(&self, job: &nzbd_types::Job, post: bool) -> PathBuf {
+        if post {
+            if let Some(cfg) = &self.post {
+                return cfg
+                    .categories
+                    .iter()
+                    .find(|r| {
+                        job.category
+                            .as_deref()
+                            .is_some_and(|name| r.name.eq_ignore_ascii_case(name.trim()))
+                    })
+                    .and_then(|r| r.dest_dir.clone())
+                    .or_else(|| cfg.completed_dir.clone())
+                    .unwrap_or_else(|| self.dest_dir.clone());
+            }
+        }
+        self.dest_dir.clone()
     }
 
     pub(crate) fn authority_ready(&self) -> bool {
@@ -1307,6 +1334,7 @@ async fn work_complete(
         s.leases.lock().unwrap().remove(&req.lease_id);
         s.apply_local_budgets().await;
         return Json(CompleteResponse {
+            final_dir: None,
             ok: true,
             durable_receipt: Some(req.receipt_id),
             accepted_at_unix_ms: Some(accepted_at_ms),
@@ -1314,6 +1342,7 @@ async fn work_complete(
         })
         .into_response();
     }
+    let mut final_publication = None;
     let mut published_job = req.job.clone();
     published_job
         .params
@@ -1322,7 +1351,7 @@ async fn work_complete(
         .params
         .push(("*Cluster:result-ref".into(), req.result_ref.clone()));
     if matches!(info.kind, LeaseKind::Post | LeaseKind::Assemble) {
-        let dest_dir = s.dest_dir.clone();
+        let dest_dir = s.publication_root(&published_job, info.kind == LeaseKind::Post);
         let result_ref = req.result_ref.clone();
         let fence = req.token.fence;
         let original_dir = published_job
@@ -1337,6 +1366,7 @@ async fn work_complete(
             )
                 .into_response();
         };
+        let final_path = dest_dir.join(&original_dir);
         let publish_dir = original_dir.clone();
         let publish = tokio::task::spawn_blocking(move || {
             publish_generation(
@@ -1356,10 +1386,25 @@ async fn work_complete(
                 .into_response();
         }
         published_job.dir_name = original_dir;
+        published_job
+            .params
+            .retain(|(k, _)| k != "*Cluster:final-dir");
+        published_job.params.push((
+            "*Cluster:final-dir".into(),
+            final_path.to_string_lossy().into_owned(),
+        ));
+        final_publication = Some(final_path);
     }
     let history_recorded_by_authority = info.kind == LeaseKind::Post && s.history.is_some();
     if info.kind == LeaseKind::Post {
-        if let Err(error) = record_pp_history(&s, &published_job, accepted_at_ms).await {
+        if let Err(error) = record_pp_history(
+            &s,
+            &published_job,
+            accepted_at_ms,
+            final_publication.as_deref().expect("post publication path"),
+        )
+        .await
+        {
             tracing::warn!(job = job_id.0, %error, "published PP result awaits durable history");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1378,6 +1423,7 @@ async fn work_complete(
     s.leases.lock().unwrap().remove(&req.lease_id);
     s.apply_local_budgets().await;
     Json(CompleteResponse {
+        final_dir: final_publication.map(|p| p.to_string_lossy().into_owned()),
         ok: true,
         durable_receipt: Some(req.receipt_id),
         accepted_at_unix_ms: Some(accepted_at_ms),
@@ -1766,15 +1812,16 @@ async fn recover_selected_publications(s: &LeaderShared) -> Result<(), String> {
         else {
             continue;
         };
-        let dest_dir = s.dest_dir.clone();
+        let dest_dir = s.publication_root(&job, kind == "post");
         let original_dir = original_dir.clone();
+        let final_path = dest_dir.join(&original_dir);
         tokio::task::spawn_blocking(move || {
             publish_generation(&dest_dir, &result_ref, &original_dir, fence, &result_id)
         })
         .await
         .map_err(|error| format!("publication recovery task failed: {error}"))??;
         if kind == "post" {
-            record_pp_history(s, &job, accepted_at_ms).await?;
+            record_pp_history(s, &job, accepted_at_ms, &final_path).await?;
         }
     }
     Ok(())
@@ -1784,6 +1831,7 @@ async fn record_pp_history(
     s: &LeaderShared,
     job: &nzbd_types::Job,
     accepted_at_ms: i64,
+    final_path: &Path,
 ) -> Result<(), String> {
     let Some(history) = &s.history else {
         return Ok(());
@@ -1798,19 +1846,7 @@ async fn record_pp_history(
         job: job.id,
         name: job.name.clone(),
         category: job.category.clone(),
-        final_dir: job
-            .params
-            .iter()
-            .find(|(key, _)| key == "*Cluster:result-ref")
-            .map(|(_, value)| value.clone())
-            .or_else(|| {
-                Some(
-                    s.dest_dir
-                        .join(nzbd_engine::queue::job_dir_name(job))
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-            }),
+        final_dir: Some(final_path.to_string_lossy().into_owned()),
         status,
         size: job.totals.size,
         health: nzbd_types::Health::calc(&job.totals).0,
@@ -2216,6 +2252,127 @@ mod tests {
         assert!(worker_admits_new_work(&record));
         record.disk_low = true;
         assert!(!worker_admits_new_work(&record));
+    }
+
+    #[tokio::test]
+    async fn completed_cluster_history_reports_the_materialized_configured_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = SharedLayout::new(tmp.path(), "leader").unwrap();
+        let provider = ServerDef {
+            id: ServerId(1),
+            name: "provider".into(),
+            host: "127.0.0.1".into(),
+            port: 119,
+            tls: TlsMode::None,
+            username: None,
+            password: None,
+            active: true,
+            tier: 0,
+            group: 0,
+            fill: false,
+            max_connections: 9,
+            pipeline_depth: 1,
+            retention_days: 0,
+            cert_verification: CertLevel::Strict,
+        };
+        let mut scarce = provider.clone();
+        scarce.id = ServerId(2);
+        scarce.name = "scarce".into();
+        scarce.max_connections = 1;
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![provider.clone(), scarce.clone()],
+            layout.state_dir(),
+            tmp.path().join("dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let (_view_tx, view) = watch::channel(LeaderView {
+            record: Some(LeaderRecord {
+                epoch: 1,
+                node: "leader".into(),
+                api_url: "http://leader.invalid".into(),
+                seq: 1,
+            }),
+            is_me: true,
+        });
+        let cfg = ClusterConfig {
+            cluster_id: "test".into(),
+            node_name: "leader".into(),
+            shared_dir: tmp.path().to_path_buf(),
+            advertise_url: "http://leader.invalid".into(),
+            secret: "secret".into(),
+            coordinator: true,
+            priority: 0,
+            download: true,
+            max_download_jobs: 1,
+            post_process: true,
+            pp_slots: 1,
+            lease_interval: std::time::Duration::from_secs(1),
+            takeover_after: std::time::Duration::from_secs(2),
+            worker_ttl: std::time::Duration::from_secs(3),
+            control_dir: tmp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: "127.0.0.1:38110".into(),
+            control_api_bind: "127.0.0.1:38210".into(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
+            disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
+        };
+        let hist = Arc::new(
+            nzbd_state::history::HistoryDb::open(
+                &tmp.path().join("history.sqlite"),
+                Some(tmp.path()),
+            )
+            .unwrap(),
+        );
+        let post = nzbd_post::manager::PostConfig {
+            completed_dir: Some(tmp.path().join("complete")),
+            categories: vec![nzbd_post::manager::CategoryRule {
+                name: "tv".into(),
+                dest_dir: Some(tmp.path().join("category")),
+                unpack: None,
+                extensions: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let shared = LeaderShared::new(
+            engine.clone(),
+            layout,
+            tmp.path().join("dest"),
+            cfg,
+            vec![provider, scarce],
+            view,
+            LeaderDurability::new(None, Some(hist.clone()), "test-incarnation".into())
+                .with_post(Some(post)),
+        );
+        let mut job = test_job(812);
+        job.params
+            .push(("*Cluster:result-ref".into(), "/immutable/generation".into()));
+        assert_eq!(
+            shared.publication_root(&job, false),
+            tmp.path().join("dest")
+        );
+        let ordinary = shared.publication_root(&job, true).join("job");
+        assert_eq!(ordinary, tmp.path().join("complete/job"));
+        job.category = Some(" TV ".into());
+        let category = shared.publication_root(&job, true).join("job");
+        assert_eq!(category, tmp.path().join("category/job"));
+        // Both normal completion and takeover call this with the path just
+        // materialized, never the immutable generation root from the worker.
+        record_pp_history(&shared, &job, 123000, &category)
+            .await
+            .unwrap();
+        record_pp_history(&shared, &job, 123000, &category)
+            .await
+            .unwrap();
+        let entries = hist.list(10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].final_dir.as_deref(), category.to_str());
+        engine.shutdown().await;
     }
 
     #[tokio::test]

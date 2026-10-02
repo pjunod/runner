@@ -2239,6 +2239,10 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     T.renderFiles();
     eq(body.children.length, 4, "closing removes the panel");
 
+    const pendingMove = T.fileDetailModel({ artifact: art("move", { owned: true, state: "retained", hold: "review: interrupted move", inspected_at: 1 }), files: [], total: 0, offset: 0, events: [], relocations: [{id:"move-1", state:"review", error:"publish failed"}] });
+    ok(T.fileDetailHtml(pendingMove).includes('data-action="f-abandon-move"'), "a pending relocation has an explicit abandonment action");
+    ok(T.fileDetailHtml(pendingMove).includes('data-operation="move-1"'), "abandonment identifies the exact operation");
+
     // 3. The panel model: what is offered depends on state.
     const unmeasuredPanel = T.fileDetailModel({ artifact: art("u"), files: [], total: 0, offset: 0, events: [], preview: null });
     ok(!unmeasuredPanel.buttons.some(b => b.action === "f-adopt"), "an unmeasured folder cannot be adopted yet");
@@ -2255,6 +2259,45 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     T.filesSelections.clear();
     const paged = T.fileDetailModel({ artifact: art("p", { inspected_at: 5 }), files: Array.from({ length: 200 }, (_, i) => ({ path: "f" + i, identity: { bytes: 1, directory: false } })), total: 450, offset: 200, events: [], preview: null });
     ok(T.fileDetailHtml(paged).includes("201–400 of 450"), "the file list pages inside the panel");
+
+    // Select all covers the folder, skips directories, and invalidates an old
+    // recovery preview. A changing manifest must never commit a partial set.
+    const bulkFiles = Array.from({ length: 59 }, (_, i) => ({ path: `part${i}.rar`, identity: { bytes: 5, directory: false } }));
+    bulkFiles.push({ path: "subfolder", identity: { bytes: 0, directory: true } });
+    const bulk = { artifact: art("bulk", { owned: true, state: "retained", hold: null, inspected_at: 5 }),
+      files: bulkFiles, total: 60, fileCount: 59, offset: 0, events: [], preview: { text: "old preview" }, previewRequest: {} };
+    T.setFilesDetailForTest("bulk", bulk);
+    await T.filesSelectionChange({ classList: { contains: c => c === "recovery-all" }, checked: true,
+      closest: () => ({ dataset: { artifact: "bulk" } }) });
+    eq(T.filesSelections.get("bulk").size, 59, "one checkbox selects all 59 files");
+    ok(!T.filesSelections.get("bulk").has("subfolder"), "directories are never selected for recovery");
+    eq(bulk.preview, null, "bulk selection clears the previous preview");
+    eq(bulk.previewRequest, null, "…and its old recovery request");
+    const bulkModel = T.fileDetailModel(bulk);
+    eq(bulkModel.allSelected, true, "the master checkbox reflects full selection");
+    ok(T.fileDetailHtml(bulkModel).includes("Select all files"), "bulk selection has a visible label");
+    ok(bulkModel.archiveNote.includes("does not unpack"), "archives explain the limits of recovery copying");
+    ok(bulkModel.retainedNote.includes("does not mean processing completed"), "retained does not imply a finished download");
+    await T.filesClick("f-select-none", { dataset: { artifact: "bulk" }, closest: () => null });
+    eq(T.filesSelections.get("bulk").size, 0, "clear selection clears the entire folder");
+    T.filesSelections.set("bulk", new Set(["part0.rar"]));
+    eq(T.fileDetailModel(bulk).someSelected, true, "partial selection makes the master checkbox indeterminate");
+    eq(T.filesStateModel({ state: "retained", error: "move failed" }).cls, "st bad", "retained with an error is not green success");
+
+    const firstPage = bulkFiles.slice(0, 30), secondPage = bulkFiles.slice(30);
+    bulk.files = secondPage; bulk.offset = 30;
+    routes.set("/api/v1/artifacts/bulk/files?offset=0", { status: 200, body: { revision: 1, total: 60, files: firstPage } });
+    routes.set("/api/v1/artifacts/bulk/files?offset=30", { status: 200, body: { revision: 1, total: 60, files: secondPage } });
+    routes.set("/api/v1/artifacts/bulk", { status: 200, body: bulk.artifact });
+    await T.selectAllFiles("bulk", true);
+    eq(T.filesSelections.get("bulk").size, 59, "select all from page two includes files from both pages");
+    T.filesSelections.set("bulk", new Set(["part0.rar"]));
+    routes.set("/api/v1/artifacts/bulk/files?offset=30", { status: 200, body: { revision: 2, total: 60, files: secondPage } });
+    await T.selectAllFiles("bulk", true);
+    eq(T.filesSelections.get("bulk").size, 1, "a revision change preserves the previous selection without a partial update");
+    T.filesSelections.clear();
+    T.setFilesDetailForTest(null, null);
+    routes.clear();
 
     // 3b. Staging is offered only when the server would accept it
     //     (owned · unheld · settled state). Field report 2026-09-28 #2: a
@@ -2361,6 +2404,18 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     // Nothing is inspected in a way that lets a stale click through: the
     // page never asks for more than one page of manifests.
     ok(!seen.some(r => r.url.includes("/files?")), "the list never fetches manifests it is not showing");
+
+    // Terminal recovery history is opt-in; a cancelled row must not look active.
+    const terminalHistory = doc.getElementById("files-recoveries-terminal");
+    terminalHistory.checked = false;
+    seen.length = 0;
+    await T.refreshFiles(true);
+    ok(seen.some(r => r.url.includes("recoveries?include_terminal=false")), "active recovery view excludes terminal handoffs");
+    terminalHistory.checked = true;
+    seen.length = 0;
+    await T.refreshFiles(true);
+    ok(seen.some(r => r.url.includes("recoveries?include_terminal=true")), "history toggle includes completed and cancelled handoffs");
+    terminalHistory.checked = false;
 
     // 5b. A daemon that answers the list with an error renders an empty
     //     state, not a TypeError on every 5 s poll.

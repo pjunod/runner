@@ -11,6 +11,7 @@
 use crate::{DownloadEvidence, PostError, VerifyResult};
 use nzbd_yenc::crc32_combine;
 use std::collections::{BTreeSet, HashMap};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -36,7 +37,7 @@ pub struct Par2Set {
     pub main_path: Option<PathBuf>,
 }
 
-/// Parse every readable `*.par2` in a directory into one set.
+/// Parse PAR2 indexes discovered by extension or packet signature.
 ///
 /// The packet walking itself lives in `nzbd-par2`, a leaf crate, because
 /// the download engine needs the same FileDesc names *during* a download
@@ -60,7 +61,18 @@ pub fn load_sets(dir: &Path) -> Result<Vec<Par2Set>, PostError> {
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("par2"))
         {
-            continue;
+            let mut input = nzbd_state::fileops::open(&path).map_err(|e| {
+                PostError::Subprocess(format!("PAR discovery {}: {e}", path.display()))
+            })?;
+            let mut signature = [0; 8];
+            let is_par = match input.read_exact(&mut signature) {
+                Ok(()) => &signature == b"PAR2\0PKT",
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => false,
+                Err(e) => return Err(e.into()),
+            };
+            if !is_par {
+                continue;
+            }
         }
         if std::fs::metadata(&path)?.len() > 64 * 1024 * 1024 {
             return Err(PostError::Subprocess("PAR metadata size limit".into()));
@@ -283,6 +295,20 @@ mod tests {
         assert_eq!(set.files[0].slice_crcs.len(), 7); // ceil(50000/8192)
         assert_eq!(set.recovery_blocks, 8);
         assert!(set.main_path.as_ref().unwrap().ends_with("set.par2"));
+
+        // Discovery must not depend on renaming the index first.
+        for (index, path) in crate::namespace::files(tmp.path())
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "par2"))
+            .enumerate()
+        {
+            std::fs::rename(path, tmp.path().join(format!("obfuscated-index-{index}"))).unwrap();
+        }
+        let recovered = load_dir(tmp.path()).unwrap().unwrap();
+        assert_eq!(recovered.files[0].name, "payload.bin");
+        assert_eq!(recovered.files[0].md5_full, set.files[0].md5_full);
+        assert_eq!(recovered.recovery_blocks, set.recovery_blocks);
 
         // Quick verify from "download evidence" — the whole-file CRC only.
         let ev = vec![DownloadEvidence {

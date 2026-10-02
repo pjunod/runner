@@ -11,7 +11,13 @@ struct Relocation {
     destination_root: Identity,
     scratch: Option<Artifact>,
     #[serde(default)]
-    registry: bool,
+    registry: bool, // legacy journals only
+    #[serde(default)]
+    publication: Option<super::publication::PublishedDirectory>,
+    #[serde(default)]
+    publication_key: Option<String>,
+    #[serde(default)]
+    cleanup_done: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,42 +38,144 @@ fn boundary(stage: &'static str) -> Result<()> {
     let _ = stage;
     Ok(())
 }
-fn probe_publication(root: &Path, token: &str) -> Result<()> {
-    boundary("capability")?;
-    let a = root.join(format!(".runner-probe-{token}-a"));
-    let b = root.join(format!(".runner-probe-{token}-b"));
-    std::fs::create_dir(&a)?;
-    let result = fs::rename_exclusive(&a, &b);
-    // Remove only entries allocated by this probe. No recursive cleanup.
-    let _ = std::fs::remove_dir(&a);
-    if result.is_ok() {
-        std::fs::remove_dir(&b)?;
-    }
-    result
-}
-
-/// Registry fallback is unreachable from ordinary production relocation until
-/// all consumers have a separate managed mapping and native durability evidence.
-/// The normal API always passes None. This policy is used by synthetic gates.
-#[derive(Clone, Debug)]
-pub struct RegistryPolicy {
-    pub managed_root: PathBuf,
-    pub consumers_isolated: bool,
-}
-
 impl Inventory {
+    /// Called inside the transaction transferring authority to deletion.
+    /// Scratch has its own inventory identity and remains available for review.
+    pub(super) fn cancel_relocations(
+        db: &Connection,
+        artifact: &str,
+        generation: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let raws = {
+            let mut stmt = db.prepare("SELECT data FROM operations WHERE artifact=?1 AND state NOT IN ('succeeded','cancelled') AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.generation')=?2")?;
+            let rows = stmt.query_map([artifact, generation], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in raws {
+            let mut op: Operation = serde_json::from_str(&raw)?;
+            op.state = "cancelled".into();
+            op.error = Some(reason.into());
+            save_operation(db, &op)?;
+            event(db, artifact, "relocation_cancelled", &op.id)?;
+        }
+        Ok(())
+    }
+
+    /// A successful delete is terminal for its generation. Older reconcilers
+    /// could overwrite its tombstone with a stale move's review state. Restore
+    /// the journal's result before interpreting any unfinished operations;
+    /// never inspect or delete the bytes now occupying the old pathname.
+    pub(super) fn reconcile_deleted_artifacts(&self) -> Result<()> {
+        let _guard = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let raws = {
+            // For legacy journals require a still-uncommitted move that names
+            // this generation and predates even the deletion REQUEST. This is
+            // stricter than comparing with success time (old operations do not
+            // store that timestamp). Equal-second ordering is left for review.
+            let mut stmt = tx.prepare("SELECT DISTINCT a.data FROM artifacts a
+                JOIN operations d ON d.artifact=a.id
+                WHERE d.state='succeeded' AND json_extract(d.data,'$.kind')='delete'
+                AND (
+                    json_extract(json_extract(d.data,'$.request'),'$[4]')=json_extract(a.data,'$.generation')
+                    OR (json_array_length(json_extract(d.data,'$.request'))=4 AND EXISTS (
+                        SELECT 1 FROM operations proof WHERE proof.artifact=a.id
+                        AND proof.state IN ('running','review')
+                        AND json_extract(proof.data,'$.kind')='relocate'
+                        AND json_extract(proof.data,'$.created_at') < json_extract(d.data,'$.created_at')
+                        AND json_extract(json_extract(proof.data,'$.request'),'$.source.generation')=json_extract(a.data,'$.generation')
+                    ))
+                )
+                AND (a.state!='deleted' OR EXISTS (
+                    SELECT 1 FROM operations m WHERE m.artifact=a.id
+                    AND m.state NOT IN ('succeeded','cancelled')
+                    AND json_extract(m.data,'$.kind')='relocate'
+                ))")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in raws {
+            let mut a: Artifact = serde_json::from_str(&raw)?;
+            Self::cancel_relocations(
+                &tx,
+                &a.id,
+                &a.generation,
+                "source deletion already committed",
+            )?;
+            if a.state != "deleted" {
+                a.state = "deleted".into();
+                a.hold = None;
+                a.error = None;
+                a.updated_at = now();
+                a.revision += 1;
+                save_artifact(&tx, &a)?;
+                event(
+                    &tx,
+                    &a.id,
+                    "deletion_reconciled",
+                    "restored committed deletion",
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Revisions may advance during PP/review, but an operation only owns its
+    /// original generation and location while that generation remains live.
+    /// Both commit and error handling must obey the same authority check.
+    fn relocation_source(&self, op: &Operation, movement: &Relocation) -> Result<Option<Artifact>> {
+        let persisted = self.operation(&op.id)?;
+        let current = self.get(&op.artifact)?;
+        let source = &movement.source;
+        let same_identity = match (&current.identity, &source.identity) {
+            (Some(a), Some(b)) => a.same_object(b),
+            _ => false,
+        };
+        Ok((matches!(persisted.state.as_str(), "running" | "review")
+            && matches!(
+                current.state.as_str(),
+                "active" | "transitioning" | "retained"
+            )
+            && current.id == source.id
+            && current.generation == source.generation
+            && current.path == source.path
+            && current.root == source.root
+            && current.owned == source.owned
+            && same_identity)
+            .then_some(current))
+    }
+
+    fn cancel_obsolete_relocation(&self, op: &mut Operation) -> Result<()> {
+        // A concurrent deletion may have already cancelled this operation.
+        // Keep its recorded reason instead of overwriting that transition.
+        let saved = self.operation(&op.id)?;
+        if matches!(saved.state.as_str(), "succeeded" | "cancelled") {
+            *op = saved;
+            return Ok(());
+        }
+        op.state = "cancelled".into();
+        op.error = Some("relocation no longer owns the source generation".into());
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        save_operation(&tx, op)?;
+        event(&tx, &op.artifact, "relocation_cancelled", &op.id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn save_relocation_progress(&self, op: &Operation, movement: &Relocation) -> Result<()> {
+        let _guard = self.mutation_guard()?;
+        self.relocation_source(op, movement)?
+            .ok_or_else(|| Error::Conflict("relocation authority revoked".into()))?;
+        save_operation(&self.db.lock().unwrap(), op)
+    }
+
     /// Journal before moving. A cross-volume move publishes a verified copy,
     /// then retires only the exact source entries captured by this operation.
     pub fn relocate(&self, job: u32, destination: &Path) -> Result<RelocationResult> {
-        self.relocate_with_registry(job, destination, None)
-    }
-
-    pub fn relocate_with_registry(
-        &self,
-        job: u32,
-        destination: &Path,
-        policy: Option<&RegistryPolicy>,
-    ) -> Result<RelocationResult> {
         let guard = self.mutation_guard()?;
         let mut source = self.for_job(job)?.ok_or(Error::NotFound)?;
         // A committed generation is stable even when its physical path differs
@@ -136,9 +244,10 @@ impl Inventory {
             return Err(Error::Conflict("move destination already exists".into()));
         }
         let key = format!(
-            "move-{}-{}-{:x}",
+            "move-{}-{}-{}-{:x}",
             source.id,
             source.generation,
+            source.revision,
             Sha256::digest(destination.as_os_str().as_encoded_bytes())
         );
         let mut relocation = Relocation {
@@ -148,6 +257,9 @@ impl Inventory {
             destination_root: fs::identity(&root_dir.metadata()?),
             scratch: None,
             registry: false,
+            publication: None,
+            publication_key: None,
+            cleanup_done: false,
         };
         let mut op = Operation {
             id: key.clone(),
@@ -172,52 +284,31 @@ impl Inventory {
         }
         drop(guard);
         let result = (|| {
-            // Probe the actual destination before moving or allocating payload
-            // scratch. Repeat each time so a remount cannot reuse stale evidence.
-            let publication = probe_publication(root, &key);
-            if let Err(error) = publication {
-                let unsupported = matches!(&error, Error::Io(e) if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)));
-                let Some(policy) = policy.filter(|p| p.consumers_isolated && unsupported) else {
-                    return Err(error);
-                };
-                fs::absolute(&policy.managed_root)?;
-                if policy.managed_root.starts_with(&source.path)
-                    || source.path.starts_with(&policy.managed_root)
-                    || policy.managed_root.starts_with(root)
-                    || root.starts_with(&policy.managed_root)
-                {
-                    return Err(Error::Conflict(
-                        "registry root overlaps an ordinary scan root".into(),
-                    ));
-                }
-                let managed = fs::open_dir(&policy.managed_root)?;
-                relocation.registry = true;
-                relocation.destination_root = fs::identity(&managed.metadata()?);
-                relocation.destination = policy.managed_root.join(format!("generation-{key}"));
-                op.request = serde_json::to_string(&relocation)?;
-                save_operation(&self.db.lock().unwrap(), &op)?;
-            }
             let root = relocation.destination.parent().unwrap();
             let root_dir = fs::open_dir(root)?;
-            let destination = relocation.destination.as_path();
+            let destination = relocation.destination.clone();
             boundary("before_move")?;
-            let initial = if relocation.registry {
-                Err(Error::Io(std::io::Error::from_raw_os_error(libc::EXDEV)))
-            } else {
-                fs::rename_exclusive(&source.path, destination)
+            let direct_key = format!("{key}-direct");
+            let initial = {
+                let _guard = self.mutation_guard()?;
+                self.relocation_source(&op, &relocation)?
+                    .ok_or_else(|| Error::Conflict("relocation authority revoked".into()))?;
+                self.verify(&relocation.source)?;
+                self.publish_directory_unlocked(&source.path, &destination, &source.id, &direct_key)
             };
             match initial {
-                Ok(()) => (),
+                Ok(published) => {
+                    relocation.publication = Some(published);
+                    relocation.publication_key = Some(direct_key);
+                    op.request = serde_json::to_string(&relocation)?;
+                    self.save_relocation_progress(&op, &relocation)?;
+                }
                 Err(Error::Io(e))
                     if e.kind() == std::io::ErrorKind::CrossesDevices
                         || e.raw_os_error() == Some(18) =>
                 {
                     let _capacity = crate::capacity::reserve(root, source.summary().1)?;
-                    let scratch_path = if relocation.registry {
-                        destination.to_path_buf()
-                    } else {
-                        root.join(format!(".runner-{key}"))
-                    };
+                    let scratch_path = root.join(format!(".runner-{key}"));
                     // An existing name is never authority, even after a crash.
                     std::fs::create_dir(&scratch_path)?;
                     fs::sync_directory(&root_dir)?;
@@ -239,7 +330,7 @@ impl Inventory {
                     save_artifact(&self.db.lock().unwrap(), &scratch)?;
                     relocation.scratch = Some(scratch.clone());
                     op.request = serde_json::to_string(&relocation)?;
-                    save_operation(&self.db.lock().unwrap(), &op)?;
+                    self.save_relocation_progress(&op, &relocation)?;
                     for entry in &source.files {
                         let target = scratch_path.join(&entry.path);
                         if entry.identity.directory {
@@ -254,7 +345,18 @@ impl Inventory {
                             .write(true)
                             .create_new(true)
                             .open(&target)?;
-                        let bytes = std::io::copy(&mut input, &mut output)?;
+                        // Network mounts may reject copy_file_range; use the
+                        // portable read/write path for the verified copy.
+                        let mut bytes = 0;
+                        let mut buffer = vec![0u8; 1024 * 1024];
+                        loop {
+                            let n = input.read(&mut buffer)?;
+                            if n == 0 {
+                                break;
+                            }
+                            output.write_all(&buffer[..n])?;
+                            bytes += n as u64;
+                        }
                         output.sync_all()?;
                         input.rewind()?;
                         let hash = |f: &mut File| -> Result<Vec<u8>> {
@@ -287,10 +389,25 @@ impl Inventory {
                     relocation.scratch = Some(scratch.clone());
                     op.request = serde_json::to_string(&relocation)?;
                     save_artifact(&self.db.lock().unwrap(), &scratch)?;
-                    save_operation(&self.db.lock().unwrap(), &op)?;
-                    if !relocation.registry {
-                        fs::rename_exclusive(&scratch_path, destination)?;
-                    }
+                    self.save_relocation_progress(&op, &relocation)?;
+                    let copy_key = format!("{key}-copy");
+                    let published = {
+                        let _guard = self.mutation_guard()?;
+                        self.relocation_source(&op, &relocation)?.ok_or_else(|| {
+                            Error::Conflict("relocation authority revoked".into())
+                        })?;
+                        self.verify(&scratch)?;
+                        self.publish_directory_unlocked(
+                            &scratch_path,
+                            &destination,
+                            &source.id,
+                            &copy_key,
+                        )?
+                    };
+                    relocation.publication = Some(published);
+                    relocation.publication_key = Some(copy_key);
+                    op.request = serde_json::to_string(&relocation)?;
+                    self.save_relocation_progress(&op, &relocation)?;
                 }
                 Err(e) => return Err(e),
             }
@@ -298,7 +415,11 @@ impl Inventory {
             self.commit_relocation(&mut op, &relocation)
         })();
         let guard = self.mutation_guard()?;
-        if let Err(e) = &result {
+        if let Err(e) = result {
+            if self.relocation_source(&op, &relocation)?.is_none() {
+                self.cancel_obsolete_relocation(&mut op)?;
+                return Err(e);
+            }
             op.state = "review".into();
             op.error = Some(e.to_string());
             save_operation(&self.db.lock().unwrap(), &op)?;
@@ -315,9 +436,9 @@ impl Inventory {
                 retained.error = Some(e.to_string());
                 save_artifact(&self.db.lock().unwrap(), &retained)?;
             }
+            return Err(e);
         }
         drop(guard);
-        result?;
         if let Err(e) = self.retire_relocation_source(&op.id) {
             tracing::warn!(operation=%op.id, error=%e, "relocation committed; source retirement pending");
         }
@@ -330,6 +451,9 @@ impl Inventory {
         })
     }
     fn commit_relocation(&self, op: &mut Operation, movement: &Relocation) -> Result<()> {
+        let mut current = self.relocation_source(op, movement)?.ok_or_else(|| {
+            Error::Conflict("relocation no longer owns the source generation".into())
+        })?;
         let root = movement.destination.parent().unwrap();
         let root_dir = fs::open_dir(root)?;
         if !movement
@@ -342,18 +466,23 @@ impl Inventory {
         let target = fs::open_dir(&movement.destination)?;
         let expected = movement.scratch.as_ref().unwrap_or(&movement.source);
         let observed = fs::identity(&target.metadata()?);
-        if !expected
-            .identity
+        let expected_identity = movement
+            .publication
             .as_ref()
-            .is_some_and(|i| i.same_object(&observed))
-        {
+            .map(|p| &p.identity)
+            .or(expected.identity.as_ref());
+        if !expected_identity.is_some_and(|i| i.same_object(&observed)) {
             return Err(Error::Conflict("move publication identity changed".into()));
         }
         let files = fs::manifest(&target, 100_000)?;
-        if files != expected.files {
+        let expected_files = movement
+            .publication
+            .as_ref()
+            .map(|p| &p.files)
+            .unwrap_or(&expected.files);
+        if &files != expected_files {
             return Err(Error::Conflict("move publication contents changed".into()));
         }
-        let mut current = self.get(&movement.source.id)?;
         current.path = movement.destination.clone();
         current.root = root.into();
         current.root_identity = movement.destination_root.clone();
@@ -369,14 +498,21 @@ impl Inventory {
             obsolete.state = "source_gone".into();
             obsolete.updated_at = now();
             save_artifact(&tx, &obsolete)?;
+        }
+        if movement.scratch.is_some()
+            || movement
+                .publication
+                .as_ref()
+                .is_some_and(|p| p.source_retained)
+        {
             let mut old = movement.source.clone();
             old.id = format!("source-{}", op.id);
             old.job = None;
             old.state = "retained".into();
-            // Local fsync/registry commit is not the server's power-loss
-            // contract. Source retirement needs separate evidence and receipts.
-            old.hold = Some("review: publication durability and handoff".into());
-            old.keep = current.keep;
+            // Verified, synced destination and custody commit authorize
+            // retiring this duplicate source through the existing delete journal.
+            old.hold = None;
+            old.keep = false;
             old.retention_seconds = 0;
             old.deadline = None;
             self.sidecar(&old)?;
@@ -390,7 +526,13 @@ impl Inventory {
                         artifact: old.id.clone(),
                         kind: "delete".into(),
                         state: "queued".into(),
-                        request: serde_json::to_string(&(&old.id, old.revision, 0u64, false))?,
+                        request: serde_json::to_string(&(
+                            &old.id,
+                            old.revision,
+                            0u64,
+                            false,
+                            &old.generation,
+                        ))?,
                         created_at: now(),
                         not_before: now(),
                         attempts: 0,
@@ -414,12 +556,43 @@ impl Inventory {
         Ok(())
     }
     fn retire_relocation_source(&self, key: &str) -> Result<()> {
-        if let Ok(old) = self.get(&format!("source-{key}")) {
-            if old.owned && !old.keep && old.hold.is_none() && !old.terminal() {
-                let op = self.request_delete(&old.id, old.revision, &format!("retire-{key}"), 0)?;
-                self.execute_delete(&op.id)?;
+        let mut op = self.operation(key)?;
+        let mut movement: Relocation = serde_json::from_str(&op.request)?;
+        if op.state != "succeeded" || movement.cleanup_done {
+            return Ok(());
+        }
+        if movement.scratch.is_some() {
+            if let Some(publication_key) = &movement.publication_key {
+                let _guard = self.mutation_guard()?;
+                self.retire_publication_source_unlocked(publication_key)?;
             }
         }
+        if let Ok(old) = self.get(&format!("source-{key}")) {
+            if old.owned && !old.keep && old.hold.is_none() && !old.terminal() {
+                let delete_key = format!("retire-{key}");
+                let deletion = match self.operation(&delete_key) {
+                    Ok(op) => op,
+                    Err(Error::NotFound) => self.request_delete(
+                        &old.id,
+                        old.revision,
+                        &format!("retire-{:x}", Sha256::digest(key.as_bytes())),
+                        0,
+                    )?,
+                    Err(e) => return Err(e),
+                };
+                let result = self.execute_delete(&deletion.id)?;
+                if result.state != "succeeded" {
+                    return Err(Error::Conflict(format!(
+                        "source retirement {}: {}",
+                        result.state,
+                        result.error.unwrap_or_default()
+                    )));
+                }
+            }
+        }
+        movement.cleanup_done = true;
+        op.request = serde_json::to_string(&movement)?;
+        save_operation(&self.db.lock().unwrap(), &op)?;
         Ok(())
     }
     pub fn reconcile_relocations(&self) -> Result<()> {
@@ -433,8 +606,48 @@ impl Inventory {
         let mut retired = Vec::new();
         for raw in raws {
             let mut op: Operation = serde_json::from_str(&raw)?;
-            let movement: Relocation = serde_json::from_str(&op.request)?;
-            if let Err(e) = self.commit_relocation(&mut op, &movement) {
+            let mut movement: Relocation = serde_json::from_str(&op.request)?;
+            if self.relocation_source(&op, &movement)?.is_none() {
+                self.cancel_obsolete_relocation(&mut op)?;
+                continue;
+            }
+            // Preserve an admitted deletion's revision/hold through its undo
+            // window. Once it starts, execute_delete transfers authority;
+            // cancelling it leaves ordinary relocation recovery available.
+            let deletion_pending: bool = self.db.lock().unwrap().query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state='queued' AND json_extract(data,'$.kind')='delete')",
+                [&op.artifact], |r| r.get(0),
+            )?;
+            if deletion_pending {
+                continue;
+            }
+            let recovered = (|| {
+                if movement.publication.is_none() && !movement.registry {
+                    let (source_path, suffix) = match &movement.scratch {
+                        Some(scratch) => (scratch.path.clone(), "copy"),
+                        None => (movement.source.path.clone(), "direct"),
+                    };
+                    let publication_key = format!("{}-{suffix}", op.id);
+                    // Only a journaled publication can resume; legacy moves
+                    // still use their captured identities in commit_relocation.
+                    if self
+                        .operation(&format!("publish-{publication_key}"))
+                        .is_ok()
+                    {
+                        movement.publication = Some(self.publish_directory_unlocked(
+                            &source_path,
+                            &movement.destination,
+                            &op.artifact,
+                            &publication_key,
+                        )?);
+                        movement.publication_key = Some(publication_key);
+                        op.request = serde_json::to_string(&movement)?;
+                        save_operation(&self.db.lock().unwrap(), &op)?;
+                    }
+                }
+                self.commit_relocation(&mut op, &movement)
+            })();
+            if let Err(e) = recovered {
                 op.state = "review".into();
                 op.error = Some(format!("interrupted move: {e}"));
                 if let Some(scratch) = &movement.scratch {
@@ -453,10 +666,137 @@ impl Inventory {
                 retired.push(op.id);
             }
         }
+        {
+            let db = self.db.lock().unwrap();
+            let mut stmt = db.prepare("SELECT id FROM operations WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup_done'),0)=0 LIMIT 25")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            retired.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+        }
         drop(guard);
+        retired.sort();
+        retired.dedup();
         for key in retired {
-            self.retire_relocation_source(&key)?;
+            if let Err(e) = self.retire_relocation_source(&key) {
+                tracing::warn!(operation=%key, error=%e, "publication committed; source retirement remains pending");
+            }
         }
         Ok(())
+    }
+}
+
+impl Inventory {
+    pub fn pending_relocations(&self, artifact: &str) -> Result<Vec<Operation>> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare("SELECT data FROM operations WHERE artifact=?1 AND state IN ('running','review') AND json_extract(data,'$.kind')='relocate'")?;
+        let rows = stmt.query_map([artifact], |r| r.get::<_, String>(0))?;
+        rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
+    }
+
+    /// Explicitly relinquish one failed move. The original directory must still
+    /// match its snapshot. Published/changed identities require reconciliation,
+    /// never force-release. Residual scratch and partial targets remain visible
+    /// in inventory for an explicit disposition.
+    pub fn abandon_relocation(
+        &self,
+        key: &str,
+        revision: u64,
+        generation: &str,
+    ) -> Result<Artifact> {
+        let _guard = self.mutation_guard()?;
+        let mut op = self.operation(key)?;
+        if op.kind != "relocate" || !matches!(op.state.as_str(), "running" | "review") {
+            return Err(Error::Conflict("relocation is not pending".into()));
+        }
+        let movement: Relocation = serde_json::from_str(&op.request)?;
+        let mut source = self.get(&op.artifact)?;
+        if source.revision != revision
+            || source.generation != generation
+            || source.generation != movement.source.generation
+            || source.path != movement.source.path
+            || source.terminal()
+        {
+            return Err(Error::Conflict(
+                "relocation source generation or revision changed".into(),
+            ));
+        }
+        let root = self.verify(&source)?;
+        let actual_files = fs::manifest(&root, 100_000)?;
+        if actual_files.len() != movement.source.files.len() {
+            return Err(Error::Conflict("relocation source contents changed".into()));
+        }
+        for suffix in ["direct", "copy"] {
+            if self
+                .operation(&format!("publish-{}-{suffix}", op.id))
+                .is_ok_and(|p| p.state == "succeeded")
+            {
+                return Err(Error::Conflict(
+                    "publication committed; reconcile the move".into(),
+                ));
+            }
+        }
+        for expected in &movement.source.files {
+            let current = fs::open_relative(&root, &expected.path)?;
+            let actual = fs::identity(&current.metadata()?);
+            if !expected.identity.same_object(&actual)
+                || (!actual.directory && expected.identity != actual)
+            {
+                return Err(Error::Conflict("relocation source contents changed".into()));
+            }
+        }
+        if movement.publication.is_some() {
+            return Err(Error::Conflict(
+                "relocation has a verified publication; reconcile it instead of abandoning".into(),
+            ));
+        }
+        if source
+            .hold
+            .as_deref()
+            .is_some_and(|h| !h.starts_with("review: interrupted move") && h != "review")
+        {
+            return Err(Error::Conflict("source has an independent hold".into()));
+        }
+        if movement.destination.symlink_metadata().is_ok() {
+            self.discover_unlocked(
+                movement.destination.parent().unwrap(),
+                &movement.destination,
+            )?;
+        }
+        op.state = "cancelled".into();
+        op.error = Some(
+            "operator abandoned relocation; original retained, scratch requires review".into(),
+        );
+        source.state = movement.source.state.clone();
+        source.hold = None;
+        source.error = None;
+        source.revision += 1;
+        source.files = fs::manifest(&root, 100_000)?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        for suffix in ["direct", "copy"] {
+            if let Ok(mut publication) =
+                read::<Operation>(&tx, "operations", &format!("publish-{}-{suffix}", op.id))
+            {
+                if publication.state == "succeeded" {
+                    return Err(Error::Conflict(
+                        "publication committed before acknowledgement; reconcile the move".into(),
+                    ));
+                }
+                publication.state = "cancelled".into();
+                publication.error = op.error.clone();
+                save_operation(&tx, &publication)?;
+            }
+        }
+        if let Some(scratch) = movement.scratch {
+            let mut retained = scratch;
+            retained.state = "retained".into();
+            retained.hold = Some("review: abandoned relocation staging".into());
+            retained.revision += 1;
+            save_artifact(&tx, &retained)?;
+        }
+        save_artifact(&tx, &source)?;
+        save_operation(&tx, &op)?;
+        event(&tx, &source.id, "relocation_abandoned", &op.id)?;
+        tx.commit()?;
+        Ok(source)
     }
 }

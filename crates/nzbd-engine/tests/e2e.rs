@@ -1806,3 +1806,42 @@ async fn an_obfuscated_job_names_itself_from_its_par2_metadata() {
 
     engine.shutdown().await;
 }
+
+#[tokio::test]
+async fn public_resume_releases_allocation_hold_but_not_identity_hold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path(), Vec::new()).await;
+    let post = build_post(
+        "allocation-control",
+        &[("payload.bin", prng_bytes(1, 100))],
+        100,
+    );
+    let job = engine
+        .add_nzb_opts(
+            "allocation-control",
+            post.nzb.as_bytes(),
+            AddOpts::default(),
+        )
+        .await
+        .unwrap();
+    assert!(engine
+        .hold_job(job, "allocation", "download_write", "allocation refused")
+        .await
+        .unwrap());
+    assert!(engine.resume_job(job).await.unwrap());
+    let control = engine
+        .export_job(job)
+        .await
+        .unwrap()
+        .unwrap()
+        .control()
+        .unwrap();
+    assert_eq!(control.lifecycle, "running");
+    assert_eq!(control.retry_policy, "resume_same_job");
+    assert!(engine
+        .hold_job(job, "identity_conflict", "extract", "review required")
+        .await
+        .unwrap());
+    assert!(!engine.resume_job(job).await.unwrap());
+    engine.shutdown().await;
+}

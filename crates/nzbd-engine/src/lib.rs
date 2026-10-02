@@ -702,6 +702,18 @@ impl EngineHandle {
     pub async fn resume_job(&self, job: JobId) -> Result<bool, EngineError> {
         if let Some(record) = self.export_job(job).await? {
             if let Some(control) = record.control().filter(|c| c.lifecycle == "held") {
+                // Allocation may have no owned payload yet: do not run the
+                // capacity probe, which requires one. The queue owner persists
+                // release and wakes normal allocation admission for this job.
+                if control.cause == "allocation" {
+                    return self
+                        .roundtrip_bool(|reply| QueueCommand::ReleaseResourceHold {
+                            job,
+                            revision: control.revision.clone(),
+                            reply,
+                        })
+                        .await;
+                }
                 if !matches!(control.cause.as_str(), "capacity" | "quota") {
                     return Ok(false);
                 }
@@ -1135,6 +1147,33 @@ impl EngineHandle {
     pub async fn retain_jobs(&self, keep: Vec<JobId>) -> Result<(), EngineError> {
         self.roundtrip_unit(|reply| QueueCommand::RetainJobs { keep, reply })
             .await
+    }
+
+    /// Explicit PP retry; the owner verifies the observed hold and payload custody.
+    pub async fn abandon_relocation(
+        &self,
+        operation: String,
+        revision: u64,
+        generation: String,
+    ) -> Result<Result<nzbd_state::artifacts::Artifact, String>, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::AbandonRelocation {
+            operation,
+            revision,
+            generation,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| EngineError::Closed)
+    }
+
+    pub async fn retry_post_hold(&self, job: JobId, revision: String) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::RetryPostHold {
+            job,
+            revision,
+            reply,
+        })
+        .await
     }
 
     /// Persist a nonterminal fence before exposing it to consumers.

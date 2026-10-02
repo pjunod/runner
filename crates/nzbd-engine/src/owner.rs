@@ -279,6 +279,17 @@ pub(crate) enum QueueCommand {
     // -- post-processing hooks (phase 2) ------------------------------------
     /// Post-processing state transitions (PostQueued / Post{stage} /
     /// terminal). Only meaningful on jobs whose download already finished.
+    AbandonRelocation {
+        operation: String,
+        revision: u64,
+        generation: String,
+        reply: oneshot::Sender<Result<nzbd_state::artifacts::Artifact, String>>,
+    },
+    RetryPostHold {
+        job: JobId,
+        revision: String,
+        reply: oneshot::Sender<bool>,
+    },
     BeginResourceProbe {
         job: JobId,
         revision: String,
@@ -774,7 +785,7 @@ impl Owner {
                 .reconcile_startup(&state.jobs.iter().map(|job| job.id.0).collect::<Vec<_>>())
                 .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?;
             for job in &state.jobs {
-                if job.torrent.is_none() {
+                if job.torrent.is_none() && artifacts.for_job(job.id.0).ok().flatten().is_none() {
                     artifacts
                         .register_legacy_active(
                             job.id.0,
@@ -814,7 +825,12 @@ impl Owner {
                 }
             }
             for j in &mut state.jobs {
-                let dir = dest_dir.join(job_dir_name(j));
+                let dir = artifacts
+                    .for_job(j.id.0)
+                    .ok()
+                    .flatten()
+                    .map(|a| a.path)
+                    .unwrap_or_else(|| dest_dir.join(job_dir_name(j)));
                 for f in &mut j.files {
                     let key = format!("*File:size:{}", f.id.0);
                     if let Some(size) = j
@@ -1283,23 +1299,7 @@ impl Owner {
                 // Nothing has been written yet, so a better name may take
                 // the directory with it.
                 let name = self.name_from_requestor(id, true).unwrap_or(name);
-                if let Some(job) = self.state.job_mut(id) {
-                    let base = job_dir_name(job);
-                    // Requeue creates a new allocation, never implicitly adopts
-                    // bytes retained by the previous job incarnation.
-                    if self.dest_dir.join(&base).exists() {
-                        let mut suffix = 0u32;
-                        loop {
-                            let candidate = format!("{base}.job-{}-{suffix}", id.0);
-                            if !self.dest_dir.join(&candidate).exists() {
-                                job.dir_name = candidate;
-                                break;
-                            }
-                            suffix += 1;
-                        }
-                    }
-                }
-                let allocation = self.ensure_allocation(id);
+                let allocation = self.allocate_new_payload(id);
                 if let Err(e) = allocation {
                     self.state.jobs.retain(|j| j.id != id);
                     let _ = reply.send(Err(nzbd_state::StateError::Corrupt(format!(
@@ -1400,7 +1400,18 @@ impl Owner {
                     // with nothing, fall back to who asked. Still no files
                     // on disk, so the directory follows the name.
                     self.name_from_requestor(job, true);
-                    tracing::info!(job = job.0, "url fetch complete; queued");
+                    // URL admissions need the same fresh allocation as direct
+                    // uploads. A retained release directory belongs to the old
+                    // job, even when the newly fetched NZB has the same name.
+                    if let Err(error) = self.allocate_new_payload(job) {
+                        self.hold_job(
+                            job,
+                            "allocation",
+                            "download_write",
+                            &format!("payload allocation: {error}"),
+                        );
+                    }
+                    tracing::info!(job = job.0, "url fetch complete");
                     self.save_snapshot();
                     self.publish_now();
                     self.emit(Event::UrlFetchResolved { job });
@@ -2039,6 +2050,129 @@ impl Owner {
                 self.bump_epoch();
                 let _ = reply.send(());
             }
+            QueueCommand::AbandonRelocation {
+                operation,
+                revision,
+                generation,
+                reply,
+            } => {
+                let result = (|| {
+                    let op = self
+                        .artifacts
+                        .operation(&operation)
+                        .map_err(|e| e.to_string())?;
+                    let artifact = self
+                        .artifacts
+                        .get(&op.artifact)
+                        .map_err(|e| e.to_string())?;
+                    if let Some(job) = artifact.job.map(JobId) {
+                        if self.retiring_writers.contains_key(&job) {
+                            return Err("payload retirement is in progress".into());
+                        }
+                        if let Some(j) = self.state.job(job) {
+                            let held_move = j.control().is_some_and(|c| {
+                                c.lifecycle == "held"
+                                    && matches!(c.cause.as_str(), "unknown" | "post_failure")
+                                    && c.stage == "move"
+                            });
+                            if !held_move
+                                || j.files.iter().any(|f| {
+                                    self.writers
+                                        .get(&f.id)
+                                        .is_some_and(|w| !*w.stopped.borrow())
+                                })
+                            {
+                                return Err("only a quiescent post-processing move hold can be abandoned while the job is queued".into());
+                            }
+                        }
+                    }
+                    self.artifacts
+                        .abandon_relocation(&operation, revision, &generation)
+                        .map_err(|e| e.to_string())
+                })();
+                let _ = reply.send(result);
+            }
+            QueueCommand::RetryPostHold {
+                job,
+                revision,
+                reply,
+            } => {
+                let before = self.state.job(job).cloned();
+                let control = before.as_ref().and_then(|j| j.control()).filter(|c| {
+                    c.lifecycle == "held"
+                        && c.revision == revision
+                        && matches!(c.cause.as_str(), "unknown" | "post_failure")
+                        && matches!(
+                            c.previous_status,
+                            Some(
+                                JobStatus::Post { .. }
+                                    | JobStatus::PostQueued
+                                    | JobStatus::Completed
+                            )
+                        )
+                        && matches!(
+                            c.stage.as_str(),
+                            "par_rename"
+                                | "rar_rename"
+                                | "par_verify"
+                                | "par_repair"
+                                | "unpack"
+                                | "extract"
+                                | "cleanup"
+                                | "post_unpack_rename"
+                                | "move"
+                        )
+                });
+                let mut changed = None;
+                if !self.retiring_writers.contains_key(&job)
+                    && before.as_ref().is_some_and(|j| {
+                        !j.params.iter().any(|(k, _)| k == nzbd_types::PP_DONE_PARAM)
+                            && j.files.iter().all(|f| {
+                                self.writers.get(&f.id).is_none_or(|w| *w.stopped.borrow())
+                            })
+                    })
+                {
+                    if let Some(mut c) = control {
+                        if let Some(next) = c
+                            .revision
+                            .parse::<u64>()
+                            .ok()
+                            .and_then(|r| r.checked_add(1))
+                        {
+                            match self.artifacts.validate_post_retry(job.0) {
+                                Ok(()) => {
+                                    c.revision = next.to_string();
+                                    c.lifecycle = "running".into();
+                                    c.manual_pause = false;
+                                    c.message =
+                                        "Post-processing retry admitted after custody validation"
+                                            .into();
+                                    let j = self.state.job_mut(job).unwrap();
+                                    j.status = JobStatus::PostQueued;
+                                    j.set_control(&c);
+                                    changed = Some(c);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(job=job.0, error=%e, "post-processing retry refused")
+                                }
+                            }
+                        }
+                    }
+                }
+                self.dirty |= changed.is_some();
+                let ok = changed.is_some() && (!self.persist || self.save_snapshot());
+                if ok {
+                    self.bump_epoch();
+                    self.publish_now();
+                    self.emit(Event::JobControlChanged {
+                        job,
+                        control: changed.unwrap(),
+                    });
+                } else if let Some(before) = before {
+                    *self.state.job_mut(job).unwrap() = before;
+                }
+                let _ = reply.send(ok);
+            }
             QueueCommand::BeginResourceProbe {
                 job,
                 revision,
@@ -2100,7 +2234,7 @@ impl Owner {
                     if let Some(mut control) = j.control().filter(|c| {
                         c.revision == revision
                             && c.lifecycle == "held"
-                            && matches!(c.cause.as_str(), "capacity" | "quota")
+                            && matches!(c.cause.as_str(), "capacity" | "quota" | "allocation")
                     }) {
                         if let Some(next) = control
                             .revision
@@ -2110,7 +2244,12 @@ impl Owner {
                         {
                             control.revision = next.to_string();
                             control.lifecycle = "running".into();
-                            control.message = "Storage admitted; resuming this job".into();
+                            control.message = if control.cause == "allocation" {
+                                "Allocation retry requested; checking this job again"
+                            } else {
+                                "Storage admitted; resuming this job"
+                            }
+                            .into();
                             j.status = if control.manual_pause {
                                 JobStatus::Paused
                             } else {
@@ -2550,7 +2689,12 @@ impl Owner {
         let is_blocked = move |id: ServerId| blocked_now.contains(&id);
 
         let mut leases = Vec::new();
-        for _ in 0..max {
+        // A refused allocation removes one job from eligibility; it must not
+        // consume the lease budget or prevent another eligible job progressing.
+        for _ in 0..max.saturating_add(self.state.jobs.len()) {
+            if leases.len() >= max {
+                break;
+            }
             let ladder = Ladder::new(&servers);
             let mut ctx = SelectionCtx {
                 ladder: &ladder,
@@ -2574,8 +2718,18 @@ impl Owner {
             let Some(r) = lease else { break };
 
             if let Err(e) = self.ensure_allocation(r.job) {
-                tracing::error!(job = r.job.0, error = %e, "payload allocation unavailable; download held");
-                break;
+                if self.retiring_writers.contains_key(&r.job) {
+                    // Writer retirement owns its own completion/wake-up. It is
+                    // transient, not an allocation needing operator review.
+                    break;
+                }
+                self.hold_job(
+                    r.job,
+                    "allocation",
+                    "download_write",
+                    &format!("payload allocation: {e}"),
+                );
+                continue;
             }
             let (message_id, writer) = {
                 let Some(seg) = self.state.segment_mut(r) else {
@@ -2906,7 +3060,7 @@ impl Owner {
             lifecycle: "held".into(),
             cause: cause.into(),
             stage: stage.into(),
-            retry_policy: if matches!(cause, "capacity" | "quota") {
+            retry_policy: if matches!(cause, "capacity" | "quota" | "allocation") {
                 "resume_same_job"
             } else {
                 "review"
@@ -3369,6 +3523,39 @@ impl Owner {
 
     // -- writers -------------------------------------------------------------
 
+    /// Only for new admissions, before any segments or writers exist. Existing
+    /// jobs must retain their committed allocation and go through ownership
+    /// review if it becomes unavailable.
+    fn allocate_new_payload(&mut self, job: JobId) -> Result<(), nzbd_state::artifacts::Error> {
+        let record = self
+            .state
+            .job(job)
+            .ok_or(nzbd_state::artifacts::Error::NotFound)?;
+        let base = job_dir_name(record);
+        let occupied = |name: &str| {
+            self.dest_dir.join(name).symlink_metadata().is_ok()
+                || self
+                    .state
+                    .jobs
+                    .iter()
+                    .any(|j| j.id != job && job_dir_name(j) == name)
+        };
+        if occupied(&base) {
+            let mut suffix = 0u32;
+            loop {
+                let candidate = format!("{base}.job-{}-{suffix}", job.0);
+                if !occupied(&candidate) {
+                    self.state.job_mut(job).unwrap().dir_name = candidate;
+                    break;
+                }
+                suffix = suffix.checked_add(1).ok_or_else(|| {
+                    nzbd_state::artifacts::Error::Conflict("no free payload directory name".into())
+                })?;
+            }
+        }
+        self.ensure_allocation(job)
+    }
+
     fn ensure_allocation(&mut self, job: JobId) -> Result<(), nzbd_state::artifacts::Error> {
         if self.retiring_writers.contains_key(&job) {
             return Err(nzbd_state::artifacts::Error::Conflict(
@@ -3382,6 +3569,12 @@ impl Owner {
             .state
             .job(job)
             .ok_or(nzbd_state::artifacts::Error::NotFound)?;
+        if let Some(existing) = self.artifacts.for_job(job.0)? {
+            self.artifacts
+                .allocate(job.0, &existing.root, &existing.path)?;
+            self.allocated_jobs.insert(job);
+            return Ok(());
+        }
         let dir = self.dest_dir.join(job_dir_name(record));
         self.artifacts.allocate(job.0, &self.dest_dir, &dir)?;
         self.allocated_jobs.insert(job);
@@ -3408,7 +3601,13 @@ impl Owner {
         // `job_dir`, never `job.name`: a job that renamed itself from its
         // par2 metadata mid-download must not split its files across two
         // directories.
-        let dir = self.dest_dir.join(job_dir);
+        let dir = self
+            .artifacts
+            .for_job(job.0)
+            .ok()
+            .flatten()
+            .map(|a| a.path)
+            .unwrap_or_else(|| self.dest_dir.join(job_dir));
         if let Err(e) = self.ensure_allocation(job) {
             tracing::error!(job = job.0, error = %e, "writer held: allocation not committed");
             let (tx, _) = mpsc::channel(1);
@@ -5633,6 +5832,157 @@ mod tests {
         }];
         recompute_job_totals(&mut job);
         job
+    }
+
+    #[tokio::test]
+    async fn url_download_allocates_fresh_directory_beside_retained_payload() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let post = nzbd_nserv::build_post("release", &[("payload.bin", vec![7; 100])], 100);
+        let parsed = nzbd_nzb::parse(post.nzb.as_bytes()).unwrap();
+        let id = owner
+            .state
+            .admit_url("release".into(), "http://example.test/file.nzb", None, 0);
+        let retained = owner.dest_dir.join("release");
+        std::fs::create_dir_all(&retained).unwrap();
+        std::fs::write(retained.join("old.bin"), b"retained bytes").unwrap();
+        let collision = owner.dest_dir.join(format!("release.job-{}-0", id.0));
+        std::fs::create_dir(&collision).unwrap();
+
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::CompleteUrlFetch {
+            job: id,
+            parsed: Box::new(parsed),
+            reply,
+        });
+        assert!(result.await.unwrap());
+        let job = owner.state.job(id).unwrap();
+        assert_eq!(job.name, "release");
+        assert_eq!(job.status, JobStatus::Queued);
+        let expected = format!("release.job-{}-1", id.0);
+        assert_eq!(job.dir_name, expected);
+        let allocation = owner.artifacts.for_job(id.0).unwrap().unwrap();
+        assert_eq!(allocation.path, owner.dest_dir.join(&expected));
+        owner
+            .artifacts
+            .allocate(id.0, &owner.dest_dir, &allocation.path)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(retained.join("old.bin")).unwrap(),
+            b"retained bytes"
+        );
+        assert!(collision.is_dir());
+        let saved = owner.snap_store.load().unwrap().unwrap();
+        assert_eq!(
+            saved.jobs.iter().find(|j| j.id == id).unwrap().dir_name,
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn allocation_refusal_holds_only_that_job_and_release_retries_it() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        owner.servers = Arc::new(vec![ServerDef {
+            id: ServerId(1),
+            name: "test".into(),
+            host: "localhost".into(),
+            port: 119,
+            tls: nzbd_types::TlsMode::None,
+            username: None,
+            password: None,
+            active: true,
+            tier: 0,
+            group: 0,
+            fill: false,
+            max_connections: 1,
+            pipeline_depth: 1,
+            retention_days: 0,
+            cert_verification: nzbd_types::CertLevel::Strict,
+        }]);
+        owner.state.jobs = (1..=3).map(pending_job).collect();
+        let conflict = owner.dest_dir.join("job-1");
+        std::fs::create_dir_all(&conflict).unwrap();
+        let leases = owner.grant_work(ServerId(1), 1);
+        assert_eq!(leases.len(), 1, "a hold must not consume the lease budget");
+        assert_eq!(leases[0].r.job, JobId(2));
+        assert_eq!(owner.state.jobs[0].control().unwrap().cause, "allocation");
+        assert_eq!(owner.grant_work(ServerId(1), 1)[0].r.job, JobId(3));
+        let revision = owner.state.jobs[0].control().unwrap().revision;
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::ReleaseResourceHold {
+            job: JobId(1),
+            revision: revision.clone(),
+            reply,
+        });
+        assert!(rx.await.unwrap());
+        assert!(owner.grant_work(ServerId(1), 1).is_empty());
+        let held = owner.state.jobs[0].control().unwrap();
+        assert_eq!(held.lifecycle, "held");
+        assert!(held.revision.parse::<u64>().unwrap() > revision.parse::<u64>().unwrap());
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::ReleaseResourceHold {
+            job: JobId(1),
+            revision,
+            reply,
+        });
+        assert!(!rx.await.unwrap(), "stale release must be rejected");
+        std::fs::remove_dir(&conflict).unwrap();
+        let mut epoch = owner.epoch_tx.subscribe();
+        epoch.borrow_and_update();
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::ReleaseResourceHold {
+            job: JobId(1),
+            revision: owner.state.jobs[0].control().unwrap().revision,
+            reply,
+        });
+        assert!(rx.await.unwrap());
+        assert!(epoch.has_changed().unwrap());
+        assert_eq!(owner.grant_work(ServerId(1), 1)[0].r.job, JobId(1));
+    }
+
+    #[tokio::test]
+    async fn post_hold_retry_checks_revision_custody_and_stage_then_persists() {
+        let (tmp, mut owner, _adapter) = control_test_owner();
+        let mut job = bare_job();
+        job.dir_name = "pp".into();
+        owner.state.jobs.push(job);
+        owner.ensure_allocation(JobId(1)).unwrap();
+        assert!(owner.hold_job(JobId(1), "post_failure", "unpack", "tool failed"));
+        let revision = owner.state.jobs[0].control().unwrap().revision;
+        for expected_revision in ["stale".to_string(), revision.clone()] {
+            let (reply, rx) = oneshot::channel();
+            owner.on_command(QueueCommand::RetryPostHold {
+                job: JobId(1),
+                revision: expected_revision.clone(),
+                reply,
+            });
+            assert_eq!(rx.await.unwrap(), expected_revision == revision);
+        }
+        assert_eq!(owner.state.jobs[0].status, JobStatus::PostQueued);
+        let persisted = SnapshotStore::open(&tmp.path().join("state"))
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        let restored = QueueState::from_doc(persisted);
+        assert!(!restored.jobs[0].held());
+        assert!(owner.hold_job(JobId(1), "post_failure", "script", "uncertain script"));
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::RetryPostHold {
+            job: JobId(1),
+            revision: owner.state.jobs[0].control().unwrap().revision,
+            reply,
+        });
+        assert!(!rx.await.unwrap());
+        assert!(owner.state.jobs[0].held());
+    }
+
+    #[tokio::test]
+    async fn writer_retirement_does_not_create_an_allocation_review_hold() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        owner.state.jobs.push(pending_job(1));
+        owner.retiring_writers.insert(JobId(1), Vec::new());
+        assert!(owner.ensure_allocation(JobId(1)).is_err());
+        assert!(!owner.state.jobs[0].held());
     }
 
     fn restarted_recovery_job(id: u32, state: SegmentState) -> Job {

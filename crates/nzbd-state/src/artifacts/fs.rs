@@ -3,6 +3,11 @@ use super::{Error, FileEntry, Identity, Result};
 use std::fs::{self, File};
 use std::path::{Component, Path};
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static RENAME_FAILURE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
 pub fn identity(meta: &fs::Metadata) -> Identity {
     #[cfg(unix)]
     {
@@ -405,28 +410,96 @@ pub fn rename_exclusive(from: &Path, to: &Path) -> Result<()> {
             .as_bytes(),
     )
     .map_err(|_| Error::Conflict("invalid target".into()))?;
+    if a == b {
+        let src = identity(&source.metadata()?);
+        let dst = identity(&target.metadata()?);
+        if src.device == dst.device && src.inode == dst.inode {
+            return Ok(());
+        }
+    }
+    #[cfg(test)]
+    let injected = RENAME_FAILURE.with(|e| e.take());
+    #[cfg(not(test))]
+    let injected: Option<i32> = None;
     #[cfg(target_os = "linux")]
-    let rc = unsafe {
-        libc::renameat2(
-            source.as_raw_fd(),
-            a.as_ptr(),
-            target.as_raw_fd(),
-            b.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
+    let rc = if injected.is_some() {
+        -1
+    } else {
+        unsafe {
+            libc::renameat2(
+                source.as_raw_fd(),
+                a.as_ptr(),
+                target.as_raw_fd(),
+                b.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        }
     };
     #[cfg(target_os = "macos")]
-    let rc = unsafe {
-        libc::renameatx_np(
-            source.as_raw_fd(),
-            a.as_ptr(),
-            target.as_raw_fd(),
-            b.as_ptr(),
-            libc::RENAME_EXCL,
-        )
+    let rc = if injected.is_some() {
+        -1
+    } else {
+        unsafe {
+            libc::renameatx_np(
+                source.as_raw_fd(),
+                a.as_ptr(),
+                target.as_raw_fd(),
+                b.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        }
     };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error().into());
+    let error = injected
+        .map(std::io::Error::from_raw_os_error)
+        .or_else(|| (rc != 0).then(std::io::Error::last_os_error));
+    if let Some(error) = error {
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EEXIST)
+        ) {
+            return Err(error.into());
+        }
+        // Hard-link creation has atomic no-replacement semantics on NFS and
+        // FUSE too. Restrict the fallback to regular files: POSIX offers no
+        // equivalent directory primitive, and check-then-rename is racy.
+        let name = Path::new(from.file_name().unwrap());
+        let input = open_at(&source, name, false)?;
+        let original = identity(&input.metadata()?);
+        if !input.metadata()?.is_file() {
+            return Err(error.into());
+        }
+        input.sync_all()?;
+        if unsafe {
+            libc::linkat(
+                source.as_raw_fd(),
+                a.as_ptr(),
+                target.as_raw_fd(),
+                b.as_ptr(),
+                0,
+            )
+        } != 0
+        {
+            let link_error = std::io::Error::last_os_error();
+            if link_error.raw_os_error() != Some(libc::EEXIST) {
+                return Err(link_error.into());
+            }
+            // Resume only the two-name state left by link-before-unlink.
+            // Equal bytes in a different inode do not authorize deletion.
+            let existing = open_at(&target, Path::new(to.file_name().unwrap()), false)?;
+            if identity(&existing.metadata()?) != original {
+                return Err(link_error.into());
+            }
+        }
+        target.sync_all()?;
+        let linked = open_at(&target, Path::new(to.file_name().unwrap()), false)?;
+        let current = open_at(&source, name, false)?;
+        if identity(&linked.metadata()?) != original || identity(&current.metadata()?) != original {
+            return Err(Error::Conflict(
+                "source changed during exclusive file rename; both names retained for review"
+                    .into(),
+            ));
+        }
+        unlink(&source, name, false)?;
     }
     target.sync_all()?;
     source.sync_all()?;
@@ -444,4 +517,52 @@ pub fn rename_exclusive(from: &Path, to: &Path) -> Result<()> {
     // Windows rename fails if a destination directory already exists.
     std::fs::rename(from, to)?;
     Ok(())
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod exclusive_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_file_rename_and_crash_replay_preserve_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("source");
+        let to = tmp.path().join("target");
+        for code in [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP] {
+            fs::write(&from, b"payload").unwrap();
+            let before = identity(&fs::metadata(&from).unwrap());
+            RENAME_FAILURE.with(|v| v.set(Some(code)));
+            rename_exclusive(&from, &to).unwrap();
+            assert!(!from.exists());
+            assert_eq!(identity(&fs::metadata(&to).unwrap()), before);
+            fs::hard_link(&to, &from).unwrap();
+            rename_exclusive(&from, &to).unwrap();
+            assert!(!from.exists());
+            assert_eq!(fs::read(&to).unwrap(), b"payload");
+            rename_exclusive(&to, &to).unwrap();
+            assert!(to.exists());
+            fs::remove_file(&to).unwrap();
+        }
+    }
+
+    #[test]
+    fn exclusive_fallback_never_replaces_conflicts_or_moves_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("source");
+        let to = tmp.path().join("target");
+        fs::write(&from, b"same bytes different inode").unwrap();
+        fs::write(&to, b"same bytes different inode").unwrap();
+        for code in [libc::EINVAL, libc::EEXIST, libc::EIO] {
+            RENAME_FAILURE.with(|v| v.set(Some(code)));
+            assert!(rename_exclusive(&from, &to).is_err());
+            assert_eq!(fs::read(&from).unwrap(), fs::read(&to).unwrap());
+        }
+        fs::remove_file(&from).unwrap();
+        fs::remove_file(&to).unwrap();
+        fs::create_dir(&from).unwrap();
+        RENAME_FAILURE.with(|v| v.set(Some(libc::EINVAL)));
+        assert!(rename_exclusive(&from, &to).is_err());
+        assert!(from.is_dir());
+        assert!(!to.exists());
+    }
 }

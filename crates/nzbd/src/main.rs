@@ -208,6 +208,7 @@ fn post_config(
     stats: Option<Arc<nzbd_types::metrics::PpStageStats>>,
 ) -> nzbd_post::manager::PostConfig {
     nzbd_post::manager::PostConfig {
+        completed_dir: Some(cfg.dest_dir()),
         par2_cmd: cfg.post.par2_cmd.clone(),
         unrar_cmd: cfg.post.unrar_cmd.clone(),
         sevenzip_cmd: cfg.post.sevenzip_cmd.clone(),
@@ -791,7 +792,7 @@ fn run(
     let mut engine_cfg = EngineConfig::single_node(
         servers,
         cfg.state_dir(),
-        cfg.dest_dir(),
+        cfg.download_dir(),
         tuning,
         cfg.speed_limit_bps(),
     );
@@ -963,7 +964,7 @@ fn run(
                 engine.clone(),
                 post_config(&cfg, slots, Some(stats)),
                 history_db.expect("post-processing history opened above"),
-                cfg.dest_dir(),
+                cfg.download_dir(),
                 None, // single node: always the authority
                 pp_cancel.clone(),
                 &pp_tracker,
@@ -1253,7 +1254,7 @@ async fn run_cluster(
     let (cluster_cfg, shared_dir) = cluster_runtime_config(&cfg)?;
     // Job data must be visible to every node: default dest to the shared
     // volume unless the operator pointed it there (or elsewhere) already.
-    let dest_dir = cfg.dest_dir();
+    let dest_dir = cfg.download_dir();
     if !dest_dir.starts_with(&shared_dir) {
         tracing::warn!(
             dest = %dest_dir.display(),
