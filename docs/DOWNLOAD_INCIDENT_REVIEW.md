@@ -9,8 +9,8 @@ This document replaces that account; readers need not resolve contradictory
 proposals across old sections.
 
 **Status, October 1, 2026:** implementation complete in draft
-[PR #247](https://github.com/pjunod/runner/pull/247), awaiting the final adversarial
-review and test pass. See [the status page](DOWNLOAD_INCIDENT_STATUS.md) for the
+[PR #247](https://github.com/pjunod/runner/pull/247), with final adversarial
+review findings addressed and tests pending. See [the status page](DOWNLOAD_INCIDENT_STATUS.md) for the
 validation ledger and merge result. No production deployment, configuration
 change, payload rename, or live retry was performed in this follow-up.
 
@@ -270,3 +270,15 @@ production rollout and existing-job recovery remain separate from merging this
 PR. No live data repair, filesystem force-adoption, or configuration change is
 included. Existing held jobs may need the explicit retry or abandonment action;
 a changed identity remains for investigation rather than being force-released.
+
+## 8. Final adversarial review
+
+The merge-readiness review found five implementation defects beyond the Opus
+findings: oversized retirement request IDs, re-entry into completed extraction,
+cluster history pointing at a generation root, one unjournaled final rename,
+and cleanup errors invalidating a completed recovery. All are corrected; the
+[status page](DOWNLOAD_INCIDENT_STATUS.md) records their disposition.
+Successful extraction receipts bind output identity across journaled renames.
+Cleanup has its own durable checkpoint, cannot revoke publication, and remains
+reconcilable after cancellation or import. Final unit execution follows this
+review, rather than repeatedly running suites during implementation.

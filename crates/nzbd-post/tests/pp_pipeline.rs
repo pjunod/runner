@@ -2671,14 +2671,14 @@ async fn configured_completed_root_receives_only_successful_publication() {
         let engine = spawn_engine(tmp.path()).await;
         let dir = tmp.path().join("dest/intermediate-job");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("Movie.S01E01.mkv"), b"payload").unwrap();
+        std::fs::write(dir.join("deadbeefdeadbeef.mkv"), b"payload").unwrap();
         engine
             .import_fixture_job(
                 tmp.path(),
                 completed_job(
                     811,
                     "intermediate-job",
-                    vec![file_entry(811, "Movie.S01E01.mkv", None, false)],
+                    vec![file_entry(811, "deadbeefdeadbeef.mkv", None, false)],
                 ),
                 false,
                 false,
@@ -2705,7 +2705,11 @@ async fn configured_completed_root_receives_only_successful_publication() {
         .await;
         if conflict {
             assert!(result.is_err());
-            assert!(dir.join("Movie.S01E01.mkv").exists());
+            assert!(dir.join("intermediate-job.mkv").exists());
+            engine
+                .artifacts()
+                .validate_post_retry(811)
+                .expect("final rename remains in the custody manifest after failed publication");
             assert!(!engine
                 .export_job(JobId(811))
                 .await
@@ -2718,7 +2722,7 @@ async fn configured_completed_root_receives_only_successful_publication() {
             assert!(result.is_ok());
             assert!(!dir.exists());
             assert_eq!(
-                std::fs::read(complete.join("intermediate-job/Movie.S01E01.mkv")).unwrap(),
+                std::fs::read(complete.join("intermediate-job/intermediate-job.mkv")).unwrap(),
                 b"payload"
             );
         }
@@ -2777,6 +2781,92 @@ async fn manager_operator_retry_of_held_unpack_uses_existing_restart_action() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn held_move_retry_reuses_a_verified_successful_extraction() {
+    if !require_tool("7z") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/retry-extracted");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bytes = vec![b'X'; 32768];
+    std::fs::write(dir.join("Movie.S01E01.mkv"), &bytes).unwrap();
+    let result = std::process::Command::new("7z")
+        .args(["a", "-tzip", "-y", "release.zip", "Movie.S01E01.mkv"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    std::fs::remove_file(dir.join("Movie.S01E01.mkv")).unwrap();
+    engine
+        .import_fixture_job(
+            tmp.path(),
+            completed_job(
+                813,
+                "retry-extracted",
+                vec![file_entry(813, "release.zip", None, false)],
+            ),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    let completed = tmp.path().join("completed");
+    let occupied = completed.join("retry-extracted");
+    std::fs::create_dir_all(&occupied).unwrap();
+    let hist = history(tmp.path());
+    let mut cfg = PostConfig {
+        completed_dir: Some(completed.clone()),
+        ..Default::default()
+    };
+    assert!(
+        process_job(&engine, &cfg, &hist, &tmp.path().join("dest"), JobId(813))
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(dir.join("Movie.S01E01.mkv")).unwrap(), bytes);
+    assert!(engine
+        .hold_job(JobId(813), "post_failure", "move", "destination conflict")
+        .await
+        .unwrap());
+    std::fs::remove_dir(&occupied).unwrap();
+    // Re-extraction would fail: the successful transform must be reused.
+    cfg.sevenzip_cmd = "/no-such-extractor".into();
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    let manager = spawn_post_manager(
+        engine.clone(),
+        cfg,
+        hist.clone(),
+        tmp.path().join("dest"),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+    manager
+        .restart(JobId(813), RestartPoint::Beginning)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while engine.export_job(JobId(813)).await.unwrap().is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "retry of completed extraction stayed held"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(hist.list(10).unwrap()[0].status, "SUCCESS");
+    assert_eq!(
+        std::fs::read(completed.join("retry-extracted/Movie.S01E01.mkv")).unwrap(),
+        bytes
+    );
     cancel.cancel();
     tracker.close();
     tracker.wait().await;

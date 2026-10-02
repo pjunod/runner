@@ -467,7 +467,11 @@ impl Inventory {
                 .operation(&format!("publish-recovery-{}", r.id))
                 .is_ok()
             {
-                self.retire_publication_source_unlocked(&format!("recovery-{}", r.id))?;
+                if let Err(e) =
+                    self.retire_publication_source_unlocked(&format!("recovery-{}", r.id))
+                {
+                    tracing::warn!(recovery=%r.id, error=%e, "recovery published; scratch cleanup pending");
+                }
             }
             Ok(())
         })();
@@ -592,7 +596,11 @@ impl Inventory {
                 .operation(&format!("publish-recovery-{}", r.id))
                 .is_ok()
             {
-                self.retire_publication_source_unlocked(&format!("recovery-{}", r.id))?;
+                if let Err(e) =
+                    self.retire_publication_source_unlocked(&format!("recovery-{}", r.id))
+                {
+                    tracing::warn!(recovery=%r.id, error=%e, "recovery published; scratch cleanup pending");
+                }
             }
             Ok(())
         })();
@@ -627,6 +635,19 @@ impl Inventory {
         };
         for raw in pending {
             self.resume_publication(serde_json::from_str(&raw)?)?;
+        }
+        // This is cleanup of committed publications, independent of import state.
+        // A failed cleanup cannot revoke a usable publication or prevent startup.
+        let pending_cleanup = {
+            let db = self.db.lock().unwrap();
+            let mut stmt = db.prepare("SELECT r.id FROM recoveries r JOIN operations o ON o.id='publish-recovery-'||r.id WHERE r.state IN ('published','claimed','imported','partial','cancel_pending','cancelled','pruned') AND o.state='succeeded' AND COALESCE(json_extract(json_extract(o.data,'$.request'),'$.retirement_done'),0)=0 LIMIT 10")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for id in pending_cleanup {
+            if let Err(e) = self.retire_publication_source_unlocked(&format!("recovery-{id}")) {
+                tracing::warn!(recovery=%id, error=%e, "recovery scratch cleanup remains pending");
+            }
         }
         Ok(())
     }

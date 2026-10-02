@@ -1049,3 +1049,40 @@ fn recovery_publication_falls_back_without_sharing_original_inodes() {
     db.reconcile_recoveries().unwrap();
     assert_eq!(db.recovery(&r.id).unwrap().state, "published");
 }
+
+#[test]
+fn recovery_cleanup_failure_keeps_publication_claimable_and_retries_after_restart() {
+    for cancel in [false, true] {
+        let (tmp, db, root) = fixture();
+        let a = parked(&db, &root);
+        fs::RENAME_FAILURE.with(|f| f.set(Some(libc::EINVAL)));
+        super::publication::RETIRE_FAILURE.with(|f| f.set(true));
+        let r = db
+            .stage_recovery(
+                &a.id,
+                a.revision,
+                "cleanup-fault",
+                &["episode.mkv".into()],
+                &tmp.path().join("recovery"),
+            )
+            .unwrap();
+        assert_eq!(r.state, "published");
+        let scratch = tmp.path().join("recovery/.staging").join(&r.id);
+        assert!(scratch.exists());
+        if cancel {
+            db.cancel_recovery(&r.id, None, false).unwrap();
+        } else {
+            db.claim_recovery(&r.id, "consumer", "import", &r.manifest_digest)
+                .unwrap();
+        }
+        drop(db);
+        let db = Inventory::open(&tmp.path().join("state")).unwrap();
+        db.reconcile_recoveries().unwrap();
+        assert_eq!(
+            db.recovery(&r.id).unwrap().state,
+            if cancel { "cancelled" } else { "claimed" }
+        );
+        assert!(!scratch.exists());
+        assert!(r.published.join("payload/episode.mkv").is_file());
+    }
+}

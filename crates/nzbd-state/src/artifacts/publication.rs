@@ -20,6 +20,8 @@ struct Publication {
     linked: bool,
     directories: BTreeMap<String, Identity>,
     published: Option<PublishedDirectory>,
+    #[serde(default)]
+    retirement_done: bool,
 }
 
 fn parent(root: &File, relative: &str) -> Result<(File, PathBuf)> {
@@ -140,6 +142,9 @@ fn verified_target(p: &Publication) -> Result<PublishedDirectory> {
     })
 }
 
+#[cfg(test)]
+thread_local! { pub(super) static RETIRE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
 impl Inventory {
     /// Caller holds the inventory mutation guard. No marker inside the payload
     /// grants ownership; every directory identity is checkpointed in SQLite.
@@ -183,6 +188,7 @@ impl Inventory {
                     linked: false,
                     directories: BTreeMap::new(),
                     published: None,
+                    retirement_done: false,
                 };
                 let op = Operation {
                     id: key,
@@ -316,6 +322,27 @@ impl Inventory {
     /// Only after the owning operation commits. A partial cleanup can resume;
     /// unexpected files or identities are retained for explicit review.
     pub(super) fn retire_publication_source_unlocked(&self, key: &str) -> Result<()> {
+        let mut op = self.operation(&format!("publish-{key}"))?;
+        let mut p: Publication = serde_json::from_str(&op.request)?;
+        if p.retirement_done {
+            return Ok(());
+        }
+        let result = self.retire_publication_entries_unlocked(key);
+        p.retirement_done = result.is_ok();
+        op.error = result
+            .as_ref()
+            .err()
+            .map(|e| format!("publication ready; staging cleanup pending: {e}"));
+        op.request = serde_json::to_string(&p)?;
+        save_operation(&self.db.lock().unwrap(), &op)?;
+        result
+    }
+
+    fn retire_publication_entries_unlocked(&self, key: &str) -> Result<()> {
+        #[cfg(test)]
+        if RETIRE_FAILURE.with(|f| f.replace(false)) {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+        }
         let op = self.operation(&format!("publish-{key}"))?;
         let p: Publication = serde_json::from_str(&op.request)?;
         if op.state != "succeeded" || !p.published.as_ref().is_some_and(|r| r.source_retained) {

@@ -129,6 +129,9 @@ pub struct CompleteRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompleteResponse {
+    /// Concrete publication path chosen by the authority, after materialization.
+    #[serde(default)]
+    pub final_dir: Option<String>,
     pub ok: bool,
     pub durable_receipt: Option<String>,
     /// Replicated receipt time used as the one authoritative history key.

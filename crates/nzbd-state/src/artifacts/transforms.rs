@@ -10,6 +10,8 @@ pub struct Workspace {
     pub retained: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub attempts: Vec<WorkspaceAttempt>,
+    #[serde(default)]
+    pub published_files: Option<Vec<FileEntry>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceAttempt {
@@ -62,6 +64,7 @@ impl Inventory {
             scratch,
             retained: Default::default(),
             attempts: Vec::new(),
+            published_files: None,
         };
         let mut op = Operation {
             id: key,
@@ -122,9 +125,14 @@ impl Inventory {
         let mut op = self.operation(&workspace.operation_id)?;
         let mut current: Workspace = serde_json::from_str(&op.request)?;
         self.verify_workspace_attempts(&current)?;
-        if op.kind != "extract" || op.state != "running" || current.attempts.len() >= 64 {
+        if op.kind != "extract"
+            || !(op.state == "running"
+                || (op.state == "succeeded" && current.published_files.is_none()))
+            || current.attempts.len() >= 64
+        {
             return Err(Error::Conflict("extraction attempt requires review".into()));
         }
+        op.state = "running".into();
         let directory = format!("attempt-{}", current.attempts.len() + 1);
         current.attempts.push(WorkspaceAttempt {
             directory: directory.clone(),
@@ -186,6 +194,53 @@ impl Inventory {
     }
 
     pub fn finish_workspace(&self, workspace: &Workspace) -> Result<()> {
+        self.finish_workspace_output(workspace, None)
+    }
+
+    pub fn finish_extraction(&self, workspace: &Workspace, output: &Path) -> Result<()> {
+        self.finish_workspace_output(workspace, Some(output))
+    }
+
+    /// A successful extraction can be reused after a later stage fails. Names
+    /// may have been journal-renamed, but every output must retain its complete
+    /// identity in the current owned manifest AND on disk.
+    pub fn extraction_published(&self, workspace: &Workspace) -> Result<bool> {
+        let _guard = self.mutation_guard()?;
+        let op = self.operation(&workspace.operation_id)?;
+        if op.kind != "extract" || op.state != "succeeded" {
+            return Ok(false);
+        }
+        let Some(outputs) = &workspace.published_files else {
+            return Ok(false);
+        };
+        let source = self.get(&workspace.source.id)?;
+        if source.generation != workspace.source.generation
+            || source.terminal()
+            || source.hold.is_some()
+        {
+            return Err(Error::Conflict(
+                "extraction no longer owns this generation".into(),
+            ));
+        }
+        let root = self.verify(&source)?;
+        for expected in outputs {
+            let entry = source
+                .files
+                .iter()
+                .find(|f| f.identity == expected.identity)
+                .ok_or_else(|| Error::Conflict("published extraction output changed".into()))?;
+            if fs::identity(&fs::open_relative(&root, &entry.path)?.metadata()?)
+                != expected.identity
+            {
+                return Err(Error::Conflict(
+                    "published extraction output changed".into(),
+                ));
+            }
+        }
+        Ok(true)
+    }
+
+    fn finish_workspace_output(&self, workspace: &Workspace, output: Option<&Path>) -> Result<()> {
         let _guard = self.mutation_guard()?;
         let mut source = self.get(&workspace.source.id)?;
         let dir = self.verify(&source)?;
@@ -211,6 +266,25 @@ impl Inventory {
         source.revision += 1;
         source.files = fs::manifest(&dir, 100_000)?;
         let mut op = self.operation(&workspace.operation_id)?;
+        if let Some(output) = output {
+            let output_root = fs::open_dir(output)?;
+            let mut finished = workspace.clone();
+            finished.published_files = Some(
+                fs::manifest(&output_root, 100_000)?
+                    .iter()
+                    .filter(|e| !e.identity.directory)
+                    .map(|e| {
+                        let identity = fs::identity(&fs::open_relative(&dir, &e.path)?.metadata()?);
+                        Ok(FileEntry {
+                            path: e.path.clone(),
+                            identity,
+                            digest: None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            op.request = serde_json::to_string(&finished)?;
+        }
         op.state = "succeeded".into();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
@@ -403,6 +477,45 @@ impl Inventory {
     }
 }
 
+impl Inventory {
+    /// Validate custody before an operator retries a held PP job. This does not
+    /// release an identity or relocation hold, adopt bytes, or delete an attempt.
+    pub fn validate_post_retry(&self, job: u32) -> Result<()> {
+        let _guard = self.mutation_guard()?;
+        let source = self.for_job(job)?.ok_or(Error::NotFound)?;
+        if !source.owned
+            || source.hold.is_some()
+            || !matches!(
+                source.state.as_str(),
+                "active" | "transitioning" | "retained"
+            )
+        {
+            return Err(Error::Conflict(
+                "payload custody must be resolved before retrying post-processing".into(),
+            ));
+        }
+        let root = self.verify(&source)?;
+        for entry in source.files.iter().filter(|e| !e.identity.directory) {
+            let file = fs::open_relative(&root, &entry.path)?;
+            if fs::identity(&file.metadata()?) != entry.identity {
+                return Err(Error::Conflict(
+                    "post-processing input changed; review required".into(),
+                ));
+            }
+        }
+        let pending: i64 = self.db.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM operations WHERE artifact=?1 AND state IN ('running','review','queued','retry') AND json_extract(data,'$.kind') IN ('relocate','delete')",
+            [&source.id], |r| r.get(0),
+        )?;
+        if pending != 0 {
+            return Err(Error::Conflict(
+                "resolve pending relocation or deletion before retrying post-processing".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,44 +576,5 @@ mod tests {
             std::fs::read(reused.scratch.path.join("repaired.bin")).unwrap(),
             b"verified output"
         );
-    }
-}
-
-impl Inventory {
-    /// Validate custody before an operator retries a held PP job. This does not
-    /// release an identity or relocation hold, adopt bytes, or delete an attempt.
-    pub fn validate_post_retry(&self, job: u32) -> Result<()> {
-        let _guard = self.mutation_guard()?;
-        let source = self.for_job(job)?.ok_or(Error::NotFound)?;
-        if !source.owned
-            || source.hold.is_some()
-            || !matches!(
-                source.state.as_str(),
-                "active" | "transitioning" | "retained"
-            )
-        {
-            return Err(Error::Conflict(
-                "payload custody must be resolved before retrying post-processing".into(),
-            ));
-        }
-        let root = self.verify(&source)?;
-        for entry in source.files.iter().filter(|e| !e.identity.directory) {
-            let file = fs::open_relative(&root, &entry.path)?;
-            if fs::identity(&file.metadata()?) != entry.identity {
-                return Err(Error::Conflict(
-                    "post-processing input changed; review required".into(),
-                ));
-            }
-        }
-        let pending: i64 = self.db.lock().unwrap().query_row(
-            "SELECT COUNT(*) FROM operations WHERE artifact=?1 AND state IN ('running','review','queued','retry') AND json_extract(data,'$.kind') IN ('relocate','delete')",
-            [&source.id], |r| r.get(0),
-        )?;
-        if pending != 0 {
-            return Err(Error::Conflict(
-                "resolve pending relocation or deletion before retrying post-processing".into(),
-            ));
-        }
-        Ok(())
     }
 }

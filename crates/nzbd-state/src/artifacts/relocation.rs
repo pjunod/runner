@@ -569,8 +569,25 @@ impl Inventory {
         }
         if let Ok(old) = self.get(&format!("source-{key}")) {
             if old.owned && !old.keep && old.hold.is_none() && !old.terminal() {
-                let op = self.request_delete(&old.id, old.revision, &format!("retire-{key}"), 0)?;
-                self.execute_delete(&op.id)?;
+                let delete_key = format!("retire-{key}");
+                let deletion = match self.operation(&delete_key) {
+                    Ok(op) => op,
+                    Err(Error::NotFound) => self.request_delete(
+                        &old.id,
+                        old.revision,
+                        &format!("retire-{:x}", Sha256::digest(key.as_bytes())),
+                        0,
+                    )?,
+                    Err(e) => return Err(e),
+                };
+                let result = self.execute_delete(&deletion.id)?;
+                if result.state != "succeeded" {
+                    return Err(Error::Conflict(format!(
+                        "source retirement {}: {}",
+                        result.state,
+                        result.error.unwrap_or_default()
+                    )));
+                }
             }
         }
         movement.cleanup_done = true;
@@ -659,7 +676,9 @@ impl Inventory {
         retired.sort();
         retired.dedup();
         for key in retired {
-            self.retire_relocation_source(&key)?;
+            if let Err(e) = self.retire_relocation_source(&key) {
+                tracing::warn!(operation=%key, error=%e, "publication committed; source retirement remains pending");
+            }
         }
         Ok(())
     }

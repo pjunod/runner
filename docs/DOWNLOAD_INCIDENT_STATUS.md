@@ -3,7 +3,7 @@
 Companion to [the incident review](DOWNLOAD_INCIDENT_REVIEW.md), which records
 causes, evidence, and design decisions. This page tracks execution.
 
-**Updated:** 2026-10-01 (America/New_York). **Phase:** ready for adversarial review.
+**Updated:** 2026-10-01 (America/New_York). **Phase:** final validation.
 **Branch:** `codex/download-incident-recovery`, based on `main` at `9d3288b`.
 **Agent checkout:** `/private/tmp/nzbd-incident-agent`.
 **PR:** [#247](https://github.com/pjunod/runner/pull/247), draft. **Deployed:** no.
@@ -23,7 +23,7 @@ causes, evidence, and design decisions. This page tracks execution.
 - [x] Honor configured intermediate directory, preserving empty-value semantics.
 - [x] Supported media extension recovery; exact PAR mappings win. Optional ffprobe deferred as a separate enhancement.
 - [x] Finish implementation and regression coverage; reconcile final review document.
-- [ ] One adversarial agent review at merge readiness; address findings.
+- [x] One adversarial agent review at merge readiness; five findings addressed and targeted verification completed.
 - [ ] Run required unit/regression/CI checks once on the reviewed candidate; retry failed or affected checks only.
 - [ ] Merge the combined PR after green checks; clean agent resources.
 
@@ -58,4 +58,19 @@ assertions passed before this workflow instruction and transfer to current main.
 Those results must not be presented as validation of future changes.
 
 Workspace/all-target compile check passed. No unit tests have run under the
-new workflow yet. Final adversarial review is the next step.
+new workflow yet. Final adversarial review and targeted follow-up are complete.
+
+## Adversarial review disposition
+
+| Finding | Resolution |
+|---|---|
+| Retirement request ID exceeds API limit | Execute the already-authorized delete; short digest key only for legacy fallback. Cleanup errors cannot block startup. |
+| Retry revisits a succeeded extraction workspace | Record committed output identities and verify them before reusing a successful extraction. Legacy workspaces can start a fresh attempt. |
+| Cluster history advertises generation root | Normal completion and takeover pass the actual published path into history; completion response carries it to worker fallback. |
+| Final heuristic rename bypasses custody | Use owned rename path; regression covers rename then publication conflict. |
+| Cleanup failure invalidates a published recovery | Publication remains claimable. Durable cleanup checkpoint is retried through existing reconciliation, including cancelled/partial/terminal handoffs. |
+
+The reviewer confirmed fixes 1–4, then identified terminal cleanup omission in
+fix 5. That omission was corrected and covered by the same restart regression.
+No tests were run by the reviewer. Full-workspace Clippy passed before that
+last query/test update; final checks follow below.

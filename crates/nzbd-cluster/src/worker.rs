@@ -324,12 +324,20 @@ async fn report_completions(
         {
             Ok(resp) if resp.ok => {
                 if lease.kind == LeaseKind::Post && !resp.history_recorded_by_authority {
+                    // Older authorities omit the concrete path. Their selected
+                    // immutable generation stores payloads under files/.
+                    let final_dir = resp.final_dir.clone().unwrap_or_else(|| {
+                        std::path::Path::new(&req.result_ref)
+                            .join("files")
+                            .to_string_lossy()
+                            .into_owned()
+                    });
                     let history_result = match (pp, resp.accepted_at_unix_ms) {
                         (Some(setup), Some(accepted_at_ms)) => {
                             record_published_pp_history(
                                 setup.history.clone(),
                                 &req.job,
-                                &req.result_ref,
+                                &final_dir,
                                 accepted_at_ms,
                             )
                             .await

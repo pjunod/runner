@@ -1522,6 +1522,14 @@ async fn process_job_ctx_from(
                     .artifacts()
                     .workspace(job_id.0, "extract", &token)
                     .map_err(|e| PostError::Subprocess(e.to_string()))?;
+                if engine
+                    .artifacts()
+                    .extraction_published(&workspace)
+                    .map_err(|e| PostError::Subprocess(e.to_string()))?
+                {
+                    unpacked_any = true;
+                    continue;
+                }
                 let _workspace_capacity =
                     nzbd_state::capacity::reserve(&workspace.scratch.path, job.totals.size)?;
                 let attempt = engine
@@ -1610,7 +1618,7 @@ async fn process_job_ctx_from(
                     commit_staging(&staging, &dir)?;
                     engine
                         .artifacts()
-                        .finish_workspace(&workspace)
+                        .finish_extraction(&workspace, &staging)
                         .map_err(|e| PostError::Subprocess(e.to_string()))?;
                     unpacked_any = true;
                 } else {
@@ -1652,10 +1660,11 @@ async fn process_job_ctx_from(
             &par2_names,
             Some((&engine.artifacts(), job_id.0)),
         )?;
-        deobfuscated.extend(crate::deobfuscate::deobfuscate_dir(
+        deobfuscated.extend(crate::deobfuscate::deobfuscate_dir_owned(
             &dir,
             &sanitized,
             &par2_names,
+            Some((&engine.artifacts(), job_id.0)),
         )?);
         for (from, to) in &deobfuscated {
             tracing::info!(
