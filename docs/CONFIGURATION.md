@@ -561,3 +561,14 @@ name = "movies"
 bind = "0.0.0.0:6789"
 password = "change-me"
 ```
+
+### Usenet download and completion paths
+
+`paths.inter_dir`, when nonempty, is the Usenet download and processing root.
+Successful post-processing publishes to `paths.dest_dir`, or the matching
+category's destination, before extension scripts and completion notification.
+A failed move does not report success. With an empty intermediate value,
+downloads remain in the destination root, matching the existing NZBGet contract.
+`paths.main_dir` supplies state and other default paths; it does not override
+an empty intermediate setting. Existing allocated jobs retain their recorded
+custody path when settings change. Path changes take effect after daemon restart.

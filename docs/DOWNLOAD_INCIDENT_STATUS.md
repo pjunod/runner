@@ -3,7 +3,7 @@
 Companion to [the incident review](DOWNLOAD_INCIDENT_REVIEW.md), which records
 causes, evidence, and design decisions. This page tracks execution.
 
-**Updated:** 2026-10-01 (America/New_York). **Phase:** implementation.
+**Updated:** 2026-10-01 (America/New_York). **Phase:** ready for adversarial review.
 **Branch:** `codex/download-incident-recovery`, based on `main` at `9d3288b`.
 **Agent checkout:** `/private/tmp/nzbd-incident-agent`.
 **PR:** [#247](https://github.com/pjunod/runner/pull/247), draft. **Deployed:** no.
@@ -17,12 +17,12 @@ causes, evidence, and design decisions. This page tracks execution.
 - [x] Fresh extraction retry destinations; stop invented season-pack numbering.
 - [x] Generation-bound deletion and conservative legacy resurrection repair.
 - [x] Select-all and terminal recovery-history controls.
-- [~] Directory publication and recovery implemented with journaled mkdir/link fallback; interruption regressions are being completed.
-- [ ] Known-extension RAR stem normalization with proven order/membership.
-- [ ] Safe PP-hold retry and relocation abandonment through existing actions/UI.
-- [ ] Honor configured intermediate directory, preserving empty-value semantics.
-- [ ] Supported media extension recovery; assess optional ffprobe evidence without overriding exact mappings.
-- [ ] Finish implementation and regression coverage; reconcile final review document.
+- [x] Directory publication and recovery use journaled mkdir/link fallback with interruption regressions.
+- [x] Known-extension RAR stem normalization with proven order/membership.
+- [x] Safe PP-hold retry and relocation abandonment through existing actions/UI.
+- [x] Honor configured intermediate directory, preserving empty-value semantics.
+- [x] Supported media extension recovery; exact PAR mappings win. Optional ffprobe deferred as a separate enhancement.
+- [x] Finish implementation and regression coverage; reconcile final review document.
 - [ ] One adversarial agent review at merge readiness; address findings.
 - [ ] Run required unit/regression/CI checks once on the reviewed candidate; retry failed or affected checks only.
 - [ ] Merge the combined PR after green checks; clean agent resources.
@@ -42,8 +42,9 @@ existing custody journal to checkpoint exclusive mkdir/link publication.
 Target entries become visible incrementally, but completion is published only
 after manifest verification and fsync. Uncheckpointed creations require explicit
 review. No feature flag or coordinated-writer assumption is introduced.
-Duplicate sources are retired only after the owning custody commit. Consumers
-and the final adversarial review must verify the completion boundary.
+Duplicate sources are retired only after the owning custody commit. Curator current source was checked in an independent clone: automatic imports
+consume completed status with a final path, not directory existence. This is
+source verification, not a claim about its deployed revision.
 
 Make routine decisions autonomously and record consequential choices here and
 in the final review document. Production data recovery is separate from merging
@@ -55,3 +56,6 @@ Final candidate validation has not started. Historical local candidate: 418
 Rust tests passed, two existing performance fixtures ignored; Clippy and 844 UI
 assertions passed before this workflow instruction and transfer to current main.
 Those results must not be presented as validation of future changes.
+
+Workspace/all-target compile check passed. No unit tests have run under the
+new workflow yet. Final adversarial review is the next step.

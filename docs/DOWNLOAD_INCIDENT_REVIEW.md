@@ -8,11 +8,11 @@ are preserved only in the [superseded investigation](DOWNLOAD_INCIDENT_INVESTIGA
 This document replaces that account; readers need not resolve contradictory
 proposals across old sections.
 
-**Status, October 1, 2026:** local candidate under review, not ready to deploy.
-Several fixes are implemented and locally tested; directory publication,
-known-extension RAR stem recovery, PP-hold recovery, and relocation abandonment
-remain incomplete. No production deployment, configuration change, payload
-rename, or retry of a live failed job has been performed in this follow-up.
+**Status, October 1, 2026:** implementation complete in draft
+[PR #247](https://github.com/pjunod/runner/pull/247), awaiting the final adversarial
+review and test pass. See [the status page](DOWNLOAD_INCIDENT_STATUS.md) for the
+validation ledger and merge result. No production deployment, configuration
+change, payload rename, or live retry was performed in this follow-up.
 
 ## 1. Evidence and corrections
 
@@ -110,44 +110,36 @@ The cancelled recovery handoff is terminal history, not an active transfer.
 The UI always requested terminal entries and offered no way to hide them.
 Its display issue is distinct from the filesystem failure that cancelled it.
 
-## 3. Candidate implementation and finding coverage
+## 3. Implementation and review finding coverage
 
-“Implemented” means local uncommitted code; it does not imply deployment or
-that the remaining incident is solved.
+Both Opus reviews are incorporated. Implementation is in the combined PR;
+compilation is verified, while final regression execution follows adversarial
+review. Historical test counts from the earlier candidate are not evidence
+for this version.
 
-| Review finding | Current disposition | Remaining work |
-|---|---|---|
-| D1 regular-file rename | Implemented: unsupported flagged rename falls back to descriptor-relative hard-link creation, fsync, identity checks, source unlink. | Verify on actual Linux NFS/Gluster with isolated fixtures; review caller durability. |
-| v2 same-inode replay | Implemented: an existing target with the same regular-file identity permits finishing source unlink. Equal bytes on another inode fail closed. Same source/destination entry is a no-op. | Broader crash-boundary injection and mount-level diagnostics. |
-| D1 directory publication | Proposed design below; unsupported directory rename still fails closed. | Journaled incremental publication and consumer-visibility decision. |
-| D3 failed extraction retry | Implemented: keep failed output in place, exclusively create a fresh retry directory, return actual output path in `ExtractOutcome`, commit that path. | Real production-like multipart fixture validation. |
-| Required PP rename errors | Implemented: PAR/archive/final rename failures propagate instead of producing silent SUCCESS. | Extend fault coverage across every rename caller. |
-| v2 PAR2 discovery | Implemented: detect index packet magic independently of extension; load/parse errors propagate. | Full incident-shaped six-file recovery regression. |
-| D4 held allocation | Implemented: `allocation` cause, normal selection continues, public resume dispatches existing revision-checked release; next grant revalidates allocation. | Persistence-failure and restart coverage of the new cause. |
-| D5 URL allocation parity | Implemented shared fresh-allocation helper for URL and direct admission. | Keep path/settings behavior unchanged. |
-| D2 hidden RAR4 order | Implemented CRC-checked header walk and ENDARC volume index; contiguous order validation before volume renames. | Real multipart extraction fixture; known-extension normalization below. |
-| v2 known-extension mismatched RAR stems | Accepted; not implemented. | Prove set membership, normalize stems, reject ambiguity, test real old-style volumes. |
-| v2 lexical season numbering | Removed. Unit and pipeline tests require obfuscated packs to keep their names absent evidence. | No replacement guessing heuristic. |
-| New deletion generation binding | Implemented for request, execution, relocation cancellation, and reconciliation. | Review explicit cancellation/abandon flow. |
-| v2 legacy deletion proof | Implemented stricter form: matching uncommitted relocation must predate the delete request, not merely success. | Production read-only proof validation; ambiguous legacy entries stay for review. |
-| PP exception retry | Accepted; not implemented. Existing `unknown` holds remain non-resumable. | Revision-checked PP retry with custody validation and cancellation fencing. |
-| Relocation abandonment | Accepted; not implemented. | Operation/generation-scoped transition with source and scratch disposition. |
-| Select all | Implemented across the inspected file manifest, with revision consistency and selected count. | Browser verification with a multi-page manifest. |
-| Cancelled handoff display | Implemented default active-only query and opt-in completed/cancelled history. | Browser verification. |
-| D6 explicit `inter_dir` | Accepted; deferred until publication and script-path contract are corrected. | Wire configured root without changing empty-value semantics. |
-| Content extension detection / ffprobe | Separate follow-up proposal, not implemented and not needed to establish 1703's cause. | See section 6. |
+| Finding | Implemented resolution |
+|---|---|
+| D1 file rename / same-inode replay | Anchored no-replace hard-link fallback on unsupported flagged rename; identity checks, fsync, and source unlink. Same-inode replay completes an interrupted rename; equal bytes on a different inode remain a conflict. |
+| D1 directory publication | Separate journaled publication operation, with exclusive mkdir and links when atomic rename is unsupported. Cross-filesystem relocation first makes a verified destination-local copy. |
+| D3 extraction retries | Each attempt gets a fresh directory; failed output is retained. The extractor returns its actual successful output directory to the commit path. |
+| Swallowed naming failures | Required renames propagate errors. Filename changes use the existing custody journal, including PAR index, archive and final media names. |
+| D2 hidden RAR4 / v2 unrelated known stems | CRC-checked headers establish order, split-file continuity establishes membership, and archive flags select old/new naming. Missing, mixed or ambiguous sets fail without guessed ordering. Existing correctly named sets stay intact. |
+| v2 hidden PAR2 / raw media | Index discovery reads magic independently of extension. Prefix digest narrows candidates; length and full MD5 establish exact names. A six-file regression reverses lexical order. |
+| v2 lexical episode numbering | Removed. Multi-file packs need per-file evidence. Supported container headers can restore a missing extension without assigning an episode. |
+| D4 scheduler / D5 URL admission | Allocation conflicts durably hold the refused job while other jobs remain eligible. Explicit revision-checked retry wakes scheduling. URL and direct admission share fresh-path allocation. |
+| Deleted artifact resurrection | Delete requests bind generation; deletion revokes relocation authority. Move and transform replay cannot restore authority over a terminal or replaced generation. Legacy repair requires independent older matching-move evidence. |
+| PP exception retry | Existing PP restart action admits a quiescent, revision-checked known PP failure after custody validation. Identity, deletion, unresolved relocation and uncertain script execution remain explicit conflicts. |
+| Relocation abandonment | UI names the pending operation. Queue owner checks quiescence; inventory checks revision, generation and source manifest before cancelling it. Original and residual copies retain explicit custody. Verified publication must reconcile, not be abandoned. |
+| Select all / cancelled recovery | Manifest-wide select-all checks revision across pages; selected count and clear action. Terminal handoffs are opt-in history. |
+| D6 configured intermediate root | Explicit nonempty `inter_dir` drives download allocation; `dest_dir` or category destination receives successful publication before scripts. Empty intermediate retains the established destination behavior. Recorded custody locates existing payloads across settings changes. |
 
-The previous owner-only retry helper was removed: it was unreachable through
-the public `resume_job` hold filter. Both layers now use the existing release
-protocol. Capacity/quota resume retains its health probe; allocation resume
-cannot require a payload that allocation has not yet created. Custody/identity
-holds remain excluded. Writer retirement remains a transient refusal rather
-than an operator allocation hold.
+No mount-specific paths, new feature flags, or periodic retry watchdogs were
+added. Existing operation reconciliation owns interrupted transitions.
 
-## 4. Proposed directory publication contract
+## 4. Directory publication contract
 
 Keep `rename_exclusive` atomic for supported directory renames. Do not quietly
-replace that contract with a recursive copy/link routine. Add an explicit
+replace that contract with a recursive copy/link routine. The implementation adds an explicit
 journaled publication operation for filesystems lacking atomic no-replace
 directory rename, using the existing inventory lifecycle rather than a watchdog.
 
@@ -172,16 +164,25 @@ on pathname alone. That conservative outcome is safe even if not automatically
 recoverable. Tests must cover every boundary and foreign replacement of empty
 and populated directories, not just completed happy-path copies.
 
-**Decision still required:** incremental target visibility is acceptable only
-if all import consumers obey the completion/commit boundary. Review v2 proposes
-this trade-off; this follow-up has not verified Curator's scans or other watchers.
-A filename-independent watcher could see a partial directory before SUCCESS.
-Preserving no-overwrite does not by itself preserve atomic visibility. Do not
-ship this publication mode until consumer behavior or the new visibility
-contract is explicitly settled. Reservation plus ordinary rename is rejected
-as an equivalent strict no-replace primitive.
+**Visibility decision:** completion is the import boundary. Fallback publication
+may expose entries incrementally; Runner reports success only after verifying
+and syncing the full destination and committing custody. A failed final move
+now stops PP instead of merely logging an error and continuing to SUCCESS.
 
-## 5. Recovery transitions still to implement
+Read-only verification of Curator main at `08af1064f9c617fa35387cadab4bdd3d2f91446d`
+confirmed that its [NZBGet adapter](https://github.com/pjunod/curator/blob/08af1064f9c617fa35387cadab4bdd3d2f91446d/internal/adapters/nzbget/nzbget.go)
+and [Runner adapter](https://github.com/pjunod/curator/blob/08af1064f9c617fa35387cadab4bdd3d2f91446d/internal/adapters/nzbd/nzbd.go)
+map successful history to completed status. Its
+[event adapter](https://github.com/pjunod/curator/blob/08af1064f9c617fa35387cadab4bdd3d2f91446d/internal/adapters/nzbd/events.go)
+reserves completion for PP completion, and the
+[acquisition transition](https://github.com/pjunod/curator/blob/08af1064f9c617fa35387cadab4bdd3d2f91446d/internal/app/acquisition/acquisition.go)
+requires a completed status with a nonempty payload path before automatic import.
+This verifies source behavior, not the deployed Curator revision. Manual imports
+or third-party watchers of directory existence do not provide that contract.
+The empty-intermediate configuration already exposes downloads within DestDir;
+operators needing a distinct download area use the existing InterDir setting.
+
+## 5. Recovery transitions
 
 ### PP exceptions
 
@@ -193,10 +194,11 @@ attempt. A failed admission returns a specific error and preserves the hold.
 A successful transition persists before waking PP. Identity, destructive
 cleanup, and uncertain script execution holds must not become generic resume.
 
-For the existing 1704 `unknown` hold, recovery must inspect its saved stage and
-retained operation before admitting a retry. Simply making every `unknown`
-hold resumable would weaken unrelated safeguards. Test the public REST action,
-not just an internal owner method.
+The existing restart route now inspects 1704-style `unknown` holds by saved
+stage. It admits only a beginning-of-PP retry, with no active attempt. A manager
+integration regression covers the public restart handle; the owner regression
+covers stale revision and uncertain script refusal. It does not automatically
+retry live jobs.
 
 ### Relocation abandonment and legacy deletion
 
@@ -227,51 +229,44 @@ ffprobe. Six raw Matroska files have exact episode names in the index. Sorting
 the obfuscated filenames would assign all six episodes incorrectly, according
 to review v2's mapping.
 
-For other posts without exact mappings, signature-based extension recovery is
-a useful separate improvement. A post-extraction PAR2 pass can recover metadata
-bundled inside archives, but this incident does not establish that requirement.
+For posts without exact mappings, bounded container-header parsing restores
+missing Matroska, WebM, MP4/M4A and AVI extensions. It preserves basenames and
+never overrides exact PAR evidence. This establishes file type, not integrity
+or episode identity. Unknown headers remain unchanged.
 
-The user's `ffprobe` proposal remains useful for optional container/stream
-inspection and embedded title/tag evidence. [FFmpeg documents these outputs](https://ffmpeg.org/ffprobe.html).
-Use structured output, existing subprocess limits, and validated local-file
-access. Embedded titles can be missing or wrong; they must not override an exact
-content-to-name mapping or manufacture episode order. A successful probe does
-not prove full-file integrity. This proposal is deferred rather than silently
-removed, and is not part of the demonstrated repair for 1703.
+The user's `ffprobe` proposal remains useful for optional stream validation and
+embedded title/tag evidence. [FFmpeg documents those outputs](https://ffmpeg.org/ffprobe.html).
+Decision: do not add an external probe dependency to this repair. The observed
+six-file incident has exact PAR evidence; supported extension recovery uses
+container headers. Embedded titles can be absent or incorrect and must never
+override exact mappings. Full stream verification remains a distinct enhancement.
+
+RAR parsing follows the vendor's
+[RAR4 format note](https://sources.debian.org/src/rar/2:3.9.3-1/technote.txt/),
+[UnRAR header definitions](https://github.com/pmachapman/unrar/blob/master/headers.hpp)
+and [RAR5 format note](https://www.rarlab.com/technote.htm).
+Obfuscated multipart RAR5 without exact names currently fails explicitly because
+volume numbers alone cannot prove membership. Correctly named RAR5 sets retain
+the normal extractor path.
 
 ## 7. Validation and release boundary
 
-Checks on this candidate:
+The whole workspace and all test targets compile. Final unit/regression tests
+are deliberately deferred until the combined adversarial review has completed,
+per the requested CI/CD workflow. Results belong in the
+[validation ledger](DOWNLOAD_INCIDENT_STATUS.md); earlier candidate counts must
+not be presented as a pass for this branch.
 
-| Check | Result |
-|---|---|
-| `cargo test -p nzbd-state -p nzbd-engine -p nzbd-post` | 418 passed, 2 existing performance tests ignored; doc tests passed. |
-| `cargo clippy -p nzbd-state -p nzbd-engine -p nzbd-post --all-targets -- -D warnings` | Passed. |
-| `make ui-test` | Boot and DOM harnesses passed; terminal-history query coverage added. |
-| `git diff --check` | Passed. |
+Regression coverage includes unsupported file and directory rename, replay,
+foreign directory/file collisions, generation reuse, legacy deletion proof,
+operation abandonment, recovery copy inode independence, PP retry and uncertain
+script refusal, configured publication success/failure, manifest-wide selection,
+hidden PAR mapping, multipart membership refusal, and a complete stored RAR4
+split-file extraction through the independent 7-Zip tool.
 
-Tests cover unsupported regular-file rename, same-inode crash replay,
-different-inode conflicts, conservative directory refusal, allocation release
-and re-hold, public resume versus identity holds, PAR2 discovery after index
-names are obfuscated, preserved season-pack names, fresh extraction retry
-outputs, generation reuse, and the narrowly proven legacy resurrection.
-The initial sandboxed engine run could not bind three local socket fixtures;
-the complete rerun outside the sandbox passed. These are local results.
-
-Local tests do not establish production filesystem behavior: the current
-regular-file fallback tests inject unsupported-syscall errors on macOS.
-Archive header fixtures are synthetic; a real multipart extraction fixture
-remains a release requirement for the archive ordering changes.
-
-Do not deploy this working tree as a completed incident fix. Before release:
-
-- Finish directory publication with an explicit visibility contract.
-- Finish known-extension RAR recovery, PP-hold retry, and relocation abandonment.
-- Exercise interruption, conflicting identity, duplicate-content/different-inode,
-  absent header evidence, and real multipart extraction cases.
-- Verify existing path settings and script directory behavior.
-- Review the reconciled candidate and decide separately whether to retry or
-  repair live jobs 1699, 1700, 1702, 1703, and 1704. No live repair was performed.
-
-No mount-specific paths, periodic retry watchdogs, or silent force-adoption
-exceptions belong in these fixes.
+Tests injecting unsupported rename on a local filesystem do not verify NFS or
+Gluster durability. The reviewers' mount probes establish primitive capability;
+production rollout and existing-job recovery remain separate from merging this
+PR. No live data repair, filesystem force-adoption, or configuration change is
+included. Existing held jobs may need the explicit retry or abandonment action;
+a changed identity remains for investigation rather than being force-released.
