@@ -8,9 +8,9 @@ are preserved only in the [superseded investigation](DOWNLOAD_INCIDENT_INVESTIGA
 This document replaces that account; readers need not resolve contradictory
 proposals across old sections.
 
-**Status, October 1, 2026:** implementation complete in draft
+**Status, October 1, 2026:** implementation complete in
 [PR #247](https://github.com/pjunod/runner/pull/247), with final adversarial
-review findings addressed and tests pending. See [the status page](DOWNLOAD_INCIDENT_STATUS.md) for the
+review findings addressed and local validation passing; required CI controls merge. See [the status page](DOWNLOAD_INCIDENT_STATUS.md) for the
 validation ledger and merge result. No production deployment, configuration
 change, payload rename, or live retry was performed in this follow-up.
 
@@ -251,11 +251,11 @@ the normal extractor path.
 
 ## 7. Validation and release boundary
 
-The whole workspace and all test targets compile. Final unit/regression tests
-are deliberately deferred until the combined adversarial review has completed,
-per the requested CI/CD workflow. Results belong in the
-[validation ledger](DOWNLOAD_INCIDENT_STATUS.md); earlier candidate counts must
-not be presented as a pass for this branch.
+The whole workspace and all test targets compile. Unit/regression execution
+followed the combined adversarial review and its fixes, as requested. Local
+validation passes, including targeted reruns of two corrected test fixtures.
+The [validation ledger](DOWNLOAD_INCIDENT_STATUS.md) records results; required
+CI on the latest PR commit controls merge.
 
 Regression coverage includes unsupported file and directory rename, replay,
 foreign directory/file collisions, generation reuse, legacy deletion proof,

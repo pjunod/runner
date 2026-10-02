@@ -589,7 +589,9 @@ mod tests {
             bytes.extend(data);
         }
         if let Some(n) = volume {
-            bytes.extend(block(0x7b, 8, &n.to_le_bytes()));
+            // EARC_NEXT_VOLUME tells extractors to open the next volume;
+            // FILE_SPLIT_AFTER alone does not establish that signal.
+            bytes.extend(block(0x7b, 8 | if n < 2 { 1 } else { 0 }, &n.to_le_bytes()));
         }
         bytes
     }

@@ -2130,10 +2130,12 @@ async fn post_processing_resumes_after_a_crash_between_move_and_stamp() {
     let engine = spawn_engine(tmp.path()).await;
     let library = tmp.path().join("library/tv");
 
-    // The state a crash right after the move leaves behind.
-    std::fs::create_dir_all(library.join("crashjob")).unwrap();
-    std::fs::write(library.join("crashjob/payload.bin"), b"already moved").unwrap();
-    assert!(!tmp.path().join("dest/crashjob").exists());
+    // Start with an owned download and commit its real relocation, stopping
+    // before PP stamps completion. A matching destination name alone is not
+    // evidence of a previous move and must never grant ownership.
+    let source = tmp.path().join("dest/crashjob");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("payload.bin"), b"already moved").unwrap();
 
     let mut job = completed_job(
         1,
@@ -2145,6 +2147,13 @@ async fn post_processing_resumes_after_a_crash_between_move_and_stamp() {
         .import_fixture_job(tmp.path(), job, false, false)
         .await
         .unwrap();
+
+    std::fs::create_dir_all(&library).unwrap();
+    engine
+        .artifacts()
+        .relocate(1, &library.join("crashjob"))
+        .unwrap();
+    assert!(!source.exists());
 
     let hist = history(tmp.path());
     let cfg = PostConfig {

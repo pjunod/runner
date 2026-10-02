@@ -6,7 +6,7 @@ causes, evidence, and design decisions. This page tracks execution.
 **Updated:** 2026-10-01 (America/New_York). **Phase:** final validation.
 **Branch:** `codex/download-incident-recovery`, based on `main` at `9d3288b`.
 **Agent checkout:** `/private/tmp/nzbd-incident-agent`.
-**PR:** [#247](https://github.com/pjunod/runner/pull/247), draft. **Deployed:** no.
+**PR:** [#247](https://github.com/pjunod/runner/pull/247), ready for merge once required checks pass. **Deployed:** no.
 
 ## Progress
 
@@ -52,13 +52,33 @@ code; do not silently retry or rename live payloads.
 
 ## Validation ledger
 
-Final candidate validation has not started. Historical local candidate: 418
-Rust tests passed, two existing performance fixtures ignored; Clippy and 844 UI
-assertions passed before this workflow instruction and transfer to current main.
-Those results must not be presented as validation of future changes.
+Final adversarial review and follow-up are complete. Local validation passed:
 
-Workspace/all-target compile check passed. No unit tests have run under the
-new workflow yet. Final adversarial review and targeted follow-up are complete.
+| Check | Result |
+|---|---|
+| Engine unit tests outside CI's torrent filters | 134 passed |
+| Engine integration tests outside CI's two torrent cases | 22 passed |
+| Post-processing unit tests | All 67 passed across initial and targeted runs |
+| Post-processing failure regressions | 6 passed |
+| Post-processing pipeline regressions | All 34 passed across initial and targeted runs |
+| Daemon unit tests | 22 passed |
+| Workspace/all-target compile and Clippy | Passed |
+
+Two regression fixtures failed initially. The synthetic split RAR omitted the
+ENDARC next-volume flag; adding the flag made independent 7-Zip extract all
+three bytes. The crash-after-move fixture created an unowned destination instead
+of committing a custody relocation; it now executes the real move before
+simulating interruption. The 15 affected naming tests and the one move-resume
+test passed on targeted rerun. Production behavior was not relaxed.
+
+GitHub required checks are authoritative on the PR's latest commit. UI/static,
+mobile, and supply-chain checks passed on the preceding candidate; Rust CI was
+still running when the fixture corrections were committed. Final required
+checks must be green before merge. The repository automatically runs its full
+selected CI lanes after each push; those required runs are not bypassed. Local
+passed suites are not repeated for an unrelated fixture failure.
+
+Historical pre-workflow results are excluded from this final validation ledger.
 
 ## Adversarial review disposition
 
