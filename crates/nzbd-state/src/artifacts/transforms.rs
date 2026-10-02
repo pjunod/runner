@@ -305,6 +305,24 @@ impl Inventory {
         };
         for raw in raws {
             let mut op: Operation = serde_json::from_str(&raw)?;
+            let current = self.get(&op.artifact)?;
+            let source_generation = if op.kind == "par_restore" {
+                let (source, _, _, _): (Artifact, PathBuf, PathBuf, Identity) =
+                    serde_json::from_str(&op.request)?;
+                source.generation
+            } else {
+                let workspace: Workspace = serde_json::from_str(&op.request)?;
+                workspace.source.generation
+            };
+            if current.terminal()
+                || current.state == "deleting"
+                || current.generation != source_generation
+            {
+                op.state = "cancelled".into();
+                op.error = Some("transform no longer owns the source generation".into());
+                save_operation(&self.db.lock().unwrap(), &op)?;
+                continue;
+            }
             let result = (|| -> Result<()> {
                 if op.kind == "par_restore" {
                     let (mut source, old, new, identity): (Artifact, PathBuf, PathBuf, Identity) =
@@ -313,6 +331,12 @@ impl Inventory {
                     let before = fs::open_relative(&root, &old.to_string_lossy());
                     let after = fs::open_relative(&root, &new.to_string_lossy());
                     match (before, after) {
+                        (Ok(before), Ok(after))
+                            if fs::identity(&before.metadata()?) == identity
+                                && fs::identity(&after.metadata()?) == identity =>
+                        {
+                            fs::rename_exclusive(&source.path.join(&old), &source.path.join(&new))?;
+                        }
                         (Ok(file), Err(Error::Io(e)))
                             if e.kind() == std::io::ErrorKind::NotFound
                                 && fs::identity(&file.metadata()?) == identity =>
@@ -439,5 +463,44 @@ mod tests {
             std::fs::read(reused.scratch.path.join("repaired.bin")).unwrap(),
             b"verified output"
         );
+    }
+}
+
+impl Inventory {
+    /// Validate custody before an operator retries a held PP job. This does not
+    /// release an identity or relocation hold, adopt bytes, or delete an attempt.
+    pub fn validate_post_retry(&self, job: u32) -> Result<()> {
+        let _guard = self.mutation_guard()?;
+        let source = self.for_job(job)?.ok_or(Error::NotFound)?;
+        if !source.owned
+            || source.hold.is_some()
+            || !matches!(
+                source.state.as_str(),
+                "active" | "transitioning" | "retained"
+            )
+        {
+            return Err(Error::Conflict(
+                "payload custody must be resolved before retrying post-processing".into(),
+            ));
+        }
+        let root = self.verify(&source)?;
+        for entry in source.files.iter().filter(|e| !e.identity.directory) {
+            let file = fs::open_relative(&root, &entry.path)?;
+            if fs::identity(&file.metadata()?) != entry.identity {
+                return Err(Error::Conflict(
+                    "post-processing input changed; review required".into(),
+                ));
+            }
+        }
+        let pending: i64 = self.db.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM operations WHERE artifact=?1 AND state IN ('running','review','queued','retry') AND json_extract(data,'$.kind') IN ('relocate','delete')",
+            [&source.id], |r| r.get(0),
+        )?;
+        if pending != 0 {
+            return Err(Error::Conflict(
+                "resolve pending relocation or deletion before retrying post-processing".into(),
+            ));
+        }
+        Ok(())
     }
 }

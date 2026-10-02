@@ -2440,6 +2440,9 @@ function pipelineModels(j, nowMs) {
 // skip the very work being recovered and could delete its source archives.
 function recoveryMax(j) {
   if (j.pp_done) return "";
+  if (j.control && j.control.lifecycle === "held" && ["unknown", "post_failure"].includes(j.control.cause)
+      && ["par_rename", "rar_rename", "par_verify", "par_repair", "unpack", "extract", "cleanup", "post_unpack_rename", "move"].includes(j.control.stage)) return "all";
+
   // The open stage remains useful observability during a delayed-PAR
   // Queued/Downloading interlude, but the post manager deliberately rejects
   // restart requests until the recovery download restores the Post state.
@@ -4926,8 +4929,10 @@ function fileDetailModel(dt) {
     key: "fd" + a.id, kind: "fdetail", id: a.id,
     sig: [a.id, a.revision, dt.offset, dt.total, dt.files.length, a.error || "", a.hold || "", a.keep, a.owned,
           a.state, [...sel].sort().join("\n"), selectingAll, measuring, deleting, dt.events.length, dt.preview ? dt.preview.text : "", a.inspected_at || 0,
+          (dt.relocations || []).map(op => op.id + ":" + op.state).join(","),
           handoffs.map(h => h.id + ":" + h.state + ":" + h.error + ":" + h.cancelling).join(",")].join("|"),
     path: a.path,
+    relocations: (dt.relocations || []).map(op => ({ id: op.id, state: op.state, error: op.error || "" })),
     facts: [
       ["state", filesStateModel(a).label],
       ["ownership", a.owned ? "owned by Runner" : "not owned"],
@@ -5014,6 +5019,7 @@ function fileDetailHtml(m) {
     </details>
     ${stage}
     ${handoffs}
+    ${(m.relocations || []).map(op => `<div class="fd-note warn">Pending move: ${esc(op.error || op.state)} <button data-action="f-abandon-move" data-operation="${esc(op.id)}">Abandon move and retain original</button></div>`).join("")}
     ${events}
   </div>`;
 }
@@ -5178,10 +5184,11 @@ async function refreshFiles(force = false) {
 }
 async function loadFileDetail(id, offset = 0, render = true) {
   try {
-    const [a, f, ev] = await Promise.all([
+    const [a, f, ev, moves] = await Promise.all([
       fileRequest("artifacts/" + id, null, "GET"),
       fileRequest("artifacts/" + id + "/files?offset=" + offset, null, "GET"),
       fileRequest("artifacts/" + id + "/events?after=0", null, "GET").catch(() => []),
+      fileRequest("artifacts/" + id + "/relocations", null, "GET").catch(() => []),
     ]);
     if (filesOpen !== id) return;
     // The handoff that holds this folder may sit on another page of the
@@ -5196,6 +5203,7 @@ async function loadFileDetail(id, offset = 0, render = true) {
     filesDetail = {
       artifact: a, files: f.files || [], total: f.total || 0, offset,
       fileCount: f.file_count, bytes: f.bytes, measured: f.measured, holding,
+      relocations: Array.isArray(moves) ? moves : [],
       events: Array.isArray(ev) ? ev.slice(-8) : [],
       preview: prev && prev.artifact.revision === a.revision ? prev.preview : null,
       previewRequest: prev && prev.artifact.revision === a.revision ? prev.previewRequest : null,
@@ -5348,6 +5356,13 @@ function filesClick(action, el) {
   if (action === "f-rec-prune") return pruneRecovery(el.dataset.recovery);
   if (action === "f-rec-cancel") return cancelRecovery(el.dataset.recovery);
   if (!id) return;
+  if (action === "f-abandon-move") {
+    const a = filesDetail && filesDetail.artifact;
+    if (!a || a.id !== id) return;
+    return fileRequest("artifact-operations/" + encodeURIComponent(el.dataset.operation) + "/abandon-relocation", { revision: a.revision, generation: a.generation })
+      .then(() => { toast({ text: "Move abandoned. Original retained; any staged copies remain available for review." }); return refreshFiles(true); })
+      .catch(filesError);
+  }
   if (action === "f-details") return toggleFile(id);
   if (action === "f-inspect") return inspectFile(id);
   if (action === "f-select-none") return selectAllFiles(id, false);

@@ -31,6 +31,11 @@ pub fn router() -> Router<ApiState> {
         .route("/api/v1/artifacts/{id}", get(detail))
         .route("/api/v1/artifacts/{id}/files", get(files))
         .route("/api/v1/artifacts/{id}/events", get(events))
+        .route("/api/v1/artifacts/{id}/relocations", get(relocations))
+        .route(
+            "/api/v1/artifact-operations/{id}/abandon-relocation",
+            post(abandon_relocation),
+        )
         .route("/api/v1/artifacts/{id}/inspect", post(inspect))
         .route("/api/v1/artifacts/{id}/adopt", post(adopt))
         .route(
@@ -167,6 +172,38 @@ async fn detail(State(st): State<ApiState>, Path(id): Path<String>) -> Response 
         Ok(a)
     })
     .await
+}
+async fn relocations(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
+    let db = st.engine.artifacts();
+    work(move || db.pending_relocations(&id)).await
+}
+#[derive(Deserialize)]
+struct AbandonRelocation {
+    revision: u64,
+    generation: String,
+}
+async fn abandon_relocation(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<AbandonRelocation>,
+) -> Response {
+    let db = st.engine.artifacts();
+    let op = match db.operation(&id) {
+        Ok(op) => op,
+        Err(e) => return failure(e),
+    };
+    if let Err(response) = validate_artifact_role(&st, &op.artifact) {
+        return response;
+    }
+    match st
+        .engine
+        .abandon_relocation(id, body.revision, body.generation)
+        .await
+    {
+        Ok(Ok(artifact)) => Json(artifact).into_response(),
+        Ok(Err(e)) => error(StatusCode::CONFLICT, &e),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+    }
 }
 async fn files(
     State(st): State<ApiState>,
@@ -349,7 +386,12 @@ pub(crate) fn scan_request(
             .map(|p| nzbd_config::expand_home(p))
             .unwrap_or_else(|| nzbd_config::expand_home(&cfg.paths.main_dir).join("failed")),
     ];
-    if let Some(p) = &cfg.paths.inter_dir {
+    if let Some(p) = cfg
+        .paths
+        .inter_dir
+        .as_ref()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
         roots.push(nzbd_config::expand_home(p));
     }
     for category in &cfg.categories {
@@ -376,7 +418,16 @@ async fn scan(State(st): State<ApiState>) -> Response {
     let mut active = Vec::new();
     for summary in &st.engine.snapshot().jobs {
         if let Ok(Some(job)) = st.engine.export_job(summary.id).await {
-            active.push(cfg.dest_dir().join(nzbd_engine::queue::job_dir_name(&job)));
+            active.push(
+                db.for_job(job.id.0)
+                    .ok()
+                    .flatten()
+                    .map(|a| a.path)
+                    .unwrap_or_else(|| {
+                        cfg.download_dir()
+                            .join(nzbd_engine::queue::job_dir_name(&job))
+                    }),
+            );
         }
     }
     let request = scan_request(&cfg, &db, active);

@@ -2239,6 +2239,10 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     T.renderFiles();
     eq(body.children.length, 4, "closing removes the panel");
 
+    const pendingMove = T.fileDetailModel({ artifact: art("move", { owned: true, state: "retained", hold: "review: interrupted move", inspected_at: 1 }), files: [], total: 0, offset: 0, events: [], relocations: [{id:"move-1", state:"review", error:"publish failed"}] });
+    ok(T.fileDetailHtml(pendingMove).includes('data-action="f-abandon-move"'), "a pending relocation has an explicit abandonment action");
+    ok(T.fileDetailHtml(pendingMove).includes('data-operation="move-1"'), "abandonment identifies the exact operation");
+
     // 3. The panel model: what is offered depends on state.
     const unmeasuredPanel = T.fileDetailModel({ artifact: art("u"), files: [], total: 0, offset: 0, events: [], preview: null });
     ok(!unmeasuredPanel.buttons.some(b => b.action === "f-adopt"), "an unmeasured folder cannot be adopted yet");

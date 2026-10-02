@@ -1025,3 +1025,27 @@ fn a_staging_failure_names_the_operation_and_the_path() {
         "…and the operation: {err}"
     );
 }
+
+#[test]
+fn recovery_publication_falls_back_without_sharing_original_inodes() {
+    let (tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    fs::RENAME_FAILURE.with(|failure| failure.set(Some(libc::EINVAL)));
+    let r = db
+        .stage_recovery(
+            &a.id,
+            a.revision,
+            "fallback-stage",
+            &["episode.mkv".into()],
+            &tmp.path().join("recovery"),
+        )
+        .unwrap();
+    assert_eq!(r.state, "published", "{:?}", r.error);
+    let input = fs::identity(&std::fs::metadata(a.path.join("episode.mkv")).unwrap());
+    let output = fs::identity(&std::fs::metadata(r.published.join("payload/episode.mkv")).unwrap());
+    assert!(!input.same_object(&output));
+    assert!(!tmp.path().join("recovery/.staging").join(&r.id).exists());
+    assert!(a.path.join("episode.mkv").exists());
+    db.reconcile_recoveries().unwrap();
+    assert_eq!(db.recovery(&r.id).unwrap().state, "published");
+}

@@ -1149,6 +1149,33 @@ impl EngineHandle {
             .await
     }
 
+    /// Explicit PP retry; the owner verifies the observed hold and payload custody.
+    pub async fn abandon_relocation(
+        &self,
+        operation: String,
+        revision: u64,
+        generation: String,
+    ) -> Result<Result<nzbd_state::artifacts::Artifact, String>, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::AbandonRelocation {
+            operation,
+            revision,
+            generation,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| EngineError::Closed)
+    }
+
+    pub async fn retry_post_hold(&self, job: JobId, revision: String) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::RetryPostHold {
+            job,
+            revision,
+            reply,
+        })
+        .await
+    }
+
     /// Persist a nonterminal fence before exposing it to consumers.
     pub async fn hold_job(
         &self,

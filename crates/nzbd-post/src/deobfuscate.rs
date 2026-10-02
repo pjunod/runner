@@ -170,6 +170,7 @@ fn rename_with_companions(
     parent: &Path,
     all_files: &[PathBuf],
     out: &mut Vec<(PathBuf, PathBuf)>,
+    custody: crate::rename::Custody<'_>,
 ) -> Result<(), crate::PostError> {
     for f in all_files {
         if f.parent() != Some(parent) {
@@ -181,16 +182,118 @@ fn rename_with_companions(
             continue;
         };
         let target = unique_target(parent, new_stem, suffix);
-        nzbd_state::fileops::rename_exclusive(f, &target).map_err(|e| {
-            crate::PostError::Subprocess(format!(
-                "deobfuscate {} to {}: {e}",
-                f.display(),
-                target.display()
-            ))
-        })?;
+        crate::rename::rename_owned(f, target.clone(), custody)?;
         out.push((f.clone(), target));
     }
     Ok(())
+}
+
+/// Container evidence restores a missing extension only. It does not identify
+/// episodes or validate the whole stream; exact PAR names remain authoritative.
+pub fn restore_media_extensions(
+    dir: &Path,
+    protected: &std::collections::HashSet<String>,
+) -> Result<Vec<(PathBuf, PathBuf)>, crate::PostError> {
+    restore_media_extensions_owned(dir, protected, None)
+}
+pub fn restore_media_extensions_owned(
+    dir: &Path,
+    protected: &std::collections::HashSet<String>,
+    custody: crate::rename::Custody<'_>,
+) -> Result<Vec<(PathBuf, PathBuf)>, crate::PostError> {
+    use std::io::Read;
+    fn vint(bytes: &[u8], at: &mut usize) -> Option<usize> {
+        let first = *bytes.get(*at)?;
+        let n = first.leading_zeros() as usize + 1;
+        if n > 8 {
+            return None;
+        }
+        let mut value = usize::from(first & (0xff >> n));
+        *at += 1;
+        for _ in 1..n {
+            value = value
+                .checked_mul(256)?
+                .checked_add(usize::from(*bytes.get(*at)?))?;
+            *at += 1;
+        }
+        Some(value)
+    }
+    fn kind(bytes: &[u8]) -> Option<&'static str> {
+        if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+            let mut at = 4;
+            let size = vint(bytes, &mut at)?;
+            let end = at.checked_add(size)?;
+            if end > bytes.len() {
+                return None;
+            }
+            let bytes = &bytes[..end];
+            while at < end {
+                let start = at;
+                let first = *bytes.get(at)?;
+                let id_len = first.leading_zeros() as usize + 1;
+                if id_len > 4 {
+                    return None;
+                }
+                at = at.checked_add(id_len)?;
+                let id = bytes.get(start..at)?;
+                let len = vint(bytes, &mut at)?;
+                let data = bytes.get(at..at.checked_add(len)?)?;
+                if id == [0x42, 0x82] {
+                    return match data {
+                        b"matroska" => Some("mkv"),
+                        b"webm" => Some("webm"),
+                        _ => None,
+                    };
+                }
+                at += len;
+            }
+        }
+        if bytes.get(..4) == Some(b"RIFF") && bytes.get(8..12) == Some(b"AVI ") {
+            return Some("avi");
+        }
+        if bytes.get(4..8) == Some(b"ftyp") {
+            return match bytes.get(8..12)? {
+                b"M4A " => Some("m4a"),
+                b"isom" | b"iso2" | b"mp41" | b"mp42" | b"avc1" | b"M4V " => Some("mp4"),
+                _ => None,
+            };
+        }
+        None
+    }
+    let mut plan = Vec::new();
+    for path in crate::namespace::files(dir)? {
+        if path.extension().is_some()
+            || protected.contains(
+                &path
+                    .strip_prefix(dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        nzbd_state::fileops::open(&path)
+            .map_err(|e| crate::PostError::Subprocess(e.to_string()))?
+            .take(4096)
+            .read_to_end(&mut bytes)?;
+        if let Some(ext) = kind(&bytes) {
+            plan.push((path.clone(), path.with_extension(ext)));
+        }
+    }
+    for (_, target) in &plan {
+        if target.symlink_metadata().is_ok() {
+            return Err(crate::PostError::Subprocess(format!(
+                "media extension target exists: {}",
+                target.display()
+            )));
+        }
+    }
+    for (source, target) in &plan {
+        crate::rename::rename_owned(source, target.clone(), custody)?;
+    }
+    Ok(plan)
 }
 
 /// The final deobfuscation pass. Returns the applied `(from, to)` pairs.
@@ -203,6 +306,14 @@ pub fn deobfuscate_dir(
     dir: &Path,
     job_name: &str,
     protected: &std::collections::HashSet<String>,
+) -> Result<Vec<(PathBuf, PathBuf)>, crate::PostError> {
+    deobfuscate_dir_owned(dir, job_name, protected, None)
+}
+pub fn deobfuscate_dir_owned(
+    dir: &Path,
+    job_name: &str,
+    protected: &std::collections::HashSet<String>,
+    custody: crate::rename::Custody<'_>,
 ) -> Result<Vec<(PathBuf, PathBuf)>, crate::PostError> {
     let job_stem = job_name.trim().trim_end_matches(".nzb").trim();
     // A job whose *own* name is noise gives us nothing to rename toward.
@@ -257,7 +368,7 @@ pub fn deobfuscate_dir(
             && !stem.eq_ignore_ascii_case(job_stem)
         {
             if let Some(parent) = path.parent() {
-                rename_with_companions(&stem, job_stem, parent, &files, &mut renames)?;
+                rename_with_companions(&stem, job_stem, parent, &files, &mut renames, custody)?;
             }
         }
         return Ok(renames);
@@ -270,6 +381,29 @@ pub fn deobfuscate_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_container_extensions_do_not_invent_pack_names_or_override_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mkv = b"\x1a\x45\xdf\xa3\x8b\x42\x82\x88matroska";
+        for name in ["random1", "random2", "exact"] {
+            std::fs::write(tmp.path().join(name), mkv).unwrap();
+        }
+        std::fs::write(tmp.path().join("unknown"), b"not media").unwrap();
+        let protected = ["exact".to_string()].into_iter().collect();
+        assert_eq!(
+            restore_media_extensions(tmp.path(), &protected)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(tmp.path().join("random1.mkv").is_file());
+        assert!(tmp.path().join("random2.mkv").is_file());
+        assert!(tmp.path().join("exact").is_file());
+        assert!(tmp.path().join("unknown").is_file());
+        std::fs::write(tmp.path().join("random1"), mkv).unwrap();
+        assert!(restore_media_extensions(tmp.path(), &protected).is_err());
+    }
 
     #[test]
     fn heuristics_definite_tier() {

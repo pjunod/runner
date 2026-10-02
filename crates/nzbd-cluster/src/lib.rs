@@ -215,7 +215,8 @@ impl ClusterRuntime {
                 control.clone(),
                 pp.as_ref().map(|setup| setup.history.clone()),
                 owner_incarnation.clone(),
-            ),
+            )
+            .with_post(pp.as_ref().map(|setup| setup.post.clone())),
         );
         spawn_leader_task(leader_shared.clone(), cancel.clone(), &tracker);
         registry::spawn_registry(

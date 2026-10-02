@@ -2663,3 +2663,122 @@ async fn review_terminal_history_and_event_keep_resolved_control() {
     assert!(observed, "completion event omitted the resolving control");
     engine.shutdown().await;
 }
+
+#[tokio::test]
+async fn configured_completed_root_receives_only_successful_publication() {
+    for conflict in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = spawn_engine(tmp.path()).await;
+        let dir = tmp.path().join("dest/intermediate-job");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Movie.S01E01.mkv"), b"payload").unwrap();
+        engine
+            .import_fixture_job(
+                tmp.path(),
+                completed_job(
+                    811,
+                    "intermediate-job",
+                    vec![file_entry(811, "Movie.S01E01.mkv", None, false)],
+                ),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        let complete = tmp.path().join("complete");
+        std::fs::create_dir(&complete).unwrap();
+        if conflict {
+            std::fs::create_dir(complete.join("intermediate-job")).unwrap();
+        }
+        let cfg = PostConfig {
+            completed_dir: Some(complete.clone()),
+            unpack: false,
+            ..PostConfig::default()
+        };
+        let result = process_job(
+            &engine,
+            &cfg,
+            &history(tmp.path()),
+            &tmp.path().join("dest"),
+            JobId(811),
+        )
+        .await;
+        if conflict {
+            assert!(result.is_err());
+            assert!(dir.join("Movie.S01E01.mkv").exists());
+            assert!(!engine
+                .export_job(JobId(811))
+                .await
+                .unwrap()
+                .unwrap()
+                .params
+                .iter()
+                .any(|(k, _)| k == PP_DONE_PARAM));
+        } else {
+            assert!(result.is_ok());
+            assert!(!dir.exists());
+            assert_eq!(
+                std::fs::read(complete.join("intermediate-job/Movie.S01E01.mkv")).unwrap(),
+                b"payload"
+            );
+        }
+        engine.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn manager_operator_retry_of_held_unpack_uses_existing_restart_action() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/held-job");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Movie.S01E01.mkv"), b"payload").unwrap();
+    engine
+        .import_fixture_job(
+            tmp.path(),
+            completed_job(
+                812,
+                "held-job",
+                vec![file_entry(812, "Movie.S01E01.mkv", None, false)],
+            ),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(engine
+        .hold_job(JobId(812), "post_failure", "unpack", "extraction failed")
+        .await
+        .unwrap());
+    let hist = history(tmp.path());
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    let manager = spawn_post_manager(
+        engine.clone(),
+        PostConfig::default(),
+        hist.clone(),
+        tmp.path().join("dest"),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+    manager
+        .restart(JobId(812), RestartPoint::Beginning)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if engine.export_job(JobId(812)).await.unwrap().is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "held PP retry did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+    engine.shutdown().await;
+}

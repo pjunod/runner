@@ -687,6 +687,7 @@ fn run_pp_lease(
 ) {
     // A remote attempt may transform only its private generation. Category
     // publication is selected by the authority after the result receipt.
+    setup.post.completed_dir = None;
     for rule in &mut setup.post.categories {
         rule.dest_dir = None;
     }

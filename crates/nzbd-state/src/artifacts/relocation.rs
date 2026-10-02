@@ -16,6 +16,8 @@ struct Relocation {
     publication: Option<super::publication::PublishedDirectory>,
     #[serde(default)]
     publication_key: Option<String>,
+    #[serde(default)]
+    cleanup_done: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -164,6 +166,13 @@ impl Inventory {
         Ok(())
     }
 
+    fn save_relocation_progress(&self, op: &Operation, movement: &Relocation) -> Result<()> {
+        let _guard = self.mutation_guard()?;
+        self.relocation_source(op, movement)?
+            .ok_or_else(|| Error::Conflict("relocation authority revoked".into()))?;
+        save_operation(&self.db.lock().unwrap(), op)
+    }
+
     /// Journal before moving. A cross-volume move publishes a verified copy,
     /// then retires only the exact source entries captured by this operation.
     pub fn relocate(&self, job: u32, destination: &Path) -> Result<RelocationResult> {
@@ -235,9 +244,10 @@ impl Inventory {
             return Err(Error::Conflict("move destination already exists".into()));
         }
         let key = format!(
-            "move-{}-{}-{:x}",
+            "move-{}-{}-{}-{:x}",
             source.id,
             source.generation,
+            source.revision,
             Sha256::digest(destination.as_os_str().as_encoded_bytes())
         );
         let mut relocation = Relocation {
@@ -249,6 +259,7 @@ impl Inventory {
             registry: false,
             publication: None,
             publication_key: None,
+            cleanup_done: false,
         };
         let mut op = Operation {
             id: key.clone(),
@@ -280,6 +291,9 @@ impl Inventory {
             let direct_key = format!("{key}-direct");
             let initial = {
                 let _guard = self.mutation_guard()?;
+                self.relocation_source(&op, &relocation)?
+                    .ok_or_else(|| Error::Conflict("relocation authority revoked".into()))?;
+                self.verify(&relocation.source)?;
                 self.publish_directory_unlocked(&source.path, &destination, &source.id, &direct_key)
             };
             match initial {
@@ -287,7 +301,7 @@ impl Inventory {
                     relocation.publication = Some(published);
                     relocation.publication_key = Some(direct_key);
                     op.request = serde_json::to_string(&relocation)?;
-                    save_operation(&self.db.lock().unwrap(), &op)?;
+                    self.save_relocation_progress(&op, &relocation)?;
                 }
                 Err(Error::Io(e))
                     if e.kind() == std::io::ErrorKind::CrossesDevices
@@ -316,7 +330,7 @@ impl Inventory {
                     save_artifact(&self.db.lock().unwrap(), &scratch)?;
                     relocation.scratch = Some(scratch.clone());
                     op.request = serde_json::to_string(&relocation)?;
-                    save_operation(&self.db.lock().unwrap(), &op)?;
+                    self.save_relocation_progress(&op, &relocation)?;
                     for entry in &source.files {
                         let target = scratch_path.join(&entry.path);
                         if entry.identity.directory {
@@ -375,10 +389,14 @@ impl Inventory {
                     relocation.scratch = Some(scratch.clone());
                     op.request = serde_json::to_string(&relocation)?;
                     save_artifact(&self.db.lock().unwrap(), &scratch)?;
-                    save_operation(&self.db.lock().unwrap(), &op)?;
+                    self.save_relocation_progress(&op, &relocation)?;
                     let copy_key = format!("{key}-copy");
                     let published = {
                         let _guard = self.mutation_guard()?;
+                        self.relocation_source(&op, &relocation)?.ok_or_else(|| {
+                            Error::Conflict("relocation authority revoked".into())
+                        })?;
+                        self.verify(&scratch)?;
                         self.publish_directory_unlocked(
                             &scratch_path,
                             &destination,
@@ -389,7 +407,7 @@ impl Inventory {
                     relocation.publication = Some(published);
                     relocation.publication_key = Some(copy_key);
                     op.request = serde_json::to_string(&relocation)?;
-                    save_operation(&self.db.lock().unwrap(), &op)?;
+                    self.save_relocation_progress(&op, &relocation)?;
                 }
                 Err(e) => return Err(e),
             }
@@ -538,9 +556,9 @@ impl Inventory {
         Ok(())
     }
     fn retire_relocation_source(&self, key: &str) -> Result<()> {
-        let op = self.operation(key)?;
-        let movement: Relocation = serde_json::from_str(&op.request)?;
-        if op.state != "succeeded" {
+        let mut op = self.operation(key)?;
+        let mut movement: Relocation = serde_json::from_str(&op.request)?;
+        if op.state != "succeeded" || movement.cleanup_done {
             return Ok(());
         }
         if movement.scratch.is_some() {
@@ -555,6 +573,9 @@ impl Inventory {
                 self.execute_delete(&op.id)?;
             }
         }
+        movement.cleanup_done = true;
+        op.request = serde_json::to_string(&movement)?;
+        save_operation(&self.db.lock().unwrap(), &op)?;
         Ok(())
     }
     pub fn reconcile_relocations(&self) -> Result<()> {
@@ -628,10 +649,135 @@ impl Inventory {
                 retired.push(op.id);
             }
         }
+        {
+            let db = self.db.lock().unwrap();
+            let mut stmt = db.prepare("SELECT id FROM operations WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup_done'),0)=0 LIMIT 25")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            retired.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+        }
         drop(guard);
+        retired.sort();
+        retired.dedup();
         for key in retired {
             self.retire_relocation_source(&key)?;
         }
         Ok(())
+    }
+}
+
+impl Inventory {
+    pub fn pending_relocations(&self, artifact: &str) -> Result<Vec<Operation>> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare("SELECT data FROM operations WHERE artifact=?1 AND state IN ('running','review') AND json_extract(data,'$.kind')='relocate'")?;
+        let rows = stmt.query_map([artifact], |r| r.get::<_, String>(0))?;
+        rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
+    }
+
+    /// Explicitly relinquish one failed move. The original directory must still
+    /// match its snapshot. Published/changed identities require reconciliation,
+    /// never force-release. Residual scratch and partial targets remain visible
+    /// in inventory for an explicit disposition.
+    pub fn abandon_relocation(
+        &self,
+        key: &str,
+        revision: u64,
+        generation: &str,
+    ) -> Result<Artifact> {
+        let _guard = self.mutation_guard()?;
+        let mut op = self.operation(key)?;
+        if op.kind != "relocate" || !matches!(op.state.as_str(), "running" | "review") {
+            return Err(Error::Conflict("relocation is not pending".into()));
+        }
+        let movement: Relocation = serde_json::from_str(&op.request)?;
+        let mut source = self.get(&op.artifact)?;
+        if source.revision != revision
+            || source.generation != generation
+            || source.generation != movement.source.generation
+            || source.path != movement.source.path
+            || source.terminal()
+        {
+            return Err(Error::Conflict(
+                "relocation source generation or revision changed".into(),
+            ));
+        }
+        let root = self.verify(&source)?;
+        let actual_files = fs::manifest(&root, 100_000)?;
+        if actual_files.len() != movement.source.files.len() {
+            return Err(Error::Conflict("relocation source contents changed".into()));
+        }
+        for suffix in ["direct", "copy"] {
+            if self
+                .operation(&format!("publish-{}-{suffix}", op.id))
+                .is_ok_and(|p| p.state == "succeeded")
+            {
+                return Err(Error::Conflict(
+                    "publication committed; reconcile the move".into(),
+                ));
+            }
+        }
+        for expected in &movement.source.files {
+            let current = fs::open_relative(&root, &expected.path)?;
+            let actual = fs::identity(&current.metadata()?);
+            if !expected.identity.same_object(&actual)
+                || (!actual.directory && expected.identity != actual)
+            {
+                return Err(Error::Conflict("relocation source contents changed".into()));
+            }
+        }
+        if movement.publication.is_some() {
+            return Err(Error::Conflict(
+                "relocation has a verified publication; reconcile it instead of abandoning".into(),
+            ));
+        }
+        if source
+            .hold
+            .as_deref()
+            .is_some_and(|h| !h.starts_with("review: interrupted move") && h != "review")
+        {
+            return Err(Error::Conflict("source has an independent hold".into()));
+        }
+        if movement.destination.symlink_metadata().is_ok() {
+            self.discover_unlocked(
+                movement.destination.parent().unwrap(),
+                &movement.destination,
+            )?;
+        }
+        op.state = "cancelled".into();
+        op.error = Some(
+            "operator abandoned relocation; original retained, scratch requires review".into(),
+        );
+        source.state = movement.source.state.clone();
+        source.hold = None;
+        source.error = None;
+        source.revision += 1;
+        source.files = fs::manifest(&root, 100_000)?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        for suffix in ["direct", "copy"] {
+            if let Ok(mut publication) =
+                read::<Operation>(&tx, "operations", &format!("publish-{}-{suffix}", op.id))
+            {
+                if publication.state == "succeeded" {
+                    return Err(Error::Conflict(
+                        "publication committed before acknowledgement; reconcile the move".into(),
+                    ));
+                }
+                publication.state = "cancelled".into();
+                publication.error = op.error.clone();
+                save_operation(&tx, &publication)?;
+            }
+        }
+        if let Some(scratch) = movement.scratch {
+            let mut retained = scratch;
+            retained.state = "retained".into();
+            retained.hold = Some("review: abandoned relocation staging".into());
+            retained.revision += 1;
+            save_artifact(&tx, &retained)?;
+        }
+        save_artifact(&tx, &source)?;
+        save_operation(&tx, &op)?;
+        event(&tx, &source.id, "relocation_abandoned", &op.id)?;
+        tx.commit()?;
+        Ok(source)
     }
 }

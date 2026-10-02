@@ -53,6 +53,7 @@ pub struct LeaderShared {
     pub engine: EngineHandle,
     pub layout: SharedLayout,
     pub dest_dir: PathBuf,
+    post: Option<nzbd_post::manager::PostConfig>,
     pub cfg: ClusterConfig,
     pub servers: Vec<ServerDef>,
     pub view: watch::Receiver<LeaderView>,
@@ -71,6 +72,7 @@ pub struct LeaderShared {
 }
 
 pub(crate) struct LeaderDurability {
+    post: Option<nzbd_post::manager::PostConfig>,
     control: Option<ControlStore>,
     history: Option<Arc<nzbd_state::history::HistoryDb>>,
     owner_incarnation: String,
@@ -83,10 +85,15 @@ impl LeaderDurability {
         owner_incarnation: String,
     ) -> Self {
         Self {
+            post: None,
             control,
             history,
             owner_incarnation,
         }
+    }
+    pub(crate) fn with_post(mut self, post: Option<nzbd_post::manager::PostConfig>) -> Self {
+        self.post = post;
+        self
     }
 }
 
@@ -104,6 +111,7 @@ impl LeaderShared {
             engine,
             layout,
             dest_dir,
+            post: durability.post,
             cfg,
             servers,
             view,
@@ -116,6 +124,25 @@ impl LeaderShared {
             mutation_serial: tokio::sync::Mutex::new(()),
             authority_ready: AtomicBool::new(false),
         })
+    }
+
+    fn publication_root(&self, job: &nzbd_types::Job, post: bool) -> PathBuf {
+        if post {
+            if let Some(cfg) = &self.post {
+                return cfg
+                    .categories
+                    .iter()
+                    .find(|r| {
+                        job.category
+                            .as_deref()
+                            .is_some_and(|name| r.name.eq_ignore_ascii_case(name.trim()))
+                    })
+                    .and_then(|r| r.dest_dir.clone())
+                    .or_else(|| cfg.completed_dir.clone())
+                    .unwrap_or_else(|| self.dest_dir.clone());
+            }
+        }
+        self.dest_dir.clone()
     }
 
     pub(crate) fn authority_ready(&self) -> bool {
@@ -1322,7 +1349,7 @@ async fn work_complete(
         .params
         .push(("*Cluster:result-ref".into(), req.result_ref.clone()));
     if matches!(info.kind, LeaseKind::Post | LeaseKind::Assemble) {
-        let dest_dir = s.dest_dir.clone();
+        let dest_dir = s.publication_root(&published_job, info.kind == LeaseKind::Post);
         let result_ref = req.result_ref.clone();
         let fence = req.token.fence;
         let original_dir = published_job
@@ -1766,7 +1793,7 @@ async fn recover_selected_publications(s: &LeaderShared) -> Result<(), String> {
         else {
             continue;
         };
-        let dest_dir = s.dest_dir.clone();
+        let dest_dir = s.publication_root(&job, kind == "post");
         let original_dir = original_dir.clone();
         tokio::task::spawn_blocking(move || {
             publish_generation(&dest_dir, &result_ref, &original_dir, fence, &result_id)

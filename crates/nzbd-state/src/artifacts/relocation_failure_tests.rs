@@ -287,3 +287,31 @@ fn pending_delete_cannot_cross_generations_and_legacy_success_cannot_repair_them
     );
     assert_eq!(inventory.get(&old.id).unwrap().state, "retained");
 }
+
+#[test]
+fn abandoned_move_cannot_resurrect_and_a_new_move_uses_a_new_operation() {
+    let (_tmp, db, _source, target) = fixture();
+    FAULTS.with(|f| f.borrow_mut().insert("before_move", libc::EIO));
+    assert!(db.relocate(91, &target).is_err());
+    let op = db
+        .pending_relocations(&db.for_job(91).unwrap().unwrap().id)
+        .unwrap()
+        .remove(0);
+    let a = db.for_job(91).unwrap().unwrap();
+    assert!(db
+        .abandon_relocation(&op.id, a.revision + 1, &a.generation)
+        .is_err());
+    let a = db
+        .abandon_relocation(&op.id, a.revision, &a.generation)
+        .unwrap();
+    assert!(a.hold.is_none());
+    db.reconcile_startup(&[91]).unwrap();
+    assert_eq!(db.operation(&op.id).unwrap().state, "cancelled");
+    assert!(db.for_job(91).unwrap().unwrap().hold.is_none());
+    let next = db.relocate(91, &target).unwrap();
+    assert_ne!(next.operation_id, op.id);
+    assert_eq!(
+        std::fs::read(target.join("media.mkv")).unwrap(),
+        b"PAR_FAILURE retained input"
+    );
+}

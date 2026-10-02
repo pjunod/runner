@@ -7,8 +7,8 @@
 //!   themselves are found by content (`PAR2\0PKT` magic), not extension.
 //! - **rar-rename**: files whose *content* is a RAR/7z/zip volume but
 //!   whose name hides it get an extension back. Multi-volume RAR sets are
-//!   numbered in stem order (uploaders obfuscate consistently); RAR5
-//!   internal volume numbers are honored when present.
+//!   ordered by checked headers; split-file continuity establishes membership.
+//!   Ambiguous sets retain their names and fail explicitly.
 
 use crate::PostError;
 use md5::{Digest, Md5};
@@ -96,6 +96,25 @@ fn safe_rename(from: &Path, to: PathBuf) -> Result<Option<(PathBuf, PathBuf)>, P
     }
 }
 
+pub(crate) type Custody<'a> = Option<(&'a nzbd_state::artifacts::Inventory, u32)>;
+pub(crate) fn rename_owned(
+    from: &Path,
+    to: PathBuf,
+    custody: Custody<'_>,
+) -> Result<Option<(PathBuf, PathBuf)>, PostError> {
+    if from == to {
+        return Ok(None);
+    }
+    if let Some((inventory, job)) = custody {
+        inventory
+            .restore_file(job, from, &to)
+            .map_err(|e| PostError::Subprocess(e.to_string()))?;
+        Ok(Some((from.to_path_buf(), to)))
+    } else {
+        safe_rename(from, to)
+    }
+}
+
 /// par-rename. Returns `(old, new)` pairs so the caller can remap download
 /// evidence (whole-file CRCs are content-addressed; only paths change).
 pub fn par_rename(dir: &Path) -> Renames {
@@ -115,7 +134,7 @@ pub fn par_rename_owned(
                 "{}.par2",
                 p.file_stem().unwrap_or_default().to_string_lossy()
             ));
-            if let Some(pair) = safe_rename(&p, to)? {
+            if let Some(pair) = rename_owned(&p, to, custody)? {
                 renames.push(pair);
             }
         }
@@ -196,7 +215,15 @@ fn rar5_volume_number(data: &[u8]) -> Option<u64> {
     };
     // Header: crc32(4) + size(vint) + type(vint) + flags(vint) …
     pos += 4;
-    let _size = vint(data, &mut pos)?;
+    let size = usize::try_from(vint(data, &mut pos)?).ok()?;
+    let end = pos.checked_add(size)?;
+    if end > data.len()
+        || crc32fast::hash(data.get(12..end)?)
+            != u32::from_le_bytes(data.get(8..12)?.try_into().ok()?)
+    {
+        return None;
+    }
+    let data = &data[..end];
     let htype = vint(data, &mut pos)?;
     if htype != 1 {
         return None; // expected the main archive header
@@ -218,7 +245,23 @@ fn rar5_volume_number(data: &[u8]) -> Option<u64> {
 /// RAR4 stores the volume number in ENDARC, after an optional data CRC.
 /// Walk validated headers and seek over packed data; filenames and lexical
 /// order are not evidence. See UnRAR arcread.cpp HEAD_ENDARC / EARC_VOLNUMBER.
+#[derive(Clone, PartialEq, Eq)]
+struct RarMember {
+    name: Vec<u8>,
+    size: u64,
+    method: u8,
+    version: u8,
+}
+struct RarVolume {
+    new_numbering: bool,
+    number: u64,
+    first: Option<(RarMember, bool)>,
+    last: Option<(RarMember, bool)>,
+}
 fn rar4_volume_number(path: &Path) -> Option<u64> {
+    rar4_volume(path).map(|v| v.number)
+}
+fn rar4_volume(path: &Path) -> Option<RarVolume> {
     let mut file = nzbd_state::fileops::open(path).ok()?;
     let length = file.metadata().ok()?.len();
     let mut magic = [0u8; 7];
@@ -228,6 +271,9 @@ fn rar4_volume_number(path: &Path) -> Option<u64> {
     }
     let mut offset = 7u64;
     let mut first = None;
+    let mut new_numbering = false;
+    let mut first_member = None;
+    let mut last_member = None;
     for _ in 0..100_000 {
         file.seek(SeekFrom::Start(offset)).ok()?;
         let mut short = [0u8; 7];
@@ -253,9 +299,15 @@ fn rar4_volume_number(path: &Path) -> Option<u64> {
                 return None;
             }
             if flags & 1 == 0 {
-                return Some(0);
+                return Some(RarVolume {
+                    new_numbering: flags & 0x10 != 0,
+                    number: 0,
+                    first: None,
+                    last: None,
+                });
             } // single-volume archive
             first = Some(flags & 0x100 != 0);
+            new_numbering = flags & 0x10 != 0;
         }
         if short[2] == 0x7b {
             if flags & 8 == 0 {
@@ -266,7 +318,33 @@ fn rar4_volume_number(path: &Path) -> Option<u64> {
             if first == Some(true) && number != 0 {
                 return None;
             }
-            return Some(u64::from(number));
+            return Some(RarVolume {
+                new_numbering,
+                number: u64::from(number),
+                first: first_member,
+                last: last_member,
+            });
+        }
+        if short[2] == 0x74 {
+            if size < 32 || flags & 4 != 0 {
+                return None;
+            }
+            let name_len = u16::from_le_bytes(header[26..28].try_into().ok()?) as usize;
+            let start = if flags & 0x100 != 0 { 40 } else { 32 };
+            let mut unpacked = u64::from(word(11)?);
+            if flags & 0x100 != 0 {
+                unpacked |= u64::from(word(36)?) << 32;
+            }
+            let member = RarMember {
+                name: header.get(start..start + name_len)?.to_vec(),
+                size: unpacked,
+                method: header[25],
+                version: header[24],
+            };
+            if first_member.is_none() {
+                first_member = Some((member.clone(), flags & 1 != 0));
+            }
+            last_member = Some((member, flags & 2 != 0));
         }
         let mut packed = if flags & 0x8000 != 0 {
             u64::from(word(7)?)
@@ -322,89 +400,155 @@ pub(crate) fn split_volume_ext(ext: &str) -> bool {
         || (b[0].is_ascii_alphabetic() && b[1].is_ascii_digit() && b[2].is_ascii_digit())
 }
 
-/// rar-rename (plus 7z/zip signatures). Returns `(old, new)` pairs.
+/// Restore only sets whose order AND membership are established. Correctly
+/// named sets remain the extractor's responsibility. No lexical ordering.
 pub fn rar_rename(dir: &Path) -> Renames {
-    let mut renames = Vec::new();
+    rar_rename_owned(dir, None)
+}
+pub fn rar_rename_owned(dir: &Path, custody: Custody<'_>) -> Renames {
     let known = ["rar", "7z", "zip", "par2", "nzb", "sfv", "nfo", "srr"];
-    let mut hidden_rars: Vec<(PathBuf, Option<u64>)> = Vec::new();
-
+    let mut groups: std::collections::BTreeMap<PathBuf, Vec<PathBuf>> = Default::default();
+    let mut plan = Vec::new();
     for p in files_of(dir) {
         let ext = p
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        if known.contains(&ext.as_str()) || split_volume_ext(&ext) {
+        let h = head(&p, 128);
+        if h.starts_with(RAR_MAGIC) {
+            groups
+                .entry(p.parent().unwrap().into())
+                .or_default()
+                .push(p);
+        } else if !known.contains(&ext.as_str()) && !split_volume_ext(&ext) {
+            let extension = if h.starts_with(SEVENZIP_MAGIC) {
+                Some("7z")
+            } else if h.starts_with(ZIP_MAGIC) {
+                Some("zip")
+            } else {
+                None
+            };
+            if let Some(e) = extension {
+                plan.push((p.clone(), p.with_extension(e)));
+            }
+        }
+    }
+    for (parent, files) in groups {
+        let hidden = files.iter().any(|p| {
+            let e = p
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            e != "rar" && !split_volume_ext(&e)
+        });
+        // A known old-style continuation must have a matching first volume.
+        let mismatched = files.iter().any(|p| {
+            p.extension().is_some_and(|e| {
+                let e = e.to_string_lossy().to_ascii_lowercase();
+                e.len() == 3
+                    && e.starts_with('r')
+                    && e[1..].bytes().all(|b| b.is_ascii_digit())
+                    && !files.contains(&p.with_extension("rar"))
+            })
+        });
+        if !hidden && !mismatched {
             continue;
         }
-        let h = head(&p, 32);
-        if h.starts_with(RAR_MAGIC) {
-            let number = if h.starts_with(b"Rar!\x1a\x07\x00") {
-                rar4_volume_number(&p)
+        if files.len() == 1 {
+            let p = &files[0];
+            let h = head(p, 128);
+            let n = if h.starts_with(b"Rar!\x1a\x07\x00") {
+                rar4_volume_number(p)
             } else {
                 rar5_volume_number(&h)
             };
-            hidden_rars.push((p, number));
-        } else if h.starts_with(SEVENZIP_MAGIC) {
-            let to = dir.join(format!(
-                "{}.7z",
-                p.file_stem().unwrap_or_default().to_string_lossy()
-            ));
-            if let Some(pair) = safe_rename(&p, to)? {
-                renames.push(pair);
+            if n != Some(0) {
+                return Err(PostError::Subprocess(
+                    "RAR head is missing or invalid; filenames preserved".into(),
+                ));
             }
-        } else if h.starts_with(ZIP_MAGIC) {
-            let to = dir.join(format!(
-                "{}.zip",
-                p.file_stem().unwrap_or_default().to_string_lossy()
-            ));
-            if let Some(pair) = safe_rename(&p, to)? {
-                renames.push(pair);
+            plan.push((p.clone(), p.with_extension("rar")));
+            continue;
+        }
+        let mut volumes = Vec::new();
+        for p in files {
+            let info = rar4_volume(&p).ok_or_else(|| {
+                PostError::Subprocess(
+                    "RAR set lacks checked order/membership evidence; filenames preserved".into(),
+                )
+            })?;
+            volumes.push((p, info));
+        }
+        volumes.sort_by_key(|(_, v)| v.number);
+        for (i, (_, v)) in volumes.iter().enumerate() {
+            let valid = v.new_numbering == volumes[0].1.new_numbering
+                && v.number == i as u64
+                && if i == 0 {
+                    v.first.as_ref().is_some_and(|(_, split)| !split)
+                } else {
+                    match (&volumes[i - 1].1.last, &v.first) {
+                        (Some((previous, true)), Some((current, true))) => previous == current,
+                        _ => false,
+                    }
+                };
+            if !valid {
+                return Err(PostError::Subprocess(
+                    "RAR volume continuity is ambiguous or incomplete; filenames preserved".into(),
+                ));
             }
         }
-    }
-
-    // Validate the whole set before renaming any volume. Duplicate numbers,
-    // missing heads, gaps, mixed sets, and unknown order require review.
-    let base_name = hidden_rars.first().map(|(p, _)| {
-        p.file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
-    });
-    hidden_rars.sort_by_key(|(_, number)| *number);
-    for (expected, (_, number)) in hidden_rars.iter().enumerate() {
-        if *number != Some(expected as u64) {
+        if !volumes
+            .last()
+            .unwrap()
+            .1
+            .last
+            .as_ref()
+            .is_some_and(|(_, split)| !split)
+        {
             return Err(PostError::Subprocess(
-                "RAR volume order is unknown, duplicated, or incomplete; filenames preserved"
-                    .into(),
+                "RAR final volume missing; filenames preserved".into(),
+            ));
+        }
+        let head = &volumes[0].0;
+        let stem = head.file_stem().unwrap().to_string_lossy();
+        let base = stem.strip_suffix(".part01").unwrap_or(&stem).to_owned();
+        let modern = volumes[0].1.new_numbering;
+        for (i, (path, _)) in volumes.into_iter().enumerate() {
+            let name = if modern {
+                format!("{base}.part{:02}.rar", i + 1)
+            } else if i == 0 {
+                format!("{base}.rar")
+            } else if i <= 900 {
+                format!(
+                    "{base}.{}{:02}",
+                    (b'r' + ((i - 1) / 100) as u8) as char,
+                    (i - 1) % 100
+                )
+            } else {
+                return Err(PostError::Subprocess(
+                    "RAR volume count exceeds old-style naming range".into(),
+                ));
+            };
+            plan.push((path, parent.join(name)));
+        }
+    }
+    let mut targets = std::collections::HashSet::new();
+    for (source, target) in &plan {
+        if !targets.insert(target.clone())
+            || (source != target && target.symlink_metadata().is_ok())
+        {
+            return Err(PostError::Subprocess(
+                "archive rename target already exists; filenames preserved".into(),
             ));
         }
     }
-    match hidden_rars.len() {
-        0 => {}
-        1 => {
-            let (p, _) = &hidden_rars[0];
-            let to = dir.join(format!(
-                "{}.rar",
-                p.file_stem().unwrap_or_default().to_string_lossy()
-            ));
-            if let Some(pair) = safe_rename(p, to)? {
-                renames.push(pair);
-            }
-        }
-        _ => {
-            // Every member is now ordered by its validated archive header.
-            let base = base_name.unwrap();
-            let ordered: Vec<_> = hidden_rars.iter().map(|(p, _)| p.clone()).collect();
-            for (i, p) in ordered.iter().enumerate() {
-                let to = dir.join(format!("{base}.part{:02}.rar", i + 1));
-                if let Some(pair) = safe_rename(p, to)? {
-                    renames.push(pair);
-                }
-            }
+    let mut renamed = Vec::new();
+    for (source, target) in plan {
+        if let Some(pair) = rename_owned(&source, target, custody)? {
+            renamed.push(pair);
         }
     }
-    Ok(renames)
+    Ok(renamed)
 }
 
 #[cfg(test)]
@@ -423,8 +567,27 @@ mod tests {
             h
         }
         let mut bytes = b"Rar!\x1a\x07\x00".to_vec();
-        let flags = volume.map_or(0, |n| 1 | if n == 0 { 0x100 } else { 0 });
+        let flags = volume.map_or(0, |n| 0x11 | if n == 0 { 0x100 } else { 0 });
         bytes.extend(block(0x73, flags, &[0; 6]));
+        if let Some(n) = volume {
+            let data = [b'a' + n as u8];
+            let mut member = Vec::new();
+            member.extend(1u32.to_le_bytes());
+            member.extend(3u32.to_le_bytes());
+            member.push(3); // Unix host
+            member.extend(crc32fast::hash(if n == 2 { b"abc" } else { &data }).to_le_bytes());
+            member.extend(0u32.to_le_bytes());
+            member.extend([20, 0x30]); // RAR2, stored
+            member.extend(9u16.to_le_bytes());
+            member.extend(0x20u32.to_le_bytes());
+            member.extend(b"video.mkv");
+            bytes.extend(block(
+                0x74,
+                0x8000 | if n > 0 { 1 } else { 0 } | if n < 2 { 2 } else { 0 },
+                &member,
+            ));
+            bytes.extend(data);
+        }
         if let Some(n) = volume {
             bytes.extend(block(0x7b, 8, &n.to_le_bytes()));
         }
@@ -440,7 +603,7 @@ mod tests {
         assert_eq!(rar_rename(tmp.path()).unwrap().len(), 3);
         for number in 0..3 {
             assert_eq!(
-                rar4_volume_number(&tmp.path().join(format!("a-last.part{:02}.rar", number + 1))),
+                rar4_volume_number(&tmp.path().join(format!("z-head.part{:02}.rar", number + 1))),
                 Some(number)
             );
         }
@@ -461,6 +624,43 @@ mod tests {
             assert!(rar_rename(tmp.path()).is_err());
             assert_eq!(std::fs::read(tmp.path().join("first")).unwrap(), head);
             assert_eq!(std::fs::read(tmp.path().join("other")).unwrap(), other);
+        }
+    }
+
+    #[test]
+    fn six_raw_media_files_recover_exact_par_names_from_hidden_index() {
+        if !crate::tools::require_tool("par2") {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let names: Vec<_> = (1..=6).map(|n| format!("Show.S01E{n:02}.mkv")).collect();
+        for (i, name) in names.iter().enumerate() {
+            let bytes: Vec<_> = (0..32768).map(|j| ((j + i * 13) % 251) as u8).collect();
+            std::fs::write(tmp.path().join(name), bytes).unwrap();
+        }
+        let output = Command::new("par2")
+            .args(["create", "-q", "-q", "-s8192", "-c1", "set.par2"])
+            .args(&names)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        for (i, name) in names.iter().enumerate() {
+            std::fs::rename(
+                tmp.path().join(name),
+                tmp.path().join(format!("obfuscated-{}", 6 - i)),
+            )
+            .unwrap();
+        }
+        for p in files_of(tmp.path()) {
+            if ext_is(&p, "par2") {
+                std::fs::rename(&p, p.with_extension("hidden")).unwrap();
+            }
+        }
+        par_rename(tmp.path()).unwrap();
+        for (i, name) in names.iter().enumerate() {
+            let bytes: Vec<_> = (0..32768).map(|j| ((j + i * 13) % 251) as u8).collect();
+            assert_eq!(std::fs::read(tmp.path().join(name)).unwrap(), bytes);
         }
     }
 
@@ -609,27 +809,21 @@ mod tests {
         assert!(tmp.path().join("a1b2c3d4e5.rar").exists());
     }
 
+    fn rar5_header(fields: &[u8]) -> Vec<u8> {
+        let mut data = b"Rar!\x1a\x07\x01\x00".to_vec();
+        let mut header = vec![fields.len() as u8];
+        header.extend(fields);
+        data.extend(crc32fast::hash(&header).to_le_bytes());
+        data.extend(header);
+        data
+    }
+
     #[test]
     fn rar5_volume_number_parses() {
         // Synthesized minimal RAR5 main header: sig + crc + size +
         // type=1 + hflags=0 + arcflags=volume|number + number=3.
-        let mut d = b"Rar!\x1a\x07\x01\x00".to_vec();
-        d.extend_from_slice(&[0, 0, 0, 0]); // header crc (unchecked)
-        d.push(5); // header size vint
-        d.push(1); // type = main
-        d.push(0); // header flags
-        d.push(0x03); // archive flags: volume + number present
-        d.push(3); // volume number
-        assert_eq!(rar5_volume_number(&d), Some(3));
-
-        let mut first = b"Rar!\x1a\x07\x01\x00".to_vec();
-        first.extend_from_slice(&[0, 0, 0, 0]);
-        first.push(4);
-        first.push(1);
-        first.push(0);
-        first.push(0x01); // volume, no explicit number => first
-        assert_eq!(rar5_volume_number(&first), Some(0));
-
+        assert_eq!(rar5_volume_number(&rar5_header(&[1, 0, 3, 3])), Some(3));
+        assert_eq!(rar5_volume_number(&rar5_header(&[1, 0, 1])), Some(0));
         assert_eq!(rar5_volume_number(b"Rar!\x1a\x07\x00garbage"), None); // RAR4
     }
 
@@ -674,10 +868,10 @@ mod tests {
         wrong_type.extend_from_slice(&[4, 2, 0, 0]);
         assert_eq!(rar5_volume_number(&wrong_type), None);
 
-        let mut extra_non_volume = b"Rar!\x1a\x07\x01\x00".to_vec();
-        extra_non_volume.extend_from_slice(&[0, 0, 0, 0]);
-        extra_non_volume.extend_from_slice(&[5, 1, 1, 0, 0]);
-        assert_eq!(rar5_volume_number(&extra_non_volume), Some(0));
+        assert_eq!(rar5_volume_number(&rar5_header(&[1, 1, 0, 0])), Some(0));
+        let mut corrupt = rar5_header(&[1, 0, 0]);
+        corrupt[8] ^= 1;
+        assert_eq!(rar5_volume_number(&corrupt), None);
     }
 
     #[test]
@@ -701,27 +895,69 @@ mod tests {
     }
 
     #[test]
-    fn rar5_volume_numbers_control_multi_volume_order() {
-        fn numbered(volume: u8) -> Vec<u8> {
-            let mut data = b"Rar!\x1a\x07\x01\x00".to_vec();
-            data.extend_from_slice(&[0, 0, 0, 0]);
-            data.extend_from_slice(&[5, 1, 0, 3, volume]);
-            data
-        }
-
+    fn rar5_volume_numbers_alone_do_not_prove_membership() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("a-second"), numbered(1)).unwrap();
-        std::fs::write(tmp.path().join("z-first"), numbered(0)).unwrap();
-        let renames = rar_rename(tmp.path()).unwrap();
+        for (name, n) in [("first", 0), ("second", 1)] {
+            std::fs::write(tmp.path().join(name), rar5_header(&[1, 0, 3, n])).unwrap();
+        }
+        assert!(rar_rename(tmp.path()).is_err());
+        assert!(tmp.path().join("first").exists());
+        assert!(tmp.path().join("second").exists());
+    }
 
-        assert_eq!(renames.len(), 2);
-        assert_eq!(
-            std::fs::read(tmp.path().join("a-second.part01.rar")).unwrap(),
-            numbered(0)
+    #[test]
+    fn mismatched_stems_extract_the_complete_stored_rar_set() {
+        if !crate::tools::require_tool("7z") {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, number) in [("a-last.r01", 2), ("m-middle.r00", 1), ("z-head.rar", 0)] {
+            let mut bytes = rar4_fixture(Some(number));
+            // Old-style numbering in the actual archive header.
+            bytes[10] &= !0x10;
+            let checksum = crc32fast::hash(&bytes[9..20]) as u16;
+            bytes[7..9].copy_from_slice(&checksum.to_le_bytes());
+            std::fs::write(tmp.path().join(name), bytes).unwrap();
+        }
+        rar_rename(tmp.path()).unwrap();
+        assert!(tmp.path().join("z-head.r00").is_file());
+        let out = tmp.path().join("out");
+        let result = Command::new("7z")
+            .arg("x")
+            .arg("-y")
+            .arg(format!("-o{}", out.display()))
+            .arg(tmp.path().join("z-head.rar"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
         );
-        assert_eq!(
-            std::fs::read(tmp.path().join("a-second.part02.rar")).unwrap(),
-            numbered(1)
-        );
+        assert_eq!(std::fs::read(out.join("video.mkv")).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn mixed_rar_membership_and_missing_tail_preserve_inputs() {
+        for mixed in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            for (name, number) in [("head.rar", 0), ("middle.r00", 1)] {
+                let mut bytes = rar4_fixture(Some(number));
+                if mixed && number == 1 {
+                    // Name in the FILE_HEAD differs, with valid header CRC.
+                    let offset = 20;
+                    bytes[offset + 32] = b'X';
+                    let size = u16::from_le_bytes(bytes[offset + 5..offset + 7].try_into().unwrap())
+                        as usize;
+                    let crc = crc32fast::hash(&bytes[offset + 2..offset + size]) as u16;
+                    bytes[offset..offset + 2].copy_from_slice(&crc.to_le_bytes());
+                }
+                std::fs::write(tmp.path().join(name), bytes).unwrap();
+            }
+            assert!(rar_rename(tmp.path()).is_err());
+            assert!(tmp.path().join("head.rar").exists());
+            assert!(tmp.path().join("middle.r00").exists());
+        }
     }
 }

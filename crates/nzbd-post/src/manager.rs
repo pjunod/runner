@@ -6,7 +6,7 @@
 //! recording the outcome in history and stamping the job so restarts never
 //! re-process. Stage parallelism follows `PostStrategy`.
 
-use crate::rename::{par_rename_owned, rar_rename};
+use crate::rename::{par_rename_owned, rar_rename_owned};
 use crate::script::{discover, ScriptHost};
 use crate::tools::{detect_archives, Extractors, Par2Tool};
 use crate::{par2, DownloadEvidence, PostError, RepairResult, VerifyResult};
@@ -81,6 +81,8 @@ pub struct CategoryRule {
 
 #[derive(Clone)]
 pub struct PostConfig {
+    /// Final publication root; None keeps the input root (private cluster attempts).
+    pub completed_dir: Option<PathBuf>,
     pub par2_cmd: String,
     pub unrar_cmd: String,
     pub sevenzip_cmd: String,
@@ -88,7 +90,7 @@ pub struct PostConfig {
     pub unpack: bool,
     pub cleanup: bool,
     /// Rename still-obfuscated files to the job name after unpack
-    /// (SABnzbd-style; fully obfuscated season packs get `<job> - NN`).
+    /// Exact mappings win; multi-file episode order is never guessed.
     pub deobfuscate_final: bool,
     /// What happens to the files of a job that ends in a terminal
     /// failure (par, unpack, script, health abort, crash).
@@ -113,6 +115,7 @@ pub struct PostConfig {
 impl Default for PostConfig {
     fn default() -> Self {
         PostConfig {
+            completed_dir: None,
             par2_cmd: "par2".into(),
             unrar_cmd: "unrar".into(),
             sevenzip_cmd: "7z".into(),
@@ -475,6 +478,25 @@ async fn manager_task(
             }
             Some(cmd) = control.recv() => match cmd {
                 ManagerCommand::Restart { job, from, reply } => {
+                    let held = engine.export_job(job).await.ok().flatten()
+                        .and_then(|j| j.control()).filter(|c| c.lifecycle == "held");
+                    if let Some(control) = held {
+                        // Held exceptions retry from the beginning, never past
+                        // uncertain work or scripts. A live attempt must finish
+                        // before its persisted hold can be released.
+                        if from != RestartPoint::Beginning || active.contains_key(&job) {
+                            let _ = reply.send(Err(RestartPostError::UnsafePoint));
+                            continue;
+                        }
+                        if !claim(&gate, job) {
+                            let _ = reply.send(Err(RestartPostError::NotOwned));
+                            continue;
+                        }
+                        if !engine.retry_post_hold(job, control.revision).await.unwrap_or(false) {
+                            let _ = reply.send(Err(RestartPostError::NotReady));
+                            continue;
+                        }
+                    }
                     let result = match engine.snapshot().jobs.iter().find(|j| j.id == job) {
                         None => Err(RestartPostError::NotFound),
                         Some(j) if j.pp_done => Err(RestartPostError::AlreadyFinished),
@@ -1041,7 +1063,7 @@ fn spawn_job(
                     {
                         "identity_conflict"
                     } else {
-                        "unknown"
+                        "post_failure"
                     };
                     let stage = engine
                         .snapshot()
@@ -1390,30 +1412,15 @@ async fn process_job_ctx_from(
     // from a mutable name is how the pipeline would come looking for a
     // directory the engine never wrote.
     let sanitized = nzbd_engine::queue::job_dir_name(&job);
-    // The engine always writes downloads under the global destination;
-    // a `[[category]] dest_dir` is a *move* at the end of the pipeline
-    // (PostStage::Move), not a different download target.
-    let mut dir = dest_dir.join(&sanitized);
+    // Custody survives settings changes and committed relocations. Never adopt a
+    // similarly named directory merely because it exists at the new destination.
+    let mut dir = engine
+        .artifacts()
+        .for_job(job_id.0)
+        .map_err(|e| PostError::Subprocess(e.to_string()))?
+        .map(|a| a.path)
+        .unwrap_or_else(|| dest_dir.join(&sanitized));
     let rule = cfg.rule_for(job.category.as_deref()).cloned();
-    // Re-run after a crash between the move and the `*PP:done` stamp: the
-    // files are already at the category destination and the global path is
-    // gone. Adopt what is on disk. Without this the whole pipeline runs
-    // against a directory that no longer exists — par2 load fails with
-    // ENOENT, `process_job` errors, and the job is wedged forever: never
-    // stamped, never in history, never announced, never retired from the
-    // queue. The stage graph is idempotent, and this is what keeps that
-    // true across the one step that moves its own input.
-    if let Some(moved) = rule.as_ref().and_then(|r| r.dest_dir.as_ref()) {
-        let moved = moved.join(&sanitized);
-        if !dir.exists() && moved.is_dir() {
-            tracing::info!(
-                job = job_id.0,
-                dir = %moved.display(),
-                "resuming post-processing at the category destination (already moved)"
-            );
-            dir = moved;
-        }
-    }
     let unpack_enabled = rule.as_ref().and_then(|r| r.unpack).unwrap_or(cfg.unpack);
     // Superseded staging dirs (a reclaimed lease's leftovers) are garbage
     // by definition — this lease is now the only live executor.
@@ -1431,7 +1438,10 @@ async fn process_job_ctx_from(
         renames = par_rename_owned(&dir, Some((&engine.artifacts(), job_id.0)))?;
         if unpack_enabled {
             stages.enter(PostStage::RarRename).await;
-            renames.extend(rar_rename(&dir)?);
+            renames.extend(rar_rename_owned(
+                &dir,
+                Some((&engine.artifacts(), job_id.0)),
+            )?);
         }
     }
     let rename_map: std::collections::HashMap<PathBuf, PathBuf> = renames.into_iter().collect();
@@ -1637,7 +1647,16 @@ async fn process_job_ctx_from(
     let mut deobfuscated: Vec<(PathBuf, PathBuf)> = Vec::new();
     if from.includes(RestartPoint::Cleanup) && cfg.deobfuscate_final && par_ok && unpack_ok {
         stages.enter(PostStage::PostUnpackRename).await;
-        deobfuscated = crate::deobfuscate::deobfuscate_dir(&dir, &sanitized, &par2_names)?;
+        deobfuscated = crate::deobfuscate::restore_media_extensions_owned(
+            &dir,
+            &par2_names,
+            Some((&engine.artifacts(), job_id.0)),
+        )?;
+        deobfuscated.extend(crate::deobfuscate::deobfuscate_dir(
+            &dir,
+            &sanitized,
+            &par2_names,
+        )?);
         for (from, to) in &deobfuscated {
             tracing::info!(
                 job = job_id.0,
@@ -1663,8 +1682,12 @@ async fn process_job_ctx_from(
     // path in the event, in history, and in compat `FinalDir` is the path
     // the files are actually at. Moving earlier would fight the unpack
     // staging; moving later would report a path that is about to change.
-    if from.includes(RestartPoint::Move) {
-        if let Some(target_root) = rule.as_ref().and_then(|r| r.dest_dir.as_ref()) {
+    if from.includes(RestartPoint::Move) && par_ok && unpack_ok {
+        if let Some(target_root) = rule
+            .as_ref()
+            .and_then(|r| r.dest_dir.as_ref())
+            .or(cfg.completed_dir.as_ref())
+        {
             let target = target_root.join(&sanitized);
             if target != dir && dir.exists() {
                 let _ = std::fs::remove_dir_all(&staging); // never move the lease's scratch
@@ -1688,21 +1711,10 @@ async fn process_job_ctx_from(
                         dir = result.published_path;
                     }
                     Err(e) => {
-                        // Report where the files ARE, not where they were
-                        // meant to go. A wrong path here is the silent import
-                        // failure this whole change exists to remove.
-                        tracing::error!(
-                            job = job_id.0,
-                            to = %target.display(),
-                            error = %e,
-                            "category move failed; leaving the files in the global destination"
-                        );
-                        if nzbd_engine::is_out_of_space(&e.to_string()) {
-                            engine.report_out_of_space(format!(
-                                "category move to {}: {e}",
-                                target.display()
-                            ));
-                        }
+                        return Err(PostError::Subprocess(format!(
+                            "publish completed payload to {}: {e}",
+                            target.display()
+                        )));
                     }
                 }
             }

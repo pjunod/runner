@@ -279,6 +279,17 @@ pub(crate) enum QueueCommand {
     // -- post-processing hooks (phase 2) ------------------------------------
     /// Post-processing state transitions (PostQueued / Post{stage} /
     /// terminal). Only meaningful on jobs whose download already finished.
+    AbandonRelocation {
+        operation: String,
+        revision: u64,
+        generation: String,
+        reply: oneshot::Sender<Result<nzbd_state::artifacts::Artifact, String>>,
+    },
+    RetryPostHold {
+        job: JobId,
+        revision: String,
+        reply: oneshot::Sender<bool>,
+    },
     BeginResourceProbe {
         job: JobId,
         revision: String,
@@ -774,7 +785,7 @@ impl Owner {
                 .reconcile_startup(&state.jobs.iter().map(|job| job.id.0).collect::<Vec<_>>())
                 .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?;
             for job in &state.jobs {
-                if job.torrent.is_none() {
+                if job.torrent.is_none() && artifacts.for_job(job.id.0).ok().flatten().is_none() {
                     artifacts
                         .register_legacy_active(
                             job.id.0,
@@ -814,7 +825,12 @@ impl Owner {
                 }
             }
             for j in &mut state.jobs {
-                let dir = dest_dir.join(job_dir_name(j));
+                let dir = artifacts
+                    .for_job(j.id.0)
+                    .ok()
+                    .flatten()
+                    .map(|a| a.path)
+                    .unwrap_or_else(|| dest_dir.join(job_dir_name(j)));
                 for f in &mut j.files {
                     let key = format!("*File:size:{}", f.id.0);
                     if let Some(size) = j
@@ -2033,6 +2049,129 @@ impl Owner {
                 self.publish_now();
                 self.bump_epoch();
                 let _ = reply.send(());
+            }
+            QueueCommand::AbandonRelocation {
+                operation,
+                revision,
+                generation,
+                reply,
+            } => {
+                let result = (|| {
+                    let op = self
+                        .artifacts
+                        .operation(&operation)
+                        .map_err(|e| e.to_string())?;
+                    let artifact = self
+                        .artifacts
+                        .get(&op.artifact)
+                        .map_err(|e| e.to_string())?;
+                    if let Some(job) = artifact.job.map(JobId) {
+                        if self.retiring_writers.contains_key(&job) {
+                            return Err("payload retirement is in progress".into());
+                        }
+                        if let Some(j) = self.state.job(job) {
+                            let held_move = j.control().is_some_and(|c| {
+                                c.lifecycle == "held"
+                                    && matches!(c.cause.as_str(), "unknown" | "post_failure")
+                                    && c.stage == "move"
+                            });
+                            if !held_move
+                                || j.files.iter().any(|f| {
+                                    self.writers
+                                        .get(&f.id)
+                                        .is_some_and(|w| !*w.stopped.borrow())
+                                })
+                            {
+                                return Err("only a quiescent post-processing move hold can be abandoned while the job is queued".into());
+                            }
+                        }
+                    }
+                    self.artifacts
+                        .abandon_relocation(&operation, revision, &generation)
+                        .map_err(|e| e.to_string())
+                })();
+                let _ = reply.send(result);
+            }
+            QueueCommand::RetryPostHold {
+                job,
+                revision,
+                reply,
+            } => {
+                let before = self.state.job(job).cloned();
+                let control = before.as_ref().and_then(|j| j.control()).filter(|c| {
+                    c.lifecycle == "held"
+                        && c.revision == revision
+                        && matches!(c.cause.as_str(), "unknown" | "post_failure")
+                        && matches!(
+                            c.previous_status,
+                            Some(
+                                JobStatus::Post { .. }
+                                    | JobStatus::PostQueued
+                                    | JobStatus::Completed
+                            )
+                        )
+                        && matches!(
+                            c.stage.as_str(),
+                            "par_rename"
+                                | "rar_rename"
+                                | "par_verify"
+                                | "par_repair"
+                                | "unpack"
+                                | "extract"
+                                | "cleanup"
+                                | "post_unpack_rename"
+                                | "move"
+                        )
+                });
+                let mut changed = None;
+                if !self.retiring_writers.contains_key(&job)
+                    && before.as_ref().is_some_and(|j| {
+                        !j.params.iter().any(|(k, _)| k == nzbd_types::PP_DONE_PARAM)
+                            && j.files.iter().all(|f| {
+                                self.writers.get(&f.id).is_none_or(|w| *w.stopped.borrow())
+                            })
+                    })
+                {
+                    if let Some(mut c) = control {
+                        if let Some(next) = c
+                            .revision
+                            .parse::<u64>()
+                            .ok()
+                            .and_then(|r| r.checked_add(1))
+                        {
+                            match self.artifacts.validate_post_retry(job.0) {
+                                Ok(()) => {
+                                    c.revision = next.to_string();
+                                    c.lifecycle = "running".into();
+                                    c.manual_pause = false;
+                                    c.message =
+                                        "Post-processing retry admitted after custody validation"
+                                            .into();
+                                    let j = self.state.job_mut(job).unwrap();
+                                    j.status = JobStatus::PostQueued;
+                                    j.set_control(&c);
+                                    changed = Some(c);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(job=job.0, error=%e, "post-processing retry refused")
+                                }
+                            }
+                        }
+                    }
+                }
+                self.dirty |= changed.is_some();
+                let ok = changed.is_some() && (!self.persist || self.save_snapshot());
+                if ok {
+                    self.bump_epoch();
+                    self.publish_now();
+                    self.emit(Event::JobControlChanged {
+                        job,
+                        control: changed.unwrap(),
+                    });
+                } else if let Some(before) = before {
+                    *self.state.job_mut(job).unwrap() = before;
+                }
+                let _ = reply.send(ok);
             }
             QueueCommand::BeginResourceProbe {
                 job,
@@ -3430,6 +3569,12 @@ impl Owner {
             .state
             .job(job)
             .ok_or(nzbd_state::artifacts::Error::NotFound)?;
+        if let Some(existing) = self.artifacts.for_job(job.0)? {
+            self.artifacts
+                .allocate(job.0, &existing.root, &existing.path)?;
+            self.allocated_jobs.insert(job);
+            return Ok(());
+        }
         let dir = self.dest_dir.join(job_dir_name(record));
         self.artifacts.allocate(job.0, &self.dest_dir, &dir)?;
         self.allocated_jobs.insert(job);
@@ -3456,7 +3601,13 @@ impl Owner {
         // `job_dir`, never `job.name`: a job that renamed itself from its
         // par2 metadata mid-download must not split its files across two
         // directories.
-        let dir = self.dest_dir.join(job_dir);
+        let dir = self
+            .artifacts
+            .for_job(job.0)
+            .ok()
+            .flatten()
+            .map(|a| a.path)
+            .unwrap_or_else(|| self.dest_dir.join(job_dir));
         if let Err(e) = self.ensure_allocation(job) {
             tracing::error!(job = job.0, error = %e, "writer held: allocation not committed");
             let (tx, _) = mpsc::channel(1);
@@ -5786,6 +5937,43 @@ mod tests {
         assert!(rx.await.unwrap());
         assert!(epoch.has_changed().unwrap());
         assert_eq!(owner.grant_work(ServerId(1), 1)[0].r.job, JobId(1));
+    }
+
+    #[tokio::test]
+    async fn post_hold_retry_checks_revision_custody_and_stage_then_persists() {
+        let (tmp, mut owner, _adapter) = control_test_owner();
+        let mut job = bare_job();
+        job.dir_name = "pp".into();
+        owner.state.jobs.push(job);
+        owner.ensure_allocation(JobId(1)).unwrap();
+        assert!(owner.hold_job(JobId(1), "post_failure", "unpack", "tool failed"));
+        let revision = owner.state.jobs[0].control().unwrap().revision;
+        for expected_revision in ["stale".to_string(), revision.clone()] {
+            let (reply, rx) = oneshot::channel();
+            owner.on_command(QueueCommand::RetryPostHold {
+                job: JobId(1),
+                revision: expected_revision.clone(),
+                reply,
+            });
+            assert_eq!(rx.await.unwrap(), expected_revision == revision);
+        }
+        assert_eq!(owner.state.jobs[0].status, JobStatus::PostQueued);
+        let persisted = SnapshotStore::open(&tmp.path().join("state"))
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        let restored = QueueState::from_doc(persisted);
+        assert!(!restored.jobs[0].held());
+        assert!(owner.hold_job(JobId(1), "post_failure", "script", "uncertain script"));
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::RetryPostHold {
+            job: JobId(1),
+            revision: owner.state.jobs[0].control().unwrap().revision,
+            reply,
+        });
+        assert!(!rx.await.unwrap());
+        assert!(owner.state.jobs[0].held());
     }
 
     #[tokio::test]
