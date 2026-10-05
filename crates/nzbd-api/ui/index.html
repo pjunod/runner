@@ -295,8 +295,8 @@ try {
      column's width. The other columns keep short metrics and controls intact. */
   #tab-queue { container-type: inline-size; }
   .queue-table { table-layout: fixed; }
-  .queue-table .col-status { width: 80px; }
-  .queue-table .col-progress { width: 28%; }
+  .queue-table .col-status { width: 120px; }
+  .queue-table .col-progress { width: 26%; }
   .queue-table .col-size { width: 78px; }
   .queue-table .col-health { width: 120px; }
   .queue-table .col-actions { width: 164px; }
@@ -308,6 +308,7 @@ try {
   .queue-table .queue-size, .queue-table .health { white-space: nowrap; }
   .queue-table .hnote { margin-top: 4px; line-height: 1.4; overflow-wrap: anywhere; }
   .queue-table .acts { gap: 4px; }
+  .queue-table .queue-status .st { max-width: 100%; box-sizing: border-box; overflow-wrap: anywhere; }
 
   .meter { min-width: 170px; }
   .meter .bar { display: flex; align-items: center; gap: 8px; }
@@ -948,8 +949,8 @@ try {
     .queue-table .hnote { margin-top: 0; }
     .queue-table .job-row > .queue-actions { grid-column: 2; grid-row: 2 / 4; }
     .queue-table .acts { flex-direction: row; align-items: center; }
-    .queue-table > tbody > :is(.section-tr, .detail-tr) { display: block; }
-    .queue-table > tbody > :is(.section-tr, .detail-tr) > td { display: block; }
+    .queue-table > tbody > tr:not(.job-row) { display: block; }
+    .queue-table > tbody > tr:not(.job-row) > td { display: block; }
   }
   @container (max-width: 560px) {
     .queue-table .job-row { grid-template-columns: minmax(0, 1fr); gap: 10px; }
