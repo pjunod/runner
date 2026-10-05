@@ -16,6 +16,8 @@ export type QueueSectionKey =
   | 'cleaning'
   | 'moving'
   | 'scripting'
+  | 'attention'
+  | 'paused'
   | 'waiting';
 
 export interface QueueSectionDefinition {
@@ -50,6 +52,8 @@ export const QUEUE_SECTIONS: readonly QueueSectionDefinition[] = [
   { key: 'scripting', label: 'Running scripts', ordered: false },
   { key: 'seeding', label: 'Seeding', ordered: false, collapsible: true },
   { key: 'completed', label: 'Completed', ordered: false, collapsible: true },
+  { key: 'attention', label: 'Needs attention', ordered: false, collapsible: true },
+  { key: 'paused', label: 'Paused', ordered: false, collapsible: true },
   { key: 'waiting', label: 'Waiting', ordered: true, collapsible: true },
 ];
 
@@ -77,21 +81,27 @@ export function currentPostStage(
 }
 
 export function queueSectionKey(job: JobSummary): QueueSectionKey {
+  if (job.control?.lifecycle === 'held' || job.status === 'failed') return 'attention';
   const phase = torrentDisplayPhase(job);
   if (phase) {
     if (phase === 'seeding') return 'seeding';
     if (phase === 'paused_seed') return 'completed';
     if (phase === 'checking' || phase === 'downloading') return phase;
     if (phase === 'fetching_source' || phase === 'fetching_metadata') return 'torrent_metadata';
-    return 'waiting';
+    if (['failed', 'missing_files', 'storage_hold', 'unknown'].includes(phase)) return 'attention';
+    if (phase === 'paused_download') return 'paused';
+    return phase === 'queued' ? 'waiting' : 'attention';
   }
   const { status, stages } = job;
+  if (status === 'paused') return 'paused';
+  if (job.pp_done || job.ready) return 'completed';
   const stage = currentPostStage(status, stages);
   if (stage) return POST_STAGE_SECTIONS[stage] ?? 'post_queued';
   if (status === 'downloading' || status === 'fetching' || status === 'post_queued') {
     return status;
   }
-  return 'waiting';
+  if (status === 'completed') return 'post_queued';
+  return status === 'queued' ? 'waiting' : 'attention';
 }
 
 export function sectionQueueJobs(jobs: readonly JobSummary[]): QueueJobSection[] {

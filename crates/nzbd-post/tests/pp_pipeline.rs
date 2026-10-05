@@ -312,7 +312,7 @@ async fn corrupt_nested_payload_after_prefix_gets_repaired_without_losing_origin
 /// Damage beyond the recovery blocks on hand and nothing left to unpause:
 /// PAR_FAILURE, job marked Failed.
 #[tokio::test]
-async fn insufficient_parity_holds_originals_without_terminal_history() {
+async fn insufficient_parity_records_failure_and_retains_requested_originals() {
     if !require_tool("par2") {
         return;
     }
@@ -345,21 +345,25 @@ async fn insufficient_parity_holds_originals_without_terminal_history() {
         .unwrap();
 
     let hist = history(tmp.path());
-    assert!(process_job(
+    let outcome = process_job(
         &engine,
-        &PostConfig::default(),
+        &PostConfig {
+            failure_action: FailureAction::None,
+            ..PostConfig::default()
+        },
         &hist,
         &tmp.path().join("dest"),
-        JobId(3)
+        JobId(3),
     )
     .await
-    .is_err());
+    .unwrap();
+    assert_eq!(outcome, PpFinal::ParFailure);
     let job = engine.export_job(JobId(3)).await.unwrap().unwrap();
-    assert!(job.held());
-    assert_eq!(job.control().unwrap().stage, "par_repair");
-    assert!(hist.list(10).unwrap().is_empty());
+    assert!(!job.held() && !job.ready());
+    assert_eq!(job.status, JobStatus::Failed);
+    assert_eq!(hist.list(10).unwrap()[0].status, "PAR_FAILURE");
     assert_eq!(std::fs::read(dir.join("payload.bin")).unwrap(), bad);
-    assert!(!job.params.iter().any(|(k, _)| k == PP_DONE_PARAM));
+    assert!(job.params.iter().any(|(k, _)| k == PP_DONE_PARAM));
     engine.shutdown().await;
 }
 
@@ -368,7 +372,7 @@ async fn insufficient_parity_holds_originals_without_terminal_history() {
 /// old behaviour and stays available for an operator who wants the
 /// forensics.
 #[tokio::test]
-async fn insufficient_parity_cannot_trigger_destructive_failure_disposition() {
+async fn insufficient_parity_obeys_failure_disposition() {
     if !require_tool("par2") {
         return;
     }
@@ -404,7 +408,7 @@ async fn insufficient_parity_cannot_trigger_destructive_failure_disposition() {
 
         let parked_root = tmp.path().join("failed");
         let hist = history(tmp.path());
-        assert!(process_job(
+        let outcome = process_job(
             &engine,
             &PostConfig {
                 failure_action: action,
@@ -413,19 +417,24 @@ async fn insufficient_parity_cannot_trigger_destructive_failure_disposition() {
             },
             &hist,
             &tmp.path().join("dest"),
-            JobId(job_id)
+            JobId(job_id),
         )
         .await
-        .is_err());
-        assert!(engine
+        .unwrap();
+        assert_eq!(outcome, PpFinal::ParFailure);
+        assert!(!engine
             .export_job(JobId(job_id))
             .await
             .unwrap()
             .unwrap()
             .held());
-        assert_eq!(std::fs::read(dir.join("payload.bin")).unwrap(), bad);
-        assert!(hist.list(10).unwrap().is_empty());
-        assert!(!parked_root.exists());
+        let retained = if action == FailureAction::Park {
+            parked_root.join("hopeless")
+        } else {
+            dir.clone()
+        };
+        assert_eq!(std::fs::read(retained.join("payload.bin")).unwrap(), bad);
+        assert_eq!(hist.list(10).unwrap()[0].status, "PAR_FAILURE");
         engine.shutdown().await;
     }
 }
@@ -2880,4 +2889,74 @@ async fn held_move_retry_reuses_a_verified_successful_extraction() {
     tracker.close();
     tracker.wait().await;
     engine.shutdown().await;
+}
+
+/// A sealed file is usable by PAR, but never exposed as finished media first.
+#[tokio::test]
+async fn private_partial_repairs_with_par_and_fails_without_par() {
+    if !require_tool("par2") {
+        return;
+    }
+    for has_par in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = spawn_engine(tmp.path()).await;
+        let dir = tmp.path().join("dest/partial");
+        std::fs::create_dir_all(&dir).unwrap();
+        let data: Vec<u8> = (0..60000u32).map(|i| ((i * 11) % 251) as u8).collect();
+        std::fs::write(dir.join("payload.bin"), &data).unwrap();
+        if has_par {
+            par2_create(&dir, 4, &["payload.bin"]);
+        }
+        let mut partial = data.clone();
+        partial[8192..16384].fill(0);
+        std::fs::remove_file(dir.join("payload.bin")).unwrap();
+        std::fs::write(dir.join(".runner-file-1.part"), &partial).unwrap();
+        let mut files = vec![file_entry(1, "obfuscated.bin", None, false)];
+        if has_par {
+            files.extend(par2_entries(&dir, 2));
+        }
+        let mut job = completed_job(800, "partial", files);
+        job.params
+            .push(("*File:repair:1".into(), data.len().to_string()));
+        engine
+            .import_fixture_job(tmp.path(), job, false, false)
+            .await
+            .unwrap();
+        let hist = history(tmp.path());
+        let outcome = process_job(
+            &engine,
+            &PostConfig {
+                unpack: false,
+                deobfuscate_final: false,
+                failure_action: FailureAction::None,
+                ..PostConfig::default()
+            },
+            &hist,
+            &tmp.path().join("dest"),
+            JobId(800),
+        )
+        .await
+        .unwrap();
+        let job = engine.export_job(JobId(800)).await.unwrap().unwrap();
+        assert!(!job.held());
+        assert_eq!(job.ready(), has_par);
+        assert_eq!(
+            outcome,
+            if has_par {
+                PpFinal::Success
+            } else {
+                PpFinal::ParFailure
+            }
+        );
+        assert!(!dir.join("obfuscated.bin").exists());
+        assert_eq!(
+            std::fs::read(dir.join(".runner-file-1.part")).unwrap(),
+            partial
+        );
+        if has_par {
+            assert_eq!(std::fs::read(dir.join("payload.bin")).unwrap(), data);
+        }
+        assert_eq!(hist.list(10).unwrap().len(), 1);
+        engine.shutdown().await;
+    }
 }

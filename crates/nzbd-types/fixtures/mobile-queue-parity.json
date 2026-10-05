@@ -38,7 +38,8 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "downloading",
     "section": "downloading",
@@ -86,7 +87,8 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "fetching_source",
     "section": "torrent_metadata",
@@ -134,7 +136,8 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "fetching_metadata",
     "section": "torrent_metadata",
@@ -182,7 +185,8 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "checking",
     "section": "checking",
@@ -230,7 +234,8 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "queued",
     "section": "waiting",
@@ -278,7 +283,8 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "seeding",
     "section": "seeding",
@@ -326,7 +332,8 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "seeding",
     "section": "seeding",
@@ -374,7 +381,8 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "paused_seed",
     "section": "completed",
@@ -427,7 +435,8 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "paused_seed",
     "section": "completed",
@@ -475,10 +484,11 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "paused_download",
-    "section": "waiting",
+    "section": "paused",
     "statusLabel": "download paused",
     "action": "resume",
     "actionLabel": "resume",
@@ -527,10 +537,11 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "missing_files",
-    "section": "waiting",
+    "section": "attention",
     "statusLabel": "missing files",
     "action": "resume",
     "actionLabel": "re-download missing files",
@@ -575,10 +586,11 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "failed",
-    "section": "waiting",
+    "section": "attention",
     "statusLabel": "torrent error",
     "action": null,
     "actionLabel": null,
@@ -623,10 +635,11 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "failed",
-    "section": "waiting",
+    "section": "attention",
     "statusLabel": "torrent error",
     "action": null,
     "actionLabel": null,
@@ -671,10 +684,11 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "storage_hold",
-    "section": "waiting",
+    "section": "attention",
     "statusLabel": "waiting for disk space",
     "action": null,
     "actionLabel": null,
@@ -719,7 +733,8 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "queued",
     "section": "waiting",
@@ -767,7 +782,8 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "seeding",
     "section": "seeding",
@@ -815,10 +831,11 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "paused_download",
-    "section": "waiting",
+    "section": "paused",
     "statusLabel": "download paused",
     "action": "pause",
     "actionLabel": "pause",
@@ -863,7 +880,8 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "fetching_metadata",
     "section": "torrent_metadata",
@@ -911,10 +929,11 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "unknown",
-    "section": "waiting",
+    "section": "attention",
     "statusLabel": "torrent state unavailable",
     "action": null,
     "actionLabel": null,
@@ -959,10 +978,11 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": "unknown",
-    "section": "waiting",
+    "section": "attention",
     "statusLabel": "torrent state unavailable",
     "action": null,
     "actionLabel": null,
@@ -1007,7 +1027,8 @@
       "dupe_key": "",
       "dupe_score": 0,
       "params": [],
-      "stages": []
+      "stages": [],
+      "critical_health_estimated": true
     },
     "phase": null,
     "section": "downloading",
@@ -1060,7 +1081,8 @@
           "stage": "par_verify",
           "started_at_unix": 100
         }
-      ]
+      ],
+      "critical_health_estimated": true
     },
     "phase": null,
     "section": "verifying",

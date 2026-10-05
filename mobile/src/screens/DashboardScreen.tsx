@@ -614,13 +614,14 @@ export function JobCard({
 }) {
   const progress = jobProgress(job);
   const statusKey = jobStatusKey(job.status);
-  const canPause = ['queued', 'downloading', 'fetching'].includes(statusKey);
-  const canResume = isJobPaused(job.status);
+  const hold = job.control?.lifecycle === 'held' ? job.control : undefined;
+  const canPause = !hold && ['queued', 'downloading', 'fetching'].includes(statusKey);
+  const canResume = isJobPaused(job.status) && (!hold || hold.retry_policy === 'resume_same_job');
   const phase = torrentDisplayPhase(job);
   const torrentAction = torrentPrimaryAction(job);
   const seed = phase === 'seeding' || phase === 'paused_seed';
   const postProcessing = job.kind !== 'torrent' && isPostProcessingSection(sectionKey);
-  const showStatus = !!phase || sectionKey === 'waiting';
+  const showStatus = !!phase || ['waiting', 'attention', 'paused'].includes(sectionKey);
   const showProgress = !postProcessing && !seed && !['fetching_source', 'fetching_metadata', 'failed', 'missing_files'].includes(phase ?? '');
   return (
     <View
@@ -654,9 +655,10 @@ export function JobCard({
         <View style={styles.jobMeta}>
           {showStatus ? (
             <Text style={[styles.status, (statusKey === 'failed' || phase === 'missing_files' || phase === 'failed') && styles.statusFailed]}>
-              {phase ? torrentStatus(job) : jobStatusLabel(job.status, job.ready)}
+              {hold ? 'held' : phase ? torrentStatus(job) : jobStatusLabel(job.status, job.ready)}
             </Text>
           ) : null}
+          {hold ? <Text style={styles.statusFailed}>{hold.message}</Text> : null}
           <Text style={styles.metaText}>
             {seed ? 'Files ready' : `${formatBytes(job.downloaded_bytes)} / ${formatBytes(job.size_bytes)}`}
           </Text>
@@ -785,11 +787,11 @@ const QUEUE_STAGE_ACCENTS: Partial<Record<QueueSectionKey, string>> = {
 };
 
 function queueSectionTone(section: QueueSectionKey, theme: Theme): QueueSectionTone {
-  if (section === 'waiting') return { accent: theme.textMuted, background: theme.panel };
+  if (section === 'waiting' || section === 'paused') return { accent: theme.textMuted, background: theme.panel };
   const accent =
     section === 'downloading'
       ? theme.success
-      : section === 'post_queued'
+      : (section === 'post_queued' || section === 'attention')
         ? theme.warning
         : QUEUE_STAGE_ACCENTS[section] ?? theme.accent;
   return {

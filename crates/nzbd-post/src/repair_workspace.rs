@@ -7,6 +7,8 @@ pub async fn repair(
     job: u32,
     set: &Par2Set,
     tool: &Par2Tool,
+    partials: &[(std::path::PathBuf, String)],
+    restored: &mut std::collections::HashSet<std::path::PathBuf>,
 ) -> Result<VerifyResult, PostError> {
     let token = set
         .set_id
@@ -19,8 +21,18 @@ pub async fn repair(
     let root = workspace.scratch.path.clone();
     let bytes = set.files.iter().map(|f| f.length).sum();
     let _capacity = nzbd_state::capacity::reserve(&root, bytes)?;
-    let candidates = crate::namespace::files(&set.root)?;
+    let mut candidates = crate::namespace::files(&set.root)?;
+    // Only engine-recorded, quiescent checkpoints enter the private repair
+    // workspace. Generic post-processing still cannot discover partials.
+    for (path, _) in partials {
+        if path.parent() == Some(set.root.as_path()) && path.try_exists()? {
+            candidates.push(path.clone());
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
     let mut mappings = Vec::new();
+    let mut recovered = Vec::new();
     for file in &set.files {
         let relative = crate::namespace::relative(&file.name)?;
         let target = root.join(&relative);
@@ -40,9 +52,9 @@ pub async fn repair(
             {
                 continue;
             }
-            if candidate
-                .extension()
-                .is_some_and(|e| e == "part" || e == "par2")
+            if candidate.extension().is_some_and(|e| e == "par2")
+                || (candidate.extension().is_some_and(|e| e == "part")
+                    && !partials.iter().any(|(path, _)| path == candidate))
             {
                 continue;
             }
@@ -61,6 +73,16 @@ pub async fn repair(
         }
         ranked.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
         let Some((score, source)) = ranked.first() else {
+            // A wholly absent file can still be reconstructed when its NZB
+            // name agrees with the PAR catalog; final full MD5 is mandatory.
+            recovered.extend(
+                partials
+                    .iter()
+                    .filter(|(path, name)| {
+                        path.parent() == Some(set.root.as_path()) && name == &file.name
+                    })
+                    .map(|(path, _)| path.clone()),
+            );
             continue;
         };
         if ranked.get(1).is_some_and(|(next, _)| next == score) {
@@ -72,7 +94,11 @@ pub async fn repair(
             nzbd_state::fileops::parents(&root, parent)
                 .map_err(|e| PostError::Subprocess(e.to_string()))?;
         }
-        mappings.push(source.to_path_buf());
+        if partials.iter().any(|(path, _)| path == *source) {
+            recovered.push(source.to_path_buf());
+        } else {
+            mappings.push(source.to_path_buf());
+        }
         if !target.exists() {
             nzbd_state::fileops::copy_publish(source, &target)
                 .map_err(|e| PostError::Subprocess(e.to_string()))?;
@@ -140,6 +166,7 @@ pub async fn repair(
     inventory
         .finish_workspace(&workspace)
         .map_err(|e| PostError::Subprocess(e.to_string()))?;
+    restored.extend(recovered);
     Ok(VerifyResult::Intact)
 }
 

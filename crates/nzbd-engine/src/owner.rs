@@ -844,7 +844,9 @@ impl Owner {
                     // Revalidate even old page-cache acknowledgements. Sparse length
                     // alone proves nothing; only matching range bytes retain Done.
                     let stable = dir.join(format!(".runner-file-{}.part", f.id.0));
-                    let path = if f.finalized {
+                    let repair_key = format!("*File:repair:{}", f.id.0);
+                    let repair_pending = j.params.iter().any(|(key, _)| key == &repair_key);
+                    let path = if f.finalized && !repair_pending {
                         dir.join(&f.filename)
                     } else if stable.exists() {
                         stable
@@ -858,6 +860,44 @@ impl Owner {
                                 f.finalized = false;
                                 f.crc32 = None;
                             }
+                        }
+                    }
+                }
+                if let Some(mut control) = j.control().filter(|c| {
+                    c.version == 1
+                        && c.lifecycle == "held"
+                        && !c.manual_pause
+                        && c.cause == "identity_conflict"
+                        && c.stage == "finalize"
+                        && c.message
+                            == "file coverage or expected size is unverified; partial retained"
+                }) {
+                    if let Some(revision) = control
+                        .revision
+                        .parse::<u64>()
+                        .ok()
+                        .and_then(|r| r.checked_add(1))
+                    {
+                        control.revision = revision.to_string();
+                        control.lifecycle = "running".into();
+                        control.message = "rechecking retained download for repair".into();
+                        j.set_control(&control);
+                        j.status = JobStatus::Queued;
+                    }
+                }
+                if let Some(mut control) = j.control().filter(|c|
+                    c.version == 1 && c.lifecycle == "held" && !c.manual_pause
+                    && matches!(c.cause.as_str(), "unknown" | "post_failure")
+                    && c.stage == "rar_rename"
+                    && c.message == "subprocess failed: RAR set lacks checked order/membership evidence; filenames preserved")
+                {
+                    if artifacts.validate_post_retry(j.id.0).is_ok() {
+                        if let Some(revision) = control.revision.parse::<u64>().ok().and_then(|r| r.checked_add(1)) {
+                            control.revision = revision.to_string();
+                            control.lifecycle = "running".into();
+                            control.message = "retrying archive restoration with SFV evidence".into();
+                            j.set_control(&control);
+                            j.status = JobStatus::PostQueued;
                         }
                     }
                 }
@@ -3198,8 +3238,16 @@ impl Owner {
         if range_checkpoint {
             combined_crc = None;
         }
-        if !range_checkpoint && (combined_crc.is_none() || file_size == 0 || coverage != file_size)
-        {
+        // Missing articles and holes in an NZB are repair inputs, not identity
+        // conflicts. Reject unknown sizes and overlapping/out-of-bounds ranges.
+        let mut end = 0;
+        let valid_ranges = file_size > 0
+            && segs.iter().all(|(offset, len, _)| {
+                let valid = *offset >= end && *len > 0;
+                end = offset.checked_add(u64::from(*len)).unwrap_or(u64::MAX);
+                valid && end <= file_size
+            });
+        if !range_checkpoint && !valid_ranges {
             self.hold_job(
                 job,
                 "identity_conflict",
@@ -3207,6 +3255,61 @@ impl Owner {
                 "file coverage or expected size is unverified; partial retained",
             );
             return;
+        }
+        if !range_checkpoint && (combined_crc.is_none() || coverage != file_size) {
+            let key = format!("*File:repair:{}", file.0);
+            let j = self.state.job_mut(job).unwrap();
+            if !j.params.iter().any(|(k, _)| k == &key) {
+                j.params.push((key, file_size.to_string()));
+                self.dirty = true;
+                if self.persist && !self.save_snapshot() {
+                    self.hold_job(
+                        job,
+                        "io",
+                        "finalize",
+                        "partial checkpoint metadata could not be persisted",
+                    );
+                    return;
+                }
+            }
+            let tx = self.writer_for(job, file);
+            match tx.try_send(WriteCmd::SealPartial {
+                file_size,
+                ranges: segs,
+            }) {
+                Ok(()) => {
+                    self.finalize_sent.insert(file);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => self.pending_finalize.push((job, file)),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.writers.remove(&file);
+                    self.pending_finalize.push((job, file));
+                }
+            }
+            return;
+        }
+        if !range_checkpoint
+            && self
+                .state
+                .job(job)
+                .is_some_and(|j| j.file_needs_repair(file))
+        {
+            let key = format!("*File:repair:{}", file.0);
+            self.state
+                .job_mut(job)
+                .unwrap()
+                .params
+                .retain(|(name, _)| name != &key);
+            self.dirty = true;
+            if self.persist && !self.save_snapshot() {
+                self.hold_job(
+                    job,
+                    "io",
+                    "finalize",
+                    "complete checkpoint metadata could not be persisted",
+                );
+                return;
+            }
         }
         let filename = self
             .state
@@ -4658,6 +4761,7 @@ impl Owner {
                     files_done: j.files.iter().filter(|f| f.is_terminal()).count() as u32,
                     health: health.0,
                     critical_health: critical.0,
+                    critical_health_estimated: Health::calc_critical(&j.totals, false) != critical,
                     assigned_node: self.delegated.get(&j.id).cloned(),
                     pp_done: j.params.iter().any(|(k, _)| k == nzbd_types::PP_DONE_PARAM),
                     ready: j.ready(),
@@ -5186,6 +5290,45 @@ mod tests {
         )
         .unwrap();
         (tmp, owner, adapter)
+    }
+
+    #[tokio::test]
+    async fn intact_publication_clears_previous_private_repair_marker() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let mut job = pending_job(1);
+        let file = job.files[0].id;
+        job.params
+            .push((format!("*File:repair:{}", file.0), "5".into()));
+        job.files[0].segments[0].state = SegmentState::Done {
+            offset: 0,
+            len: 5,
+            crc: crc32fast::hash(b"hello"),
+        };
+        owner.state.jobs.push(job);
+        owner.file_sizes.insert(file, 5);
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_done, stopped) = watch::channel(false);
+        owner.writers.insert(
+            file,
+            WriterHandle {
+                tx,
+                stop: CancellationToken::new(),
+                stopped,
+            },
+        );
+        owner.send_finalize(JobId(1), file);
+        assert!(!owner.state.job(JobId(1)).unwrap().file_needs_repair(file));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            WriteCmd::PublicationName(_)
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            WriteCmd::Finalize {
+                combined_crc: Some(_),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

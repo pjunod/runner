@@ -20,6 +20,11 @@ use tokio_util::task::TaskTracker;
 #[derive(Debug)]
 pub enum WriteCmd {
     PublicationName(String),
+    /// Flush and validate received ranges, retaining the private partial path.
+    SealPartial {
+        file_size: u64,
+        ranges: Vec<(u64, u32, u32)>,
+    },
     #[cfg(test)]
     InjectFailure(&'static str, i32),
     Segment {
@@ -110,6 +115,42 @@ async fn writer_task(
             #[cfg(test)]
             WriteCmd::InjectFailure(stage, code) => {
                 fault = Some((stage, code));
+            }
+            WriteCmd::SealPartial { file_size, ranges } => {
+                let result = async {
+                    if let Some(f) = out.as_mut() {
+                        f.sync_data().await?;
+                    }
+                    drop(out.take());
+                    let metadata = std::fs::symlink_metadata(&part_path)?;
+                    if file_size == 0
+                        || !metadata.is_file()
+                        || metadata.len() != file_size
+                        || ranges.iter().any(|(offset, len, crc)| {
+                            !validate_range(&part_path, *offset, u64::from(*len), *crc)
+                        })
+                    {
+                        return Err(std::io::Error::other("partial checkpoint identity differs"));
+                    }
+                    Ok::<_, std::io::Error>(())
+                }
+                .await;
+                let message = match result {
+                    Ok(()) => EngineMsg::WriterFinalized {
+                        job,
+                        file: file_id,
+                        ok: true,
+                        final_path: Some(part_path.clone()),
+                        combined_crc: None,
+                    },
+                    Err(error) => EngineMsg::WriterError {
+                        job,
+                        file: file_id,
+                        error: format!("seal partial: {error}"),
+                    },
+                };
+                let _ = engine_tx.send(message).await;
+                return;
             }
             WriteCmd::PublicationName(name) => {
                 if name.is_empty()

@@ -379,13 +379,16 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(f.size, "—", "no size until the NZB lands");
   eq(f.pauseHidden, true, "nothing to pause while fetching");
   const doomed = T.rowModel(job(1, { health: 700 }), { idx: 0, count: 1, healthAbortArmed: true });
-  eq(doomed.hNote, "unrepairable · aborting", "armed health-abort is stated on the row");
+  eq(doomed.hNote, "below health threshold · aborting", "armed health-abort is stated on the row");
   const doomed2 = T.rowModel(job(1, { health: 700 }), { idx: 0, count: 1, healthAbortArmed: false });
-  eq(doomed2.hNote, "unrepairable · will fail at end", "…and so is the un-armed case");
+  eq(doomed2.hNote, "below estimated repair threshold", "…and so is the un-armed case");
   const held = job(1, { status: "paused", control: {
     lifecycle: "held", cause: "identity_conflict", retry_policy: "review",
     message: "conflicting yEnc declared size",
   } });
+  eq(T.sectionOf({ ...held, stages: [{ stage: "unpack", started_at_unix: 1 }] }), "attention", "hold overrides a stale stage");
+  eq(T.sectionOf(job(2, { status: "completed", pp_done: false })), "post_queued", "completed download awaits post-processing");
+  ok(T.rowModel(job(3, { critical_health_estimated: true })).hNote.includes("unconfirmed"), "fallback threshold does not promise repair data");
   const heldRow = T.rowModel(held, { mixedSection: false });
   eq(heldRow.st, "HELD", "a hold is distinct from a manual pause");
   eq(heldRow.stHidden, false, "the hold remains visible in a single-state section");
@@ -1489,8 +1492,8 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
       ready_at_unix: 1000, seed_policy: { stop_on_complete: false, ratio_limit: 2, time_limit_secs: 172800 } });
     eq(T.sectionOf(seed), "seeding", "ready torrents never fall back to generic queued status");
     eq(T.torrentStatus({ ...seed, upload_rate_bps: 0 }), "seeding · idle", "zero upload remains seeding");
-    eq(T.sectionOf({ ...seed, torrent_phase: "missing_files" }), "waiting", "missing files override readiness");
-    eq(T.sectionOf({ ...seed, status: "failed" }), "waiting", "failure cannot be hidden by a ready flag");
+    eq(T.sectionOf({ ...seed, torrent_phase: "missing_files" }), "attention", "missing files override readiness");
+    eq(T.sectionOf({ ...seed, status: "failed" }), "attention", "failure cannot be hidden by a ready flag");
     eq(T.sectionOf({ ...seed, torrent_phase: "checking" }), "checking", "piece verification has its own section");
     eq(T.sectionOf({ ...seed, ready: false, torrent_phase: "fetching_metadata" }), "torrent_metadata", "magnet metadata is not fetching an NZB");
     const held = { ...seed, ready: false, status: "paused", torrent_phase: "paused_download", torrent_error: "storage full", seed_stop_reason: "storage_full" };
@@ -1562,8 +1565,8 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
 
     eq(T.sectionOf(job(1, { status: "downloading" })), "downloading", "");
     eq(T.sectionOf(job(1, { status: "queued" })), "waiting", "");
-    eq(T.sectionOf(job(1, { status: "paused" })), "waiting",
-      "a paused job is still waiting its turn, not doing something");
+    eq(T.sectionOf(job(1, { status: "paused" })), "paused",
+      "manual pauses are separate from jobs waiting their turn");
     eq(T.sectionOf(post("par_repair")), "repairing", "");
     eq(T.sectionOf(post("unpack")), "extracting", "");
     eq(T.sectionOf(post("par_rename")), "renaming", "");

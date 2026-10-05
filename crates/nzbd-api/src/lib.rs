@@ -2919,6 +2919,7 @@ mod tests {
             files_done: 0,
             health: 1000,
             critical_health: 850,
+            critical_health_estimated: true,
             rate_bps: 0,
             retried_articles: 0,
             assigned_node: None,

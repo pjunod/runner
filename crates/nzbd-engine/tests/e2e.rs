@@ -1060,14 +1060,14 @@ async fn dropped_connections_retry_without_losing_the_article() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unverified_holes_remain_partial_and_nonterminal() {
+async fn missing_articles_finish_download_but_keep_partial_private() {
     let tmp = tempfile::tempdir().unwrap();
     let data = prng_bytes(31, 10 * 5000);
     let post = build_post("damaged", &[("dmg.bin", data.clone())], 5000);
 
-    // Segments 3..=6 missing everywhere: 40% failed -> health 600 < 850.
+    // One missing article: 90% health still requires a repair handoff.
     let mut b = NservBuilder::new().with_post(&post);
-    for part in 3..=6 {
+    for part in 3..=3 {
         b = b.behavior(&post.message_id("dmg.bin", part), Behavior::NotFound);
     }
     let ns = b.start().await.unwrap();
@@ -1083,7 +1083,7 @@ async fn unverified_holes_remain_partial_and_nonterminal() {
             .snapshot()
             .jobs
             .iter()
-            .any(|j| j.id == job && j.control.as_ref().is_some_and(|c| c.lifecycle == "held"))
+            .any(|j| j.id == job && j.status == JobStatus::Completed)
         {
             break;
         }
@@ -1091,12 +1091,17 @@ async fn unverified_holes_remain_partial_and_nonterminal() {
     }
     let snap = engine.snapshot();
     let held = snap.jobs.iter().find(|j| j.id == job).unwrap();
-    assert_eq!(held.status, JobStatus::Paused);
-    assert_eq!(held.control.as_ref().unwrap().stage, "finalize");
+    assert_eq!(held.status, JobStatus::Completed);
+    assert!(held.control.is_none());
     assert!(!held.ready && !held.pp_done);
+    let mut finished = false;
     while let Ok(event) = rx.try_recv() {
-        assert!(!matches!(event, Event::JobFinished {job: id, ..} if id == job));
+        finished |= matches!(event, Event::JobFinished {job: id, ..} if id == job);
     }
+    assert!(
+        finished,
+        "ordinary missing articles must reach a terminal download verdict"
+    );
     let exported = engine.export_job(job).await.unwrap().unwrap();
     let file = &exported.files[0];
     let got = std::fs::read(
@@ -1105,7 +1110,7 @@ async fn unverified_holes_remain_partial_and_nonterminal() {
     )
     .unwrap();
     let mut expected = data.clone();
-    expected[2 * 5000..6 * 5000].fill(0);
+    expected[2 * 5000..3 * 5000].fill(0);
     assert_eq!(got, expected);
     assert!(!tmp.path().join("dest/damaged/dmg.bin").exists());
 
@@ -1844,4 +1849,69 @@ async fn public_resume_releases_allocation_hold_but_not_identity_hold() {
         .unwrap());
     assert!(!engine.resume_job(job).await.unwrap());
     engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn legacy_coverage_hold_recovers_without_repeating_valid_articles() {
+    for manual in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = spawn_engine(tmp.path(), vec![]).await;
+        let mut job = transfer_job(991, "legacy-partial", JobStatus::Queued);
+        let file = job.files[0].id;
+        job.params
+            .push((format!("*File:size:{}", file.0), "10".into()));
+        job.files[0].segments[0].state = SegmentState::Done {
+            offset: 0,
+            len: 5,
+            crc: crc32fast::hash(b"hello"),
+        };
+        let dir = tmp.path().join("dest/legacy-partial");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!(".runner-file-{}.part", file.0)),
+            b"hello\0\0\0\0\0",
+        )
+        .unwrap();
+        job.set_control(&nzbd_types::JobControl {
+            version: 1,
+            revision: "7".into(),
+            lifecycle: "held".into(),
+            cause: "identity_conflict".into(),
+            stage: "finalize".into(),
+            retry_policy: "review".into(),
+            message: "file coverage or expected size is unverified; partial retained".into(),
+            instance: "legacy".into(),
+            previous_status: Some(JobStatus::Downloading),
+            manual_pause: manual,
+        });
+        job.status = JobStatus::Paused;
+        engine.import_job(job, false, false).await.unwrap();
+        engine.shutdown().await;
+        let engine = spawn_engine(tmp.path(), vec![]).await;
+        for _ in 0..100 {
+            if engine
+                .export_job(JobId(991))
+                .await
+                .unwrap()
+                .is_some_and(|j| j.files[0].finalized)
+            {
+                break;
+            }
+            if manual {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let job = engine.export_job(JobId(991)).await.unwrap().unwrap();
+        assert_eq!(job.held(), manual);
+        assert_eq!(job.files[0].finalized, !manual);
+        assert!(matches!(
+            job.files[0].segments[0].state,
+            SegmentState::Done { .. }
+        ));
+        assert!(!dir.join("legacy-partial.bin").exists());
+        assert_eq!(job.file_needs_repair(file), !manual);
+        assert!(!job.ready());
+        engine.shutdown().await;
+    }
 }

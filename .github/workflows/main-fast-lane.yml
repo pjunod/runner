@@ -17,7 +17,7 @@ jobs:
   scope:
     name: Select affected validation
     if: github.event.pull_request.draft == false
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 2
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
@@ -36,7 +36,7 @@ jobs:
   preflight:
     name: Static contracts
     needs: scope
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 3
     steps:
       - uses: actions/checkout@v5
@@ -54,7 +54,7 @@ jobs:
     name: Rust merge candidate
     needs: [scope, preflight]
     if: needs.scope.outputs.rust == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
@@ -64,7 +64,11 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install bounded post-processing dependencies
+        if: runner.environment == 'github-hosted'
         run: sudo apt-get update && sudo apt-get install -y par2 p7zip-full
+      - name: Verify self-hosted post-processing dependencies
+        if: runner.environment == 'self-hosted'
+        run: command -v par2 && command -v 7z
       - run: make fast-check-rust
       - name: Torrent transfer and recovery regressions
         if: needs.scope.outputs.torrent == 'true'
@@ -74,7 +78,7 @@ jobs:
     name: Mobile compile and unit lane
     needs: [scope, preflight]
     if: needs.scope.outputs.mobile == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 12
     defaults:
       run:
@@ -94,7 +98,7 @@ jobs:
     name: Main promotion gate
     if: always() && github.event.pull_request.draft == false
     needs: [scope, preflight, rust, mobile]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 2
     steps:
       - name: Require every selected lane

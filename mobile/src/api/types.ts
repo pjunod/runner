@@ -37,7 +37,21 @@ export interface SeedPolicy {
   time_limit_secs: number | null;
 }
 
+export interface JobControl {
+  version: number;
+  revision: string;
+  lifecycle: string;
+  cause: string;
+  stage: string;
+  retry_policy: string;
+  message: string;
+  instance: string;
+  previous_status?: JobStatus | null;
+  manual_pause?: boolean;
+}
+
 export interface JobSummary {
+  control?: JobControl | null;
   id: number;
   kind?: 'nzb' | 'torrent';
   torrent_phase?: TorrentPhase | null;
@@ -60,6 +74,7 @@ export interface JobSummary {
   files_done: number;
   health: number;
   critical_health: number;
+  critical_health_estimated?: boolean;
   rate_bps: number;
   retried_articles: number;
   assigned_node: string | null;
