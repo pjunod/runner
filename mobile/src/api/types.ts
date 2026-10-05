@@ -60,6 +60,7 @@ export interface JobSummary {
   files_done: number;
   health: number;
   critical_health: number;
+  critical_health_estimated?: boolean;
   rate_bps: number;
   retried_articles: number;
   assigned_node: string | null;

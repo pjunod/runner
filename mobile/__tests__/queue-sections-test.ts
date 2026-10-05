@@ -15,9 +15,9 @@ const statusCases: [JobStatus, string][] = [
   [{ post: { stage: 'move' } }, 'moving'],
   [{ post: { stage: 'script' } }, 'scripting'],
   ['queued', 'waiting'],
-  ['paused', 'waiting'],
-  ['failed', 'waiting'],
-  ['completed', 'waiting'],
+  ['paused', 'paused'],
+  ['failed', 'attention'],
+  ['completed', 'post_queued'],
 ];
 
 test.each(statusCases)('maps %p to the %s queue section', (status, expected) => {
@@ -46,14 +46,14 @@ test('groups by activity while preserving queue positions within each section', 
     'downloading',
     'repairing',
     'extracting',
+    'paused',
     'waiting',
   ]);
   expect(sections.flatMap((section) => section.jobs.map(({ job: item }) => item.id))).toEqual([
-    12, 14, 10, 11, 13,
+    12, 14, 10, 13, 11,
   ]);
   expect(sections.find((section) => section.definition.key === 'waiting')?.jobs).toMatchObject([
     { index: 1, job: { id: 11 } },
-    { index: 3, job: { id: 13 } },
   ]);
 });
 
@@ -71,3 +71,10 @@ test('grouping uses an open stage when delayed PAR completion left a stale statu
 function job(id: number, status: JobStatus): JobSummary {
   return { id, status } as JobSummary;
 }
+
+ test('holds and pauses override stale open stage and ready facts', () => {
+   const stale = { ...job(1, 'paused'), ready: true, stages: [{ stage: 'unpack', started_at_unix: 1 }],
+     control: { lifecycle: 'held' } } as JobSummary;
+   expect(queueSectionKey(stale)).toBe('attention');
+   expect(queueSectionKey({ ...stale, control: undefined, ready: false })).toBe('paused');
+ });

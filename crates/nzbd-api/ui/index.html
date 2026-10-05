@@ -1792,6 +1792,10 @@ const SECTIONS = [
     tip: "Files are ready. These torrents continue sharing outside the download-slot limit." },
   { key: "completed", label: "Completed", collapsible: true,
     tip: "Files are ready and seeding is stopped. Files remain on disk." },
+  { key: "attention", label: "Needs attention", collapsible: true,
+    tip: "Held, failed, or missing files. These jobs need intervention before they can continue." },
+  { key: "paused", label: "Paused", collapsible: true,
+    tip: "Manually paused jobs. Resume a job to return it to the download queue." },
   { key: "waiting", label: "Waiting", ordered: true, collapsible: true,
     tip: "In the queue, in your order. These are the jobs move up / move down act on." },
 ];
@@ -1878,6 +1882,8 @@ function torrentPrimaryAction(j) {
 }
 
 function sectionOf(j) {
+  if (j.control && j.control.lifecycle === "held") return "attention";
+  if (j.status === "failed") return "attention";
   const phase = torrentPhase(j);
   if (phase) {
     if (phase === "seeding") return "seeding";
@@ -1885,15 +1891,20 @@ function sectionOf(j) {
     if (phase === "checking") return "checking";
     if (phase === "downloading") return "downloading";
     if (["fetching_metadata", "fetching_source"].includes(phase)) return "torrent_metadata";
+    if (["failed", "missing_files", "storage_hold", "unknown"].includes(phase)) return "attention";
+    if (phase === "paused_download") return "paused";
     return "waiting";
   }
   const st = j.status;
+  if (st === "paused") return "paused";
+  if (j.pp_done || j.ready) return "completed";
   const stage = currentPostStage(j);
   if (stage) return STAGE_SECTION[stage] || "post_queued";
   if (typeof st !== "string") return "post_queued";
   if (st === "downloading") return "downloading";
   if (st === "fetching") return "fetching";
-  if (st === "post_queued") return "post_queued";
+  if (st === "post_queued" || st === "completed") return "post_queued";
+  if (st !== "queued") return "attention";
   return "waiting"; // queued, paused — and anything new, which belongs in a
                     // list you can see rather than in no list at all
 }
@@ -1961,7 +1972,7 @@ function rowModel(j, ctx) {
   const over = pend ? pend.status(j.id) : null;  // unconfirmed pause/resume
   const busy = pend ? pend.busy(j.id) : false;   // an action is in flight
   const section = ctx.section || sectionOf(j);
-  const active = !["waiting", "completed"].includes(section);
+  const active = !["waiting", "completed", "attention", "paused"].includes(section);
   const torrent = j.kind === "torrent";
   const hold = j.control && j.control.lifecycle === "held" ? j.control : null;
   const reviewHold = hold && hold.retry_policy !== "resume_same_job";
@@ -1996,24 +2007,27 @@ function rowModel(j, ctx) {
     if (el != null) rest.push(" · " + fmtDur(el) + " in " + st);
   }
 
-  const crit = j.critical_health || 850;
+  const crit = j.critical_health ?? 850;
+  const estimated = j.critical_health_estimated !== false;
   const doomed = j.health < crit;
   const critPct = (crit / 10).toFixed(0);
-  let hNote = "repair limit " + critPct + "%";
+  let hNote = estimated ? "recovery data unconfirmed" : "estimated repair limit " + critPct + "%";
   let hNoteCls = "sub hnote";
-  let hNoteTip = "";
+  let hNoteTip = estimated
+    ? "No usable PAR2 data is known. The health threshold is a fallback estimate, not a repair guarantee."
+    : "Estimated from PAR2 bytes; verification determines whether recovery blocks cover the missing data.";
   if (doomed && dl) {
     if (ctx.healthAbortArmed) {
-      hNote = "unrepairable · aborting";
+      hNote = "below health threshold · aborting";
       hNoteCls = "ho bad";
-      hNoteTip = "health is below the par2 repair limit — the daemon is aborting this download";
+      hNoteTip = "Health is below the configured estimate; the daemon is aborting this download.";
     } else {
-      hNote = "unrepairable · will fail at end";
+      hNote = "below estimated repair threshold";
       hNoteCls = "ho warn";
-      hNoteTip = "below the par2 repair limit — it can't be repaired, but health-abort is off so it will keep downloading and fail the par-check at the end. Enable it in Settings → Post-processing (‘unrepairable downloads’ → park).";
+      hNoteTip = "Health is below the estimated threshold. Downloading will continue; PAR2 verification determines the outcome.";
     }
   } else if (doomed) {
-    hNote = "was unrepairable (limit " + critPct + "%)";
+    hNote = "below health threshold (" + critPct + "%)";
     hNoteCls = "sub hnote bad";
   }
 
@@ -2881,7 +2895,7 @@ function queueModels() {
         movable: ORDERED.has(sec.key),
         // Only the waiting list holds jobs whose statuses differ from one
         // another; every other section's heading IS its rows' status.
-        mixedSection: sec.key === "waiting",
+        mixedSection: ["waiting", "attention"].includes(sec.key),
         section: sec.key,
         nowMs,
       }));

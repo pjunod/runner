@@ -33,6 +33,8 @@ pub struct JobSummary {
     /// Per-mille (NZBGet scale: 1000 = 100.0%).
     pub health: u16,
     pub critical_health: u16,
+    /// True when the threshold is a fallback because no usable PAR bytes are known.
+    pub critical_health_estimated: bool,
     /// This job's current download rate (EMA, bytes/sec; 0 unless
     /// actively downloading). For local jobs this is WIRE bytes — the
     /// same measurement as the queue-wide rate, so the two never
@@ -210,6 +212,7 @@ mod mobile_queue_contract_tests {
                 files_done: serde_json::from_value(input["files_done"].clone()).unwrap(),
                 health: serde_json::from_value(input["health"].clone()).unwrap(),
                 critical_health: serde_json::from_value(input["critical_health"].clone()).unwrap(),
+                critical_health_estimated: input["critical_health_estimated"].as_bool().unwrap(),
                 rate_bps: serde_json::from_value(input["rate_bps"].clone()).unwrap(),
                 retried_articles: serde_json::from_value(input["retried_articles"].clone())
                     .unwrap(),
