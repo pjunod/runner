@@ -1517,7 +1517,13 @@ async fn process_job_ctx_from(
     // restore archive names using the verified files.
     if from.includes(RestartPoint::Unpack) && unpack_enabled && par_ok {
         stages.enter(PostStage::RarRename).await;
-        rar_rename_owned(&dir, Some((&engine.artifacts(), job_id.0)))?;
+        let archive_dir = dir.clone();
+        let inventory = engine.artifacts();
+        tokio::task::spawn_blocking(move || {
+            rar_rename_owned(&archive_dir, Some((&inventory, job_id.0)))
+        })
+        .await
+        .map_err(|error| PostError::Subprocess(error.to_string()))??;
     }
 
     // ---- UNPACK stage ------------------------------------------------------

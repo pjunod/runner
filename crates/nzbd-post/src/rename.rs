@@ -404,17 +404,50 @@ pub(crate) fn split_volume_ext(ext: &str) -> bool {
 /// complete file checksum, reject ambiguous mappings, then journal each rename.
 fn sfv_restore_archives(dir: &Path, custody: Custody<'_>) -> Renames {
     let files = crate::namespace::files(dir)?;
+    let archives: Vec<_> = files
+        .iter()
+        .filter(|path| head(path, 7).starts_with(RAR_MAGIC))
+        .collect();
+    let unresolved: std::collections::HashSet<_> = archives
+        .iter()
+        .filter(|path| {
+            let extension = path
+                .extension()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            (extension != "rar" && !split_volume_ext(&extension))
+                || (extension.len() == 3
+                    && extension.starts_with('r')
+                    && extension.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+                    && !archives.contains(&&path.with_extension("rar")))
+        })
+        .filter_map(|path| path.parent())
+        .collect();
+    if unresolved.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut catalogs = std::collections::BTreeMap::<PathBuf, u32>::new();
-    for sfv in files.iter().filter(|path| ext_is(path, "sfv")) {
+    for sfv in files.iter().filter(|path| {
+        ext_is(path, "sfv")
+            && path
+                .parent()
+                .is_some_and(|parent| unresolved.contains(parent))
+    }) {
         if std::fs::metadata(sfv)?.len() > 2 * 1024 * 1024 {
             continue;
         }
-        let text = std::fs::read_to_string(sfv)?;
-        for line in text
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with(';'))
-        {
+        let bytes = std::fs::read(sfv)?;
+        for raw in bytes.split(|byte| *byte == b'\n') {
+            let raw = raw.trim_ascii();
+            if raw.is_empty() || raw.starts_with(b";") {
+                continue;
+            }
+            // SFV comments commonly use a legacy encoding. Unrepresentable
+            // filenames cannot be restored, but unrelated entries still can.
+            let Ok(line) = std::str::from_utf8(raw) else {
+                continue;
+            };
             let Some((name, checksum)) = line.rsplit_once(char::is_whitespace) else {
                 continue;
             };
@@ -453,8 +486,11 @@ fn sfv_restore_archives(dir: &Path, custody: Custody<'_>) -> Renames {
         return Ok(Vec::new());
     }
     let mut candidates = Vec::new();
-    for path in &files {
-        if !head(path, 7).starts_with(RAR_MAGIC) {
+    for path in archives {
+        if !path
+            .parent()
+            .is_some_and(|parent| unresolved.contains(parent))
+        {
             continue;
         }
         let mut input = nzbd_state::fileops::open(path).map_err(std::io::Error::other)?;
@@ -661,6 +697,18 @@ mod tests {
     use std::process::Command;
 
     #[test]
+    fn correctly_named_archives_ignore_optional_sfv_encoding() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("release.rar"), rar4_fixture(None)).unwrap();
+        std::fs::write(
+            tmp.path().join("post.sfv"),
+            b"; legacy comment \xff\nrelease.rar 00000000\n",
+        )
+        .unwrap();
+        assert!(rar_rename(tmp.path()).unwrap().is_empty());
+    }
+
+    #[test]
     fn sfv_restores_obfuscated_old_rar_without_volume_numbers() {
         let tmp = tempfile::tempdir().unwrap();
         let mut catalog = String::new();
@@ -679,7 +727,9 @@ mod tests {
             std::fs::write(tmp.path().join(source), &bytes).unwrap();
             catalog.push_str(&format!("{name} {:08x}\n", crc32fast::hash(&bytes)));
         }
-        std::fs::write(tmp.path().join("post.sfv"), catalog).unwrap();
+        let mut sfv = b"; non-UTF8 comment \xff\n".to_vec();
+        sfv.extend(catalog.as_bytes());
+        std::fs::write(tmp.path().join("post.sfv"), sfv).unwrap();
         let renames = rar_rename(tmp.path()).unwrap();
         assert_eq!(renames.len(), 3);
         for name in ["release.rar", "release.r00", "release.r01"] {

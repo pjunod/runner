@@ -379,9 +379,9 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(f.size, "—", "no size until the NZB lands");
   eq(f.pauseHidden, true, "nothing to pause while fetching");
   const doomed = T.rowModel(job(1, { health: 700 }), { idx: 0, count: 1, healthAbortArmed: true });
-  eq(doomed.hNote, "unrepairable · aborting", "armed health-abort is stated on the row");
+  eq(doomed.hNote, "below health threshold · aborting", "armed health-abort is stated on the row");
   const doomed2 = T.rowModel(job(1, { health: 700 }), { idx: 0, count: 1, healthAbortArmed: false });
-  eq(doomed2.hNote, "unrepairable · will fail at end", "…and so is the un-armed case");
+  eq(doomed2.hNote, "below estimated repair threshold", "…and so is the un-armed case");
   const held = job(1, { status: "paused", control: {
     lifecycle: "held", cause: "identity_conflict", retry_policy: "review",
     message: "conflicting yEnc declared size",

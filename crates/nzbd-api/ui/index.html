@@ -1937,16 +1937,16 @@ function stageElapsedMs(j, nowMs) {
 // Health color: green at 100% fading to red at the par-repair limit
 // (critical health). Below it the job is unrepairable — full red.
 function healthColor(health, critical) {
-  const crit = Math.min(critical || 850, 999);
+  const crit = Math.min(critical ?? 850, 999);
   const t = Math.max(0, Math.min(1, (health - crit) / (1000 - crit)));
   const hue = 4 + t * 136; // red 4deg -> green 140deg
   return "hsl(" + hue.toFixed(0) + " 62% 46%)";
 }
-function healthTip(health, critical) {
-  const crit = ((critical || 850) / 10).toFixed(1);
-  return health < (critical || 850)
-    ? "below the par2 repair limit (" + crit + "%) — unrepairable even with all par2"
-    : "repairable down to " + crit + "% with the set's par2 blocks";
+function healthTip(health, critical, estimated) {
+  const crit = ((critical ?? 850) / 10).toFixed(1);
+  return estimated !== false
+    ? "Article delivery health; recovery data is unconfirmed. The " + crit + "% threshold is an estimate."
+    : "Article delivery health; estimated repair threshold " + crit + "%. PAR2 verification determines actual recoverability.";
 }
 
 /// Pure: JobSummary + context -> a FLAT view model (strings and flags only,
@@ -2076,7 +2076,7 @@ function rowModel(j, ctx) {
     size: fetching ? "—" : fmtBytes(total),
     health: fetching ? "—" : (torrent ? Number(j.ratio || 0).toFixed(2) + "×" : (j.health / 10).toFixed(1) + "%"),
     healthColor: fetching || torrent ? "" : healthColor(j.health, j.critical_health),
-    healthTip: fetching ? "" : (torrent ? "uploaded / selected payload bytes" : healthTip(j.health, j.critical_health)),
+    healthTip: fetching ? "" : (torrent ? "uploaded / selected payload bytes" : healthTip(j.health, j.critical_health, j.critical_health_estimated)),
     hNote: fetching ? "" : (torrent ? fmtDur((j.seeding_seconds || 0) * 1000) + " seeded" : hNote),
     hNoteCls: fetching ? "hnote" : hNoteCls,
     hNoteTip: torrent ? seedPolicyText(j.seed_policy) : hNoteTip,

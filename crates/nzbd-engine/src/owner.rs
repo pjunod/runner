@@ -3288,6 +3288,29 @@ impl Owner {
             }
             return;
         }
+        if !range_checkpoint
+            && self
+                .state
+                .job(job)
+                .is_some_and(|j| j.file_needs_repair(file))
+        {
+            let key = format!("*File:repair:{}", file.0);
+            self.state
+                .job_mut(job)
+                .unwrap()
+                .params
+                .retain(|(name, _)| name != &key);
+            self.dirty = true;
+            if self.persist && !self.save_snapshot() {
+                self.hold_job(
+                    job,
+                    "io",
+                    "finalize",
+                    "complete checkpoint metadata could not be persisted",
+                );
+                return;
+            }
+        }
         let filename = self
             .state
             .file_mut(job, file)
@@ -5267,6 +5290,45 @@ mod tests {
         )
         .unwrap();
         (tmp, owner, adapter)
+    }
+
+    #[tokio::test]
+    async fn intact_publication_clears_previous_private_repair_marker() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let mut job = pending_job(1);
+        let file = job.files[0].id;
+        job.params
+            .push((format!("*File:repair:{}", file.0), "5".into()));
+        job.files[0].segments[0].state = SegmentState::Done {
+            offset: 0,
+            len: 5,
+            crc: crc32fast::hash(b"hello"),
+        };
+        owner.state.jobs.push(job);
+        owner.file_sizes.insert(file, 5);
+        let (tx, mut rx) = mpsc::channel(8);
+        let (_done, stopped) = watch::channel(false);
+        owner.writers.insert(
+            file,
+            WriterHandle {
+                tx,
+                stop: CancellationToken::new(),
+                stopped,
+            },
+        );
+        owner.send_finalize(JobId(1), file);
+        assert!(!owner.state.job(JobId(1)).unwrap().file_needs_repair(file));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            WriteCmd::PublicationName(_)
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            WriteCmd::Finalize {
+                combined_crc: Some(_),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
