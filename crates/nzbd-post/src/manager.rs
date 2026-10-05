@@ -1436,13 +1436,6 @@ async fn process_job_ctx_from(
     if from == RestartPoint::Beginning {
         stages.enter(PostStage::ParRename).await;
         renames = par_rename_owned(&dir, Some((&engine.artifacts(), job_id.0)))?;
-        if unpack_enabled {
-            stages.enter(PostStage::RarRename).await;
-            renames.extend(rar_rename_owned(
-                &dir,
-                Some((&engine.artifacts(), job_id.0)),
-            )?);
-        }
     }
     let rename_map: std::collections::HashMap<PathBuf, PathBuf> = renames.into_iter().collect();
 
@@ -1451,6 +1444,25 @@ async fn process_job_ctx_from(
         cmd: cfg.par2_cmd.clone(),
         timeout: cfg.tool_timeout,
     };
+    let partials: Vec<_> =
+        job.files
+            .iter()
+            .filter(|file| {
+                !file.paused
+                    && !file.is_par2
+                    && (job.file_needs_repair(file.id)
+                        || file.segments.iter().any(|segment| {
+                            matches!(segment.state, nzbd_types::SegmentState::Failed)
+                        }))
+            })
+            .map(|file| {
+                (
+                    dir.join(format!(".runner-file-{}.part", file.id.0)),
+                    file.filename.clone(),
+                )
+            })
+            .collect();
+    let mut restored = std::collections::HashSet::new();
     let mut par_ok = true;
     let mut par_did_repair = !from.includes(RestartPoint::Verify)
         && job.stages.iter().any(|s| s.stage == PostStage::ParRepair);
@@ -1469,12 +1481,20 @@ async fn process_job_ctx_from(
             if from.includes(RestartPoint::Verify) {
                 stages.enter(PostStage::ParVerify).await;
                 let quick = par2::quick_verify(&set, &evidence_of(&job, &dir, &rename_map));
-                if quick == VerifyResult::Intact {
+                if quick == VerifyResult::Intact && partials.is_empty() {
                     tracing::info!(job = job_id.0, "par quick-verify: intact (no data re-read)");
                 } else if set.main_path.is_some() {
-                    let repaired =
-                        repair_isolated_loop(engine, cfg, &par_tool, &mut stages, job_id, set)
-                            .await?;
+                    let repaired = repair_isolated_loop(
+                        engine,
+                        cfg,
+                        &par_tool,
+                        &mut stages,
+                        job_id,
+                        set,
+                        &partials,
+                        &mut restored,
+                    )
+                    .await?;
                     par_ok &= repaired;
                     par_did_repair |= repaired;
                 } else {
@@ -1484,23 +1504,27 @@ async fn process_job_ctx_from(
         }
     }
 
+    if from.includes(RestartPoint::Verify) {
+        par_ok &= partials.iter().all(|(path, _)| restored.contains(path));
+    }
     if !par_ok {
-        let _ = engine
-            .hold_job(
-                job_id,
-                "unknown",
-                "par_repair",
-                "PAR mapping or parity is insufficient; inputs retained for review",
-            )
-            .await;
-        return Err(PostError::Held);
+        tracing::warn!(
+            job = job_id.0,
+            "missing data could not be reconstructed from available PAR2 recovery files"
+        );
+    }
+    // Damaged archive headers are not naming evidence. Repair first, then
+    // restore archive names using the verified files.
+    if from.includes(RestartPoint::Unpack) && unpack_enabled && par_ok {
+        stages.enter(PostStage::RarRename).await;
+        rar_rename_owned(&dir, Some((&engine.artifacts(), job_id.0)))?;
     }
 
     // ---- UNPACK stage ------------------------------------------------------
     let mut unpack_ok = true;
     let mut unpacked_any = !from.includes(RestartPoint::Unpack)
         && job.stages.iter().any(|s| s.stage == PostStage::Unpack);
-    if unpack_enabled && from.includes(RestartPoint::Unpack) {
+    if unpack_enabled && par_ok && from.includes(RestartPoint::Unpack) {
         let archives = detect_archives(&dir);
         if !archives.is_empty() {
             stages.enter(PostStage::Unpack).await;
@@ -1886,6 +1910,12 @@ async fn process_job_ctx_from(
     if let Ok(Some(mut fin)) = engine.export_job(job_id).await {
         fin.params
             .push((PP_DONE_PARAM.into(), outcome.as_str().into()));
+        if outcome == PpFinal::ParFailure {
+            fin.params.push((
+                "Failure:Reason".into(),
+                "Missing data could not be reconstructed from available PAR2 recovery files".into(),
+            ));
+        }
         // Durable deobfuscation record: plain (non-`*`) params survive
         // into history and the compat `Parameters` array.
         if !deobfuscated.is_empty() {
@@ -2087,10 +2117,21 @@ async fn repair_isolated_loop(
     stages: &mut Stages<'_>,
     job_id: JobId,
     mut set: par2::Par2Set,
+    partials: &[(PathBuf, String)],
+    restored: &mut std::collections::HashSet<PathBuf>,
 ) -> Result<bool, PostError> {
     for _ in 0..8 {
         stages.enter(PostStage::ParRepair).await;
-        match crate::repair_workspace::repair(&engine.artifacts(), job_id.0, &set, par).await? {
+        match crate::repair_workspace::repair(
+            &engine.artifacts(),
+            job_id.0,
+            &set,
+            par,
+            partials,
+            restored,
+        )
+        .await?
+        {
             VerifyResult::Intact => return Ok(true),
             VerifyResult::NeedMoreBlocks { blocks_needed } => {
                 let freed = engine

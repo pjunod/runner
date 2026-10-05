@@ -298,7 +298,8 @@ pub struct FileEntry {
     pub segments: Vec<Segment>,
     /// Combined CRC32 of the decoded file, available once all segments are done.
     pub crc32: Option<u32>,
-    /// Output file assembled and atomically renamed into place.
+    /// Download writer finished: published intact, or privately sealed for repair
+    /// when the job carries a `*File:repair:<id>` parameter.
     #[serde(default)]
     pub finalized: bool,
 }
@@ -630,6 +631,13 @@ impl Job {
         self.torrent
             .as_ref()
             .and_then(|torrent| torrent.ready_at_unix)
+    }
+
+    /// A terminal download checkpoint retained privately for PAR verification.
+    pub fn file_needs_repair(&self, file: FileId) -> bool {
+        self.params
+            .iter()
+            .any(|(key, _)| key == &format!("*File:repair:{}", file.0))
     }
 
     pub fn ready(&self) -> bool {
