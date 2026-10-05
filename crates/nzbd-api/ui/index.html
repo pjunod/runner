@@ -281,7 +281,7 @@ try {
   td.num, th.num { text-align: right; }
   td .name { font-weight: 550; word-break: break-word; display: -webkit-box;
              -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-  /* The status chip in the name cell is a PHONE fallback for the hidden
+  /* The status chip in the name cell is a compact-layout fallback for the hidden
      status column. It has to out-specify `.st` below, which sets
      `display: inline-block` and, being later in the sheet at equal
      specificity, was quietly winning — so the chip showed on desktop too.
@@ -290,6 +290,24 @@ try {
      times. */
   .st.st-inline { display: none; }
   td .sub { color: var(--muted); font-size: 12px; }
+
+  /* Bound the progress column so a long diagnostic cannot steal the name
+     column's width. The other columns keep short metrics and controls intact. */
+  #tab-queue { container-type: inline-size; }
+  .queue-table { table-layout: fixed; }
+  .queue-table .col-status { width: 80px; }
+  .queue-table .col-progress { width: 28%; }
+  .queue-table .col-size { width: 78px; }
+  .queue-table .col-health { width: 120px; }
+  .queue-table .col-actions { width: 164px; }
+  .queue-table .job-row > td { padding-top: 12px; padding-bottom: 12px; vertical-align: top; }
+  .queue-table .queue-name .name { line-height: 1.4; overflow-wrap: anywhere; }
+  .queue-table .queue-name .sub { margin-top: 5px; line-height: 1.5; overflow-wrap: anywhere; }
+  .queue-table .meter { min-width: 0; }
+  .queue-table .meter .detail { white-space: normal; overflow-wrap: anywhere; line-height: 1.5; }
+  .queue-table .queue-size, .queue-table .health { white-space: nowrap; }
+  .queue-table .hnote { margin-top: 4px; line-height: 1.4; overflow-wrap: anywhere; }
+  .queue-table .acts { gap: 4px; }
 
   .meter { min-width: 170px; }
   .meter .bar { display: flex; align-items: center; gap: 8px; }
@@ -908,6 +926,36 @@ try {
     .jd-facts { grid-template-columns: minmax(0, 1fr); }
     .jd-fact.full { grid-column: 1; }
   }
+
+  /* Stack by the space available to the queue, including sidebar layouts. */
+  @container (max-width: 1000px) {
+    .queue-table, .queue-table > tbody { display: block; }
+    .queue-table > colgroup, .queue-table > thead { display: none; }
+    .queue-table .job-row { display: grid; grid-template-columns: minmax(0, 1fr) 152px;
+      gap: 10px 16px; padding: 12px; border-bottom: 1px solid var(--line); }
+    .queue-table .job-row:last-child { border-bottom: 0; }
+    .queue-table .job-row > td { display: block; min-width: 0; padding: 0; border: 0; }
+    #queue-body tr.job-row > td:first-child { box-shadow: none; }
+    #queue-body tr.job-row { border-left: 3px solid
+      color-mix(in srgb, var(--job-accent) 78%, transparent); }
+    .queue-table .job-row > .queue-name { grid-column: 1 / -1; grid-row: 1; }
+    .queue-table .queue-name .sub { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+    .queue-table .st.st-inline { display: inline-block; margin-top: 0; }
+    .queue-table .job-row > .queue-status, .queue-table .job-row > .queue-size { display: none; }
+    .queue-table .job-row > .queue-progress { grid-column: 1; grid-row: 2; }
+    .queue-table .job-row > .queue-health { grid-column: 1; grid-row: 3; display: flex;
+      align-items: baseline; flex-wrap: wrap; gap: 4px 8px; text-align: left; font-size: 12px; }
+    .queue-table .hnote { margin-top: 0; }
+    .queue-table .job-row > .queue-actions { grid-column: 2; grid-row: 2 / 4; }
+    .queue-table .acts { flex-direction: row; align-items: center; }
+    .queue-table > tbody > :is(.section-tr, .detail-tr) { display: block; }
+    .queue-table > tbody > :is(.section-tr, .detail-tr) > td { display: block; }
+  }
+  @container (max-width: 560px) {
+    .queue-table .job-row { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+    .queue-table .job-row > .queue-actions { grid-column: 1; grid-row: 4; }
+    .queue-table .acts { justify-content: flex-start; }
+  }
 </style>
 </head>
 <body>
@@ -1107,9 +1155,11 @@ try {
   </nav>
 
   <section id="tab-queue">
-    <table>
-      <thead><tr><th>Job</th><th style="width:96px">Status</th><th style="width:250px">Progress</th>
-        <th class="num">Size</th><th class="num">Health / ratio</th><th style="width:190px"></th></tr></thead>
+    <table class="queue-table">
+      <colgroup><col><col class="col-status"><col class="col-progress">
+        <col class="col-size"><col class="col-health"><col class="col-actions"></colgroup>
+      <thead><tr><th>Job</th><th>Status</th><th>Progress</th>
+        <th class="num">Size</th><th class="num">Health / ratio</th><th></th></tr></thead>
       <tbody id="queue-body"><tr><td colspan="6" class="empty">Loading the queue…</td></tr></tbody>
     </table>
     <div class="pager" id="queue-pager" hidden>
@@ -2042,17 +2092,17 @@ function buildJobRow(d) {
   d.data(tr, "scope", "queue");
   const c = {};
 
-  const td1 = d.append(tr, d.create("td"));
+  const td1 = d.append(tr, d.create("td", "queue-name"));
   c.name = d.append(td1, d.create("div", "name"));
   d.data(c.name, "action", "detail");
   const sub = d.append(td1, d.create("div", "sub"));
   c.sub = d.append(sub, d.create("span"));
   c.stInline = d.append(sub, d.create("span", "st st-inline"));
 
-  const td2 = d.append(tr, d.create("td"));
+  const td2 = d.append(tr, d.create("td", "queue-status"));
   c.st = d.append(td2, d.create("span", "st"));
 
-  const td3 = d.append(tr, d.create("td"));
+  const td3 = d.append(tr, d.create("td", "queue-progress"));
   const meter = d.append(td3, d.create("div", "meter"));
   const bar = c.bar = d.append(meter, d.create("div", "bar"));
   const track = d.append(bar, d.create("div", "track"));
@@ -2064,13 +2114,13 @@ function buildJobRow(d) {
   c.dRetry = d.append(det, d.create("span"));
   c.seedRule = d.append(meter, d.create("div", "sub"));
 
-  c.size = d.append(tr, d.create("td", "num"));
+  c.size = d.append(tr, d.create("td", "num queue-size"));
 
-  const td5 = d.append(tr, d.create("td", "num"));
+  const td5 = d.append(tr, d.create("td", "num queue-health"));
   c.health = d.append(td5, d.create("span", "health"));
   c.hNote = d.append(td5, d.create("div", "hnote"));
 
-  const td6 = d.append(tr, d.create("td"));
+  const td6 = d.append(tr, d.create("td", "queue-actions"));
   const acts = d.append(td6, d.create("div", "acts"));
   const mk = (cls, action, label, title) => {
     const b = d.append(acts, d.create("button", cls));
