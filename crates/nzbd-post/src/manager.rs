@@ -2116,6 +2116,7 @@ fn select_scripts(found: Vec<PathBuf>, extensions: &[String]) -> Vec<PathBuf> {
 }
 
 /// Preserve isolated repair while fetching delayed recovery blocks for this set.
+#[allow(clippy::too_many_arguments)]
 async fn repair_isolated_loop(
     engine: &EngineHandle,
     cfg: &PostConfig,
@@ -2145,19 +2146,31 @@ async fn repair_isolated_loop(
                     .await
                     .unwrap_or(0);
                 if freed == 0 || !wait_par_files(engine, job_id, cfg.par_fetch_timeout).await {
-                    return Ok(false);
+                    break;
                 }
                 let refreshed = par2::load_sets(&set.root)?
                     .into_iter()
                     .find(|candidate| candidate.set_id == set.set_id);
                 let Some(refreshed) = refreshed else {
-                    return Ok(false);
+                    break;
                 };
                 set = refreshed;
             }
-            _ => return Ok(false),
+            _ => break,
         }
     }
+    let token = set
+        .set_id
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let inventory = engine.artifacts();
+    let workspace = inventory
+        .workspace(job_id.0, "par_repair", &token)
+        .map_err(|e| PostError::Subprocess(e.to_string()))?;
+    inventory
+        .abandon_repair_workspace(&workspace)
+        .map_err(|e| PostError::Subprocess(e.to_string()))?;
     Ok(false)
 }
 

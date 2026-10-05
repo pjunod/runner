@@ -248,7 +248,7 @@ show **needs review** without offering an ineffective resume. The native job
 action API returns HTTP 409 with the hold reason when resume is refused; HTTP
 404 means the job is actually absent. New holds also appear in Logs.
 
-An upgrade preserves existing holds. If an older build stopped an obfuscated
+An upgrade preserves unrelated holds. If an older build stopped an obfuscated
 post with `conflicting yEnc name or declared size`, inspect the article metadata
 before retrying: that old message does not distinguish a harmless name change
 from a real size conflict. After confirming the name-only case and upgrading,

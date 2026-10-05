@@ -194,11 +194,27 @@ impl Inventory {
     }
 
     pub fn finish_workspace(&self, workspace: &Workspace) -> Result<()> {
-        self.finish_workspace_output(workspace, None)
+        self.finish_workspace_output(workspace, None, true)
     }
 
     pub fn finish_extraction(&self, workspace: &Workspace, output: &Path) -> Result<()> {
-        self.finish_workspace_output(workspace, Some(output))
+        self.finish_workspace_output(workspace, Some(output), true)
+    }
+
+    /// Release an exhausted repair attempt without publishing scratch output.
+    /// Original identities are checked before normal failure disposition resumes.
+    pub fn abandon_repair_workspace(&self, workspace: &Workspace) -> Result<()> {
+        let op = self.operation(&workspace.operation_id)?;
+        if op.kind != "par_repair"
+            || !workspace.retained.is_empty()
+            || workspace.published_files.is_some()
+            || op.state == "succeeded"
+        {
+            return Err(Error::Conflict(
+                "repair has already published output".into(),
+            ));
+        }
+        self.finish_workspace_output(workspace, None, false)
     }
 
     /// A successful extraction can be reused after a later stage fails. Names
@@ -240,7 +256,12 @@ impl Inventory {
         Ok(true)
     }
 
-    fn finish_workspace_output(&self, workspace: &Workspace, output: Option<&Path>) -> Result<()> {
+    fn finish_workspace_output(
+        &self,
+        workspace: &Workspace,
+        output: Option<&Path>,
+        succeeded: bool,
+    ) -> Result<()> {
         let _guard = self.mutation_guard()?;
         let mut source = self.get(&workspace.source.id)?;
         let dir = self.verify(&source)?;
@@ -285,7 +306,7 @@ impl Inventory {
             );
             op.request = serde_json::to_string(&finished)?;
         }
-        op.state = "succeeded".into();
+        op.state = if succeeded { "succeeded" } else { "failed" }.into();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         save_artifact(&tx, &source)?;
@@ -294,7 +315,11 @@ impl Inventory {
         event(
             &tx,
             &source.id,
-            "transform_published",
+            if succeeded {
+                "transform_published"
+            } else {
+                "transform_exhausted"
+            },
             &workspace.operation_id,
         )?;
         tx.commit()?;
