@@ -171,6 +171,21 @@ full checkpoint CRC. Authenticated cluster segment leases may seal private
 sparse checkpoints; the authoritative assembler validates their complete union.
 These checkpoints carry no media-ready or successful post-processing stamp.
 
+Ordinary files with missing articles or NZB coverage gaps also seal privately
+once every listed article has finished. Received ranges must be nonoverlapping,
+within the known yEnc size, and match their recorded CRCs. A durable
+`*File:repair:<id>` parameter identifies the private checkpoint. PAR repair
+copies matching blocks into its owned workspace and publishes only outputs
+whose size and full MD5 match the PAR catalog. Unknown sizes, overlapping
+ranges, and changed disk bytes still require review.
+
+Insufficient or absent recovery data produces `PAR_FAILURE` in History under
+the configured failed-file disposition. It does not leave a permanent queue
+hold. Health reports article delivery, not file completeness; an NZB can omit
+ranges despite 100% article health. When no usable PAR bytes are known, the UI
+says **recovery data unconfirmed** instead of presenting the 85% fallback as a
+repair guarantee.
+
 Multipart posts may use a different obfuscated yEnc filename in every article.
 Runner keeps the first safe confirmed filename for that NZB file, including any
 collision suffix, while requiring all articles to declare the same total size.
@@ -220,6 +235,13 @@ Attempts and exponential backoff survive restart (eight attempts; initial
 `statvfs` supplies no authoritative quota headroom. Manual pause and review
 holds survive resource release.
 
+The web and mobile queues put held jobs under **Needs attention**, with the
+recorded reason. Failed jobs and torrents with missing files or storage holds
+also belong there. **Paused** contains manual pauses. **Waiting** contains
+queued work, and downloaded jobs awaiting verification belong under
+**Waiting to post-process**. Held jobs take precedence over stale stage spans
+and are not presented as reorderable download work.
+
 The web queue labels these jobs **HELD** and shows their recorded reason.
 Resource holds keep **resume**, which requests the recovery probe. Review holds
 show **needs review** without offering an ineffective resume. The native job
@@ -252,3 +274,21 @@ Terminal history and `job_pp_finished` params preserve `*Control:v1` so a
 consumer can recover a missed resume transition after the queue row retires.
 The review probes in `failure_regressions.rs`, `pp_pipeline.rs`, and the
 workspace restart test in `transforms.rs` cover these paths.
+
+### Recovery of legacy coverage and RAR holds
+
+On startup Runner revalidates received ranges and retries the exact legacy
+`file coverage or expected size is unverified; partial retained` hold using
+the private repair path. Manual pauses and unrelated holds remain intact.
+Invalid sizes or overlapping ranges are held again with their existing bytes.
+
+RAR restoration accepts SFV archive names only after matching whole-file CRCs
+and rejecting ambiguous mappings, unsafe paths, and occupied targets. This
+supports old RAR4 sets that omit the optional volume number. Existing holds
+with the exact missing order/membership message retry after custody validation.
+Extraction still validates the restored archive; SFV naming is not a successful
+extraction verdict.
+
+Regression coverage lives in `missing_articles_finish_download_but_keep_partial_private`,
+`private_partial_repairs_with_par_and_fails_without_par`, and
+`sfv_restores_obfuscated_old_rar_without_volume_numbers`.
