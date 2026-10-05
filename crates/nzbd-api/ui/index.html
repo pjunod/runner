@@ -1893,7 +1893,7 @@ function sectionOf(j) {
     if (["fetching_metadata", "fetching_source"].includes(phase)) return "torrent_metadata";
     if (["failed", "missing_files", "storage_hold", "unknown"].includes(phase)) return "attention";
     if (phase === "paused_download") return "paused";
-    return "waiting";
+    return phase === "queued" ? "waiting" : "attention";
   }
   const st = j.status;
   if (st === "paused") return "paused";
@@ -1905,8 +1905,7 @@ function sectionOf(j) {
   if (st === "fetching") return "fetching";
   if (st === "post_queued" || st === "completed") return "post_queued";
   if (st !== "queued") return "attention";
-  return "waiting"; // queued, paused — and anything new, which belongs in a
-                    // list you can see rather than in no list at all
+  return "waiting"; // Only runnable queued work belongs here.
 }
 
 /// A coarse duration for stage timings: never more precision than the

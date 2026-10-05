@@ -90,7 +90,7 @@ export function queueSectionKey(job: JobSummary): QueueSectionKey {
     if (phase === 'fetching_source' || phase === 'fetching_metadata') return 'torrent_metadata';
     if (['failed', 'missing_files', 'storage_hold', 'unknown'].includes(phase)) return 'attention';
     if (phase === 'paused_download') return 'paused';
-    return 'waiting';
+    return phase === 'queued' ? 'waiting' : 'attention';
   }
   const { status, stages } = job;
   if (status === 'paused') return 'paused';
