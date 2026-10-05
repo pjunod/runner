@@ -74,7 +74,8 @@ function job(id: number, status: JobStatus): JobSummary {
 
  test('holds and pauses override stale open stage and ready facts', () => {
    const stale = { ...job(1, 'paused'), ready: true, stages: [{ stage: 'unpack', started_at_unix: 1 }],
-     control: { lifecycle: 'held' } } as JobSummary;
+     control: { version: 1, revision: '1', lifecycle: 'held', cause: 'identity_conflict',
+       stage: 'finalize', retry_policy: 'review', message: 'coverage unverified', instance: 'test' } } as JobSummary;
    expect(queueSectionKey(stale)).toBe('attention');
    expect(queueSectionKey({ ...stale, control: undefined, ready: false })).toBe('paused');
  });
