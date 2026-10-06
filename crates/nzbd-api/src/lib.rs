@@ -2901,6 +2901,7 @@ mod tests {
 
     fn summary(id: u32, status: JobStatus) -> JobSummary {
         JobSummary {
+            repair_progress: None,
             control: None,
             id: nzbd_types::JobId(id),
             kind: nzbd_types::JobKind::Nzb,

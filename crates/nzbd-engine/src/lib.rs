@@ -28,7 +28,10 @@ mod writer;
 pub use events::Event;
 pub use owner::{MirrorStats, MoveOp};
 pub use queue::clean_job_name;
-pub use snapshot::{new_shared_snapshot, JobSummary, QueueSnapshot, ServerVolume, SharedSnapshot};
+pub use snapshot::{
+    new_shared_snapshot, JobSummary, QueueSnapshot, RepairPhase, RepairProgress, ServerVolume,
+    SharedSnapshot,
+};
 
 use nzbd_nntp::transport::{tls_client_config, TlsClientConfig};
 use nzbd_types::{JobId, ServerDef, TlsMode};
@@ -473,6 +476,37 @@ pub struct BudgetApplyReceipt {
 }
 
 impl EngineHandle {
+    pub async fn register_repair_attempt(
+        &self,
+        job: JobId,
+        attempt: String,
+    ) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::RegisterRepairAttempt {
+            job,
+            attempt,
+            reply,
+        })
+        .await
+    }
+    pub async fn update_repair_progress(&self, job: JobId, progress: RepairProgress) {
+        let _ = self
+            .send(QueueCommand::RepairProgress { job, progress })
+            .await;
+    }
+    pub fn close_repair_attempt(&self, job: JobId, attempt: String) {
+        let command = EngineMsg::Command(QueueCommand::CloseRepairAttempt { job, attempt });
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(command)) =
+            self.cmd_tx.try_send(command)
+        {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let sender = self.cmd_tx.clone();
+                runtime.spawn(async move {
+                    let _ = sender.send(command).await;
+                });
+            }
+        }
+    }
+
     pub fn artifacts(&self) -> Arc<nzbd_state::artifacts::Inventory> {
         self.artifacts.clone()
     }

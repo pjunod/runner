@@ -349,6 +349,70 @@ async fn report_completions(
                         continue;
                     }
                 }
+                if lease.kind == LeaseKind::Post {
+                    let source_id = req
+                        .job
+                        .params
+                        .iter()
+                        .find(|(key, _)| key == "Artifact:Id")
+                        .map(|(_, value)| value.clone());
+                    let generation = req
+                        .job
+                        .params
+                        .iter()
+                        .find(|(key, _)| key == "Artifact:Generation")
+                        .map(|(_, value)| value.clone());
+                    if let (Some(source_id), Some(generation), Some(accepted_at_ms)) =
+                        (source_id, generation, resp.accepted_at_unix_ms)
+                    {
+                        let inventory = engine.artifacts();
+                        let receipt_id = req.receipt_id.clone();
+                        let outcome = req
+                            .job
+                            .params
+                            .iter()
+                            .find(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                            .map(|(_, value)| value.clone())
+                            .unwrap_or_else(|| "SUCCESS".into());
+                        let retirement = tokio::task::spawn_blocking(move || {
+                            let artifact = inventory.get(&source_id)?;
+                            if artifact.generation != generation
+                                || inventory.processing_in_use(job_id.0)?
+                            {
+                                return Err(nzbd_state::artifacts::Error::Conflict(
+                                    "remote retirement generation is still in use".into(),
+                                ));
+                            }
+                            if matches!(artifact.state.as_str(), "active" | "transitioning") {
+                                inventory.finish(
+                                    job_id.0,
+                                    &artifact.path,
+                                    &artifact.root,
+                                    if outcome == "SUCCESS" {
+                                        "completed"
+                                    } else {
+                                        "retained"
+                                    },
+                                )?;
+                            }
+                            inventory.finalize_workspaces(
+                                &nzbd_state::artifacts::SourceGeneration {
+                                    artifact: source_id,
+                                    generation,
+                                },
+                                &outcome,
+                                nzbd_state::artifacts::FinalizationProof::Cluster {
+                                    receipt: receipt_id,
+                                    accepted_at_ms,
+                                },
+                            )
+                        })
+                        .await;
+                        if let Ok(Err(error)) = retirement {
+                            tracing::warn!(job=job_id.0, %error, "remote workspace retirement remains pending");
+                        }
+                    }
+                }
                 tracing::info!(job = job_id.0, %lease_id, "completion handed to leader");
                 active.lock().unwrap().remove(&lease_id);
                 let _ = engine.remove_job_silent(job_id).await;
@@ -772,6 +836,8 @@ fn run_pp_lease(
             }
         });
         let ctx = PpCtx {
+            cancel: initial.cancel.child_token(),
+            workers: TaskTracker::new(),
             tag: lease_id.clone(),
             publish_history: false,
             script_receipt: Some(script_receipt),
@@ -800,6 +866,7 @@ fn run_pp_lease(
             _ = pp_cancel.cancelled() => Err(nzbd_post::PostError::Subprocess("PP lease authority expired".into())),
             result = process_job_ctx(&engine, &setup.post, &setup.history, &dest_dir, job_id, &ctx) => result,
         };
+        ctx.cancel.cancel(); ctx.workers.close(); ctx.workers.wait().await;
         match result {
             Ok(outcome) => {
                 tracing::info!(job = job_id.0, lease = %lease_id, outcome = outcome.as_str(), "pp lease finished");

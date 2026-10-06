@@ -1921,3 +1921,71 @@ async fn legacy_coverage_hold_recovers_without_repeating_valid_articles() {
         engine.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn transient_repair_progress_is_attempt_fenced_and_absent_after_terminal_stamp() {
+    use nzbd_engine::{RepairPhase, RepairProgress};
+    let temp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(temp.path(), vec![]).await;
+    let job = transfer_job(501, "repair-progress", JobStatus::PostQueued);
+    engine.import_job(job, false, false).await.unwrap();
+    assert!(engine
+        .register_repair_attempt(JobId(501), "old".into())
+        .await
+        .unwrap());
+    let mut progress = RepairProgress {
+        attempt_id: "old".into(),
+        phase: RepairPhase::Matching,
+        files_done: 1,
+        files_total: 2,
+        bytes_scanned: 65536,
+        round: 0,
+        recovery_blocks_available: 4,
+        additional_blocks_needed: Some(1),
+        last_progress_at: 10,
+    };
+    engine
+        .update_repair_progress(JobId(501), progress.clone())
+        .await;
+    // Export is an ordered owner barrier, so the snapshot is deterministic.
+    engine.export_job(JobId(501)).await.unwrap();
+    assert_eq!(
+        engine.snapshot().jobs[0]
+            .repair_progress
+            .as_ref()
+            .unwrap()
+            .bytes_scanned,
+        65536
+    );
+    assert!(engine
+        .register_repair_attempt(JobId(501), "new".into())
+        .await
+        .unwrap());
+    engine
+        .update_repair_progress(JobId(501), progress.clone())
+        .await;
+    engine.close_repair_attempt(JobId(501), "old".into());
+    progress.attempt_id = "new".into();
+    progress.phase = RepairPhase::Verifying;
+    engine.update_repair_progress(JobId(501), progress).await;
+    engine.export_job(JobId(501)).await.unwrap();
+    assert_eq!(
+        engine.snapshot().jobs[0]
+            .repair_progress
+            .as_ref()
+            .unwrap()
+            .attempt_id,
+        "new"
+    );
+    let mut job = engine.export_job(JobId(501)).await.unwrap().unwrap();
+    job.params
+        .push((nzbd_types::PP_DONE_PARAM.into(), "SUCCESS".into()));
+    engine.import_job(job, false, false).await.unwrap();
+    assert!(engine.snapshot().jobs[0].repair_progress.is_none());
+    let wire = serde_json::to_value(&engine.snapshot().jobs[0]).unwrap();
+    assert!(
+        wire.get("repair_progress").is_none(),
+        "old clients need no new field when idle"
+    );
+    engine.shutdown().await;
+}

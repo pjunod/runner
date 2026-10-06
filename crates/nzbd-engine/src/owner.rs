@@ -190,7 +190,10 @@ pub(crate) enum QueueCommand {
     /// How many jobs may download at once. Replies with the value
     /// actually applied, which is the request clamped into range — the
     /// caller learns what happened rather than having to re-read.
-    SetMaxActiveDownloads { n: u32, reply: oneshot::Sender<u32> },
+    SetMaxActiveDownloads {
+        n: u32,
+        reply: oneshot::Sender<u32>,
+    },
     /// Operator-set per-server connection counts. Replies with the values
     /// actually applied after clamping to each server's spawned ceiling.
     SetServerConnectionCaps {
@@ -236,7 +239,10 @@ pub(crate) enum QueueCommand {
     },
     /// Overlay remote progress and post-processing stages onto a delegated
     /// job's summary without changing the authority's durable control state.
-    MirrorProgress { job: JobId, stats: MirrorStats },
+    MirrorProgress {
+        job: JobId,
+        stats: MirrorStats,
+    },
     /// Union-fold the job's shared journal files into local state (reclaim
     /// after a worker died, or adoption after taking office).
     FoldJobJournals {
@@ -316,6 +322,19 @@ pub(crate) enum QueueCommand {
     /// stage span, closing the previous one. Separate from `SetJobStatus`
     /// because the status and the timeline must not be settable apart —
     /// see [`close_span`].
+    RegisterRepairAttempt {
+        job: JobId,
+        attempt: String,
+        reply: oneshot::Sender<bool>,
+    },
+    RepairProgress {
+        job: JobId,
+        progress: crate::RepairProgress,
+    },
+    CloseRepairAttempt {
+        job: JobId,
+        attempt: String,
+    },
     EnterPostStage {
         job: JobId,
         stage: PostStage,
@@ -530,6 +549,7 @@ pub(crate) struct Owner {
     /// a post-processing recovery job; only the listed files may receive
     /// leases, even if a user resumes another file while verification waits.
     post_fetch_files: HashMap<JobId, HashSet<FileId>>,
+    repair_progress: HashMap<JobId, (String, Option<crate::RepairProgress>)>,
     /// Per-job download-rate EMA, fed from downloaded-byte deltas at
     /// snapshot time (job id → meter).
     job_rates: HashMap<u32, JobRateMeter>,
@@ -979,6 +999,7 @@ impl Owner {
             delegated: HashMap::new(),
             mirror: HashMap::new(),
             post_fetch_files,
+            repair_progress: HashMap::new(),
             job_rates: HashMap::new(),
             job_wire_ema: HashMap::new(),
             server_wire_ema: HashMap::new(),
@@ -2374,6 +2395,47 @@ impl Owner {
                     self.publish_now();
                 }
                 let _ = reply.send(ok);
+            }
+            QueueCommand::RegisterRepairAttempt {
+                job,
+                attempt,
+                reply,
+            } => {
+                let ok = self.state.job(job).is_some_and(|job| {
+                    !job.held()
+                        && !job.ready()
+                        && !job
+                            .params
+                            .iter()
+                            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                });
+                if ok {
+                    self.repair_progress.insert(job, (attempt, None));
+                }
+                let _ = reply.send(ok);
+            }
+            QueueCommand::RepairProgress { job, progress } => {
+                if let Some((attempt, current)) = self.repair_progress.get_mut(&job) {
+                    if *attempt == progress.attempt_id {
+                        let changed = current
+                            .as_ref()
+                            .is_none_or(|old| old.phase != progress.phase);
+                        *current = Some(progress);
+                        if changed {
+                            self.publish_now();
+                        }
+                    }
+                }
+            }
+            QueueCommand::CloseRepairAttempt { job, attempt } => {
+                if self
+                    .repair_progress
+                    .get(&job)
+                    .is_some_and(|(current, _)| *current == attempt)
+                {
+                    self.repair_progress.remove(&job);
+                    self.publish_now();
+                }
             }
             QueueCommand::EnterPostStage {
                 job,
@@ -4687,6 +4749,15 @@ impl Owner {
     }
 
     fn publish_now(&mut self) {
+        self.repair_progress.retain(|id, _| {
+            self.state.job(*id).is_some_and(|job| {
+                !job.held()
+                    && !job
+                        .params
+                        .iter()
+                        .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+            })
+        });
         let rate = self
             .server_wire_ema
             .values()
@@ -4743,6 +4814,18 @@ impl Owner {
                     .map(|s| s.size as u64)
                     .sum();
                 let mut summary = JobSummary {
+                    repair_progress: if !j.held()
+                        && !j
+                            .params
+                            .iter()
+                            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                    {
+                        self.repair_progress
+                            .get(&j.id)
+                            .and_then(|(_, progress)| progress.clone())
+                    } else {
+                        None
+                    },
                     control: j.control(),
                     id: j.id,
                     kind: j.kind,

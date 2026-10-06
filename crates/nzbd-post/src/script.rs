@@ -56,7 +56,52 @@ impl ScriptHost {
         cwd: &Path,
         env: &[(String, String)],
     ) -> Result<ScriptOutcome, PostError> {
+        let control = crate::attempt::current();
+        let cancellation = control
+            .as_ref()
+            .map_or_else(tokio_util::sync::CancellationToken::new, |control| {
+                control.cancel.child_token()
+            });
+        let _cancel_on_drop = cancellation.clone().drop_guard();
+        let entry = entry.to_path_buf();
+        let cwd = cwd.to_path_buf();
+        let env = env.to_vec();
+        let timeout = self.timeout;
+        let guard = control
+            .as_ref()
+            .and_then(|control| control.use_guard.lock().unwrap().clone());
+        let worker_control = control.clone();
+        let run = async move {
+            let _guard = guard;
+            let result = ScriptHost { timeout }
+                .run_owned(&entry, &cwd, &env, cancellation)
+                .await;
+            if let Some(control) = worker_control {
+                control.preserve_uncertainty(&result).await;
+            }
+            result
+        };
+        let task = if let Some(control) = control {
+            control.workers.spawn(run)
+        } else {
+            tokio::spawn(run)
+        };
+        task.await
+            .map_err(|e| PostError::Subprocess(format!("script worker: {e}")))?
+    }
+    async fn run_owned(
+        &self,
+        entry: &Path,
+        cwd: &Path,
+        env: &[(String, String)],
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<ScriptOutcome, PostError> {
         let mut cmd = tokio::process::Command::new(entry);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.as_std_mut().process_group(0);
+        }
         cmd.current_dir(cwd)
             .env_clear()
             .env(
@@ -74,7 +119,9 @@ impl ScriptHost {
             .await
             .map_err(|e| PostError::ToolMissing(format!("{}: {e}", entry.display())))?;
 
+        let group = child.id();
         let stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
         let script = entry
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -111,21 +158,31 @@ impl ScriptHost {
             commands
         };
 
-        let result = tokio::time::timeout(self.timeout, async {
-            let (commands, status) = tokio::join!(parse, child.wait());
+        let result = tokio::select! {
+            _ = cancellation.cancelled() => None,
+            result = tokio::time::timeout(self.timeout, async {
+            let mut sink = tokio::io::sink();
+            let (commands, status, _) = tokio::join!(parse, child.wait(), tokio::io::copy(&mut stderr, &mut sink));
             (commands, status)
-        })
-        .await;
+        }) => Some(result),
+        };
 
         match result {
-            Ok((commands, Ok(status))) => Ok(ScriptOutcome {
-                exit_code: status.code().unwrap_or(-1),
-                commands,
-            }),
-            Ok((_, Err(e))) => Err(PostError::Subprocess(format!("{script}: {e}"))),
-            Err(_) => {
-                let _ = child.kill().await;
+            Some(Ok((commands, Ok(status)))) => {
+                crate::attempt::kill_child(&mut child, group).await?;
+                Ok(ScriptOutcome {
+                    exit_code: status.code().unwrap_or(-1),
+                    commands,
+                })
+            }
+            Some(Ok((_, Err(e)))) => Err(PostError::Subprocess(format!("{script}: {e}"))),
+            Some(Err(_)) => {
+                crate::attempt::kill_child(&mut child, group).await?;
                 Err(PostError::Subprocess(format!("{script}: timed out")))
+            }
+            None => {
+                crate::attempt::kill_child(&mut child, group).await?;
+                Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "script cancelled").into())
             }
         }
     }

@@ -212,6 +212,8 @@ pub type ScriptReceiptHook = Arc<
 /// final stamp — a lease that was cancelled or reclaimed must not publish.
 #[derive(Clone)]
 pub struct PpCtx {
+    pub cancel: CancellationToken,
+    pub workers: TaskTracker,
     pub tag: String,
     pub commit_ok: Arc<dyn Fn() -> bool + Send + Sync>,
     /// Remote cluster attempts publish history only after the replicated
@@ -227,6 +229,8 @@ pub struct PpCtx {
 impl Default for PpCtx {
     fn default() -> Self {
         PpCtx {
+            cancel: CancellationToken::new(),
+            workers: TaskTracker::new(),
             tag: "local".into(),
             commit_ok: Arc::new(|| true),
             publish_history: true,
@@ -855,6 +859,21 @@ async fn handle_failed_job(
             }
         }
     }
+    if let Ok(Some(artifact)) = engine.artifacts().for_job(job.0) {
+        let inventory = engine.artifacts();
+        let source = nzbd_state::artifacts::SourceGeneration {
+            artifact: artifact.id,
+            generation: artifact.generation,
+        };
+        let proof = nzbd_state::artifacts::FinalizationProof::Local {
+            history_seq: history_seq as u64,
+        };
+        let outcome = fail_status.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            inventory.finalize_workspaces(&source, &outcome, proof)
+        })
+        .await;
+    }
     engine.emit(Event::JobPpFinished {
         job,
         name,
@@ -1022,11 +1041,17 @@ fn spawn_job(
                 .await;
         if let Some(permit) = permit {
             let _permit = permit;
+            let ctx = PpCtx {
+                cancel: task_cancel.child_token(),
+                commit_ok: Arc::new({ let global = global_cancel.clone(); let task = task_cancel.clone(); move || !global.is_cancelled() && !task.is_cancelled() }),
+                ..PpCtx::default()
+            };
             let outcome = tokio::select! {
                 _ = global_cancel.cancelled() => None,
                 _ = task_cancel.cancelled() => None,
-                r = process_job_from(&engine, &cfg, &history, &dest, job, from) => Some(r),
+                r = process_job_ctx_from(&engine, &cfg, &history, &dest, job, &ctx, from) => Some(r),
             };
+            ctx.cancel.cancel(); ctx.workers.close(); ctx.workers.wait().await;
             match outcome {
                 None => {
                     tracing::info!(
@@ -1390,6 +1415,42 @@ async fn process_job_ctx_from(
     ctx: &PpCtx,
     from: RestartPoint,
 ) -> Result<PpFinal, PostError> {
+    let control = crate::attempt::AttemptControl::new(engine, ctx, job_id).await?;
+    let cancel_on_drop = control.cancel.clone().drop_guard();
+    let result = crate::attempt::CURRENT
+        .scope(
+            control.clone(),
+            process_job_ctx_from_inner(engine, cfg, history, dest_dir, job_id, ctx, from),
+        )
+        .await;
+    control.cancel.cancel();
+    control.workers.close();
+    control.workers.wait().await;
+    let completion = control.completion.lock().unwrap().take();
+    drop(cancel_on_drop);
+    drop(control);
+    if let Some(completion) = completion {
+        let inventory = engine.artifacts();
+        if let Ok(Err(error)) = tokio::task::spawn_blocking(move || {
+            inventory.finalize_workspaces(&completion.source, &completion.outcome, completion.proof)
+        })
+        .await
+        {
+            tracing::warn!(job = job_id.0, %error, "workspace finalization remains pending");
+        }
+    }
+    result
+}
+
+async fn process_job_ctx_from_inner(
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    history: &Arc<HistoryDb>,
+    dest_dir: &Path,
+    job_id: JobId,
+    ctx: &PpCtx,
+    from: RestartPoint,
+) -> Result<PpFinal, PostError> {
     if !engine
         .set_job_status(job_id, JobStatus::PostQueued)
         .await
@@ -1435,7 +1496,12 @@ async fn process_job_ctx_from(
     let mut renames = Vec::new();
     if from == RestartPoint::Beginning {
         stages.enter(PostStage::ParRename).await;
-        renames = par_rename_owned(&dir, Some((&engine.artifacts(), job_id.0)))?;
+        let rename_dir = dir.clone();
+        let inventory = engine.artifacts();
+        renames = crate::attempt::current()
+            .expect("processing control")
+            .blocking(move |_| par_rename_owned(&rename_dir, Some((&inventory, job_id.0))))
+            .await?;
     }
     let rename_map: std::collections::HashMap<PathBuf, PathBuf> = renames.into_iter().collect();
 
@@ -1470,7 +1536,12 @@ async fn process_job_ctx_from(
     // heuristic deobfuscation pass at the end.
     let mut par2_names: std::collections::HashSet<String> = Default::default();
     if from.includes(RestartPoint::Cleanup) {
-        for set in par2::load_sets(&dir)? {
+        let control = crate::attempt::current().expect("processing control");
+        let scan_dir = dir.clone();
+        let sets = control
+            .blocking(move |_| par2::load_sets(&scan_dir))
+            .await?;
+        for set in sets {
             par2_names.extend(set.files.iter().filter_map(|f| {
                 set.root
                     .join(&f.name)
@@ -1519,11 +1590,10 @@ async fn process_job_ctx_from(
         stages.enter(PostStage::RarRename).await;
         let archive_dir = dir.clone();
         let inventory = engine.artifacts();
-        tokio::task::spawn_blocking(move || {
-            rar_rename_owned(&archive_dir, Some((&inventory, job_id.0)))
-        })
-        .await
-        .map_err(|error| PostError::Subprocess(error.to_string()))??;
+        crate::attempt::current()
+            .expect("processing control")
+            .blocking(move |_| rar_rename_owned(&archive_dir, Some((&inventory, job_id.0))))
+            .await?;
     }
 
     // ---- UNPACK stage ------------------------------------------------------
@@ -1594,11 +1664,19 @@ async fn process_job_ctx_from(
                                 "unpack failed; forcing par repair + retry"
                             );
                             stages.enter(PostStage::ParRepair).await;
+                            engine
+                                .artifacts()
+                                .abandon_workspace(&workspace)
+                                .map_err(|e| PostError::Subprocess(e.to_string()))?;
                             if repair_loop(engine, cfg, &par_tool, &mut stages, job_id, &main)
                                 .await?
                             {
                                 par_did_repair = true;
                                 stages.enter(PostStage::Unpack).await;
+                                workspace = engine
+                                    .artifacts()
+                                    .workspace(job_id.0, "extract", &token)
+                                    .map_err(|e| PostError::Subprocess(e.to_string()))?;
                                 let attempt = engine
                                     .artifacts()
                                     .begin_workspace_attempt(&mut workspace)
@@ -1645,11 +1723,19 @@ async fn process_job_ctx_from(
                             "pp lease lost before commit; workspace retained".into(),
                         ));
                     }
-                    commit_staging(&staging, &dir)?;
-                    engine
-                        .artifacts()
-                        .finish_extraction(&workspace, &staging)
-                        .map_err(|e| PostError::Subprocess(e.to_string()))?;
+                    let output = staging.clone();
+                    let source = dir.clone();
+                    let inventory = engine.artifacts();
+                    let completed = workspace.clone();
+                    crate::attempt::current()
+                        .expect("processing control")
+                        .blocking(move |_| {
+                            commit_staging(&output, &source)?;
+                            inventory
+                                .finish_extraction(&completed, &output)
+                                .map_err(|e| PostError::Subprocess(e.to_string()))
+                        })
+                        .await?;
                     unpacked_any = true;
                 } else {
                     tracing::warn!(
@@ -1658,6 +1744,10 @@ async fn process_job_ctx_from(
                         password_error = r.password_error,
                         "unpack failed"
                     );
+                    engine
+                        .artifacts()
+                        .abandon_workspace(&workspace)
+                        .map_err(|e| PostError::Subprocess(e.to_string()))?;
                     unpack_ok = false;
                 }
                 // Retained workspace belongs to the operation journal.
@@ -1885,6 +1975,11 @@ async fn process_job_ctx_from(
             "pp lease lost before finalize".into(),
         ));
     }
+    // Repair, extraction and scripts have all returned. Join their actual
+    // workers before terminal disposition can move or delete the payload.
+    if let Some(control) = crate::attempt::current() {
+        control.finish_filesystem_work().await?;
+    }
     // ---- disposition of a terminal failure ---------------------------------
     // A failed job's bytes are known-bad, and until this existed nothing
     // ever removed them: the directory stayed in the very tree the
@@ -1965,11 +2060,21 @@ async fn process_job_ctx_from(
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
         };
+        if let Some(source) = crate::attempt::current().and_then(|control| control.source.clone()) {
+            fin.params
+                .retain(|(key, _)| key != "Artifact:Id" && key != "Artifact:Generation");
+            fin.params.push(("Artifact:Id".into(), source.artifact));
+            fin.params
+                .push(("Artifact:Generation".into(), source.generation));
+        }
         if !ctx.publish_history {
             if let Some(path) = &final_dir {
                 fin.params.push(("*Cluster:final-dir".into(), path.clone()));
             }
-            let _ = engine.import_job(fin, false, false).await;
+            engine
+                .import_job(fin, false, false)
+                .await
+                .map_err(|e| PostError::Subprocess(format!("remote terminal stamp: {e}")))?;
             stages.close();
             return Ok(outcome);
         }
@@ -1994,6 +2099,23 @@ async fn process_job_ctx_from(
                 .flatten()
                 .is_none_or(|a| a.path != path)
             {
+                // A script-selected external output does not erase custody
+                // of the completed owned processing source or its scratch.
+                if let Some(control) = crate::attempt::current() {
+                    if let Some(source) = &control.source {
+                        let original = inventory
+                            .get(&source.artifact)
+                            .map_err(|e| PostError::Subprocess(e.to_string()))?;
+                        if original.generation == source.generation
+                            && original.job == Some(job_id.0)
+                            && matches!(original.state.as_str(), "active" | "transitioning")
+                        {
+                            inventory
+                                .finish(job_id.0, &original.path, &original.root, "retained")
+                                .map_err(|e| PostError::Subprocess(e.to_string()))?;
+                        }
+                    }
+                }
                 inventory
                     .register_legacy_active(job_id.0, path.parent().unwrap_or(dest_dir), path)
                     .map_err(|e| {
@@ -2063,12 +2185,25 @@ async fn process_job_ctx_from(
         // History first, stamp second: a crash in between re-runs PP (the
         // stages are idempotent) — the reverse would lose the entry forever.
         let h = history.clone();
-        let history_seq = tokio::task::spawn_blocking(move || h.record_seq(&entry))
+        let (history_seq, _) = tokio::task::spawn_blocking(move || h.record_seq_durable(&entry))
             .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or(0);
-        let _ = engine.import_job(fin.clone(), false, false).await;
+            .map_err(|e| PostError::Subprocess(format!("history worker: {e}")))?
+            .map_err(|e| PostError::Subprocess(format!("durable history: {e}")))?;
+        engine
+            .import_job(fin.clone(), false, false)
+            .await
+            .map_err(|e| PostError::Subprocess(format!("durable terminal stamp: {e}")))?;
+        if let Some(control) = crate::attempt::current() {
+            if let Some(source) = &control.source {
+                *control.completion.lock().unwrap() = Some(crate::attempt::Completion {
+                    source: source.clone(),
+                    outcome: outcome.as_str().into(),
+                    proof: nzbd_state::artifacts::FinalizationProof::Local {
+                        history_seq: history_seq as u64,
+                    },
+                });
+            }
+        }
         // Only now — after the history row is durably written — does the
         // completion become public. A consumer may react to this event by
         // reading `?since_seq=history_seq-1` and is guaranteed to find the
@@ -2123,54 +2258,173 @@ async fn repair_isolated_loop(
     par: &Par2Tool,
     stages: &mut Stages<'_>,
     job_id: JobId,
-    mut set: par2::Par2Set,
+    set: par2::Par2Set,
     partials: &[(PathBuf, String)],
     restored: &mut std::collections::HashSet<PathBuf>,
 ) -> Result<bool, PostError> {
-    for _ in 0..8 {
+    let control = crate::attempt::current().expect("processing control");
+    let inventory = engine.artifacts();
+    let owned_partials = partials.to_vec();
+    let mut session = control
+        .blocking(move |_| {
+            crate::repair_workspace::RepairSession::new(inventory, job_id.0, set, owned_partials)
+        })
+        .await?;
+    let deadline = tokio::time::Instant::now() + cfg.par_fetch_timeout;
+    let mut verify_required = true;
+    let mut needed = 1;
+    let mut last_reason = "no additional recovery files remain".to_string();
+    for round in 0..8 {
+        control.checkpoint()?;
         stages.enter(PostStage::ParRepair).await;
-        match crate::repair_workspace::repair(
-            &engine.artifacts(),
-            job_id.0,
-            &set,
-            par,
-            partials,
-            restored,
-        )
-        .await?
-        {
-            VerifyResult::Intact => return Ok(true),
-            VerifyResult::NeedMoreBlocks { blocks_needed } => {
-                let freed = engine
-                    .unpause_par_blocks(job_id, blocks_needed, Some(set.slice_size))
-                    .await
-                    .unwrap_or(0);
-                if freed == 0 || !wait_par_files(engine, job_id, cfg.par_fetch_timeout).await {
+        control
+            .round(round, session.set.recovery_blocks, Some(needed))
+            .await;
+        if verify_required {
+            let authorized: std::collections::HashSet<_> = engine
+                .export_job(job_id)
+                .await
+                .map_err(|e| PostError::Subprocess(e.to_string()))?
+                .into_iter()
+                .flat_map(|job| job.files)
+                .filter(|file| file.finalized)
+                .filter_map(|file| crate::namespace::relative(&file.filename).ok())
+                .map(|path| session.set.root.join(path))
+                .collect();
+            control.phase(nzbd_engine::RepairPhase::Matching, 0).await;
+            session = control
+                .blocking(move |_| {
+                    session.match_candidates()?;
+                    Ok(session)
+                })
+                .await?;
+            control
+                .phase(
+                    nzbd_engine::RepairPhase::Preparing,
+                    session.set.files.len() + session.set.par_paths.len() + 1,
+                )
+                .await;
+            session = control
+                .blocking(move |_| {
+                    session.prepare(&authorized)?;
+                    Ok(session)
+                })
+                .await?;
+            control.phase(nzbd_engine::RepairPhase::Verifying, 0).await;
+            let verified = par.verify_full(&session.main()).await?;
+            let ready = match verified {
+                VerifyResult::Intact => true,
+                VerifyResult::Repairable { .. } => {
+                    control
+                        .phase(nzbd_engine::RepairPhase::Reconstructing, 0)
+                        .await;
+                    if par.repair(&session.main()).await? != RepairResult::Repaired {
+                        last_reason =
+                            "PAR tool reported repairable data but reconstruction failed".into();
+                        break;
+                    }
+                    true
+                }
+                VerifyResult::NeedMoreBlocks { blocks_needed } => {
+                    needed = blocks_needed.max(1);
+                    false
+                }
+                VerifyResult::Unrepairable => {
+                    last_reason = "PAR tool could not verify the set".into();
                     break;
                 }
-                let refreshed = par2::load_sets(&set.root)?
-                    .into_iter()
-                    .find(|candidate| candidate.set_id == set.set_id);
-                let Some(refreshed) = refreshed else {
-                    break;
-                };
-                set = refreshed;
+            };
+            if ready {
+                control
+                    .phase(
+                        nzbd_engine::RepairPhase::Validating,
+                        session.set.files.len(),
+                    )
+                    .await;
+                let recovered = control
+                    .blocking(move |_| session.validate_publish())
+                    .await?;
+                restored.extend(recovered);
+                return Ok(true);
             }
-            _ => break,
         }
+        if tokio::time::Instant::now() >= deadline {
+            last_reason = "recovery fetch deadline exhausted".into();
+            break;
+        }
+        control
+            .phase(nzbd_engine::RepairPhase::FetchingRecovery, 0)
+            .await;
+        control
+            .round(round, session.set.recovery_blocks, Some(needed))
+            .await;
+        let freed = engine
+            .unpause_par_blocks(job_id, needed, Some(session.set.slice_size))
+            .await
+            .unwrap_or(0);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if freed == 0 || !wait_par_files(engine, job_id, remaining).await {
+            break;
+        }
+        let root = session.set.root.clone();
+        let (sets, rejected) = control
+            .blocking(move |_| par2::load_recovery_sets(&root))
+            .await?;
+        if !rejected.is_empty() {
+            last_reason = format!("rejected recovery files: {}", rejected.join("; "));
+        }
+        let Some(mut refreshed) = sets
+            .into_iter()
+            .find(|candidate| candidate.set_id == session.set.set_id)
+        else {
+            last_reason = "recovery files no longer contain this PAR set".into();
+            break;
+        };
+        if refreshed.slice_size != session.set.slice_size
+            || refreshed.files.len() != session.set.files.len()
+            || session.set.files.iter().any(|old| {
+                !refreshed.files.iter().any(|new| {
+                    old.id == new.id
+                        && old.name == new.name
+                        && old.length == new.length
+                        && old.md5_full == new.md5_full
+                        && old.md5_16k == new.md5_16k
+                        && (old.slice_crcs.is_empty() || old.slice_crcs == new.slice_crcs)
+                })
+            })
+        {
+            return Err(PostError::Subprocess(
+                "PAR catalog changed within the repair attempt; review required".into(),
+            ));
+        }
+        if session
+            .set
+            .main_path
+            .as_ref()
+            .is_some_and(|path| refreshed.par_paths.contains(path))
+        {
+            refreshed.main_path = session.set.main_path.clone();
+        }
+        let new_exponents = refreshed
+            .recovery_exponents
+            .difference(&session.set.recovery_exponents)
+            .next()
+            .is_some();
+        let (returned, changed) = control
+            .blocking(move |_| {
+                let changed = session.sources_changed()?;
+                Ok((session, changed))
+            })
+            .await?;
+        session = returned;
+        verify_required = new_exponents || changed;
+        if !verify_required && rejected.is_empty() {
+            last_reason = "recovery files added no unique recovery blocks".into();
+        }
+        session.set = refreshed;
     }
-    let token = set
-        .set_id
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    let inventory = engine.artifacts();
-    let workspace = inventory
-        .workspace(job_id.0, "par_repair", &token)
-        .map_err(|e| PostError::Subprocess(e.to_string()))?;
-    inventory
-        .abandon_repair_workspace(&workspace)
-        .map_err(|e| PostError::Subprocess(e.to_string()))?;
+    tracing::warn!(job = job_id.0, reason = %last_reason, "PAR repair exhausted recovery inputs");
+    control.blocking(move |_| session.abandon()).await?;
     Ok(false)
 }
 
@@ -2183,49 +2437,31 @@ async fn repair_loop(
     job_id: JobId,
     main: &Path,
 ) -> Result<bool, PostError> {
-    for round in 0..8 {
-        match par.verify_full(main).await? {
-            VerifyResult::Intact => return Ok(true),
-            VerifyResult::Repairable { .. } => {
-                stages.enter(PostStage::ParRepair).await;
-                return Ok(par.repair(main).await? == RepairResult::Repaired);
-            }
-            VerifyResult::NeedMoreBlocks { blocks_needed } => {
-                let block_size = par2_block_size(main).await;
-                tracing::info!(
-                    job = job_id.0,
-                    blocks_needed,
-                    round,
-                    block_size,
-                    "requesting delayed par blocks"
-                );
-                let freed = engine
-                    .unpause_par_blocks(job_id, blocks_needed, block_size)
-                    .await
-                    .unwrap_or(0);
-                if freed == 0 {
-                    // Not "nothing left to fetch" until it says so out
-                    // loud: this branch was silent, and a repair that
-                    // never started reads exactly like a repair that ran
-                    // and failed.
-                    tracing::warn!(
-                        job = job_id.0,
-                        blocks_needed,
-                        round,
-                        block_size,
-                        "repair needs recovery blocks and none could be unpaused — giving up; \
-                         the engine log names which paused par2 files it could not price"
-                    );
-                    return Ok(false);
-                }
-                if !wait_par_files(engine, job_id, cfg.par_fetch_timeout).await {
-                    return Ok(false);
-                }
-            }
-            VerifyResult::Unrepairable => return Ok(false),
-        }
-    }
-    Ok(false)
+    let control = crate::attempt::current().expect("processing control");
+    let root = main
+        .parent()
+        .ok_or_else(|| PostError::Subprocess("PAR catalog root missing".into()))?
+        .to_path_buf();
+    let wanted = main.to_path_buf();
+    let set = control
+        .blocking(move |_| {
+            par2::load_sets(&root)?
+                .into_iter()
+                .find(|set| set.par_paths.contains(&wanted))
+                .ok_or_else(|| PostError::Subprocess("PAR catalog disappeared".into()))
+        })
+        .await?;
+    repair_isolated_loop(
+        engine,
+        cfg,
+        par,
+        stages,
+        job_id,
+        set,
+        &[],
+        &mut Default::default(),
+    )
+    .await
 }
 
 /// What became of a failed job's files: what to tell the history row, and
@@ -2318,6 +2554,7 @@ async fn dispose_failed(
 /// exists on an obfuscated post, but `bytes / slice_size` is a good enough
 /// block count to pick with. The index is small (tens of KiB) and the read
 /// is capped and off the async threads regardless.
+#[cfg(test)]
 async fn par2_block_size(main: &Path) -> Option<u64> {
     let path = main.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -2379,6 +2616,7 @@ fn remove_stale_staging(_dir: &Path, _own: &Path) {
 /// archive, same extractor).
 fn commit_staging(staging: &Path, dir: &Path) -> std::io::Result<()> {
     fn publish(source: &Path, target: &Path) -> std::io::Result<()> {
+        crate::attempt::checkpoint()?;
         let meta = std::fs::symlink_metadata(source)?;
         if meta.file_type().is_symlink() {
             return Err(std::io::Error::other("symlink extraction output"));
@@ -2400,7 +2638,12 @@ fn commit_staging(staging: &Path, dir: &Path) -> std::io::Result<()> {
         } else if meta.is_file() {
             // Hard-link publication is exclusive. Replays can reuse equal bytes;
             // different existing bytes are never overwritten.
-            match nzbd_state::fileops::copy_publish(source, target).map_err(|e| match e {
+            match nzbd_state::fileops::copy_publish_checked(
+                source,
+                target,
+                &crate::attempt::checkpoint,
+            )
+            .map_err(|e| match e {
                 nzbd_state::artifacts::Error::Io(io) => io,
                 other => std::io::Error::other(other),
             }) {

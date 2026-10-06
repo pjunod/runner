@@ -19,7 +19,10 @@
 
 use std::path::PathBuf;
 
+mod attempt;
 pub mod deobfuscate;
+mod fingerprint;
+pub use fingerprint::FileStamp;
 pub mod manager;
 pub mod namespace;
 pub mod par2;
@@ -33,6 +36,8 @@ pub enum PostError {
     /// The stage already persisted its authoritative control fact.
     #[error("post-processing held")]
     Held,
+    #[error("subprocess quiescence unconfirmed: {0}")]
+    Unquiesced(String),
     #[error("tool not found: {0}")]
     ToolMissing(String),
     #[error("subprocess failed: {0}")]
