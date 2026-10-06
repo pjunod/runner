@@ -1,18 +1,20 @@
 //! Minimal HTTPS/HTTP fetcher for URL jobs (`AddUrl`): hyper HTTP/1.1 over
 //! the same rustls stack the NNTP transport uses. Follows up to 5
 //! redirects, caps bodies at 64 MiB (an NZB, not a payload), 60 s timeout
-//! per hop.
+//! per hop. Rate limits and service-unavailable responses get up to three
+//! retries, honoring Retry-After or backing off for 10, 20, then 40 seconds.
 
 use http_body_util::BodyExt;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
 use nzbd_types::CertLevel;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::net::TcpStream;
 
 const MAX_REDIRECTS: usize = 5;
 const MAX_BODY: usize = 64 * 1024 * 1024;
 const HOP_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_RETRIES: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
@@ -22,6 +24,11 @@ pub enum FetchError {
     Io(#[from] std::io::Error),
     #[error("http: {0}")]
     Http(String),
+    #[error("http: status {status}")]
+    HttpStatus {
+        status: hyper::StatusCode,
+        retry_after: Option<Duration>,
+    },
     #[error("redirect loop / too many redirects")]
     TooManyRedirects,
     #[error("timed out")]
@@ -68,11 +75,17 @@ fn parse_url(url: &str) -> Result<Url, FetchError> {
 /// GET a URL and return the body bytes.
 pub async fn http_get(url: &str) -> Result<Vec<u8>, FetchError> {
     let mut current = url.to_string();
-    for _ in 0..=MAX_REDIRECTS {
+    let mut redirects = 0;
+    let mut retries = 0;
+    loop {
         match tokio::time::timeout(HOP_TIMEOUT, get_once(&current)).await {
             Err(_) => return Err(FetchError::Timeout),
             Ok(Ok(Hop::Body(bytes))) => return Ok(bytes),
             Ok(Ok(Hop::Redirect(next))) => {
+                if redirects == MAX_REDIRECTS {
+                    return Err(FetchError::TooManyRedirects);
+                }
+                redirects += 1;
                 current = if next.starts_with("http://") || next.starts_with("https://") {
                     next
                 } else {
@@ -86,10 +99,44 @@ pub async fn http_get(url: &str) -> Result<Vec<u8>, FetchError> {
                     }
                 };
             }
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => {
+                let Some(delay) = retry_delay(&e, retries) else {
+                    return Err(e);
+                };
+                // Reject unrepresentable server delays rather than overflowing
+                // the timer or retrying earlier than the server requested.
+                let Some(deadline) = tokio::time::Instant::now().checked_add(delay) else {
+                    return Err(e);
+                };
+                retries += 1;
+                // URLs can contain indexer credentials; never log them here.
+                tracing::warn!(error = %e, retry = retries, delay_secs = delay.as_secs(), "NZB fetch will retry");
+                tokio::time::sleep_until(deadline).await;
+            }
         }
     }
-    Err(FetchError::TooManyRedirects)
+}
+
+fn retry_delay(error: &FetchError, retries: u32) -> Option<Duration> {
+    match error {
+        FetchError::HttpStatus {
+            status,
+            retry_after,
+        } if retries < MAX_RETRIES && matches!(status.as_u16(), 429 | 503) => {
+            Some(retry_after.unwrap_or_else(|| Duration::from_secs(10 * (1 << retries))))
+        }
+        _ => None,
+    }
+}
+
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        return value.parse().ok().map(Duration::from_secs);
+    }
+    httpdate::parse_http_date(value)
+        .ok()
+        .map(|date| date.duration_since(now).unwrap_or_default())
 }
 
 enum Hop {
@@ -144,7 +191,15 @@ where
         return Ok(Hop::Redirect(loc.to_string()));
     }
     if !status.is_success() {
-        return Err(FetchError::Http(format!("status {status}")));
+        let retry_after = resp
+            .headers()
+            .get(hyper::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| parse_retry_after(v, SystemTime::now()));
+        return Err(FetchError::HttpStatus {
+            status,
+            retry_after,
+        });
     }
     let mut body = Vec::new();
     let mut incoming = resp.into_body();
@@ -164,6 +219,100 @@ where
 mod tests {
     use super::*;
     use std::io::{Read as _, Write as _};
+
+    #[test]
+    fn retry_after_and_backoff_policy() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(
+            parse_retry_after(" 120 ", now),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(parse_retry_after("0", now), Some(Duration::ZERO));
+        assert_eq!(
+            parse_retry_after(&httpdate::fmt_http_date(now + Duration::from_secs(90)), now),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_retry_after(&httpdate::fmt_http_date(now - Duration::from_secs(90)), now),
+            Some(Duration::ZERO)
+        );
+        for value in ["", "garbage", "-1", "+1", "18446744073709551616"] {
+            assert_eq!(parse_retry_after(value, now), None);
+        }
+        let error = FetchError::HttpStatus {
+            status: hyper::StatusCode::TOO_MANY_REQUESTS,
+            retry_after: None,
+        };
+        for (retry, seconds) in [10, 20, 40].into_iter().enumerate() {
+            assert_eq!(
+                retry_delay(&error, retry as u32),
+                Some(Duration::from_secs(seconds))
+            );
+        }
+        assert_eq!(retry_delay(&error, MAX_RETRIES), None);
+        let permanent = FetchError::HttpStatus {
+            status: hyper::StatusCode::FORBIDDEN,
+            retry_after: Some(Duration::ZERO),
+        };
+        assert_eq!(retry_delay(&permanent, 0), None);
+    }
+
+    async fn serve_responses(
+        responses: Vec<String>,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<Vec<(String, std::time::Instant)>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/start", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                requests.push((
+                    String::from_utf8(request).unwrap(),
+                    std::time::Instant::now(),
+                ));
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (url, server)
+    }
+
+    #[tokio::test]
+    async fn rate_limit_after_redirect_waits_then_recovers() {
+        let (url, server) = serve_responses(vec![
+            "HTTP/1.1 302 Found\r\nLocation: /real\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n<nzb />".into(),
+        ]).await;
+        assert_eq!(http_get(&url).await.unwrap(), b"<nzb />");
+        let requests = server.await.unwrap();
+        assert!(requests[1].0.starts_with("GET /real "));
+        assert!(requests[2].0.starts_with("GET /real "));
+        assert!(requests[2].1.duration_since(requests[1].1) >= Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn retryable_statuses_exhaust_the_bounded_budget() {
+        for status in ["429 Too Many Requests", "503 Service Unavailable"] {
+            let response = format!("HTTP/1.1 {status}\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let (url, server) = serve_responses(vec![response; MAX_RETRIES as usize + 1]).await;
+            let error = http_get(&url).await.unwrap_err();
+            assert!(error.to_string().contains(status));
+            assert_eq!(server.await.unwrap().len(), MAX_RETRIES as usize + 1);
+        }
+    }
 
     #[test]
     fn url_parsing() {

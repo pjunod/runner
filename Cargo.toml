@@ -72,6 +72,7 @@ axum = "0.8"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio", "server", "server-auto", "service"] }
 http-body-util = "0.1"
+httpdate = "1"
 rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc_rs"] }
 sha2 = "0.10"
 quick-xml = "0.41"

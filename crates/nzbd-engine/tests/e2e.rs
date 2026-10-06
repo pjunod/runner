@@ -1336,7 +1336,7 @@ fn resume_after_unclean_restart_refetches_nothing_done() {
 fn _hold(_: &Nserv, _: &GeneratedPost, _: PathBuf) {}
 
 /// URL job: the NZB is fetched over HTTP (local listener), then the job
-/// queues and downloads normally; a dead URL fails the job.
+/// retries a rate limit, then queues and downloads normally; a dead URL fails the job.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn url_jobs_fetch_then_download() {
     use std::io::{Read as _, Write as _};
@@ -1344,11 +1344,17 @@ async fn url_jobs_fetch_then_download() {
     let post = build_post("urljob", &[("u.bin", data.clone())], 20_000);
     let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
 
-    // One-shot HTTP server handing out the NZB.
+    // The indexer rate-limits the first request, then hands out the NZB.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let http_port = listener.local_addr().unwrap().port();
     let nzb = post.nzb.clone();
     std::thread::spawn(move || {
+        {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf);
+            s.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        }
         let (mut s, _) = listener.accept().unwrap();
         let mut buf = [0u8; 2048];
         let _ = s.read(&mut buf);
