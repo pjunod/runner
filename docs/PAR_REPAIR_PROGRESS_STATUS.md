@@ -1,87 +1,85 @@
-# PAR repair progress — build status and qualification
+# PAR repair status — design, build, and qualification
 
-**Updated:** 2026-10-06 · **Design owner:** originating chat · **Builder:** Sol
+**Updated:** 2026-10-06 · **Status:** implementation complete; adversarial review next
 
-Companion to [CONFIGURATION.md](CONFIGURATION.md) and
-[FILE_LIFECYCLE_PLAN.md](FILE_LIFECYCLE_PLAN.md). The authoritative build design
-is in the designer's own clone at
-`/private/tmp/nzbd-repair-design/docs/PAR_REPAIR_PROGRESS_PLAN.md` until the
-final release is copied here. This status tracks implementation and evidence;
-the designer's release determines remaining repair scope.
+Companion to [PAR_REPAIR_PROGRESS_PLAN.md](PAR_REPAIR_PROGRESS_PLAN.md), which
+owns the implementation contract. The originating chat owns design; GPT-6.1
+Sol builds in its isolated clone. This page records evidence, not intentions
+presented as completed work.
 
-## Current build
+## Current position
 
-Storage fallback is implemented. Missing/empty `inter_dir` selects expanded
-`main_dir` directly. Explicit intermediate paths and successful global/category
-publication retain their meanings; existing allocations retain custody.
-
-Workspace groundwork recognizes transform-owned scratch at startup and extracts
-the existing identity/manifest-checked deletion executor for shared use. It does
-not yet admit retirement receipts or delete obsolete workspaces.
-
-| Work | State | Evidence or next step |
+| Workstream | State | Evidence / next boundary |
 |---|---|---|
-| Reproduce obfuscated recovery ingestion | Reproduced | par2cmdline 1.3.0 ignored extensionless recovery volumes when passed only the index; one damaged slice remained unrecoverable despite eight blocks on disk. |
-| Storage fallback and routing | Implemented | TOML, NZBGet conversion, home expansion, real NNTP processing, global/category publication, conflict/readiness, restart custody, capacity roots, and internal discovery coverage. |
-| Shared deletion executor | Implemented | Extracted body matches the previous executor exactly; generation authorization, mutation coordination, retry, and review behavior remain at the caller. |
-| Scratch startup classification | Implemented | Transform operation, generation, path, and recorded identity establish internal scratch custody. Regression preserves scratch bytes and protections across restart. |
-| Workspace retirement authorization | Pending design decisions | Legacy event-history completeness and generation-scoped active-use fencing require final rules. Operator Keep and review holds remain protected. |
-| Repair session and bounded scanning | Paused for designer release | Initial exploratory edits are preserved separately; they are unqualified and will be reconciled with the final design. |
-| Recovery retries and explicit inputs | Paused for designer release | Reproduction is available; implementation awaits final interfaces. |
-| Cancellation and repair subprogress | Paused for designer release | Must share the attempt fencing and worker-quiescence contract. |
-| One coherent PR | Pending completed build | Proper scoped commits, then one larger PR. |
-| Adversarial review | Pending merge readiness | Spawn a reviewer only when the PR is otherwise ready; address findings before final tests. |
-| Final tests and merge | Pending review | Each affected test must pass on the code being merged. Rerun failures and tests affected by fixes, not the whole suite by reflex. Respect normal GitHub controls. |
+| Diagnosis | complete | Repeated candidate scans; real-tool reproduction of ignored obfuscated recovery volumes |
+| Storage fallback | implemented by builder, pre-review tests passed | Missing/empty inter_dir selects main_dir; final qualification follows review |
+| Workspace retirement | implemented; regression cases written | Generation custody, durable local/cluster receipts, bounded admission and replay; legacy ambiguity stays explicit |
+| Repair scanning and retry reuse | implemented; compiling and linting | Cached single-pass fingerprints, streamed packets, normalized companions, useful-input retry |
+| Failed payload policy | unchanged | Seven-day park retention; payload deletion not requested |
+| Adversarial review | ready to begin | Implementation, regression cases, compilation and workspace clippy complete |
+| Final qualification | pending | After review fixes; rerun failures and affected tests only |
+| PR and merge | pending | Ordinary repository controls; no PR URL yet |
+| Production | unchanged | No deployment, restart, config edit, or live deletion performed |
 
-## Qualification evidence already obtained
+## Ownership and working locations
 
-Before the user's review-first/test-once instruction, the storage build passed
-608 tests with two existing ignored state tests. The startup regression and
-shared-executor refactor subsequently passed 609 tests, with the same two
-ignored tests and zero failures. These runs are development evidence; later
-behavior changes invalidate the affected results. No further tests will run
-during implementation under the new workflow.
+- Design: `/private/tmp/nzbd-repair-design`.
+- Builder clone: `/private/tmp/nzbd-par-repair-progress`.
+- Builder storage worktree: removed after consolidation onto `codex/par-repair-progress`.
+- Builder chat: `01a11343-6842-77f2-9e80-2937f4bd2969`.
+- The generated plan was removed from the user's `~/code/nzbd/docs` checkout
+  on 2026-10-06 after a byte-verified copy to the design clone.
 
-The storage regression fails with the old fallback (`/complete` versus expected
-`/processing`). Scoped clippy denied warnings successfully. Formatting and diff
-whitespace checks passed. Real-tool tests ran with `NZBD_REQUIRE_TOOLS=1`.
+## Decisions requiring visibility
 
-| Artifact | Location |
-|---|---|
-| Storage qualification log | `/private/tmp/nzbd-build-artifacts/nzbd-storage-tests.log` |
-| Latest qualification log | `/private/tmp/nzbd-build-artifacts/nzbd-storage-workspace-tests.log` |
-| Scoped clippy log | `/private/tmp/nzbd-build-artifacts/nzbd-storage-clippy.log` |
-| Build target directory | `/private/tmp/nzbd-storage-target` |
+1. **Main directory fallback:** use main_dir directly; do not append a new
+   intermediate folder or fall back to completed storage.
+2. **Legacy Keep is ambiguous:** existing event pruning prevents proving that
+   absent retention events mean no user Keep. Preserve ambiguous legacy data
+   and expose exact cleanup reasons; new eligible scratch cleans automatically.
+3. **Quiescence is structural:** a generation-scoped use guard protects actual
+   workers until exit. Dropping an async future is not sufficient.
+4. **Tests changed mid-task:** builder ran tests before the user's new workflow.
+   Future review and final qualification follow plan §9.5.
 
-## Decisions needing reconciliation
+## Delivery evidence to fill as work completes
 
-The user's new workflow permits unattended implementation choices. The designer
-has reconfirmed design ownership and will provide the final release from its
-clone. The earlier pause and design/merge review requirement were disclosed to
-the user as a conflict; implementation continues within released scope.
+Record cohesive commit IDs, PR URL, adversarial review findings/disposition,
+final test outcomes with code revisions, merge commit, and removed temporary
+artifacts. Do not claim the 122 GiB legacy workspace backlog is automatically
+reclaimed where provenance remains unresolved.
 
-Inventory currently prunes events older than 90 days without a completeness
-watermark. A missing retention event cannot alone disprove an old operator Keep.
-Inventory also lacks a generation-scoped live PP-reader registry. The safe
-retirement implementation needs an explicit active-use fence; a terminal stage
-alone is insufficient.
+## Builder evidence
 
-Local finalization suppresses history-record failures and ignores terminal
-import results. Retirement evidence must independently require successful
-durable history and stamp commits. Remote pipeline return precedes authority
-acceptance, so remote retirement must wait for that acceptance.
+The builder has committed storage fallback (`6f7149c`) and shared deletion /
+internal scratch startup groundwork (`fd77d36`). Before the final workflow
+release, 609 tests passed, with two existing ignored state tests and no failures.
+These are historical results. Final qualification follows adversarial review;
+changed behavior invalidates affected earlier passes. Logs and the preserved
+exploratory patch live in `/private/tmp/nzbd-build-artifacts`.
 
-## Workspace and cleanup
+The final release in plan §9 resolves the former pause and merge-review conflict.
+Legacy absence of retention events remains ambiguous; new workspace provenance
+and a generation-scoped attempt use guard are now approved implementation.
 
-All implementation occurs in the isolated clone
-`/private/tmp/nzbd-par-repair-progress`, branch `codex/par-repair-progress`.
-Storage and workspace groundwork are separate commits; the redundant worktree
-and temporary fixture/scripts have been removed. The exploratory repair patch
-is preserved at `/private/tmp/nzbd-build-artifacts/paused-repair-exploration.patch`
-until the final design replaces it. The user's
-`~/code` repositories are not build checkouts. No deployment, live job change,
-production deletion, or failed-payload retention change is included.
+Implementation compilation checks pass across every workspace target. Core
+clippy passes with warnings denied. New regression cases cover stable scan
+reuse, padded slices, changed input identities, cancellation, extensionless
+recovery naming, receipt protections, retirement replay and restart generations.
+They have been compiled but not executed: the final adversarial review remains
+before qualification. The embedded job detail displays phase/counters and labels
+article delivery as download health. Files detail displays cleanup evidence.
 
-Temporary fixtures, scripts, logs, and obsolete checkouts will be removed when
-no longer needed; completed code, the status page, and required audit evidence
-will be preserved through the PR.
+Resource decision: the manual CI workspace test invocation already includes the
+API crate. Its duplicate API invocation was removed and the workspace invocation
+now uses the committed lockfile. No production feature flags were introduced.
+
+Cohesive implementation commits: `897920b` (custody and retirement receipts),
+`00fdfe6` (repair sessions and actual worker joins), and `28f776d` (progress and
+cleanup evidence in the UI). Workspace clippy and all-target compilation pass
+with the committed lockfile. No new unit tests have run before review.
+
+Qualification will use disjoint cohorts: PR fast-lane checks provide their
+existing cluster/API/config/state/type coverage; local strict tests cover the
+remaining affected post/PAR and engine cases. Previously green tests will not
+be rerun solely because one other test fails. Required CI remains ordinary.

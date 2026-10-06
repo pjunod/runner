@@ -85,9 +85,7 @@ jobs:
       # cluster tests (election, failover, reclaim), and the whole-daemon
       # CLI/compat test that boots the real binary.
       - name: cargo test
-        run: cargo test --workspace
-      - name: cargo test (torrent admission)
-        run: cargo test --locked -p nzbd-api
+        run: cargo test --locked --workspace
 
   msrv:
     name: MSRV check (1.95)

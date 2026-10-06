@@ -127,7 +127,8 @@ NZBGet configuration and prints a mapping report.
 ## Documentation
 
 [PAR repair build status](docs/PAR_REPAIR_PROGRESS_STATUS.md) tracks the storage,
-workspace retirement, repair, and qualification work.
+workspace retirement, repair, and qualification work specified by the
+[repair plan](docs/PAR_REPAIR_PROGRESS_PLAN.md).
 
 | Doc | What it covers |
 |---|---|
