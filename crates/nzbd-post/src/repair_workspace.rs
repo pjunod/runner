@@ -257,7 +257,9 @@ impl RepairSession {
                 self.recovered.extend(
                     self.partials
                         .iter()
-                        .filter(|(_, name)| name == &file.name)
+                        .filter(|(path, name)| {
+                            path.parent() == Some(self.set.root.as_path()) && name == &file.name
+                        })
                         .map(|(p, _)| p.clone()),
                 );
                 continue;

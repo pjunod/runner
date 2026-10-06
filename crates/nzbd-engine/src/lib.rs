@@ -1110,6 +1110,17 @@ impl EngineHandle {
             .cmd_tx
             .try_send(EngineMsg::Command(QueueCommand::MirrorProgress {
                 job,
+                node: None,
+                stats,
+            }));
+    }
+
+    pub fn mirror_progress_from(&self, job: JobId, node: String, stats: MirrorStats) {
+        let _ = self
+            .cmd_tx
+            .try_send(EngineMsg::Command(QueueCommand::MirrorProgress {
+                job,
+                node: Some(node),
                 stats,
             }));
     }

@@ -77,6 +77,13 @@ pub struct WorkspaceAssessment {
     pub reasons: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct StagedCompletion {
+    pub source: SourceGeneration,
+    pub outcome: String,
+    pub proof: FinalizationProof,
+}
+
 impl Inventory {
     pub fn acquire_attempt_use(self: &Arc<Self>, job: u32) -> Result<Option<AttemptUse>> {
         self.acquire_attempt_use_checked(job, &|| Ok(()))
@@ -85,6 +92,21 @@ impl Inventory {
         self: &Arc<Self>,
         job: u32,
         checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> Result<Option<AttemptUse>> {
+        self.acquire_use(job, checkpoint, true)
+    }
+    pub fn acquire_terminal_use(
+        self: &Arc<Self>,
+        job: u32,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> Result<Option<AttemptUse>> {
+        self.acquire_use(job, checkpoint, false)
+    }
+    fn acquire_use(
+        self: &Arc<Self>,
+        job: u32,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+        resume: bool,
     ) -> Result<Option<AttemptUse>> {
         let _coordinator = self.mutation_guard()?;
         checkpoint()?;
@@ -108,7 +130,8 @@ impl Inventory {
             ));
         }
         self.verify(&artifact)?;
-        if artifact.state == "retained" || artifact.state == "completed" {
+        checkpoint()?;
+        if resume && (artifact.state == "retained" || artifact.state == "completed") {
             artifact.state = "active".into();
             artifact.revision += 1;
             let mut db = self.db.lock().unwrap();
@@ -119,6 +142,11 @@ impl Inventory {
                 params![artifact.id, artifact.generation],
             )?;
             tx.commit()?;
+        } else if resume {
+            self.db.lock().unwrap().execute(
+                "DELETE FROM workspace_finalizations WHERE source=?1 AND generation=?2",
+                params![artifact.id, artifact.generation],
+            )?;
         }
         self.workspace_uses.lock().unwrap().insert(key, 1);
         Ok(Some(AttemptUse(Arc::new(UseLease {
@@ -128,6 +156,61 @@ impl Inventory {
                 generation: artifact.generation,
             },
         }))))
+    }
+    pub(super) fn authorized_processing_use(
+        &self,
+        artifact: &Artifact,
+        guard: Option<&AttemptUse>,
+    ) -> bool {
+        guard.is_some_and(|guard| {
+            std::ptr::eq(self, guard.0.inventory.as_ref())
+                && guard.source().artifact == artifact.id
+                && guard.source().generation == artifact.generation
+                && self.source_in_use(guard.source())
+        })
+    }
+    /// Terminal Delete is performed by the current owner after all other
+    /// workers have joined. Its guard continues to fence outside actors until
+    /// the deletion worker actually exits; Keep and holds remain mandatory.
+    pub fn delete_failed_payload(
+        &self,
+        guard: &AttemptUse,
+        job: u32,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> Result<Operation> {
+        checkpoint()?;
+        let artifact = {
+            let _mutation = self.mutation_guard()?;
+            checkpoint()?;
+            let artifact = self.for_job(job)?.ok_or(Error::NotFound)?;
+            if !self.authorized_processing_use(&artifact, Some(guard)) {
+                return Err(Error::Conflict(
+                    "terminal delete lacks its live generation owner".into(),
+                ));
+            }
+            let path = artifact.path.clone();
+            let root = artifact.root.clone();
+            self.finish_artifact_unlocked(artifact, &path, &root, "retained")?
+        };
+        if !self.authorized_processing_use(&artifact, Some(guard)) {
+            return Err(Error::Conflict(
+                "terminal delete lacks its live generation owner".into(),
+            ));
+        }
+        let key = format!("failed-delete-{}", artifact.id);
+        let op = match self.operation(&key) {
+            Ok(op) => op,
+            Err(Error::NotFound) => self.request_delete_with_use(
+                &artifact.id,
+                artifact.revision,
+                &key,
+                0,
+                false,
+                Some((guard, checkpoint)),
+            )?,
+            Err(error) => return Err(error),
+        };
+        self.execute_delete_with_use(&op.id, Some((guard, checkpoint)))
     }
     pub(super) fn source_in_use(&self, source: &SourceGeneration) -> bool {
         self.workspace_uses
@@ -189,6 +272,91 @@ impl Inventory {
         }))
     }
 
+    /// Persist the history association before stamping PP_DONE. Pending
+    /// evidence cannot admit retirement until the matching stamp is confirmed.
+    pub fn stage_workspace_finalization(
+        &self,
+        source: &SourceGeneration,
+        outcome: &str,
+        proof: &FinalizationProof,
+    ) -> Result<()> {
+        let _coordinator = self.mutation_guard()?;
+        let parent = self.get(&source.artifact)?;
+        if parent.generation != source.generation || !proof.valid() {
+            return Err(Error::Conflict(
+                "pending completion generation or history evidence changed".into(),
+            ));
+        }
+        self.db.lock().unwrap().execute("INSERT INTO workspace_finalizations(source,generation,outcome,proof,job,activated) VALUES(?1,?2,?3,?4,?5,0) ON CONFLICT(source,generation) DO UPDATE SET outcome=excluded.outcome,proof=excluded.proof,job=excluded.job,activated=CASE WHEN workspace_finalizations.proof=excluded.proof AND workspace_finalizations.outcome=excluded.outcome THEN workspace_finalizations.activated ELSE 0 END",
+            params![source.artifact,source.generation,outcome,serde_json::to_string(proof)?,parent.job])?;
+        Ok(())
+    }
+    pub fn confirm_stamped_finalization(&self, completion: &StagedCompletion) -> Result<()> {
+        let _coordinator = self.mutation_guard()?;
+        if self.get(&completion.source.artifact)?.generation != completion.source.generation
+            || !completion.proof.valid()
+        {
+            return Err(Error::Conflict("terminal stamp generation changed".into()));
+        }
+        let updated = self.db.lock().unwrap().execute("UPDATE workspace_finalizations SET activated=1 WHERE source=?1 AND generation=?2 AND outcome=?3 AND proof=?4",
+            params![completion.source.artifact, completion.source.generation, completion.outcome,serde_json::to_string(&completion.proof)?])?;
+        if updated != 1 {
+            return Err(Error::Conflict(
+                "terminal stamp has no matching pending completion".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub fn staged_completions(&self, job: u32) -> Result<Vec<StagedCompletion>> {
+        let db = self.db.lock().unwrap();
+        let mut statement = db.prepare("SELECT source,generation,outcome,proof FROM workspace_finalizations WHERE job=?1 AND activated=0 ORDER BY source LIMIT 25")?;
+        let rows = statement.query_map([job], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (artifact, generation, outcome, proof) = row?;
+            Ok(StagedCompletion {
+                source: SourceGeneration {
+                    artifact,
+                    generation,
+                },
+                outcome,
+                proof: serde_json::from_str(&proof)?,
+            })
+        })
+        .collect()
+    }
+    /// Authority acceptance is itself the cluster terminal evidence. Persist
+    /// it before terminalization so maintenance can replay a crash at either step.
+    pub fn accept_cluster_completion(
+        &self,
+        source: &SourceGeneration,
+        outcome: &str,
+        proof: FinalizationProof,
+    ) -> Result<()> {
+        {
+            let _coordinator = self.mutation_guard()?;
+            let parent = self.get(&source.artifact)?;
+            if parent.generation != source.generation
+                || self.source_in_use(source)
+                || !matches!(proof, FinalizationProof::Cluster { .. })
+                || !proof.valid()
+            {
+                return Err(Error::Conflict(
+                    "cluster acceptance lacks generation or quiescence evidence".into(),
+                ));
+            }
+            self.db.lock().unwrap().execute("INSERT INTO workspace_finalizations(source,generation,outcome,proof,job,activated) VALUES(?1,?2,?3,?4,?5,1) ON CONFLICT(source,generation) DO UPDATE SET outcome=excluded.outcome,proof=excluded.proof,job=excluded.job,activated=1",
+                params![source.artifact,source.generation,outcome,serde_json::to_string(&proof)?,parent.job])?;
+        }
+        self.reconcile_workspace_retirements()?;
+        self.run_workspace_retirements()
+    }
     /// Called only after durable whole-job completion/authority acceptance and
     /// joined workers. This receipt is not inferred from a stage return.
     pub fn finalize_workspaces(
@@ -215,8 +383,8 @@ impl Inventory {
                 return Err(Error::Conflict("workspace parent has not finalized".into()));
             }
             self.db.lock().unwrap().execute(
-                "INSERT INTO workspace_finalizations(source,generation,outcome,proof) VALUES(?1,?2,?3,?4) ON CONFLICT(source,generation) DO UPDATE SET outcome=excluded.outcome,proof=excluded.proof",
-                params![source.artifact, source.generation, outcome, serde_json::to_string(&proof)?],
+                "INSERT INTO workspace_finalizations(source,generation,outcome,proof,job,activated) VALUES(?1,?2,?3,?4,?5,1) ON CONFLICT(source,generation) DO UPDATE SET outcome=excluded.outcome,proof=excluded.proof,job=excluded.job,activated=1",
+                params![source.artifact, source.generation, outcome, serde_json::to_string(&proof)?,parent.job],
             )?;
         }
         self.reconcile_workspace_retirements()?;
@@ -228,7 +396,7 @@ impl Inventory {
         source: &SourceGeneration,
     ) -> Result<Option<(String, FinalizationProof)>> {
         let row: Option<(String, String)> = self.db.lock().unwrap().query_row(
-            "SELECT outcome,proof FROM workspace_finalizations WHERE source=?1 AND generation=?2",
+            "SELECT outcome,proof FROM workspace_finalizations WHERE source=?1 AND generation=?2 AND activated=1",
             params![source.artifact, source.generation], |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?;
         row.map(|(outcome, proof)| Ok((outcome, serde_json::from_str(&proof)?)))
@@ -376,6 +544,33 @@ impl Inventory {
             if scratch.terminal() || matches!(scratch.state.as_str(), "deleting" | "delete_failed")
             {
                 continue;
+            }
+            let source = SourceGeneration {
+                artifact: workspace.source.id.clone(),
+                generation: workspace.source.generation.clone(),
+            };
+            if let Some((outcome, FinalizationProof::Cluster { .. })) =
+                self.workspace_finalization(&source)?
+            {
+                let parent = self.get(&source.artifact)?;
+                if parent.generation == source.generation
+                    && !self.source_in_use(&source)
+                    && parent.hold.is_none()
+                    && matches!(parent.state.as_str(), "active" | "transitioning")
+                {
+                    let path = parent.path.clone();
+                    let root = parent.root.clone();
+                    self.finish_artifact_unlocked(
+                        parent,
+                        &path,
+                        &root,
+                        if outcome == "SUCCESS" {
+                            "completed"
+                        } else {
+                            "retained"
+                        },
+                    )?;
+                }
             }
             // Durable whole-job failure + joined workers can terminalize an
             // aborted stage. A successful job never supplies this inference.
@@ -630,7 +825,7 @@ mod tests {
             .unwrap();
     }
     fn record(inventory: &Inventory, workspace: &Workspace) {
-        inventory.db.lock().unwrap().execute("INSERT INTO workspace_finalizations(source,generation,outcome,proof) VALUES(?1,?2,'SUCCESS',?3)", params![workspace.source.id, workspace.source.generation, serde_json::to_string(&FinalizationProof::Local {history_seq:1}).unwrap()]).unwrap();
+        inventory.db.lock().unwrap().execute("INSERT INTO workspace_finalizations(source,generation,outcome,proof,activated) VALUES(?1,?2,'SUCCESS',?3,1)", params![workspace.source.id, workspace.source.generation, serde_json::to_string(&FinalizationProof::Local {history_seq:1}).unwrap()]).unwrap();
     }
     #[test]
     fn terminal_receipts_retire_only_scratch_and_restart_gets_fresh_generation() {
@@ -832,6 +1027,130 @@ mod tests {
         assert!(!inventory.workspace_cursor.lock().unwrap().is_empty());
         inventory.reconcile_workspace_retirements().unwrap();
         inventory.run_workspace_retirements().unwrap();
+        assert!(!workspace.scratch.path.exists());
+    }
+    #[test]
+    fn pending_history_evidence_cannot_retire_until_matching_stamp_is_confirmed() {
+        let (temp, inventory, workspace) = fixture();
+        terminal(&inventory, &workspace, "completed");
+        let source = source(&workspace);
+        let proof = FinalizationProof::Local { history_seq: 7 };
+        inventory
+            .stage_workspace_finalization(&source, "SUCCESS", &proof)
+            .unwrap();
+        inventory.reconcile_workspace_retirements().unwrap();
+        inventory.run_workspace_retirements().unwrap();
+        assert!(workspace.scratch.path.exists());
+        drop(inventory);
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        let pending = inventory.staged_completions(12).unwrap();
+        assert_eq!(pending.len(), 1);
+        let wrong = StagedCompletion {
+            source: source.clone(),
+            outcome: "SUCCESS".into(),
+            proof: FinalizationProof::Local { history_seq: 8 },
+        };
+        assert!(inventory.confirm_stamped_finalization(&wrong).is_err());
+        inventory.confirm_stamped_finalization(&pending[0]).unwrap();
+        inventory.reconcile_workspace_retirements().unwrap();
+        inventory.run_workspace_retirements().unwrap();
+        assert!(!workspace.scratch.path.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_cross_volume_copy_and_publication_preserve_owned_source() {
+        for cancellation_checkpoint in [3, 7] {
+            let (temp, inventory, workspace) = fixture();
+            std::fs::write(workspace.source.path.join("large"), vec![1; 200000]).unwrap();
+            let target = temp.path().join("completed/job");
+            let guard = inventory.acquire_attempt_use(12).unwrap().unwrap();
+            fs::RENAME_FAILURE.with(|fault| fault.set(Some(libc::EXDEV)));
+            let checks = std::cell::Cell::new(0);
+            let result = inventory.relocate_checked(12, &target, &|| {
+                checks.set(checks.get() + 1);
+                if checks.get() == cancellation_checkpoint {
+                    Err(std::io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.is_err());
+            assert!(!target.exists());
+            assert_eq!(
+                std::fs::read(workspace.source.path.join("large"))
+                    .unwrap()
+                    .len(),
+                200000
+            );
+            assert!(inventory.processing_in_use(12).unwrap());
+            assert!(inventory.acquire_attempt_use(12).is_err());
+            drop(guard);
+            fs::RENAME_FAILURE.with(|fault| fault.set(None));
+        }
+    }
+    #[test]
+    fn terminal_delete_cancelled_while_waiting_for_mutation_preserves_payload() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_temp, inventory, workspace) = fixture();
+        let guard = inventory.acquire_attempt_use(12).unwrap().unwrap();
+        let mutation = inventory.mutation_guard().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let worker_inventory = inventory.clone();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let first = std::cell::Cell::new(true);
+            worker_inventory.delete_failed_payload(&guard, 12, &|| {
+                if first.replace(false) {
+                    started.send(()).unwrap();
+                    return Ok(());
+                }
+                if worker_cancelled.load(Ordering::SeqCst) {
+                    Err(std::io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        cancelled.store(true, Ordering::SeqCst);
+        drop(mutation);
+        assert!(worker.join().unwrap().is_err());
+        assert!(workspace.source.path.join("original").exists());
+        assert_eq!(inventory.for_job(12).unwrap().unwrap().state, "active");
+        assert!(matches!(
+            inventory.operation(&format!("failed-delete-{}", workspace.source.id)),
+            Err(Error::NotFound)
+        ));
+    }
+    #[test]
+    fn terminal_delete_owner_fences_outside_deletion_until_actual_exit() {
+        let (_temp, inventory, workspace) = fixture();
+        let guard = inventory.acquire_attempt_use(12).unwrap().unwrap();
+        terminal(&inventory, &workspace, "retained");
+        let artifact = inventory.for_job(12).unwrap().unwrap();
+        assert!(inventory
+            .request_delete(&artifact.id, artifact.revision, "outsider", 0)
+            .is_err());
+        assert_eq!(
+            inventory
+                .delete_failed_payload(&guard, 12, &|| Ok(()))
+                .unwrap()
+                .state,
+            "succeeded"
+        );
+        assert!(inventory.processing_in_use(12).unwrap());
+        assert!(workspace.scratch.path.exists());
+        drop(guard);
+        inventory
+            .finalize_workspaces(
+                &source(&workspace),
+                "PAR_FAILURE",
+                FinalizationProof::Local { history_seq: 1 },
+            )
+            .unwrap();
         assert!(!workspace.scratch.path.exists());
     }
 }

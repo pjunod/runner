@@ -2960,3 +2960,106 @@ async fn private_partial_repairs_with_par_and_fails_without_par() {
         engine.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn terminal_stamp_receipt_gap_replays_after_restart_without_reprocessing() {
+    use nzbd_state::artifacts::{FinalizationProof, SourceGeneration};
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let root = tmp.path().join("dest");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("receipt-gap");
+    engine.artifacts().allocate(1201, &root, &path).unwrap();
+    std::fs::write(path.join("payload.bin"), b"owned original").unwrap();
+    let workspace = engine
+        .artifacts()
+        .workspace(1201, "par_repair", "abc")
+        .unwrap();
+    std::fs::write(workspace.scratch.path.join("temporary"), b"scratch").unwrap();
+    engine.artifacts().finish_workspace(&workspace).unwrap();
+    engine
+        .artifacts()
+        .finish(1201, &path, &root, "completed")
+        .unwrap();
+    let mut job = completed_job(
+        1201,
+        "receipt-gap",
+        vec![file_entry(1, "payload.bin", None, false)],
+    );
+    job.params.push((PP_DONE_PARAM.into(), "SUCCESS".into()));
+    let hist = history(tmp.path());
+    let entry = nzbd_state::HistoryEntry {
+        job: job.id,
+        name: job.name.clone(),
+        category: job.category.clone(),
+        final_dir: Some(path.to_string_lossy().into_owned()),
+        status: "SUCCESS".into(),
+        size: 14,
+        health: 1000,
+        params: Vec::new(),
+        dupe_key: String::new(),
+        dupe_score: 0,
+        completed_at_unix: 1000,
+        hidden: false,
+        first_seen_at_unix: None,
+        last_seen_at_unix: None,
+        seen_count: 0,
+        removed_at_unix: None,
+        picked_up_by: None,
+        record: Some(nzbd_state::JobRecord::from_job(&job)),
+        stages: Vec::new(),
+        seq: 0,
+    };
+    let (sequence, _) = hist.record_seq_durable(&entry).unwrap();
+    let source = SourceGeneration {
+        artifact: workspace.source.id.clone(),
+        generation: workspace.source.generation.clone(),
+    };
+    engine
+        .artifacts()
+        .stage_workspace_finalization(
+            &source,
+            "SUCCESS",
+            &FinalizationProof::Local {
+                history_seq: sequence as u64,
+            },
+        )
+        .unwrap();
+    job.params
+        .push(("*PP:history-seq".into(), sequence.to_string()));
+    engine.import_job(job, false, false).await.unwrap();
+    // Model a crash after the durable stamp, before receipt confirmation.
+    engine.shutdown().await;
+    assert!(workspace.scratch.path.exists());
+    let recovered = spawn_engine(tmp.path()).await;
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    spawn_post_manager(
+        recovered.clone(),
+        PostConfig::default(),
+        hist.clone(),
+        root,
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while recovered.export_job(JobId(1201)).await.unwrap().is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "terminal receipt was not replayed"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert!(!workspace.scratch.path.exists());
+    assert!(path.join("payload.bin").exists());
+    assert_eq!(
+        hist.list(10).unwrap().len(),
+        1,
+        "receipt replay does not rerun PP/history"
+    );
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+    recovered.shutdown().await;
+}

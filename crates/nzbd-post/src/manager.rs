@@ -212,6 +212,8 @@ pub type ScriptReceiptHook = Arc<
 /// final stamp — a lease that was cancelled or reclaimed must not publish.
 #[derive(Clone)]
 pub struct PpCtx {
+    #[cfg(test)]
+    pub(crate) repair_observer: Option<crate::attempt::RepairObserver>,
     pub cancel: CancellationToken,
     pub workers: TaskTracker,
     pub tag: String,
@@ -229,6 +231,8 @@ pub struct PpCtx {
 impl Default for PpCtx {
     fn default() -> Self {
         PpCtx {
+            #[cfg(test)]
+            repair_observer: None,
             cancel: CancellationToken::new(),
             workers: TaskTracker::new(),
             tag: "local".into(),
@@ -844,11 +848,46 @@ async fn handle_failed_job(
     // These jobs never enter the stage pipeline, but they are terminal, and
     // a consumer waiting for `job_pp_finished` must not wait forever after
     // disk admission recovers.
+    let pending_completion = engine
+        .artifacts()
+        .for_job(job.0)
+        .ok()
+        .flatten()
+        .filter(|_| exported.is_some())
+        .map(|artifact| nzbd_state::artifacts::StagedCompletion {
+            source: nzbd_state::artifacts::SourceGeneration {
+                artifact: artifact.id,
+                generation: artifact.generation,
+            },
+            outcome: fail_status.to_string(),
+            proof: nzbd_state::artifacts::FinalizationProof::Local {
+                history_seq: history_seq as u64,
+            },
+        });
+    if let Some(pending) = &pending_completion {
+        let pending = pending.clone();
+        let inventory = engine.artifacts();
+        if !matches!(
+            tokio::task::spawn_blocking(move || inventory.stage_workspace_finalization(
+                &pending.source,
+                &pending.outcome,
+                &pending.proof
+            ))
+            .await,
+            Ok(Ok(()))
+        ) {
+            return;
+        }
+    }
     if let Some(mut fin) = exported {
         if let Some((_, note)) = entry.params.iter().find(|(key, _)| key == "Failure:Files") {
             fin.params.push(("Failure:Files".into(), note.clone()));
         }
+        fin.params.retain(|(key, _)| key != PP_DONE_PARAM);
         fin.params.push((PP_DONE_PARAM.into(), fail_status.into()));
+        fin.params.retain(|(key, _)| key != "*PP:history-seq");
+        fin.params
+            .push(("*PP:history-seq".into(), history_seq.to_string()));
         match engine.import_job_if_present(fin).await {
             Ok(true) => {}
             Ok(false) => return,
@@ -859,20 +898,18 @@ async fn handle_failed_job(
             }
         }
     }
-    if let Ok(Some(artifact)) = engine.artifacts().for_job(job.0) {
+    if let Some(pending) = pending_completion {
         let inventory = engine.artifacts();
-        let source = nzbd_state::artifacts::SourceGeneration {
-            artifact: artifact.id,
-            generation: artifact.generation,
-        };
-        let proof = nzbd_state::artifacts::FinalizationProof::Local {
-            history_seq: history_seq as u64,
-        };
-        let outcome = fail_status.to_string();
-        let _ = tokio::task::spawn_blocking(move || {
-            inventory.finalize_workspaces(&source, &outcome, proof)
-        })
-        .await;
+        if !matches!(
+            tokio::task::spawn_blocking(move || {
+                inventory.confirm_stamped_finalization(&pending)?;
+                inventory.finalize_workspaces(&pending.source, &pending.outcome, pending.proof)
+            })
+            .await,
+            Ok(Ok(()))
+        ) {
+            tracing::warn!(job = job.0, "failed job workspace receipt remains pending");
+        }
     }
     engine.emit(Event::JobPpFinished {
         job,
@@ -957,6 +994,13 @@ async fn scan_queue(
             && j.pp_done
             && matches!(j.status, JobStatus::Completed | JobStatus::Failed)
         {
+            if active.contains_key(&j.id) {
+                continue;
+            }
+            if let Err(error) = reconcile_stamped_completion(engine, history, j.id).await {
+                tracing::warn!(job=j.id.0,%error,"terminal workspace receipt remains pending");
+                continue;
+            }
             let _ = engine.remove_job_silent(j.id).await;
             if let Some(attempt) = active.remove(&j.id) {
                 attempt.cancel.cancel();
@@ -1001,6 +1045,79 @@ async fn scan_queue(
             active.insert(j.id, attempt);
         }
     }
+}
+
+/// Replay a crash after the terminal stamp using the exact history cursor,
+/// outcome and current source generation, never inferred stage completion.
+async fn reconcile_stamped_completion(
+    engine: &EngineHandle,
+    history: &Arc<HistoryDb>,
+    job: JobId,
+) -> Result<(), PostError> {
+    let inventory = engine.artifacts();
+    let lookup = inventory.clone();
+    let pending = tokio::task::spawn_blocking(move || lookup.staged_completions(job.0))
+        .await
+        .map_err(|e| PostError::Subprocess(e.to_string()))?
+        .map_err(|e| PostError::Subprocess(e.to_string()))?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let current = engine
+        .export_job(job)
+        .await
+        .map_err(|e| PostError::Subprocess(e.to_string()))?
+        .ok_or_else(|| PostError::Subprocess("terminal job stamp vanished".into()))?;
+    let stamped_outcome = current
+        .params
+        .iter()
+        .find(|(key, _)| key == PP_DONE_PARAM)
+        .map(|(_, value)| value.clone());
+    let sequence = current
+        .params
+        .iter()
+        .find(|(key, _)| key == "*PP:history-seq")
+        .and_then(|(_, value)| value.parse::<i64>().ok());
+    for completion in pending {
+        let nzbd_state::artifacts::FinalizationProof::Local { history_seq } = completion.proof
+        else {
+            continue;
+        };
+        if sequence != Some(history_seq as i64)
+            || stamped_outcome.as_deref() != Some(completion.outcome.as_str())
+            || !matches!(current.status, JobStatus::Completed | JobStatus::Failed)
+        {
+            return Err(PostError::Subprocess(
+                "pending completion disagrees with terminal job stamp".into(),
+            ));
+        }
+        let history = history.clone();
+        let expected = completion.outcome.clone();
+        let receipt = completion.clone();
+        let inventory = inventory.clone();
+        tokio::task::spawn_blocking(move || {
+            let recorded = history
+                .get_sequence(history_seq as i64)
+                .map_err(|e| PostError::Subprocess(e.to_string()))?
+                .ok_or_else(|| {
+                    PostError::Subprocess("pending completion history cursor missing".into())
+                })?;
+            if recorded.job != job || recorded.status != expected {
+                return Err(PostError::Subprocess(
+                    "pending completion disagrees with durable history".into(),
+                ));
+            }
+            inventory
+                .confirm_stamped_finalization(&receipt)
+                .map_err(|e| PostError::Subprocess(e.to_string()))?;
+            inventory
+                .finalize_workspaces(&receipt.source, &receipt.outcome, receipt.proof)
+                .map_err(|e| PostError::Subprocess(e.to_string()))
+        })
+        .await
+        .map_err(|e| PostError::Subprocess(e.to_string()))??;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1826,9 +1943,14 @@ async fn process_job_ctx_from_inner(
                 }
                 let inventory = engine.artifacts();
                 let to = target.clone();
-                let moved = tokio::task::spawn_blocking(move || inventory.relocate(job_id.0, &to))
-                    .await
-                    .unwrap_or_else(|e| Err(nzbd_state::artifacts::Error::Conflict(e.to_string())));
+                let moved = crate::attempt::current()
+                    .expect("processing control")
+                    .blocking(move |control| {
+                        inventory
+                            .relocate_checked(job_id.0, &to, &|| control.checkpoint())
+                            .map_err(|e| PostError::Subprocess(e.to_string()))
+                    })
+                    .await;
                 match moved {
                     Ok(result) => {
                         tracing::info!(
@@ -2009,6 +2131,7 @@ async fn process_job_ctx_from_inner(
     stages.finish().await;
     // Stamp + set final status in one import (replaces the job atomically).
     if let Ok(Some(mut fin)) = engine.export_job(job_id).await {
+        fin.params.retain(|(key, _)| key != PP_DONE_PARAM);
         fin.params
             .push((PP_DONE_PARAM.into(), outcome.as_str().into()));
         if outcome == PpFinal::ParFailure {
@@ -2071,10 +2194,15 @@ async fn process_job_ctx_from_inner(
             if let Some(path) = &final_dir {
                 fin.params.push(("*Cluster:final-dir".into(), path.clone()));
             }
-            engine
-                .import_job(fin, false, false)
+            if !engine
+                .import_job_if_present(fin)
                 .await
-                .map_err(|e| PostError::Subprocess(format!("remote terminal stamp: {e}")))?;
+                .map_err(|e| PostError::Subprocess(format!("remote terminal stamp: {e}")))?
+            {
+                return Err(PostError::Subprocess(
+                    "remote terminal stamp was not committed".into(),
+                ));
+            }
             stages.close();
             return Ok(outcome);
         }
@@ -2189,20 +2317,59 @@ async fn process_job_ctx_from_inner(
             .await
             .map_err(|e| PostError::Subprocess(format!("history worker: {e}")))?
             .map_err(|e| PostError::Subprocess(format!("durable history: {e}")))?;
-        engine
-            .import_job(fin.clone(), false, false)
+        let completion = crate::attempt::current()
+            .and_then(|control| control.source.clone())
+            .map(|source| nzbd_state::artifacts::StagedCompletion {
+                source,
+                outcome: outcome.as_str().into(),
+                proof: nzbd_state::artifacts::FinalizationProof::Local {
+                    history_seq: history_seq as u64,
+                },
+            });
+        if let Some(completion) = &completion {
+            let staged = completion.clone();
+            let inventory = engine.artifacts();
+            crate::attempt::current()
+                .expect("processing control")
+                .blocking(move |_| {
+                    inventory
+                        .stage_workspace_finalization(
+                            &staged.source,
+                            &staged.outcome,
+                            &staged.proof,
+                        )
+                        .map_err(|e| PostError::Subprocess(e.to_string()))
+                })
+                .await?;
+        }
+        fin.params.retain(|(key, _)| key != "*PP:history-seq");
+        fin.params
+            .push(("*PP:history-seq".into(), history_seq.to_string()));
+        if !engine
+            .import_job_if_present(fin.clone())
             .await
-            .map_err(|e| PostError::Subprocess(format!("durable terminal stamp: {e}")))?;
-        if let Some(control) = crate::attempt::current() {
-            if let Some(source) = &control.source {
-                *control.completion.lock().unwrap() = Some(crate::attempt::Completion {
-                    source: source.clone(),
-                    outcome: outcome.as_str().into(),
-                    proof: nzbd_state::artifacts::FinalizationProof::Local {
-                        history_seq: history_seq as u64,
-                    },
-                });
-            }
+            .map_err(|e| PostError::Subprocess(format!("durable terminal stamp: {e}")))?
+        {
+            return Err(PostError::Subprocess(
+                "terminal stamp was not durably committed".into(),
+            ));
+        }
+        if let Some(completion) = completion {
+            let stamped = completion.clone();
+            let inventory = engine.artifacts();
+            let control = crate::attempt::current().expect("processing control");
+            control
+                .blocking(move |_| {
+                    inventory
+                        .confirm_stamped_finalization(&stamped)
+                        .map_err(|e| PostError::Subprocess(e.to_string()))
+                })
+                .await?;
+            *control.completion.lock().unwrap() = Some(crate::attempt::Completion {
+                source: completion.source,
+                outcome: completion.outcome,
+                proof: completion.proof,
+            });
         }
         // Only now — after the history row is durably written — does the
         // completion become public. A consumer may react to this event by
@@ -2271,6 +2438,8 @@ async fn repair_isolated_loop(
         })
         .await?;
     let deadline = tokio::time::Instant::now() + cfg.par_fetch_timeout;
+    #[cfg(test)]
+    let (mut verified_calls, mut fetched_batches) = (0, 0);
     let mut verify_required = true;
     let mut needed = 1;
     let mut last_reason = "no additional recovery files remain".to_string();
@@ -2312,6 +2481,13 @@ async fn repair_isolated_loop(
                 .await?;
             control.phase(nzbd_engine::RepairPhase::Verifying, 0).await;
             let verified = par.verify_full(&session.main()).await?;
+            #[cfg(test)]
+            {
+                verified_calls += 1;
+                if let Some(observer) = &control.repair_observer {
+                    observer(session.matching_bytes, verified_calls, fetched_batches);
+                }
+            }
             let ready = match verified {
                 VerifyResult::Intact => true,
                 VerifyResult::Repairable { .. } => {
@@ -2365,6 +2541,13 @@ async fn repair_isolated_loop(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if freed == 0 || !wait_par_files(engine, job_id, remaining).await {
             break;
+        }
+        #[cfg(test)]
+        {
+            fetched_batches += 1;
+            if let Some(observer) = &control.repair_observer {
+                observer(session.matching_bytes, verified_calls, fetched_batches);
+            }
         }
         let root = session.set.root.clone();
         let (sets, rejected) = control
@@ -2497,23 +2680,15 @@ async fn dispose_failed(
         };
     }
     if cfg.failure_action == FailureAction::Delete {
-        let from = dir.to_path_buf();
-        let root = dir.parent().unwrap_or(dest).to_path_buf();
-        let result = tokio::task::spawn_blocking(move || {
-            let artifact = inventory.finish(job.0, &from, &root, "retained")?;
-            let key = format!("failed-delete-{}", artifact.id);
-            let op = match inventory.operation(&key) {
-                Ok(op) => op,
-                Err(nzbd_state::artifacts::Error::NotFound) => {
-                    inventory.request_delete(&artifact.id, artifact.revision, &key, 0)?
-                }
-                Err(e) => return Err(e),
-            };
-            inventory.execute_delete(&op.id)
+        let result = terminal_worker(inventory, job, move |inventory, guard, checkpoint| {
+            checkpoint()?;
+            inventory
+                .delete_failed_payload(guard, job.0, checkpoint)
+                .map_err(|e| PostError::Subprocess(e.to_string()))
         })
         .await;
         return match result {
-            Ok(Ok(op)) if op.state == "succeeded" => Disposition {
+            Ok(op) if op.state == "succeeded" => Disposition {
                 note: "deleted".into(),
                 files_at: None,
             },
@@ -2524,14 +2699,19 @@ async fn dispose_failed(
         };
     }
     if cfg.failure_action == FailureAction::Park {
-        let target = cfg
+        let to = cfg
             .failed_dir
             .clone()
             .unwrap_or_else(|| dest.join(".failed"))
             .join(name);
-        let to = target.clone();
-        return match tokio::task::spawn_blocking(move || inventory.relocate(job.0, &to)).await {
-            Ok(Ok(result)) => Disposition {
+        let moved = terminal_worker(inventory, job, move |inventory, _, checkpoint| {
+            inventory
+                .relocate_checked(job.0, &to, checkpoint)
+                .map_err(|e| PostError::Subprocess(e.to_string()))
+        })
+        .await;
+        return match moved {
+            Ok(result) => Disposition {
                 note: format!("parked at {}", result.published_path.display()),
                 files_at: Some(result.published_path),
             },
@@ -2545,6 +2725,52 @@ async fn dispose_failed(
         note: "kept".into(),
         files_at: Some(dir.into()),
     }
+}
+
+/// The terminal actor keeps its generation guard through actual filesystem
+/// exit. Outside the stage pipeline cancellation still fences publication.
+async fn terminal_worker<T: Send + 'static>(
+    inventory: Arc<nzbd_state::artifacts::Inventory>,
+    job: JobId,
+    action: impl FnOnce(
+            &nzbd_state::artifacts::Inventory,
+            &nzbd_state::artifacts::AttemptUse,
+            &dyn Fn() -> std::io::Result<()>,
+        ) -> Result<T, PostError>
+        + Send
+        + 'static,
+) -> Result<T, PostError> {
+    if let Some(control) = crate::attempt::current() {
+        return control
+            .blocking(move |control| {
+                let guard = control
+                    .use_guard
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| PostError::Subprocess("terminal owner missing".into()))?;
+                action(&inventory, &guard, &|| control.checkpoint())
+            })
+            .await;
+    }
+    let cancel = CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    tokio::task::spawn_blocking(move || {
+        let checkpoint = || {
+            if cancel.is_cancelled() {
+                Err(std::io::ErrorKind::Interrupted.into())
+            } else {
+                Ok(())
+            }
+        };
+        let guard = inventory
+            .acquire_terminal_use(job.0, &checkpoint)
+            .map_err(|e| PostError::Subprocess(e.to_string()))?
+            .ok_or_else(|| PostError::Subprocess("terminal payload custody missing".into()))?;
+        action(&inventory, &guard, &checkpoint)
+    })
+    .await
+    .map_err(|e| PostError::Subprocess(e.to_string()))?
 }
 
 /// The recovery-set slice size from the job's main par2 index, if it can
@@ -3330,5 +3556,213 @@ mod decision_tests {
         let garbage = tmp.path().join("garbage.par2");
         std::fs::write(&garbage, vec![0u8; 4096]).unwrap();
         assert_eq!(par2_block_size(&garbage).await, None);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delayed_duplicate_and_unusable_batches_do_not_repeat_matching_or_verification() {
+        use nzbd_types::{FileEntry, FileId, Segment, SegmentState};
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("par2")
+            .arg("-V")
+            .output()
+            .is_err()
+        {
+            assert!(std::env::var_os("NZBD_REQUIRE_TOOLS").is_none());
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("processing");
+        std::fs::create_dir(&root).unwrap();
+        let engine = nzbd_engine::Engine::spawn(nzbd_engine::EngineConfig::single_node(
+            vec![],
+            temp.path().join("state"),
+            root.clone(),
+            Default::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let dir = root.join("job");
+        engine.artifacts().allocate(401, &root, &dir).unwrap();
+        let bytes: Vec<_> = (0..50000).map(|n| ((n * 7) % 251) as u8).collect();
+        std::fs::write(dir.join("payload.bin"), &bytes).unwrap();
+        let status = std::process::Command::new("par2")
+            .current_dir(&dir)
+            .args([
+                "create",
+                "-q",
+                "-s8192",
+                "-c3",
+                "-n3",
+                "catalog.par2",
+                "payload.bin",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mut volumes: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().contains(".vol"))
+            .collect();
+        volumes.sort();
+        assert!(volumes.len() >= 2);
+        let duplicate = std::fs::read(&volumes[0]).unwrap();
+        let unique = std::fs::read(&volumes[1]).unwrap();
+        for path in volumes.iter().skip(1) {
+            std::fs::remove_file(path).unwrap();
+        }
+        let mut invalid = unique.clone();
+        *invalid.last_mut().unwrap() ^= 1;
+        let delayed = [
+            ("delayed0.vol100+001.par2", duplicate),
+            ("delayed1.vol200+001.par2", invalid),
+            ("delayed2.vol300+001.par2", unique),
+        ];
+        let file = |id: u32, name: String, par: bool, paused: bool, size: u32| FileEntry {
+            id: FileId(id),
+            subject: name.clone(),
+            filename: name,
+            filename_confirmed: true,
+            is_par2: par,
+            paused,
+            groups: vec![],
+            date: None,
+            segments: if paused {
+                vec![Segment {
+                    message_id: format!("{id}@fixture").into_boxed_str(),
+                    number: 1,
+                    size,
+                    state: SegmentState::Pending,
+                }]
+            } else {
+                vec![]
+            },
+            crc32: None,
+            finalized: !paused,
+        };
+        let mut files = vec![file(1, "payload.bin".into(), false, false, 50000)];
+        files.extend(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "par2"))
+                .enumerate()
+                .map(|(i, p)| {
+                    file(
+                        10 + i as u32,
+                        p.file_name().unwrap().to_string_lossy().into_owned(),
+                        true,
+                        false,
+                        0,
+                    )
+                }),
+        );
+        files.extend(delayed.iter().enumerate().map(|(i, (name, data))| {
+            file(20 + i as u32, (*name).into(), true, true, data.len() as u32)
+        }));
+        let job = Job {
+            id: JobId(401),
+            kind: nzbd_types::JobKind::Nzb,
+            name: "job".into(),
+            dir_name: "job".into(),
+            name_provisional: false,
+            queued_at_unix: 0,
+            original_name: String::new(),
+            category: None,
+            priority: 0,
+            dupe: Default::default(),
+            params: vec![],
+            files,
+            totals: Default::default(),
+            status: JobStatus::Completed,
+            torrent: None,
+            stages: vec![],
+        };
+        let mut damaged = bytes;
+        damaged[..8192].fill(0);
+        std::fs::write(dir.join("payload.bin"), damaged).unwrap();
+        engine.import_job(job, false, false).await.unwrap();
+        let count = temp.path().join("verifications");
+        let fake = temp.path().join("par-tool.sh");
+        std::fs::write(&fake,format!("#!/bin/sh\necho x >> '{}'\necho 'Repair is not possible.'\necho 'You need 1 more recovery blocks to be able to repair.'\nexit 2\n",count.display())).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let feeder_engine = engine.clone();
+        let feeder_dir = dir.clone();
+        let feeder = tokio::spawn(async move {
+            for (name, data) in delayed {
+                loop {
+                    let mut job = feeder_engine.export_job(JobId(401)).await.unwrap().unwrap();
+                    let entry = job
+                        .files
+                        .iter_mut()
+                        .find(|file| file.filename == name)
+                        .unwrap();
+                    if !entry.paused {
+                        std::fs::write(feeder_dir.join(name), &data).unwrap();
+                        entry.finalized = true;
+                        entry.segments[0].state = SegmentState::Done {
+                            offset: 0,
+                            len: data.len() as u32,
+                            crc: crc32fast::hash(&data),
+                        };
+                        feeder_engine.import_job(job, false, false).await.unwrap();
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = observations.clone();
+        let ctx = PpCtx {
+            repair_observer: Some(Arc::new(move |bytes, checks, fetches| {
+                recorded.lock().unwrap().push((bytes, checks, fetches))
+            })),
+            ..Default::default()
+        };
+        let history = Arc::new(
+            HistoryDb::open(&temp.path().join("history.sqlite"), Some(temp.path())).unwrap(),
+        );
+        let cfg = PostConfig {
+            par2_cmd: fake.to_string_lossy().into_owned(),
+            unpack: false,
+            cleanup: false,
+            deobfuscate_final: false,
+            failure_action: FailureAction::None,
+            par_fetch_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            process_job_ctx(&engine, &cfg, &history, &root, JobId(401), &ctx),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, PpFinal::ParFailure);
+        tokio::time::timeout(Duration::from_secs(3), feeder)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(count).unwrap().lines().count(), 2);
+        {
+            let observed = observations.lock().unwrap();
+            assert!(
+                observed.iter().all(|(bytes, _, _)| *bytes == 50000),
+                "payload scanned once: {observed:?}"
+            );
+            assert_eq!(
+                observed
+                    .last()
+                    .map(|(_, checks, fetches)| (*checks, *fetches)),
+                Some((2, 3))
+            );
+        }
+        engine.shutdown().await;
     }
 }

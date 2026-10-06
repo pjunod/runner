@@ -491,6 +491,7 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
     engine.mirror_progress(
         JobId(40),
         MirrorStats {
+            repair_progress: None,
             done_articles: 7,
             failed_articles: 2,
             downloaded_bytes: 77,
@@ -1987,5 +1988,63 @@ async fn transient_repair_progress_is_attempt_fenced_and_absent_after_terminal_s
         wire.get("repair_progress").is_none(),
         "old clients need no new field when idle"
     );
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn mirrored_repair_progress_is_optional_node_fenced_and_cleared_on_replacement() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(temp.path(), vec![]).await;
+    engine
+        .import_job(
+            transfer_job(502, "remote-progress", JobStatus::Completed),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    engine
+        .set_delegated(JobId(502), Some("worker-a".into()))
+        .await
+        .unwrap();
+    let repair = nzbd_engine::RepairProgress {
+        attempt_id: "lease-a:1".into(),
+        phase: nzbd_engine::RepairPhase::Matching,
+        files_done: 1,
+        files_total: 3,
+        bytes_scanned: 65536,
+        round: 0,
+        recovery_blocks_available: 4,
+        additional_blocks_needed: None,
+        last_progress_at: 1000,
+    };
+    let stats = MirrorStats {
+        repair_progress: Some(repair),
+        health: 1000,
+        ..Default::default()
+    };
+    engine.mirror_progress_from(JobId(502), "worker-a".into(), stats.clone());
+    engine.export_job(JobId(502)).await.unwrap();
+    assert_eq!(
+        engine.snapshot().jobs[0]
+            .repair_progress
+            .as_ref()
+            .unwrap()
+            .bytes_scanned,
+        65536
+    );
+    engine
+        .set_delegated(JobId(502), Some("worker-b".into()))
+        .await
+        .unwrap();
+    engine.mirror_progress_from(JobId(502), "worker-a".into(), stats.clone());
+    engine.export_job(JobId(502)).await.unwrap();
+    assert!(engine.snapshot().jobs[0].repair_progress.is_none());
+    engine.mirror_progress_from(JobId(502), "worker-b".into(), stats);
+    engine.export_job(JobId(502)).await.unwrap();
+    assert!(engine.snapshot().jobs[0].repair_progress.is_some());
+    engine.mirror_progress_from(JobId(502), "worker-b".into(), MirrorStats::default());
+    engine.export_job(JobId(502)).await.unwrap();
+    assert!(engine.snapshot().jobs[0].repair_progress.is_none());
     engine.shutdown().await;
 }

@@ -241,6 +241,7 @@ pub(crate) enum QueueCommand {
     /// job's summary without changing the authority's durable control state.
     MirrorProgress {
         job: JobId,
+        node: Option<String>,
         stats: MirrorStats,
     },
     /// Union-fold the job's shared journal files into local state (reclaim
@@ -426,6 +427,8 @@ impl JobRateMeter {
 /// scheduling continue to reason from local control state.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MirrorStats {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_progress: Option<crate::RepairProgress>,
     pub done_articles: u32,
     pub failed_articles: u32,
     pub downloaded_bytes: u64,
@@ -2019,6 +2022,9 @@ impl Owner {
                 if ok {
                     match &node {
                         Some(n) => {
+                            if self.delegated.get(&job) != Some(n) {
+                                self.mirror.remove(&job);
+                            }
                             self.delegated.insert(job, n.clone());
                         }
                         None => {
@@ -2036,8 +2042,12 @@ impl Owner {
                 }
                 let _ = reply.send(ok);
             }
-            QueueCommand::MirrorProgress { job, stats } => {
-                if self.delegated.contains_key(&job) {
+            QueueCommand::MirrorProgress { job, node, stats } => {
+                if self
+                    .delegated
+                    .get(&job)
+                    .is_some_and(|current| node.as_ref().is_none_or(|node| node == current))
+                {
                     self.mirror.insert(job, stats);
                     self.publish_now();
                 }
@@ -4905,6 +4915,11 @@ impl Owner {
                 }
                 // Delegated jobs progress remotely; overlay heartbeat stats.
                 if let Some(m) = self.mirror.get(&j.id) {
+                    summary.repair_progress = if !j.held() && !summary.pp_done {
+                        m.repair_progress.clone()
+                    } else {
+                        None
+                    };
                     summary.done_articles = m.done_articles;
                     summary.failed_articles = m.failed_articles;
                     summary.downloaded_bytes = m.downloaded_bytes;
@@ -6296,6 +6311,7 @@ mod tests {
         owner.mirror.insert(
             JobId(3),
             MirrorStats {
+                repair_progress: None,
                 done_articles: 4,
                 failed_articles: 1,
                 downloaded_bytes: 40,
@@ -6341,6 +6357,7 @@ mod tests {
         owner.mirror.insert(
             JobId(4),
             MirrorStats {
+                repair_progress: None,
                 done_articles: 1,
                 failed_articles: 0,
                 downloaded_bytes: 0,

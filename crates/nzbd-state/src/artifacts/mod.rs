@@ -24,7 +24,7 @@ use std::{
 };
 pub use transforms::Workspace;
 pub use workspace_lifecycle::{
-    AttemptUse, FinalizationProof, SourceGeneration, WorkspaceAssessment,
+    AttemptUse, FinalizationProof, SourceGeneration, StagedCompletion, WorkspaceAssessment,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -330,7 +330,7 @@ impl Inventory {
           CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,artifact TEXT NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS operations_state ON operations(state);
           CREATE TABLE IF NOT EXISTS recoveries(id TEXT PRIMARY KEY,artifact TEXT NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
-          CREATE TABLE IF NOT EXISTS workspace_finalizations(source TEXT NOT NULL,generation TEXT NOT NULL,outcome TEXT NOT NULL,proof TEXT NOT NULL,PRIMARY KEY(source,generation));
+          CREATE TABLE IF NOT EXISTS workspace_finalizations(source TEXT NOT NULL,generation TEXT NOT NULL,outcome TEXT NOT NULL,proof TEXT NOT NULL,job INTEGER,activated INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(source,generation));
           CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT,artifact TEXT NOT NULL,at INTEGER NOT NULL,kind TEXT NOT NULL,detail TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS events_artifact ON events(artifact,seq);
           INSERT OR IGNORE INTO meta VALUES('schema','1');
@@ -870,7 +870,16 @@ impl Inventory {
     /// Called at a writer/PP quiescence boundary, before publishing History.
     pub fn finish(&self, job: u32, path: &Path, root: &Path, state: &str) -> Result<Artifact> {
         let _guard = self.mutation_guard()?;
-        let mut a = self.for_job(job)?.ok_or(Error::NotFound)?;
+        let a = self.for_job(job)?.ok_or(Error::NotFound)?;
+        self.finish_artifact_unlocked(a, path, root, state)
+    }
+    pub(super) fn finish_artifact_unlocked(
+        &self,
+        mut a: Artifact,
+        path: &Path,
+        root: &Path,
+        state: &str,
+    ) -> Result<Artifact> {
         // History may record a bounded PP failure while its independent
         // deletion journal keeps retrying. Do not erase that pending authority.
         if matches!(a.state.as_str(), "deleting" | "delete_failed")
@@ -1156,7 +1165,22 @@ impl Inventory {
         undo_seconds: u64,
         automatic: bool,
     ) -> Result<Operation> {
+        self.request_delete_with_use(key, revision, request_id, undo_seconds, automatic, None)
+    }
+    fn request_delete_with_use(
+        &self,
+        key: &str,
+        revision: u64,
+        request_id: &str,
+        undo_seconds: u64,
+        automatic: bool,
+        authority: Option<(&AttemptUse, &dyn Fn() -> std::io::Result<()>)>,
+    ) -> Result<Operation> {
         let _guard = self.mutation_guard()?;
+        if let Some((_, checkpoint)) = authority {
+            checkpoint()?;
+        }
+        let use_guard = authority.map(|(guard, _)| guard);
         if request_id.is_empty() || request_id.len() > 128 || undo_seconds > 60 {
             return Err(Error::Conflict(
                 "valid idempotency key and undo of 0–60 seconds required".into(),
@@ -1183,7 +1207,7 @@ impl Inventory {
             Err(e) => return Err(e),
         }
         if a.revision != revision
-            || self.artifact_in_use(&a)?
+            || (self.artifact_in_use(&a)? && !self.authorized_processing_use(&a, use_guard))
             || !a.owned
             || a.keep
             || a.hold.is_some()
@@ -1236,7 +1260,18 @@ impl Inventory {
         Ok(op)
     }
     pub fn execute_delete(&self, key: &str) -> Result<Operation> {
+        self.execute_delete_with_use(key, None)
+    }
+    fn execute_delete_with_use(
+        &self,
+        key: &str,
+        authority: Option<(&AttemptUse, &dyn Fn() -> std::io::Result<()>)>,
+    ) -> Result<Operation> {
         let _guard = self.mutation_guard()?;
+        if let Some((_, checkpoint)) = authority {
+            checkpoint()?;
+        }
+        let use_guard = authority.map(|(guard, _)| guard);
         let mut op = self.operation(key)?;
         if op.kind != "delete" {
             return Err(Error::Conflict("not a deletion operation".into()));
@@ -1269,7 +1304,11 @@ impl Inventory {
             save_operation(&self.db.lock().unwrap(), &op)?;
             return Ok(op);
         }
-        if self.artifact_in_use(&a)? || a.keep || a.hold.is_some() || !a.owned {
+        if (self.artifact_in_use(&a)? && !self.authorized_processing_use(&a, use_guard))
+            || a.keep
+            || a.hold.is_some()
+            || !a.owned
+        {
             return Err(Error::Conflict("payload acquired a hold".into()));
         }
         op.state = "running".into();
@@ -1285,7 +1324,9 @@ impl Inventory {
             save_artifact(&tx, &a)?;
             tx.commit()?;
         }
-        let result = self.delete_manifest_checked(&a, op.attempts);
+        let result = authority
+            .map_or(Ok(()), |(_, checkpoint)| checkpoint().map_err(Error::from))
+            .and_then(|()| self.delete_manifest_checked(&a, op.attempts));
         match result {
             Ok(()) => {
                 op.state = "succeeded".into();

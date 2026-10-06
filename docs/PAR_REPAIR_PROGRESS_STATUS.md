@@ -1,6 +1,6 @@
 # PAR repair status — design, build, and qualification
 
-**Updated:** 2026-10-06 · **Status:** implementation complete; adversarial review next
+**Updated:** 2026-10-06 · **Status:** final qualification
 
 Companion to [PAR_REPAIR_PROGRESS_PLAN.md](PAR_REPAIR_PROGRESS_PLAN.md), which
 owns the implementation contract. The originating chat owns design; GPT-6.1
@@ -16,9 +16,9 @@ presented as completed work.
 | Workspace retirement | implemented; regression cases written | Generation custody, durable local/cluster receipts, bounded admission and replay; legacy ambiguity stays explicit |
 | Repair scanning and retry reuse | implemented; compiling and linting | Cached single-pass fingerprints, streamed packets, normalized companions, useful-input retry |
 | Failed payload policy | unchanged | Seven-day park retention; payload deletion not requested |
-| Adversarial review | ready to begin | Implementation, regression cases, compilation and workspace clippy complete |
-| Final qualification | pending | After review fixes; rerun failures and affected tests only |
-| PR and merge | pending | Ordinary repository controls; no PR URL yet |
+| Adversarial review | complete | Reported findings fixed; final disposition has no remaining blockers |
+| Final qualification | starting | Review fixes committed; disjoint local/CI cohorts, rerun failures and affected tests only |
+| PR and merge | draft [PR #252](https://github.com/pjunod/runner/pull/252) | Required Main promotion gate; ordinary merge after review and qualification |
 | Production | unchanged | No deployment, restart, config edit, or live deletion performed |
 
 ## Ownership and working locations
@@ -83,3 +83,37 @@ Qualification will use disjoint cohorts: PR fast-lane checks provide their
 existing cluster/API/config/state/type coverage; local strict tests cover the
 remaining affected post/PAR and engine cases. Previously green tests will not
 be rerun solely because one other test fails. Required CI remains ordinary.
+
+The repository now redirects to `pjunod/runner`; the builder clone uses that
+canonical remote. PR #252 is attached to the builder chat. Main requires the
+Main promotion gate and an up-to-date base; it does not require another human
+review. The draft PR's validation lanes are skipped while adversarial review
+runs, preserving the required review-before-tests order.
+
+## Final adversarial review
+
+The reviewer requested changes for three concrete defects:
+
+- P1: raw relocation workers could outlive cancellation without custody.
+- P1: a crash after PP_DONE but before the workspace receipt leaked scratch.
+- P2: remote repair progress never reached authority snapshots.
+
+Fixes retain generation custody through tracked filesystem exit and add
+64 KiB relocation checkpoints plus publication authority checks. Local history
+is associated in a durable pending receipt before a checked durable terminal
+stamp; confirmation and startup/rescan replay validate the exact history cursor
+and outcome. Cluster acceptance is durably recorded before dropping the worker
+lease, with maintenance replay of parent finalization. Heartbeats carry optional
+repair progress, filtered by accepted lease/token and assigned node.
+
+Focused regressions now cover cancelled cross-volume copy/publication, pending
+history without a stamp, the post-stamp crash gap across restart, authority
+rejection and acceptance replay, old heartbeat compatibility and replacement,
+and manager-level duplicate/unusable recovery batches. Qualification has not
+started; these cases have only been compiled so far.
+
+Final review disposition: all reported findings are addressed. The reviewer also
+found a terminal Delete lock-wait race during fix verification; authority is now
+checked under mutation admission and immediately before deletion. An explicit
+lock-wait cancellation regression covers that case. Workspace clippy passes
+with warnings denied. Final test qualification starts after this disposition.

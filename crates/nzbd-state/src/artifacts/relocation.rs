@@ -176,7 +176,16 @@ impl Inventory {
     /// Journal before moving. A cross-volume move publishes a verified copy,
     /// then retires only the exact source entries captured by this operation.
     pub fn relocate(&self, job: u32, destination: &Path) -> Result<RelocationResult> {
+        self.relocate_checked(job, destination, &|| Ok(()))
+    }
+    pub fn relocate_checked(
+        &self,
+        job: u32,
+        destination: &Path,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> Result<RelocationResult> {
         let guard = self.mutation_guard()?;
+        checkpoint()?;
         let mut source = self.for_job(job)?.ok_or(Error::NotFound)?;
         // A committed generation is stable even when its physical path differs
         // from the caller's ordinary destination. Revalidate before reuse.
@@ -288,12 +297,14 @@ impl Inventory {
             let root_dir = fs::open_dir(root)?;
             let destination = relocation.destination.clone();
             boundary("before_move")?;
+            checkpoint()?;
             let direct_key = format!("{key}-direct");
             let initial = {
                 let _guard = self.mutation_guard()?;
                 self.relocation_source(&op, &relocation)?
                     .ok_or_else(|| Error::Conflict("relocation authority revoked".into()))?;
                 self.verify(&relocation.source)?;
+                checkpoint()?;
                 self.publish_directory_unlocked(&source.path, &destination, &source.id, &direct_key)
             };
             match initial {
@@ -332,6 +343,7 @@ impl Inventory {
                     op.request = serde_json::to_string(&relocation)?;
                     self.save_relocation_progress(&op, &relocation)?;
                     for entry in &source.files {
+                        checkpoint()?;
                         let target = scratch_path.join(&entry.path);
                         if entry.identity.directory {
                             std::fs::create_dir(&target)?;
@@ -348,12 +360,14 @@ impl Inventory {
                         // Network mounts may reject copy_file_range; use the
                         // portable read/write path for the verified copy.
                         let mut bytes = 0;
-                        let mut buffer = vec![0u8; 1024 * 1024];
+                        let mut buffer = vec![0u8; 65536];
                         loop {
+                            checkpoint()?;
                             let n = input.read(&mut buffer)?;
                             if n == 0 {
                                 break;
                             }
+                            checkpoint()?;
                             output.write_all(&buffer[..n])?;
                             bytes += n as u64;
                         }
@@ -361,8 +375,9 @@ impl Inventory {
                         input.rewind()?;
                         let hash = |f: &mut File| -> Result<Vec<u8>> {
                             let mut h = Sha256::new();
-                            let mut b = [0u8; 1024 * 1024];
+                            let mut b = [0u8; 65536];
                             loop {
+                                checkpoint()?;
                                 let n = f.read(&mut b)?;
                                 if n == 0 {
                                     break;
@@ -397,6 +412,7 @@ impl Inventory {
                             Error::Conflict("relocation authority revoked".into())
                         })?;
                         self.verify(&scratch)?;
+                        checkpoint()?;
                         self.publish_directory_unlocked(
                             &scratch_path,
                             &destination,

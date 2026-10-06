@@ -20,7 +20,11 @@ pub(crate) struct Completion {
     pub outcome: String,
     pub proof: FinalizationProof,
 }
+#[cfg(test)]
+pub(crate) type RepairObserver = Arc<dyn Fn(u64, u32, u32) + Send + Sync>;
 pub(crate) struct AttemptControl {
+    #[cfg(test)]
+    pub repair_observer: Option<RepairObserver>,
     pub cancel: CancellationToken,
     pub workers: TaskTracker,
     pub use_guard: Mutex<Option<AttemptUse>>,
@@ -94,6 +98,8 @@ impl AttemptControl {
             .await;
         let (latest, _) = watch::channel(progress.clone());
         Ok(Arc::new(Self {
+            #[cfg(test)]
+            repair_observer: ctx.repair_observer.clone(),
             cancel,
             workers: ctx.workers.clone(),
             source: guard.as_ref().map(|guard| guard.source().clone()),
@@ -111,7 +117,6 @@ impl AttemptControl {
         self.workers.close();
         self.workers.wait().await;
         self.checkpoint()?;
-        self.use_guard.lock().unwrap().take();
         Ok(())
     }
     pub fn checkpoint(&self) -> std::io::Result<()> {
@@ -179,7 +184,9 @@ impl AttemptControl {
     {
         self.checkpoint()?;
         let control = self.clone();
+        let use_guard = self.use_guard.lock().unwrap().clone();
         let mut task = self.workers.spawn_blocking(move || {
+            let _use_guard = use_guard;
             let previous = BLOCKING.with(|slot| slot.replace(Some(control.clone())));
             struct Restore(Option<Arc<AttemptControl>>);
             impl Drop for Restore {
