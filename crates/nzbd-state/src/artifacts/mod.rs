@@ -11,6 +11,7 @@ mod relocation;
 pub use relocation::RelocationResult;
 mod tasks;
 mod transforms;
+mod workspace_lifecycle;
 pub use recovery::{Receipt, ReceiptFile, Recovery, RecoveryFile};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 pub use transforms::Workspace;
+pub use workspace_lifecycle::{
+    AttemptUse, FinalizationProof, SourceGeneration, WorkspaceAssessment,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
@@ -242,6 +246,8 @@ pub struct ListPage {
 
 pub struct Inventory {
     db: Mutex<Connection>,
+    workspace_uses: Mutex<std::collections::HashMap<(String, String), usize>>,
+    workspace_cursor: Mutex<String>,
     _process_lock: File,
     closed: std::sync::atomic::AtomicBool,
     state_dir: PathBuf,
@@ -324,6 +330,7 @@ impl Inventory {
           CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,artifact TEXT NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS operations_state ON operations(state);
           CREATE TABLE IF NOT EXISTS recoveries(id TEXT PRIMARY KEY,artifact TEXT NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS workspace_finalizations(source TEXT NOT NULL,generation TEXT NOT NULL,outcome TEXT NOT NULL,proof TEXT NOT NULL,PRIMARY KEY(source,generation));
           CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT,artifact TEXT NOT NULL,at INTEGER NOT NULL,kind TEXT NOT NULL,detail TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS events_artifact ON events(artifact,seq);
           INSERT OR IGNORE INTO meta VALUES('schema','1');
@@ -368,6 +375,8 @@ impl Inventory {
         fs::sync_directory(&fs::open_dir(state_dir)?)?;
         Ok(Self {
             db: Mutex::new(db),
+            workspace_uses: Mutex::new(std::collections::HashMap::new()),
+            workspace_cursor: Mutex::new(String::new()),
             _process_lock: process_lock,
             closed: std::sync::atomic::AtomicBool::new(false),
             state_dir: state_dir.into(),
@@ -1174,6 +1183,7 @@ impl Inventory {
             Err(e) => return Err(e),
         }
         if a.revision != revision
+            || self.artifact_in_use(&a)?
             || !a.owned
             || a.keep
             || a.hold.is_some()
@@ -1259,7 +1269,7 @@ impl Inventory {
             save_operation(&self.db.lock().unwrap(), &op)?;
             return Ok(op);
         }
-        if a.keep || a.hold.is_some() || !a.owned {
+        if self.artifact_in_use(&a)? || a.keep || a.hold.is_some() || !a.owned {
             return Err(Error::Conflict("payload acquired a hold".into()));
         }
         op.state = "running".into();
@@ -1432,6 +1442,8 @@ impl Inventory {
             }
         }
         self.run_due_deletes()?;
+        self.reconcile_workspace_retirements()?;
+        self.run_workspace_retirements()?;
         self.reconcile_recoveries()?;
         self.schedule_discovery()?;
         self.run_tasks()?;

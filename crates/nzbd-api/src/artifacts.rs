@@ -169,7 +169,11 @@ async fn detail(State(st): State<ApiState>, Path(id): Path<String>) -> Response 
     work(move || {
         let mut a = db.get(&id)?;
         a.files.clear();
-        Ok(a)
+        let mut value = serde_json::to_value(&a)?;
+        if let Some(assessment) = db.workspace_assessment(&id)? {
+            value["workspace_cleanup"] = serde_json::to_value(assessment)?;
+        }
+        Ok(value)
     })
     .await
 }

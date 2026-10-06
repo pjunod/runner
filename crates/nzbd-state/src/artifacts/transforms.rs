@@ -3,6 +3,10 @@ use super::*;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Workspace {
+    #[serde(default)]
+    pub keep_provenance: bool,
+    #[serde(default)]
+    pub logical_key: Option<String>,
     pub operation_id: String,
     pub source: Artifact,
     pub scratch: Artifact,
@@ -31,13 +35,39 @@ impl Inventory {
         if source.hold.is_some() || !matches!(source.state.as_str(), "active" | "transitioning") {
             return Err(Error::Conflict("transform source is held".into()));
         }
-        let key = format!("{kind}-{}-{}-{token}", source.id, source.generation);
-        if let Ok(op) = self.operation(&key) {
+        let logical_key = format!("{kind}-{}-{}-{token}", source.id, source.generation);
+        let raw: Option<String> = self.db.lock().unwrap().query_row(
+            "SELECT data FROM operations WHERE (id=?1 OR json_extract(json_extract(data,'$.request'),'$.logical_key')=?1) ORDER BY rowid DESC LIMIT 1",
+            [&logical_key], |row| row.get(0),
+        ).optional()?;
+        let mut key = logical_key.clone();
+        if let Some(raw) = raw {
+            let op: Operation = serde_json::from_str(&raw)?;
             let workspace: Workspace = serde_json::from_str(&op.request)?;
-            self.verify(&workspace.scratch)?;
-            self.verify_workspace_attempts(&workspace)?;
-            // The operation identity, not a directory name, grants reuse.
-            return Ok(workspace);
+            let scratch = self.get(&workspace.scratch.id)?;
+            let pending: bool = self.db.lock().unwrap().query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state IN ('queued','running','retry','succeeded') AND json_extract(data,'$.kind') IN ('delete','retire_workspace'))",
+                [&scratch.id], |row| row.get(0),
+            )?;
+            if scratch.terminal()
+                || matches!(scratch.state.as_str(), "deleting" | "delete_failed")
+                || pending
+                || op.state == "failed"
+            {
+                key = format!("{logical_key}-{}", id(&self.db.lock().unwrap())?);
+            } else {
+                if op.state == "review"
+                    || scratch
+                        .hold
+                        .as_deref()
+                        .is_some_and(|h| h != "transform workspace")
+                {
+                    return Err(Error::Conflict("workspace requires review".into()));
+                }
+                self.verify(&scratch)?;
+                self.verify_workspace_attempts(&workspace)?;
+                return Ok(workspace);
+            }
         }
         let dir = self.verify(&source)?;
         source.files = fs::manifest(&dir, 100_000)?;
@@ -55,10 +85,15 @@ impl Inventory {
         scratch.identity = None;
         scratch.files.clear();
         scratch.state = "allocating".into();
-        scratch.keep = true;
+        scratch.keep = false;
+        scratch.retention_seconds = 0;
+        scratch.eligible_seconds = 0;
+        scratch.deadline = None;
         scratch.owned = true;
         scratch.hold = Some("transform workspace".into());
         let mut workspace = Workspace {
+            keep_provenance: true,
+            logical_key: Some(logical_key),
             operation_id: key.clone(),
             source: source.clone(),
             scratch,
@@ -149,7 +184,7 @@ impl Inventory {
         let mut op = self.operation(&workspace.operation_id)?;
         let mut current: Workspace = serde_json::from_str(&op.request)?;
         self.verify_workspace_attempts(&current)?;
-        if op.kind != "extract"
+        if !matches!(op.kind.as_str(), "extract" | "par_repair")
             || !(op.state == "running"
                 || (op.state == "succeeded" && current.published_files.is_none()))
             || current.attempts.len() >= 64
@@ -174,6 +209,23 @@ impl Inventory {
         save_operation(&self.db.lock().unwrap(), &op)?;
         *workspace = current;
         Ok(path)
+    }
+
+    /// Revalidate the captured source generation and root before transform work.
+    pub fn validate_workspace_source(&self, workspace: &Workspace) -> Result<()> {
+        let _guard = self.mutation_guard()?;
+        let source = self.get(&workspace.source.id)?;
+        if source.generation != workspace.source.generation
+            || source.path != workspace.source.path
+            || source.hold.is_some()
+            || !matches!(source.state.as_str(), "active" | "transitioning")
+        {
+            return Err(Error::Conflict(
+                "transform source generation or authority changed".into(),
+            ));
+        }
+        self.verify(&source)?;
+        Ok(())
     }
 
     pub fn retain_transform_original(
@@ -227,6 +279,10 @@ impl Inventory {
 
     /// Release an exhausted repair attempt without publishing scratch output.
     /// Original identities are checked before normal failure disposition resumes.
+    pub fn abandon_workspace(&self, workspace: &Workspace) -> Result<()> {
+        self.finish_workspace_output(workspace, None, false)
+    }
+
     pub fn abandon_repair_workspace(&self, workspace: &Workspace) -> Result<()> {
         let op = self.operation(&workspace.operation_id)?;
         if op.kind != "par_repair"
@@ -288,6 +344,11 @@ impl Inventory {
     ) -> Result<()> {
         let _guard = self.mutation_guard()?;
         let mut source = self.get(&workspace.source.id)?;
+        if source.generation != workspace.source.generation {
+            return Err(Error::Conflict(
+                "transform source generation changed".into(),
+            ));
+        }
         let dir = self.verify(&source)?;
         // Each original file remains unchanged; new output does not authorize
         // removal of any original archive or unrelated sibling.
@@ -532,6 +593,14 @@ impl Inventory {
     pub fn validate_post_retry(&self, job: u32) -> Result<()> {
         let _guard = self.mutation_guard()?;
         let source = self.for_job(job)?.ok_or(Error::NotFound)?;
+        if self.source_in_use(&SourceGeneration {
+            artifact: source.id.clone(),
+            generation: source.generation.clone(),
+        }) {
+            return Err(Error::Conflict(
+                "previous processing workers have not quiesced".into(),
+            ));
+        }
         if !source.owned
             || source.hold.is_some()
             || !matches!(
