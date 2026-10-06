@@ -18,6 +18,7 @@ tokio-rustls = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
+httpdate = { workspace = true }
 libc = { workspace = true }
 crc32fast.workspace = true
 arc-swap = { workspace = true }
