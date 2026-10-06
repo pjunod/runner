@@ -615,6 +615,44 @@ mod tests {
         (status, serde_json::from_slice(&body).unwrap())
     }
 
+    #[test]
+    fn processing_root_discovery_excludes_internal_state_and_configured_roots() {
+        use super::{scan_request, Inventory, PathBuf};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = nzbd_config::Config::default();
+        cfg.paths.main_dir = tmp.path().join("processing");
+        cfg.paths.dest_dir = cfg.paths.main_dir.join("complete");
+        cfg.paths.inter_dir = Some(PathBuf::new());
+        let db = Inventory::open(&cfg.state_dir()).unwrap();
+        let scratch = cfg.state_dir().join("transform-workspaces/private");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("data"), b"private repair bytes").unwrap();
+        for directory in [
+            cfg.dest_dir(),
+            cfg.paths.main_dir.join("failed"),
+            cfg.paths.main_dir.join("recovery"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let orphan = cfg.download_dir().join("orphan");
+        std::fs::create_dir(&orphan).unwrap();
+        std::fs::write(orphan.join("payload"), b"payload").unwrap();
+        let request = scan_request(&cfg, &db, Vec::new());
+        let operation = db
+            .submit_task("scan", "installation", "processing-default-scan", request)
+            .unwrap();
+        assert_eq!(db.execute_task(&operation.id).unwrap().state, "succeeded");
+        let rows = db.list(0, 100).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "internal state roots must not become orphan payloads"
+        );
+        assert_eq!(rows[0].path, orphan);
+        assert!(rows[0].measured());
+        assert!(scratch.join("data").exists());
+    }
+
     // Field report 2026-09-28: after a scan the Files tab showed every folder
     // as "0 entries · 0 B", and Inspect queued work for a 30 s tick. The list
     // now says whether a row was measured, carries totals and per-view

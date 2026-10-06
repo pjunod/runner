@@ -114,6 +114,10 @@ password = "pass"
 connections = 20
 ```
 
+Usenet downloads process under `main_dir` unless a nonempty `inter_dir` is
+configured. Successful post-processing publishes to `dest_dir` or the category
+destination; existing jobs keep their recorded processing paths.
+
 Then open `http://localhost:6789/` for the UI, or point Sonarr/Radarr at
 host `localhost`, port `6789`, client type **NZBGet**.
 
@@ -121,6 +125,9 @@ Migrating? `nzbd import-config /path/to/nzbget.conf` converts an existing
 NZBGet configuration and prints a mapping report.
 
 ## Documentation
+
+[PAR repair build status](docs/PAR_REPAIR_PROGRESS_STATUS.md) tracks the storage,
+workspace retirement, repair, and qualification work.
 
 | Doc | What it covers |
 |---|---|

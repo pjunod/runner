@@ -622,14 +622,14 @@ impl Config {
         expand_home(&self.paths.dest_dir)
     }
 
-    /// NZBGet InterDir: an empty value keeps downloads in DestDir.
+    /// Usenet processing root: nonempty InterDir, otherwise MainDir.
     pub fn download_dir(&self) -> PathBuf {
         self.paths
             .inter_dir
             .as_ref()
             .filter(|p| !p.as_os_str().is_empty())
             .map(|p| expand_home(p))
-            .unwrap_or_else(|| self.dest_dir())
+            .unwrap_or_else(|| expand_home(&self.paths.main_dir))
     }
 
     /// Immutable torrent payload root, independent from the Usenet handoff.
@@ -700,7 +700,12 @@ impl Config {
                 .map(|path| expand_home(path))
                 .unwrap_or_else(|| expand_home(&self.paths.main_dir).join("failed")),
         );
-        if let Some(path) = &self.paths.inter_dir {
+        if let Some(path) = self
+            .paths
+            .inter_dir
+            .as_ref()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
             push("intermediate".into(), expand_home(path));
         }
         if let Some(path) = &self.paths.temp_dir {
@@ -1613,19 +1618,64 @@ bind = "0.0.0.0:6789"
 "#;
 
     #[test]
-    fn intermediate_directory_is_explicit_and_empty_preserves_destination() {
-        let mut cfg = Config::default();
-        cfg.paths.main_dir = "/state-only".into();
-        cfg.paths.dest_dir = "/complete".into();
-        assert_eq!(cfg.download_dir(), PathBuf::from("/complete"));
-        cfg.paths.inter_dir = Some(PathBuf::new());
-        assert_eq!(cfg.download_dir(), PathBuf::from("/complete"));
-        cfg.paths.inter_dir = Some("/configured-intermediate".into());
-        assert_eq!(
-            cfg.download_dir(),
-            PathBuf::from("/configured-intermediate")
-        );
-        assert_eq!(cfg.dest_dir(), PathBuf::from("/complete"));
+    fn intermediate_directory_defaults_to_main_and_preserves_completion_destination() {
+        for (intermediate, expected) in [
+            ("", "/processing"),
+            ("inter_dir = \"\"", "/processing"),
+            (
+                "inter_dir = \"/configured-intermediate\"",
+                "/configured-intermediate",
+            ),
+        ] {
+            let cfg = Config::from_toml(&format!(
+                "[paths]\nmain_dir = \"/processing\"\ndest_dir = \"/complete\"\n{intermediate}"
+            ))
+            .unwrap();
+            assert_eq!(cfg.download_dir(), PathBuf::from(expected));
+            assert_eq!(cfg.dest_dir(), PathBuf::from("/complete"));
+            let roots = cfg.storage_roots();
+            assert!(roots.iter().any(|r| r.path == cfg.download_dir()));
+            assert!(roots.iter().any(|r| r.path == cfg.dest_dir()));
+            assert!(roots.iter().all(|r| !r.path.as_os_str().is_empty()));
+        }
+    }
+
+    #[test]
+    fn processing_and_completion_paths_expand_home_independently() {
+        let home = PathBuf::from(std::env::var("HOME").unwrap());
+        let mut cfg =
+            Config::from_toml("[paths]\nmain_dir = \"~/processing\"\ndest_dir = \"~/complete\"")
+                .unwrap();
+        for intermediate in [None, Some(PathBuf::new())] {
+            cfg.paths.inter_dir = intermediate;
+            assert_eq!(cfg.download_dir(), home.join("processing"));
+            assert_eq!(cfg.dest_dir(), home.join("complete"));
+        }
+        cfg.paths.inter_dir = Some("~/intermediate".into());
+        assert_eq!(cfg.download_dir(), home.join("intermediate"));
+        assert_eq!(cfg.dest_dir(), home.join("complete"));
+    }
+
+    #[test]
+    fn nzbget_missing_and_empty_intermediate_default_to_main() {
+        for intermediate in ["", "InterDir=", "InterDir=${MainDir}/intermediate"] {
+            let (cfg, _) = import_nzbget_conf(&format!(
+                "MainDir=/processing\nDestDir=/complete\n{intermediate}\nCategory1.Name=tv\nCategory1.DestDir=${{DestDir}}/tv"
+            )).unwrap();
+            assert_eq!(
+                cfg.download_dir(),
+                PathBuf::from(if intermediate.ends_with("/intermediate") {
+                    "/processing/intermediate"
+                } else {
+                    "/processing"
+                })
+            );
+            assert_eq!(cfg.dest_dir(), PathBuf::from("/complete"));
+            assert_eq!(
+                cfg.categories[0].dest_dir,
+                Some(PathBuf::from("/complete/tv"))
+            );
+        }
     }
 
     #[test]
