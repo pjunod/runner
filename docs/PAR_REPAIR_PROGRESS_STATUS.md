@@ -48,9 +48,9 @@ whitespace checks passed. Real-tool tests ran with `NZBD_REQUIRE_TOOLS=1`.
 
 | Artifact | Location |
 |---|---|
-| Storage qualification log | `/private/tmp/nzbd-storage-tests.log` |
-| Latest qualification log | `/private/tmp/nzbd-storage-workspace-tests.log` |
-| Scoped clippy log | `/private/tmp/nzbd-storage-clippy.log` |
+| Storage qualification log | `/private/tmp/nzbd-build-artifacts/nzbd-storage-tests.log` |
+| Latest qualification log | `/private/tmp/nzbd-build-artifacts/nzbd-storage-workspace-tests.log` |
+| Scoped clippy log | `/private/tmp/nzbd-build-artifacts/nzbd-storage-clippy.log` |
 | Build target directory | `/private/tmp/nzbd-storage-target` |
 
 ## Decisions needing reconciliation
@@ -73,7 +73,12 @@ acceptance, so remote retirement must wait for that acceptance.
 
 ## Workspace and cleanup
 
-All implementation occurs in an isolated clone under `/private/tmp`. The user's
+All implementation occurs in the isolated clone
+`/private/tmp/nzbd-par-repair-progress`, branch `codex/par-repair-progress`.
+Storage and workspace groundwork are separate commits; the redundant worktree
+and temporary fixture/scripts have been removed. The exploratory repair patch
+is preserved at `/private/tmp/nzbd-build-artifacts/paused-repair-exploration.patch`
+until the final design replaces it. The user's
 `~/code` repositories are not build checkouts. No deployment, live job change,
 production deletion, or failed-payload retention change is included.
 

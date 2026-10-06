@@ -103,6 +103,30 @@ impl Inventory {
         Ok(workspace)
     }
 
+    /// Internal scratch is owned by a transform, not by a queue job. Startup
+    /// must establish that association before applying orphan-job recovery.
+    pub(super) fn is_transform_scratch(&self, artifact: &Artifact) -> Result<bool> {
+        if artifact.job.is_some() {
+            return Ok(false);
+        }
+        let raw: Option<String> = self.db.lock().unwrap().query_row(
+            "SELECT data FROM operations WHERE json_extract(data,'$.kind') IN ('extract','par_repair') AND json_extract(json_extract(data,'$.request'),'$.scratch.id')=?1 AND json_extract(json_extract(data,'$.request'),'$.scratch.generation')=?2 LIMIT 1",
+            params![artifact.id, artifact.generation], |row| row.get(0),
+        ).optional()?;
+        let Some(raw) = raw else {
+            return Ok(false);
+        };
+        let operation: Operation = serde_json::from_str(&raw)?;
+        let workspace: Workspace = serde_json::from_str(&operation.request)?;
+        Ok(workspace.scratch.path == artifact.path
+            && workspace.scratch.root == artifact.root
+            && workspace.scratch.identity == artifact.identity
+            && workspace
+                .scratch
+                .root_identity
+                .same_object(&artifact.root_identity))
+    }
+
     fn verify_workspace_attempts(&self, workspace: &Workspace) -> Result<()> {
         let root = self.verify(&workspace.scratch)?;
         for attempt in &workspace.attempts {
@@ -544,6 +568,45 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_preserves_transform_scratch_custody_and_protections() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("processing");
+        std::fs::create_dir(&root).unwrap();
+        let state = temp.path().join("state");
+        let inventory = Inventory::open(&state).unwrap();
+        let source = root.join("job");
+        inventory.allocate(5, &root, &source).unwrap();
+        std::fs::write(source.join("archive.rar"), b"original").unwrap();
+        let workspace = inventory.workspace(5, "extract", "abc").unwrap();
+        std::fs::write(workspace.scratch.path.join("partial"), b"scratch").unwrap();
+        let scratch = inventory.get(&workspace.scratch.id).unwrap();
+        assert!(inventory.is_transform_scratch(&scratch).unwrap());
+        let mut changed = scratch.clone();
+        changed.generation = "unrelated-generation".into();
+        assert!(!inventory.is_transform_scratch(&changed).unwrap());
+        changed = scratch.clone();
+        changed.path = root.join("same-name-is-not-custody");
+        assert!(!inventory.is_transform_scratch(&changed).unwrap());
+        drop(inventory);
+
+        let inventory = Inventory::open(&state).unwrap();
+        inventory.reconcile_startup(&[5]).unwrap();
+        let recovered = inventory.get(&scratch.id).unwrap();
+        assert_eq!(recovered.state, "active");
+        assert_eq!(recovered.keep, scratch.keep);
+        assert_eq!(recovered.hold, scratch.hold);
+        assert_eq!(recovered.generation, scratch.generation);
+        assert_eq!(
+            std::fs::read(recovered.path.join("partial")).unwrap(),
+            b"scratch"
+        );
+        assert_eq!(
+            std::fs::read(source.join("archive.rar")).unwrap(),
+            b"original"
+        );
+    }
+
     #[test]
     fn extraction_retry_generations_survive_restart_and_reject_changed_identity() {
         let temp = tempfile::tempdir().unwrap();

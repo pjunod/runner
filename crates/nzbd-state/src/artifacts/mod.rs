@@ -689,6 +689,11 @@ impl Inventory {
         };
         for raw in rows {
             let mut a: Artifact = serde_json::from_str(&raw)?;
+            // A scratch artifact intentionally has no job ID. Its transform
+            // operation supplies custody; it is not an orphaned download.
+            if self.is_transform_scratch(&a)? {
+                continue;
+            }
             let live = a.job.is_some_and(|job| live_jobs.contains(&job));
             if a.state == "active" && live {
                 continue;
@@ -1270,59 +1275,7 @@ impl Inventory {
             save_artifact(&tx, &a)?;
             tx.commit()?;
         }
-        let result = (|| {
-            let root = self.verify_root(&a)?;
-            if op.attempts > 1 {
-                match std::fs::symlink_metadata(&a.path) {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                    Err(e) => return Err(e.into()),
-                    Ok(_) => (),
-                }
-            }
-            let dir = self.verify(&a)?;
-            let observed = fs::manifest(&dir, 100_000)?;
-            // A restarted partial deletion may have fewer entries, never more
-            // or different ones. Every surviving regular file is revalidated.
-            for f in &observed {
-                if !a.files.iter().any(|owned| {
-                    owned.path == f.path
-                        && owned.identity.same_object(&f.identity)
-                        && (f.identity.directory || owned.identity == f.identity)
-                }) {
-                    return Err(Error::Conflict(format!(
-                        "unowned or changed entry: {}",
-                        f.path
-                    )));
-                }
-            }
-            let mut files = observed;
-            files.sort_by_key(|f| std::cmp::Reverse(f.path.matches('/').count()));
-            for f in &files {
-                if !f.identity.directory {
-                    fs::remove_entry(&dir, f)?;
-                }
-            }
-            for f in &files {
-                if f.identity.directory {
-                    fs::remove_entry(&dir, f)?;
-                }
-            }
-            if !fs::names(&dir)?.is_empty() {
-                return Err(Error::Conflict("new files appeared during deletion".into()));
-            }
-            if a.path.parent() != Some(a.root.as_path()) {
-                return Err(Error::Conflict(
-                    "payload no longer an immediate child of root".into(),
-                ));
-            }
-            // Recheck the entry itself; unlinkat cannot follow a replacement.
-            let current = fs::open_at(&root, Path::new(a.path.file_name().unwrap()), true)?;
-            if !fs::identity(&current.metadata()?).same_object(a.identity.as_ref().unwrap()) {
-                return Err(Error::Conflict("payload directory replaced".into()));
-            }
-            fs::unlink(&root, Path::new(a.path.file_name().unwrap()), true)?;
-            Ok(())
-        })();
+        let result = self.delete_manifest_checked(&a, op.attempts);
         match result {
             Ok(()) => {
                 op.state = "succeeded".into();
@@ -1358,6 +1311,62 @@ impl Inventory {
         tx.commit()?;
         Ok(op)
     }
+    /// Shared identity/manifest-checked deletion. Call only while holding the
+    /// mutation coordinator and after generation-specific authorization.
+    fn delete_manifest_checked(&self, a: &Artifact, attempts: u32) -> Result<()> {
+        let root = self.verify_root(a)?;
+        if attempts > 1 {
+            match std::fs::symlink_metadata(&a.path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e.into()),
+                Ok(_) => (),
+            }
+        }
+        let dir = self.verify(a)?;
+        let observed = fs::manifest(&dir, 100_000)?;
+        // A restarted partial deletion may have fewer entries, never more
+        // or different ones. Every surviving regular file is revalidated.
+        for f in &observed {
+            if !a.files.iter().any(|owned| {
+                owned.path == f.path
+                    && owned.identity.same_object(&f.identity)
+                    && (f.identity.directory || owned.identity == f.identity)
+            }) {
+                return Err(Error::Conflict(format!(
+                    "unowned or changed entry: {}",
+                    f.path
+                )));
+            }
+        }
+        let mut files = observed;
+        files.sort_by_key(|f| std::cmp::Reverse(f.path.matches('/').count()));
+        for f in &files {
+            if !f.identity.directory {
+                fs::remove_entry(&dir, f)?;
+            }
+        }
+        for f in &files {
+            if f.identity.directory {
+                fs::remove_entry(&dir, f)?;
+            }
+        }
+        if !fs::names(&dir)?.is_empty() {
+            return Err(Error::Conflict("new files appeared during deletion".into()));
+        }
+        if a.path.parent() != Some(a.root.as_path()) {
+            return Err(Error::Conflict(
+                "payload no longer an immediate child of root".into(),
+            ));
+        }
+        // Recheck the entry itself; unlinkat cannot follow a replacement.
+        let current = fs::open_at(&root, Path::new(a.path.file_name().unwrap()), true)?;
+        if !fs::identity(&current.metadata()?).same_object(a.identity.as_ref().unwrap()) {
+            return Err(Error::Conflict("payload directory replaced".into()));
+        }
+        fs::unlink(&root, Path::new(a.path.file_name().unwrap()), true)?;
+        Ok(())
+    }
+
     /// Count only daemon monotonic uptime observed while eligible. Reset the
     /// checkpoint before the transaction: a failed commit loses time safely.
     pub fn tick(&self) -> Result<()> {
