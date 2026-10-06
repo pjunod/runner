@@ -2330,6 +2330,21 @@ function editSeedPolicy(ev) {
 document.addEventListener("input", editSeedPolicy);
 document.addEventListener("change", editSeedPolicy);
 
+function repairProgressText(p, nowMs) {
+  if (!p) return "";
+  const phases = { matching: "Matching repair inputs", preparing: "Preparing repair workspace",
+    verifying: "Verifying PAR data", fetching_recovery: "Fetching recovery files",
+    reconstructing: "Reconstructing files", validating: "Validating repaired files" };
+  const parts = [phases[p.phase] || "Repair in progress"];
+  if (p.files_total > 0) parts.push(p.files_done + "/" + p.files_total + " files");
+  if (p.bytes_scanned > 0) parts.push(fmtBytes(p.bytes_scanned) + " scanned");
+  if (p.round != null) parts.push("round " + (p.round + 1));
+  parts.push((p.recovery_blocks_available || 0) + " recovery blocks available");
+  if (p.additional_blocks_needed != null) parts.push(p.additional_blocks_needed + " more needed");
+  if (p.last_progress_at > 0) parts.push("last work " + fmtDur(Math.max(0, nowMs - p.last_progress_at * 1000)) + " ago");
+  return parts.join(" · ");
+}
+
 function buildDetailRow(d) {
   const tr = d.create("tr", "detail-tr");
   const td = d.append(tr, d.create("td"));
@@ -2351,6 +2366,7 @@ function buildDetailRow(d) {
   d.data(c.close, "action", "detail-close");
   d.text(c.close, "close");
 
+  c.repair = d.append(wrap, d.create("div", "jd-metric"));
   c.torrent = d.append(wrap, d.create("section", "jd-torrent"));
   const facts = d.append(c.torrent, d.create("dl", "torrent-facts"));
   for (const [key, label] of [["torReady", "Files"], ["torUploaded", "Uploaded"],
@@ -2561,7 +2577,8 @@ function detailModel(j, nowMs) {
       (j.failed_articles ? " · " + j.failed_articles + " failed" : "") +
       (j.retried_articles ? " · " + j.retried_articles + " retried" : ""),
     health: torrent ? "ratio " + Number(j.ratio || 0).toFixed(2) + "×" :
-      "health " + (j.health / 10).toFixed(1) + "%",
+      "download health " + (j.health / 10).toFixed(1) + "%",
+    repair: torrent ? "" : repairProgressText(j.repair_progress, nowMs),
     dupe: j.dupe_key ? "dupe: " + j.dupe_key : "",
     nzbHref: "/api/v1/jobs/" + j.id + (torrent ? "/torrent-file" : "/nzb"),
     sourceLabel: torrent ? "download torrent" : "download nzb",
@@ -2683,6 +2700,7 @@ function applyDetail(tr, m, d) {
   });
   metric("articles", m.articles);
   metric("health", m.health);
+  metric("repair", m.repair);
   metric("dupe", m.dupe);
   w("nzbHref", m.nzbHref || "", v => d.attr(c.nzb, "href", v));
   w("sourceLabel", m.sourceLabel || "download source", v => d.text(c.nzb, v));
@@ -4992,7 +5010,7 @@ function fileDetailModel(dt) {
   return {
     key: "fd" + a.id, kind: "fdetail", id: a.id,
     sig: [a.id, a.revision, dt.offset, dt.total, dt.files.length, a.error || "", a.hold || "", a.keep, a.owned,
-          a.state, [...sel].sort().join("\n"), selectingAll, measuring, deleting, dt.events.length, dt.preview ? dt.preview.text : "", a.inspected_at || 0,
+          a.state, JSON.stringify(a.workspace_cleanup || null), [...sel].sort().join("\n"), selectingAll, measuring, deleting, dt.events.length, dt.preview ? dt.preview.text : "", a.inspected_at || 0,
           (dt.relocations || []).map(op => op.id + ":" + op.state).join(","),
           handoffs.map(h => h.id + ":" + h.state + ":" + h.error + ":" + h.cancelling).join(",")].join("|"),
     path: a.path,
@@ -5005,6 +5023,13 @@ function fileDetailModel(dt) {
       ["size", measured ? fmtBytes(bytes) : "—"],
       ["measured", a.inspected_at ? fmtAgo(a.inspected_at) : measured ? "at completion" : "never"],
       ["job", a.job != null ? "#" + a.job : "—"],
+      ...(a.workspace_cleanup ? [
+        ["cleanup", a.workspace_cleanup.reasons.length ? a.workspace_cleanup.reasons.join(", ") : "eligible after finalization"],
+        ["source completion", a.workspace_cleanup.source_state],
+        ["transform completion", a.workspace_cleanup.transform_state],
+        ["workspace identity", a.workspace_cleanup.identity_valid ? "verified" : "changed or missing"],
+        ["workspace bytes", fmtBytes(a.workspace_cleanup.bytes)],
+      ] : []),
     ],
     note, noteCls: a.error ? "bad" : !measured ? "warn" : "",
     retainedNote: a.state === "retained" ? "These files were preserved for recovery or review. Retained does not mean processing completed successfully." : "",
@@ -6247,7 +6272,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     readDisplay, displayMode, applyDisplay, DISPLAY_LAYOUTS, DISPLAY_PALETTES,
     rowModel, reconcileRows, applyRow, differ, KINDS, store,
     histModel, fileModel, statusModels, storageModels, queueModels, detailModel,
-    statusName, statusLabel, healthColor, fmtBytes, fmtRate, fmtEta, fmtDur, ppSummary,
+    statusName, statusLabel, healthColor, repairProgressText, fmtBytes, fmtRate, fmtEta, fmtDur, ppSummary,
     sectionOf, currentPostStage, pipelineModels, stageElapsedMs, SECTIONS, ORDERED,
     torrentPrimaryAction, torrentPhase, torrentStatus, seedPolicyText, seedStopText, seedLimitReached, toggleSection, collapsedSections,
     pending, satisfied, toast, connState, pollResult,
