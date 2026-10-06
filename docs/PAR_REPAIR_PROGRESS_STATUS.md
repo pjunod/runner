@@ -1,6 +1,6 @@
 # PAR repair status — design, build, and qualification
 
-**Updated:** 2026-10-06 · **Status:** final qualification
+**Updated:** 2026-10-06 · **Status:** local qualification passed; required PR CI next
 
 Companion to [PAR_REPAIR_PROGRESS_PLAN.md](PAR_REPAIR_PROGRESS_PLAN.md), which
 owns the implementation contract. The originating chat owns design; GPT-6.1
@@ -17,7 +17,7 @@ presented as completed work.
 | Repair scanning and retry reuse | implemented; compiling and linting | Cached single-pass fingerprints, streamed packets, normalized companions, useful-input retry |
 | Failed payload policy | unchanged | Seven-day park retention; payload deletion not requested |
 | Adversarial review | complete | Reported findings fixed; final disposition has no remaining blockers |
-| Final qualification | starting | Review fixes committed; disjoint local/CI cohorts, rerun failures and affected tests only |
+| Final qualification | local cohort passed | 501 local tests passed; required CI supplies its disjoint cohort |
 | PR and merge | draft [PR #252](https://github.com/pjunod/runner/pull/252) | Required Main promotion gate; ordinary merge after review and qualification |
 | Production | unchanged | No deployment, restart, config edit, or live deletion performed |
 
@@ -116,4 +116,23 @@ Final review disposition: all reported findings are addressed. The reviewer also
 found a terminal Delete lock-wait race during fix verification; authority is now
 checked under mutation admission and immediately before deletion. An explicit
 lock-wait cancellation regression covers that case. Workspace clippy passes
-with warnings denied. Final test qualification starts after this disposition.
+with warnings denied. Final test qualification started after this disposition.
+
+## Final local qualification
+
+The local cohort has 501 passing tests and three existing ignored torrent
+fixtures. Post/PAR (126), nonduplicated engine unit/integration (163), the
+remaining workspace targets (206), and configuration examples (6) were run
+with the lockfile and required external tools. Two integration failures were
+fixed and only those cases rerun: receipt replay now wraps an exhausted cursor
+immediately within its 25-record bound; the delayed-recovery fixture budgets
+initial verification as well as fetching. Passing tests were not rerun solely
+because those cases failed. Core formatting, whitespace and focused clippy
+checks remain clean.
+
+PR CI will provide cluster, API/config/state/types/qbit, selected engine torrent,
+embedded JavaScript, and mobile qualification. The Rust UI DOM wrapper locally
+also verifies server-schema roundtripping; its boot-only wrapper is omitted
+because PR CI executes the identical boot harness. Required CI and the ordinary
+merge are still pending. Final CI/merge/cleanup evidence will be recorded on
+the PR, preserving this tested code revision without a redundant CI-only push.

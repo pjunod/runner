@@ -528,12 +528,17 @@ impl Inventory {
             let db = self.db.lock().unwrap();
             let cursor = self.workspace_cursor.lock().unwrap().clone();
             let mut query = db.prepare("SELECT data FROM operations WHERE id>?1 AND json_extract(data,'$.kind') IN ('extract','par_repair') ORDER BY id LIMIT 25")?;
-            let rows = query.query_map([cursor], |row| row.get::<_, String>(0))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
+            let rows = query.query_map([&cursor], |row| row.get::<_, String>(0))?;
+            let mut raws = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+            if raws.is_empty() && !cursor.is_empty() {
+                // A new terminal receipt may qualify an already visited row.
+                // Wrap immediately while retaining the 25-row work bound.
+                self.workspace_cursor.lock().unwrap().clear();
+                let rows = query.query_map([""], |row| row.get::<_, String>(0))?;
+                raws = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+            }
+            raws
         };
-        if raws.is_empty() {
-            self.workspace_cursor.lock().unwrap().clear();
-        }
         for raw in raws {
             let mut op: Operation = serde_json::from_str(&raw)?;
             *self.workspace_cursor.lock().unwrap() = op.id.clone();

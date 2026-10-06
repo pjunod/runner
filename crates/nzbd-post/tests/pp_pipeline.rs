@@ -2596,7 +2596,7 @@ async fn review_missing_parity_requests_available_paused_volume() {
         &engine,
         &PostConfig {
             unpack: false,
-            par_fetch_timeout: Duration::from_millis(20),
+            par_fetch_timeout: Duration::from_secs(1),
             ..Default::default()
         },
         &history(tmp.path()),
@@ -3032,6 +3032,10 @@ async fn terminal_stamp_receipt_gap_replays_after_restart_without_reprocessing()
     engine.shutdown().await;
     assert!(workspace.scratch.path.exists());
     let recovered = spawn_engine(tmp.path()).await;
+    assert!(
+        recovered.export_job(JobId(1201)).await.unwrap().is_some(),
+        "terminal stamp survived restart"
+    );
     let cancel = CancellationToken::new();
     let tracker = TaskTracker::new();
     spawn_post_manager(
@@ -3051,7 +3055,14 @@ async fn terminal_stamp_receipt_gap_replays_after_restart_without_reprocessing()
         );
         tokio::task::yield_now().await;
     }
-    assert!(!workspace.scratch.path.exists());
+    assert!(
+        !workspace.scratch.path.exists(),
+        "cleanup assessment: {:?}",
+        recovered
+            .artifacts()
+            .workspace_assessment(&workspace.scratch.id)
+            .unwrap()
+    );
     assert!(path.join("payload.bin").exists());
     assert_eq!(
         hist.list(10).unwrap().len(),
