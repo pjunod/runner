@@ -1499,6 +1499,229 @@ mod tests {
         nzbd_config::Config::from_toml(&toml).unwrap()
     }
 
+    #[tokio::test]
+    async fn default_processing_allocation_publishes_only_after_success() {
+        use nzbd_engine::{AddOpts, Event};
+        use nzbd_nserv::{build_post, prng_bytes, NservBuilder};
+        use nzbd_types::JobStatus;
+
+        for (category, conflict) in [(false, false), (true, false), (false, true), (true, true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = prng_bytes(17, 32768);
+            let post = build_post("storage-contract", &[("payload.bin", data.clone())], 8192);
+            let server = NservBuilder::new().with_post(&post).start().await.unwrap();
+            let mut cfg = nzbd_config::Config::default();
+            cfg.paths.main_dir = tmp.path().join("processing");
+            cfg.paths.dest_dir = tmp.path().join("complete");
+            cfg.servers = vec![nzbd_config::ServerConfig {
+                name: "mock".into(),
+                host: "127.0.0.1".into(),
+                port: server.port(),
+                tls: false,
+                ..Default::default()
+            }];
+            cfg.queue.min_free_disk_mb = 0;
+            cfg.post.unpack = false;
+            cfg.post.deobfuscate_final = false;
+            cfg.categories = vec![nzbd_config::CategoryConfig {
+                name: "tv".into(),
+                dest_dir: Some(tmp.path().join("library/tv")),
+                ..Default::default()
+            }];
+            let mut engine_cfg = EngineConfig::single_node(
+                cfg.server_defs(),
+                cfg.state_dir(),
+                cfg.download_dir(),
+                engine_tuning(&cfg),
+                None,
+            );
+            engine_cfg.disk_guard_roots = disk_guard_roots(&cfg);
+            let engine = Engine::spawn(engine_cfg).await.unwrap();
+            let mut events = engine.subscribe();
+            let job = engine
+                .add_nzb_opts(
+                    "storage-contract",
+                    post.nzb.as_bytes(),
+                    AddOpts {
+                        category: category.then(|| "TV".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let allocation = engine.artifacts().for_job(job.0).unwrap().unwrap();
+            assert_eq!(allocation.root, cfg.paths.main_dir);
+            assert!(!cfg.dest_dir().join("storage-contract").exists());
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Event::JobFinished {
+                        job: finished,
+                        status,
+                        ..
+                    } = events.recv().await.unwrap()
+                    {
+                        if finished == job {
+                            assert_eq!(status, JobStatus::Completed);
+                            break;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("download must finish");
+            assert_eq!(
+                std::fs::read(allocation.path.join("payload.bin")).unwrap(),
+                data
+            );
+            assert!(!engine.export_job(job).await.unwrap().unwrap().ready());
+            let destination = if category {
+                tmp.path().join("library/tv")
+            } else {
+                cfg.dest_dir()
+            };
+            assert!(!destination.join("storage-contract").exists());
+            if conflict {
+                std::fs::create_dir_all(destination.join("storage-contract")).unwrap();
+            }
+            let history = Arc::new(
+                nzbd_state::history::HistoryDb::open(&cfg.state_dir().join("history.sqlite"), None)
+                    .unwrap(),
+            );
+            let result = nzbd_post::manager::process_job(
+                &engine,
+                &post_config(&cfg, 1, None),
+                &history,
+                &cfg.download_dir(),
+                job,
+            )
+            .await;
+            if conflict {
+                assert!(result.is_err());
+                assert!(!engine.export_job(job).await.unwrap().unwrap().ready());
+                assert_eq!(
+                    std::fs::read(allocation.path.join("payload.bin")).unwrap(),
+                    data
+                );
+                assert!(!destination.join("storage-contract/payload.bin").exists());
+            } else {
+                assert_eq!(result.unwrap(), nzbd_post::manager::PpFinal::Success);
+                assert!(engine.export_job(job).await.unwrap().unwrap().ready());
+                assert_eq!(
+                    std::fs::read(destination.join("storage-contract/payload.bin")).unwrap(),
+                    data
+                );
+                assert!(!allocation.path.exists());
+                assert_eq!(
+                    history.list(10).unwrap()[0].final_dir.as_deref(),
+                    destination.join("storage-contract").to_str()
+                );
+            }
+            engine.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_processing_default_preserves_existing_custody_after_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = nzbd_config::Config::default();
+        cfg.paths.main_dir = tmp.path().join("processing");
+        cfg.paths.dest_dir = tmp.path().join("complete");
+        cfg.paths.inter_dir = Some(cfg.dest_dir()); // Reproduce the old allocation root.
+        let post = nzbd_nserv::build_post("existing-job", &[("payload.bin", vec![7; 100])], 100);
+        let spawn = |cfg: &nzbd_config::Config| {
+            Engine::spawn(EngineConfig::single_node(
+                Vec::new(),
+                cfg.state_dir(),
+                cfg.download_dir(),
+                Tuning::default(),
+                None,
+            ))
+        };
+        let engine = spawn(&cfg).await.unwrap();
+        let job = engine
+            .add_nzb_opts(
+                "existing-job",
+                post.nzb.as_bytes(),
+                nzbd_engine::AddOpts {
+                    paused: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let old = engine.artifacts().for_job(job.0).unwrap().unwrap();
+        assert_eq!(old.root, cfg.dest_dir());
+        std::fs::write(old.path.join("sentinel"), b"preserve").unwrap();
+        engine.shutdown().await;
+        drop(engine);
+
+        cfg.paths.inter_dir = None;
+        let engine = spawn(&cfg).await.unwrap();
+        let existing = engine.artifacts().for_job(job.0).unwrap().unwrap();
+        assert_eq!(existing.path, old.path);
+        assert_eq!(existing.generation, old.generation);
+        assert_eq!(
+            std::fs::read(existing.path.join("sentinel")).unwrap(),
+            b"preserve"
+        );
+        assert!(!cfg.download_dir().join("existing-job").exists());
+        let new = engine
+            .add_nzb_opts(
+                "new-job",
+                post.nzb.as_bytes(),
+                nzbd_engine::AddOpts {
+                    paused: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.artifacts().for_job(new.0).unwrap().unwrap().root,
+            cfg.paths.main_dir
+        );
+        engine.shutdown().await;
+    }
+
+    #[test]
+    fn processing_root_is_covered_by_single_node_and_cluster_capacity_wiring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = nzbd_config::Config::default();
+        cfg.paths.main_dir = tmp.path().join("shared/processing");
+        cfg.paths.dest_dir = tmp.path().join("shared/complete");
+        cfg.cluster.shared_dir = Some(tmp.path().join("shared"));
+        cfg.cluster.secret = Some("fixture-secret".into());
+        for intermediate in [
+            None,
+            Some(PathBuf::new()),
+            Some(tmp.path().join("shared/intermediate")),
+        ] {
+            cfg.paths.inter_dir = intermediate;
+            assert!(disk_guard_roots(&cfg)
+                .iter()
+                .any(|r| r.path == cfg.download_dir()));
+            cfg.cluster.enabled = true;
+            let (cluster, _) = cluster_runtime_config(&cfg).unwrap();
+            assert!(cluster
+                .disk_guard_roots
+                .iter()
+                .any(|r| r.path == cfg.download_dir()));
+            assert!(cluster
+                .disk_guard_roots
+                .iter()
+                .any(|r| r.path == cfg.dest_dir()));
+            assert_eq!(
+                post_config(&cfg, 1, None).completed_dir,
+                Some(cfg.dest_dir())
+            );
+            assert!(cluster
+                .disk_guard_roots
+                .iter()
+                .all(|r| !r.path.as_os_str().is_empty()));
+            cfg.cluster.enabled = false;
+        }
+    }
+
     #[test]
     fn compat_options_project_nzbget_vocabulary() {
         let cfg = cfg_with(

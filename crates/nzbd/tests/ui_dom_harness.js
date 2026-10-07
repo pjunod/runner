@@ -427,6 +427,29 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     "unchanged storage readings do not rewrite their rows");
 }
 
+// Repair progress is an optional, stable text node; old snapshots stay valid.
+{
+  const j = job(91);
+  eq(T.detailModel(j).repair, "", "old snapshots have no repair detail");
+  j.repair_progress = { phase: "matching", files_done: 2, files_total: 7,
+    bytes_scanned: 65536, round: 1, recovery_blocks_available: 8,
+    additional_blocks_needed: 3, last_progress_at: 10 };
+  const text = T.repairProgressText(j.repair_progress, 12000);
+  ok(text.includes("2/7 files") && text.includes("round 2") && text.includes("3 more needed"), "repair counters are rendered");
+  ok(text.includes("last work 2s ago"), "repair age uses actual work time");
+  ok(T.detailModel(j).health.startsWith("download health"), "download health is labelled distinctly");
+  const body = node("tbody");
+  T.reconcileRows(body, [T.detailModel(j)], fake);
+  const row = body.children[0], repair = row.__c.repair;
+  j.repair_progress.phase = "reconstructing";
+  T.reconcileRows(body, [T.detailModel(j)], fake);
+  ok(body.children[0] === row && row.__c.repair === repair, "repair updates keep the detail subtree");
+  ok(repair.textContent.includes("Reconstructing") && !repair.textContent.includes("%"), "tool phases have no invented percentage");
+  delete j.repair_progress;
+  T.reconcileRows(body, [T.detailModel(j)], fake);
+  ok(repair.hidden, "closed attempts clear repair progress");
+}
+
 // --- 9. detail panel is a stable subtree ---------------------------------
 {
   const tbody = node("tbody");

@@ -14,9 +14,9 @@ what was recognized but not applicable, and what needs review by hand.
 
 ```toml
 [paths]
-main_dir = "~/downloads"            # working root; state lives under it
+main_dir = "~/downloads"            # default Usenet processing root + state
 dest_dir = "~/downloads/complete"   # finished downloads (per-category overrides below)
-# inter_dir = "~/downloads/inter"   # optional intermediate/download area
+# inter_dir = "~/downloads/inter"   # processing override; absent/empty uses main_dir
 # nzb_watch_dir = "~/downloads/nzb" # drop .nzb files here to auto-queue them
 # queue_dir = "~/downloads/queue"   # journal + queue snapshots (default: <main_dir>/queue)
 # temp_dir = "/tmp/nzbd"            # scratch space
@@ -155,9 +155,10 @@ extensions = []                  # extension scripts to run for this category
 *arr sending `TV` lands on `name = "tv"`.
 
 `dest_dir` is a **move at the end of post-processing**, not a different
-download target: the engine always writes under `paths.dest_dir`, and the
-finished folder is relocated to `<category dest_dir>/<job name>` before
-extension scripts run and before any path is reported. Cross-filesystem
+download target: the engine writes under nonempty `paths.inter_dir`, otherwise
+`paths.main_dir`, and the finished folder is relocated to
+`<category dest_dir>/<job name>` before extension scripts run and before any
+path is reported. Cross-filesystem
 destinations work (the move falls back to copy-then-remove), which is the
 usual homelab shape — download on the SSD, library on the NAS. If the
 move fails, the failure is logged loudly and every reported path names
@@ -567,8 +568,12 @@ password = "change-me"
 `paths.inter_dir`, when nonempty, is the Usenet download and processing root.
 Successful post-processing publishes to `paths.dest_dir`, or the matching
 category's destination, before extension scripts and completion notification.
-A failed move does not report success. With an empty intermediate value,
-downloads remain in the destination root, matching the existing NZBGet contract.
-`paths.main_dir` supplies state and other default paths; it does not override
-an empty intermediate setting. Existing allocated jobs retain their recorded
-custody path when settings change. Path changes take effect after daemon restart.
+A failed move does not report success. Absent or empty `paths.inter_dir` uses
+expanded `paths.main_dir` directly, without an appended subdirectory. This also
+applies to imported NZBGet configurations with absent or empty `InterDir`.
+`paths.dest_dir` is the successful publication destination, not the implicit
+processing root. `paths.main_dir` also supplies state and other default paths.
+Existing allocated jobs retain their recorded custody path when settings change;
+this default change does not relocate them. Path changes take effect after daemon
+restart. Configure separate processing and completed roots for the intended
+separation; overlap validation is not introduced by this fallback change.

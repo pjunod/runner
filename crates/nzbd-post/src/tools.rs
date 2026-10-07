@@ -24,7 +24,52 @@ pub async fn run_tool(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<ToolOutput, PostError> {
-    let mut child = tokio::process::Command::new(cmd)
+    let control = crate::attempt::current();
+    let cancellation = control
+        .as_ref()
+        .map_or_else(tokio_util::sync::CancellationToken::new, |control| {
+            control.cancel.child_token()
+        });
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    let owned_cmd = cmd.to_owned();
+    let owned_args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    let owned_cwd = cwd.to_path_buf();
+    let guard = control
+        .as_ref()
+        .and_then(|control| control.use_guard.lock().unwrap().clone());
+    let worker_control = control.clone();
+    let run = async move {
+        let _guard = guard;
+        let result =
+            run_tool_owned(&owned_cmd, &owned_args, &owned_cwd, timeout, cancellation).await;
+        if let Some(control) = worker_control {
+            control.preserve_uncertainty(&result).await;
+        }
+        result
+    };
+    let task = if let Some(control) = control {
+        control.workers.spawn(run)
+    } else {
+        tokio::spawn(run)
+    };
+    task.await
+        .map_err(|e| PostError::Subprocess(format!("tool worker: {e}")))?
+}
+
+async fn run_tool_owned(
+    cmd: &str,
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<ToolOutput, PostError> {
+    let mut command = tokio::process::Command::new(cmd);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
+    let mut child = command
         .args(args)
         .current_dir(cwd)
         .env_clear()
@@ -39,6 +84,7 @@ pub async fn run_tool(
         .spawn()
         .map_err(|e| PostError::ToolMissing(format!("{cmd}: {e}")))?;
 
+    let group = child.id();
     let out = child.stdout.take().unwrap();
     let mut err = child.stderr.take().unwrap();
     let read_capped = |mut r: tokio::process::ChildStdout| async move {
@@ -72,22 +118,31 @@ pub async fn run_tool(
         buf
     };
 
-    let result = tokio::time::timeout(timeout, async {
+    let result = tokio::select! {
+        _ = cancellation.cancelled() => None,
+        result = tokio::time::timeout(timeout, async {
         let (o, e, status) = tokio::join!(read_capped(out), read_err, child.wait());
         (o, e, status)
-    })
-    .await;
+    }) => Some(result),
+    };
 
     match result {
-        Ok((o, e, Ok(status))) => Ok(ToolOutput {
-            code: status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&o).into_owned(),
-            stderr: String::from_utf8_lossy(&e).into_owned(),
-        }),
-        Ok((_, _, Err(e))) => Err(PostError::Subprocess(format!("{cmd}: {e}"))),
-        Err(_) => {
-            let _ = child.kill().await;
+        Some(Ok((o, e, Ok(status)))) => {
+            crate::attempt::kill_child(&mut child, group).await?;
+            Ok(ToolOutput {
+                code: status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&o).into_owned(),
+                stderr: String::from_utf8_lossy(&e).into_owned(),
+            })
+        }
+        Some(Ok((_, _, Err(e)))) => Err(PostError::Subprocess(format!("{cmd}: {e}"))),
+        Some(Err(_)) => {
+            crate::attempt::kill_child(&mut child, group).await?;
             Err(PostError::Subprocess(format!("{cmd}: timed out")))
+        }
+        None => {
+            crate::attempt::kill_child(&mut child, group).await?;
+            Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "tool cancelled").into())
         }
     }
 }

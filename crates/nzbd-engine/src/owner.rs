@@ -190,7 +190,10 @@ pub(crate) enum QueueCommand {
     /// How many jobs may download at once. Replies with the value
     /// actually applied, which is the request clamped into range — the
     /// caller learns what happened rather than having to re-read.
-    SetMaxActiveDownloads { n: u32, reply: oneshot::Sender<u32> },
+    SetMaxActiveDownloads {
+        n: u32,
+        reply: oneshot::Sender<u32>,
+    },
     /// Operator-set per-server connection counts. Replies with the values
     /// actually applied after clamping to each server's spawned ceiling.
     SetServerConnectionCaps {
@@ -213,6 +216,7 @@ pub(crate) enum QueueCommand {
     /// `RetainJobs` already removed while an external disposition awaited.
     ImportJobIfPresent {
         job: Box<Job>,
+        require_snapshot: bool,
         reply: oneshot::Sender<bool>,
     },
     /// Clone a job's full current state out (for grants and completion
@@ -236,7 +240,11 @@ pub(crate) enum QueueCommand {
     },
     /// Overlay remote progress and post-processing stages onto a delegated
     /// job's summary without changing the authority's durable control state.
-    MirrorProgress { job: JobId, stats: MirrorStats },
+    MirrorProgress {
+        job: JobId,
+        node: Option<String>,
+        stats: MirrorStats,
+    },
     /// Union-fold the job's shared journal files into local state (reclaim
     /// after a worker died, or adoption after taking office).
     FoldJobJournals {
@@ -316,6 +324,19 @@ pub(crate) enum QueueCommand {
     /// stage span, closing the previous one. Separate from `SetJobStatus`
     /// because the status and the timeline must not be settable apart —
     /// see [`close_span`].
+    RegisterRepairAttempt {
+        job: JobId,
+        attempt: String,
+        reply: oneshot::Sender<bool>,
+    },
+    RepairProgress {
+        job: JobId,
+        progress: crate::RepairProgress,
+    },
+    CloseRepairAttempt {
+        job: JobId,
+        attempt: String,
+    },
     EnterPostStage {
         job: JobId,
         stage: PostStage,
@@ -407,6 +428,8 @@ impl JobRateMeter {
 /// scheduling continue to reason from local control state.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MirrorStats {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_progress: Option<crate::RepairProgress>,
     pub done_articles: u32,
     pub failed_articles: u32,
     pub downloaded_bytes: u64,
@@ -530,6 +553,7 @@ pub(crate) struct Owner {
     /// a post-processing recovery job; only the listed files may receive
     /// leases, even if a user resumes another file while verification waits.
     post_fetch_files: HashMap<JobId, HashSet<FileId>>,
+    repair_progress: HashMap<JobId, (String, Option<crate::RepairProgress>)>,
     /// Per-job download-rate EMA, fed from downloaded-byte deltas at
     /// snapshot time (job id → meter).
     job_rates: HashMap<u32, JobRateMeter>,
@@ -979,6 +1003,7 @@ impl Owner {
             delegated: HashMap::new(),
             mirror: HashMap::new(),
             post_fetch_files,
+            repair_progress: HashMap::new(),
             job_rates: HashMap::new(),
             job_wire_ema: HashMap::new(),
             server_wire_ema: HashMap::new(),
@@ -1943,13 +1968,19 @@ impl Owner {
                 let _ = self.import_job(*job, fold_journals, emit_finished);
                 let _ = reply.send(());
             }
-            QueueCommand::ImportJobIfPresent { job, reply } => {
+            QueueCommand::ImportJobIfPresent {
+                job,
+                require_snapshot,
+                reply,
+            } => {
                 let id = job.id;
                 let previous = self.state.job(id).cloned();
                 let previous_delegated = self.delegated.get(&id).cloned();
                 let previous_mirror = self.mirror.get(&id).cloned();
                 let previous_post_fetch = self.post_fetch_files.get(&id).cloned();
-                let committed = previous.is_some() && self.import_job(*job, false, false);
+                let committed = previous.is_some()
+                    && (!require_snapshot || self.persist)
+                    && self.import_job(*job, false, false);
                 if !committed {
                     // Atomic means memory and disk agree. A failed snapshot
                     // commit must not leave an in-memory-only PP_DONE or
@@ -1998,6 +2029,9 @@ impl Owner {
                 if ok {
                     match &node {
                         Some(n) => {
+                            if self.delegated.get(&job) != Some(n) {
+                                self.mirror.remove(&job);
+                            }
                             self.delegated.insert(job, n.clone());
                         }
                         None => {
@@ -2015,8 +2049,12 @@ impl Owner {
                 }
                 let _ = reply.send(ok);
             }
-            QueueCommand::MirrorProgress { job, stats } => {
-                if self.delegated.contains_key(&job) {
+            QueueCommand::MirrorProgress { job, node, stats } => {
+                if self
+                    .delegated
+                    .get(&job)
+                    .is_some_and(|current| node.as_ref().is_none_or(|node| node == current))
+                {
                     self.mirror.insert(job, stats);
                     self.publish_now();
                 }
@@ -2375,6 +2413,47 @@ impl Owner {
                 }
                 let _ = reply.send(ok);
             }
+            QueueCommand::RegisterRepairAttempt {
+                job,
+                attempt,
+                reply,
+            } => {
+                let ok = self.state.job(job).is_some_and(|job| {
+                    !job.held()
+                        && !job.ready()
+                        && !job
+                            .params
+                            .iter()
+                            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                });
+                if ok {
+                    self.repair_progress.insert(job, (attempt, None));
+                }
+                let _ = reply.send(ok);
+            }
+            QueueCommand::RepairProgress { job, progress } => {
+                if let Some((attempt, current)) = self.repair_progress.get_mut(&job) {
+                    if *attempt == progress.attempt_id {
+                        let changed = current
+                            .as_ref()
+                            .is_none_or(|old| old.phase != progress.phase);
+                        *current = Some(progress);
+                        if changed {
+                            self.publish_now();
+                        }
+                    }
+                }
+            }
+            QueueCommand::CloseRepairAttempt { job, attempt } => {
+                if self
+                    .repair_progress
+                    .get(&job)
+                    .is_some_and(|(current, _)| *current == attempt)
+                {
+                    self.repair_progress.remove(&job);
+                    self.publish_now();
+                }
+            }
             QueueCommand::EnterPostStage {
                 job,
                 stage,
@@ -2543,7 +2622,7 @@ impl Owner {
         }
         tracing::info!(job = job_id.0, %name, ?status, "job imported");
         self.dirty = true;
-        let committed = self.persist && self.save_snapshot();
+        let committed = !self.persist || self.save_snapshot();
         self.publish_now();
         if terminal && emit_finished {
             self.emit(Event::JobFinished {
@@ -4687,6 +4766,15 @@ impl Owner {
     }
 
     fn publish_now(&mut self) {
+        self.repair_progress.retain(|id, _| {
+            self.state.job(*id).is_some_and(|job| {
+                !job.held()
+                    && !job
+                        .params
+                        .iter()
+                        .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+            })
+        });
         let rate = self
             .server_wire_ema
             .values()
@@ -4743,6 +4831,18 @@ impl Owner {
                     .map(|s| s.size as u64)
                     .sum();
                 let mut summary = JobSummary {
+                    repair_progress: if !j.held()
+                        && !j
+                            .params
+                            .iter()
+                            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                    {
+                        self.repair_progress
+                            .get(&j.id)
+                            .and_then(|(_, progress)| progress.clone())
+                    } else {
+                        None
+                    },
                     control: j.control(),
                     id: j.id,
                     kind: j.kind,
@@ -4822,6 +4922,11 @@ impl Owner {
                 }
                 // Delegated jobs progress remotely; overlay heartbeat stats.
                 if let Some(m) = self.mirror.get(&j.id) {
+                    summary.repair_progress = if !j.held() && !summary.pp_done {
+                        m.repair_progress.clone()
+                    } else {
+                        None
+                    };
                     summary.done_articles = m.done_articles;
                     summary.failed_articles = m.failed_articles;
                     summary.downloaded_bytes = m.downloaded_bytes;
@@ -6213,6 +6318,7 @@ mod tests {
         owner.mirror.insert(
             JobId(3),
             MirrorStats {
+                repair_progress: None,
                 done_articles: 4,
                 failed_articles: 1,
                 downloaded_bytes: 40,
@@ -6230,6 +6336,7 @@ mod tests {
         let (reply, mut received) = oneshot::channel();
         owner.on_command(QueueCommand::ImportJobIfPresent {
             job: Box::new(replacement),
+            require_snapshot: true,
             reply,
         });
 
@@ -6258,6 +6365,7 @@ mod tests {
         owner.mirror.insert(
             JobId(4),
             MirrorStats {
+                repair_progress: None,
                 done_articles: 1,
                 failed_articles: 0,
                 downloaded_bytes: 0,

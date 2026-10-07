@@ -827,6 +827,15 @@ impl HistoryDb {
         Ok(self.query(&sql, &[&job.0])?.into_iter().next())
     }
 
+    /// Exact cursor lookup for durable completion reconciliation.
+    pub fn get_sequence(&self, sequence: i64) -> Result<Option<HistoryEntry>, StateError> {
+        self.query(
+            &format!("SELECT {COLUMNS} FROM history WHERE id=?1"),
+            &[&sequence],
+        )
+        .map(|entries| entries.into_iter().next())
+    }
+
     /// One page of the newest-first view: `limit` entries starting at
     /// `offset`.
     ///

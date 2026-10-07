@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 md-5 = { workspace = true }
 crc32fast = { workspace = true }
+libc = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]

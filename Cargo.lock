@@ -2658,6 +2658,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2781,6 +2782,7 @@ name = "nzbd-post"
 version = "0.2.0"
 dependencies = [
  "crc32fast",
+ "libc",
  "md-5",
  "nzbd-engine",
  "nzbd-nserv",

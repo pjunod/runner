@@ -1026,6 +1026,7 @@ async fn work_heartbeat(
     s.persist_budget_state().await;
     let mut cancel = Vec::new();
     let mut renewed = Vec::new();
+    let mut accepted_progress = HashMap::new();
     let mut controls = HashMap::new();
     let snap = s.engine.snapshot();
     for lp in &req.leases {
@@ -1118,6 +1119,7 @@ async fn work_heartbeat(
                         current.token = next.clone();
                         current.last_hb = Instant::now();
                         controls.insert(lp.lease_id.clone(), current.control_revision);
+                        accepted_progress.insert(lp.lease_id.clone(), next.clone());
                         renewed.push(next);
                     }
                 }
@@ -1126,8 +1128,26 @@ async fn work_heartbeat(
         }
     }
     for lp in &req.leases {
-        if !cancel.contains(&lp.lease_id) {
-            s.engine.mirror_progress(lp.job, lp.stats.clone());
+        let leases = s.leases.lock().unwrap();
+        if !cancel.contains(&lp.lease_id)
+            && leases.get(&lp.lease_id).is_some_and(|lease| {
+                lease.node == req.node
+                    && lease.job == lp.job
+                    && accepted_progress.get(&lp.lease_id) == Some(&lease.token)
+            })
+        {
+            let mut stats = lp.stats.clone();
+            if stats.repair_progress.as_ref().is_some_and(|progress| {
+                !progress
+                    .attempt_id
+                    .starts_with(&format!("{}:", lp.lease_id))
+            }) {
+                stats.repair_progress = None;
+            }
+            s.engine
+                .mirror_progress_from(lp.job, req.node.clone(), stats);
+        } else if !cancel.contains(&lp.lease_id) {
+            cancel.push(lp.lease_id.clone());
         }
     }
     Json(HeartbeatResponse {

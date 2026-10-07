@@ -491,6 +491,7 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
     engine.mirror_progress(
         JobId(40),
         MirrorStats {
+            repair_progress: None,
             done_articles: 7,
             failed_articles: 2,
             downloaded_bytes: 77,
@@ -643,6 +644,47 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
     engine.fold_job_journals(JobId(40)).await.unwrap();
     assert!(engine.remove_job_silent(JobId(41)).await.unwrap());
     assert!(!engine.remove_job_silent(JobId(41)).await.unwrap());
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn worker_terminal_replace_is_ephemeral_and_never_resurrects_missing_jobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = EngineConfig::single_node(
+        vec![],
+        tmp.path().join("state"),
+        tmp.path().join("dest"),
+        Tuning::default(),
+        None,
+    );
+    config.persist_queue = false;
+    let engine = Engine::spawn(config).await.unwrap();
+    let mut job = transfer_job(77, "worker", JobStatus::Completed);
+    engine.import_job(job.clone(), false, false).await.unwrap();
+    job.params
+        .push((nzbd_types::PP_DONE_PARAM.into(), "SUCCESS".into()));
+    assert!(engine
+        .import_worker_job_if_present(job.clone())
+        .await
+        .unwrap());
+    assert!(engine.snapshot().jobs[0].pp_done);
+    assert!(!tmp.path().join("state/queue.json").exists());
+    // The authority replacement API must retain its durable-commit contract.
+    let mut strict = job.clone();
+    strict.priority = 99;
+    assert!(!engine.import_job_if_present(strict).await.unwrap());
+    assert_eq!(
+        engine
+            .export_job(JobId(77))
+            .await
+            .unwrap()
+            .unwrap()
+            .priority,
+        job.priority
+    );
+    assert!(engine.remove_job_silent(JobId(77)).await.unwrap());
+    assert!(!engine.import_worker_job_if_present(job).await.unwrap());
+    assert!(engine.export_job(JobId(77)).await.unwrap().is_none());
     engine.shutdown().await;
 }
 
@@ -1920,4 +1962,130 @@ async fn legacy_coverage_hold_recovers_without_repeating_valid_articles() {
         assert!(!job.ready());
         engine.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn transient_repair_progress_is_attempt_fenced_and_absent_after_terminal_stamp() {
+    use nzbd_engine::{RepairPhase, RepairProgress};
+    let temp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(temp.path(), vec![]).await;
+    let job = transfer_job(501, "repair-progress", JobStatus::PostQueued);
+    engine.import_job(job, false, false).await.unwrap();
+    assert!(engine
+        .register_repair_attempt(JobId(501), "old".into())
+        .await
+        .unwrap());
+    let mut progress = RepairProgress {
+        attempt_id: "old".into(),
+        phase: RepairPhase::Matching,
+        files_done: 1,
+        files_total: 2,
+        bytes_scanned: 65536,
+        round: 0,
+        recovery_blocks_available: 4,
+        additional_blocks_needed: Some(1),
+        last_progress_at: 10,
+    };
+    engine
+        .update_repair_progress(JobId(501), progress.clone())
+        .await;
+    // Export is an ordered owner barrier, so the snapshot is deterministic.
+    engine.export_job(JobId(501)).await.unwrap();
+    assert_eq!(
+        engine.snapshot().jobs[0]
+            .repair_progress
+            .as_ref()
+            .unwrap()
+            .bytes_scanned,
+        65536
+    );
+    assert!(engine
+        .register_repair_attempt(JobId(501), "new".into())
+        .await
+        .unwrap());
+    engine
+        .update_repair_progress(JobId(501), progress.clone())
+        .await;
+    engine.close_repair_attempt(JobId(501), "old".into());
+    progress.attempt_id = "new".into();
+    progress.phase = RepairPhase::Verifying;
+    engine.update_repair_progress(JobId(501), progress).await;
+    engine.export_job(JobId(501)).await.unwrap();
+    assert_eq!(
+        engine.snapshot().jobs[0]
+            .repair_progress
+            .as_ref()
+            .unwrap()
+            .attempt_id,
+        "new"
+    );
+    let mut job = engine.export_job(JobId(501)).await.unwrap().unwrap();
+    job.params
+        .push((nzbd_types::PP_DONE_PARAM.into(), "SUCCESS".into()));
+    engine.import_job(job, false, false).await.unwrap();
+    assert!(engine.snapshot().jobs[0].repair_progress.is_none());
+    let wire = serde_json::to_value(&engine.snapshot().jobs[0]).unwrap();
+    assert!(
+        wire.get("repair_progress").is_none(),
+        "old clients need no new field when idle"
+    );
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn mirrored_repair_progress_is_optional_node_fenced_and_cleared_on_replacement() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(temp.path(), vec![]).await;
+    engine
+        .import_job(
+            transfer_job(502, "remote-progress", JobStatus::Completed),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    engine
+        .set_delegated(JobId(502), Some("worker-a".into()))
+        .await
+        .unwrap();
+    let repair = nzbd_engine::RepairProgress {
+        attempt_id: "lease-a:1".into(),
+        phase: nzbd_engine::RepairPhase::Matching,
+        files_done: 1,
+        files_total: 3,
+        bytes_scanned: 65536,
+        round: 0,
+        recovery_blocks_available: 4,
+        additional_blocks_needed: None,
+        last_progress_at: 1000,
+    };
+    let stats = MirrorStats {
+        repair_progress: Some(repair),
+        health: 1000,
+        ..Default::default()
+    };
+    engine.mirror_progress_from(JobId(502), "worker-a".into(), stats.clone());
+    engine.export_job(JobId(502)).await.unwrap();
+    assert_eq!(
+        engine.snapshot().jobs[0]
+            .repair_progress
+            .as_ref()
+            .unwrap()
+            .bytes_scanned,
+        65536
+    );
+    engine
+        .set_delegated(JobId(502), Some("worker-b".into()))
+        .await
+        .unwrap();
+    engine.mirror_progress_from(JobId(502), "worker-a".into(), stats.clone());
+    engine.export_job(JobId(502)).await.unwrap();
+    assert!(engine.snapshot().jobs[0].repair_progress.is_none());
+    engine.mirror_progress_from(JobId(502), "worker-b".into(), stats);
+    engine.export_job(JobId(502)).await.unwrap();
+    assert!(engine.snapshot().jobs[0].repair_progress.is_some());
+    engine.mirror_progress_from(JobId(502), "worker-b".into(), MirrorStats::default());
+    engine.export_job(JobId(502)).await.unwrap();
+    assert!(engine.snapshot().jobs[0].repair_progress.is_none());
+    engine.shutdown().await;
 }

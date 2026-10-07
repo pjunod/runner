@@ -24,11 +24,14 @@ const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
 
 fn head(path: &Path, n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
-    let Ok(mut f) = std::fs::File::open(path) else {
+    let Ok(mut f) = nzbd_state::fileops::open(path) else {
         return Vec::new();
     };
     let mut read = 0;
     while read < n {
+        if crate::attempt::checkpoint().is_err() {
+            break;
+        }
         match f.read(&mut buf[read..]) {
             Ok(0) => break,
             Ok(k) => read += k,
@@ -55,14 +58,25 @@ fn files_of(dir: &Path) -> Vec<PathBuf> {
 
 pub(crate) fn full_md5(path: &Path) -> Option<[u8; 16]> {
     let mut file = nzbd_state::fileops::open(path).ok()?;
+    let before = crate::fingerprint::FileStamp::of(&file.metadata().ok()?);
+    let mut read_bytes = 0;
     let mut digest = Md5::new();
     let mut buf = [0; 65536];
     loop {
+        crate::attempt::checkpoint().ok()?;
         let n = file.read(&mut buf).ok()?;
+        crate::attempt::scanned(n as u64);
         if n == 0 {
             break;
         }
+        read_bytes += n as u64;
         digest.update(&buf[..n]);
+    }
+    if read_bytes != before.length
+        || crate::fingerprint::FileStamp::of(&file.metadata().ok()?) != before
+        || crate::fingerprint::stamp(path).ok()? != before
+    {
+        return None;
     }
     Some(digest.finalize().into())
 }
@@ -102,6 +116,7 @@ pub(crate) fn rename_owned(
     to: PathBuf,
     custody: Custody<'_>,
 ) -> Result<Option<(PathBuf, PathBuf)>, PostError> {
+    crate::attempt::checkpoint()?;
     if from == to {
         return Ok(None);
     }
@@ -129,6 +144,7 @@ pub fn par_rename_owned(
 
     // 1. Give obfuscated par2 files their extension back (by magic).
     for p in files_of(dir) {
+        crate::attempt::checkpoint()?;
         if !ext_is(&p, "par2") && head(&p, 8) == PAR2_MAGIC {
             let to = dir.join(format!(
                 "{}.par2",
@@ -157,11 +173,12 @@ pub fn par_rename_owned(
             let Some(catalog) = wanted.get(&hash) else {
                 continue;
             };
+            let full = full_md5(&p);
             let matches: Vec<_> = catalog
                 .iter()
                 .filter(|f| {
                     std::fs::metadata(&p).is_ok_and(|m| m.len() == f.length)
-                        && full_md5(&p) == Some(f.md5_full)
+                        && full == Some(f.md5_full)
                 })
                 .collect();
             if matches.len() != 1 {
@@ -176,6 +193,7 @@ pub fn par_rename_owned(
                 continue;
             }
             create_parents(&set.root, target.parent().unwrap())?;
+            crate::attempt::checkpoint()?;
             if let Some((inventory, job)) = custody {
                 inventory.restore_file(job, &p, &target).map_err(|e| {
                     PostError::Subprocess(format!(

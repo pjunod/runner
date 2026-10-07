@@ -30,7 +30,7 @@ not the current fleet.
 | Working filesystem | Container `/processing/` maps to host `/mnt/processing`, GlusterFS FUSE. It is used for state and other configured roles. The claim that Runner does not use it was wrong. |
 | Completed filesystem | Container `/working` maps to host `/mnt/qnap/working`, NFS 4.1. Completed setting is `/working/monarr/completed`. |
 | Filesystem primitives | Reviews report `RENAME_NOREPLACE` returns `EINVAL` on both mounts; hard links and exclusive `mkdir` work and refuse existing targets. |
-| Path configuration | `main_dir=/processing/`, `dest_dir=/working/monarr/completed`, `inter_dir` empty. Empty `InterDir` means download to `DestDir` under the NZBGet contract; do not invent a `MainDir` fallback. |
+| Path configuration | `main_dir=/processing/`, `dest_dir=/working/monarr/completed`, `inter_dir` empty. Empty `InterDir` used `DestDir` in the inspected deployment. The October 6 approved fallback below supersedes that behavior for new allocations. |
 | Job 1703 | Six directly posted Matroska files plus an extensionless PAR2 index; no unpack stage. The index has exact episode filenames. Calling these extracted media was incorrect. |
 | Job 1704 | Downloaded at 21:39–21:40 UTC, then failed at 21:40:52 UTC during extraction fallback. Distinct random stems retain `.rar`/`.rNN` extensions. |
 
@@ -131,7 +131,7 @@ for this version.
 | PP exception retry | Existing PP restart action admits a quiescent, revision-checked known PP failure after custody validation. Identity, deletion, unresolved relocation and uncertain script execution remain explicit conflicts. |
 | Relocation abandonment | UI names the pending operation. Queue owner checks quiescence; inventory checks revision, generation and source manifest before cancelling it. Original and residual copies retain explicit custody. Verified publication must reconcile, not be abandoned. |
 | Select all / cancelled recovery | Manifest-wide select-all checks revision across pages; selected count and clear action. Terminal handoffs are opt-in history. |
-| D6 configured intermediate root | Explicit nonempty `inter_dir` drives download allocation; `dest_dir` or category destination receives successful publication before scripts. Empty intermediate retains the established destination behavior. Recorded custody locates existing payloads across settings changes. |
+| D6 configured intermediate root | Explicit nonempty `inter_dir` drives download allocation; `dest_dir` or category destination receives successful publication before scripts. The October 1 implementation kept empty intermediate values in the destination. The October 6 approved fallback uses `main_dir`; recorded custody still locates existing payloads across settings changes. |
 
 No mount-specific paths, new feature flags, or periodic retry watchdogs were
 added. Existing operation reconciliation owns interrupted transitions.
@@ -179,8 +179,14 @@ reserves completion for PP completion, and the
 requires a completed status with a nonempty payload path before automatic import.
 This verifies source behavior, not the deployed Curator revision. Manual imports
 or third-party watchers of directory existence do not provide that contract.
-The empty-intermediate configuration already exposes downloads within DestDir;
-operators needing a distinct download area use the existing InterDir setting.
+
+**Storage contract update (2026-10-06):** the user approved absent/empty
+`inter_dir` defaulting directly to expanded `main_dir`. The earlier deployment
+behavior described above exposed downloads within `DestDir`; it is superseded
+for new allocations by this fallback change. Nonempty `inter_dir` remains an
+explicit processing-root override. Successful global/category publication and
+existing recorded custody paths remain unchanged. See
+[CONFIGURATION.md](CONFIGURATION.md#usenet-download-and-completion-paths).
 
 ## 5. Recovery transitions
 

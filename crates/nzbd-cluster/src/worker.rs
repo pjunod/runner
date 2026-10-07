@@ -148,6 +148,7 @@ fn progress_of(engine: &EngineHandle, job: JobId) -> MirrorStats {
         .iter()
         .find(|j| j.id == job)
         .map(|j| MirrorStats {
+            repair_progress: j.repair_progress.clone(),
             done_articles: j.done_articles,
             failed_articles: j.failed_articles,
             downloaded_bytes: j.downloaded_bytes,
@@ -156,6 +157,58 @@ fn progress_of(engine: &EngineHandle, job: JobId) -> MirrorStats {
             stages: j.stages.clone(),
         })
         .unwrap_or_default()
+}
+
+/// Accepted immutable completion is durably recorded before the worker
+/// forgets its lease/job. A rejected or timestamp-less response preserves scratch.
+async fn accept_worker_retirement(
+    engine: &EngineHandle,
+    request: &CompleteRequest,
+    response: &CompleteResponse,
+) -> Result<(), String> {
+    if !response.ok {
+        return Err("authority did not accept completion".into());
+    }
+    let source = request
+        .job
+        .params
+        .iter()
+        .find(|(key, _)| key == "Artifact:Id")
+        .map(|(_, value)| value.clone());
+    let generation = request
+        .job
+        .params
+        .iter()
+        .find(|(key, _)| key == "Artifact:Generation")
+        .map(|(_, value)| value.clone());
+    let (Some(artifact), Some(generation)) = (source, generation) else {
+        return Ok(());
+    };
+    let accepted_at_ms = response
+        .accepted_at_unix_ms
+        .ok_or("authority acceptance timestamp missing")?;
+    let outcome = request
+        .job
+        .params
+        .iter()
+        .find(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+        .map(|(_, value)| value.clone())
+        .ok_or("accepted job lacks terminal PP outcome")?;
+    let source = nzbd_state::artifacts::SourceGeneration {
+        artifact,
+        generation,
+    };
+    let proof = nzbd_state::artifacts::FinalizationProof::Cluster {
+        receipt: request.receipt_id.clone(),
+        accepted_at_ms,
+    };
+    let inventory = engine.artifacts();
+    tokio::task::spawn_blocking(move || {
+        inventory.accept_cluster_completion(&source, &outcome, proof)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }
 
 async fn heartbeat_and_cancel(
@@ -349,6 +402,12 @@ async fn report_completions(
                         continue;
                     }
                 }
+                if lease.kind == LeaseKind::Post {
+                    if let Err(error) = accept_worker_retirement(engine, &req, &resp).await {
+                        tracing::warn!(job=job_id.0,%error,"remote workspace retirement awaits durable acceptance recording");
+                        continue;
+                    }
+                }
                 tracing::info!(job = job_id.0, %lease_id, "completion handed to leader");
                 active.lock().unwrap().remove(&lease_id);
                 let _ = engine.remove_job_silent(job_id).await;
@@ -538,8 +597,13 @@ async fn poll_for_work(
                     )
                     .await;
                 }
-                if let Err(error) =
-                    prepare_pp_attempt(dest_dir, &mut grant.job, grant.token.fence).await
+                if let Err(error) = prepare_pp_attempt(
+                    engine.artifacts(),
+                    dest_dir,
+                    &mut grant.job,
+                    grant.token.fence,
+                )
+                .await
                 {
                     tracing::warn!(job = job_id.0, %error, "private PP attempt could not be prepared");
                     reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
@@ -772,6 +836,8 @@ fn run_pp_lease(
             }
         });
         let ctx = PpCtx {
+            cancel: initial.cancel.child_token(),
+            workers: TaskTracker::new(),
             tag: lease_id.clone(),
             publish_history: false,
             script_receipt: Some(script_receipt),
@@ -800,6 +866,7 @@ fn run_pp_lease(
             _ = pp_cancel.cancelled() => Err(nzbd_post::PostError::Subprocess("PP lease authority expired".into())),
             result = process_job_ctx(&engine, &setup.post, &setup.history, &dest_dir, job_id, &ctx) => result,
         };
+        ctx.cancel.cancel(); ctx.workers.close(); ctx.workers.wait().await;
         match result {
             Ok(outcome) => {
                 tracing::info!(job = job_id.0, lease = %lease_id, outcome = outcome.as_str(), "pp lease finished");
@@ -819,6 +886,7 @@ fn run_pp_lease(
 }
 
 async fn prepare_pp_attempt(
+    inventory: Arc<nzbd_state::artifacts::Inventory>,
     dest_dir: &std::path::Path,
     job: &mut nzbd_types::Job,
     fence: u64,
@@ -837,34 +905,34 @@ async fn prepare_pp_attempt(
         .saturating_add(64 * 1024 * 1024);
     let source_for_copy = source.clone();
     let target_for_copy = target.clone();
+    let job_id = job.id.0;
     tokio::task::spawn_blocking(move || {
-        if target_for_copy.exists() {
-            return Ok::<(), String>(());
-        }
         let parent = target_for_copy
             .parent()
             .ok_or_else(|| "private PP target has no parent".to_owned())?;
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("create private PP parent: {error}"))?;
-        let building = parent.join(format!(".building-fence-{fence}"));
-        if building.exists() {
-            std::fs::remove_dir_all(&building)
-                .map_err(|error| format!("remove abandoned PP build: {error}"))?;
-        }
-        std::fs::create_dir(&building)
-            .map_err(|error| format!("create private PP build: {error}"))?;
+        let artifact = inventory
+            .allocate_processing_successor(job_id, parent, &target_for_copy)
+            .map_err(|error| format!("allocate owned private PP input: {error}"))?;
+        // The actual copy worker retains custody even if its async caller drops.
+        let _use_guard = inventory
+            .acquire_attempt_use(job_id)
+            .map_err(|error| format!("acquire private PP copy custody: {error}"))?;
+
         let mut bytes = 0;
         let mut files = Vec::new();
-        copy_generation_tree(
+        if let Err(error) = copy_generation_tree(
             &source_for_copy,
-            &building,
+            &target_for_copy,
             std::path::Path::new(""),
             limit,
             &mut bytes,
             &mut files,
-        )?;
-        std::fs::rename(&building, &target_for_copy)
-            .map_err(|error| format!("publish private PP input: {error}"))?;
+        ) {
+            let _ = inventory.note_error(&artifact.id, &error);
+            return Err(error);
+        }
         Ok::<(), String>(())
     })
     .await
@@ -1317,7 +1385,30 @@ mod tests {
             .await
             .unwrap());
 
+        engine
+            .register_repair_attempt(JobId(77), "transition-lease:1".into())
+            .await
+            .unwrap();
+        let repair = nzbd_engine::RepairProgress {
+            attempt_id: "transition-lease:1".into(),
+            phase: nzbd_engine::RepairPhase::Matching,
+            files_done: 1,
+            files_total: 2,
+            bytes_scanned: 65536,
+            round: 0,
+            recovery_blocks_available: 3,
+            additional_blocks_needed: Some(1),
+            last_progress_at: 1000,
+        };
+        engine.update_repair_progress(JobId(77), repair).await;
+        engine.export_job(JobId(77)).await.unwrap();
         let progress = progress_of(&engine, JobId(77));
+        assert_eq!(
+            progress.repair_progress.as_ref().unwrap().bytes_scanned,
+            65536
+        );
+        let old: MirrorStats = serde_json::from_value(serde_json::json!({"done_articles":0,"failed_articles":0,"downloaded_bytes":0,"health":1000})).unwrap();
+        assert!(old.repair_progress.is_none());
         assert_eq!(progress.remaining_bytes, Some(0));
         assert_eq!(progress.stages.len(), 1);
         assert_eq!(progress.stages[0].stage, PostStage::ParVerify);
@@ -1489,6 +1580,70 @@ mod tests {
         tracker.close();
         tracker.wait().await;
         server.abort();
+        engine.shutdown().await;
+    }
+    #[tokio::test]
+    async fn retirement_requires_authority_acceptance_and_replays_durably() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("dest");
+        std::fs::create_dir(&root).unwrap();
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            temp.path().join("state"),
+            root.clone(),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let source = engine
+            .artifacts()
+            .allocate(77, &root, &root.join("transition"))
+            .unwrap();
+        std::fs::write(source.path.join("payload"), b"owned").unwrap();
+        let workspace = engine
+            .artifacts()
+            .workspace(77, "par_repair", "abc")
+            .unwrap();
+        std::fs::write(workspace.scratch.path.join("temporary"), b"scratch").unwrap();
+        engine.artifacts().finish_workspace(&workspace).unwrap();
+        let mut job = queued_test_job();
+        job.status = JobStatus::Completed;
+        job.params.extend([
+            ("Artifact:Id".into(), source.id.clone()),
+            ("Artifact:Generation".into(), source.generation.clone()),
+            (nzbd_types::PP_DONE_PARAM.into(), "SUCCESS".into()),
+        ]);
+        let request = CompleteRequest {
+            node: "worker".into(),
+            lease_id: "transition-lease".into(),
+            token: test_token(),
+            expected_job_revision: 1,
+            result_id: "result".into(),
+            result_ref: "/private/result".into(),
+            receipt_id: "accepted-receipt".into(),
+            job,
+        };
+        let mut response = CompleteResponse {
+            final_dir: None,
+            ok: false,
+            durable_receipt: None,
+            accepted_at_unix_ms: Some(10),
+            history_recorded_by_authority: true,
+        };
+        assert!(accept_worker_retirement(&engine, &request, &response)
+            .await
+            .is_err());
+        assert!(workspace.scratch.path.exists());
+        response.ok = true;
+        accept_worker_retirement(&engine, &request, &response)
+            .await
+            .unwrap();
+        assert!(!workspace.scratch.path.exists());
+        assert!(source.path.join("payload").exists());
+        accept_worker_retirement(&engine, &request, &response)
+            .await
+            .unwrap();
         engine.shutdown().await;
     }
 }

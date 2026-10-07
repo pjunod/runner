@@ -70,6 +70,7 @@ pub fn equal_files(a: &Path, b: &Path) -> io::Result<bool> {
     let mut x = [0; 65536];
     let mut y = [0; 65536];
     loop {
+        crate::attempt::checkpoint()?;
         let n = a.read(&mut x)?;
         b.read_exact(&mut y[..n])?;
         if x[..n] != y[..n] {

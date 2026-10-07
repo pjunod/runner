@@ -8,8 +8,34 @@ use nzbd_types::{JobId, JobKind, JobStatus, StageSpan};
 use serde::Serialize;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairPhase {
+    Matching,
+    Preparing,
+    Verifying,
+    FetchingRecovery,
+    Reconstructing,
+    Validating,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RepairProgress {
+    pub attempt_id: String,
+    pub phase: RepairPhase,
+    pub files_done: u32,
+    pub files_total: u32,
+    pub bytes_scanned: u64,
+    pub round: u32,
+    pub recovery_blocks_available: u32,
+    pub additional_blocks_needed: Option<u32>,
+    pub last_progress_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct JobSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair_progress: Option<RepairProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control: Option<nzbd_types::JobControl>,
     pub id: JobId,
@@ -193,6 +219,7 @@ mod mobile_queue_contract_tests {
             let input = &fixture["job"];
             // Construct the actual engine DTO, rather than adding Deserialize to it.
             let summary = JobSummary {
+                repair_progress: None,
                 control: None,
                 id: serde_json::from_value(input["id"].clone()).unwrap(),
                 kind: serde_json::from_value(input["kind"].clone()).unwrap(),

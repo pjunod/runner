@@ -101,14 +101,24 @@ pub fn link(source: &Path, target: &Path) -> Result<()> {
 }
 
 pub fn copy_publish(source: &Path, target: &Path) -> Result<()> {
+    copy_publish_checked(source, target, &|| Ok(()))
+}
+
+/// Cooperative copy: the caller must await the worker before retiring custody.
+pub fn copy_publish_checked(
+    source: &Path,
+    target: &Path,
+    checkpoint: &dyn Fn() -> std::io::Result<()>,
+) -> Result<()> {
     use sha2::{Digest, Sha256};
-    use std::io::{Read, Seek};
+    use std::io::{Read, Seek, Write};
     let mut input = open(source)?;
     let identity = fs::identity(&input.metadata()?);
     let hash = |file: &mut File| -> Result<Vec<u8>> {
         let mut h = Sha256::new();
         let mut buf = [0; 65536];
         loop {
+            checkpoint()?;
             let n = file.read(&mut buf)?;
             if n == 0 {
                 break;
@@ -171,7 +181,15 @@ pub fn copy_publish(source: &Path, target: &Path) -> Result<()> {
             previous
         } else {
             let mut output = unsafe { File::from_raw_fd(fd) };
-            std::io::copy(&mut input, &mut output)?;
+            let mut buffer = [0; 65536];
+            loop {
+                checkpoint()?;
+                let n = input.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                output.write_all(&buffer[..n])?;
+            }
             output.sync_all()?;
             output.rewind()?;
             output
@@ -179,6 +197,7 @@ pub fn copy_publish(source: &Path, target: &Path) -> Result<()> {
         if hash(&mut output)? != expected || fs::identity(&input.metadata()?) != identity {
             return Err(Error::Conflict("publication source or copy changed".into()));
         }
+        checkpoint()?;
         if unsafe {
             libc::linkat(
                 parent.as_raw_fd(),

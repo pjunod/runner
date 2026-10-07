@@ -45,6 +45,8 @@ pub struct Scan {
     pub crcs: Vec<([u8; 16], Vec<u32>)>,
     /// Recovery-slice exponents seen, for counting recovery blocks.
     pub exponents: Vec<u32>,
+    /// Validated recovery payload lengths, excluding the exponent.
+    pub recovery_sizes: Vec<(u32, u64)>,
 }
 
 impl Scan {
@@ -136,6 +138,7 @@ pub fn scan(bytes: &[u8]) -> Scan {
                 let e = u32::from_le_bytes(body[0..4].try_into().unwrap());
                 if !out.exponents.contains(&e) {
                     out.exponents.push(e);
+                    out.recovery_sizes.push((e, body.len() as u64 - 4));
                 }
             }
             _ => {}
@@ -143,6 +146,123 @@ pub fn scan(bytes: &[u8]) -> Scan {
         pos += len;
     }
     out
+}
+
+/// Strict streaming discovery for complete, quiescent recovery inputs.
+/// Recovery bodies use 64 KiB of storage; metadata is capped at 64 MiB per
+/// file. The callback runs between reads and can cancel blocking discovery.
+pub fn scan_reader(
+    input: &mut impl std::io::Read,
+    checkpoint: &dyn Fn() -> std::io::Result<()>,
+) -> std::io::Result<Scan> {
+    use md5::{Digest, Md5};
+    let mut out = Scan::default();
+    let mut recovery_seen = std::collections::HashMap::new();
+    let mut metadata_bytes = 0u64;
+    loop {
+        checkpoint()?;
+        let mut header = [0; 64];
+        let n = input.read(&mut header[..1])?;
+        if n == 0 {
+            break;
+        }
+        input.read_exact(&mut header[1..])?;
+        let len = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        if &header[..8] != MAGIC || len < 64 || !len.is_multiple_of(4) {
+            out.invalid = true;
+            break;
+        }
+        let set: [u8; 16] = header[32..48].try_into().unwrap();
+        if out.set_id.is_some_and(|id| id != set) {
+            out.invalid = true;
+            break;
+        }
+        out.set_id = Some(set);
+        let recovery = &header[48..64] == b"PAR 2.0\0RecvSlic";
+        if !recovery {
+            metadata_bytes = metadata_bytes.saturating_add(len);
+            if metadata_bytes > 64 * 1024 * 1024 {
+                return Err(std::io::Error::other("PAR metadata size limit"));
+            }
+        }
+        let mut hash = Md5::new();
+        hash.update(&header[32..]);
+        let mut packet = if recovery {
+            Vec::new()
+        } else {
+            header.to_vec()
+        };
+        let mut exponent = [0; 4];
+        let mut offset = 0u64;
+        let mut remaining = len - 64;
+        let mut buffer = [0; 65536];
+        while remaining > 0 {
+            checkpoint()?;
+            let n = remaining.min(buffer.len() as u64) as usize;
+            input.read_exact(&mut buffer[..n])?;
+            hash.update(&buffer[..n]);
+            if recovery && offset == 0 && n >= 4 {
+                exponent.copy_from_slice(&buffer[..4]);
+            }
+            if !recovery {
+                packet.extend_from_slice(&buffer[..n]);
+            }
+            remaining -= n as u64;
+            offset += n as u64;
+        }
+        if hash.finalize().as_slice() != &header[16..32] || (recovery && len < 68) {
+            out.invalid = true;
+            break;
+        }
+        if recovery {
+            let e = u32::from_le_bytes(exponent);
+            if recovery_seen.get(&e).is_some_and(|size| *size != len - 68) {
+                out.invalid = true;
+                break;
+            }
+            if let std::collections::hash_map::Entry::Vacant(entry) = recovery_seen.entry(e) {
+                metadata_bytes = metadata_bytes.saturating_add(64);
+                if metadata_bytes > 64 * 1024 * 1024 {
+                    return Err(std::io::Error::other("PAR recovery metadata size limit"));
+                }
+                entry.insert(len - 68);
+                out.exponents.push(e);
+                out.recovery_sizes.push((e, len - 68));
+            }
+        } else {
+            let parsed = scan(&packet);
+            if parsed.slice_size > 0 {
+                if out.slice_size != 0 && out.slice_size != parsed.slice_size {
+                    out.invalid = true;
+                    break;
+                }
+                out.slice_size = parsed.slice_size;
+            }
+            for desc in parsed.descs {
+                if out.descs.iter().any(|d| d.id == desc.id && d != &desc) {
+                    out.invalid = true;
+                    break;
+                }
+                if !out.descs.iter().any(|d| d.id == desc.id) {
+                    out.descs.push(desc);
+                }
+            }
+            for (id, crcs) in parsed.crcs {
+                if out
+                    .crcs
+                    .iter()
+                    .any(|(key, previous)| *key == id && previous != &crcs)
+                {
+                    out.invalid = true;
+                    break;
+                }
+                if !out.crcs.iter().any(|(key, _)| *key == id) {
+                    out.crcs.push((id, crcs));
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -239,5 +359,71 @@ mod tests {
         let mut f = filedesc(7, "Movie.mkv", 10);
         f.extend(filedesc(7, "Movie.mkv", 10));
         assert_eq!(scan(&f).descs.len(), 1);
+    }
+    #[test]
+    fn streaming_matches_packet_evidence_and_rejects_corruption() {
+        let mut bytes = filedesc(1, "-file with spaces.bin", 120);
+        bytes.extend(packet(b"PAR 2.0\0RecvSlic", &[2, 0, 0, 0, 9, 8, 7, 6]));
+        let memory = scan(&bytes);
+        let stream = scan_reader(&mut &bytes[..], &|| Ok(())).unwrap();
+        assert_eq!(stream.descs, memory.descs);
+        assert_eq!(stream.recovery_sizes, memory.recovery_sizes);
+        assert_eq!(stream.exponents, memory.exponents);
+        let mut corrupted = bytes.clone();
+        *corrupted.last_mut().unwrap() ^= 1;
+        assert!(
+            scan_reader(&mut &corrupted[..], &|| Ok(()))
+                .unwrap()
+                .invalid
+        );
+        assert!(scan_reader(&mut &bytes[..bytes.len() - 1], &|| Ok(())).is_err());
+        let mut mixed = packet(b"PAR 2.0\0RecvSlic", &[3, 0, 0, 0]);
+        mixed[32] = 1;
+        use md5::{Digest, Md5};
+        let digest = Md5::digest(&mixed[32..]);
+        mixed[16..32].copy_from_slice(&digest);
+        bytes.extend(mixed);
+        assert!(scan_reader(&mut &bytes[..], &|| Ok(())).unwrap().invalid);
+    }
+    #[test]
+    fn streaming_large_recovery_uses_bounded_reads_and_cooperative_cancellation() {
+        use md5::{Digest, Md5};
+        use std::io::Read;
+        let length = 65 * 1024 * 1024u64;
+        let mut header = [0; 64];
+        header[..8].copy_from_slice(MAGIC);
+        header[8..16].copy_from_slice(&(68 + length).to_le_bytes());
+        header[48..64].copy_from_slice(b"PAR 2.0\0RecvSlic");
+        let mut hash = Md5::new();
+        hash.update(&header[32..]);
+        hash.update([0; 4]);
+        let zeros = [0; 65536];
+        for _ in 0..length / 65536 {
+            hash.update(zeros);
+        }
+        header[16..32].copy_from_slice(&hash.finalize());
+        struct Bounded<R>(R);
+        impl<R: Read> Read for Bounded<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                assert!(buffer.len() <= 65536);
+                self.0.read(buffer)
+            }
+        }
+        let reader = std::io::Cursor::new(header).chain(std::io::repeat(0).take(length + 4));
+        let scan = scan_reader(&mut Bounded(reader), &|| Ok(())).unwrap();
+        assert!(!scan.invalid);
+        assert_eq!(scan.recovery_sizes, vec![(0, length)]);
+        let mut reader = std::io::Cursor::new(header).chain(std::io::repeat(0).take(length + 4));
+        let checks = std::cell::Cell::new(0);
+        let error = scan_reader(&mut reader, &|| {
+            checks.set(checks.get() + 1);
+            if checks.get() > 3 {
+                Err(std::io::ErrorKind::Interrupted.into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
     }
 }

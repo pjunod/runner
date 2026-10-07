@@ -33,6 +33,9 @@ pub struct Par2Set {
     pub files: Vec<Par2File>,
     /// Distinct recovery blocks present across the parsed .par2 files.
     pub recovery_blocks: u32,
+    pub recovery_exponents: BTreeSet<u32>,
+    /// Descriptor identities retained with the validated packet metadata.
+    pub input_stamps: HashMap<PathBuf, crate::FileStamp>,
     /// The "main" par2 file (smallest, index packets) for subprocess calls.
     pub main_path: Option<PathBuf>,
 }
@@ -54,61 +57,210 @@ pub fn load_dir(dir: &Path) -> Result<Option<Par2Set>, PostError> {
     Ok(sets.pop())
 }
 
+#[derive(Default)]
+pub(crate) struct DiscoveryCache {
+    files: HashMap<
+        PathBuf,
+        (
+            crate::fingerprint::FileStamp,
+            std::sync::Arc<nzbd_par2::Scan>,
+        ),
+    >,
+    metadata_bytes: usize,
+}
+
 pub fn load_sets(dir: &Path) -> Result<Vec<Par2Set>, PostError> {
-    let mut groups: std::collections::BTreeMap<[u8; 16], Vec<PathBuf>> = Default::default();
+    load_sets_checked(dir, &crate::attempt::checkpoint)
+}
+pub(crate) fn load_sets_checked(
+    dir: &Path,
+    checkpoint: &dyn Fn() -> std::io::Result<()>,
+) -> Result<Vec<Par2Set>, PostError> {
+    if let Some(control) = crate::attempt::current() {
+        discover(
+            dir,
+            checkpoint,
+            &mut control.par_cache.lock().unwrap(),
+            false,
+        )
+        .map(|(sets, _)| sets)
+    } else {
+        discover(dir, checkpoint, &mut DiscoveryCache::default(), false).map(|(sets, _)| sets)
+    }
+}
+pub(crate) fn load_recovery_sets(dir: &Path) -> Result<(Vec<Par2Set>, Vec<String>), PostError> {
+    if let Some(control) = crate::attempt::current() {
+        discover(
+            dir,
+            &crate::attempt::checkpoint,
+            &mut control.par_cache.lock().unwrap(),
+            true,
+        )
+    } else {
+        discover(
+            dir,
+            &crate::attempt::checkpoint,
+            &mut DiscoveryCache::default(),
+            true,
+        )
+    }
+}
+fn metadata_cost(scan: &nzbd_par2::Scan) -> usize {
+    scan.descs
+        .iter()
+        .map(|d| d.name.len() + std::mem::size_of::<nzbd_par2::FileDesc>())
+        .sum::<usize>()
+        + scan
+            .crcs
+            .iter()
+            .map(|(_, crc)| crc.len() * 4 + 40)
+            .sum::<usize>()
+        + scan.exponents.len() * 16
+        + 128
+}
+fn discover(
+    dir: &Path,
+    checkpoint: &dyn Fn() -> std::io::Result<()>,
+    cache: &mut DiscoveryCache,
+    tolerate_invalid: bool,
+) -> Result<(Vec<Par2Set>, Vec<String>), PostError> {
+    let mut groups: std::collections::BTreeMap<
+        [u8; 16],
+        Vec<(PathBuf, std::sync::Arc<nzbd_par2::Scan>)>,
+    > = Default::default();
+    let mut rejected = Vec::new();
     for path in crate::namespace::files(dir)? {
-        if !path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("par2"))
-        {
-            let mut input = nzbd_state::fileops::open(&path).map_err(|e| {
-                PostError::Subprocess(format!("PAR discovery {}: {e}", path.display()))
-            })?;
-            let mut signature = [0; 8];
-            let is_par = match input.read_exact(&mut signature) {
-                Ok(()) => &signature == b"PAR2\0PKT",
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => false,
-                Err(e) => return Err(e.into()),
-            };
-            if !is_par {
-                continue;
+        checkpoint()?;
+        let parsed = (|| -> Result<Option<std::sync::Arc<nzbd_par2::Scan>>, PostError> {
+            let mut input = nzbd_state::fileops::open(&path)
+                .map_err(|e| PostError::Subprocess(e.to_string()))?;
+            let before = crate::fingerprint::FileStamp::of(&input.metadata()?);
+            if let Some((stamp, scan)) = cache.files.get(&path) {
+                if *stamp == before {
+                    return Ok(Some(scan.clone()));
+                }
             }
-        }
-        if std::fs::metadata(&path)?.len() > 64 * 1024 * 1024 {
-            return Err(PostError::Subprocess("PAR metadata size limit".into()));
-        }
-        let scan = nzbd_par2::scan(&std::fs::read(&path)?);
-        if scan.invalid {
-            return Err(PostError::Subprocess(
-                "invalid PAR packet digest or mixed set".into(),
-            ));
-        }
-        if let Some(set_id) = scan.set_id {
-            groups.entry(set_id).or_default().push(path);
+            if !path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("par2"))
+            {
+                let mut signature = [0; 8];
+                match input.read_exact(&mut signature) {
+                    Ok(()) if &signature == b"PAR2\0PKT" => {}
+                    Ok(()) => return Ok(None),
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        return Ok(None)
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                use std::io::Seek;
+                input.rewind()?;
+            }
+            let mut input = crate::fingerprint::ProgressReader(input);
+            let scan = nzbd_par2::scan_reader(&mut input, checkpoint)?;
+            if scan.invalid || scan.set_id.is_none() {
+                return Err(PostError::Subprocess(
+                    "invalid PAR packet digest, magic or mixed set".into(),
+                ));
+            }
+            if before != crate::fingerprint::FileStamp::of(&input.0.metadata()?)
+                || crate::fingerprint::stamp(&path)? != before
+            {
+                return Err(PostError::Subprocess(
+                    "PAR input identity changed during discovery".into(),
+                ));
+            }
+            let scan = std::sync::Arc::new(scan);
+            let old_cost = cache
+                .files
+                .get(&path)
+                .map_or(0, |(_, scan)| metadata_cost(scan) + path.as_os_str().len());
+            let cost = metadata_cost(&scan) + path.as_os_str().len();
+            let next = cache
+                .metadata_bytes
+                .saturating_sub(old_cost)
+                .saturating_add(cost);
+            if next > 64 * 1024 * 1024 {
+                return Err(PostError::Subprocess(
+                    "PAR discovery cache metadata exceeds 64 MiB".into(),
+                ));
+            }
+            cache.metadata_bytes = next;
+            cache.files.insert(path.clone(), (before, scan.clone()));
+            Ok(Some(scan))
+        })();
+        match parsed {
+            Ok(Some(scan)) => {
+                groups
+                    .entry(scan.set_id.unwrap())
+                    .or_default()
+                    .push((path, scan));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                checkpoint()?;
+                if !tolerate_invalid {
+                    return Err(error);
+                }
+                rejected.push(format!("{}: {error}", path.display()));
+            }
         }
     }
     let mut sets = Vec::new();
     for (set_id, paths) in groups {
         let root = paths
             .first()
-            .and_then(|p| p.parent())
+            .and_then(|(p, _)| p.parent())
             .unwrap_or(dir)
             .to_path_buf();
-        if paths.iter().any(|p| p.parent() != Some(root.as_path())) {
+        if paths
+            .iter()
+            .any(|(path, _)| path.parent() != Some(root.as_path()))
+        {
             return Err(PostError::Subprocess(
                 "PAR set spans multiple catalog roots; review required".into(),
             ));
         }
-        if let Some(mut set) = load_one(&root, paths)? {
+        let accepted = if tolerate_invalid {
+            let mut accepted = Vec::new();
+            // Catalog-bearing packets establish slice length before bare volumes.
+            let mut paths = paths;
+            paths.sort_by_key(|(_, scan)| !scan.has_descs());
+            for (path, scan) in paths {
+                let mut trial = accepted.clone();
+                trial.push((path.clone(), scan.clone()));
+                match load_one(&root, trial) {
+                    Ok(_) => accepted.push((path, scan)),
+                    Err(error) => rejected.push(format!("{}: {error}", path.display())),
+                }
+            }
+            accepted
+        } else {
+            paths
+        };
+        let stamps = accepted
+            .iter()
+            .filter_map(|(path, _)| {
+                cache
+                    .files
+                    .get(path)
+                    .map(|(stamp, _)| (path.clone(), stamp.clone()))
+            })
+            .collect();
+        if let Some(mut set) = load_one(&root, accepted)? {
+            set.input_stamps = stamps;
             set.set_id = set_id;
             sets.push(set);
         }
     }
-    Ok(sets)
+    Ok((sets, rejected))
 }
 
-fn load_one(dir: &Path, mut par_files: Vec<PathBuf>) -> Result<Option<Par2Set>, PostError> {
-    par_files.sort();
+fn load_one(
+    dir: &Path,
+    mut par_files: Vec<(PathBuf, std::sync::Arc<nzbd_par2::Scan>)>,
+) -> Result<Option<Par2Set>, PostError> {
+    par_files.sort_by(|a, b| a.0.cmp(&b.0));
     let mut slice_size = 0u64;
     type Description = (String, u64, [u8; 16], [u8; 16]);
     let mut descs: HashMap<[u8; 16], Description> = HashMap::new();
@@ -118,36 +270,57 @@ fn load_one(dir: &Path, mut par_files: Vec<PathBuf>) -> Result<Option<Par2Set>, 
     let mut main_path: Option<PathBuf> = None;
     let mut main_size = u64::MAX;
 
-    for path in &par_files {
-        let Ok(bytes) = std::fs::read(path) else {
-            continue; // unreadable / still paused-not-downloaded
-        };
-        let scan = nzbd_par2::scan(&bytes);
+    for (path, scan) in &par_files {
         if scan.slice_size > 0 {
+            if slice_size != 0 && slice_size != scan.slice_size {
+                return Err(PostError::Subprocess("inconsistent PAR slice size".into()));
+            }
             slice_size = scan.slice_size;
         }
         let has_descs = scan.has_descs();
         for d in &scan.descs {
-            if descs
-                .insert(d.id, (d.name.clone(), d.length, d.md5_16k, d.md5_full))
-                .is_none()
-            {
+            let description = (d.name.clone(), d.length, d.md5_16k, d.md5_full);
+            if let Some(previous) = descs.get(&d.id) {
+                if *previous != description {
+                    return Err(PostError::Subprocess(
+                        "conflicting PAR file descriptions".into(),
+                    ));
+                }
+            } else {
+                descs.insert(d.id, description);
                 order.push(d.id);
             }
         }
-        for (id, v) in scan.crcs {
-            crcs.entry(id).or_insert(v);
+        for (id, v) in &scan.crcs {
+            if let Some(previous) = crcs.get(id) {
+                if previous != v {
+                    return Err(PostError::Subprocess(
+                        "conflicting PAR slice evidence".into(),
+                    ));
+                }
+            } else {
+                crcs.insert(*id, v.clone());
+            }
         }
-        exponents.extend(scan.exponents);
+        exponents.extend(&scan.exponents);
         // The main file is conventionally the smallest one with FileDesc packets.
-        if has_descs && bytes.len() as u64 <= main_size {
-            main_size = bytes.len() as u64;
+        if has_descs && std::fs::metadata(path)?.len() <= main_size {
+            main_size = std::fs::metadata(path)?.len();
             main_path = Some(path.clone());
         }
     }
 
     if descs.is_empty() || slice_size == 0 {
         return Ok(None);
+    }
+    if par_files.iter().any(|(_, scan)| {
+        scan.recovery_sizes
+            .iter()
+            .any(|(_, bytes)| *bytes != slice_size)
+    }) {
+        return Err(PostError::Subprocess(
+            "invalid PAR recovery slice length".into(),
+        ));
     }
     let files = order
         .into_iter()
@@ -164,12 +337,14 @@ fn load_one(dir: &Path, mut par_files: Vec<PathBuf>) -> Result<Option<Par2Set>, 
         })
         .collect();
     Ok(Some(Par2Set {
-        par_paths: par_files,
+        par_paths: par_files.into_iter().map(|(path, _)| path).collect(),
         set_id: [0; 16],
         root: dir.into(),
         slice_size,
         files,
         recovery_blocks: exponents.len() as u32,
+        recovery_exponents: exponents,
+        input_stamps: Default::default(),
         main_path,
     }))
 }
@@ -379,6 +554,8 @@ mod tests {
             slice_size: 3,
             files: vec![file],
             recovery_blocks: 7,
+            recovery_exponents: Default::default(),
+            input_stamps: Default::default(),
             main_path: None,
         };
         assert_eq!(
