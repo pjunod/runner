@@ -2195,7 +2195,7 @@ async fn process_job_ctx_from_inner(
                 fin.params.push(("*Cluster:final-dir".into(), path.clone()));
             }
             if !engine
-                .import_job_if_present(fin)
+                .import_worker_job_if_present(fin)
                 .await
                 .map_err(|e| PostError::Subprocess(format!("remote terminal stamp: {e}")))?
             {

@@ -1,6 +1,6 @@
 # PAR repair status — design, build, and qualification
 
-**Updated:** 2026-10-06 · **Status:** local qualification passed; required PR CI next
+**Updated:** 2026-10-06 · **Status:** CI failure fixed; targeted qualification passed
 
 Companion to [PAR_REPAIR_PROGRESS_PLAN.md](PAR_REPAIR_PROGRESS_PLAN.md), which
 owns the implementation contract. The originating chat owns design; GPT-6.1
@@ -17,7 +17,7 @@ presented as completed work.
 | Repair scanning and retry reuse | implemented; compiling and linting | Cached single-pass fingerprints, streamed packets, normalized companions, useful-input retry |
 | Failed payload policy | unchanged | Seven-day park retention; payload deletion not requested |
 | Adversarial review | complete | Reported findings fixed; final disposition has no remaining blockers |
-| Final qualification | local cohort passed | 501 local tests passed; required CI supplies its disjoint cohort |
+| Final qualification | targeted CI fix passed | 504 distinct local tests passed; ordinary required CI validates the final head |
 | PR and merge | draft [PR #252](https://github.com/pjunod/runner/pull/252) | Required Main promotion gate; ordinary merge after review and qualification |
 | Production | unchanged | No deployment, restart, config edit, or live deletion performed |
 
@@ -136,3 +136,22 @@ also verifies server-schema roundtripping; its boot-only wrapper is omitted
 because PR CI executes the identical boot harness. Required CI and the ordinary
 merge are still pending. Final CI/merge/cleanup evidence will be recorded on
 the PR, preserving this tested code revision without a redundant CI-only push.
+
+## CI follow-through
+
+The first PR run passed static/UI, mobile and supply-chain checks, compilation,
+lint, 14 cluster unit tests and 12 cluster integration cases. Remote PP failed.
+Tracing identified two prerequisites: private input copies were registered as
+legacy data with a review hold, and ephemeral workers used the durable authority
+stamp API. Fresh private generations now receive a journaled owned allocation
+before copying; the actual copy worker retains a use guard. Existing paths
+are rejected rather than adopted, and previous generation custody/Keep/holds
+are preserved. Executor replacements check presence while authority updates
+still require durable snapshot commits.
+
+The failed remote PP case now passes. Focused replacement, demotion, rollback,
+failed-stamp durability and fresh-generation custody checks pass. Together with
+the earlier cohort, 504 distinct local tests have passed; only affected cases
+were rerun. Required GitHub checks must run on the new head under plan §9.5;
+this repeat is imposed by the protected gate, not a discretionary full-suite
+rerun. CI status and merge/cleanup evidence remain on PR #252.

@@ -1269,6 +1269,10 @@ async fn single_node_cluster_restart_keeps_the_queue() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn pp_runs_on_idle_node_via_anti_affinity() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     // C2: the leader downloads a job with a real par2 set; the scheduler
     // must hand post-processing to the idle non-download node, which
     // quick-verifies natively, stamps the job, appends shared-volume

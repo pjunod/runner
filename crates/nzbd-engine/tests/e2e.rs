@@ -648,6 +648,47 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
 }
 
 #[tokio::test]
+async fn worker_terminal_replace_is_ephemeral_and_never_resurrects_missing_jobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = EngineConfig::single_node(
+        vec![],
+        tmp.path().join("state"),
+        tmp.path().join("dest"),
+        Tuning::default(),
+        None,
+    );
+    config.persist_queue = false;
+    let engine = Engine::spawn(config).await.unwrap();
+    let mut job = transfer_job(77, "worker", JobStatus::Completed);
+    engine.import_job(job.clone(), false, false).await.unwrap();
+    job.params
+        .push((nzbd_types::PP_DONE_PARAM.into(), "SUCCESS".into()));
+    assert!(engine
+        .import_worker_job_if_present(job.clone())
+        .await
+        .unwrap());
+    assert!(engine.snapshot().jobs[0].pp_done);
+    assert!(!tmp.path().join("state/queue.json").exists());
+    // The authority replacement API must retain its durable-commit contract.
+    let mut strict = job.clone();
+    strict.priority = 99;
+    assert!(!engine.import_job_if_present(strict).await.unwrap());
+    assert_eq!(
+        engine
+            .export_job(JobId(77))
+            .await
+            .unwrap()
+            .unwrap()
+            .priority,
+        job.priority
+    );
+    assert!(engine.remove_job_silent(JobId(77)).await.unwrap());
+    assert!(!engine.import_worker_job_if_present(job).await.unwrap());
+    assert!(engine.export_job(JobId(77)).await.unwrap().is_none());
+    engine.shutdown().await;
+}
+
+#[tokio::test]
 async fn successful_authority_adoption_merges_durable_and_local_state() {
     let tmp = tempfile::tempdir().unwrap();
     let authority = spawn_engine(tmp.path(), Vec::new()).await;

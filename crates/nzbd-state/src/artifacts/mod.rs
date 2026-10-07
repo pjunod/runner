@@ -597,6 +597,43 @@ impl Inventory {
     /// a file. A directory already on disk must be explicitly adopted instead.
     pub fn allocate(&self, job: u32, root: &Path, path: &Path) -> Result<Artifact> {
         let _guard = self.mutation_guard()?;
+        self.allocate_unlocked(job, root, path)
+    }
+    /// Allocate a fresh private executor generation, preserving prior custody
+    /// and operator holds. Existing paths never confer ownership.
+    pub fn allocate_processing_successor(
+        &self,
+        job: u32,
+        root: &Path,
+        path: &Path,
+    ) -> Result<Artifact> {
+        let _guard = self.mutation_guard()?;
+        fs::absolute(path)?;
+        if path.parent() != Some(root) || std::fs::symlink_metadata(path).is_ok() {
+            return Err(Error::Conflict(
+                "private processing generation requires a fresh path".into(),
+            ));
+        }
+        fs::open_dir(root)?;
+        if let Some(mut previous) = self.for_job(job)? {
+            if self.artifact_in_use(&previous)? {
+                return Err(Error::Conflict(
+                    "previous processing workers have not quiesced".into(),
+                ));
+            }
+            previous.job = None;
+            if matches!(previous.state.as_str(), "active" | "transitioning") {
+                previous.state = "retained".into();
+                previous
+                    .hold
+                    .get_or_insert_with(|| "review: superseded private processing source".into());
+            }
+            previous.revision += 1;
+            save_artifact(&self.db.lock().unwrap(), &previous)?;
+        }
+        self.allocate_unlocked(job, root, path)
+    }
+    fn allocate_unlocked(&self, job: u32, root: &Path, path: &Path) -> Result<Artifact> {
         if let Some(a) = self.for_job(job)? {
             if a.path == path && a.state == "active" {
                 self.verify(&a)?;

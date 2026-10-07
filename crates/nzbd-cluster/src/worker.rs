@@ -597,8 +597,13 @@ async fn poll_for_work(
                     )
                     .await;
                 }
-                if let Err(error) =
-                    prepare_pp_attempt(dest_dir, &mut grant.job, grant.token.fence).await
+                if let Err(error) = prepare_pp_attempt(
+                    engine.artifacts(),
+                    dest_dir,
+                    &mut grant.job,
+                    grant.token.fence,
+                )
+                .await
                 {
                     tracing::warn!(job = job_id.0, %error, "private PP attempt could not be prepared");
                     reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
@@ -881,6 +886,7 @@ fn run_pp_lease(
 }
 
 async fn prepare_pp_attempt(
+    inventory: Arc<nzbd_state::artifacts::Inventory>,
     dest_dir: &std::path::Path,
     job: &mut nzbd_types::Job,
     fence: u64,
@@ -899,34 +905,34 @@ async fn prepare_pp_attempt(
         .saturating_add(64 * 1024 * 1024);
     let source_for_copy = source.clone();
     let target_for_copy = target.clone();
+    let job_id = job.id.0;
     tokio::task::spawn_blocking(move || {
-        if target_for_copy.exists() {
-            return Ok::<(), String>(());
-        }
         let parent = target_for_copy
             .parent()
             .ok_or_else(|| "private PP target has no parent".to_owned())?;
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("create private PP parent: {error}"))?;
-        let building = parent.join(format!(".building-fence-{fence}"));
-        if building.exists() {
-            std::fs::remove_dir_all(&building)
-                .map_err(|error| format!("remove abandoned PP build: {error}"))?;
-        }
-        std::fs::create_dir(&building)
-            .map_err(|error| format!("create private PP build: {error}"))?;
+        let artifact = inventory
+            .allocate_processing_successor(job_id, parent, &target_for_copy)
+            .map_err(|error| format!("allocate owned private PP input: {error}"))?;
+        // The actual copy worker retains custody even if its async caller drops.
+        let _use_guard = inventory
+            .acquire_attempt_use(job_id)
+            .map_err(|error| format!("acquire private PP copy custody: {error}"))?;
+
         let mut bytes = 0;
         let mut files = Vec::new();
-        copy_generation_tree(
+        if let Err(error) = copy_generation_tree(
             &source_for_copy,
-            &building,
+            &target_for_copy,
             std::path::Path::new(""),
             limit,
             &mut bytes,
             &mut files,
-        )?;
-        std::fs::rename(&building, &target_for_copy)
-            .map_err(|error| format!("publish private PP input: {error}"))?;
+        ) {
+            let _ = inventory.note_error(&artifact.id, &error);
+            return Err(error);
+        }
         Ok::<(), String>(())
     })
     .await

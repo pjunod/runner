@@ -833,6 +833,47 @@ mod tests {
         inventory.db.lock().unwrap().execute("INSERT INTO workspace_finalizations(source,generation,outcome,proof,activated) VALUES(?1,?2,'SUCCESS',?3,1)", params![workspace.source.id, workspace.source.generation, serde_json::to_string(&FinalizationProof::Local {history_seq:1}).unwrap()]).unwrap();
     }
     #[test]
+    fn processing_successor_requires_fresh_path_and_preserves_prior_custody() {
+        let (temp, inventory, workspace) = fixture();
+        let root = temp.path().join("private");
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("fence-2");
+        std::fs::create_dir(&target).unwrap();
+        assert!(inventory
+            .allocate_processing_successor(12, &root, &target)
+            .is_err());
+        assert_eq!(
+            inventory.for_job(12).unwrap().unwrap().id,
+            workspace.source.id
+        );
+        std::fs::remove_dir(&target).unwrap();
+        let guard = inventory.acquire_attempt_use(12).unwrap().unwrap();
+        assert!(inventory
+            .allocate_processing_successor(12, &root, &target)
+            .is_err());
+        assert!(!target.exists());
+        drop(guard);
+        let mut kept = inventory.get(&workspace.source.id).unwrap();
+        kept.keep = true;
+        kept.hold = Some("operator review".into());
+        save_artifact(&inventory.db.lock().unwrap(), &kept).unwrap();
+        let next = inventory
+            .allocate_processing_successor(12, &root, &target)
+            .unwrap();
+        assert!(next.owned);
+        assert!(!next.keep);
+        assert!(next.hold.is_none());
+        assert_ne!(next.generation, workspace.source.generation);
+        let old = inventory.get(&workspace.source.id).unwrap();
+        assert_eq!(old.job, None);
+        assert!(old.keep);
+        assert_eq!(old.hold.as_deref(), Some("operator review"));
+        assert!(old.path.join("original").exists());
+        let guard = inventory.acquire_attempt_use(12).unwrap().unwrap();
+        assert_eq!(guard.source().generation, next.generation);
+        assert!(inventory.workspace(12, "par_repair", "abc2").is_ok());
+    }
+    #[test]
     fn terminal_receipts_retire_only_scratch_and_restart_gets_fresh_generation() {
         for state in ["completed", "parked_failed", "retained"] {
             let (_temp, inventory, workspace) = fixture();

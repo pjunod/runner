@@ -216,6 +216,7 @@ pub(crate) enum QueueCommand {
     /// `RetainJobs` already removed while an external disposition awaited.
     ImportJobIfPresent {
         job: Box<Job>,
+        require_snapshot: bool,
         reply: oneshot::Sender<bool>,
     },
     /// Clone a job's full current state out (for grants and completion
@@ -1967,13 +1968,19 @@ impl Owner {
                 let _ = self.import_job(*job, fold_journals, emit_finished);
                 let _ = reply.send(());
             }
-            QueueCommand::ImportJobIfPresent { job, reply } => {
+            QueueCommand::ImportJobIfPresent {
+                job,
+                require_snapshot,
+                reply,
+            } => {
                 let id = job.id;
                 let previous = self.state.job(id).cloned();
                 let previous_delegated = self.delegated.get(&id).cloned();
                 let previous_mirror = self.mirror.get(&id).cloned();
                 let previous_post_fetch = self.post_fetch_files.get(&id).cloned();
-                let committed = previous.is_some() && self.import_job(*job, false, false);
+                let committed = previous.is_some()
+                    && (!require_snapshot || self.persist)
+                    && self.import_job(*job, false, false);
                 if !committed {
                     // Atomic means memory and disk agree. A failed snapshot
                     // commit must not leave an in-memory-only PP_DONE or
@@ -2615,7 +2622,7 @@ impl Owner {
         }
         tracing::info!(job = job_id.0, %name, ?status, "job imported");
         self.dirty = true;
-        let committed = self.persist && self.save_snapshot();
+        let committed = !self.persist || self.save_snapshot();
         self.publish_now();
         if terminal && emit_finished {
             self.emit(Event::JobFinished {
@@ -6329,6 +6336,7 @@ mod tests {
         let (reply, mut received) = oneshot::channel();
         owner.on_command(QueueCommand::ImportJobIfPresent {
             job: Box::new(replacement),
+            require_snapshot: true,
             reply,
         });
 

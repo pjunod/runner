@@ -1025,6 +1025,24 @@ impl EngineHandle {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::ImportJobIfPresent {
             job: Box::new(job),
+            require_snapshot: true,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| EngineError::Closed)
+    }
+
+    /// Stamp an existing executor copy. Worker queues are intentionally
+    /// ephemeral; the authority accepts the fenced result before retirement.
+    /// An authority engine still requires its snapshot commit.
+    pub async fn import_worker_job_if_present(
+        &self,
+        job: nzbd_types::Job,
+    ) -> Result<bool, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::ImportJobIfPresent {
+            job: Box::new(job),
+            require_snapshot: false,
             reply: tx,
         })
         .await?;
