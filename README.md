@@ -1,4 +1,4 @@
-# nzbd
+# runner
 
 [![Tests](https://github.com/pjunod/nzbd/actions/workflows/ci.yml/badge.svg)](https://github.com/pjunod/nzbd/actions/workflows/ci.yml)
 [![Lint](https://github.com/pjunod/nzbd/actions/workflows/lint.yml/badge.svg)](https://github.com/pjunod/nzbd/actions/workflows/lint.yml)
@@ -11,14 +11,6 @@ downloader — modern architecture, same soul: tiny footprint, line-rate
 throughput, direct-to-disk writing, and drop-in compatibility with the
 Sonarr/Radarr ecosystem and NZBGet's post-processing script protocol.
 Optionally runs as a **multi-node cluster** over a shared work volume.
-
-> **Status:** phases 0–4 complete — download engine, full post-processing,
-> NZBGet-compatible JSON-RPC/XML-RPC API, embedded web UI, RSS feeds,
-> packaging, and cluster C1+C2 (distributed downloads *and* distributed
-> post-processing). See [STATUS.md](STATUS.md) for the live scoreboard.
-> The [cluster completion plan](docs/CLUSTERING_COMPLETION_PLAN.md) compares
-> the current plurx contracts and scopes the remaining authority, C3, and
-> operator work; [cluster progress](docs/CLUSTERING_STATUS.md) tracks delivery.
 
 Follow [file lifecycle progress](docs/FILE_LIFECYCLE_STATUS.md) for the
 [ownership and recovery plan](docs/FILE_LIFECYCLE_PLAN.md) and its
@@ -52,7 +44,7 @@ recovery mounts, cancellation and backup/restore.
   too big to replay says so rather than looking contiguous, and
   `GET /api/v1/history?since_seq=N` reconstructs anything the stream
   dropped. Tag a download with your own id at add time and grep for it
-  across the whole pipeline. nzbd makes no outbound connections: push is
+  across the whole pipeline. runner makes no outbound connections: push is
   an optimization over the poll, never a replacement.
 - **RSS/Atom feeds** with the NZBGet filter language
   (`Accept`/`Reject`/`Require`, wildcards, size/age windows, per-rule
@@ -135,7 +127,7 @@ workspace retirement, repair, and qualification work specified by the
 | [docs/INSTALL.md](docs/INSTALL.md) | Release binaries, Docker, Homebrew, building from source, musl static builds |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | The complete annotated `nzbd.toml` reference |
 | [docs/USAGE.md](docs/USAGE.md) | CLI, web UI, connecting the *arr apps, RSS feeds + filter language, extension scripts, deobfuscation |
-| [docs/MOBILE.md](docs/MOBILE.md) | Building the iPhone/iPad/Android app, connecting it to nzbd, and its exact control/security boundaries |
+| [docs/MOBILE.md](docs/MOBILE.md) | Building the iPhone/iPad/Android app, connecting it to runner, and its exact control/security boundaries |
 | [docs/MOBILE_QUEUE_PARITY_PLAN.md](docs/MOBILE_QUEUE_PARITY_PLAN.md) | Reviewed mobile torrent grouping and controls implementation plan |
 | [docs/MOBILE_QUEUE_PARITY_REVIEW.md](docs/MOBILE_QUEUE_PARITY_REVIEW.md) | Fable's source review and required corrections |
 | [docs/MOBILE_QUEUE_PARITY_STATUS.md](docs/MOBILE_QUEUE_PARITY_STATUS.md) | Implementation, review, validation, and delivery progress |
