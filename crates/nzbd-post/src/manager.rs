@@ -6571,7 +6571,11 @@ mod decision_tests {
             .allocate_for_delivery(41, &downloads, &source, true, true)
             .unwrap();
         let good = vec![b'a'; 30_000];
-        let damaged_original = vec![b'b'; 50_000];
+        // par2cmdline 0.8.1 on Linux cannot reconstruct this intentionally
+        // low-entropy repeated-byte fixture from a single recovery block.
+        // Use deterministic varied data, as real media does, while keeping
+        // one damaged 8192-byte slice and exactly one recovery block.
+        let damaged_original: Vec<_> = (0..50_000).map(|n| ((n * 7) % 251) as u8).collect();
         std::fs::write(source.join("episode-01.mkv"), &good).unwrap();
         std::fs::write(source.join("episode-02.mkv"), &damaged_original).unwrap();
         let generated = std::process::Command::new("par2")
@@ -6619,9 +6623,26 @@ mod decision_tests {
             vec![("monarr-transfer".into(), "failed-par-token".into())],
         );
         request.delivery_lifecycle = true;
-        repair_failed_health_par_sets(&engine, &PostConfig::default(), &request, &None)
-            .await
-            .unwrap();
+        let source_files = inventory.for_job(request.id.0).unwrap().unwrap().files;
+        let (repairable_paths, repair_sets) =
+            par_repairable_evidence(&source, &source_files).unwrap();
+        assert_eq!(repair_sets.len(), 1, "expected one valid PAR set");
+        assert_eq!(
+            repair_sets[0].recovery_blocks, 1,
+            "fixture must provide one recovery block"
+        );
+        assert!(
+            repairable_paths.contains_key("episode-02.mkv"),
+            "fixture must measure the damaged source slice"
+        );
+        let failures =
+            repair_failed_health_par_sets(&engine, &PostConfig::default(), &request, &None)
+                .await
+                .unwrap();
+        assert!(
+            failures.is_empty(),
+            "PAR salvage did not repair the measured set: {failures:?}"
+        );
         assert_eq!(
             std::fs::read(source.join("episode-02.mkv")).unwrap(),
             damaged_original
