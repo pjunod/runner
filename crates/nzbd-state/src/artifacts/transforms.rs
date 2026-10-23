@@ -1,6 +1,69 @@
 //! Operation-owned PAR/extraction workspaces, in the existing custody journal.
 use super::*;
 
+fn digest_open(file: &mut File) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek};
+    let before = fs::identity_for_file(file)?;
+    file.rewind()?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buffer[..n]);
+    }
+    file.rewind()?;
+    if fs::identity_for_file(file)? != before {
+        return Err(Error::Conflict(
+            "file changed while verifying owned rename".into(),
+        ));
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn rename_transition_matches(before: &Identity, after: &Identity) -> bool {
+    before.same_object(after) && before.bytes == after.bytes && before.modified == after.modified
+}
+
+fn digest_file(root: &File, path: &str, expected: &Identity) -> Result<String> {
+    digest_file_with_checkpoint(root, path, expected, || Ok(()))
+}
+
+fn digest_file_with_checkpoint(
+    root: &File,
+    path: &str,
+    expected: &Identity,
+    mut checkpoint: impl FnMut() -> std::io::Result<()>,
+) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = fs::open_relative(root, path)?;
+    if fs::identity_for_file(&file)? != *expected {
+        return Err(Error::Conflict(format!(
+            "transform output identity changed before digest: {path}"
+        )));
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        checkpoint()?;
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    if fs::identity_for_file(&file)? != *expected {
+        return Err(Error::Conflict(format!(
+            "transform output identity changed while hashing: {path}"
+        )));
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Workspace {
     #[serde(default)]
@@ -8,14 +71,28 @@ pub struct Workspace {
     #[serde(default)]
     pub logical_key: Option<String>,
     pub operation_id: String,
+    #[serde(default)]
+    pub input_path: Option<String>,
+    #[serde(default)]
+    pub input_paths: Vec<String>,
     pub source: Artifact,
     pub scratch: Artifact,
     #[serde(default)]
     pub retained: std::collections::HashMap<String, String>,
+    /// Content proof for operation-owned original-file renames. Rename changes
+    /// inode ctime on common filesystems; this proof permits only that journaled
+    /// transition while keeping ordinary identity comparisons strict.
+    #[serde(default)]
+    pub retained_digests: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub attempts: Vec<WorkspaceAttempt>,
     #[serde(default)]
     pub published_files: Option<Vec<FileEntry>>,
+    /// Source-relative outputs that a verified PAR repair wrote back to the
+    /// processing generation. These are captured only after validating the
+    /// PAR catalog digest and copying the output into the source tree.
+    #[serde(default)]
+    pub verified_output_paths: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceAttempt {
@@ -80,7 +157,7 @@ impl Inventory {
         scratch.job = None;
         scratch.generation = id(&self.db.lock().unwrap())?;
         scratch.root = workspace_root;
-        scratch.root_identity = fs::identity(&workspace_dir.metadata()?);
+        scratch.root_identity = fs::identity_for_file(&workspace_dir)?;
         scratch.path = path.clone();
         scratch.identity = None;
         scratch.files.clear();
@@ -95,11 +172,15 @@ impl Inventory {
             keep_provenance: true,
             logical_key: Some(logical_key),
             operation_id: key.clone(),
+            input_path: None,
+            input_paths: Vec::new(),
             source: source.clone(),
             scratch,
             retained: Default::default(),
+            retained_digests: Default::default(),
             attempts: Vec::new(),
             published_files: None,
+            verified_output_paths: Vec::new(),
         };
         let mut op = Operation {
             id: key,
@@ -126,7 +207,7 @@ impl Inventory {
         std::fs::create_dir(&path)?;
         fs::sync_directory(&workspace_dir)?;
         let scratch_dir = fs::open_dir(&path)?;
-        workspace.scratch.identity = Some(fs::identity(&scratch_dir.metadata()?));
+        workspace.scratch.identity = Some(fs::identity_for_file(&scratch_dir)?);
         workspace.scratch.state = "active".into();
         self.sidecar(&workspace.scratch)?;
         op.request = serde_json::to_string(&workspace)?;
@@ -136,6 +217,85 @@ impl Inventory {
         save_operation(&tx, &op)?;
         tx.commit()?;
         Ok(workspace)
+    }
+
+    /// Bind the exact source-relative archive name to this transform journal.
+    /// This is evidence only; it becomes a consumed input only when the same
+    /// operation later records a successfully published extraction.
+    pub fn bind_extraction_input(&self, workspace: &mut Workspace, input: &Path) -> Result<()> {
+        self.bind_extraction_inputs(workspace, &[input.to_path_buf()])
+    }
+
+    /// Bind all files consumed by a successful extraction, including every
+    /// volume of a multi-part archive. The set is immutable for a transform
+    /// operation and persisted before extraction starts.
+    pub fn bind_extraction_inputs(
+        &self,
+        workspace: &mut Workspace,
+        inputs: &[PathBuf],
+    ) -> Result<()> {
+        if inputs.is_empty() {
+            return Err(Error::Conflict("extraction input set is empty".into()));
+        }
+        let mut relatives = inputs
+            .iter()
+            .map(|input| {
+                let relative = input.strip_prefix(&workspace.source.path).map_err(|_| {
+                    Error::Conflict("extraction input is outside its source generation".into())
+                })?;
+                relative
+                    .components()
+                    .map(|part| match part {
+                        std::path::Component::Normal(s) => s.to_str().map(str::to_owned),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .filter(|parts| !parts.is_empty())
+                    .map(|parts| parts.join("/"))
+                    .ok_or_else(|| Error::Conflict("unsupported extraction input path".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        relatives.sort();
+        relatives.dedup();
+        let relative = relatives[0].clone();
+        let _guard = self.mutation_guard()?;
+        let mut op = self.operation(&workspace.operation_id)?;
+        if workspace.input_paths == relatives && workspace.input_path.as_deref() == Some(&relative)
+        {
+            return Ok(());
+        }
+        if op.kind != "extract" || op.state != "running" {
+            return Err(Error::Conflict("extraction journal is not active".into()));
+        }
+        let source = self.get(&workspace.source.id)?;
+        if source.generation != workspace.source.generation
+            || relatives.iter().any(|path| {
+                !source
+                    .files
+                    .iter()
+                    .any(|entry| entry.path == *path && !entry.identity.directory)
+            })
+        {
+            return Err(Error::Conflict(
+                "extraction input is absent from the source manifest".into(),
+            ));
+        }
+        if !workspace.input_paths.is_empty() && workspace.input_paths != relatives {
+            return Err(Error::Conflict(
+                "extraction journal input set changed".into(),
+            ));
+        }
+        if workspace
+            .input_path
+            .as_deref()
+            .is_some_and(|existing| existing != relative)
+        {
+            return Err(Error::Conflict("extraction journal input changed".into()));
+        }
+        workspace.input_path = Some(relative);
+        workspace.input_paths = relatives;
+        op.request = serde_json::to_string(workspace)?;
+        save_operation(&self.db.lock().unwrap(), &op)
     }
 
     /// Internal scratch is owned by a transform, not by a queue job. Startup
@@ -169,7 +329,7 @@ impl Inventory {
                 Error::Conflict("interrupted extraction attempt allocation requires review".into())
             })?;
             let observed = fs::open_relative(&root, &attempt.directory)?;
-            if !expected.same_object(&fs::identity(&observed.metadata()?)) {
+            if !expected.same_object(&fs::identity_for_file(&observed)?) {
                 return Err(Error::Conflict(
                     "extraction attempt identity changed".into(),
                 ));
@@ -203,7 +363,7 @@ impl Inventory {
         std::fs::create_dir(&path)?;
         fs::sync_directory(&self.verify(&current.scratch)?)?;
         current.attempts.last_mut().unwrap().identity =
-            Some(fs::identity(&fs::open_dir(&path)?.metadata()?));
+            Some(fs::identity_for_file(&fs::open_dir(&path)?)?);
         op.request = serde_json::to_string(&current)?;
         op.attempts = current.attempts.len() as u32;
         save_operation(&self.db.lock().unwrap(), &op)?;
@@ -233,7 +393,6 @@ impl Inventory {
         workspace: &mut Workspace,
         relative: &str,
     ) -> Result<()> {
-        let _guard = self.mutation_guard()?;
         let entry = workspace
             .source
             .files
@@ -247,30 +406,135 @@ impl Inventory {
             Sha256::digest(format!("{}:{relative}", workspace.operation_id).as_bytes())
         ));
         let backup = backup.to_string_lossy().into_owned();
-        workspace.retained.insert(relative.into(), backup.clone());
-        let mut op = self.operation(&workspace.operation_id)?;
-        op.request = serde_json::to_string(workspace)?;
-        save_operation(&self.db.lock().unwrap(), &op)?;
         let root = fs::open_dir(&workspace.source.path)?;
+        let original = fs::open_relative(&root, relative)?;
+        let original_identity = fs::identity_for_file(&original)?;
+        if original_identity != entry.identity {
+            return Err(Error::Conflict("original identity changed".into()));
+        }
+        // Hash through a stable descriptor before taking the global mutation
+        // guard. Large media files must not block unrelated custody controls.
+        let digest = digest_open(&mut original.try_clone()?)?;
+        let _guard = self.mutation_guard()?;
+        let current = self.get(&workspace.source.id)?;
+        if current.generation != workspace.source.generation
+            || current.path != workspace.source.path
+            || current.terminal()
+        {
+            return Err(Error::Conflict(
+                "transform source generation changed".into(),
+            ));
+        }
+        let mut op = self.operation(&workspace.operation_id)?;
+        let latest_workspace: Workspace = serde_json::from_str(&op.request)?;
+        if latest_workspace.source.generation != workspace.source.generation
+            || latest_workspace.operation_id != workspace.operation_id
+        {
+            return Err(Error::Conflict("transform operation changed".into()));
+        }
+        if fs::identity_for_file(&original)? != original_identity {
+            return Err(Error::Conflict("original changed while hashing".into()));
+        }
         if let Ok(old) = fs::open_relative(&root, &backup) {
-            if fs::identity(&old.metadata()?) == entry.identity {
+            let observed = fs::identity_for_file(&old)?;
+            let expected_digest = workspace
+                .retained_digests
+                .get(relative)
+                .ok_or_else(|| Error::Conflict("retained original proof missing".into()))?;
+            if rename_transition_matches(&entry.identity, &observed)
+                && digest_open(&mut old.try_clone()?)? == *expected_digest
+            {
+                if let Some(captured) = workspace
+                    .source
+                    .files
+                    .iter_mut()
+                    .find(|f| f.path == relative)
+                {
+                    captured.identity = observed;
+                }
+                workspace.retained.insert(relative.into(), backup);
+                op.request = serde_json::to_string(workspace)?;
+                save_operation(&self.db.lock().unwrap(), &op)?;
                 return Ok(());
             }
             return Err(Error::Conflict("retained original identity changed".into()));
         }
-        let original = fs::open_relative(&root, relative)?;
-        if fs::identity(&original.metadata()?) != entry.identity {
-            return Err(Error::Conflict("original identity changed".into()));
-        }
+        workspace.retained.insert(relative.into(), backup.clone());
+        workspace.retained_digests.insert(relative.into(), digest);
+        op.request = serde_json::to_string(workspace)?;
+        save_operation(&self.db.lock().unwrap(), &op)?;
         fs::rename_exclusive(
             &workspace.source.path.join(relative),
             &workspace.source.path.join(&backup),
         )?;
+        let renamed = fs::open_relative(&root, &backup)?;
+        let observed = fs::identity_for_file(&renamed)?;
+        if !rename_transition_matches(&entry.identity, &observed) {
+            return Err(Error::Conflict(
+                "retained original changed during rename".into(),
+            ));
+        }
+        if let Some(captured) = workspace
+            .source
+            .files
+            .iter_mut()
+            .find(|f| f.path == relative)
+        {
+            captured.identity = observed;
+        }
+        op.request = serde_json::to_string(workspace)?;
+        save_operation(&self.db.lock().unwrap(), &op)?;
         Ok(())
     }
 
     pub fn finish_workspace(&self, workspace: &Workspace) -> Result<()> {
         self.finish_workspace_output(workspace, None, true)
+    }
+
+    /// Finish a verified PAR repair while durably recording the exact
+    /// source-relative output files whose repaired bytes were validated
+    /// against the PAR catalog. This proof is generation-bound and is
+    /// rechecked by `verified_transform_evidence` before publication.
+    pub fn finish_repair_workspace(
+        &self,
+        workspace: &Workspace,
+        verified_output_paths: &[String],
+    ) -> Result<()> {
+        if verified_output_paths.is_empty() {
+            return Err(Error::Conflict("verified repair has no outputs".into()));
+        }
+        let mut workspace = workspace.clone();
+        workspace.verified_output_paths = verified_output_paths.to_vec();
+        // Hash large repaired media before entering the inventory mutation
+        // lock. The subsequent journal commit rechecks each captured identity
+        // while holding that lock.
+        let root = fs::open_dir(&workspace.source.path)?;
+        let mut proofs = Vec::with_capacity(verified_output_paths.len());
+        for path in verified_output_paths {
+            let relative = Path::new(path);
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err(Error::Conflict(
+                    "invalid verified repair output path".into(),
+                ));
+            }
+            let file = fs::open_relative(&root, path)?;
+            let identity = fs::identity_for_file(&file)?;
+            if identity.directory {
+                return Err(Error::Conflict("repair output is not a file".into()));
+            }
+            let digest = digest_file(&root, path, &identity)?;
+            proofs.push(FileEntry {
+                path: path.clone(),
+                identity,
+                digest: Some(digest),
+            });
+        }
+        workspace.published_files = Some(proofs);
+        self.finish_workspace_output(&workspace, None, true)
     }
 
     pub fn finish_extraction(&self, workspace: &Workspace, output: &Path) -> Result<()> {
@@ -325,8 +589,7 @@ impl Inventory {
                 .iter()
                 .find(|f| f.identity == expected.identity)
                 .ok_or_else(|| Error::Conflict("published extraction output changed".into()))?;
-            if fs::identity(&fs::open_relative(&root, &entry.path)?.metadata()?)
-                != expected.identity
+            if fs::identity_for_file(&fs::open_relative(&root, &entry.path)?)? != expected.identity
             {
                 return Err(Error::Conflict(
                     "published extraction output changed".into(),
@@ -334,6 +597,206 @@ impl Inventory {
             }
         }
         Ok(true)
+    }
+
+    /// Return only extraction outputs whose successful transform journal and
+    /// current source identities still prove them. This is used by delivery
+    /// salvage after a later archive or script failed; an extension alone is
+    /// never integrity evidence.
+    pub fn verified_transform_evidence(
+        &self,
+        job: u32,
+    ) -> Result<(
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    )> {
+        let Some(source) = self.for_job(job)? else {
+            return Ok(Default::default());
+        };
+        let raws = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT data FROM operations WHERE artifact=?1 AND state='succeeded' AND json_extract(data,'$.kind') IN ('extract','par_repair')",
+            )?;
+            let rows = statement.query_map([&source.id], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut inputs = std::collections::HashSet::new();
+        let mut outputs = std::collections::HashSet::new();
+        let root = self.verify(&source)?;
+        let observed = fs::manifest(&root, 100_000)?;
+        for raw in raws {
+            let operation: Operation = serde_json::from_str(&raw)?;
+            let workspace: Workspace = serde_json::from_str(&operation.request)?;
+            if workspace.source.generation != source.generation
+                || operation.state != "succeeded"
+                || !matches!(operation.kind.as_str(), "extract" | "par_repair")
+            {
+                continue;
+            }
+            if operation.kind == "extract" {
+                inputs.extend(workspace.input_paths.iter().cloned());
+                if let Some(path) = &workspace.input_path {
+                    inputs.insert(path.clone());
+                }
+            }
+            for output in workspace.published_files.as_deref().unwrap_or_default() {
+                if let Some(current) = observed
+                    .iter()
+                    .find(|entry| entry.identity == output.identity && !entry.identity.directory)
+                {
+                    if fs::open_relative(&root, &current.path)
+                        .and_then(|file| fs::identity_for_file(&file))
+                        .is_ok_and(|identity| identity == output.identity)
+                    {
+                        outputs.insert(current.path.clone());
+                    }
+                }
+            }
+            // A successful repair may rewrite the damaged file in place.
+            // Such outputs cannot match the pre-repair manifest identity, so
+            // their exact paths were recorded only after PAR digest validation
+            // and are checked against the current generation here.
+            if operation.kind == "par_repair" {
+                let Some(proofs) = workspace.published_files.as_ref() else {
+                    continue;
+                };
+                for path in workspace.verified_output_paths {
+                    let Some(proof) = proofs
+                        .iter()
+                        .find(|entry| entry.path == path && !entry.identity.directory)
+                    else {
+                        continue;
+                    };
+                    let matches_identity = observed
+                        .iter()
+                        .find(|entry| entry.path == path && !entry.identity.directory)
+                        .is_some_and(|current| current.identity == proof.identity);
+                    let matches_digest = proof.digest.as_deref().is_some_and(|expected| {
+                        digest_file(&root, &path, &proof.identity)
+                            .is_ok_and(|actual| actual == expected)
+                    });
+                    if matches_identity && matches_digest {
+                        outputs.insert(path.clone());
+                    }
+                }
+            }
+        }
+        Ok((inputs, outputs))
+    }
+
+    /// Return journaled filename restorations that still match the same
+    /// source generation, controlled rename identity transition, and exact
+    /// post-rename digest. This proves provenance for a renamed path only; a
+    /// caller must still establish payload integrity (for example, by
+    /// matching the finalized NZB whole-file CRC) before publishing it.
+    pub fn verified_restore_paths(
+        &self,
+        job: u32,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        self.verified_restore_paths_with_checkpoint(job, || Ok(()))
+    }
+
+    pub fn verified_restore_paths_with_checkpoint(
+        &self,
+        job: u32,
+        mut checkpoint: impl FnMut() -> std::io::Result<()>,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let Some(source) = self.for_job(job)? else {
+            return Ok(Default::default());
+        };
+        let raws = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT data FROM operations WHERE artifact=?1 AND state='succeeded' AND json_extract(data,'$.kind')='par_restore'",
+            )?;
+            let rows = statement.query_map([&source.id], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let root = self.verify(&source)?;
+        let mut proofs = Vec::new();
+        for raw in raws {
+            let operation: Operation = serde_json::from_str(&raw)?;
+            if operation.kind != "par_restore" || operation.state != "succeeded" {
+                continue;
+            }
+            let raw_request: serde_json::Value = serde_json::from_str(&operation.request)?;
+            if raw_request
+                .as_array()
+                .is_some_and(|fields| fields.len() == 4)
+            {
+                // Pre-proof restore journals cannot establish either a
+                // controlled ctime transition or the bytes' original content.
+                continue;
+            }
+            let (recorded_source, old, new, original, expected_digest): (
+                Artifact,
+                PathBuf,
+                PathBuf,
+                Identity,
+                String,
+            ) = serde_json::from_str(&operation.request)?;
+            if recorded_source.id != source.id
+                || recorded_source.generation != source.generation
+                || recorded_source.path != source.path
+            {
+                continue;
+            }
+            let (Some(old), Some(new)) = (old.to_str(), new.to_str()) else {
+                continue;
+            };
+            let safe_relative = |path: &str| {
+                let path = Path::new(path);
+                !path.as_os_str().is_empty()
+                    && !path.is_absolute()
+                    && path
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)))
+            };
+            if !safe_relative(old) || !safe_relative(new) {
+                continue;
+            }
+            proofs.push((old.to_string(), new.to_string(), original, expected_digest));
+        }
+        let mut restored = std::collections::HashMap::new();
+        for (old, new, original, expected_digest) in &proofs {
+            let Some(current) = source.files.iter().find(|entry| entry.path == *new) else {
+                continue;
+            };
+            if current.identity.directory
+                || !rename_transition_matches(original, &current.identity)
+                || digest_file_with_checkpoint(&root, new, &current.identity, &mut checkpoint)?
+                    != *expected_digest
+            {
+                continue;
+            }
+            // A second owned rename may move an already restored name. Follow
+            // only journal edges whose bytes and file identity chain remain
+            // the same; intermediate path absence is expected after rename.
+            let mut oldest = old.as_str();
+            let mut child_identity = original;
+            let mut seen = std::collections::HashSet::new();
+            loop {
+                restored.insert(oldest.to_string(), new.clone());
+                let predecessor =
+                    proofs
+                        .iter()
+                        .find(|(_, candidate_new, candidate_identity, digest)| {
+                            candidate_new == oldest
+                                && digest == expected_digest
+                                && rename_transition_matches(candidate_identity, child_identity)
+                        });
+                let Some((predecessor_old, _, predecessor_identity, _)) = predecessor else {
+                    break;
+                };
+                if predecessor_old == oldest || !seen.insert(oldest.to_string()) {
+                    break;
+                }
+                oldest = predecessor_old;
+                child_identity = predecessor_identity;
+            }
+        }
+        Ok(restored)
     }
 
     fn finish_workspace_output(
@@ -360,7 +823,7 @@ impl Inventory {
         {
             let path = workspace.retained.get(&entry.path).unwrap_or(&entry.path);
             let observed = fs::open_relative(&dir, path)?;
-            if fs::identity(&observed.metadata()?) != entry.identity {
+            if fs::identity_for_file(&observed)? != entry.identity {
                 return Err(Error::Conflict("transform input changed".into()));
             }
         }
@@ -380,7 +843,7 @@ impl Inventory {
                     .iter()
                     .filter(|e| !e.identity.directory)
                     .map(|e| {
-                        let identity = fs::identity(&fs::open_relative(&dir, &e.path)?.metadata()?);
+                        let identity = fs::identity_for_file(&fs::open_relative(&dir, &e.path)?)?;
                         Ok(FileEntry {
                             path: e.path.clone(),
                             identity,
@@ -389,6 +852,26 @@ impl Inventory {
                     })
                     .collect::<Result<Vec<_>>>()?,
             );
+            op.request = serde_json::to_string(&finished)?;
+        } else if succeeded && !workspace.verified_output_paths.is_empty() {
+            let observed = fs::manifest(&dir, 100_000)?;
+            let finished = workspace.clone();
+            let proofs = finished.published_files.as_ref().ok_or_else(|| {
+                Error::Conflict("verified repair output has no durable byte proof".into())
+            })?;
+            if proofs.len() != finished.verified_output_paths.len()
+                || proofs.iter().any(|proof| {
+                    !finished.verified_output_paths.contains(&proof.path)
+                        || proof.digest.as_ref().is_none_or(String::is_empty)
+                        || !observed.iter().any(|entry| {
+                            entry.path == proof.path && entry.identity == proof.identity
+                        })
+                })
+            {
+                return Err(Error::Conflict(
+                    "verified repair output changed before journal commit".into(),
+                ));
+            }
             op.request = serde_json::to_string(&finished)?;
         }
         op.state = if succeeded { "succeeded" } else { "failed" }.into();
@@ -416,9 +899,7 @@ impl Inventory {
     /// Journal an intact file's identity before restoring a catalog path.
     pub fn restore_file(&self, job: u32, from: &Path, to: &Path) -> Result<()> {
         use sha2::{Digest, Sha256};
-        let _guard = self.mutation_guard()?;
         let mut source = self.for_job(job)?.ok_or(Error::NotFound)?;
-        let root = self.verify(&source)?;
         let old = from
             .strip_prefix(&source.path)
             .map_err(|_| Error::Conflict("restore source outside payload".into()))?;
@@ -431,8 +912,28 @@ impl Inventory {
         {
             return Err(Error::Conflict("unsafe restore target".into()));
         }
+        let root = self.verify(&source)?;
         let file = fs::open_relative(&root, &old.to_string_lossy())?;
-        let identity = fs::identity(&file.metadata()?);
+        let identity = fs::identity_for_file(&file)?;
+        // Keep the potentially large content pass outside the global mutation
+        // lock, then revalidate the exact source generation and identity.
+        let digest = digest_open(&mut file.try_clone()?)?;
+        let _guard = self.mutation_guard()?;
+        let current = self.for_job(job)?.ok_or(Error::NotFound)?;
+        if current.id != source.id
+            || current.generation != source.generation
+            || current.path != source.path
+        {
+            return Err(Error::Conflict("restore source generation changed".into()));
+        }
+        source = current;
+        let root = self.verify(&source)?;
+        let current_file = fs::open_relative(&root, &old.to_string_lossy())?;
+        if fs::identity_for_file(&current_file)? != identity {
+            return Err(Error::Conflict(
+                "restore source changed while hashing".into(),
+            ));
+        }
         let key = format!(
             "restore-{}-{:x}",
             source.generation,
@@ -449,7 +950,7 @@ impl Inventory {
             artifact: source.id.clone(),
             kind: "par_restore".into(),
             state: "running".into(),
-            request: serde_json::to_string(&(source.clone(), old, new, &identity))?,
+            request: serde_json::to_string(&(source.clone(), old, new, &identity, &digest))?,
             created_at: now(),
             not_before: 0,
             attempts: 1,
@@ -462,7 +963,8 @@ impl Inventory {
         }
         fs::rename_exclusive(from, to)?;
         let observed = fs::open_relative(&root, &new.to_string_lossy())?;
-        if fs::identity(&observed.metadata()?) != identity {
+        let observed_identity = fs::identity_for_file(&observed)?;
+        if !rename_transition_matches(&identity, &observed_identity) {
             return Err(Error::Conflict("restore identity changed".into()));
         }
         source.files = fs::manifest(&root, 100_000)?;
@@ -480,19 +982,35 @@ impl Inventory {
 impl Inventory {
     /// Reconcile journaled mappings before new queue or PP operations start.
     pub(super) fn reconcile_transforms(&self) -> Result<()> {
-        let _guard = self.mutation_guard()?;
+        let mut guard = Some(self.mutation_guard()?);
         let raws = {
             let db = self.db.lock().unwrap();
-            let mut statement=db.prepare("SELECT data FROM operations WHERE state='running' AND json_extract(data,'$.kind') IN ('par_restore','par_repair','extract')")?;
-            let rows = statement.query_map([], |r| r.get::<_, String>(0))?;
+            let mut statement=db.prepare("SELECT data FROM operations WHERE (state='running' OR (state='retry' AND COALESCE(json_extract(data,'$.next_retry'),0)<=?1)) AND json_extract(data,'$.kind') IN ('par_restore','par_repair','extract')")?;
+            let rows = statement.query_map([now()], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         for raw in raws {
             let mut op: Operation = serde_json::from_str(&raw)?;
+            if op.state == "retry" {
+                op.state = "running".into();
+                op.next_retry = 0;
+                save_operation(&self.db.lock().unwrap(), &op)?;
+            }
             let current = self.get(&op.artifact)?;
             let source_generation = if op.kind == "par_restore" {
-                let (source, _, _, _): (Artifact, PathBuf, PathBuf, Identity) =
-                    serde_json::from_str(&op.request)?;
+                let tuple: serde_json::Value = serde_json::from_str(&op.request)?;
+                if tuple.as_array().is_some_and(|fields| fields.len() == 4) {
+                    // Old journals did not carry content proof for the
+                    // ctime-changing rename transition. Preserve the files
+                    // and require explicit review instead of failing startup
+                    // or inventing authority from today's bytes.
+                    op.state = "review".into();
+                    op.error = Some("legacy restore journal lacks rename content proof".into());
+                    save_operation(&self.db.lock().unwrap(), &op)?;
+                    continue;
+                }
+                let (source, _, _, _, _): (Artifact, PathBuf, PathBuf, Identity, String) =
+                    serde_json::from_value(tuple)?;
                 source.generation
             } else {
                 let workspace: Workspace = serde_json::from_str(&op.request)?;
@@ -509,30 +1027,91 @@ impl Inventory {
             }
             let result = (|| -> Result<()> {
                 if op.kind == "par_restore" {
-                    let (mut source, old, new, identity): (Artifact, PathBuf, PathBuf, Identity) =
-                        serde_json::from_str(&op.request)?;
+                    let (mut source, old, new, identity, digest): (
+                        Artifact,
+                        PathBuf,
+                        PathBuf,
+                        Identity,
+                        String,
+                    ) = serde_json::from_str(&op.request)?;
                     let root = self.verify(&source)?;
                     let before = fs::open_relative(&root, &old.to_string_lossy());
                     let after = fs::open_relative(&root, &new.to_string_lossy());
+                    let before_identity = match &before {
+                        Ok(file) => Some(fs::identity_for_file(file)?),
+                        Err(_) => None,
+                    };
+                    let after_identity = match &after {
+                        Ok(file) => Some(fs::identity_for_file(file)?),
+                        Err(_) => None,
+                    };
+                    let needs_hash = matches!(
+                        (&before, &after),
+                        (Ok(_), Ok(_)) | (Ok(_), Err(_)) | (Err(_), Ok(_))
+                    );
+                    let (before_digest, after_digest) = if needs_hash {
+                        drop(guard.take());
+                        let before_digest = before
+                            .as_ref()
+                            .ok()
+                            .map(|file| digest_open(&mut file.try_clone()?))
+                            .transpose()?;
+                        let after_digest = after
+                            .as_ref()
+                            .ok()
+                            .map(|file| digest_open(&mut file.try_clone()?))
+                            .transpose()?;
+                        guard = Some(self.mutation_guard()?);
+                        let current_op = self.operation(&op.id)?;
+                        let current_source = self.get(&op.artifact)?;
+                        let before_rechecked = match &before {
+                            Ok(file) => Some(fs::identity_for_file(file)?),
+                            Err(_) => None,
+                        };
+                        let after_rechecked = match &after {
+                            Ok(file) => Some(fs::identity_for_file(file)?),
+                            Err(_) => None,
+                        };
+                        if current_op.state != "running"
+                            || current_source.generation != source.generation
+                            || current_source.path != source.path
+                            || before_rechecked != before_identity
+                            || after_rechecked != after_identity
+                        {
+                            return Err(Error::Conflict(
+                                "restore authority changed while verifying content".into(),
+                            ));
+                        }
+                        (before_digest, after_digest)
+                    } else {
+                        (None, None)
+                    };
                     match (before, after) {
-                        (Ok(before), Ok(after))
-                            if fs::identity(&before.metadata()?) == identity
-                                && fs::identity(&after.metadata()?) == identity =>
+                        (Ok(_), Ok(_))
+                            if before_identity.as_ref() == Some(&identity)
+                                && after_identity.as_ref().is_some_and(|observed| {
+                                    rename_transition_matches(&identity, observed)
+                                })
+                                && after_digest.as_deref() == Some(digest.as_str()) =>
                         {
                             fs::rename_exclusive(&source.path.join(&old), &source.path.join(&new))?;
                         }
-                        (Ok(file), Err(Error::Io(e)))
+                        (Ok(_file), Err(Error::Io(e)))
                             if e.kind() == std::io::ErrorKind::NotFound
-                                && fs::identity(&file.metadata()?) == identity =>
+                                && before_identity.as_ref() == Some(&identity)
+                                && before_digest.as_deref() == Some(digest.as_str()) =>
                         {
                             if let Some(parent) = new.parent() {
                                 crate::fileops::parents(&source.path, parent)?;
                             }
                             fs::rename_exclusive(&source.path.join(&old), &source.path.join(&new))?;
                         }
-                        (Err(Error::Io(e)), Ok(file))
+                        (Err(Error::Io(e)), Ok(_file))
                             if e.kind() == std::io::ErrorKind::NotFound
-                                && fs::identity(&file.metadata()?) == identity => {}
+                                && after_identity.as_ref().is_some_and(|observed| {
+                                    rename_transition_matches(&identity, observed)
+                                })
+                                && after_digest.as_deref() == Some(digest.as_str()) => {}
                         _ => {
                             return Err(Error::Conflict(
                                 "interrupted restore has ambiguous identities".into(),
@@ -548,39 +1127,82 @@ impl Inventory {
                     save_operation(&tx, &op)?;
                     tx.commit()?;
                 } else {
-                    let workspace: Workspace = serde_json::from_str(&op.request)?;
+                    let mut workspace: Workspace = serde_json::from_str(&op.request)?;
                     self.verify(&workspace.scratch)?;
                     self.verify_workspace_attempts(&workspace)?;
                     let root = self.verify(&workspace.source)?;
                     for entry in workspace
                         .source
                         .files
-                        .iter()
+                        .iter_mut()
                         .filter(|e| !e.identity.directory)
                     {
-                        let path = workspace.retained.get(&entry.path).unwrap_or(&entry.path);
-                        if fs::identity(&fs::open_relative(&root, path)?.metadata()?)
-                            != entry.identity
-                        {
-                            return Err(Error::Conflict(
-                                "interrupted transform input changed".into(),
-                            ));
+                        let path = workspace
+                            .retained
+                            .get(&entry.path)
+                            .unwrap_or(&entry.path)
+                            .clone();
+                        let file = fs::open_relative(&root, &path)?;
+                        let observed = fs::identity_for_file(&file)?;
+                        if observed != entry.identity {
+                            let proof = workspace.retained_digests.get(&entry.path);
+                            let digest_matches = if let Some(digest) = proof {
+                                drop(guard.take());
+                                let actual = digest_open(&mut file.try_clone()?)?;
+                                guard = Some(self.mutation_guard()?);
+                                let current_op = self.operation(&op.id)?;
+                                let current_source = self.get(&op.artifact)?;
+                                if current_op.state != "running"
+                                    || current_source.generation != workspace.source.generation
+                                    || fs::identity_for_file(&file)? != observed
+                                {
+                                    return Err(Error::Conflict(
+                                        "transform authority changed while verifying content"
+                                            .into(),
+                                    ));
+                                }
+                                actual == *digest
+                            } else {
+                                false
+                            };
+                            if !workspace.retained.contains_key(&entry.path)
+                                || !rename_transition_matches(&entry.identity, &observed)
+                                || !digest_matches
+                            {
+                                return Err(Error::Conflict(
+                                    "interrupted transform input changed".into(),
+                                ));
+                            }
+                            entry.identity = observed;
                         }
                     }
+                    op.request = serde_json::to_string(&workspace)?;
+                    save_operation(&self.db.lock().unwrap(), &op)?;
                 }
                 Ok(())
             })();
             if let Err(error) = result {
-                op.state = "review".into();
+                if guard.is_none() {
+                    guard = Some(self.mutation_guard()?);
+                }
                 op.error = Some(error.to_string());
-                let mut source = self.get(&op.artifact)?;
-                source.hold = Some("review: interrupted transform".into());
-                source.keep = true;
-                let mut db = self.db.lock().unwrap();
-                let tx = db.transaction()?;
-                save_artifact(&tx, &source)?;
-                save_operation(&tx, &op)?;
-                tx.commit()?;
+                if matches!(error, Error::Io(_)) {
+                    op.attempts = op.attempts.saturating_add(1);
+                    let delay = [30, 60, 120, 300][op.attempts.saturating_sub(1).min(3) as usize];
+                    op.state = "retry".into();
+                    op.next_retry = now().saturating_add(delay);
+                    save_operation(&self.db.lock().unwrap(), &op)?;
+                } else {
+                    op.state = "review".into();
+                    let mut source = self.get(&op.artifact)?;
+                    source.hold = Some("review: interrupted transform".into());
+                    source.keep = true;
+                    let mut db = self.db.lock().unwrap();
+                    let tx = db.transaction()?;
+                    save_artifact(&tx, &source)?;
+                    save_operation(&tx, &op)?;
+                    tx.commit()?;
+                }
             }
         }
         Ok(())
@@ -615,7 +1237,7 @@ impl Inventory {
         let root = self.verify(&source)?;
         for entry in source.files.iter().filter(|e| !e.identity.directory) {
             let file = fs::open_relative(&root, &entry.path)?;
-            if fs::identity(&file.metadata()?) != entry.identity {
+            if fs::identity_for_file(&file)? != entry.identity {
                 return Err(Error::Conflict(
                     "post-processing input changed; review required".into(),
                 ));
@@ -733,5 +1355,102 @@ mod tests {
             std::fs::read(reused.scratch.path.join("repaired.bin")).unwrap(),
             b"verified output"
         );
+    }
+
+    #[test]
+    fn verified_par_repair_output_survives_restart_as_generation_bound_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("downloads");
+        std::fs::create_dir(&root).unwrap();
+        let state = temp.path().join("state");
+        let inventory = Inventory::open(&state).unwrap();
+        let source = root.join("job");
+        inventory
+            .allocate_for_delivery(5, &root, &source, true, true)
+            .unwrap();
+        std::fs::write(source.join("episode.mkv"), b"damaged direct media").unwrap();
+
+        let mut workspace = inventory.workspace(5, "par_repair", "abc").unwrap();
+        inventory
+            .retain_transform_original(&mut workspace, "episode.mkv")
+            .unwrap();
+        // The repair layer calls this only after PAR full-digest validation
+        // and checked publication into the source generation.
+        let repaired = b"repaired PAR-verified bytes";
+        std::fs::write(source.join("episode.mkv"), repaired).unwrap();
+        inventory
+            .finish_repair_workspace(&workspace, &["episode.mkv".into()])
+            .unwrap();
+        drop(inventory);
+
+        let inventory = Inventory::open(&state).unwrap();
+        let (_, verified) = inventory.verified_transform_evidence(5).unwrap();
+        assert!(verified.contains("episode.mkv"));
+        assert_eq!(
+            std::fs::read(source.join("episode.mkv")).unwrap(),
+            b"repaired PAR-verified bytes"
+        );
+        assert_eq!(
+            std::fs::read(source.join(workspace.retained.get("episode.mkv").unwrap())).unwrap(),
+            b"damaged direct media"
+        );
+        let source_artifact = inventory.for_job(5).unwrap().unwrap();
+        let selected = source_artifact
+            .files
+            .iter()
+            .find(|entry| entry.path == "episode.mkv")
+            .unwrap()
+            .clone();
+        let completed = temp.path().join("completed");
+        std::fs::create_dir(&completed).unwrap();
+        let outcome = DeliveryFileOutcome {
+            source_path: "episode.mkv".into(),
+            publication_path: Some("episode.mkv".into()),
+            classification: "media".into(),
+            outcome: "published".into(),
+            reason: Some("PAR digest-validated repair output".into()),
+            source_cleanup_status: "pending".into(),
+        };
+        let publication = inventory
+            .publish_selected_for_delivery_checked(
+                5,
+                &completed.join("release.runner-generation"),
+                vec![selected],
+                vec![outcome],
+                &|| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read(publication.published_path.join("episode.mkv")).unwrap(),
+            repaired
+        );
+    }
+
+    #[test]
+    fn changed_par_repair_output_is_not_retrusted_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("downloads");
+        std::fs::create_dir(&root).unwrap();
+        let state = temp.path().join("state");
+        let inventory = Inventory::open(&state).unwrap();
+        let source = root.join("job");
+        inventory.allocate(5, &root, &source).unwrap();
+        std::fs::write(source.join("episode.mkv"), b"damaged direct media").unwrap();
+
+        let mut workspace = inventory.workspace(5, "par_repair", "abc").unwrap();
+        inventory
+            .retain_transform_original(&mut workspace, "episode.mkv")
+            .unwrap();
+        let repaired = b"repaired PAR-verified bytes";
+        std::fs::write(source.join("episode.mkv"), repaired).unwrap();
+        inventory
+            .finish_repair_workspace(&workspace, &["episode.mkv".into()])
+            .unwrap();
+        drop(inventory);
+
+        std::fs::write(source.join("episode.mkv"), vec![b'x'; repaired.len()]).unwrap();
+        let inventory = Inventory::open(&state).unwrap();
+        let (_, verified) = inventory.verified_transform_evidence(5).unwrap();
+        assert!(!verified.contains("episode.mkv"));
     }
 }

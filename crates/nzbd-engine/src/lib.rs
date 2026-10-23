@@ -34,11 +34,12 @@ pub use snapshot::{
 };
 
 use nzbd_nntp::transport::{tls_client_config, TlsClientConfig};
-use nzbd_types::{JobId, ServerDef, TlsMode};
+use nzbd_types::{Job, JobId, ServerDef, TlsMode};
 use owner::{EngineMsg, Owner, QueueCommand};
 use rate::{RateLimiter, SpeedMeter};
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -62,6 +63,24 @@ pub fn is_out_of_space(msg: &str) -> bool {
         || lower.contains("no storage space")
 }
 
+fn fetch_retry_state(job: &Job) -> crate::fetch::FetchRetryState {
+    let value = |key: &str| {
+        job.params
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    };
+    crate::fetch::FetchRetryState {
+        attempts: value(crate::fetch::RETRY_ATTEMPT_PARAM)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        next_retry_at: value(crate::fetch::NEXT_RETRY_PARAM).and_then(|value| value.parse().ok()),
+        blocked_since: value(crate::fetch::BLOCKED_SINCE_PARAM)
+            .and_then(|value| value.parse().ok()),
+        last_error: value(crate::fetch::LAST_ERROR_PARAM).map(str::to_string),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("invalid NZB: {0}")]
@@ -72,6 +91,10 @@ pub enum EngineError {
     Tls(String),
     #[error("file lifecycle: {0}")]
     Lifecycle(String),
+    #[error("request token conflict: {0}")]
+    RequestConflict(String),
+    #[error("request-token admission could not be durably saved")]
+    AdmissionNotDurable,
     #[error("engine is shutting down")]
     Closed,
 }
@@ -302,7 +325,7 @@ impl Engine {
         // process — re-spawn one per unique URL below (once the handle
         // exists) and fail same-URL pile-ups as duplicates.
         let (refetch, refetch_dupes) =
-            crate::owner::plan_url_refetches(owner.pending_url_fetches());
+            crate::owner::plan_url_refetches_scoped(owner.pending_url_fetches());
 
         // Multi-root free-space prober — OFF the owner loop and startup
         // critical path. Each root has its own blocking task and deadline,
@@ -385,11 +408,18 @@ impl Engine {
             tracker,
             backend_adapter: Arc::new(std::sync::Mutex::new(Some(backend_adapter))),
             budget_tracker,
+            url_fetches: Arc::new(Mutex::new(HashSet::new())),
         };
 
         for (job, url) in refetch {
             tracing::info!(job = job.0, %url, "re-spawning NZB fetch for job recovered mid-fetch");
-            handle.spawn_url_fetch(job, url);
+            let retry_state = handle
+                .export_job(job)
+                .await?
+                .as_ref()
+                .map(fetch_retry_state)
+                .unwrap_or_default();
+            handle.spawn_url_fetch(job, url, retry_state);
         }
         for (job, original) in refetch_dupes {
             let h = handle.clone();
@@ -431,6 +461,10 @@ pub struct AddOpts {
     /// `Parameters` with no second write path. `*`-prefixed keys are
     /// reserved for internals and are rejected at the API edge.
     pub params: Vec<(String, String)>,
+    /// Tags supplied through the qBittorrent compatibility API. They are
+    /// persisted only after duplicate-hash detection succeeds, so a repeated
+    /// add cannot relabel an existing torrent with a new transfer token.
+    pub torrent_tags: Vec<String>,
     /// Who asked for this job (`monarr`, `Sonarr`, `web-ui`), from the
     /// request's client header. Stored as the reserved `*Client` param and
     /// used to name a job whose own documents name it nothing —
@@ -452,6 +486,15 @@ fn with_client(mut params: Vec<(String, String)>, client: Option<String>) -> Vec
     params
 }
 
+fn validate_external_params(params: &[(String, String)]) -> Result<(), EngineError> {
+    if params.iter().any(|(key, _)| key.starts_with('*')) {
+        return Err(EngineError::RequestConflict(
+            "job parameters cannot set Runner internal keys".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Cloneable handle to a running engine.
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -463,6 +506,20 @@ pub struct EngineHandle {
     tracker: TaskTracker,
     backend_adapter: Arc<std::sync::Mutex<Option<backend::BackendAdapterPort>>>,
     budget_tracker: Arc<pool::BudgetTracker>,
+    url_fetches: Arc<Mutex<HashSet<JobId>>>,
+}
+
+struct UrlFetchGuard {
+    jobs: Arc<Mutex<HashSet<JobId>>>,
+    job: JobId,
+}
+
+impl Drop for UrlFetchGuard {
+    fn drop(&mut self) {
+        if let Ok(mut jobs) = self.jobs.lock() {
+            jobs.remove(&self.job);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -523,6 +580,8 @@ impl EngineHandle {
         secret: Vec<u8>,
         opts: AddOpts,
     ) -> Result<JobId, EngineError> {
+        validate_external_params(&opts.params)?;
+        validate_torrent_tags(&opts.torrent_tags)?;
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::ReserveTorrentAdmission {
             source,
@@ -543,6 +602,8 @@ impl EngineHandle {
         opts: AddOpts,
         record: nzbd_types::TorrentRecord,
     ) -> Result<Option<Result<JobId, JobId>>, EngineError> {
+        validate_external_params(&opts.params)?;
+        validate_torrent_tags(&opts.torrent_tags)?;
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::CommitTorrentAdmission {
             job,
@@ -593,15 +654,16 @@ impl EngineHandle {
     /// is fetched in the background, then the job queues like any other.
     /// A fetch/parse failure fails the job (history: `FAILURE/FETCH`).
     ///
-    /// Adding a URL that is already `Fetching` returns the existing job's
-    /// id instead of creating a duplicate (clients re-add when a fetch
-    /// looks stalled; each retry must not queue another copy).
+    /// A transfer-token URL admission is durably idempotent across terminal
+    /// jobs, history clearing, and restart. Reusing its token with changed
+    /// submission fields returns a conflict.
     pub async fn add_url(
         &self,
         name: &str,
         url: &str,
         opts: AddOpts,
     ) -> Result<JobId, EngineError> {
+        validate_external_params(&opts.params)?;
         // Name the placeholder through the same junk-stripper the fetched
         // NZB's metadata pass uses, not a raw `rsplit('/')`: indexer URLs
         // glue query params after the filename ("…af51ab….nzb&i=…&r=<key>")
@@ -629,23 +691,82 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        let (id, created) = rx.await.map_err(|_| EngineError::Closed)?;
+        let (id, created) = rx.await.map_err(|_| EngineError::Closed)??;
         if created {
-            self.spawn_url_fetch(id, url.to_string());
+            self.spawn_url_fetch(
+                id,
+                url.to_string(),
+                crate::fetch::FetchRetryState::default(),
+            );
         }
         Ok(id)
+    }
+
+    /// Look up the durable outcome for one transfer token, including after
+    /// its visible queue/history row has been removed.
+    pub async fn url_admission(
+        &self,
+        request_token: &str,
+    ) -> Result<Option<nzbd_state::UrlAdmissionReceipt>, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::GetUrlAdmission {
+            request_token: request_token.to_string(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| EngineError::Closed)
     }
 
     /// Background NZB download for a URL job. Shutdown-aware: an in-flight
     /// fetch aborts on cancel instead of holding graceful shutdown open for
     /// up to the 60 s hop timeout.
-    fn spawn_url_fetch(&self, id: JobId, url: String) {
+    fn spawn_url_fetch(&self, id: JobId, url: String, retry_state: crate::fetch::FetchRetryState) {
+        if let Ok(mut jobs) = self.url_fetches.lock() {
+            if !jobs.insert(id) {
+                return;
+            }
+        } else {
+            return;
+        }
         let handle = self.clone();
         self.tracker.spawn(async move {
+            let _fetch_guard = UrlFetchGuard { jobs: handle.url_fetches.clone(), job: id };
+            let mut events = handle.subscribe();
             let fetched = tokio::select! {
                 _ = handle.cancel.cancelled() => return, // shutting down
-                r = crate::fetch::http_get(&url) => r,
+                _ = async {
+                    loop {
+                        match events.recv().await {
+                            Ok(Event::JobDeleted { job }) if job == id => break,
+                            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                } => return,
+                r = crate::fetch::http_get_observed(&url, retry_state, {
+                    let progress_handle = handle.clone();
+                    move |progress| {
+                        let progress_handle = progress_handle.clone();
+                        async move {
+                            loop {
+                                if progress_handle.cancel.is_cancelled() {
+                                    return false;
+                                }
+                                match progress_handle.record_url_fetch_progress(id, progress.clone()).await {
+                                    Ok(active) => return active,
+                                    Err(error) => {
+                                        tracing::warn!(job = id.0, %error, "could not persist URL fetch retry progress; waiting before retrying persistence");
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }) => r,
             };
+            if matches!(fetched, Err(crate::fetch::FetchError::Cancelled)) {
+                return;
+            }
             let outcome = match fetched {
                 Ok(bytes) => match nzbd_nzb::parse(&bytes) {
                     Ok(parsed) => Ok(parsed),
@@ -683,7 +804,7 @@ impl EngineHandle {
             }
             if let Some(job) = self.export_job(summary.id).await? {
                 if let Some((_, url)) = job.params.iter().find(|(key, _)| key == "*URL") {
-                    self.spawn_url_fetch(job.id, url.clone());
+                    self.spawn_url_fetch(job.id, url.clone(), fetch_retry_state(&job));
                 }
             }
         }
@@ -701,6 +822,21 @@ impl EngineHandle {
         rx.await.map_err(|_| EngineError::Closed)
     }
 
+    async fn record_url_fetch_progress(
+        &self,
+        job_id: JobId,
+        progress: crate::fetch::FetchRetryState,
+    ) -> Result<bool, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::UpdateUrlFetchProgress {
+            job: job_id,
+            progress,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| EngineError::Closed)
+    }
+
     /// [`EngineHandle::add_nzb`] with the full option set (dupe metadata,
     /// add-paused).
     pub async fn add_nzb_opts(
@@ -709,6 +845,7 @@ impl EngineHandle {
         content: &[u8],
         opts: AddOpts,
     ) -> Result<JobId, EngineError> {
+        validate_external_params(&opts.params)?;
         let parsed = nzbd_nzb::parse(content)?;
         let name = crate::queue::clean_job_name(name, &parsed);
         let (tx, rx) = oneshot::channel();
@@ -919,6 +1056,14 @@ impl EngineHandle {
             reply,
         })
         .await
+    }
+
+    /// Persist the operator's per-download choice to retain the processing
+    /// source if this job fails. This flag is independent from Runner's
+    /// custody state and is never set implicitly by handoff.
+    pub async fn set_keep_on_failure(&self, job: JobId, keep: bool) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::SetKeepOnFailure { job, keep, reply })
+            .await
     }
 
     pub async fn set_category(
@@ -1383,6 +1528,45 @@ impl EngineHandle {
     }
 }
 
+/// Reserved durable queue key for qBittorrent tag passthrough. Admission
+/// callers cannot set it through `params`; only the typed torrent option is
+/// copied here by the queue owner after duplicate detection.
+pub const QBIT_TAGS_PARAM: &str = "*Qbit:Tags";
+
+fn validate_torrent_tags(tags: &[String]) -> Result<(), EngineError> {
+    let mut seen = HashSet::new();
+    let mut transfer_seen = false;
+    let invalid = tags.len() > 32
+        || tags.iter().any(|tag| {
+            let duplicate = !seen.insert(tag);
+            let invalid_transfer = if let Some(token) = tag.strip_prefix("monarr-transfer-") {
+                let invalid = transfer_seen
+                    || token.is_empty()
+                    || token.len() > 128
+                    || !token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+                transfer_seen = true;
+                invalid
+            } else {
+                false
+            };
+            duplicate
+                || invalid_transfer
+                || tag.is_empty()
+                || tag.len() > 256
+                || tag.contains(',')
+                || tag.chars().any(char::is_control)
+        })
+        || tags.iter().map(String::len).sum::<usize>() + tags.len().saturating_sub(1) > 1024;
+    if invalid {
+        return Err(EngineError::RequestConflict(
+            "qBittorrent tags are malformed or exceed supported count or size limits".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod out_of_space_tests {
     use super::is_out_of_space;
@@ -1405,11 +1589,19 @@ mod out_of_space_tests {
 
 #[cfg(test)]
 mod torrent_admission_persistence_tests {
-    use super::{AddOpts, Engine, EngineConfig, EngineError, Tuning};
+    use super::{validate_external_params, AddOpts, Engine, EngineConfig, EngineError, Tuning};
     use nzbd_state::torrent_sources::PendingSourceStore;
     use nzbd_types::TorrentSource;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn external_params_cannot_set_qbit_tags() {
+        let error =
+            validate_external_params(&[("*Qbit:Tags".into(), "monarr-transfer-forged".into())])
+                .expect_err("qBittorrent tags are an internal persisted field");
+        assert!(error.to_string().contains("Runner internal keys"));
+    }
 
     #[tokio::test]
     async fn cancellation_reports_snapshot_failure_and_keeps_recovery_evidence() {

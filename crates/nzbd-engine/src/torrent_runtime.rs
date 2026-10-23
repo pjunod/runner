@@ -727,6 +727,7 @@ mod tests {
             name: "not logged".into(),
             dir_name: "torrent".into(),
             name_provisional: false,
+            delivery_lifecycle: false,
             queued_at_unix: 1,
             original_name: String::new(),
             category: None,

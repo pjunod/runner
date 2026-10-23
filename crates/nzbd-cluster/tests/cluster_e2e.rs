@@ -1284,7 +1284,7 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
 
     let src = tempfile::tempdir().unwrap();
     let payload = prng_bytes(77, 90_000);
-    std::fs::write(src.path().join("payload.bin"), &payload).unwrap();
+    std::fs::write(src.path().join("payload.mkv"), &payload).unwrap();
     let ok = std::process::Command::new("par2")
         .args([
             "create",
@@ -1293,14 +1293,14 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
             "-s8192",
             "-c4",
             "set.par2",
-            "payload.bin",
+            "payload.mkv",
         ])
         .current_dir(src.path())
         .status()
         .expect("par2 binary required (apt-get install par2)")
         .success();
     assert!(ok, "par2 create failed");
-    let mut files: Vec<(String, Vec<u8>)> = vec![("payload.bin".into(), payload.clone())];
+    let mut files: Vec<(String, Vec<u8>)> = vec![("payload.mkv".into(), payload.clone())];
     let mut pars: Vec<_> = std::fs::read_dir(src.path())
         .unwrap()
         .flatten()
@@ -1402,7 +1402,7 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
     .await;
 
     // Payload survived PP bit-identically (no repair was needed).
-    let got = std::fs::read(tmp.path().join("complete/pardl/payload.bin")).unwrap();
+    let got = std::fs::read(tmp.path().join("complete/pardl/payload.mkv")).unwrap();
     assert_eq!(got, payload);
 
     // No staging residue in the job dir.

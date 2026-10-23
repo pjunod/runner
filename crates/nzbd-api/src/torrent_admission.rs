@@ -367,6 +367,7 @@ impl TorrentAdmissionService {
                 stop_seeding_on_complete: pending.stop_seeding_on_complete,
                 params: pending.params.clone(),
                 client: pending.client.clone(),
+                torrent_tags: pending.torrent_tags.clone(),
                 ..Default::default()
             };
             let attempt: Result<AdmissionResult, AdmissionError> = async {
@@ -2496,7 +2497,7 @@ mod tests {
 
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(state.join("queue.json")).unwrap()).unwrap();
-        assert_eq!(raw["schema_version"], 4);
+        assert_eq!(raw["schema_version"], nzbd_state::QUEUE_SCHEMA_VERSION);
         assert_eq!(raw["pending_admissions"][0]["job_id"], job.0);
         assert_eq!(raw["pending_admissions"][0]["source"], "url");
         assert_eq!(

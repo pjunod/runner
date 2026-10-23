@@ -372,11 +372,8 @@ impl Inventory {
             at_dir(fs::open_dir(&published), "open", &published)?;
             let scratch = staging.join(&r.id);
             at(std::fs::create_dir(&scratch), "create", &scratch)?;
-            r.scratch_identity = Some(fs::identity(&at(
-                at_dir(fs::open_dir(&scratch), "open", &scratch)?.metadata(),
-                "stat",
-                &scratch,
-            )?));
+            let scratch_dir = at_dir(fs::open_dir(&scratch), "open", &scratch)?;
+            r.scratch_identity = Some(fs::identity_for_file(&scratch_dir)?);
             sync_dir_lenient(&staging)?;
             save(&self.db.lock().unwrap(), &r)?;
             let payload = scratch.join("payload");
@@ -390,12 +387,7 @@ impl Inventory {
                     "open source file",
                     Path::new(&f.path),
                 )?;
-                if fs::identity(&at(
-                    input.metadata(),
-                    "stat source file",
-                    Path::new(&f.path),
-                )?) != f.identity
-                {
+                if fs::identity_for_file(&input)? != f.identity {
                     return Err(Error::Conflict("source identity changed".into()));
                 }
                 let target = payload.join(&f.path);
@@ -409,7 +401,7 @@ impl Inventory {
                 let sha256 = digest(&mut at(File::open(&target), "open copy", &target)?)?;
                 if bytes != f.identity.bytes
                     || sha256 != source_hash
-                    || fs::identity(&input.metadata()?) != f.identity
+                    || fs::identity_for_file(&input)? != f.identity
                 {
                     return Err(Error::Conflict(
                         "source changed while copying; original remains held".into(),
@@ -445,7 +437,7 @@ impl Inventory {
             sync_dir_lenient(&staging)?;
             // Journal the complete manifest before publication. Crash recovery
             // may validate it and finish the acknowledgement without recopying.
-            let _publication_guard = self.mutation_guard()?;
+            let mut publication_guard = Some(self.mutation_guard()?);
             if self.recovery(&r.id)?.state == "cancel_pending" {
                 return Err(Error::Conflict("staging cancelled".into()));
             }
@@ -453,6 +445,7 @@ impl Inventory {
             save(&self.db.lock().unwrap(), &r)?;
             let publication_key = format!("recovery-{}", r.id);
             let published_tree = self.publish_directory_unlocked(
+                &mut publication_guard,
                 &scratch,
                 &r.published,
                 &r.artifact,
@@ -533,6 +526,7 @@ impl Inventory {
             .ok_or_else(|| Error::Conflict("invalid recovery root".into()))?;
         let scratch = root.join(".staging").join(&r.id);
         let result = (|| {
+            let mut publication_guard = Some(self.mutation_guard()?);
             if r.state != "publishing" {
                 return Err(Error::Conflict("copy interrupted before its complete manifest was durable; inspect retained staging".into()));
             }
@@ -543,6 +537,7 @@ impl Inventory {
                 || !r.published.try_exists()?
             {
                 let tree = self.publish_directory_unlocked(
+                    &mut publication_guard,
                     &scratch,
                     &r.published,
                     &r.artifact,
@@ -557,7 +552,7 @@ impl Inventory {
                 &scratch
             };
             let dir = fs::open_dir(location)?;
-            let observed = fs::identity(&dir.metadata()?);
+            let observed = fs::identity_for_file(&dir)?;
             if !r
                 .publication_identity
                 .as_ref()
@@ -624,7 +619,7 @@ impl Inventory {
         Ok(r)
     }
     pub fn reconcile_recoveries(&self) -> Result<()> {
-        let _guard = self.mutation_guard()?;
+        let mut guard = Some(self.mutation_guard()?);
         let pending = {
             let db = self.db.lock().unwrap();
             let mut stmt = db.prepare(
@@ -633,6 +628,7 @@ impl Inventory {
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
+        drop(guard.take());
         for raw in pending {
             self.resume_publication(serde_json::from_str(&raw)?)?;
         }
@@ -874,7 +870,7 @@ impl Inventory {
                 Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
             };
-            if fs::identity(&file.metadata()?) != entry.identity
+            if fs::identity_for_file(&file)? != entry.identity
                 || digest(&mut file)? != selected.sha256
             {
                 return Err(Error::Conflict(
@@ -908,7 +904,7 @@ impl Inventory {
         if remaining.is_empty() {
             let root = self.verify_root(&a)?;
             let current = fs::open_at(&root, a.path.file_name().unwrap().as_ref(), true)?;
-            let observed = fs::identity(&current.metadata()?);
+            let observed = fs::identity_for_file(&current)?;
             if !a
                 .identity
                 .as_ref()

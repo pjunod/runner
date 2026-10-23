@@ -8,7 +8,11 @@ fn fixture() -> (tempfile::TempDir, Inventory, PathBuf, PathBuf) {
     std::fs::create_dir(&ordinary).unwrap();
     let inventory = Inventory::open(&temp.path().join("state")).unwrap();
     let path = source.join("job");
-    inventory.allocate(91, &source, &path).unwrap();
+    // These cases exercise the post-upgrade automatic retirement path. The
+    // legacy cohort remains covered separately and must stay fenced.
+    inventory
+        .allocate_for_delivery(91, &source, &path, true, false)
+        .unwrap();
     std::fs::write(path.join("media.mkv"), b"PAR_FAILURE retained input").unwrap();
     (temp, inventory, path, ordinary.join("job"))
 }
@@ -60,12 +64,80 @@ fn unsupported_flagged_rename_publishes_without_a_registry_or_feature_gate() {
     assert_eq!(result.operation_id, repeated.operation_id);
     assert_eq!(result.generation, repeated.generation);
 }
+
+#[test]
+fn hardlink_fallback_retires_nested_source_with_private_target_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_root = temp.path().join("downloads");
+    let target_root = temp.path().join("ordinary");
+    std::fs::create_dir(&source_root).unwrap();
+    std::fs::create_dir(&target_root).unwrap();
+    let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+    let source = source_root.join("job");
+    inventory
+        .allocate_for_delivery(93, &source_root, &source, true, false)
+        .unwrap();
+    std::fs::create_dir(source.join("Season 1")).unwrap();
+    std::fs::write(source.join("Season 1/episode.mkv"), b"nested payload").unwrap();
+    inventory
+        .finish(93, &source, &source_root, "active")
+        .unwrap();
+
+    fs::RENAME_FAILURE.with(|f| f.set(Some(libc::EINVAL)));
+    let target = target_root.join("job");
+    inventory.relocate(93, &target).unwrap();
+    assert_eq!(
+        std::fs::read(target.join("Season 1/episode.mkv")).unwrap(),
+        b"nested payload"
+    );
+    assert!(!source.exists());
+}
+
+#[test]
+fn restart_refreshes_hardlink_identity_after_source_unlink() {
+    let (temp, inventory, source, target) = fixture();
+    fs::RENAME_FAILURE.with(|f| f.set(Some(libc::EINVAL)));
+    super::relocation::FAIL_SOURCE_UNLINK_REFRESH.with(|fail| fail.set(true));
+    let relocation = inventory.relocate(91, &target).unwrap();
+    assert!(
+        !source.exists(),
+        "source unlink completed before injected crash"
+    );
+    assert_eq!(
+        inventory.operation(&relocation.operation_id).unwrap().state,
+        "succeeded"
+    );
+    drop(inventory);
+
+    let reopened = Inventory::open(&temp.path().join("state")).unwrap();
+    reopened.reconcile_relocations().unwrap();
+    let artifact = reopened.for_job(91).unwrap().unwrap();
+    let observed = fs::manifest(&fs::open_dir(&target).unwrap(), 100_000).unwrap();
+    assert_eq!(artifact.files, observed);
+    let operation = reopened.operation(&relocation.operation_id).unwrap();
+    let movement: serde_json::Value = serde_json::from_str(&operation.request).unwrap();
+    assert_eq!(movement["cleanup_done"], true);
+}
+
 #[test]
 fn lost_commit_acknowledgement_reconciles_same_publication() {
     let (_temp, inventory, _source, target) = fixture();
     FAULTS.with(|f| f.borrow_mut().insert("registry_commit", libc::EIO));
     assert!(inventory.relocate(91, &target).is_err());
     assert!(target.join("media.mkv").exists());
+    let operation = inventory
+        .pending_relocations(&inventory.for_job(91).unwrap().unwrap().id)
+        .unwrap()
+        .remove(0);
+    inventory
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE operations SET data=json_set(data,'$.next_retry',0) WHERE id=?1",
+            [&operation.id],
+        )
+        .unwrap();
     inventory.reconcile_relocations().unwrap();
     assert_eq!(
         inventory.relocate(91, &target).unwrap().published_path,
@@ -114,7 +186,7 @@ fn deleted_move_source_stays_deleted_when_its_path_is_reused() {
 }
 
 #[test]
-fn startup_restores_a_deletion_over_a_legacy_resurrected_move_source() {
+fn startup_fences_a_legacy_delete_without_generation_authority() {
     let (temp, inventory, source, target) = fixture();
     FAULTS.with(|f| f.borrow_mut().insert("before_move", libc::EINVAL));
     assert!(inventory.relocate(91, &target).is_err());
@@ -154,11 +226,12 @@ fn startup_restores_a_deletion_over_a_legacy_resurrected_move_source() {
     let reopened = Inventory::open(&temp.path().join("state")).unwrap();
     reopened.reconcile_startup(&[92]).unwrap();
     let restored = reopened.get(&old.id).unwrap();
-    assert_eq!(restored.state, "deleted");
-    assert!(restored.hold.is_none());
-    assert_eq!(
+    assert_eq!(restored.state, "retained");
+    assert!(restored.hold.is_some());
+    assert_ne!(
         reopened.operation(&stale_move.id).unwrap().state,
-        "cancelled"
+        "succeeded",
+        "a stale relocation cannot reauthorize legacy deletion"
     );
     assert_eq!(
         serde_json::to_value(reopened.get(&replacement.id).unwrap()).unwrap(),
@@ -217,12 +290,26 @@ fn pending_deletion_survives_relocation_reconciliation_without_losing_authorizat
         assert_eq!(inventory.get(&old.id).unwrap().revision, old.revision);
         if cancel {
             inventory.cancel_delete(&deletion.id).unwrap();
+            let pending = inventory.pending_relocations(&old.id).unwrap();
+            for operation in pending {
+                inventory
+                    .db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE operations SET data=json_set(data,'$.next_retry',0) WHERE id=?1",
+                        [&operation.id],
+                    )
+                    .unwrap();
+            }
             inventory.reconcile_relocations().unwrap();
             assert_eq!(
-                inventory.get(&old.id).unwrap().hold.as_deref(),
-                Some("review: interrupted move")
+                inventory.get(&old.id).unwrap().path,
+                source,
+                "cancelling deletion must not authorize a failed move or remove its source"
             );
             assert!(source.join("media.mkv").exists());
+            assert!(!target.exists());
         } else {
             assert_eq!(
                 inventory.execute_delete(&deletion.id).unwrap().state,

@@ -1,20 +1,27 @@
 //! Minimal HTTPS/HTTP fetcher for URL jobs (`AddUrl`): hyper HTTP/1.1 over
 //! the same rustls stack the NNTP transport uses. Follows up to 5
 //! redirects, caps bodies at 64 MiB (an NZB, not a payload), 60 s timeout
-//! per hop. Rate limits and service-unavailable responses get up to three
-//! retries, honoring Retry-After or backing off for 10, 20, then 40 seconds.
+//! per hop. Rate limits, service-unavailable responses and transient network
+//! failures retry the same durable URL job until success or a permanent
+//! response, honoring Retry-After or backing off for 30, 60, 120, then 300
+//! seconds indefinitely.
 
 use http_body_util::BodyExt;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
 use nzbd_types::CertLevel;
+use std::future::Future;
 use std::time::{Duration, SystemTime};
 use tokio::net::TcpStream;
 
 const MAX_REDIRECTS: usize = 5;
 const MAX_BODY: usize = 64 * 1024 * 1024;
 const HOP_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_RETRIES: u32 = 3;
+const RETRY_BACKOFF_SECONDS: [u64; 4] = [30, 60, 120, 300];
+pub(crate) const RETRY_ATTEMPT_PARAM: &str = "*URL:retry-attempt";
+pub(crate) const NEXT_RETRY_PARAM: &str = "*URL:next-retry-at";
+pub(crate) const BLOCKED_SINCE_PARAM: &str = "*URL:blocked-since";
+pub(crate) const LAST_ERROR_PARAM: &str = "*URL:last-error";
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
@@ -24,6 +31,8 @@ pub enum FetchError {
     Io(#[from] std::io::Error),
     #[error("http: {0}")]
     Http(String),
+    #[error("transient network error: {0}")]
+    TransientNetwork(String),
     #[error("http: status {status}")]
     HttpStatus {
         status: hyper::StatusCode,
@@ -33,6 +42,16 @@ pub enum FetchError {
     TooManyRedirects,
     #[error("timed out")]
     Timeout,
+    #[error("URL fetch stopped because its queue job is no longer fetching")]
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FetchRetryState {
+    pub attempts: u32,
+    pub next_retry_at: Option<i64>,
+    pub blocked_since: Option<i64>,
+    pub last_error: Option<String>,
 }
 
 struct Url {
@@ -74,12 +93,42 @@ fn parse_url(url: &str) -> Result<Url, FetchError> {
 
 /// GET a URL and return the body bytes.
 pub async fn http_get(url: &str) -> Result<Vec<u8>, FetchError> {
+    http_get_observed(url, FetchRetryState::default(), |_| async { true }).await
+}
+
+/// Retry transient acquisition failures while persisting the absolute retry
+/// deadline and elapsed-wait origin through `on_retry`. A restart can pass
+/// the saved state back in, preserving the same token-scoped attempt and
+/// honoring a provider's outstanding Retry-After delay.
+pub async fn http_get_observed<F, Fut>(
+    url: &str,
+    mut retry_state: FetchRetryState,
+    mut on_retry: F,
+) -> Result<Vec<u8>, FetchError>
+where
+    F: FnMut(FetchRetryState) -> Fut,
+    Fut: Future<Output = bool>,
+{
     let mut current = url.to_string();
     let mut redirects = 0;
-    let mut retries = 0;
+    if let Some(deadline) = retry_state.next_retry_at {
+        let wait = deadline.saturating_sub(unix_now()).max(0) as u64;
+        if wait > 0 {
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+        }
+    }
+    retry_state.next_retry_at = None;
+    if !on_retry(retry_state.clone()).await {
+        return Err(FetchError::Cancelled);
+    }
     loop {
         match tokio::time::timeout(HOP_TIMEOUT, get_once(&current)).await {
-            Err(_) => return Err(FetchError::Timeout),
+            Err(_) => {
+                let error = FetchError::Timeout;
+                if !wait_before_retry(&mut retry_state, &mut on_retry, &error, None).await {
+                    return Err(FetchError::Cancelled);
+                }
+            }
             Ok(Ok(Hop::Body(bytes))) => return Ok(bytes),
             Ok(Ok(Hop::Redirect(next))) => {
                 if redirects == MAX_REDIRECTS {
@@ -100,21 +149,60 @@ pub async fn http_get(url: &str) -> Result<Vec<u8>, FetchError> {
                 };
             }
             Ok(Err(e)) => {
-                let Some(delay) = retry_delay(&e, retries) else {
-                    return Err(e);
+                let retry_after = match &e {
+                    FetchError::HttpStatus { retry_after, .. } => *retry_after,
+                    _ => None,
                 };
-                // Reject unrepresentable server delays rather than overflowing
-                // the timer or retrying earlier than the server requested.
-                let Some(deadline) = tokio::time::Instant::now().checked_add(delay) else {
+                if retry_delay(&e, retry_state.attempts).is_none() {
                     return Err(e);
-                };
-                retries += 1;
-                // URLs can contain indexer credentials; never log them here.
-                tracing::warn!(error = %e, retry = retries, delay_secs = delay.as_secs(), "NZB fetch will retry");
-                tokio::time::sleep_until(deadline).await;
+                }
+                if !wait_before_retry(&mut retry_state, &mut on_retry, &e, retry_after).await {
+                    return Err(FetchError::Cancelled);
+                }
             }
         }
     }
+}
+
+async fn wait_before_retry<F, Fut>(
+    state: &mut FetchRetryState,
+    on_retry: &mut F,
+    error: &FetchError,
+    retry_after: Option<Duration>,
+) -> bool
+where
+    F: FnMut(FetchRetryState) -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let delay = retry_after.unwrap_or_else(|| retry_backoff(state.attempts));
+    let unix_deadline =
+        unix_now().saturating_add(i64::try_from(delay.as_secs()).unwrap_or(i64::MAX));
+    state.attempts = state.attempts.saturating_add(1);
+    state.blocked_since.get_or_insert_with(unix_now);
+    state.next_retry_at = Some(unix_deadline);
+    // Do not persist URLs or error bodies; errors from providers may contain
+    // credentials. The display string carries the useful stable diagnosis.
+    state.last_error = Some(error.to_string());
+    tracing::warn!(error = %error, retry = state.attempts, delay_secs = delay.as_secs(), "NZB fetch will retry");
+    if !on_retry(state.clone()).await {
+        return false;
+    }
+    let mut remaining = delay;
+    let chunk = Duration::from_secs(24 * 60 * 60);
+    while !remaining.is_zero() {
+        let wait = remaining.min(chunk);
+        tokio::time::sleep(wait).await;
+        remaining = remaining.saturating_sub(wait);
+    }
+    state.next_retry_at = None;
+    on_retry(state.clone()).await
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 fn retry_delay(error: &FetchError, retries: u32) -> Option<Duration> {
@@ -122,11 +210,22 @@ fn retry_delay(error: &FetchError, retries: u32) -> Option<Duration> {
         FetchError::HttpStatus {
             status,
             retry_after,
-        } if retries < MAX_RETRIES && matches!(status.as_u16(), 429 | 503) => {
-            Some(retry_after.unwrap_or_else(|| Duration::from_secs(10 * (1 << retries))))
+        } if matches!(status.as_u16(), 429 | 503) => {
+            Some(retry_after.unwrap_or_else(|| retry_backoff(retries)))
+        }
+        FetchError::Io(_) | FetchError::Timeout | FetchError::TransientNetwork(_) => {
+            Some(retry_backoff(retries))
         }
         _ => None,
     }
+}
+
+fn retry_backoff(retries: u32) -> Duration {
+    Duration::from_secs(
+        RETRY_BACKOFF_SECONDS[usize::try_from(retries)
+            .unwrap_or(usize::MAX)
+            .min(RETRY_BACKOFF_SECONDS.len() - 1)],
+    )
 }
 
 fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
@@ -167,7 +266,7 @@ where
 {
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
-        .map_err(|e| FetchError::Http(e.to_string()))?;
+        .map_err(|e| FetchError::TransientNetwork(e.to_string()))?;
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -180,7 +279,7 @@ where
     let resp = sender
         .send_request(req)
         .await
-        .map_err(|e| FetchError::Http(e.to_string()))?;
+        .map_err(|e| FetchError::TransientNetwork(e.to_string()))?;
     let status = resp.status();
     if status.is_redirection() {
         let loc = resp
@@ -204,7 +303,7 @@ where
     let mut body = Vec::new();
     let mut incoming = resp.into_body();
     while let Some(frame) = incoming.frame().await {
-        let frame = frame.map_err(|e| FetchError::Http(e.to_string()))?;
+        let frame = frame.map_err(|e| FetchError::TransientNetwork(e.to_string()))?;
         if let Some(chunk) = frame.data_ref() {
             if body.len() + chunk.len() > MAX_BODY {
                 return Err(FetchError::Http("body too large for an NZB".into()));
@@ -243,13 +342,16 @@ mod tests {
             status: hyper::StatusCode::TOO_MANY_REQUESTS,
             retry_after: None,
         };
-        for (retry, seconds) in [10, 20, 40].into_iter().enumerate() {
+        for (retry, seconds) in [30, 60, 120, 300, 300].into_iter().enumerate() {
             assert_eq!(
                 retry_delay(&error, retry as u32),
                 Some(Duration::from_secs(seconds))
             );
         }
-        assert_eq!(retry_delay(&error, MAX_RETRIES), None);
+        assert_eq!(
+            retry_delay(&error, u32::MAX),
+            Some(Duration::from_secs(300))
+        );
         let permanent = FetchError::HttpStatus {
             status: hyper::StatusCode::FORBIDDEN,
             retry_after: Some(Duration::ZERO),
@@ -304,14 +406,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retryable_statuses_exhaust_the_bounded_budget() {
+    async fn retryable_statuses_keep_the_same_request_until_success() {
         for status in ["429 Too Many Requests", "503 Service Unavailable"] {
             let response = format!("HTTP/1.1 {status}\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-            let (url, server) = serve_responses(vec![response; MAX_RETRIES as usize + 1]).await;
-            let error = http_get(&url).await.unwrap_err();
-            assert!(error.to_string().contains(status));
-            assert_eq!(server.await.unwrap().len(), MAX_RETRIES as usize + 1);
+            let (url, server) = serve_responses(vec![
+                response.clone(),
+                response.clone(),
+                response,
+                "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n<nzb />".into(),
+            ])
+            .await;
+            assert_eq!(http_get(&url).await.unwrap(), b"<nzb />");
+            assert_eq!(server.await.unwrap().len(), 4);
         }
+    }
+
+    #[test]
+    fn transient_network_errors_retry_indefinitely_with_capped_backoff() {
+        let error = FetchError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        ));
+        assert_eq!(retry_delay(&error, 0), Some(Duration::from_secs(30)));
+        assert_eq!(
+            retry_delay(&FetchError::Timeout, 1),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            retry_delay(&FetchError::Timeout, 2),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            retry_delay(&FetchError::Timeout, 3),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            retry_delay(&FetchError::Timeout, 100),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            retry_delay(&FetchError::BadUrl("not-a-url".into()), 0),
+            None,
+            "invalid URL submissions stop immediately"
+        );
     }
 
     #[test]

@@ -14,6 +14,13 @@ use std::{path::PathBuf, sync::Arc};
 
 pub fn router() -> Router<ApiState> {
     Router::new()
+        .route("/api/v1/deliveries", get(deliveries))
+        .route("/api/v1/deliveries/{id}", get(delivery))
+        .route("/api/v1/deliveries/{id}/accept", post(accept_delivery))
+        .route(
+            "/api/v1/deliveries/{id}/source-cleanup/retry",
+            post(retry_delivery_cleanup),
+        )
         .route("/api/v1/artifacts", get(list))
         .route(
             "/api/v1/artifacts/settings",
@@ -57,6 +64,89 @@ pub fn router() -> Router<ApiState> {
             post(prune_source),
         )
         .route("/api/v1/recoveries/{id}/cancel-ack", post(cancel_ack))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryPage {
+    #[serde(default)]
+    after: i64,
+    limit: Option<u32>,
+    #[serde(default)]
+    include_accepted: bool,
+}
+
+#[cfg(test)]
+mod delivery_query_tests {
+    use super::DeliveryPage;
+
+    #[test]
+    fn delivery_query_uses_the_documented_camel_case_flag() {
+        let page: DeliveryPage =
+            serde_urlencoded::from_str("after=41&limit=100&includeAccepted=true").unwrap();
+        assert_eq!(page.after, 41);
+        assert_eq!(page.limit, Some(100));
+        assert!(page.include_accepted);
+    }
+}
+
+async fn deliveries(State(st): State<ApiState>, Query(page): Query<DeliveryPage>) -> Response {
+    let db = st.engine.artifacts();
+    let limit = page.limit.unwrap_or(50);
+    let include_accepted = page.include_accepted;
+    work(move || {
+        let (deliveries, next_cursor) =
+            db.deliveries_page(page.after, limit, include_accepted)?;
+        Ok(json!({
+            "protocolVersion": 1,
+            "deliveries": deliveries,
+            "nextCursor": next_cursor,
+            "cursorRule": "Rescan with after=0 each sweep, or durably persist every returned delivery before advancing the cursor."
+        }))
+    })
+    .await
+}
+
+async fn delivery(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
+    let db = st.engine.artifacts();
+    work(move || db.delivery(&id)).await
+}
+
+async fn retry_delivery_cleanup(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
+    let db = st.engine.artifacts();
+    work(move || db.retry_delivery_source_cleanup(&id)).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryAcceptance {
+    protocol_version: u8,
+    publication_generation: String,
+    manifest_digest: String,
+    consumer_receipt_id: String,
+}
+
+async fn accept_delivery(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<DeliveryAcceptance>,
+) -> Response {
+    let db = st.engine.artifacts();
+    if body.protocol_version != 1 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "unsupported delivery protocol version",
+        );
+    }
+    work(move || {
+        db.accept_delivery(
+            &id,
+            &body.publication_generation,
+            &body.manifest_digest,
+            &body.consumer_receipt_id,
+        )
+    })
+    .await
 }
 fn failure(e: Error) -> Response {
     let status = match e {

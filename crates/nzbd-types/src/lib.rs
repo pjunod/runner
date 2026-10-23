@@ -531,8 +531,27 @@ pub struct JobControl {
     pub previous_status: Option<JobStatus>,
     #[serde(default)]
     pub manual_pause: bool,
+    /// Number of automatically scheduled post-processing retries already
+    /// admitted for a recoverable held delivery job.
+    #[serde(default)]
+    pub retry_attempt: u8,
+    /// Unix time for the next durable automatic retry, when scheduled.
+    #[serde(default)]
+    pub next_retry_at_unix: Option<i64>,
+    /// First time this failure entered a held state; used for the visible
+    /// long-wait warning even after the bounded retry schedule is exhausted.
+    #[serde(default)]
+    pub blocked_since_unix: Option<i64>,
 }
 pub const CONTROL_PARAM: &str = "*Control:v1";
+/// Explicit request to hand a successful publication to Curator.
+pub const DELIVERY_INTENT_PARAM: &str = "monarr-delivery";
+
+pub fn has_delivery_intent(params: &[(String, String)]) -> bool {
+    params
+        .iter()
+        .any(|(key, value)| key == DELIVERY_INTENT_PARAM && value == "1")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
@@ -568,6 +587,10 @@ pub struct Job {
     /// like junk?" would refuse the real name when it finally arrived.
     #[serde(default)]
     pub name_provisional: bool,
+    /// Explicit managed-consumer handoff intent, persisted at admission via
+    /// the `monarr-delivery=1` parameter. Old snapshots deserialize false.
+    #[serde(default)]
+    pub delivery_lifecycle: bool,
     /// When this job entered the queue. With the history entry's
     /// completion time this is how long the whole thing took — the one
     /// duration nothing else records. `0` on snapshots written before it
@@ -601,6 +624,18 @@ pub struct Job {
 }
 
 impl Job {
+    /// New-work lifecycle policy is broader than an optional Curator handoff:
+    /// every newly allocated Runner job gets reason-based recovery, while only
+    /// jobs with delivery intent publish a Curator Delivery record. Old queue
+    /// rows lack this marker and remain in the reviewed legacy cohort.
+    pub fn lifecycle_eligible(&self) -> bool {
+        self.delivery_lifecycle
+            || self
+                .params
+                .iter()
+                .any(|(key, value)| key == "*Runner:LifecycleEligible" && value == "1")
+    }
+
     pub fn control(&self) -> Option<JobControl> {
         self.params
             .iter()
@@ -736,6 +771,7 @@ mod tests {
             name: "x".into(),
             dir_name: String::new(),
             name_provisional: false,
+            delivery_lifecycle: false,
             queued_at_unix: 0,
             original_name: String::new(),
             category: None,
@@ -761,6 +797,7 @@ mod tests {
             name: "x".into(),
             dir_name: String::new(),
             name_provisional: false,
+            delivery_lifecycle: false,
             queued_at_unix: 0,
             original_name: String::new(),
             category: None,

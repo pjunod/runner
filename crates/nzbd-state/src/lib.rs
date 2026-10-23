@@ -337,12 +337,51 @@ fn sanitize_suffix(s: &str) -> String {
 /// explicit envelope. Version 3 reserves the torrent job variant and its
 /// defaulted durable transfer record. Older schema-2 documents continue to
 /// decode as their original Usenet jobs and are rewritten as version 3 on the
-/// next owner snapshot. Version 4 adds protected pending torrent admissions.
-pub const QUEUE_SCHEMA_VERSION: u32 = 4;
+/// next owner snapshot. Version 4 adds protected pending torrent admissions;
+/// version 5 adds durable token-scoped URL admission receipts.
+pub const QUEUE_SCHEMA_VERSION: u32 = 5;
 const OLDEST_QUEUE_SCHEMA_VERSION: u32 = 1;
 
 const fn legacy_queue_schema_version() -> u32 {
     OLDEST_QUEUE_SCHEMA_VERSION
+}
+
+/// Durable idempotency tombstone for a token-scoped URL admission. Entries
+/// outlive queue and visible history rows so replay cannot start a second
+/// transfer after a consumer clears history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UrlAdmissionReceipt {
+    pub protocol_version: u8,
+    pub request_token: String,
+    /// SHA-256 of the canonical admission fields. The URL itself is already
+    /// persisted on the live job and is intentionally not duplicated here.
+    pub submission_sha256: String,
+    pub job_id: u32,
+    pub generation: String,
+    pub runner_instance_id: String,
+    #[serde(default)]
+    pub terminal_outcome: Option<String>,
+    #[serde(default)]
+    pub outcome: String,
+    #[serde(default)]
+    pub failure_stage: Option<String>,
+    #[serde(default)]
+    pub failure_cause: Option<String>,
+    #[serde(default)]
+    pub custody_state: String,
+    #[serde(default)]
+    pub keep_source_on_failure: bool,
+    #[serde(default)]
+    pub source_cleanup_status: Option<String>,
+    #[serde(default)]
+    pub publication_path: Option<String>,
+    /// Runner-owned processing source for retained outcomes. This is distinct
+    /// from the immutable completed publication artifact in a Delivery.
+    #[serde(default)]
+    pub source_artifact_id: Option<String>,
+    #[serde(default)]
+    pub source_generation: Option<String>,
 }
 
 /// Everything needed to reconstruct the queue after a restart.
@@ -354,6 +393,8 @@ pub struct QueueSnapshotDoc {
     /// is a mode-0600 sidecar; this record is deliberately non-secret.
     #[serde(default)]
     pub pending_admissions: Vec<PendingAdmission>,
+    #[serde(default)]
+    pub url_admission_receipts: Vec<UrlAdmissionReceipt>,
     pub jobs: Vec<Job>,
     pub next_job_id: u32,
     pub next_file_id: u32,
@@ -371,6 +412,7 @@ impl Default for QueueSnapshotDoc {
         Self {
             schema_version: QUEUE_SCHEMA_VERSION,
             pending_admissions: Vec::new(),
+            url_admission_receipts: Vec::new(),
             jobs: Vec::new(),
             next_job_id: 0,
             next_file_id: 0,
@@ -402,6 +444,10 @@ pub struct PendingAdmission {
     pub params: Vec<(String, String)>,
     #[serde(default)]
     pub client: Option<String>,
+    /// qBittorrent-compatible tags retained with a pending source so a
+    /// restart cannot drop transfer correlation before metainfo validation.
+    #[serde(default)]
+    pub torrent_tags: Vec<String>,
 }
 
 /// Read only when the typed queue document fails. Unknown fields — including
@@ -804,6 +850,7 @@ mod tests {
             name: "legacy".into(),
             dir_name: "legacy".into(),
             name_provisional: false,
+            delivery_lifecycle: false,
             queued_at_unix: 0,
             original_name: String::new(),
             category: None,
@@ -883,6 +930,24 @@ mod tests {
         let doc = QueueSnapshotDoc {
             schema_version: QUEUE_SCHEMA_VERSION,
             pending_admissions: Vec::new(),
+            url_admission_receipts: vec![UrlAdmissionReceipt {
+                protocol_version: 1,
+                request_token: "token-7".into(),
+                submission_sha256: "a".repeat(64),
+                job_id: 7,
+                generation: "url-7-generation".into(),
+                runner_instance_id: "runner-installation".into(),
+                terminal_outcome: Some("UNPACK_FAILURE".into()),
+                outcome: "failed".into(),
+                failure_stage: Some("unpack".into()),
+                failure_cause: Some("bad archive".into()),
+                custody_state: "runner_owned".into(),
+                keep_source_on_failure: true,
+                source_cleanup_status: Some("pending".into()),
+                publication_path: None,
+                source_artifact_id: Some("source-artifact".into()),
+                source_generation: Some("source-generation".into()),
+            }],
             jobs: vec![],
             next_job_id: 7,
             next_file_id: 42,
@@ -904,6 +969,9 @@ mod tests {
         assert_eq!(loaded.next_file_id, 42);
         assert!(loaded.download_paused);
         assert_eq!(loaded.speed_limit_bps, Some(1_000_000));
+        assert_eq!(loaded.url_admission_receipts.len(), 1);
+        assert_eq!(loaded.url_admission_receipts[0].request_token, "token-7");
+        assert_eq!(loaded.url_admission_receipts[0].outcome, "failed");
         assert!(!dir.path().join("queue.json.tmp").exists());
     }
 
@@ -915,6 +983,7 @@ mod tests {
         let doc = QueueSnapshotDoc {
             schema_version: QUEUE_SCHEMA_VERSION,
             pending_admissions: Vec::new(),
+            url_admission_receipts: Vec::new(),
             jobs: vec![],
             next_job_id: 1,
             next_file_id: 1,
@@ -951,6 +1020,7 @@ mod tests {
         let mut value = serde_json::to_value(QueueSnapshotDoc {
             schema_version: 2,
             pending_admissions: Vec::new(),
+            url_admission_receipts: Vec::new(),
             jobs: vec![minimal_job()],
             next_job_id: 7,
             next_file_id: 0,
@@ -985,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_roundtrips_a_non_empty_schema_4_pending_admission() {
+    fn snapshot_roundtrips_a_non_empty_current_schema_pending_admission() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::open(dir.path()).unwrap();
         let pending = PendingAdmission {
@@ -1000,6 +1070,7 @@ mod tests {
             stop_seeding_on_complete: Some(true),
             params: vec![("source".into(), "test".into())],
             client: Some("Sonarr".into()),
+            torrent_tags: vec!["monarr-transfer-token".into()],
         };
         store
             .save(&QueueSnapshotDoc {
@@ -1019,7 +1090,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_roundtrips_schema_4_torrent_control_state() {
+    fn snapshot_roundtrips_current_schema_torrent_control_state() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::open(dir.path()).unwrap();
         let mut job = minimal_job();
@@ -1063,7 +1134,7 @@ mod tests {
             .unwrap();
 
         let loaded = store.load().unwrap().unwrap();
-        assert_eq!(loaded.schema_version, 4);
+        assert_eq!(loaded.schema_version, QUEUE_SCHEMA_VERSION);
         let torrent = loaded.jobs[0].torrent.as_ref().unwrap();
         assert_eq!(torrent.downloaded_bytes, 21);
         assert_eq!(torrent.files[0].path, PathBuf::from("payload.bin"));
@@ -1072,7 +1143,7 @@ mod tests {
         // the document before it can misread or skip the torrent variant.
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("queue.json")).unwrap()).unwrap();
-        assert_eq!(raw["schema_version"], 4);
+        assert_eq!(raw["schema_version"], QUEUE_SCHEMA_VERSION);
     }
 
     #[test]
@@ -1081,13 +1152,21 @@ mod tests {
         let store = SnapshotStore::open(dir.path()).unwrap();
         std::fs::write(
             dir.path().join("queue.json"),
-            br#"{"schema_version":5,"jobs":[{"kind":"future_transfer"}]}"#,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": QUEUE_SCHEMA_VERSION + 1,
+                "jobs": [{"kind": "future_transfer"}],
+            }))
+            .unwrap(),
         )
         .unwrap();
 
         let err = store.load().unwrap_err().to_string();
         assert!(
-            err.contains("queue.json schema version 5 is newer than this nzbd supports (4)"),
+            err.contains(&format!(
+                "queue.json schema version {} is newer than this nzbd supports ({})",
+                QUEUE_SCHEMA_VERSION + 1,
+                QUEUE_SCHEMA_VERSION
+            )),
             "unexpected error: {err}"
         );
         assert!(
@@ -1107,7 +1186,10 @@ mod tests {
 
         let err = store.save(&doc).unwrap_err().to_string();
         assert!(
-            err.contains("refusing to write queue schema version 1; this nzbd writes 4"),
+            err.contains(&format!(
+                "refusing to write queue schema version 1; this nzbd writes {}",
+                QUEUE_SCHEMA_VERSION
+            )),
             "unexpected error: {err}"
         );
         assert!(!dir.path().join("queue.json").exists());
@@ -1154,6 +1236,7 @@ mod tests {
         let doc = QueueSnapshotDoc {
             schema_version: QUEUE_SCHEMA_VERSION,
             pending_admissions: Vec::new(),
+            url_admission_receipts: Vec::new(),
             jobs: (0..4u32)
                 .map(|j| Job {
                     id: JobId(j),
@@ -1161,6 +1244,7 @@ mod tests {
                     name: format!("job {j}"),
                     dir_name: String::new(),
                     name_provisional: false,
+                    delivery_lifecycle: false,
                     queued_at_unix: 0,
                     original_name: String::new(),
                     category: Some("tv".into()),

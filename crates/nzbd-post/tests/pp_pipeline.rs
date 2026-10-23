@@ -3,13 +3,15 @@
 //! subprocess repair, unpack + cleanup, extension scripts, failure
 //! classification, and the event-driven manager.
 
-use nzbd_engine::{Engine, EngineConfig, EngineHandle, Tuning};
+use nzbd_engine::{AddOpts, Engine, EngineConfig, EngineHandle, Tuning};
 use nzbd_post::manager::{
     process_job, spawn_post_manager, FailureAction, PostConfig, PpFinal, PpGate, RestartPoint,
     PP_DONE_PARAM,
 };
 use nzbd_state::history::HistoryDb;
-use nzbd_types::{DupeInfo, FileEntry, FileId, Job, JobId, JobKind, JobStatus, JobTotals};
+use nzbd_types::{
+    DupeInfo, FileEntry, FileId, Job, JobId, JobKind, JobStatus, JobTotals, SegmentState,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +22,14 @@ fn crc(data: &[u8]) -> u32 {
     let mut h = crc32fast::Hasher::new();
     h.update(data);
     h.finalize()
+}
+
+fn corrupt_archive_tool(root: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join("corrupt-archive-tool");
+    std::fs::write(&path, "#!/bin/sh\necho 'Data Error' >&2\nexit 2\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_string_lossy().into_owned()
 }
 
 async fn spawn_engine(dir: &Path) -> EngineHandle {
@@ -106,6 +116,7 @@ fn completed_job(id: u32, name: &str, files: Vec<FileEntry>) -> Job {
         name: name.into(),
         dir_name: String::new(),
         name_provisional: false,
+        delivery_lifecycle: false,
         queued_at_unix: 0,
         original_name: String::new(),
         category: Some("test".into()),
@@ -2379,6 +2390,230 @@ async fn a_multi_volume_archive_extracts_whole_or_fails() {
         }
         engine.shutdown().await;
     }
+}
+
+/// A real UNPACK_FAILURE must still publish independently verified direct
+/// media from the same failed attempt. The bad pack remains in the separate
+/// Runner source generation with a concrete retained outcome; it must never
+/// be copied into Curator's publication tree or deleted as a side effect.
+#[tokio::test]
+async fn failed_pack_salvages_verified_direct_media_and_excludes_invalid_archive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let nzb = br#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE nzb PUBLIC "-//newzBin//DTD NZB 1.1//EN" "http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd">
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="p" date="1720000000" subject="&quot;episode.mkv&quot; yEnc">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="1" number="1">episode@example</segment></segments>
+  </file>
+  <file poster="p" date="1720000001" subject="&quot;broken.zip&quot; yEnc">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="1" number="1">broken@example</segment></segments>
+  </file>
+</nzb>"#;
+    let job_id = engine
+        .add_nzb_opts(
+            "partial-failed-pack",
+            nzb,
+            AddOpts {
+                category: Some("test".into()),
+                params: vec![("monarr-delivery".into(), "1".into())],
+                ..AddOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    let artifact = engine
+        .artifacts()
+        .for_job(job_id.0)
+        .unwrap()
+        .expect("new delivery admission allocates a source artifact");
+    let good = b"verified episode bytes";
+    let bad_pack = b"not a valid zip archive";
+    std::fs::write(artifact.path.join("episode.mkv"), good).unwrap();
+    std::fs::write(artifact.path.join("broken.zip"), bad_pack).unwrap();
+    engine.artifacts().refresh_for_delivery(job_id.0).unwrap();
+
+    let mut job = engine.export_job(job_id).await.unwrap().unwrap();
+    job.status = JobStatus::Completed;
+    for file in &mut job.files {
+        let (name, bytes) = if file.filename.contains("episode") {
+            file.filename = "episode.mkv".into();
+            ("episode.mkv", good.as_slice())
+        } else {
+            file.filename = "broken.zip".into();
+            ("broken.zip", bad_pack.as_slice())
+        };
+        file.subject = name.into();
+        file.finalized = true;
+        file.crc32 = Some(crc(bytes));
+        assert_eq!(file.segments.len(), 1);
+        file.segments[0].state = SegmentState::Done {
+            offset: 0,
+            len: bytes.len() as u32,
+            crc: crc(bytes),
+        };
+    }
+    engine.import_job(job, false, false).await.unwrap();
+
+    let corrupt_tool = corrupt_archive_tool(tmp.path());
+    let out = process_job(
+        &engine,
+        &PostConfig {
+            unrar_cmd: corrupt_tool.clone(),
+            sevenzip_cmd: corrupt_tool,
+            failure_action: FailureAction::Delete,
+            deobfuscate_final: false,
+            ..PostConfig::default()
+        },
+        &history(tmp.path()),
+        &tmp.path().join("dest"),
+        job_id,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(out, PpFinal::UnpackFailure);
+    let delivery = engine
+        .artifacts()
+        .delivery_for_job(job_id.0)
+        .unwrap()
+        .expect("good direct media is durably salvaged");
+    assert_eq!(delivery.terminal_outcome, "UNPACK_FAILURE");
+    assert_eq!(
+        delivery
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        ["episode.mkv"]
+    );
+    assert_eq!(
+        std::fs::read(Path::new(&delivery.publication_path).join("episode.mkv")).unwrap(),
+        good
+    );
+    assert!(!Path::new(&delivery.publication_path)
+        .join("broken.zip")
+        .exists());
+    assert!(delivery
+        .file_outcomes
+        .iter()
+        .any(|file| file.source_path == "broken.zip" && file.outcome == "excluded_source_cleanup"));
+    engine.shutdown().await;
+}
+
+/// Exercise the actual queue manager's failure path: the downloader job is
+/// already complete, extraction fails, and a verified direct episode is
+/// published before the manager retires the history row.
+#[tokio::test]
+async fn manager_salvages_verified_episode_from_failed_pack_before_history_retirement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let nzb = br#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE nzb PUBLIC "-//newzBin//DTD NZB 1.1//EN" "http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd">
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="p" date="1720000000" subject="&quot;episode.mkv&quot; yEnc"><groups><group>alt.binaries.test</group></groups><segments><segment bytes="1" number="1">episode@example</segment></segments></file>
+  <file poster="p" date="1720000001" subject="&quot;broken.zip&quot; yEnc"><groups><group>alt.binaries.test</group></groups><segments><segment bytes="1" number="1">broken@example</segment></segments></file>
+</nzb>"#;
+    let job_id = engine
+        .add_nzb_opts(
+            "manager-partial-pack",
+            nzb,
+            AddOpts {
+                category: Some("test".into()),
+                params: vec![("monarr-delivery".into(), "1".into())],
+                ..AddOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    let artifact = engine.artifacts().for_job(job_id.0).unwrap().unwrap();
+    let good = b"manager verified episode";
+    let bad = b"not a valid zip archive";
+    std::fs::write(artifact.path.join("episode.mkv"), good).unwrap();
+    std::fs::write(artifact.path.join("broken.zip"), bad).unwrap();
+    engine.artifacts().refresh_for_delivery(job_id.0).unwrap();
+    let mut job = engine.export_job(job_id).await.unwrap().unwrap();
+    job.status = JobStatus::Completed;
+    for file in &mut job.files {
+        let (name, bytes) = if file.filename.contains("episode") {
+            file.filename = "episode.mkv".into();
+            ("episode.mkv", good.as_slice())
+        } else {
+            file.filename = "broken.zip".into();
+            ("broken.zip", bad.as_slice())
+        };
+        file.subject = name.into();
+        file.finalized = true;
+        file.crc32 = Some(crc(bytes));
+        file.segments[0].state = SegmentState::Done {
+            offset: 0,
+            len: bytes.len() as u32,
+            crc: crc(bytes),
+        };
+    }
+    engine.import_job(job, false, true).await.unwrap();
+
+    let hist = history(tmp.path());
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    let corrupt_tool = corrupt_archive_tool(tmp.path());
+    spawn_post_manager(
+        engine.clone(),
+        PostConfig {
+            unrar_cmd: corrupt_tool.clone(),
+            sevenzip_cmd: corrupt_tool,
+            deobfuscate_final: false,
+            ..PostConfig::default()
+        },
+        hist.clone(),
+        tmp.path().join("dest"),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let delivery = loop {
+        if let Some(delivery) = engine
+            .artifacts()
+            .delivery_for_job(job_id.0)
+            .unwrap()
+            .as_ref()
+        {
+            if engine.export_job(job_id).await.unwrap().is_none()
+                && !hist.list(10).unwrap().is_empty()
+            {
+                break delivery.clone();
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "manager did not finish failed-pack salvage"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(delivery.terminal_outcome, "UNPACK_FAILURE");
+    assert_eq!(
+        delivery
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        ["episode.mkv"]
+    );
+    assert!(Path::new(&delivery.publication_path)
+        .join("episode.mkv")
+        .exists());
+    assert!(delivery.file_outcomes.iter().any(|file| {
+        file.source_path == "broken.zip" && file.outcome == "excluded_source_cleanup"
+    }));
+
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+    engine.shutdown().await;
 }
 
 /// The stage timeline reaches history — every stage the job actually ran,

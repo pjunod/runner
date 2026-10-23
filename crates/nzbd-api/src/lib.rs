@@ -452,6 +452,8 @@ pub fn require_auth(router: Router, auth: AuthConfig) -> Router {
 
 #[derive(Debug, Serialize)]
 pub struct StatusDto {
+    /// Additive feature negotiation for native consumers.
+    pub capabilities: Vec<&'static str>,
     /// The build identity the UI footer shows: the crate version, then
     /// what `git describe` said about the checkout — so it moves on every
     /// commit — or `+unknown` when the build had no way to know. See
@@ -543,6 +545,7 @@ fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -
     let count =
         |pred: &dyn Fn(&JobSummary) -> bool| snap.jobs.iter().filter(|j| pred(j)).count() as u32;
     StatusDto {
+        capabilities: vec!["deliveries-v1", "request-token-idempotency-v1"],
         version: version::full(),
         built: version::BUILT,
         up_since_unix: snap.up_since_unix,
@@ -941,6 +944,16 @@ struct SetJobPriorityBody {
     priority: i32,
 }
 
+/// Read the durable result of a token-scoped URL admission, including after
+/// its live job and visible history entry have been removed.
+async fn get_request_admission(State(st): State<ApiState>, Path(token): Path<String>) -> Response {
+    match st.engine.url_admission(&token).await {
+        Ok(Some(receipt)) => Json(receipt).into_response(),
+        Ok(None) => not_found(),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+    }
+}
+
 /// `PUT /api/v1/jobs/{id}/priority` — change the scheduler priority for a
 /// queued or active job. Higher numeric values are selected first; priority
 /// 900 is the existing force band that can run through soft holds.
@@ -953,6 +966,43 @@ async fn set_job_priority(
         Ok(true) => Json(json!({ "ok": true, "priority": body.priority })).into_response(),
         Ok(false) => not_found(),
         Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct KeepOnFailureBody {
+    keep: bool,
+}
+
+/// `PUT /api/v1/jobs/{id}/failure-keep` persists this job's explicit choice
+/// to retain its Runner-owned source if the transfer fails.
+async fn set_keep_on_failure(
+    State(st): State<ApiState>,
+    Path(id): Path<u32>,
+    Json(body): Json<KeepOnFailureBody>,
+) -> Response {
+    match st.engine.set_keep_on_failure(JobId(id), body.keep).await {
+        Ok(true) => Json(json!({ "ok": true, "keep": body.keep })).into_response(),
+        Ok(false) => not_found(),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+    }
+}
+
+async fn retry_job_now(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
+    let Some(manager) = st.pp_manager.as_ref() else {
+        return error(
+            StatusCode::NOT_IMPLEMENTED,
+            "post-processing retry is not available on this node",
+        );
+    };
+    use nzbd_post::manager::RestartPostError as E;
+    match manager.retry_now(JobId(id)).await {
+        Ok(()) => Json(json!({"ok": true, "retrying": true})).into_response(),
+        Err(E::NotFound) => not_found(),
+        Err(E::NotReady | E::UnsafePoint | E::AlreadyFinished | E::NotOwned) => {
+            error(StatusCode::CONFLICT, "job has no retryable lifecycle work")
+        }
+        Err(E::Closed) => error(StatusCode::SERVICE_UNAVAILABLE, &E::Closed.to_string()),
     }
 }
 
@@ -1044,6 +1094,13 @@ async fn add_job(
     if let Some(url) = &q.url {
         return match st.engine.add_url(&name, url, opts).await {
             Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+            Err(nzbd_engine::EngineError::RequestConflict(message)) => {
+                error(StatusCode::CONFLICT, &message)
+            }
+            Err(nzbd_engine::EngineError::AdmissionNotDurable) => error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "request-token admission could not be durably saved",
+            ),
             Err(e) => error(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()),
         };
     }
@@ -2065,6 +2122,9 @@ async fn openapi() -> Response {
         "info": { "title": "nzbd native API", "version": env!("CARGO_PKG_VERSION") },
         "paths": {
             "/api/v1/status": { "get": { "summary": "Queue + rate + guard status" } },
+            "/api/v1/request-admissions/{token}": { "get": { "summary": "Read the durable outcome of one transfer-token URL admission" } },
+            "/api/v1/deliveries": { "get": { "summary": "Durable pending publication deliveries; rescan after=0 or persist every receipt before advancing the cursor" } },
+            "/api/v1/deliveries/{id}/accept": { "post": { "summary": "Persist an idempotent consumer receipt for an immutable publication generation and manifest" } },
             "/api/v1/jobs": {
                 "get": { "summary": "List queue jobs" },
                 "post": { "summary": "Add a job (NZB body, or ?url=)",
@@ -2082,6 +2142,7 @@ async fn openapi() -> Response {
             },
             "/api/v1/jobs/{id}": { "get": { "summary": "Job detail" } },
             "/api/v1/jobs/{id}/priority": { "put": { "summary": "Set scheduler priority; higher values run first and 900 is force" } },
+            "/api/v1/jobs/{id}/retry": { "post": { "summary": "Retry the same job's held post-processing or failed-source cleanup" } },
             "/api/v1/jobs/{id}/torrent/seed-policy": { "put": { "summary": "Set stop_on_complete, positive ratio_limit/time_limit_secs (null = unlimited), or use_defaults; never starts a stopped torrent" } },
             "/api/v1/jobs/{id}/actions/{action}": { "post": { "summary": "pause|resume|delete|delete-files|move-*|post-restart-*; delete answers {ok, parked}" } },
             "/api/v1/queue/actions/{action}": { "post": { "summary": "pause|resume" } },
@@ -2773,6 +2834,10 @@ pub fn router_with(state: ApiState) -> Router {
         .merge(artifacts::router())
         .route("/api/v1/status", get(get_status))
         .route(
+            "/api/v1/request-admissions/{token}",
+            get(get_request_admission),
+        )
+        .route(
             "/api/v1/jobs",
             get(list_jobs)
                 .post(add_job)
@@ -2780,6 +2845,8 @@ pub fn router_with(state: ApiState) -> Router {
         )
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/priority", put(set_job_priority))
+        .route("/api/v1/jobs/{id}/failure-keep", put(set_keep_on_failure))
+        .route("/api/v1/jobs/{id}/retry", post(retry_job_now))
         .route("/api/v1/jobs/{id}/files", get(get_job_files))
         .route("/api/v1/jobs/{id}/torrent", get(get_job_torrent))
         .route(
@@ -2869,6 +2936,210 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn request_admission_route_serializes_full_durable_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let token = "api-receipt-fixture";
+        engine
+            .add_url(
+                "receipt fixture",
+                "http://127.0.0.1:9/receipt.nzb",
+                nzbd_engine::AddOpts {
+                    params: vec![
+                        ("monarr-transfer".into(), token.into()),
+                        ("monarr-delivery".into(), "1".into()),
+                    ],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let response = router(engine.clone())
+            .oneshot(
+                axum::http::Request::get(format!("/api/v1/request-admissions/{token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        for key in [
+            "terminalOutcome",
+            "failureStage",
+            "failureCause",
+            "custodyState",
+            "keepSourceOnFailure",
+            "sourceCleanupStatus",
+            "publicationPath",
+            "sourceArtifactId",
+            "sourceGeneration",
+        ] {
+            assert!(body.get(key).is_some(), "receipt omitted {key}: {body}");
+        }
+        assert_eq!(body["requestToken"], token);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_routes_page_accept_refresh_and_retry_source_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let root = tmp.path().join("processing");
+        std::fs::create_dir(&root).unwrap();
+        let publication = root.join("release-generation");
+        let artifacts = engine.artifacts();
+        artifacts
+            .allocate_for_delivery(711, &root, &publication, true, true)
+            .unwrap();
+        std::fs::write(publication.join("episode.mkv"), b"verified episode").unwrap();
+        artifacts
+            .finish(711, &publication, &root, "active")
+            .unwrap();
+        let delivery = artifacts
+            .create_delivery(711, true, Some("api-delivery-fixture"))
+            .unwrap();
+        let app = router(engine.clone());
+
+        let pending = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/deliveries?after=0&limit=1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.status(), StatusCode::OK);
+        let pending = body_json(pending).await;
+        assert_eq!(pending["protocolVersion"], 1);
+        assert_eq!(pending["deliveries"][0]["deliveryId"], delivery.delivery_id);
+        assert_eq!(pending["nextCursor"], delivery.sequence);
+
+        let body = serde_json::json!({
+            "protocolVersion": 1,
+            "publicationGeneration": delivery.publication_generation,
+            "manifestDigest": delivery.manifest_digest,
+            "consumerReceiptId": "curator-receipt-fixture"
+        });
+        let accepted = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post(format!(
+                    "/api/v1/deliveries/{}/accept",
+                    delivery.delivery_id
+                ))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(accepted).await["consumerReceiptId"],
+            "curator-receipt-fixture"
+        );
+
+        let hidden_after_accept = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/deliveries?after=0&limit=1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let hidden_after_accept = body_json(hidden_after_accept).await;
+        assert!(hidden_after_accept["deliveries"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(hidden_after_accept["nextCursor"], delivery.sequence);
+
+        let accepted_page = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/deliveries?after=0&limit=1&includeAccepted=true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            body_json(accepted_page).await["deliveries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let refreshed = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!("/api/v1/deliveries/{}", delivery.delivery_id))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refreshed.status(), StatusCode::OK);
+        assert!(body_json(refreshed).await["acceptedAt"].is_number());
+
+        let replay = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post(format!(
+                    "/api/v1/deliveries/{}/accept",
+                    delivery.delivery_id
+                ))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+
+        let conflicting = serde_json::json!({
+            "protocolVersion": 1,
+            "publicationGeneration": delivery.publication_generation,
+            "manifestDigest": delivery.manifest_digest,
+            "consumerReceiptId": "different-receipt"
+        });
+        let conflict = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post(format!(
+                    "/api/v1/deliveries/{}/accept",
+                    delivery.delivery_id
+                ))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(conflicting.to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+        let retry_cleanup = app
+            .oneshot(
+                axum::http::Request::post(format!(
+                    "/api/v1/deliveries/{}/source-cleanup/retry",
+                    delivery.delivery_id
+                ))
+                .body(axum::body::Body::from("{}"))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry_cleanup.status(), StatusCode::OK);
+        let cleanup = body_json(retry_cleanup).await;
+        assert_eq!(cleanup["deliveryId"], delivery.delivery_id);
+        engine.shutdown().await;
+    }
+
     const NZB: &str = r#"<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
 <file poster="p" date="1720000000" subject="&quot;f.bin&quot; yEnc (1/1)">
 <groups><group>a.b</group></groups>
@@ -2903,6 +3174,10 @@ mod tests {
         JobSummary {
             repair_progress: None,
             control: None,
+            lifecycle_eligible: false,
+            url_fetch: None,
+            failed_cleanup: None,
+            post_timing: None,
             id: nzbd_types::JobId(id),
             kind: nzbd_types::JobKind::Nzb,
             name: format!("job {id}"),
@@ -3597,6 +3872,27 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK, "healthz stays open");
 
         let creds = base64::engine::general_purpose::STANDARD.encode("u:p");
+        let deliveries = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/deliveries?after=0&limit=50")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deliveries.status(), StatusCode::UNAUTHORIZED);
+        let deliveries = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/deliveries?after=0&limit=50")
+                    .header("authorization", format!("Basic {creds}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deliveries.status(), StatusCode::OK);
         let resp = app
             .clone()
             .oneshot(

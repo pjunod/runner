@@ -449,6 +449,97 @@ pub fn detect_archives(dir: &Path) -> Vec<(PathBuf, ArchiveKind)> {
     out
 }
 
+/// Return the complete source-file set consumed by an archive extraction.
+/// Multi-volume RAR and `.001` split archives consume sibling volume files;
+/// single-file formats consume only the selected archive. The returned paths
+/// are source paths and are sorted for stable journaling.
+pub fn archive_input_set(dir: &Path, first: &Path, kind: ArchiveKind) -> Vec<PathBuf> {
+    if !matches!(kind, ArchiveKind::Rar | ArchiveKind::Split) {
+        return vec![first.to_path_buf()];
+    }
+    let first_name = first
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    let base = if kind == ArchiveKind::Split {
+        first_name
+            .strip_suffix(".001")
+            .unwrap_or(&first_name)
+            .to_owned()
+    } else {
+        match first_name.rfind(".part") {
+            Some(i) if first_name.ends_with(".rar") => first_name[..i].to_owned(),
+            _ => first_name
+                .rsplit_once('.')
+                .map(|(stem, _)| stem.to_owned())
+                .unwrap_or_else(|| first_name.clone()),
+        }
+    };
+    let mut inputs: Vec<PathBuf> = files_of(dir)
+        .into_iter()
+        .filter(|path| path.parent() == first.parent())
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase();
+            if kind == ArchiveKind::Split {
+                name.strip_prefix(&format!("{base}."))
+                    .is_some_and(|suffix| {
+                        suffix.len() == 3 && suffix.bytes().all(|b| b.is_ascii_digit())
+                    })
+            } else {
+                let same_base = match name.rfind(".part") {
+                    Some(i) if name.ends_with(".rar") => name[..i] == base,
+                    _ => name.rsplit_once('.').is_some_and(|(stem, _)| stem == base),
+                };
+                same_base && volume_number(&name).is_some()
+            }
+        })
+        .collect();
+    if !inputs.iter().any(|path| path == first) {
+        inputs.push(first.to_path_buf());
+    }
+    inputs.sort();
+    inputs.dedup();
+    inputs
+}
+
+fn operational_extractor_failure(diagnostic: &str) -> bool {
+    [
+        "input/output error",
+        "i/o error",
+        "permission denied",
+        "access denied",
+        "read error",
+        "write error",
+        "device not ready",
+        "failed to open",
+    ]
+    .iter()
+    .any(|phrase| diagnostic.contains(phrase))
+}
+
+fn terminal_archive_diagnostic(diagnostic: &str) -> bool {
+    [
+        "data error",
+        "crc failed",
+        "checksum error",
+        "unexpected end of archive",
+        "headers error",
+        "cannot find volume",
+        "you need to start extraction",
+        "is not archive",
+        "not an archive",
+        "cannot open file as archive",
+        "can not open file as archive",
+    ]
+    .iter()
+    .any(|phrase| diagnostic.contains(phrase))
+}
+
 impl Extractors {
     pub async fn extract(
         &self,
@@ -479,7 +570,17 @@ impl Extractors {
             // Password failures are about the credential, not the tool, and
             // retrying with another extractor cannot help.
             if let Ok(o) = &first {
-                if o.password_error || o.disk_space_error {
+                // `retryable_error` describes whether a failed operation may
+                // succeed on a later attempt. It is deliberately broader
+                // than this fallback decision: an extractor that does not
+                // recognize an archive (or emits an inconclusive diagnostic)
+                // is retryable, but a second configured parser may still be
+                // able to read it. Stop only when trying another parser would
+                // repeat a known operational failure against the same bytes.
+                let operational_failure = o.attempts.iter().any(|attempt| {
+                    operational_extractor_failure(&attempt.diagnostic.to_lowercase())
+                });
+                if o.password_error || o.disk_space_error || operational_failure {
                     return first;
                 }
             }
@@ -609,6 +710,11 @@ impl Extractors {
                 .chars()
                 .take(4096)
                 .collect();
+                let success = out.code == 0 && all.contains("All OK") && !broke_the_chain;
+                let password_error = out.code == 11
+                    || out.stderr.contains("password")
+                    || out.stdout.contains("password is incorrect");
+                let disk_space_error = capacity || quota_error;
                 Ok(ExtractOutcome {
                     output_dir: dest.to_path_buf(),
                     attempts: vec![crate::ExtractAttempt {
@@ -621,11 +727,14 @@ impl Extractors {
                         diagnostic,
                     }],
                     quota_error,
-                    success: out.code == 0 && all.contains("All OK") && !broke_the_chain,
-                    password_error: out.code == 11
-                        || out.stderr.contains("password")
-                        || out.stdout.contains("password is incorrect"),
-                    disk_space_error: capacity || quota_error || out.code == 5,
+                    success,
+                    password_error,
+                    disk_space_error,
+                    retryable_error: !success
+                        && !password_error
+                        && !disk_space_error
+                        && (operational_extractor_failure(&lower)
+                            || !terminal_archive_diagnostic(&lower)),
                 })
             }
             ArchiveKind::SevenZip | ArchiveKind::Zip | ArchiveKind::Split => {
@@ -647,6 +756,11 @@ impl Extractors {
                 .chars()
                 .take(4096)
                 .collect();
+                let success = out.code == 0 && all.contains("Everything is Ok");
+                let password_error = lower.contains("wrong password")
+                    || lower.contains("password is incorrect")
+                    || lower.contains("password required");
+                let disk_space_error = capacity || quota_error;
                 Ok(ExtractOutcome {
                     output_dir: dest.to_path_buf(),
                     attempts: vec![crate::ExtractAttempt {
@@ -659,9 +773,14 @@ impl Extractors {
                         diagnostic,
                     }],
                     quota_error,
-                    success: out.code == 0 && all.contains("Everything is Ok"),
-                    password_error: all.contains("Wrong password"),
-                    disk_space_error: capacity || quota_error,
+                    success,
+                    password_error,
+                    disk_space_error,
+                    retryable_error: !success
+                        && !password_error
+                        && !disk_space_error
+                        && (operational_extractor_failure(&lower)
+                            || !terminal_archive_diagnostic(&lower)),
                 })
             }
         }
@@ -753,6 +872,24 @@ mod tests {
             names,
             vec!["a.part1.rar", "b.rar", "c.zip", "d.7z", "e.001"]
         );
+        let rar = found
+            .iter()
+            .find(|(_, kind)| *kind == ArchiveKind::Rar)
+            .unwrap();
+        let rar_inputs = archive_input_set(tmp.path(), &rar.0, rar.1)
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(rar_inputs, vec!["a.part1.rar", "a.part2.rar"]);
+        let split = found
+            .iter()
+            .find(|(_, kind)| *kind == ArchiveKind::Split)
+            .unwrap();
+        let split_inputs = archive_input_set(tmp.path(), &split.0, split.1)
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(split_inputs, vec!["e.001", "e.002"]);
     }
 
     #[tokio::test]
@@ -1099,13 +1236,13 @@ mod tests {
         // because that is the attempt whose password/disk flags were set by
         // the tool that actually understands the archive. Give the two tools
         // different failures so the choice is observable: unrar exits 5
-        // (unrar's write/disk-error code), 7-Zip fails with no disk marker
+        // with explicit capacity text, 7-Zip fails with no disk marker
         // at all. Merging the other way round would silently lose the
         // "the volume is full" diagnosis operators act on.
         let disk_full_unrar = tmp.path().join("disk-full-unrar");
         write_tool(
             &disk_full_unrar,
-            "#!/bin/sh\necho 'cannot write' >&2\nexit 5\n",
+            "#!/bin/sh\necho 'No space left on device' >&2\nexit 5\n",
         );
         let extractors = Extractors {
             unrar_cmd: disk_full_unrar.to_string_lossy().into_owned(),
@@ -1170,6 +1307,47 @@ mod tests {
             .unwrap();
         assert!(!outcome.success);
         assert!(outcome.disk_space_error);
+    }
+
+    #[tokio::test]
+    async fn extractor_requires_positive_corruption_evidence_before_disposal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("episode.zip");
+        std::fs::write(&archive, b"archive input").unwrap();
+        let fake = tmp.path().join("fake-7z");
+        let extractors = Extractors {
+            unrar_cmd: fake.to_string_lossy().into_owned(),
+            sevenzip_cmd: fake.to_string_lossy().into_owned(),
+            timeout: SUBPROCESS_TEST_TIMEOUT,
+        };
+        write_tool(&fake, "#!/bin/sh\necho 'Input/output error' >&2\nexit 2\n");
+        let io = extractors
+            .extract(&archive, ArchiveKind::Zip, &tmp.path().join("io-out"), None)
+            .await
+            .unwrap();
+        assert!(io.retryable_error && !io.disk_space_error && !io.password_error);
+        write_tool(&fake, "#!/bin/sh\necho 'Data Error' >&2\nexit 2\n");
+        let corrupt = extractors
+            .extract(
+                &archive,
+                ArchiveKind::Zip,
+                &tmp.path().join("data-out"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!corrupt.retryable_error && !corrupt.success);
+        write_tool(&fake, "#!/bin/sh\necho 'Wrong password' >&2\nexit 2\n");
+        let password = extractors
+            .extract(
+                &archive,
+                ArchiveKind::Zip,
+                &tmp.path().join("password-out"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(password.password_error && !password.retryable_error);
     }
 
     #[test]

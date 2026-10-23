@@ -10,7 +10,7 @@ use crate::backend::torrent_wants_download_slot;
 use crate::failover::{Candidates, Ladder, SegmentAttempt};
 use crate::AddOpts;
 use nzbd_nzb::ParsedNzb;
-use nzbd_state::{PendingAdmission, QueueSnapshotDoc, QUEUE_SCHEMA_VERSION};
+use nzbd_state::{PendingAdmission, QueueSnapshotDoc, UrlAdmissionReceipt, QUEUE_SCHEMA_VERSION};
 use nzbd_types::{
     DupeInfo, FileEntry, FileId, Health, Job, JobId, JobKind, JobStatus, Segment, SegmentState,
     ServerDef, ServerId, TorrentRecord, TorrentSource,
@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 pub struct QueueState {
     pub jobs: Vec<Job>,
     pub pending_admissions: Vec<PendingAdmission>,
+    pub url_admission_receipts: Vec<UrlAdmissionReceipt>,
     pub next_job_id: u32,
     pub next_file_id: u32,
     pub download_paused: bool,
@@ -67,6 +68,7 @@ impl Default for QueueState {
         QueueState {
             jobs: Vec::new(),
             pending_admissions: Vec::new(),
+            url_admission_receipts: Vec::new(),
             next_job_id: 0,
             next_file_id: 0,
             download_paused: false,
@@ -110,6 +112,7 @@ impl QueueState {
         let mut state = QueueState {
             jobs: doc.jobs,
             pending_admissions: doc.pending_admissions,
+            url_admission_receipts: doc.url_admission_receipts,
             next_job_id: doc.next_job_id,
             next_file_id: doc.next_file_id,
             download_paused: doc.download_paused,
@@ -209,12 +212,89 @@ impl QueueState {
         QueueSnapshotDoc {
             schema_version: QUEUE_SCHEMA_VERSION,
             pending_admissions: self.pending_admissions.clone(),
+            url_admission_receipts: self.url_admission_receipts.clone(),
             jobs: self.jobs.clone(),
             next_job_id: self.next_job_id,
             next_file_id: self.next_file_id,
             download_paused: self.download_paused,
             speed_limit_bps: self.speed_limit_bps,
             max_active_downloads: self.max_active_downloads,
+        }
+    }
+
+    pub fn sync_url_admission_receipts(&mut self) {
+        let jobs: HashMap<u32, &Job> = self.jobs.iter().map(|job| (job.id.0, job)).collect();
+        for receipt in &mut self.url_admission_receipts {
+            if let Some(job) = jobs.get(&receipt.job_id).filter(|job| {
+                job.params
+                    .iter()
+                    .any(|(key, value)| key == "monarr-transfer" && value == &receipt.request_token)
+            }) {
+                receipt.outcome = match job.status {
+                    JobStatus::Fetching => "fetching",
+                    JobStatus::Queued => "queued",
+                    JobStatus::Downloading => "downloading",
+                    JobStatus::Paused => "paused",
+                    JobStatus::PostQueued => "post_queued",
+                    JobStatus::Post { .. } => "post_processing",
+                    JobStatus::Completed => "completed",
+                    JobStatus::Failed => "failed",
+                    JobStatus::Deleted => "deleted",
+                }
+                .to_string();
+                let param = |name: &str| {
+                    job.params
+                        .iter()
+                        .find(|(key, _)| key == name)
+                        .map(|(_, value)| value.clone())
+                };
+                if let Some(stage) = param("Failure:Stage") {
+                    receipt.failure_stage = Some(stage);
+                }
+                receipt.failure_cause = param("Failure:Reason")
+                    .or_else(|| param("*Failure:Reason"))
+                    .or_else(|| param("Failure:Files"));
+                receipt.terminal_outcome = param(nzbd_types::PP_DONE_PARAM);
+                // Once source custody is pinned to an artifact generation,
+                // its live preference is authoritative. Queue params are only
+                // a fallback before that durable relation exists.
+                if receipt.source_artifact_id.is_none() || receipt.source_generation.is_none() {
+                    receipt.keep_source_on_failure = param("Failure:KeepOnFailure")
+                        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+                }
+                receipt.source_cleanup_status = param("Delivery:SourceCleanup");
+                if let Some(custody) =
+                    param("Delivery:Custody").or_else(|| param("Artifact:Custody"))
+                {
+                    receipt.custody_state = custody;
+                }
+                receipt.publication_path =
+                    param("Delivery:Path").or_else(|| param("*Cluster:final-dir"));
+                let nonempty = |value: Option<String>| value.filter(|value| !value.is_empty());
+                let delivery_source = (
+                    nonempty(param("Delivery:SourceArtifactId")),
+                    nonempty(param("Delivery:SourceGeneration")),
+                );
+                let artifact_source = (
+                    nonempty(param("Artifact:Id")),
+                    nonempty(param("Artifact:Generation")),
+                );
+                let source = match delivery_source {
+                    (Some(id), Some(generation)) => Some((id, generation)),
+                    (None, None) => match artifact_source {
+                        (Some(id), Some(generation)) => Some((id, generation)),
+                        _ => None,
+                    },
+                    // A partially emitted Delivery tuple may be a two-step
+                    // queue update. Keep the already pinned relation until
+                    // both fields arrive; do not fall back to Artifact data.
+                    _ => None,
+                };
+                if let Some((source_id, source_generation)) = source {
+                    receipt.source_artifact_id = Some(source_id);
+                    receipt.source_generation = Some(source_generation);
+                }
+            }
         }
     }
 
@@ -256,6 +336,7 @@ impl QueueState {
             stop_seeding_on_complete: opts.stop_seeding_on_complete,
             params: opts.params,
             client: opts.client,
+            torrent_tags: opts.torrent_tags,
         });
         job_id
     }
@@ -280,10 +361,11 @@ impl QueueState {
             params,
             record,
         } = commit;
-        self.pending_admissions
+        let torrent_tags = self
+            .pending_admissions
             .iter()
-            .any(|p| p.job_id == id)
-            .then_some(())?;
+            .find(|pending| pending.job_id == id)
+            .map(|pending| pending.torrent_tags.clone())?;
         if let Some(position) = self.jobs.iter().position(|job| {
             job.torrent
                 .as_ref()
@@ -303,6 +385,10 @@ impl QueueState {
         }
         self.cancel_torrent_admission(id);
         let dir_name = self.unique_dir_name(id, sanitize_name(&name));
+        let mut params = params;
+        if !torrent_tags.is_empty() {
+            params.push((crate::QBIT_TAGS_PARAM.to_string(), torrent_tags.join(",")));
+        }
         let total = record.total_bytes;
         self.jobs.push(Job {
             id,
@@ -310,6 +396,7 @@ impl QueueState {
             name,
             dir_name,
             name_provisional: false,
+            delivery_lifecycle: nzbd_types::has_delivery_intent(&params),
             queued_at_unix: unix_now(),
             original_name: String::new(),
             category,
@@ -355,6 +442,7 @@ impl QueueState {
             name,
             dir_name,
             name_provisional: false,
+            delivery_lifecycle: false,
             queued_at_unix: unix_now(),
             original_name: String::new(),
             category,
@@ -426,6 +514,7 @@ impl QueueState {
             name,
             dir_name,
             name_provisional: false,
+            delivery_lifecycle: false,
             queued_at_unix: unix_now(),
             original_name: String::new(),
             category,
@@ -1502,6 +1591,95 @@ mod tests {
     }
 
     #[test]
+    fn admission_receipt_needs_terminal_and_custody_evidence() {
+        let mut state = QueueState::default();
+        let id = state.admit_nzb(
+            "receipt-job".into(),
+            &sample_nzb(&[("a.bin", 1)]),
+            None,
+            0,
+            true,
+        );
+        let job = state.job_mut(id).unwrap();
+        job.status = JobStatus::Completed;
+        job.params.push(("monarr-transfer".into(), "token".into()));
+        state.url_admission_receipts.push(UrlAdmissionReceipt {
+            protocol_version: 1,
+            request_token: "token".into(),
+            submission_sha256: "a".repeat(64),
+            job_id: id.0,
+            generation: "generation".into(),
+            runner_instance_id: "instance".into(),
+            terminal_outcome: None,
+            outcome: "queued".into(),
+            failure_stage: None,
+            failure_cause: None,
+            custody_state: "runner_owned".into(),
+            keep_source_on_failure: false,
+            source_cleanup_status: None,
+            publication_path: None,
+            // The immutable source relation is pinned before queue params
+            // record it. Once pinned, stale historical Keep params cannot
+            // overwrite this durable control preference.
+            source_artifact_id: Some("pinned-source".into()),
+            source_generation: Some("pinned-gen".into()),
+        });
+
+        state.sync_url_admission_receipts();
+        let receipt = &state.url_admission_receipts[0];
+        assert_eq!(receipt.terminal_outcome, None);
+        assert_eq!(receipt.custody_state, "runner_owned");
+
+        let job = state.job_mut(id).unwrap();
+        job.status = JobStatus::Deleted;
+        job.params
+            .push(("*PP:done".into(), "FAILURE/HEALTH".into()));
+        job.params
+            .push(("Delivery:Custody".into(), "curator".into()));
+        job.params
+            .push(("Failure:KeepOnFailure".into(), "true".into()));
+        job.params
+            .push(("Delivery:SourceCleanup".into(), "blocked".into()));
+        state.sync_url_admission_receipts();
+        let receipt = &state.url_admission_receipts[0];
+        assert_eq!(receipt.terminal_outcome.as_deref(), Some("FAILURE/HEALTH"));
+        assert_eq!(receipt.custody_state, "curator");
+        assert!(
+            !receipt.keep_source_on_failure,
+            "queue params cannot override a pinned source preference"
+        );
+        assert_eq!(receipt.source_cleanup_status.as_deref(), Some("blocked"));
+
+        let job = state.job_mut(id).unwrap();
+        job.params
+            .push(("Artifact:Id".into(), "artifact-source".into()));
+        job.params
+            .push(("Artifact:Generation".into(), "artifact-gen".into()));
+        job.params
+            .push(("Delivery:SourceArtifactId".into(), "new-source".into()));
+        state.sync_url_admission_receipts();
+        let receipt = &state.url_admission_receipts[0];
+        assert_eq!(receipt.source_generation.as_deref(), Some("pinned-gen"));
+        assert_eq!(receipt.source_artifact_id.as_deref(), Some("pinned-source"));
+        assert!(
+            !receipt.keep_source_on_failure,
+            "a partial Delivery tuple cannot be hybridized with an Artifact generation"
+        );
+
+        let job = state.job_mut(id).unwrap();
+        job.params
+            .push(("Delivery:SourceGeneration".into(), "new-source-gen".into()));
+        state.sync_url_admission_receipts();
+        let receipt = &state.url_admission_receipts[0];
+        assert_eq!(receipt.source_artifact_id.as_deref(), Some("new-source"));
+        assert_eq!(receipt.source_generation.as_deref(), Some("new-source-gen"));
+        assert!(
+            !receipt.keep_source_on_failure,
+            "a historical queue param cannot overwrite the pinned source preference"
+        );
+    }
+
+    #[test]
     fn regenerated_nzb_is_parseable_and_escapes_queue_evidence() {
         let parsed = nzbd_nzb::ParsedNzb {
             meta: nzbd_nzb::NzbMeta {
@@ -1737,6 +1915,7 @@ mod tests {
             name: "fake torrent".into(),
             dir_name: "fake-torrent".into(),
             name_provisional: false,
+            delivery_lifecycle: false,
             queued_at_unix: 1_799_999_900,
             original_name: String::new(),
             category: None,
@@ -2137,6 +2316,7 @@ mod tests {
         let doc = nzbd_state::QueueSnapshotDoc {
             schema_version: nzbd_state::QUEUE_SCHEMA_VERSION,
             pending_admissions: Vec::new(),
+            url_admission_receipts: Vec::new(),
             jobs: vec![],
             next_job_id: 1,
             next_file_id: 1,
@@ -2477,6 +2657,7 @@ mod tests {
             name: name.into(),
             dir_name: String::new(),
             name_provisional: false,
+            delivery_lifecycle: false,
             queued_at_unix: 0,
             original_name: String::new(),
             category: category.map(str::to_string),
@@ -2906,7 +3087,13 @@ mod tests {
     #[test]
     fn torrent_pending_intent_is_structurally_replaced_and_live_hash_deduplicates() {
         let mut queue = QueueState::default();
-        let first = queue.reserve_torrent_admission(TorrentSource::Magnet, AddOpts::default());
+        let first = queue.reserve_torrent_admission(
+            TorrentSource::Magnet,
+            AddOpts {
+                torrent_tags: vec!["monarr-transfer-first-token".into(), "tv".into()],
+                ..AddOpts::default()
+            },
+        );
         assert!(queue.jobs.is_empty());
         let record = TorrentRecord {
             info_hash_v1: "0123456789abcdef0123456789abcdef01234567".into(),
@@ -2947,8 +3134,32 @@ mod tests {
         );
         assert!(queue.pending_admissions.is_empty());
         assert_eq!(queue.jobs[0].id, first);
+        assert_eq!(
+            queue.jobs[0]
+                .params
+                .iter()
+                .find(|(key, _)| key == crate::QBIT_TAGS_PARAM)
+                .map(|(_, value)| value.as_str()),
+            Some("monarr-transfer-first-token,tv")
+        );
+        let restored = QueueState::from_doc(queue.to_doc());
+        assert_eq!(
+            restored.jobs[0]
+                .params
+                .iter()
+                .find(|(key, _)| key == crate::QBIT_TAGS_PARAM)
+                .map(|(_, value)| value.as_str()),
+            Some("monarr-transfer-first-token,tv"),
+            "the exact transfer tag survives queue snapshot restart"
+        );
 
-        let retry = queue.reserve_torrent_admission(TorrentSource::Url, AddOpts::default());
+        let retry = queue.reserve_torrent_admission(
+            TorrentSource::Url,
+            AddOpts {
+                torrent_tags: vec!["monarr-transfer-second-token".into()],
+                ..AddOpts::default()
+            },
+        );
         assert_eq!(
             queue.commit_torrent_admission(
                 retry,
@@ -2965,5 +3176,14 @@ mod tests {
         );
         assert_eq!(queue.jobs.len(), 1);
         assert!(queue.pending_admissions.is_empty());
+        assert_eq!(
+            queue.jobs[0]
+                .params
+                .iter()
+                .find(|(key, _)| key == crate::QBIT_TAGS_PARAM)
+                .map(|(_, value)| value.as_str()),
+            Some("monarr-transfer-first-token,tv"),
+            "duplicate hash admission cannot reassign the original transfer tag"
+        );
     }
 }

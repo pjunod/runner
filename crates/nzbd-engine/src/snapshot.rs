@@ -38,6 +38,14 @@ pub struct JobSummary {
     pub repair_progress: Option<RepairProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control: Option<nzbd_types::JobControl>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub lifecycle_eligible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url_fetch: Option<UrlFetchProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_cleanup: Option<FailedCleanupProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_timing: Option<PostTiming>,
     pub id: JobId,
     pub kind: JobKind,
     pub name: String,
@@ -104,6 +112,101 @@ pub struct JobSummary {
     /// Rides the existing 1 Hz tick, so the queue row's stage timer and
     /// the detail pipeline cost no extra request.
     pub stages: Vec<StageSpan>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UrlFetchProgress {
+    pub attempts: u32,
+    pub next_retry_at_unix: Option<i64>,
+    pub blocked_since_unix: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailedCleanupProgress {
+    pub attempts: u32,
+    pub next_retry_at_unix: Option<i64>,
+    pub blocked_since_unix: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostTiming {
+    pub started_at_unix: i64,
+    pub elapsed_ms: u64,
+    pub work_ms: u64,
+    pub wait_ms: u64,
+    pub attempts: u32,
+}
+
+pub(crate) fn failed_cleanup_progress(job: &nzbd_types::Job) -> Option<FailedCleanupProgress> {
+    let value = |key: &str| {
+        job.params
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    };
+    let attempts = value("*PP:failure-disposition-attempts")?.parse().ok()?;
+    Some(FailedCleanupProgress {
+        attempts,
+        next_retry_at_unix: value("*PP:failed-cleanup-next-retry").and_then(|v| v.parse().ok()),
+        blocked_since_unix: value("*PP:failed-cleanup-blocked-since").and_then(|v| v.parse().ok()),
+        last_error: value("*PP:failed-cleanup-last-error").map(str::to_owned),
+    })
+}
+
+pub(crate) fn post_timing(job: &nzbd_types::Job, now_unix: i64) -> Option<PostTiming> {
+    let first = job.stages.first()?;
+    let elapsed_ms = now_unix.saturating_sub(first.started_at_unix).max(0) as u64 * 1000;
+    let work_ms =
+        job.stages.iter().fold(0u64, |sum, span| {
+            sum.saturating_add(span.ms.unwrap_or_else(|| {
+                now_unix.saturating_sub(span.started_at_unix).max(0) as u64 * 1000
+            }))
+        });
+    let attempts = job
+        .control()
+        .map_or(0, |control| u32::from(control.retry_attempt));
+    Some(PostTiming {
+        started_at_unix: first.started_at_unix,
+        elapsed_ms,
+        work_ms: work_ms.min(elapsed_ms),
+        wait_ms: elapsed_ms.saturating_sub(work_ms),
+        attempts,
+    })
+}
+
+pub(crate) fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+pub(crate) fn url_fetch_progress(job: &nzbd_types::Job) -> Option<UrlFetchProgress> {
+    if job.status != nzbd_types::JobStatus::Fetching {
+        return None;
+    }
+    let param = |key: &str| {
+        job.params
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
+    };
+    let attempts = param("*URL:retry-attempt").and_then(|value| value.parse().ok())?;
+    Some(UrlFetchProgress {
+        attempts,
+        next_retry_at_unix: param("*URL:next-retry-at").and_then(|value| value.parse().ok()),
+        blocked_since_unix: param("*URL:blocked-since").and_then(|value| value.parse().ok()),
+        last_error: param("*URL:last-error").cloned(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -221,6 +324,10 @@ mod mobile_queue_contract_tests {
             let summary = JobSummary {
                 repair_progress: None,
                 control: None,
+                lifecycle_eligible: false,
+                url_fetch: None,
+                failed_cleanup: None,
+                post_timing: None,
                 id: serde_json::from_value(input["id"].clone()).unwrap(),
                 kind: serde_json::from_value(input["kind"].clone()).unwrap(),
                 name: serde_json::from_value(input["name"].clone()).unwrap(),

@@ -22,6 +22,7 @@ fn dormant_torrent_job() -> nzbd_types::Job {
         name: "foreign-torrent".into(),
         dir_name: "foreign-torrent".into(),
         name_provisional: false,
+        delivery_lifecycle: false,
         queued_at_unix: 1_800_000_000,
         original_name: String::new(),
         category: None,
@@ -65,6 +66,7 @@ fn transfer_job(id: u32, name: &str, status: JobStatus) -> Job {
         name: name.into(),
         dir_name: name.into(),
         name_provisional: false,
+        delivery_lifecycle: false,
         queued_at_unix: 1_800_000_000,
         original_name: name.into(),
         category: Some("test".into()),
@@ -235,11 +237,15 @@ async fn cluster_authority_adoption_refuses_dormant_torrent_rows_without_rewrite
 
 #[tokio::test]
 async fn cluster_authority_adoption_refuses_unreadable_snapshots_without_rewrite() {
+    let future_version = nzbd_state::QUEUE_SCHEMA_VERSION + 1;
+    let future_snapshot =
+        format!(r#"{{"schema_version":{future_version},"jobs":[{{"kind":"future_transfer"}}]}}"#);
+    let future_error = format!("queue.json schema version {future_version} is newer");
     for (name, bytes, expected) in [
         (
             "future schema",
-            br#"{"schema_version":5,"jobs":[{"kind":"future_transfer"}]}"#.as_slice(),
-            "queue.json schema version 5 is newer",
+            future_snapshot.as_bytes(),
+            future_error.as_str(),
         ),
         (
             "corrupt JSON",
@@ -305,6 +311,36 @@ async fn wait_finished(
     })
     .await
     .expect("timed out waiting for JobFinished")
+}
+
+async fn wait_finished_with_snapshot(
+    engine: &EngineHandle,
+    rx: &mut broadcast::Receiver<Event>,
+    job: JobId,
+    secs: u64,
+) -> (JobStatus, u16) {
+    let result = tokio::time::timeout(Duration::from_secs(secs), async {
+        loop {
+            match rx.recv().await {
+                Ok(Event::JobFinished {
+                    job: actual,
+                    status,
+                    health,
+                    ..
+                }) if actual == job => return (status, health),
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(error) => panic!("event stream closed: {error}"),
+            }
+        }
+    })
+    .await;
+    match result {
+        Ok(finished) => finished,
+        Err(error) => {
+            let job = engine.export_job(job).await.unwrap_or(None);
+            panic!("timed out waiting for JobFinished: {error}; current job: {job:#?}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -815,6 +851,9 @@ async fn duplicate_inflight_url_add_updates_params_without_a_second_job() {
                 params: vec![
                     ("tracking".into(), "second".into()),
                     ("new-key".into(), "new-value".into()),
+                    // A duplicate request cannot promote this previously
+                    // admitted legacy URL job into the new lifecycle cohort.
+                    ("monarr-delivery".into(), "1".into()),
                 ],
                 client: Some("second-client".into()),
                 ..AddOpts::default()
@@ -834,6 +873,11 @@ async fn duplicate_inflight_url_add_updates_params_without_a_second_job() {
         .params
         .iter()
         .any(|(key, value)| key == "new-key" && value == "new-value"));
+    assert!(!fetching.delivery_lifecycle);
+    assert!(!fetching
+        .params
+        .iter()
+        .any(|(key, _)| key == "monarr-delivery"));
     assert!(fetching
         .params
         .iter()
@@ -1427,7 +1471,7 @@ async fn url_jobs_fetch_then_download() {
         .iter()
         .any(|j| j.id == id && matches!(j.status, JobStatus::Fetching)));
 
-    let (status, _) = wait_finished(&mut rx, id, 30).await;
+    let (status, _) = wait_finished_with_snapshot(&engine, &mut rx, id, 30).await;
     assert_eq!(status, JobStatus::Completed);
     assert_eq!(
         std::fs::read(tmp.path().join("dest/urljob/u.bin")).unwrap(),
@@ -1436,16 +1480,26 @@ async fn url_jobs_fetch_then_download() {
 
     // Dead URL: job fails (history classification is FAILURE/FETCH,
     // asserted at the PP layer).
+    let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_url = format!(
+        "http://127.0.0.1:{}/nope.nzb",
+        dead_listener.local_addr().unwrap().port()
+    );
+    let dead_response = std::thread::spawn(move || {
+        let (mut stream, _) = dead_listener.accept().unwrap();
+        let mut request = [0u8; 2048];
+        let _ = stream.read(&mut request);
+        stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+    });
     let dead = engine
-        .add_url(
-            "deadjob",
-            "http://127.0.0.1:1/nope.nzb",
-            nzbd_engine::AddOpts::default(),
-        )
+        .add_url("deadjob", &dead_url, nzbd_engine::AddOpts::default())
         .await
         .unwrap();
     let (status, _) = wait_finished(&mut rx, dead, 30).await;
     assert_eq!(status, JobStatus::Failed);
+    dead_response.join().unwrap();
     engine.shutdown().await;
 }
 
@@ -1579,6 +1633,88 @@ async fn url_fetch_resumes_after_restart_with_clean_name() {
         data
     );
     engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transfer_token_is_durable_after_failed_job_history_removal_and_restart() {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/not-present.nzb",
+        listener.local_addr().unwrap().port()
+    );
+    let terminal_response = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 2048];
+        let _ = stream.read(&mut request);
+        stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let token = "manual-transfer-unique-0001";
+    let opts = || AddOpts {
+        category: Some("tv".into()),
+        priority: 7,
+        params: vec![
+            ("monarr-transfer".into(), token.into()),
+            ("monarr-delivery".into(), "1".into()),
+        ],
+        ..AddOpts::default()
+    };
+
+    let first_engine = spawn_engine(tmp.path(), Vec::new()).await;
+    let first = first_engine.add_url("one", &url, opts()).await.unwrap();
+    let mut events = first_engine.subscribe();
+    let (status, _) = wait_finished_with_snapshot(&first_engine, &mut events, first, 10).await;
+    assert_eq!(status, JobStatus::Failed);
+    terminal_response.join().unwrap();
+    assert!(first_engine.remove_job_silent(first).await.unwrap());
+    assert!(first_engine
+        .snapshot()
+        .jobs
+        .iter()
+        .all(|job| job.id != first));
+    first_engine.shutdown().await;
+
+    let restarted = spawn_engine(tmp.path(), Vec::new()).await;
+    let replay = restarted.add_url("one", &url, opts()).await.unwrap();
+    assert_eq!(
+        replay, first,
+        "replay returns the original admission receipt"
+    );
+    assert!(restarted.snapshot().jobs.iter().all(|job| job.id != first));
+    let receipt = restarted.url_admission(token).await.unwrap().unwrap();
+    assert_eq!(receipt.job_id, first.0);
+    assert_eq!(receipt.outcome, "failed");
+    assert!(!receipt.runner_instance_id.is_empty());
+
+    let changed = restarted
+        .add_url("one", "http://127.0.0.1:1/changed.nzb", opts())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        changed,
+        nzbd_engine::EngineError::RequestConflict(_)
+    ));
+    let changed_intent = restarted
+        .add_url(
+            "one",
+            &url,
+            AddOpts {
+                category: Some("tv".into()),
+                priority: 7,
+                params: vec![("monarr-transfer".into(), token.into())],
+                ..AddOpts::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        changed_intent,
+        nzbd_engine::EngineError::RequestConflict(_)
+    ));
+    restarted.shutdown().await;
 }
 
 /// The disk-low guard reads a CACHED free-space value maintained by a
@@ -1931,6 +2067,9 @@ async fn legacy_coverage_hold_recovers_without_repeating_valid_articles() {
             instance: "legacy".into(),
             previous_status: Some(JobStatus::Downloading),
             manual_pause: manual,
+            retry_attempt: 0,
+            next_retry_at_unix: None,
+            blocked_since_unix: None,
         });
         job.status = JobStatus::Paused;
         engine.import_job(job, false, false).await.unwrap();

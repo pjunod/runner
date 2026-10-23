@@ -89,20 +89,21 @@ pub(crate) fn load_sets_checked(
     }
 }
 pub(crate) fn load_recovery_sets(dir: &Path) -> Result<(Vec<Par2Set>, Vec<String>), PostError> {
+    load_recovery_sets_checked(dir, &crate::attempt::checkpoint)
+}
+pub(crate) fn load_recovery_sets_checked(
+    dir: &Path,
+    checkpoint: &dyn Fn() -> std::io::Result<()>,
+) -> Result<(Vec<Par2Set>, Vec<String>), PostError> {
     if let Some(control) = crate::attempt::current() {
         discover(
             dir,
-            &crate::attempt::checkpoint,
+            checkpoint,
             &mut control.par_cache.lock().unwrap(),
             true,
         )
     } else {
-        discover(
-            dir,
-            &crate::attempt::checkpoint,
-            &mut DiscoveryCache::default(),
-            true,
-        )
+        discover(dir, checkpoint, &mut DiscoveryCache::default(), true)
     }
 }
 fn metadata_cost(scan: &nzbd_par2::Scan) -> usize {
@@ -132,8 +133,7 @@ fn discover(
     for path in crate::namespace::files(dir)? {
         checkpoint()?;
         let parsed = (|| -> Result<Option<std::sync::Arc<nzbd_par2::Scan>>, PostError> {
-            let mut input = nzbd_state::fileops::open(&path)
-                .map_err(|e| PostError::Subprocess(e.to_string()))?;
+            let mut input = nzbd_state::fileops::open(&path).map_err(PostError::from)?;
             let before = crate::fingerprint::FileStamp::of(&input.metadata()?);
             if let Some((stamp, scan)) = cache.files.get(&path) {
                 if *stamp == before {
@@ -166,9 +166,9 @@ fn discover(
             if before != crate::fingerprint::FileStamp::of(&input.0.metadata()?)
                 || crate::fingerprint::stamp(&path)? != before
             {
-                return Err(PostError::Subprocess(
-                    "PAR input identity changed during discovery".into(),
-                ));
+                return Err(PostError::Io(std::io::Error::other(
+                    "PAR input identity changed during discovery",
+                )));
             }
             let scan = std::sync::Arc::new(scan);
             let old_cost = cache
@@ -181,9 +181,9 @@ fn discover(
                 .saturating_sub(old_cost)
                 .saturating_add(cost);
             if next > 64 * 1024 * 1024 {
-                return Err(PostError::Subprocess(
-                    "PAR discovery cache metadata exceeds 64 MiB".into(),
-                ));
+                return Err(PostError::Io(std::io::Error::other(
+                    "PAR discovery metadata exceeds 64 MiB; inspect source before cleanup",
+                )));
             }
             cache.metadata_bytes = next;
             cache.files.insert(path.clone(), (before, scan.clone()));
@@ -199,7 +199,12 @@ fn discover(
             Ok(None) => {}
             Err(error) => {
                 checkpoint()?;
-                if !tolerate_invalid {
+                if !tolerate_invalid
+                    || matches!(
+                        error,
+                        PostError::Io(_) | PostError::Artifact(nzbd_state::artifacts::Error::Io(_))
+                    )
+                {
                     return Err(error);
                 }
                 rejected.push(format!("{}: {error}", path.display()));

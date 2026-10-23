@@ -1246,6 +1246,12 @@ try {
         <button class="small" data-action="f-rec-next">next ›</button>
       </div>
     </details>
+    <details class="files-recoveries" id="files-deliveries-box">
+      <summary>Published deliveries <span class="sec-count" id="files-deliveries-count"></span></summary>
+      <p class="sub">Runner transfers the published payload to Curator and tracks source cleanup separately. Retained processing sources remain Runner-owned.</p>
+      <div id="files-deliveries"></div>
+      <button class="small" id="files-deliveries-more" data-action="f-deliveries-next" hidden>load older deliveries</button>
+    </details>
   </section>
 
   <section id="tab-history" hidden>
@@ -1974,7 +1980,7 @@ function rowModel(j, ctx) {
   const active = !["waiting", "completed", "attention", "paused"].includes(section);
   const torrent = j.kind === "torrent";
   const hold = j.control && j.control.lifecycle === "held" ? j.control : null;
-  const reviewHold = hold && hold.retry_policy !== "resume_same_job";
+  const reviewHold = hold && !["resume_same_job", "reobserve_mount"].includes(hold.retry_policy);
   const phase = torrentPhase(j);
   const seed = phase === "seeding" || phase === "paused_seed";
   const seedPaused = phase === "paused_seed";
@@ -2030,7 +2036,18 @@ function rowModel(j, ctx) {
     hNoteCls = "sub hnote bad";
   }
 
-  if (hold) rest.push(" · " + (hold.message || "job on hold") + (reviewHold ? " · needs review" : ""));
+  if (hold) {
+    rest.push(" · " + (hold.message || "job on hold") + (reviewHold ? " · needs review" : ""));
+    if (hold.retry_policy === "reobserve_mount")
+      rest.push(" · waiting for the configured storage source; Runner will resume when it returns");
+    if (["scheduled_retry", "resume_same_job"].includes(hold.retry_policy) && hold.blocked_since_unix != null) {
+      const blockedForMs = Math.max(0, (ctx.nowMs || Date.now()) - hold.blocked_since_unix * 1000);
+      if (blockedForMs >= 30 * 60 * 1000)
+        rest.push(" · still blocked after 30 minutes; source remains in Runner for recovery");
+      else if (hold.retry_policy === "scheduled_retry" && hold.next_retry_at_unix != null)
+        rest.push(" · next retry in " + fmtDur(Math.max(0, hold.next_retry_at_unix * 1000 - (ctx.nowMs || Date.now()))));
+    }
+  }
   const shownSt = over || (hold ? "held" : st);
   const shownCls = over ? (STATUS_CLASS[over] || "dim") : cls;
   return {
@@ -2317,6 +2334,19 @@ async function saveSeedPolicy(id) {
   } else toast({ text: "Couldn't save seeding policy — " + result.error, kind: "error" });
   renderQueue();
 }
+async function toggleFailureKeep(id) {
+  const job = store.jobs.find(item => item.id === id);
+  if (!job) return;
+  const keep = !(job.params || []).some(([key, value]) => key === "*Runner:KeepOnFailure" && value === "1");
+  const response = await post("/api/v1/jobs/" + id + "/failure-keep", {
+    method: "PUT", headers: { ...CLIENT_HDRS, "content-type": "application/json" },
+    body: JSON.stringify({ keep }),
+  });
+  if (response.ok) {
+    toast({ text: keep ? "Runner will retain this download's source if it fails" : "This download will follow Runner's configured failure policy" });
+    refreshAll();
+  } else toast({ text: "Couldn't save failure retention — " + response.error, kind: "error" });
+}
 function editSeedPolicy(ev) {
   const el = ev.target;
   const field = el && el.dataset && el.dataset.seedField;
@@ -2362,6 +2392,8 @@ function buildDetailRow(d) {
   c.nzb = d.append(head, d.create("a", "btnlike"));
   d.attr(c.nzb, "download", "");
   d.text(c.nzb, "download source");
+  c.keepFailure = d.append(head, d.create("button", "small"));
+  d.data(c.keepFailure, "action", "failure-keep");
   c.close = d.append(head, d.create("button", "small"));
   d.data(c.close, "action", "detail-close");
   d.text(c.close, "close");
@@ -2406,6 +2438,12 @@ function buildDetailRow(d) {
   const pipeLabel = d.append(c.pipeSection, d.create("div", "jd-section-label"));
   d.text(pipeLabel, "Processing timeline");
   c.pipe = d.append(c.pipeSection, d.create("div", "jd-pipe"));
+
+  c.lifecycle = d.append(wrap, d.create("div", "jd-recovery"));
+  c.lifecycleStatus = d.append(c.lifecycle, d.create("span", "jd-recovery-label"));
+  c.retryNow = d.append(c.lifecycle, d.create("button", "small"));
+  d.data(c.retryNow, "action", "lifecycle-retry-now");
+  d.text(c.retryNow, "retry now");
 
   // Recovery is intentionally in the live detail panel, beside the stage
   // timeline it acts on. Each boundary restarts that phase and everything
@@ -2554,7 +2592,21 @@ function detailModel(j, nowMs) {
   const bits = (j.params || [])
     .filter(([k]) => k && k[0] !== "*")
     .map(([k, v]) => k + " = " + v);
+  const keepOnFailure = (j.params || []).some(([key, value]) => key === "*Runner:KeepOnFailure" && value === "1");
   const recoverMax = recoveryMax(j);
+  const postTiming = j.postTiming;
+  const cleanupRetry = j.failedCleanup;
+  const urlRetry = j.urlFetch;
+  const heldControl = j.control && j.control.lifecycle === "held" ? j.control : null;
+  const lifecycleStatus = postTiming
+    ? "Post-processing: " + fmtDur(postTiming.elapsedMs) + " elapsed · " + fmtDur(postTiming.workMs) + " work · " + fmtDur(postTiming.waitMs) + " waiting · " + postTiming.attempts + " retries"
+    : cleanupRetry
+      ? "Source cleanup retry " + cleanupRetry.attempts + (cleanupRetry.blockedSinceUnix ? " · blocked " + fmtDur(Math.max(0, nowMs - cleanupRetry.blockedSinceUnix * 1000)) : "") + (cleanupRetry.lastError ? " · " + cleanupRetry.lastError : "")
+      : urlRetry
+        ? "NZB fetch retry " + urlRetry.attempts + (urlRetry.blockedSinceUnix ? " · waiting " + fmtDur(Math.max(0, nowMs - urlRetry.blockedSinceUnix * 1000)) : "") + (urlRetry.nextRetryAtUnix ? " · next " + new Date(urlRetry.nextRetryAtUnix * 1000).toLocaleTimeString() : "") + (urlRetry.lastError ? " · " + urlRetry.lastError : "")
+        : heldControl
+          ? "Held at " + heldControl.stage + " (" + heldControl.cause + "): " + heldControl.message
+          : "";
   const draft = seedDraft(j);
   return {
     key: "__detail", kind: "detail", id: j.id, name: j.name, scope: "queue",
@@ -2585,10 +2637,16 @@ function detailModel(j, nowMs) {
     sourceTitle: torrent
       ? "Download this job's retained .torrent metainfo."
       : "Download this job's NZB regenerated from queue state.",
+    failureKeep: keepOnFailure,
+    failureKeepHidden: torrent || j.status === "completed" || j.status === "failed" || j.status === "deleted",
     nzbHidden: false,
     closeHidden: false,
     recoverHidden: torrent || !recoverMax,
     recoverMax,
+    lifecycleHidden: torrent || (!lifecycleStatus && !(j.lifecycleEligible && j.status === "failed")),
+    lifecycleStatus: lifecycleStatus || (j.lifecycleEligible && j.status === "failed" ? "Failed source cleanup is ready for an immediate retry." : ""),
+    lifecycleRetryHidden: torrent || !(j.lifecycleEligible && (cleanupRetry || (j.control && ["scheduled_retry", "resume_same_job", "reobserve_mount"].includes(j.control.retry_policy)))) ,
+    lifecycleRetryDisabled: !!(j.urlFetch && j.urlFetch.nextRetryAtUnix && j.status === "fetching"),
     meta: bits.join("  ·  "),
     metaHidden: false,
     metaClient: "", metaElapsed: "", metaPar: "", metaSource: "",
@@ -2705,11 +2763,22 @@ function applyDetail(tr, m, d) {
   w("nzbHref", m.nzbHref || "", v => d.attr(c.nzb, "href", v));
   w("sourceLabel", m.sourceLabel || "download source", v => d.text(c.nzb, v));
   w("sourceTitle", m.sourceTitle || "", v => d.prop(c.nzb, "title", v));
+  w("failureKeep", !!m.failureKeep, v => {
+    d.text(c.keepFailure, "Keep on failure: " + (v ? "on" : "off"));
+    d.prop(c.keepFailure, "title", v
+      ? "Retain this Runner source if the download fails. Change is saved to the durable queue record."
+      : "Default: failed source files follow Runner's configured failure policy.");
+  });
+  w("failureKeepHidden", !!m.failureKeepHidden, v => d.prop(c.keepFailure, "hidden", v));
   // History has no NZB endpoint of its own — a parked NZB is reachable
   // only through requeue — so the button is absent rather than broken.
   w("nzbHidden", !!m.nzbHidden, v => d.prop(c.nzb, "hidden", v));
   w("closeHidden", !!m.closeHidden, v => d.prop(c.close, "hidden", v));
   w("recoverHidden", m.recoverHidden !== false, v => d.prop(c.recovery, "hidden", v));
+  w("lifecycleHidden", !!m.lifecycleHidden, v => d.prop(c.lifecycle, "hidden", v));
+  w("lifecycleStatus", m.lifecycleStatus || "", v => d.text(c.lifecycleStatus, v));
+  w("lifecycleRetryHidden", !!m.lifecycleRetryHidden, v => d.prop(c.retryNow, "hidden", v));
+  w("lifecycleRetryDisabled", !!m.lifecycleRetryDisabled, v => d.prop(c.retryNow, "disabled", v));
   w("recoverMax", m.recoverMax || "", v => {
     const order = ["all", "verify", "unpack", "cleanup", "move", "scripts"];
     const max = order.indexOf(v);
@@ -4139,8 +4208,8 @@ function armIsSet(key) { return armed.key === key; }
 function armButton(key) {
   if (armed.timer) clearTimeout(armed.timer);
   armed.key = key;
-  armed.timer = setTimeout(() => { armed.key = null; armed.timer = null; renderHistory(); renderQueue(); }, ARM_MS);
-  renderHistory(); renderQueue();
+  armed.timer = setTimeout(() => { armed.key = null; armed.timer = null; renderHistory(); renderQueue(); renderFiles(); }, ARM_MS);
+  renderHistory(); renderQueue(); renderFiles();
 }
 function disarmButton() {
   if (armed.timer) clearTimeout(armed.timer);
@@ -4152,11 +4221,23 @@ document.addEventListener("click", (ev) => {
   const el = t && t.closest ? t.closest("[data-action]") : null;
   if (!el) return;
   const action = el.dataset.action;
+  if (armed.key && armed.key.startsWith("ds:") && action !== "f-delivery-source-delete") {
+    disarmButton(); renderFiles();
+  }
   if (action === "toggle-section") { toggleSection(el.dataset.section); return; }
   if (action.startsWith("f-")) { filesClick(action, el); return; }
   const row = el.closest ? el.closest("[data-job-id]") : null;
   const id = Number(el.dataset.job || (row && row.dataset.jobId));
   const scope = row ? row.dataset.scope : "queue";
+  if (action === "lifecycle-retry-now") {
+    const name = store.jobs.find(j => j.id === id)?.name || ("job #" + id);
+    post("/api/v1/jobs/" + id + "/retry").then(result => {
+      if (!result.ok) toast({ text: "Retry failed — " + result.error, kind: "error" });
+      else toast({ text: "Retrying lifecycle work for “" + name + "”" });
+      refreshAll(true);
+    });
+    return;
+  }
   // Any other click disarms a pending two-step button: aiming somewhere
   // else is as clear a "no" as waiting it out.
   if (action !== "h-delete-files" && action !== "delete-data" && armed.key) { disarmButton(); renderHistory(); renderQueue(); }
@@ -4192,6 +4273,7 @@ document.addEventListener("click", (ev) => {
   }
   if (action === "seed-options") { if (openJob !== id) toggleJob(id); return; }
   if (action === "seed-save") { saveSeedPolicy(id); return; }
+  if (action === "failure-keep") { toggleFailureKeep(id); return; }
   if (action === "delete") {
     deleteJob(id, name);
     return;
@@ -4762,7 +4844,11 @@ const filesSelectingAll = new Set();
 const filesWatch = new Map();
 store.files = null; // { entries, total, counts, discovery, filter, sort, q }
 store.recoveries = null;
+store.deliveries = null;
 let filesRecoveryOffset = 0;
+let filesDeliveryAfter = 0;
+let filesDeliveryNext = 0;
+let filesDeliveryRows = [];
 
 async function fileRequest(path, body, method = "POST") {
   const response = await jfetch("/api/v1/" + path, {
@@ -5210,6 +5296,7 @@ function renderFiles() {
   renderFilesToolbar();
   renderFilesScan();
   renderRecoveries();
+  renderDeliveries();
 }
 function renderRecoveries() {
   const box = $("files-recoveries"), count = $("files-recoveries-count");
@@ -5238,6 +5325,53 @@ function renderRecoveries() {
     setText($("files-recoveries-info"), (filesRecoveryOffset + 1) + "–" + (filesRecoveryOffset + r.length));
   }
 }
+function renderDeliveries() {
+  const box = $("files-deliveries"), count = $("files-deliveries-count"), rows = store.deliveries;
+  if (!box) return;
+  if (armed.key && armed.key.startsWith("ds:") &&
+      !(rows || []).some(d => deliverySourceArmKey(d) === armed.key)) disarmButton();
+  if (count) setText(count, rows ? String(rows.length) : "");
+  const sig = rows ? rows.map(d => deliverySourceArmKey(d) + ":" + d.status + ":" + d.sourceCleanup.status + ":" + (d.sourceCleanup.error || "") + ":" + (d.sourceCleanup.warning || "") + ":" + d.sourceCleanup.lastAttemptAt + ":" + d.sourceCleanup.completedAt + ":" + JSON.stringify(d.sourceCleanup.attemptHistory || [])).join("|") + ":" + (armed.key || "") : "";
+  const more = $("files-deliveries-more");
+  if (more) more.hidden = !(filesDeliveryNext > filesDeliveryAfter);
+  if (box.__sig === sig) return;
+  box.__sig = sig;
+  if (!rows || !rows.length) { box.innerHTML = `<div class="sub">no published deliveries</div>`; return; }
+  box.innerHTML = rows.slice().reverse().map(d => {
+    const cleanup = d.sourceCleanup || {};
+    const retryable = ["blocked", "retry", "pending"].includes(cleanup.status);
+    const retained = (d.fileOutcomes || []).filter(f => f.outcome === "retained_processing").length;
+    const hasSeparateSource = d.sourceArtifactId && d.sourceArtifactId !== d.artifactId;
+    const timeline = ["ready " + fmtTime(d.readyAt)];
+    if (d.acceptedAt) timeline.push("accepted " + fmtTime(d.acceptedAt));
+    if (cleanup.startedAt) timeline.push("cleanup started " + fmtTime(cleanup.startedAt));
+    if (cleanup.lastAttemptAt && cleanup.lastAttemptAt !== cleanup.startedAt)
+      timeline.push("last cleanup attempt " + fmtTime(cleanup.lastAttemptAt));
+    if (cleanup.completedAt) {
+      const elapsed = cleanup.startedAt ? " in " + fmtDur((cleanup.completedAt - cleanup.startedAt) * 1000) : "";
+      timeline.push("source retired " + fmtTime(cleanup.completedAt) + elapsed);
+    }
+    const attempts = (cleanup.attemptHistory || []).map(a => {
+      const work = a.workMs == null ? "running" : fmtDur(a.workMs);
+      return "attempt " + a.attempt + ": " + a.outcome + " · work " + work + " · wait " + fmtDur(a.waitMs) + (a.error ? " · " + a.error : "");
+    });
+    return `<div class="rec-row"><code>${esc(d.deliveryId)}</code>` +
+      `<span class="st ${d.status === "accepted" ? "ok" : "warn"}">${esc(d.status)}</span>` +
+      `<span>${(d.files || []).length} payload files</span><span>source cleanup: ${esc(cleanup.status || "unknown")}</span>` +
+      `<span class="rec-folder">${esc(timeline.join(" · "))}</span>` +
+      (attempts.length ? `<span class="rec-folder" title="${esc(attempts.join("\n"))}">${esc(attempts.slice(-3).join(" · "))}</span>` : "") +
+      (retained ? `<span>${retained} retained source files</span>` : "") +
+      (cleanup.warning ? `<span class="warn">${esc(cleanup.warning)}</span>` : "") +
+      (cleanup.error ? `<span class="err">${esc(cleanup.error)}</span>` : "") +
+      (retryable ? `<button class="small" data-action="f-delivery-retry" data-delivery="${esc(d.deliveryId)}">retry source cleanup</button>` : "") +
+      `<span class="rec-folder" title="${esc(d.sourceArtifactId || "")}">Runner source ${esc(d.sourceArtifactId || "unknown")}</span>` +
+      (hasSeparateSource ? `<button class="small del" data-action="f-delivery-source-delete" data-delivery="${esc(d.deliveryId)}">${armIsSet(deliverySourceArmKey(d)) ? "click again to remove" : "remove retained source"}</button>` : "") + `</div>`;
+  }).join("");
+}
+function deliverySourceArmKey(delivery) {
+  return "ds:" + [delivery.deliveryId, delivery.artifactId, delivery.publicationGeneration || delivery.generation,
+    delivery.sourceArtifactId, delivery.sourceGeneration].join(":");
+}
 
 // ---- fetch -------------------------------------------------------------------
 async function refreshFiles(force = false) {
@@ -5265,11 +5399,44 @@ async function refreshFiles(force = false) {
       const rec = await fileRequest("recoveries?include_terminal=" + !!$("files-recoveries-terminal")?.checked + "&offset=" + filesRecoveryOffset, null, "GET");
       store.recoveries = Array.isArray(rec) ? rec : [];
     } catch { store.recoveries = store.recoveries || []; }
+    try {
+      const priorRows = filesDeliveryRows;
+      const priorAfter = filesDeliveryAfter;
+      const priorNext = filesDeliveryNext;
+      const requestedAfter = 0;
+      const page = await fileRequest("deliveries?after=" + requestedAfter + "&limit=100&includeAccepted=true", null, "GET");
+      const firstCursor = Number(page.nextCursor || 0);
+      filesDeliveryAfter = requestedAfter;
+      filesDeliveryNext = firstCursor;
+      filesDeliveryRows = Array.isArray(page.deliveries) ? page.deliveries : [];
+      if (priorNext > firstCursor) {
+        const seen = new Set(filesDeliveryRows.map(d => d.deliveryId));
+        for (const d of priorRows) {
+          if (Number(d.sequence || 0) > firstCursor && !seen.has(d.deliveryId)) filesDeliveryRows.push(d);
+        }
+        filesDeliveryAfter = priorAfter;
+        filesDeliveryNext = priorNext;
+      }
+      store.deliveries = filesDeliveryRows;
+    } catch { store.deliveries = store.deliveries || []; }
     renderFiles();
   } catch (e) {
     if (store.files == null) { store.files = "off"; renderFiles(); }
     else filesError(e);
   } finally { filesBusy = false; }
+}
+async function loadOlderDeliveries() {
+  if (!(filesDeliveryNext > filesDeliveryAfter)) return;
+  try {
+    const after = filesDeliveryNext;
+    const page = await fileRequest("deliveries?after=" + after + "&limit=100&includeAccepted=true", null, "GET");
+    filesDeliveryAfter = after;
+    filesDeliveryNext = Number(page.nextCursor || after);
+    const seen = new Set(filesDeliveryRows.map(d => d.deliveryId));
+    for (const d of (page.deliveries || [])) if (!seen.has(d.deliveryId)) filesDeliveryRows.push(d);
+    store.deliveries = filesDeliveryRows;
+    renderDeliveries();
+  } catch (e) { filesError(e); }
 }
 async function loadFileDetail(id, offset = 0, render = true) {
   try {
@@ -5430,6 +5597,40 @@ async function pruneRecovery(rid) {
     });
   } catch (e) { filesError(e); }
 }
+async function retryDeliveryCleanup(id) {
+  try {
+    const delivery = await fileRequest("deliveries/" + encodeURIComponent(id) + "/source-cleanup/retry", {});
+    const cleanup = delivery.sourceCleanup || {};
+    toast({ text: "Source cleanup is " + (cleanup.status || "unknown") + (cleanup.error ? " — " + cleanup.error : "") });
+    await refreshFiles(true);
+  } catch (e) { filesError(e); }
+}
+async function deleteDeliverySource(id) {
+  const delivery = (store.deliveries || []).find(d => d.deliveryId === id);
+  if (!delivery || !delivery.sourceArtifactId || delivery.sourceArtifactId === delivery.artifactId) return;
+  try {
+    const source = await fileRequest("artifacts/" + encodeURIComponent(delivery.sourceArtifactId), null, "GET");
+    if (source.generation !== delivery.sourceGeneration || !source.owned) {
+      throw new Error("Runner source identity changed; inspect the artifact before removing it.");
+    }
+    const op = await fileRequest("artifacts/" + encodeURIComponent(source.id) + "/delete", {
+      revision: source.revision, idempotency_key: uuid(), undo_seconds: 8,
+    });
+    const toastHandle = toast({
+      text: "Removing retained Runner source in 8 s", ttlMs: UNDO_MS,
+      action: { label: "Undo", fn: async () => {
+        try { await fileRequest("artifact-operations/" + op.id + "/cancel"); filesWatch.delete(op.id); }
+        catch (e) { filesError(e); }
+        return refreshFiles(true);
+      } },
+    });
+    watchOperation(op, "delete", source.id, async done => {
+      if (done.state === "succeeded") { toastHandle.dismiss(); toast({ text: "Retained Runner source removed" }); }
+      else if (done.state !== "cancelled") toast({ text: "Source removal " + done.state + (done.error ? " — " + done.error : ""), kind: "error", ttlMs: 12000 });
+      await refreshFiles(true);
+    });
+  } catch (e) { filesError(e); }
+}
 // Every Files-tab click routes here from the page's one delegated listener.
 function filesClick(action, el) {
   const row = el.closest ? el.closest("[data-artifact]") : null;
@@ -5444,6 +5645,16 @@ function filesClick(action, el) {
   if (action === "f-rec-next") { filesRecoveryOffset += 100; return refreshFiles(true); }
   if (action === "f-rec-prune") return pruneRecovery(el.dataset.recovery);
   if (action === "f-rec-cancel") return cancelRecovery(el.dataset.recovery);
+  if (action === "f-delivery-retry") return retryDeliveryCleanup(el.dataset.delivery);
+  if (action === "f-deliveries-next") return loadOlderDeliveries();
+  if (action === "f-delivery-source-delete") {
+    const delivery = (store.deliveries || []).find(d => d.deliveryId === el.dataset.delivery);
+    if (!delivery || !delivery.sourceArtifactId || delivery.sourceArtifactId === delivery.artifactId) return;
+    const key = deliverySourceArmKey(delivery);
+    if (!armIsSet(key)) { armButton(key); return; }
+    disarmButton();
+    return deleteDeliverySource(el.dataset.delivery);
+  }
   if (!id) return;
   if (action === "f-abandon-move") {
     const a = filesDetail && filesDetail.artifact;
@@ -6296,11 +6507,15 @@ if (typeof __nzbd_test_enable !== "undefined") {
     },
     clientLabel, clientChipModels, UA_MAX,
     fileRowModel, fileDetailModel, fileDetailHtml, filesStateModel, fileRetentionText, filesScanModel,
-    fileBaseName, fileParent, renderFiles, refreshFiles, filesClick, toggleFile, watchOperation, selectAllFiles, filesSelectionChange,
+    fileBaseName, fileParent, renderFiles, renderDeliveries, refreshFiles, loadOlderDeliveries, retryDeliveryCleanup, filesClick, toggleFile, watchOperation, selectAllFiles, filesSelectionChange,
     setFilesPage, setFilesPageSize, setFilesFilter, setFilesSort, setFilesQuery, filesPages,
     filesView, filesWatch, filesSelections, FILES_PAGE_SIZES, FILES_PAGE_SIZE_DEFAULT,
     getFilesDetail: () => filesDetail, getFilesOpen: () => filesOpen,
     setFilesDetailForTest: (open, d) => { filesOpen = open; filesDetail = d; },
+    setDeliveriesForTest: (rows, after, next) => {
+      filesDeliveryRows = rows; filesDeliveryAfter = after; filesDeliveryNext = next; store.deliveries = rows;
+    },
+    getDeliveryPagingForTest: () => ({ after: filesDeliveryAfter, next: filesDeliveryNext, count: filesDeliveryRows.length }),
     pageSlice, setPage, setPageSize, renderPager, PAGE_SIZES, PAGE_SIZE_DEFAULT,
     pageState: () => ({ page, pageSize }),
     seedDraft, seedDrafts, seedBody, saveSeedPolicy,

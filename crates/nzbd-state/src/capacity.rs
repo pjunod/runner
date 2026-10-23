@@ -10,6 +10,10 @@ mod native {
     use std::sync::{Mutex, OnceLock};
 
     const RESERVE: u64 = 1024 * 1024 * 1024;
+    #[cfg(test)]
+    thread_local! {
+        pub(crate) static FAIL_NEXT_RESERVATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
     static CLAIMS: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
     pub struct Reservation {
         device: u64,
@@ -24,6 +28,10 @@ mod native {
     }
 
     pub fn reserve(root: &Path, bytes: u64) -> io::Result<Reservation> {
+        #[cfg(test)]
+        if FAIL_NEXT_RESERVATION.with(|fail| fail.replace(false)) {
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        }
         let meta = std::fs::symlink_metadata(root)?;
         if !meta.is_dir() || meta.file_type().is_symlink() {
             return Err(io::Error::other("unsafe capacity context"));
@@ -79,6 +87,8 @@ mod native {
         Ok(reservation)
     }
 }
+#[cfg(all(unix, test))]
+pub(crate) use native::FAIL_NEXT_RESERVATION;
 #[cfg(unix)]
 pub use native::{available, health, reserve, Reservation};
 #[cfg(not(unix))]

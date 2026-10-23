@@ -306,7 +306,7 @@ bind = "{addr}"
 fn a_finished_download_announces_its_stages_its_final_dir_and_its_history_row() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let data = prng_bytes(7, 120_000);
-    let post = build_post("Show.S01E01", &[("payload.bin", data.clone())], 25_000);
+    let post = build_post("Show.S01E01", &[("episode.mkv", data.clone())], 25_000);
 
     // A category with its own destination: N6's honesty fix, exercised by
     // the same download rather than in isolation, because the thing that

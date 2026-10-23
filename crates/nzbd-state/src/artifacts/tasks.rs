@@ -193,6 +193,7 @@ impl Inventory {
     /// task twice. Bounded so a task that re-queues itself cannot spin.
     pub fn run_tasks(&self) -> Result<()> {
         let _runner = self.tasks.lock().unwrap();
+        self.retry_delivery_cleanup()?;
         for _ in 0..400 {
             // A kicked runner can outlive shutdown; leave the rest queued for
             // the next boot instead of failing each one against a closed inventory.

@@ -1508,7 +1508,7 @@ mod tests {
         for (category, conflict) in [(false, false), (true, false), (false, true), (true, true)] {
             let tmp = tempfile::tempdir().unwrap();
             let data = prng_bytes(17, 32768);
-            let post = build_post("storage-contract", &[("payload.bin", data.clone())], 8192);
+            let post = build_post("storage-contract", &[("payload.mkv", data.clone())], 8192);
             let server = NservBuilder::new().with_post(&post).start().await.unwrap();
             let mut cfg = nzbd_config::Config::default();
             cfg.paths.main_dir = tmp.path().join("processing");
@@ -1570,7 +1570,7 @@ mod tests {
             .await
             .expect("download must finish");
             assert_eq!(
-                std::fs::read(allocation.path.join("payload.bin")).unwrap(),
+                std::fs::read(allocation.path.join("payload.mkv")).unwrap(),
                 data
             );
             assert!(!engine.export_job(job).await.unwrap().unwrap().ready());
@@ -1579,9 +1579,11 @@ mod tests {
             } else {
                 cfg.dest_dir()
             };
-            assert!(!destination.join("storage-contract").exists());
+            let published_dir =
+                destination.join(format!("storage-contract.runner-{}", allocation.generation));
+            assert!(!published_dir.exists());
             if conflict {
-                std::fs::create_dir_all(destination.join("storage-contract")).unwrap();
+                std::fs::create_dir_all(&published_dir).unwrap();
             }
             let history = Arc::new(
                 nzbd_state::history::HistoryDb::open(&cfg.state_dir().join("history.sqlite"), None)
@@ -1599,21 +1601,21 @@ mod tests {
                 assert!(result.is_err());
                 assert!(!engine.export_job(job).await.unwrap().unwrap().ready());
                 assert_eq!(
-                    std::fs::read(allocation.path.join("payload.bin")).unwrap(),
+                    std::fs::read(allocation.path.join("payload.mkv")).unwrap(),
                     data
                 );
-                assert!(!destination.join("storage-contract/payload.bin").exists());
+                assert!(!published_dir.join("payload.mkv").exists());
             } else {
                 assert_eq!(result.unwrap(), nzbd_post::manager::PpFinal::Success);
                 assert!(engine.export_job(job).await.unwrap().unwrap().ready());
                 assert_eq!(
-                    std::fs::read(destination.join("storage-contract/payload.bin")).unwrap(),
+                    std::fs::read(published_dir.join("payload.mkv")).unwrap(),
                     data
                 );
                 assert!(!allocation.path.exists());
                 assert_eq!(
                     history.list(10).unwrap()[0].final_dir.as_deref(),
-                    destination.join("storage-contract").to_str()
+                    published_dir.to_str()
                 );
             }
             engine.shutdown().await;

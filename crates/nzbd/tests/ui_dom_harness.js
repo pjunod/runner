@@ -1182,6 +1182,60 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   const stack = sandbox.document.getElementById("toasts");
   const reset = () => { stack.children.length = 0; routes.clear(); seen.length = 0; T.pending.clear(); };
 
+  // Delivery sequence windows include accepted rows when requested. The UI
+  // exposes a bounded next-page action so an early accepted window cannot
+  // hide later publications, and cleanup retry remains independent of ack.
+  reset();
+  const delivery = (id, status, sequence) => ({ deliveryId: id, status, sequence, artifactId: "published-" + id,
+    sourceArtifactId: "source-" + id, sourceGeneration: "source-generation", fileOutcomes: [], files: [],
+    readyAt: 1, sourceCleanup: { status: "retry", attempts: 1, attemptHistory: [] } });
+  T.setDeliveriesForTest([delivery("d1", "accepted", 1)], 0, 100);
+  T.renderDeliveries();
+  ok(sandbox.document.getElementById("files-deliveries").innerHTML.includes("accepted"),
+    "accepted deliveries remain visible in the durable listing");
+  routes.set("/api/v1/deliveries?after=100", { status: 200, body: { deliveries: [delivery("d2", "pending", 101)], nextCursor: 200 } });
+  await T.loadOlderDeliveries();
+  eq(T.getDeliveryPagingForTest().count, 2, "next delivery page appends without dropping prior receipts");
+  ok(seen.some(r => r.url.includes("deliveries?after=100&limit=100&includeAccepted=true")),
+    "pagination requests accepted rows in the next bounded sequence window");
+  routes.set("/api/v1/deliveries/d2/source-cleanup/retry", { status: 200, body: { sourceCleanup: { status: "retry" } } });
+  routes.set("/api/v1/artifacts?", { status: 200, body: { entries: [], total: 0 } });
+  routes.set("/api/v1/recoveries?", { status: 200, body: [] });
+  routes.set("/api/v1/deliveries?after=0", { status: 200, body: { deliveries: [delivery("d1", "accepted")], nextCursor: 100 } });
+  await T.retryDeliveryCleanup("d2");
+  ok(seen.some(r => r.url.endsWith("/api/v1/deliveries/d2/source-cleanup/retry") && r.method === "POST"),
+    "source cleanup retry calls its independent Runner endpoint");
+
+  // Source removal requires two clicks bound to the exact delivery and
+  // source generation. The first click cannot issue a destructive request;
+  // refreshing the row with a different generation invalidates that arm.
+  reset();
+  const sourceDelivery = delivery("d2", "accepted", 101);
+  sourceDelivery.publicationGeneration = "publication-generation";
+  T.setDeliveriesForTest([sourceDelivery], 100, 200);
+  T.renderDeliveries();
+  const sourceButton = { dataset: { delivery: "d2" }, closest: () => null };
+  await T.filesClick("f-delivery-source-delete", sourceButton);
+  ok(T.armIsSet("ds:d2:published-d2:publication-generation:source-d2:source-generation"),
+    "first click arms removal for the exact publication and source generations");
+  ok(!seen.some(r => r.method === "POST" && r.url.includes("/artifacts/source-d2/delete")),
+    "first click performs no source deletion");
+  const changedSourceDelivery = { ...sourceDelivery, sourceGeneration: "replacement-generation" };
+  T.setDeliveriesForTest([changedSourceDelivery], 100, 200);
+  T.renderDeliveries();
+  ok(!sandbox.document.getElementById("files-deliveries").innerHTML.includes("click again to remove"),
+    "a changed source generation clears the old armed control");
+  routes.set("/api/v1/artifacts/source-d2", { status: 200, body: {
+    id: "source-d2", generation: "replacement-generation", owned: true, revision: 7,
+  } });
+  routes.set("/api/v1/artifacts/source-d2/delete", { status: 202, body: { id: "delete-d2" } });
+  await T.filesClick("f-delivery-source-delete", sourceButton);
+  ok(!seen.some(r => r.method === "POST" && r.url.includes("/artifacts/source-d2/delete")),
+    "the old click cannot authorize a changed source generation");
+  await T.filesClick("f-delivery-source-delete", sourceButton);
+  ok(seen.some(r => r.method === "POST" && r.url.includes("/artifacts/source-d2/delete")),
+    "the second click on the current generation sends the scoped deletion");
+
   // --- 21b. BitTorrent intake is reachable from the dashboard ------------
   // The backend and Settings toggle shipped before an add surface did. Pin
   // both wire forms here: typed JSON for magnet/URL and raw metainfo bytes.

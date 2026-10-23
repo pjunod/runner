@@ -44,6 +44,8 @@ pub enum PostError {
     Subprocess(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("artifact inventory: {0}")]
+    Artifact(#[from] nzbd_state::artifacts::Error),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +100,9 @@ pub struct ExtractOutcome {
     pub password_error: bool,
     /// Out of disk space (unrar exit code 5).
     pub disk_space_error: bool,
+    /// Tool or storage failed without positive archive-corruption evidence.
+    /// Retain the source and retry instead of declaring it disposable.
+    pub retryable_error: bool,
 }
 
 #[derive(Debug, Clone)]

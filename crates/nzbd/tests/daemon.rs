@@ -1675,7 +1675,7 @@ fn daemon_cli_compat_end_to_end() {
     // Mock provider on its own runtime.
     let rt = tokio::runtime::Runtime::new().unwrap();
     let data = prng_bytes(5, 120_000);
-    let post = build_post("cli demo", &[("payload.bin", data.clone())], 25_000);
+    let post = build_post("cli demo", &[("payload.mkv", data.clone())], 25_000);
     let ns = rt.block_on(async { NservBuilder::new().with_post(&post).start().await.unwrap() });
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1747,40 +1747,55 @@ bind = "{api_addr}"
     // PP's final deobfuscation pass renames the generically-named payload
     // to the job name, so that is the path that must appear.
     let start = Instant::now();
-    let payload_path = tmp.path().join("dest/cli demo/cli demo.bin");
-    loop {
+    let completed_root = tmp.path().join("dest");
+    let payload_path = loop {
         assert!(
             start.elapsed() < Duration::from_secs(30),
             "download did not finish\n--- daemon log ---\n{}",
             std::fs::read_to_string(&daemon_log_path)
                 .unwrap_or_else(|error| format!("could not read daemon log: {error}"))
         );
-        if std::fs::read(&payload_path)
-            .map(|got| got == data)
-            .unwrap_or(false)
-        {
-            break;
+        let published = std::fs::read_dir(&completed_root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path().join("cli demo.mkv"))
+            .find(|path| std::fs::read(path).is_ok_and(|got| got == data));
+        if let Some(path) = published {
+            break path;
         }
         // `nzbd status` keeps answering while we wait (CLI liveness check).
         let out = child_output(Command::new(bin).args(["status", "--url", &api_addr])).unwrap();
         assert!(out.status.success());
         std::thread::sleep(Duration::from_millis(200));
-    }
+    };
 
     // The finished job lands in history with a SUCCESS status.
+    let expected_final_dir = std::fs::canonicalize(payload_path.parent().unwrap()).unwrap();
     let start = Instant::now();
     loop {
-        assert!(
-            start.elapsed() < Duration::from_secs(15),
-            "job never reached history"
-        );
+        if start.elapsed() >= Duration::from_secs(15) {
+            let (code, body) = http(&api_addr, "GET", "/api/v1/history", b"");
+            panic!(
+                "job never reached history (HTTP {code})\n--- history response ---\n{body}\n--- daemon log ---\n{}",
+                std::fs::read_to_string(&daemon_log_path)
+                    .unwrap_or_else(|error| format!("could not read daemon log: {error}"))
+            );
+        }
         let (code, body) = http(&api_addr, "GET", "/api/v1/history", b"");
         assert_eq!(code, 200);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        if v["entries"]
-            .as_array()
-            .is_some_and(|e| e.iter().any(|h| h["status"] == "SUCCESS"))
-        {
+        if v["entries"].as_array().is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry["status"] == "SUCCESS"
+                    && entry["final_dir"]
+                        .as_str()
+                        .and_then(|path| std::fs::canonicalize(path).ok())
+                        .as_ref()
+                        == Some(&expected_final_dir)
+            })
+        }) {
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -2088,8 +2103,12 @@ bind = "{api_addr}"
         }),
     );
     let nzbid = v["result"].as_i64().unwrap();
-    assert!(nzbid > 0, "append returned {v}");
-
+    assert!(
+        nzbid > 0,
+        "append returned {v}\n--- daemon log ---\n{}",
+        std::fs::read_to_string(&daemon_log_path)
+            .unwrap_or_else(|error| format!("could not read daemon log: {error}"))
+    );
     // 4. Poll listgroups until the download leaves the queue…
     let start = Instant::now();
     loop {
