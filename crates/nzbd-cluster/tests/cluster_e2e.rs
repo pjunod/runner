@@ -608,13 +608,17 @@ async fn three_voters_keep_majority_and_reject_mutations_after_quorum_loss() {
     // loss of one voter, require a successful linearizable quorum round trip
     // from each node; `quorum_commit_healthy` is sampled from the real control
     // client, not inferred from the app registry.
-    wait_for("all three control voters have committed through quorum", 20, || {
-        [&a, &b, &c].iter().all(|node| {
-            let control = get_json(&node.url, "/api/v1/cluster")["control"].clone();
-            control["mode"] == "hiqlite-fixed-voters"
-                && control["quorum_commit_healthy"].as_bool() == Some(true)
-        })
-    })
+    wait_for(
+        "all three control voters have committed through quorum",
+        20,
+        || {
+            [&a, &b, &c].iter().all(|node| {
+                let control = get_json(&node.url, "/api/v1/cluster")["control"].clone();
+                control["mode"] == "hiqlite-fixed-voters"
+                    && control["quorum_commit_healthy"].as_bool() == Some(true)
+            })
+        },
+    )
     .await;
 
     let leader_name = get_json(&a.url, "/api/v1/cluster")["leader"]["node"]
