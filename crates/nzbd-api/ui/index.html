@@ -5341,6 +5341,7 @@ function renderDeliveries() {
     const cleanup = d.sourceCleanup || {};
     const retryable = ["blocked", "retry", "pending"].includes(cleanup.status);
     const retained = (d.fileOutcomes || []).filter(f => f.outcome === "retained_processing").length;
+    const repairDependencies = (d.fileOutcomes || []).filter(f => f.repairDependency).length;
     const hasSeparateSource = d.sourceArtifactId && d.sourceArtifactId !== d.artifactId;
     const timeline = ["ready " + fmtTime(d.readyAt)];
     if (d.acceptedAt) timeline.push("accepted " + fmtTime(d.acceptedAt));
@@ -5361,6 +5362,7 @@ function renderDeliveries() {
       `<span class="rec-folder">${esc(timeline.join(" · "))}</span>` +
       (attempts.length ? `<span class="rec-folder" title="${esc(attempts.join("\n"))}">${esc(attempts.slice(-3).join(" · "))}</span>` : "") +
       (retained ? `<span>${retained} retained source files</span>` : "") +
+      (repairDependencies ? `<span>${repairDependencies} PAR repair inputs retained</span>` : "") +
       (cleanup.warning ? `<span class="warn">${esc(cleanup.warning)}</span>` : "") +
       (cleanup.error ? `<span class="err">${esc(cleanup.error)}</span>` : "") +
       (retryable ? `<button class="small" data-action="f-delivery-retry" data-delivery="${esc(d.deliveryId)}">retry source cleanup</button>` : "") +

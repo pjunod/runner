@@ -908,7 +908,7 @@ async fn handle_failed_job(
         "FAILURE/HEALTH"
     };
     let keep_on_failure = exported.as_ref().is_some_and(job_keeps_failed_source);
-    let recoverable_failed_source = if salvage.is_none() && !fetch_failure {
+    let failed_source_assessment = if salvage.is_none() && !fetch_failure {
         match exported.as_ref().filter(|row| row.lifecycle_eligible()) {
             Some(row) => {
                 let row = row.clone();
@@ -919,7 +919,7 @@ async fn handle_failed_job(
                 })
                 .await
                 {
-                    Ok(Ok(recovery)) => recovery,
+                    Ok(Ok(assessment)) => Some(assessment),
                     Ok(Err(error)) => {
                         record_failed_cleanup_retry(engine, job, error).await;
                         return;
@@ -935,6 +935,13 @@ async fn handle_failed_job(
     } else {
         None
     };
+    let recoverable_failed_source =
+        failed_source_assessment
+            .as_ref()
+            .and_then(|(path, assessment)| match assessment.disposition.as_str() {
+                "recoverable" | "unknown" => Some((path.clone(), assessment.reason.clone())),
+                _ => None,
+            });
     let mut failure_cfg = cfg.clone();
     if keep_on_failure {
         failure_cfg.failure_action = FailureAction::None;
@@ -1317,20 +1324,35 @@ async fn handle_failed_job(
             .finish(job.0, path, path.parent().unwrap_or(dest_dir), state)
         {
             Ok(artifact) => {
-                if keep_on_failure {
-                    match engine
-                        .artifacts()
-                        .retention(&artifact.id, artifact.revision, true, None)
-                    {
-                        Ok(kept) => entry.params.push(("Artifact:Id".into(), kept.id)),
-                        Err(e) => {
-                            tracing::error!(job=job.0,error=%e,"explicit failure retention was not committed");
-                            return;
-                        }
+                // Keep-on-failure is a separate mutable source policy, not
+                // the generic artifact Keep control. Persist the terminal
+                // classifier result before PP_DONE so clearing Keep after a
+                // restart can dispose only positively unusable data.
+                if keep_on_failure
+                    && exported
+                        .as_ref()
+                        .is_some_and(|job| job.lifecycle_eligible())
+                {
+                    let (disposition, reason) = failed_source_assessment
+                        .as_ref()
+                        .map(|(_, assessment)| {
+                            (assessment.disposition.as_str(), assessment.reason.as_str())
+                        })
+                        .unwrap_or((
+                            "unknown",
+                            "bounded failed-source assessment did not complete; retry diagnostics before cleanup",
+                        ));
+                    if let Err(error) = engine.artifacts().set_failure_assessment(
+                        &artifact.id,
+                        &artifact.generation,
+                        disposition,
+                        reason,
+                    ) {
+                        tracing::error!(job=job.0,error=%error,"failed source assessment was not committed");
+                        return;
                     }
-                } else {
-                    entry.params.push(("Artifact:Id".into(), artifact.id));
                 }
+                entry.params.push(("Artifact:Id".into(), artifact.id));
             }
             Err(e) => {
                 tracing::error!(job=job.0,error=%e,"failed payload inventory not committed; finalization held");
@@ -1725,7 +1747,10 @@ fn salvage_failed_delivery(
         .refresh_for_delivery(job.id.0)
         .map_err(|error| error.to_string())?;
     if !source.automatic_cleanup_eligible || !source.owned {
-        return Ok(None);
+        return Err(
+            "failed source is not an owned eligible generation for bounded recovery assessment"
+                .into(),
+        );
     }
     let restored_paths = inventory
         .verified_restore_paths(job.id.0)
@@ -1819,12 +1844,14 @@ fn failed_source_recovery(
     inventory: &nzbd_state::artifacts::Inventory,
     job: &Job,
     archive_assessment: &EarlyArchiveAssessment,
-) -> Result<Option<(PathBuf, String)>, String> {
+) -> Result<(PathBuf, FailedSourceAssessment), String> {
     let source = inventory
         .refresh_for_delivery(job.id.0)
         .map_err(|error| error.to_string())?;
     if !source.automatic_cleanup_eligible || !source.owned {
-        return Ok(None);
+        return Err(
+            "bounded failed-source assessment requires the exact owned eligible generation".into(),
+        );
     }
     let restored_paths = inventory
         .verified_restore_paths(job.id.0)
@@ -1855,7 +1882,60 @@ fn failed_source_recovery(
         &archive_assessment.terminal,
         &diagnostics,
     );
-    Ok(recovery_reason(&outcomes).map(|reason| (source.path, reason)))
+    let assessment = failed_source_assessment(&outcomes);
+    Ok((source.path, assessment))
+}
+
+fn failed_source_assessment(outcomes: &[DeliveryFileOutcome]) -> FailedSourceAssessment {
+    if outcomes
+        .iter()
+        .any(|file| file.outcome == "unverified_review")
+    {
+        return FailedSourceAssessment {
+            disposition: "unknown".into(),
+            reason: "bounded diagnostics could not establish source integrity; retry assessment or inspect the retained source".into(),
+        };
+    }
+    if let Some(reason) = recovery_reason(outcomes) {
+        return FailedSourceAssessment {
+            disposition: "recoverable".into(),
+            reason,
+        };
+    }
+    if outcomes.is_empty() {
+        return FailedSourceAssessment {
+            disposition: "unknown".into(),
+            reason: "no regular source files were available to the bounded integrity/format assessment; inspect or retry diagnostics".into(),
+        };
+    }
+    if outcomes.iter().all(|file| {
+        matches!(
+            file.outcome.as_str(),
+            "excluded_source_cleanup" | "consumed"
+        ) && file
+            .reason
+            .as_deref()
+            .is_some_and(|reason| !reason.trim().is_empty())
+    }) {
+        return FailedSourceAssessment {
+            disposition: "unusable".into(),
+            reason: outcomes
+                .iter()
+                .filter_map(|file| file.reason.as_deref())
+                .take(3)
+                .collect::<Vec<_>>()
+                .join("; "),
+        };
+    }
+    FailedSourceAssessment {
+        disposition: "unknown".into(),
+        reason: "bounded assessment did not establish either a concrete recovery action or terminal unusability; inspect source or retry diagnostics".into(),
+    }
+}
+
+struct FailedSourceAssessment {
+    disposition: String,
+    reason: String,
 }
 
 struct FailedSalvage {
@@ -4232,7 +4312,7 @@ fn select_delivery_payload(
                     Some(action.as_str()),
                 )),
                 _ => classifications.push((
-                    payload_classification(&extension), "excluded_source_cleanup",
+                    payload_classification(&extension), "unverified_review",
                     Some("no completed NZB/CRC or verified transform evidence identifies this payload"),
                 )),
             }
@@ -4368,6 +4448,10 @@ fn select_delivery_payload(
                 classification: classification.to_string(),
                 outcome: outcome.to_string(),
                 reason: reason.map(str::to_owned),
+                repair_dependency: matches!(
+                    diagnostics.get(&entry.path),
+                    Some(FileAssessment::Repairable(_))
+                ),
                 source_cleanup_status: if matches!(
                     outcome,
                     "retained_processing"
@@ -4554,6 +4638,7 @@ fn par_repairable_evidence_checked(
         }
         let mut damaged = 0u64;
         let mut affected = Vec::new();
+        let mut members = Vec::new();
         let mut assessable = true;
         for descriptor in &set.files {
             checkpoint()?;
@@ -4565,6 +4650,7 @@ fn par_repairable_evidence_checked(
                 ));
             };
             let source_relative = source_relative.to_string_lossy().into_owned();
+            members.push(source_relative.clone());
             let entry = entries
                 .iter()
                 .find(|entry| !entry.identity.directory && entry.path == source_relative);
@@ -4651,7 +4737,7 @@ fn par_repairable_evidence_checked(
             "PAR set has {damaged} damaged slices and {} distinct recovery blocks; retry PAR repair with the configured tool",
             set.recovery_blocks
         );
-        for path in affected {
+        for path in affected.into_iter().chain(members) {
             repairable.insert(path, reason.clone());
         }
         for path in &set.par_paths {
@@ -5615,6 +5701,95 @@ mod decision_tests {
         }
     }
 
+    fn assessment_outcome(outcome: &str, reason: &str) -> DeliveryFileOutcome {
+        DeliveryFileOutcome {
+            source_path: "episode.mkv".into(),
+            publication_path: None,
+            classification: "payload".into(),
+            outcome: outcome.into(),
+            reason: Some(reason.into()),
+            repair_dependency: false,
+            source_cleanup_status: "pending".into(),
+        }
+    }
+
+    #[test]
+    fn absent_integrity_proof_is_unknown_not_cleanup_authority() {
+        let outcome = assessment_outcome("unverified_review", "any display text");
+        let assessment = failed_source_assessment(&[outcome]);
+        assert_eq!(assessment.disposition, "unknown");
+    }
+
+    #[test]
+    fn partial_publication_retains_unverified_media_sibling_during_source_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let downloads = temp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        let source_path = downloads.join("partial-release");
+        let inventory = nzbd_state::artifacts::Inventory::open(&temp.path().join("state")).unwrap();
+        inventory
+            .allocate_for_delivery(94, &downloads, &source_path, true, true)
+            .unwrap();
+        std::fs::write(source_path.join("episode-01.mkv"), b"verified episode").unwrap();
+        std::fs::write(source_path.join("episode-02.mkv"), b"unverified sibling").unwrap();
+        inventory
+            .finish(94, &source_path, &downloads, "active")
+            .unwrap();
+        let source = inventory.for_job(94).unwrap().unwrap();
+        let verified = ["episode-01.mkv".to_string()].into_iter().collect();
+        let (selected, outcomes) = select_delivery_payload(
+            &source.files,
+            &Default::default(),
+            &verified,
+            &Default::default(),
+            &Default::default(),
+        );
+        let unknown = outcomes
+            .iter()
+            .find(|outcome| outcome.source_path == "episode-02.mkv")
+            .unwrap();
+        assert_eq!(unknown.outcome, "unverified_review");
+        assert_eq!(failed_source_assessment(&outcomes).disposition, "unknown");
+
+        let completed = temp.path().join("completed");
+        std::fs::create_dir(&completed).unwrap();
+        let target = completed.join("partial-release-generation");
+        inventory
+            .publish_selected_for_delivery_checked(94, &target, selected, outcomes, &|| Ok(()))
+            .unwrap();
+        let delivery = inventory
+            .create_delivery(94, true, Some("partial-unknown-integrity"))
+            .unwrap();
+        let cleanup = inventory
+            .retire_delivery_source(&delivery.delivery_id)
+            .unwrap();
+
+        assert_eq!(cleanup.source_cleanup.status, "blocked");
+        assert!(!source_path.join("episode-01.mkv").exists());
+        assert!(source_path.join("episode-02.mkv").exists());
+        assert!(target.join("episode-01.mkv").exists());
+        assert!(!target.join("episode-02.mkv").exists());
+        assert_eq!(
+            cleanup
+                .file_outcomes
+                .iter()
+                .find(|outcome| outcome.source_path == "episode-02.mkv")
+                .unwrap()
+                .source_cleanup_status,
+            "retained"
+        );
+    }
+
+    #[test]
+    fn positive_terminal_corruption_can_authorize_cleanup() {
+        let outcome = assessment_outcome(
+            "excluded_source_cleanup",
+            "bounded assessment proved the finalized source entry incomplete and unrepaired",
+        );
+        let assessment = failed_source_assessment(&[outcome]);
+        assert_eq!(assessment.disposition, "unusable");
+    }
+
     fn real_entry(root: &Path, name: &str) -> nzbd_state::artifacts::FileEntry {
         use std::os::unix::fs::MetadataExt;
         let metadata = std::fs::metadata(root.join(name)).unwrap();
@@ -5896,7 +6071,7 @@ mod decision_tests {
             "excluded_source_cleanup"
         );
         assert_eq!(outcome("unsupported.mpg").outcome, "unsupported_review");
-        assert_eq!(outcome("unverified.mp4").outcome, "excluded_source_cleanup");
+        assert_eq!(outcome("unverified.mp4").outcome, "unverified_review");
     }
 
     #[test]
@@ -6492,9 +6667,9 @@ mod decision_tests {
         inventory
             .allocate_for_delivery(41, &downloads, &source, true, true)
             .unwrap();
-        let good = b"complete independent episode";
-        let damaged_original = vec![b'x'; 50_000];
-        std::fs::write(source.join("episode-01.mkv"), good).unwrap();
+        let good = vec![b'g'; 51_200];
+        let damaged_original = vec![b'x'; 51_200];
+        std::fs::write(source.join("episode-01.mkv"), &good).unwrap();
         std::fs::write(source.join("episode-02.mkv"), &damaged_original).unwrap();
         assert!(std::process::Command::new("par2")
             .args([
@@ -6504,6 +6679,7 @@ mod decision_tests {
                 "-s8192",
                 "-c1",
                 "set.par2",
+                "episode-01.mkv",
                 "episode-02.mkv"
             ])
             .current_dir(&source)
@@ -6517,7 +6693,7 @@ mod decision_tests {
         damaged.write_all(b"y").unwrap();
         damaged.sync_all().unwrap();
         inventory.finish(41, &source, &downloads, "active").unwrap();
-        let mut good_file = file(1, "episode-01.mkv", Some(crc32fast::hash(good)));
+        let mut good_file = file(1, "episode-01.mkv", Some(crc32fast::hash(&good)));
         good_file.segments = vec![Segment {
             message_id: "good".into(),
             number: 1,
@@ -6525,7 +6701,7 @@ mod decision_tests {
             state: SegmentState::Done {
                 offset: 0,
                 len: good.len() as u32,
-                crc: crc32fast::hash(good),
+                crc: crc32fast::hash(&good),
             },
         }];
         let mut bad_file = file(2, "episode-02.mkv", None);
@@ -6579,6 +6755,35 @@ mod decision_tests {
         assert_eq!(
             outcomes
                 .iter()
+                .find(|outcome| outcome.source_path == "episode-01.mkv")
+                .unwrap()
+                .outcome,
+            "published"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .find(|outcome| outcome.source_path == "episode-01.mkv")
+                .unwrap()
+                .repair_dependency
+        );
+        assert!(
+            outcomes
+                .iter()
+                .find(|outcome| outcome.source_path == "episode-02.mkv")
+                .unwrap()
+                .repair_dependency
+        );
+        assert!(
+            outcomes
+                .iter()
+                .find(|outcome| outcome.source_path == "set.par2")
+                .unwrap()
+                .repair_dependency
+        );
+        assert_eq!(
+            outcomes
+                .iter()
                 .find(|outcome| outcome.source_path == "episode-02.mkv")
                 .unwrap()
                 .outcome,
@@ -6588,8 +6793,26 @@ mod decision_tests {
             .retire_delivery_source(&delivery.delivery_id)
             .unwrap();
         assert_ne!(cleanup.source_cleanup.status, "succeeded");
+        assert!(source.join("episode-01.mkv").exists());
         assert!(source.join("episode-02.mkv").exists());
         assert!(source.join("set.par2").exists());
+        std::fs::remove_dir_all(&salvage.published_path).unwrap();
+        let verify = std::process::Command::new("par2")
+            .args(["verify", "set.par2"])
+            .current_dir(&source)
+            .output()
+            .unwrap();
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&verify.stdout),
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        assert!(
+            verify.status.success()
+                || verify.status.code() == Some(1)
+                || report.to_ascii_lowercase().contains("repair is possible"),
+            "shared PAR set must remain repairable after publication deletion: {report}"
+        );
     }
 
     #[test]

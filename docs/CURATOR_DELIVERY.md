@@ -192,6 +192,13 @@ regular source file has a `sourcePath`, an optional target-relative
 `reason`. Curator may ignore this field when importing, but it must not treat
 it as part of the manifest digest.
 
+`repairDependency` is independent of `outcome`. When true, the source file is
+an exact member of a measured, generation-bound PAR set with enough recovery
+blocks for the diagnosed damage. Runner keeps that source member and the
+measured set inputs even if a verified sibling is also published; a later
+repair attempt must produce fresh evidence before those dependencies become
+disposable.
+
 Runner publishes the same recognized video (`.mkv`, `.mp4`, `.avi`, `.m4v`,
 `.mov`, `.wmv`, `.ts`, `.webm`), audio (`.m4b`, `.m4a`, `.mp3`, `.aac`,
 `.flac`, `.ogg`, `.opus`, `.wav`, `.wma`), and native-book (`.epub`, `.azw3`,

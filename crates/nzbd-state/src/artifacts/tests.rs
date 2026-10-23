@@ -288,6 +288,7 @@ fn selected_delivery_copies_only_payload_and_prunes_resolved_source_files() {
             classification: "video".into(),
             outcome: "published".into(),
             reason: None,
+            repair_dependency: false,
             source_cleanup_status: "pending".into(),
         },
         DeliveryFileOutcome {
@@ -296,6 +297,7 @@ fn selected_delivery_copies_only_payload_and_prunes_resolved_source_files() {
             classification: "incidental".into(),
             outcome: "excluded_source_cleanup".into(),
             reason: Some("known readme".into()),
+            repair_dependency: false,
             source_cleanup_status: "pending".into(),
         },
         DeliveryFileOutcome {
@@ -304,6 +306,7 @@ fn selected_delivery_copies_only_payload_and_prunes_resolved_source_files() {
             classification: "archive_input".into(),
             outcome: "consumed".into(),
             reason: Some("verified extraction published".into()),
+            repair_dependency: false,
             source_cleanup_status: "pending".into(),
         },
         DeliveryFileOutcome {
@@ -312,6 +315,7 @@ fn selected_delivery_copies_only_payload_and_prunes_resolved_source_files() {
             classification: "archive_input".into(),
             outcome: "retained_processing".into(),
             reason: Some("no extraction record".into()),
+            repair_dependency: false,
             source_cleanup_status: "retained".into(),
         },
     ];
@@ -357,6 +361,66 @@ fn selected_delivery_copies_only_payload_and_prunes_resolved_source_files() {
 }
 
 #[test]
+fn selected_delivery_retains_published_par_repair_dependency_without_keep() {
+    let (tmp, db, root) = fixture();
+    let source = root.join("working-par-dependency");
+    db.allocate_for_delivery(54, &root, &source, true, true)
+        .unwrap();
+    std::fs::write(source.join("episode.mkv"), b"verified payload").unwrap();
+    std::fs::write(source.join("set.par2"), b"validated recovery evidence").unwrap();
+    db.finish(54, &source, &root, "active").unwrap();
+    let artifact = db.for_job(54).unwrap().unwrap();
+    let selected = artifact
+        .files
+        .iter()
+        .filter(|entry| entry.path == "episode.mkv")
+        .cloned()
+        .collect();
+    let outcomes = vec![
+        DeliveryFileOutcome {
+            source_path: "episode.mkv".into(),
+            publication_path: Some("episode.mkv".into()),
+            classification: "video".into(),
+            outcome: "published".into(),
+            reason: Some("complete CRC plus a measured repairable PAR set".into()),
+            repair_dependency: true,
+            source_cleanup_status: "pending".into(),
+        },
+        DeliveryFileOutcome {
+            source_path: "set.par2".into(),
+            publication_path: None,
+            classification: "repair_input".into(),
+            outcome: "retained_processing".into(),
+            reason: Some("retry repair using this measured set".into()),
+            repair_dependency: true,
+            source_cleanup_status: "retained".into(),
+        },
+    ];
+    let completed = tmp.path().join("completed-par");
+    std::fs::create_dir(&completed).unwrap();
+    let target = completed.join("release-generation");
+    db.publish_selected_for_delivery_checked(54, &target, selected, outcomes, &|| Ok(()))
+        .unwrap();
+    let delivery = db
+        .create_delivery(54, true, Some("repair-dependency-token"))
+        .unwrap();
+    let cleanup = db.retire_delivery_source(&delivery.delivery_id).unwrap();
+    assert_eq!(cleanup.source_cleanup.status, "blocked");
+    assert!(source.join("episode.mkv").exists());
+    assert!(source.join("set.par2").exists());
+    assert_eq!(
+        cleanup
+            .file_outcomes
+            .iter()
+            .find(|outcome| outcome.source_path == "episode.mkv")
+            .unwrap()
+            .source_cleanup_status,
+        "retained_repair_dependency"
+    );
+    assert!(!db.get(&delivery.artifact_id).unwrap().keep_on_failure);
+}
+
+#[test]
 fn standalone_lifecycle_publication_uses_selected_tree_and_journaled_source_retirement() {
     let (tmp, db, root) = fixture();
     let source = root.join("working-standalone");
@@ -381,6 +445,7 @@ fn standalone_lifecycle_publication_uses_selected_tree_and_journaled_source_reti
             classification: "video".into(),
             outcome: "published".into(),
             reason: None,
+            repair_dependency: false,
             source_cleanup_status: "pending".into(),
         },
         DeliveryFileOutcome {
@@ -389,6 +454,7 @@ fn standalone_lifecycle_publication_uses_selected_tree_and_journaled_source_reti
             classification: "incidental".into(),
             outcome: "excluded_source_cleanup".into(),
             reason: Some("download descriptor".into()),
+            repair_dependency: false,
             source_cleanup_status: "pending".into(),
         },
         DeliveryFileOutcome {
@@ -397,6 +463,7 @@ fn standalone_lifecycle_publication_uses_selected_tree_and_journaled_source_reti
             classification: "unknown".into(),
             outcome: "retained_processing".into(),
             reason: Some("unrecognized potentially useful file".into()),
+            repair_dependency: false,
             source_cleanup_status: "retained".into(),
         },
     ];
@@ -451,6 +518,7 @@ fn selected_publication_io_failure_keeps_source_for_same_attempt_retry() {
         classification: "media".into(),
         outcome: "published".into(),
         reason: Some("verified complete media".into()),
+        repair_dependency: false,
         source_cleanup_status: "pending".into(),
     }];
     let target_parent = tmp.path().join("not-yet-mounted-completed");
@@ -526,6 +594,7 @@ fn keep_after_publication_targets_retained_source_generation() {
             classification: "media".into(),
             outcome: "published".into(),
             reason: Some("verified complete media".into()),
+            repair_dependency: false,
             source_cleanup_status: "pending".into(),
         }],
         &|| Ok(()),
@@ -550,6 +619,148 @@ fn keep_after_publication_targets_retained_source_generation() {
 
     assert!(db.set_keep_on_failure(56, false).unwrap());
     assert!(!db.get(&source_id).unwrap().keep_on_failure);
+}
+
+#[test]
+fn clearing_keep_only_schedules_delete_for_persisted_unusable_assessment() {
+    let (_tmp, db, root) = fixture();
+    let unusable = root.join("kept-unusable");
+    db.allocate_for_delivery(58, &root, &unusable, true, false)
+        .unwrap();
+    std::fs::write(unusable.join("bad.bin"), b"terminally unusable").unwrap();
+    let unusable_artifact = db.finish(58, &unusable, &root, "retained").unwrap();
+    db.set_failure_assessment(
+        &unusable_artifact.id,
+        &unusable_artifact.generation,
+        "unusable",
+        "bounded integrity assessment found no verified payload or repair path",
+    )
+    .unwrap();
+    assert!(db.set_keep_on_failure(58, true).unwrap());
+    assert!(db.set_keep_on_failure(58, false).unwrap());
+    let delete = db
+        .operation(&format!("failed-delete-{}", unusable_artifact.id))
+        .unwrap();
+    assert_eq!(delete.state, "queued");
+    assert!(
+        unusable.exists(),
+        "clearing Keep schedules durable deletion"
+    );
+    db.run_due_deletes().unwrap();
+    assert!(!unusable.exists());
+
+    let recoverable = root.join("kept-recoverable");
+    db.allocate_for_delivery(59, &root, &recoverable, true, false)
+        .unwrap();
+    std::fs::write(recoverable.join("complete.rar"), b"recoverable input").unwrap();
+    let recoverable_artifact = db.finish(59, &recoverable, &root, "retained").unwrap();
+    db.set_failure_assessment(
+        &recoverable_artifact.id,
+        &recoverable_artifact.generation,
+        "recoverable",
+        "complete recognized archive; retry extraction with installed 7z",
+    )
+    .unwrap();
+    assert!(db.set_keep_on_failure(59, true).unwrap());
+    assert!(db.set_keep_on_failure(59, false).unwrap());
+    assert!(db
+        .operation(&format!("failed-delete-{}", recoverable_artifact.id))
+        .is_err());
+    assert!(recoverable.join("complete.rar").exists());
+
+    let unknown = root.join("legacy-no-assessment");
+    db.allocate_for_delivery(60, &root, &unknown, false, false)
+        .unwrap();
+    std::fs::write(unknown.join("old.bin"), b"legacy bytes").unwrap();
+    let unknown_artifact = db.finish(60, &unknown, &root, "retained").unwrap();
+    assert!(db.set_keep_on_failure(60, true).unwrap());
+    assert!(db.set_keep_on_failure(60, false).unwrap());
+    assert!(db
+        .operation(&format!("failed-delete-{}", unknown_artifact.id))
+        .is_err());
+    assert!(unknown.join("old.bin").exists());
+}
+
+#[test]
+fn clearing_keep_retries_partial_delivery_cleanup_without_deleting_recoverable_inputs() {
+    let (tmp, db, root) = fixture();
+    let source = root.join("keep-partial-source");
+    db.allocate_for_delivery(61, &root, &source, true, true)
+        .unwrap();
+    std::fs::write(source.join("episode.mkv"), b"verified payload").unwrap();
+    std::fs::write(source.join("sample.txt"), b"disposable sample").unwrap();
+    std::fs::write(source.join("complete.rar"), b"recoverable archive").unwrap();
+    db.finish(61, &source, &root, "active").unwrap();
+    let artifact = db.for_job(61).unwrap().unwrap();
+    let selected = artifact
+        .files
+        .iter()
+        .filter(|entry| entry.path == "episode.mkv")
+        .cloned()
+        .collect();
+    let outcomes = vec![
+        DeliveryFileOutcome {
+            source_path: "episode.mkv".into(),
+            publication_path: Some("episode.mkv".into()),
+            classification: "video".into(),
+            outcome: "published".into(),
+            reason: None,
+            repair_dependency: false,
+            source_cleanup_status: "pending".into(),
+        },
+        DeliveryFileOutcome {
+            source_path: "sample.txt".into(),
+            publication_path: None,
+            classification: "incidental".into(),
+            outcome: "excluded_source_cleanup".into(),
+            reason: Some("known disposable sample".into()),
+            repair_dependency: false,
+            source_cleanup_status: "pending".into(),
+        },
+        DeliveryFileOutcome {
+            source_path: "complete.rar".into(),
+            publication_path: None,
+            classification: "archive_input".into(),
+            outcome: "archive_review".into(),
+            reason: Some("complete recognized archive; retry extraction with 7z".into()),
+            repair_dependency: false,
+            source_cleanup_status: "review_required".into(),
+        },
+    ];
+    let completed = tmp.path().join("completed-keep-partial");
+    std::fs::create_dir(&completed).unwrap();
+    let target = completed.join("release-generation");
+    db.publish_selected_for_delivery_checked(61, &target, selected, outcomes, &|| Ok(()))
+        .unwrap();
+    let delivery = db
+        .create_delivery(61, true, Some("keep-partial-token"))
+        .unwrap();
+    assert!(db.set_keep_on_failure(61, true).unwrap());
+    let kept = db.retire_delivery_source(&delivery.delivery_id).unwrap();
+    assert_eq!(kept.source_cleanup.status, "blocked");
+    assert!(source.join("sample.txt").exists());
+    assert!(source.join("complete.rar").exists());
+
+    // The immutable serialized receipt is historical evidence. Make its
+    // cleanup field stale to ensure Keep-off consults the mutable SQL column,
+    // not that old JSON snapshot.
+    {
+        let db = db.db.lock().unwrap();
+        db.execute(
+            "UPDATE deliveries SET data=json_set(data,'$.sourceCleanup.status','succeeded') WHERE id=?1",
+            [&delivery.delivery_id],
+        )
+        .unwrap();
+    }
+
+    assert!(db.set_keep_on_failure(61, false).unwrap());
+    let scheduled = db.delivery(&delivery.delivery_id).unwrap();
+    assert_eq!(scheduled.source_cleanup.status, "retry");
+    let refreshed = db.retire_delivery_source(&delivery.delivery_id).unwrap();
+    assert_eq!(refreshed.source_cleanup.status, "blocked");
+    assert!(!source.join("sample.txt").exists());
+    assert!(source.join("complete.rar").exists());
+    assert!(target.join("episode.mkv").exists());
 }
 
 #[test]
@@ -735,6 +946,7 @@ fn selected_publication_resumes_a_partial_private_copy_after_restart() {
         classification: "video".into(),
         outcome: "published".into(),
         reason: None,
+        repair_dependency: false,
         source_cleanup_status: "pending".into(),
     }];
     let target_root = tmp.path().join("completed-resume");
@@ -798,6 +1010,7 @@ fn selected_publication_hardlink_fallback_keeps_original_source_identity() {
             classification: "video".into(),
             outcome: "published".into(),
             reason: Some("verified complete media".into()),
+            repair_dependency: false,
             source_cleanup_status: "pending".into(),
         }],
         &|| Ok(()),
@@ -835,6 +1048,7 @@ fn selected_publication_retries_capacity_failure_before_scratch_exists() {
         classification: "video".into(),
         outcome: "published".into(),
         reason: None,
+        repair_dependency: false,
         source_cleanup_status: "pending".into(),
     }];
     let completed = tmp.path().join("capacity-completed");
@@ -911,6 +1125,7 @@ fn resumed_relocation_does_not_restore_artifact_after_concurrent_delete() {
                 classification: "video".into(),
                 outcome: "published".into(),
                 reason: None,
+                repair_dependency: false,
                 source_cleanup_status: "pending".into(),
             }],
             &|| Ok(()),

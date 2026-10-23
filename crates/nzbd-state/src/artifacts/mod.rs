@@ -120,6 +120,11 @@ pub struct Artifact {
     /// Keep control so enabling it cannot fabricate a user-wide Keep state.
     #[serde(default)]
     pub keep_on_failure: bool,
+    /// Bounded, generation-pinned terminal assessment for a new failed
+    /// source retained by Keep. Missing legacy evidence is never deletion
+    /// authority; only `unusable` may be disposed when Keep is later cleared.
+    #[serde(default)]
+    pub failure_assessment: Option<FailureAssessment>,
     pub hold: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -134,6 +139,13 @@ pub struct Artifact {
     /// "not measured yet" until this is set — never "empty".
     #[serde(default)]
     pub inspected_at: Option<i64>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FailureAssessment {
+    pub disposition: String,
+    pub reason: String,
+    pub assessed_at: i64,
 }
 impl Artifact {
     pub fn terminal(&self) -> bool {
@@ -899,6 +911,7 @@ impl Inventory {
             delivery_lifecycle,
             keep: !cfg!(unix),
             keep_on_failure,
+            failure_assessment: None,
             hold: None,
             created_at: now(),
             updated_at: now(),
@@ -1282,6 +1295,7 @@ impl Inventory {
             delivery_lifecycle: false,
             keep: true,
             keep_on_failure: false,
+            failure_assessment: None,
             hold: Some("review".into()),
             created_at: now(),
             updated_at: now(),
@@ -1438,7 +1452,7 @@ impl Inventory {
     /// consulted at the physical-delete boundary. Explicit artifact deletion
     /// remains a separate user action and is not blocked by this preference.
     pub fn set_keep_on_failure(&self, job: u32, keep: bool) -> Result<bool> {
-        let _guard = self.mutation_guard()?;
+        let guard = self.mutation_guard()?;
         let mut artifact = self.for_job(job)?;
         // After publication, the job handle resolves to the transferred
         // publication artifact. Keep governs the separate Runner-owned
@@ -1469,38 +1483,162 @@ impl Inventory {
         if !artifact.owned || artifact.terminal() {
             return Ok(false);
         }
-        if artifact.keep_on_failure == keep {
+        if artifact.keep_on_failure == keep && keep {
             return Ok(true);
         }
-        artifact.keep_on_failure = keep;
+        if artifact.keep_on_failure != keep {
+            artifact.keep_on_failure = keep;
+            artifact.revision = artifact.revision.saturating_add(1);
+            artifact.updated_at = now();
+        }
+        {
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
+            if keep {
+                let raws = {
+                    let mut statement = tx.prepare(
+                        "SELECT data FROM operations WHERE artifact=?1 AND state IN ('queued','retry') AND id LIKE 'failed-delete-%'",
+                    )?;
+                    let rows =
+                        statement.query_map([&artifact.id], |row| row.get::<_, String>(0))?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                for raw in raws {
+                    let mut operation: Operation = serde_json::from_str(&raw)?;
+                    operation.state = "cancelled".into();
+                    operation.error = Some("per-download Keep on failure was enabled".into());
+                    save_operation(&tx, &operation)?;
+                }
+            } else if artifact
+                .failure_assessment
+                .as_ref()
+                .is_some_and(|assessment| assessment.disposition == "unusable")
+                && artifact.automatic_cleanup_eligible
+                && artifact.owned
+                && !artifact.terminal()
+                && matches!(artifact.state.as_str(), "retained" | "completed")
+            {
+                // Clearing Keep is explicit authorization to dispose only a
+                // source whose bounded terminal assessment is persisted as
+                // unusable for this exact artifact generation. Legacy or
+                // unknown assessments never authorize deletion.
+                let operation_id = format!("failed-delete-{}", artifact.id);
+                let request = serde_json::to_string(&(
+                    artifact.id.as_str(),
+                    artifact.revision,
+                    0u64,
+                    false,
+                    artifact.generation.as_str(),
+                ))?;
+                let existing: Option<String> = tx
+                    .query_row(
+                        "SELECT data FROM operations WHERE id=?1",
+                        [&operation_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let mut operation = if let Some(raw) = existing {
+                    serde_json::from_str::<Operation>(&raw)?
+                } else {
+                    Operation {
+                        id: operation_id,
+                        artifact: artifact.id.clone(),
+                        kind: "delete".into(),
+                        state: "queued".into(),
+                        request: request.clone(),
+                        created_at: now(),
+                        not_before: now(),
+                        attempts: 0,
+                        next_retry: 0,
+                        error: None,
+                    }
+                };
+                if operation.artifact != artifact.id || operation.kind != "delete" {
+                    return Err(Error::Conflict(
+                        "failed-source deletion id is bound to another operation".into(),
+                    ));
+                }
+                operation.state = "queued".into();
+                operation.request = request;
+                operation.not_before = now();
+                operation.next_retry = 0;
+                operation.attempts = 0;
+                operation.error = None;
+                save_operation(&tx, &operation)?;
+            }
+            save_artifact(&tx, &artifact)?;
+            if !keep {
+                // Read the mutable cleanup columns directly. The serialized
+                // Delivery is the immutable receipt snapshot and may lag a
+                // worker's latest cleanup status.
+                let delivery: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT id,cleanup_status FROM deliveries WHERE json_extract(data,'$.jobId')=?1 AND json_extract(data,'$.sourceArtifactId')=?2 AND json_extract(data,'$.sourceGeneration')=?3 ORDER BY sequence DESC LIMIT 1",
+                        params![job, artifact.id, artifact.generation],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((delivery_id, cleanup_status)) = delivery {
+                    if matches!(cleanup_status.as_str(), "pending" | "retry" | "blocked") {
+                        tx.execute(
+                            "UPDATE deliveries SET cleanup_status='retry',cleanup_error=NULL,cleanup_next_retry_at=0 WHERE id=?1 AND cleanup_status IN ('pending','retry','blocked')",
+                            [&delivery_id],
+                        )?;
+                    }
+                }
+            }
+            event(
+                &tx,
+                &artifact.id,
+                "failure_keep",
+                if keep { "enabled" } else { "disabled" },
+            )?;
+            tx.commit()?;
+        }
+        drop(guard);
+        Ok(true)
+    }
+
+    /// Persist bounded post-failure evidence before PP_DONE. This record is
+    /// pinned to the artifact generation and is the only automatic
+    /// Keep-off deletion authority for a no-Delivery failed source.
+    pub fn set_failure_assessment(
+        &self,
+        artifact_id: &str,
+        generation: &str,
+        disposition: &str,
+        reason: &str,
+    ) -> Result<Artifact> {
+        if !matches!(disposition, "unusable" | "recoverable" | "unknown")
+            || reason.trim().is_empty()
+            || reason.len() > 2048
+        {
+            return Err(Error::Conflict("invalid failed-source assessment".into()));
+        }
+        let _guard = self.mutation_guard()?;
+        let mut artifact = self.get(artifact_id)?;
+        if artifact.generation != generation
+            || !artifact.automatic_cleanup_eligible
+            || !artifact.owned
+            || artifact.terminal()
+        {
+            return Err(Error::Conflict(
+                "failed-source assessment does not match an owned eligible generation".into(),
+            ));
+        }
+        artifact.failure_assessment = Some(FailureAssessment {
+            disposition: disposition.into(),
+            reason: reason.into(),
+            assessed_at: now(),
+        });
         artifact.revision = artifact.revision.saturating_add(1);
         artifact.updated_at = now();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
-        if keep {
-            let raws = {
-                let mut statement = tx.prepare(
-                    "SELECT data FROM operations WHERE artifact=?1 AND state IN ('queued','retry') AND id LIKE 'failed-delete-%'",
-                )?;
-                let rows = statement.query_map([&artifact.id], |row| row.get::<_, String>(0))?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()?
-            };
-            for raw in raws {
-                let mut operation: Operation = serde_json::from_str(&raw)?;
-                operation.state = "cancelled".into();
-                operation.error = Some("per-download Keep on failure was enabled".into());
-                save_operation(&tx, &operation)?;
-            }
-        }
         save_artifact(&tx, &artifact)?;
-        event(
-            &tx,
-            &artifact.id,
-            "failure_keep",
-            if keep { "enabled" } else { "disabled" },
-        )?;
+        event(&tx, artifact_id, "failure_assessment", disposition)?;
         tx.commit()?;
-        Ok(true)
+        Ok(artifact)
     }
     pub fn release_review(&self, key: &str, revision: u64) -> Result<Artifact> {
         let _guard = self.mutation_guard()?;
@@ -2015,6 +2153,7 @@ impl Inventory {
             delivery_lifecycle: false,
             keep: false,
             keep_on_failure: false,
+            failure_assessment: None,
             hold: Some("awaiting complete import receipt".into()),
             created_at: now(),
             updated_at: now(),

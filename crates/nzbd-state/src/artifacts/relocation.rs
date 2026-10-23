@@ -1135,7 +1135,12 @@ impl Inventory {
                             let retained = movement
                                 .file_outcomes
                                 .iter()
-                                .filter(|outcome| outcome.source_cleanup_status == "retained")
+                                .filter(|outcome| {
+                                    matches!(
+                                        outcome.source_cleanup_status.as_str(),
+                                        "retained" | "retained_repair_dependency"
+                                    )
+                                })
                                 .map(|outcome| outcome.source_path.as_str())
                                 .collect::<Vec<_>>()
                                 .join(", ");
@@ -1389,8 +1394,11 @@ impl Inventory {
                     | "unsupported_review"
                     | "assessment_retry"
             );
-            if recoverable || (source.keep_on_failure && !resolved) {
-                movement.file_outcomes[outcome_index].source_cleanup_status = if recoverable {
+            let repair_dependency = movement.file_outcomes[outcome_index].repair_dependency;
+            if repair_dependency || recoverable || (source.keep_on_failure && !resolved) {
+                movement.file_outcomes[outcome_index].source_cleanup_status = if repair_dependency {
+                    "retained_repair_dependency".into()
+                } else if recoverable {
                     "retained".into()
                 } else {
                     "retained_keep".into()
@@ -1475,15 +1483,17 @@ impl Inventory {
         remaining.sort_by_key(|entry| std::cmp::Reverse(entry.path.matches('/').count()));
         for directory in remaining.iter().filter(|entry| entry.identity.directory) {
             if movement.file_outcomes.iter().any(|outcome| {
-                (matches!(
-                    outcome.outcome.as_str(),
-                    "retained_processing"
-                        | "unverified_review"
-                        | "archive_review"
-                        | "unsupported_review"
-                        | "assessment_retry"
-                ) || (source.keep_on_failure
-                    && !matches!(outcome.outcome.as_str(), "published" | "consumed")))
+                (outcome.repair_dependency
+                    || matches!(
+                        outcome.outcome.as_str(),
+                        "retained_processing"
+                            | "unverified_review"
+                            | "archive_review"
+                            | "unsupported_review"
+                            | "assessment_retry"
+                    )
+                    || (source.keep_on_failure
+                        && !matches!(outcome.outcome.as_str(), "published" | "consumed")))
                     && (outcome.source_path == directory.path
                         || outcome
                             .source_path
@@ -1515,7 +1525,7 @@ impl Inventory {
             .filter(|outcome| {
                 matches!(
                     outcome.source_cleanup_status.as_str(),
-                    "retained" | "retained_keep"
+                    "retained" | "retained_keep" | "retained_repair_dependency"
                 )
             })
             .map(|outcome| outcome.source_path.clone())

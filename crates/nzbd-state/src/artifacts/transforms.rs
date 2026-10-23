@@ -1409,6 +1409,7 @@ mod tests {
             classification: "media".into(),
             outcome: "published".into(),
             reason: Some("PAR digest-validated repair output".into()),
+            repair_dependency: false,
             source_cleanup_status: "pending".into(),
         };
         let publication = inventory

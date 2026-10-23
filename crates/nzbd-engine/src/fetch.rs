@@ -102,19 +102,34 @@ pub async fn http_get(url: &str) -> Result<Vec<u8>, FetchError> {
 /// honoring a provider's outstanding Retry-After delay.
 pub async fn http_get_observed<F, Fut>(
     url: &str,
-    mut retry_state: FetchRetryState,
-    mut on_retry: F,
+    retry_state: FetchRetryState,
+    on_retry: F,
 ) -> Result<Vec<u8>, FetchError>
 where
     F: FnMut(FetchRetryState) -> Fut,
     Fut: Future<Output = bool>,
+{
+    http_get_observed_with_sleep(url, retry_state, on_retry, tokio::time::sleep).await
+}
+
+async fn http_get_observed_with_sleep<F, Fut, S, SFut>(
+    url: &str,
+    mut retry_state: FetchRetryState,
+    mut on_retry: F,
+    mut sleep: S,
+) -> Result<Vec<u8>, FetchError>
+where
+    F: FnMut(FetchRetryState) -> Fut,
+    Fut: Future<Output = bool>,
+    S: FnMut(Duration) -> SFut,
+    SFut: Future<Output = ()>,
 {
     let mut current = url.to_string();
     let mut redirects = 0;
     if let Some(deadline) = retry_state.next_retry_at {
         let wait = deadline.saturating_sub(unix_now()).max(0) as u64;
         if wait > 0 {
-            tokio::time::sleep(Duration::from_secs(wait)).await;
+            sleep(Duration::from_secs(wait)).await;
         }
     }
     retry_state.next_retry_at = None;
@@ -125,7 +140,9 @@ where
         match tokio::time::timeout(HOP_TIMEOUT, get_once(&current)).await {
             Err(_) => {
                 let error = FetchError::Timeout;
-                if !wait_before_retry(&mut retry_state, &mut on_retry, &error, None).await {
+                if !wait_before_retry(&mut retry_state, &mut on_retry, &mut sleep, &error, None)
+                    .await
+                {
                     return Err(FetchError::Cancelled);
                 }
             }
@@ -156,7 +173,9 @@ where
                 if retry_delay(&e, retry_state.attempts).is_none() {
                     return Err(e);
                 }
-                if !wait_before_retry(&mut retry_state, &mut on_retry, &e, retry_after).await {
+                if !wait_before_retry(&mut retry_state, &mut on_retry, &mut sleep, &e, retry_after)
+                    .await
+                {
                     return Err(FetchError::Cancelled);
                 }
             }
@@ -164,17 +183,20 @@ where
     }
 }
 
-async fn wait_before_retry<F, Fut>(
+async fn wait_before_retry<F, Fut, S, SFut>(
     state: &mut FetchRetryState,
     on_retry: &mut F,
+    sleep: &mut S,
     error: &FetchError,
     retry_after: Option<Duration>,
 ) -> bool
 where
     F: FnMut(FetchRetryState) -> Fut,
     Fut: Future<Output = bool>,
+    S: FnMut(Duration) -> SFut,
+    SFut: Future<Output = ()>,
 {
-    let delay = retry_after.unwrap_or_else(|| retry_backoff(state.attempts));
+    let delay = retry_schedule(state.attempts, retry_after);
     let unix_deadline =
         unix_now().saturating_add(i64::try_from(delay.as_secs()).unwrap_or(i64::MAX));
     state.attempts = state.attempts.saturating_add(1);
@@ -191,7 +213,7 @@ where
     let chunk = Duration::from_secs(24 * 60 * 60);
     while !remaining.is_zero() {
         let wait = remaining.min(chunk);
-        tokio::time::sleep(wait).await;
+        sleep(wait).await;
         remaining = remaining.saturating_sub(wait);
     }
     state.next_retry_at = None;
@@ -210,9 +232,7 @@ fn retry_delay(error: &FetchError, retries: u32) -> Option<Duration> {
         FetchError::HttpStatus {
             status,
             retry_after,
-        } if matches!(status.as_u16(), 429 | 503) => {
-            Some(retry_after.unwrap_or_else(|| retry_backoff(retries)))
-        }
+        } if matches!(status.as_u16(), 429 | 503) => Some(retry_schedule(retries, *retry_after)),
         FetchError::Io(_) | FetchError::Timeout | FetchError::TransientNetwork(_) => {
             Some(retry_backoff(retries))
         }
@@ -226,6 +246,13 @@ fn retry_backoff(retries: u32) -> Duration {
             .unwrap_or(usize::MAX)
             .min(RETRY_BACKOFF_SECONDS.len() - 1)],
     )
+}
+
+/// Provider Retry-After is a lower bound on the local retry schedule, not a
+/// replacement for it. Invalid/missing values are represented as `None` by
+/// the parser and use the normal capped backoff.
+fn retry_schedule(retries: u32, retry_after: Option<Duration>) -> Duration {
+    retry_after.unwrap_or_default().max(retry_backoff(retries))
 }
 
 fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
@@ -352,6 +379,18 @@ mod tests {
             retry_delay(&error, u32::MAX),
             Some(Duration::from_secs(300))
         );
+        for (retry, server_seconds, expected) in
+            [(0, 5, 30), (1, 90, 90), (2, 60, 120), (3, 600, 600)]
+        {
+            let status = FetchError::HttpStatus {
+                status: hyper::StatusCode::SERVICE_UNAVAILABLE,
+                retry_after: Some(Duration::from_secs(server_seconds)),
+            };
+            assert_eq!(
+                retry_delay(&status, retry),
+                Some(Duration::from_secs(expected))
+            );
+        }
         let permanent = FetchError::HttpStatus {
             status: hyper::StatusCode::FORBIDDEN,
             retry_after: Some(Duration::ZERO),
@@ -361,10 +400,7 @@ mod tests {
 
     async fn serve_responses(
         responses: Vec<String>,
-    ) -> (
-        String,
-        tokio::task::JoinHandle<Vec<(String, std::time::Instant)>>,
-    ) {
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/start", listener.local_addr().unwrap());
@@ -380,10 +416,7 @@ mod tests {
                 while !request.ends_with(b"\r\n\r\n") {
                     request.push(socket.read_u8().await.unwrap());
                 }
-                requests.push((
-                    String::from_utf8(request).unwrap(),
-                    std::time::Instant::now(),
-                ));
+                requests.push(String::from_utf8(request).unwrap());
                 socket.write_all(response.as_bytes()).await.unwrap();
             }
             requests
@@ -398,17 +431,36 @@ mod tests {
             "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
             "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n<nzb />".into(),
         ]).await;
-        assert_eq!(http_get(&url).await.unwrap(), b"<nzb />");
+        let delays = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = delays.clone();
+        assert_eq!(
+            http_get_observed_with_sleep(
+                &url,
+                FetchRetryState::default(),
+                |_| async { true },
+                move |delay| {
+                    capture.lock().unwrap().push(delay);
+                    async {}
+                },
+            )
+            .await
+            .unwrap(),
+            b"<nzb />"
+        );
         let requests = server.await.unwrap();
-        assert!(requests[1].0.starts_with("GET /real "));
-        assert!(requests[2].0.starts_with("GET /real "));
-        assert!(requests[2].1.duration_since(requests[1].1) >= Duration::from_secs(1));
+        assert!(requests[1].starts_with("GET /real "));
+        assert!(requests[2].starts_with("GET /real "));
+        assert_eq!(*delays.lock().unwrap(), [Duration::from_secs(30)]);
     }
 
     #[tokio::test]
     async fn retryable_statuses_keep_the_same_request_until_success() {
-        for status in ["429 Too Many Requests", "503 Service Unavailable"] {
-            let response = format!("HTTP/1.1 {status}\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        for (status, retry_after, expected) in [
+            ("429 Too Many Requests", "0", [30, 60, 120]),
+            ("503 Service Unavailable", "1", [30, 60, 120]),
+            ("503 Service Unavailable", "90", [90, 90, 120]),
+        ] {
+            let response = format!("HTTP/1.1 {status}\r\nRetry-After: {retry_after}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             let (url, server) = serve_responses(vec![
                 response.clone(),
                 response.clone(),
@@ -416,8 +468,53 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n<nzb />".into(),
             ])
             .await;
-            assert_eq!(http_get(&url).await.unwrap(), b"<nzb />");
-            assert_eq!(server.await.unwrap().len(), 4);
+            let delays = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let delay_capture = delays.clone();
+            let states = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let state_capture = states.clone();
+            assert_eq!(
+                http_get_observed_with_sleep(
+                    &url,
+                    FetchRetryState::default(),
+                    move |state| {
+                        state_capture.lock().unwrap().push(state);
+                        async { true }
+                    },
+                    move |delay| {
+                        delay_capture.lock().unwrap().push(delay);
+                        async {}
+                    },
+                )
+                .await
+                .unwrap(),
+                b"<nzb />"
+            );
+            let requests = server.await.unwrap();
+            assert_eq!(requests.len(), 4);
+            assert_eq!(
+                *delays.lock().unwrap(),
+                expected.map(Duration::from_secs),
+                "Retry-After {retry_after} must not undercut local backoff"
+            );
+            let scheduled = states
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|state| state.next_retry_at.is_some())
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(scheduled.len(), 3);
+            for (state, delay) in scheduled.iter().zip(expected) {
+                assert!(state.blocked_since.is_some());
+                assert!(state.next_retry_at.is_some());
+                assert!(state.attempts > 0);
+                let remaining = state.next_retry_at.unwrap() - unix_now();
+                let delay_seconds = delay as i64;
+                assert!(
+                    (delay_seconds - 1..=delay_seconds).contains(&remaining),
+                    "durable retry deadline must represent the selected {delay}s delay"
+                );
+            }
         }
     }
 

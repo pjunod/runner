@@ -31,6 +31,7 @@
         "classification": "archive_input",
         "outcome": "consumed",
         "reason": "validated extraction output selected",
+        "repairDependency": false,
         "sourceCleanupStatus": "removed"
       },
       {
@@ -39,6 +40,7 @@
         "classification": "unknown",
         "outcome": "retained_processing",
         "reason": "unsupported format needs review",
+        "repairDependency": false,
         "sourceCleanupStatus": "retained"
       }
     ],

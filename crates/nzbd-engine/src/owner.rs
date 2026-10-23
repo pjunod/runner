@@ -6185,6 +6185,7 @@ mod tests {
                     classification: "video".into(),
                     outcome: "published".into(),
                     reason: Some("verified complete media".into()),
+                    repair_dependency: false,
                     source_cleanup_status: "pending".into(),
                 }],
                 &|| Ok(()),

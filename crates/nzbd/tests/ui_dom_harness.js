@@ -1189,10 +1189,14 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   const delivery = (id, status, sequence) => ({ deliveryId: id, status, sequence, artifactId: "published-" + id,
     sourceArtifactId: "source-" + id, sourceGeneration: "source-generation", fileOutcomes: [], files: [],
     readyAt: 1, sourceCleanup: { status: "retry", attempts: 1, attemptHistory: [] } });
-  T.setDeliveriesForTest([delivery("d1", "accepted", 1)], 0, 100);
+  const repairDelivery = delivery("d1", "accepted", 1);
+  repairDelivery.fileOutcomes = [{ repairDependency: true, outcome: "published" }];
+  T.setDeliveriesForTest([repairDelivery], 0, 100);
   T.renderDeliveries();
   ok(sandbox.document.getElementById("files-deliveries").innerHTML.includes("accepted"),
     "accepted deliveries remain visible in the durable listing");
+  ok(sandbox.document.getElementById("files-deliveries").innerHTML.includes("1 PAR repair inputs retained"),
+    "a published sibling can visibly remain a required PAR repair input");
   routes.set("/api/v1/deliveries?after=100", { status: 200, body: { deliveries: [delivery("d2", "pending", 101)], nextCursor: 200 } });
   await T.loadOlderDeliveries();
   eq(T.getDeliveryPagingForTest().count, 2, "next delivery page appends without dropping prior receipts");

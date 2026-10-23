@@ -22,6 +22,13 @@ pub struct DeliveryFileOutcome {
     pub classification: String,
     pub outcome: String,
     pub reason: Option<String>,
+    /// This source file is an evidence-backed member of a measured PAR set
+    /// still needed to retry repair for the same source generation. It is
+    /// independent of publication classification: a verified sibling may be
+    /// published while remaining a repair input until a later attempt proves
+    /// the set resolved.
+    #[serde(default)]
+    pub repair_dependency: bool,
     #[serde(default)]
     pub source_cleanup_status: String,
 }

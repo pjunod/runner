@@ -1471,7 +1471,8 @@ async fn url_jobs_fetch_then_download() {
         .iter()
         .any(|j| j.id == id && matches!(j.status, JobStatus::Fetching)));
 
-    let (status, _) = wait_finished_with_snapshot(&engine, &mut rx, id, 30).await;
+    // Retry-After: 0 cannot undercut the production 30-second first backoff.
+    let (status, _) = wait_finished_with_snapshot(&engine, &mut rx, id, 90).await;
     assert_eq!(status, JobStatus::Completed);
     assert_eq!(
         std::fs::read(tmp.path().join("dest/urljob/u.bin")).unwrap(),
