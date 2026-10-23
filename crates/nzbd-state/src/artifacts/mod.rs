@@ -1516,11 +1516,7 @@ impl Inventory {
                     // not claim that already removed bytes were restored.
                     artifact.state = "retained".into();
                 }
-            } else if artifact
-                .failure_assessment
-                .as_ref()
-                .is_some_and(|assessment| assessment.disposition == "unusable")
-                && artifact.automatic_cleanup_eligible
+            } else if artifact.automatic_cleanup_eligible
                 && artifact.owned
                 && !artifact.terminal()
                 && artifact.hold.is_none()
@@ -1529,10 +1525,11 @@ impl Inventory {
                     "retained" | "completed" | "delete_failed" | "deleting"
                 )
             {
-                // Clearing Keep is explicit authorization to dispose only a
-                // source whose bounded terminal assessment is persisted as
-                // unusable for this exact artifact generation. Legacy or
-                // unknown assessments never authorize deletion.
+                // A durable failed-delete operation is already exact
+                // generation-bound authority, even when it came from the
+                // default Keep-off terminal pipeline (which has no separate
+                // failure assessment). Minting a new operation still
+                // requires positive unusable evidence below.
                 let operation_id = format!("failed-delete-{}", artifact.id);
                 let fresh_request = || {
                     serde_json::to_string(&(
@@ -1554,7 +1551,7 @@ impl Inventory {
                     let mut operation = serde_json::from_str::<Operation>(&raw)?;
                     if operation.artifact != artifact.id
                         || operation.kind != "delete"
-                        || !operation.id.starts_with("failed-delete-")
+                        || operation.id != operation_id
                     {
                         return Err(Error::Conflict(
                             "failed-source deletion id is bound to another operation".into(),
@@ -1577,36 +1574,46 @@ impl Inventory {
                         // A succeeded or review-held journal is not revived
                         // by Keep-off. Review and conflict states require an
                         // explicit inspection/re-authorization path.
-                        return Ok(false);
+                        None
+                    } else {
+                        if operation.attempts == 0 {
+                            operation.request = fresh_request()?;
+                        }
+                        Some(operation)
                     }
-                    if operation.attempts == 0 {
-                        operation.request = fresh_request()?;
-                    }
-                    operation
                 } else {
-                    // delete_failed/deleting rows must resume their exact
-                    // generation-bound operation, never mint fresh authority.
-                    if matches!(artifact.state.as_str(), "delete_failed" | "deleting") {
-                        return Ok(false);
-                    }
-                    Operation {
-                        id: operation_id,
-                        artifact: artifact.id.clone(),
-                        kind: "delete".into(),
-                        state: "queued".into(),
-                        request: fresh_request()?,
-                        created_at: now(),
-                        not_before: now(),
-                        attempts: 0,
-                        next_retry: 0,
-                        error: None,
+                    // New authorization requires a persisted assessment for
+                    // this generation. A failed/in-flight deletion without
+                    // its journal cannot be reconstructed from Keep-off.
+                    if artifact
+                        .failure_assessment
+                        .as_ref()
+                        .is_some_and(|assessment| assessment.disposition == "unusable")
+                        && matches!(artifact.state.as_str(), "retained" | "completed")
+                    {
+                        Some(Operation {
+                            id: operation_id,
+                            artifact: artifact.id.clone(),
+                            kind: "delete".into(),
+                            state: "queued".into(),
+                            request: fresh_request()?,
+                            created_at: now(),
+                            not_before: now(),
+                            attempts: 0,
+                            next_retry: 0,
+                            error: None,
+                        })
+                    } else {
+                        None
                     }
                 };
-                operation.state = "queued".into();
-                operation.not_before = now();
-                operation.next_retry = 0;
-                operation.error = None;
-                save_operation(&tx, &operation)?;
+                if let Some(mut operation) = operation.take() {
+                    operation.state = "queued".into();
+                    operation.not_before = now();
+                    operation.next_retry = 0;
+                    operation.error = None;
+                    save_operation(&tx, &operation)?;
+                }
             }
             save_artifact(&tx, &artifact)?;
             if !keep {

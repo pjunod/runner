@@ -669,7 +669,7 @@ fn clearing_keep_only_schedules_delete_for_persisted_unusable_assessment() {
     assert!(recoverable.join("complete.rar").exists());
 
     let unknown = root.join("legacy-no-assessment");
-    db.allocate_for_delivery(60, &root, &unknown, false, false)
+    db.allocate_for_delivery(60, &root, &unknown, true, false)
         .unwrap();
     std::fs::write(unknown.join("old.bin"), b"legacy bytes").unwrap();
     let unknown_artifact = db.finish(60, &unknown, &root, "retained").unwrap();
@@ -679,6 +679,62 @@ fn clearing_keep_only_schedules_delete_for_persisted_unusable_assessment() {
         .operation(&format!("failed-delete-{}", unknown_artifact.id))
         .is_err());
     assert!(unknown.join("old.bin").exists());
+}
+
+#[test]
+fn keep_toggle_resumes_default_terminal_delete_journal_without_assessment() {
+    let (tmp, db, root) = fixture();
+    let db = Arc::new(db);
+    let path = root.join("default-terminal-delete");
+    db.allocate_for_delivery(65, &root, &path, true, false)
+        .unwrap();
+    std::fs::write(path.join("bad.bin"), b"terminally unusable bytes").unwrap();
+    db.finish(65, &path, &root, "active").unwrap();
+    let guard = db.acquire_attempt_use(65).unwrap().unwrap();
+    let op_id = format!("failed-delete-{}", db.for_job(65).unwrap().unwrap().id);
+    let offline = root
+        .parent()
+        .unwrap()
+        .join("processing-default-delete-offline");
+    let calls = std::cell::Cell::new(0);
+    let operation = db
+        .delete_failed_payload(&guard, 65, &|| {
+            let next = calls.get() + 1;
+            calls.set(next);
+            if next == 5 {
+                // The delete operation has been durably marked running by
+                // this checkpoint. Hide its root so the real filesystem
+                // verification returns a retryable NotFound I/O error.
+                std::fs::rename(&root, &offline)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(operation.state, "retry");
+    assert_eq!(operation.attempts, 1);
+    assert!(db
+        .get(&operation.artifact)
+        .unwrap()
+        .failure_assessment
+        .is_none());
+
+    assert!(db.set_keep_on_failure(65, true).unwrap());
+    assert_eq!(db.operation(&op_id).unwrap().state, "cancelled");
+    assert!(db.set_keep_on_failure(65, false).unwrap());
+    let resumed = db.operation(&op_id).unwrap();
+    assert_eq!(resumed.state, "queued");
+    assert_eq!(resumed.attempts, 1);
+    assert_eq!(resumed.request, operation.request);
+    drop(guard);
+    db.close().unwrap();
+
+    std::fs::rename(&offline, &root).unwrap();
+    let restarted = Inventory::open(&tmp.path().join("state")).unwrap();
+    restarted.run_due_deletes().unwrap();
+    let completed = restarted.operation(&op_id).unwrap();
+    assert_eq!(completed.state, "succeeded");
+    assert_eq!(completed.attempts, 2);
+    assert!(!path.exists());
 }
 
 #[test]
