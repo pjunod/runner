@@ -1497,17 +1497,24 @@ impl Inventory {
             if keep {
                 let raws = {
                     let mut statement = tx.prepare(
-                        "SELECT data FROM operations WHERE artifact=?1 AND state IN ('queued','retry') AND id LIKE 'failed-delete-%'",
+                        "SELECT data FROM operations WHERE artifact=?1 AND state IN ('queued','retry','running') AND id LIKE 'failed-delete-%'",
                     )?;
                     let rows =
                         statement.query_map([&artifact.id], |row| row.get::<_, String>(0))?;
                     rows.collect::<std::result::Result<Vec<_>, _>>()?
                 };
+                let cancelled_failed_delete = !raws.is_empty();
                 for raw in raws {
                     let mut operation: Operation = serde_json::from_str(&raw)?;
                     operation.state = "cancelled".into();
                     operation.error = Some("per-download Keep on failure was enabled".into());
                     save_operation(&tx, &operation)?;
+                }
+                if cancelled_failed_delete && artifact.state == "deleting" {
+                    // A persisted running delete may be from a process that
+                    // stopped mid-operation. Keep pauses future work; it does
+                    // not claim that already removed bytes were restored.
+                    artifact.state = "retained".into();
                 }
             } else if artifact
                 .failure_assessment
@@ -1516,20 +1523,26 @@ impl Inventory {
                 && artifact.automatic_cleanup_eligible
                 && artifact.owned
                 && !artifact.terminal()
-                && matches!(artifact.state.as_str(), "retained" | "completed")
+                && artifact.hold.is_none()
+                && matches!(
+                    artifact.state.as_str(),
+                    "retained" | "completed" | "delete_failed" | "deleting"
+                )
             {
                 // Clearing Keep is explicit authorization to dispose only a
                 // source whose bounded terminal assessment is persisted as
                 // unusable for this exact artifact generation. Legacy or
                 // unknown assessments never authorize deletion.
                 let operation_id = format!("failed-delete-{}", artifact.id);
-                let request = serde_json::to_string(&(
-                    artifact.id.as_str(),
-                    artifact.revision,
-                    0u64,
-                    false,
-                    artifact.generation.as_str(),
-                ))?;
+                let fresh_request = || {
+                    serde_json::to_string(&(
+                        artifact.id.as_str(),
+                        artifact.revision,
+                        0u64,
+                        false,
+                        artifact.generation.as_str(),
+                    ))
+                };
                 let existing: Option<String> = tx
                     .query_row(
                         "SELECT data FROM operations WHERE id=?1",
@@ -1538,14 +1551,50 @@ impl Inventory {
                     )
                     .optional()?;
                 let mut operation = if let Some(raw) = existing {
-                    serde_json::from_str::<Operation>(&raw)?
+                    let mut operation = serde_json::from_str::<Operation>(&raw)?;
+                    if operation.artifact != artifact.id
+                        || operation.kind != "delete"
+                        || !operation.id.starts_with("failed-delete-")
+                    {
+                        return Err(Error::Conflict(
+                            "failed-source deletion id is bound to another operation".into(),
+                        ));
+                    }
+                    let request: DeleteRequest = serde_json::from_str(&operation.request)?;
+                    let (id, _, _, automatic, generation) = request.fields();
+                    if id != artifact.id
+                        || automatic
+                        || generation != Some(artifact.generation.as_str())
+                    {
+                        return Err(Error::Conflict(
+                            "failed-source deletion authorization changed".into(),
+                        ));
+                    }
+                    if !matches!(
+                        operation.state.as_str(),
+                        "cancelled" | "retry" | "queued" | "running"
+                    ) {
+                        // A succeeded or review-held journal is not revived
+                        // by Keep-off. Review and conflict states require an
+                        // explicit inspection/re-authorization path.
+                        return Ok(false);
+                    }
+                    if operation.attempts == 0 {
+                        operation.request = fresh_request()?;
+                    }
+                    operation
                 } else {
+                    // delete_failed/deleting rows must resume their exact
+                    // generation-bound operation, never mint fresh authority.
+                    if matches!(artifact.state.as_str(), "delete_failed" | "deleting") {
+                        return Ok(false);
+                    }
                     Operation {
                         id: operation_id,
                         artifact: artifact.id.clone(),
                         kind: "delete".into(),
                         state: "queued".into(),
-                        request: request.clone(),
+                        request: fresh_request()?,
                         created_at: now(),
                         not_before: now(),
                         attempts: 0,
@@ -1553,16 +1602,9 @@ impl Inventory {
                         error: None,
                     }
                 };
-                if operation.artifact != artifact.id || operation.kind != "delete" {
-                    return Err(Error::Conflict(
-                        "failed-source deletion id is bound to another operation".into(),
-                    ));
-                }
                 operation.state = "queued".into();
-                operation.request = request;
                 operation.not_before = now();
                 operation.next_retry = 0;
-                operation.attempts = 0;
                 operation.error = None;
                 save_operation(&tx, &operation)?;
             }

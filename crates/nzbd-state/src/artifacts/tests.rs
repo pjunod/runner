@@ -682,6 +682,144 @@ fn clearing_keep_only_schedules_delete_for_persisted_unusable_assessment() {
 }
 
 #[test]
+fn keep_off_resumes_retryable_failed_delete_for_the_same_generation_after_restart() {
+    let (tmp, db, root) = fixture();
+    let path = root.join("retryable-unusable");
+    db.allocate_for_delivery(62, &root, &path, true, false)
+        .unwrap();
+    std::fs::write(path.join("bad.bin"), b"unusable payload").unwrap();
+    let artifact = db.finish(62, &path, &root, "retained").unwrap();
+    db.set_failure_assessment(
+        &artifact.id,
+        &artifact.generation,
+        "unusable",
+        "bounded terminal corruption evidence",
+    )
+    .unwrap();
+    assert!(db.set_keep_on_failure(62, true).unwrap());
+    assert!(db.set_keep_on_failure(62, false).unwrap());
+    let op_id = format!("failed-delete-{}", artifact.id);
+    let authorized = db.operation(&op_id).unwrap();
+
+    // A missing volume is a retryable I/O failure, not a new deletion
+    // authorization or a review hold.
+    let offline = root.parent().unwrap().join("processing-offline");
+    std::fs::rename(&root, &offline).unwrap();
+    let failed = db.execute_delete(&op_id).unwrap();
+    assert_eq!(failed.state, "retry");
+    assert_eq!(failed.attempts, 1);
+    assert_eq!(db.get(&artifact.id).unwrap().state, "delete_failed");
+
+    assert!(db.set_keep_on_failure(62, true).unwrap());
+    assert_eq!(db.operation(&op_id).unwrap().state, "cancelled");
+    assert!(db.set_keep_on_failure(62, false).unwrap());
+    let resumed = db.operation(&op_id).unwrap();
+    assert_eq!(resumed.state, "queued");
+    assert_eq!(resumed.attempts, 1, "Keep toggles preserve delete progress");
+    assert_eq!(resumed.request, authorized.request);
+    db.close().unwrap();
+
+    std::fs::rename(&offline, &root).unwrap();
+    let restarted = Inventory::open(&tmp.path().join("state")).unwrap();
+    restarted.run_due_deletes().unwrap();
+    let succeeded = restarted.operation(&op_id).unwrap();
+    assert_eq!(succeeded.state, "succeeded");
+    assert_eq!(succeeded.attempts, 2);
+    assert!(!path.exists());
+    assert_eq!(restarted.get(&artifact.id).unwrap().state, "deleted");
+}
+
+#[test]
+fn restart_resumes_running_delete_of_partially_removed_generation() {
+    let (tmp, db, root) = fixture();
+    let path = root.join("interrupted-unusable");
+    db.allocate_for_delivery(63, &root, &path, true, false)
+        .unwrap();
+    std::fs::write(path.join("one.bin"), b"first").unwrap();
+    std::fs::write(path.join("two.bin"), b"second").unwrap();
+    let artifact = db.finish(63, &path, &root, "retained").unwrap();
+    db.set_failure_assessment(
+        &artifact.id,
+        &artifact.generation,
+        "unusable",
+        "bounded terminal corruption evidence",
+    )
+    .unwrap();
+    assert!(db.set_keep_on_failure(63, true).unwrap());
+    assert!(db.set_keep_on_failure(63, false).unwrap());
+    let op_id = format!("failed-delete-{}", artifact.id);
+    let mut operation = db.operation(&op_id).unwrap();
+    operation.state = "running".into();
+    operation.attempts = 1;
+    let mut deleting = db.get(&artifact.id).unwrap();
+    deleting.state = "deleting".into();
+    {
+        let mut connection = db.db.lock().unwrap();
+        let tx = connection.transaction().unwrap();
+        save_operation(&tx, &operation).unwrap();
+        save_artifact(&tx, &deleting).unwrap();
+        tx.commit().unwrap();
+    }
+    // Simulate a process exiting after removing one file but before the
+    // operation's completion record was committed.
+    std::fs::remove_file(path.join("one.bin")).unwrap();
+    db.close().unwrap();
+
+    let restarted = Inventory::open(&tmp.path().join("state")).unwrap();
+    let interrupted = restarted.operation(&op_id).unwrap();
+    assert_eq!(interrupted.state, "running");
+    assert_eq!(interrupted.attempts, 1);
+    assert!(restarted.set_keep_on_failure(63, true).unwrap());
+    assert_eq!(restarted.operation(&op_id).unwrap().state, "cancelled");
+    assert!(restarted.set_keep_on_failure(63, false).unwrap());
+    let resumed = restarted.operation(&op_id).unwrap();
+    assert_eq!(resumed.state, "queued");
+    assert_eq!(resumed.attempts, 1);
+    assert_eq!(resumed.request, operation.request);
+    restarted.run_due_deletes().unwrap();
+    let completed = restarted.operation(&op_id).unwrap();
+    assert_eq!(completed.state, "succeeded");
+    assert_eq!(completed.attempts, 2);
+    assert!(!path.exists());
+    assert_eq!(restarted.get(&artifact.id).unwrap().state, "deleted");
+}
+
+#[test]
+fn keep_off_does_not_requeue_conflicted_failed_delete() {
+    let (_tmp, db, root) = fixture();
+    let path = root.join("conflicted-unusable");
+    db.allocate_for_delivery(64, &root, &path, true, false)
+        .unwrap();
+    std::fs::write(path.join("bad.bin"), b"original bytes").unwrap();
+    let artifact = db.finish(64, &path, &root, "retained").unwrap();
+    db.set_failure_assessment(
+        &artifact.id,
+        &artifact.generation,
+        "unusable",
+        "bounded terminal corruption evidence",
+    )
+    .unwrap();
+    assert!(db.set_keep_on_failure(64, true).unwrap());
+    assert!(db.set_keep_on_failure(64, false).unwrap());
+    let op_id = format!("failed-delete-{}", artifact.id);
+    std::fs::write(path.join("bad.bin"), b"external replacement").unwrap();
+    assert_eq!(db.execute_delete(&op_id).unwrap().state, "review");
+    assert_eq!(
+        db.get(&artifact.id).unwrap().hold.as_deref(),
+        Some("review")
+    );
+
+    assert!(db.set_keep_on_failure(64, true).unwrap());
+    assert!(db.set_keep_on_failure(64, false).unwrap());
+    assert_eq!(db.operation(&op_id).unwrap().state, "review");
+    assert_eq!(
+        db.get(&artifact.id).unwrap().hold.as_deref(),
+        Some("review")
+    );
+    assert!(path.join("bad.bin").exists());
+}
+
+#[test]
 fn clearing_keep_retries_partial_delivery_cleanup_without_deleting_recoverable_inputs() {
     let (tmp, db, root) = fixture();
     let source = root.join("keep-partial-source");
