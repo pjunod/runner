@@ -15,8 +15,10 @@ pub fn identity(meta: &fs::Metadata) -> Identity {
         Identity {
             device: meta.dev(),
             inode: meta.ino(),
+            mount_id: String::new(),
             bytes: meta.len(),
             modified: format!("{}:{}", meta.mtime(), meta.mtime_nsec()),
+            changed: format!("{}:{}", meta.ctime(), meta.ctime_nsec()),
             directory: meta.is_dir(),
         }
     }
@@ -26,8 +28,10 @@ pub fn identity(meta: &fs::Metadata) -> Identity {
         Identity {
             device: 0,
             inode: meta.creation_time(),
+            mount_id: String::new(),
             bytes: meta.len(),
             modified: meta.last_write_time().to_string(),
+            changed: meta.last_write_time().to_string(),
             directory: meta.is_dir(),
         }
     }
@@ -36,11 +40,153 @@ pub fn identity(meta: &fs::Metadata) -> Identity {
         Identity {
             device: 0,
             inode: 0,
+            mount_id: String::new(),
             bytes: meta.len(),
             modified: format!("{:?}", meta.modified()),
+            changed: String::new(),
             directory: meta.is_dir(),
         }
     }
+}
+
+/// Stable mount source/type/root identity for the filesystem containing this
+/// descriptor. Device numbers and `f_fsid` are deliberately not authority:
+/// both can be reused or change across a remount.
+#[cfg(target_os = "linux")]
+pub fn mount_id(dir: &File) -> Result<String> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
+    linux_mount_id(dir, &mountinfo)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mount_id(dir: &File, mountinfo: &str) -> Result<String> {
+    use std::os::fd::AsRawFd;
+    let fd = dir.as_raw_fd();
+    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?;
+    let mount_id = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:").map(str::trim))
+        .ok_or_else(|| Error::Conflict("descriptor has no mount id".into()))?;
+    let descriptor_path = std::fs::read_link(format!("/proc/self/fd/{fd}"))?;
+    let descriptor_path = descriptor_path.to_string_lossy();
+    for line in mountinfo.lines() {
+        let Some((before, after)) = line.split_once(" - ") else {
+            continue;
+        };
+        let fields: Vec<_> = before.split_ascii_whitespace().collect();
+        let fs_fields: Vec<_> = after.split_ascii_whitespace().collect();
+        if fields.len() < 5 || fs_fields.len() < 2 || fields[0] != mount_id {
+            continue;
+        }
+        let root = decode_mountinfo(fields[3])?;
+        let mount_point = decode_mountinfo(fields[4])?;
+        let source = decode_mountinfo(fs_fields[1])?;
+        let fs_type = fs_fields[0];
+        let is_prefix = descriptor_path == mount_point
+            || descriptor_path
+                .strip_prefix(&mount_point)
+                .is_some_and(|suffix| mount_point == "/" || suffix.starts_with('/'));
+        if !is_prefix {
+            return Err(Error::Conflict(
+                "descriptor path does not match its mounted filesystem".into(),
+            ));
+        }
+        return Ok(format!(
+            "linux\n{}:{}\n{}:{}\n{}:{}\n{}:{}",
+            fs_type.len(),
+            fs_type,
+            source.len(),
+            source,
+            root.len(),
+            root,
+            mount_point.len(),
+            mount_point
+        ));
+    }
+    Err(Error::Conflict(
+        "could not identify descriptor mount source".into(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn identity_for_file_with_mountinfo(file: &File, mountinfo: &str) -> Result<Identity> {
+    let mut identity = identity(&file.metadata()?);
+    identity.mount_id = linux_mount_id(file, mountinfo)?;
+    Ok(identity)
+}
+
+#[cfg(target_os = "macos")]
+pub fn mount_id(dir: &File) -> Result<String> {
+    use std::ffi::CStr;
+    use std::os::fd::AsRawFd;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(dir.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stat = unsafe { stat.assume_init() };
+    let fs_type = unsafe { CStr::from_ptr(stat.f_fstypename.as_ptr()) }.to_string_lossy();
+    let source = unsafe { CStr::from_ptr(stat.f_mntfromname.as_ptr()) }.to_string_lossy();
+    let mount_root = unsafe { CStr::from_ptr(stat.f_mntonname.as_ptr()) }.to_string_lossy();
+    Ok(format!(
+        "macos\n{}:{}\n{}:{}\n{}:{}",
+        fs_type.len(),
+        fs_type,
+        source.len(),
+        source,
+        mount_root.len(),
+        mount_root
+    ))
+}
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+pub fn mount_id(_: &File) -> Result<String> {
+    // Fail closed for remount recovery on platforms where we cannot identify
+    // the mount source. Same-device comparisons remain available for legacy use.
+    Ok(String::new())
+}
+#[cfg(not(unix))]
+pub fn mount_id(_: &File) -> Result<String> {
+    Ok(String::new())
+}
+
+#[cfg(target_os = "linux")]
+fn decode_mountinfo(value: &str) -> Result<String> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            if i + 3 >= bytes.len()
+                || !bytes[i + 1..i + 4]
+                    .iter()
+                    .all(|byte| (b'0'..=b'7').contains(byte))
+            {
+                return Err(Error::Conflict("invalid mountinfo escape".into()));
+            }
+            let octal =
+                (bytes[i + 1] - b'0') * 64 + (bytes[i + 2] - b'0') * 8 + (bytes[i + 3] - b'0');
+            decoded.push(octal);
+            i += 4;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| Error::Conflict("non-UTF8 mount identity".into()))
+}
+
+pub fn identity_for_file(file: &File) -> Result<Identity> {
+    let mut identity = identity(&file.metadata()?);
+    identity.mount_id = mount_id(file)?;
+    Ok(identity)
+}
+
+fn ensure_same_mount(root_mount: &str, child_mount: &str, path: &str) -> Result<()> {
+    if !root_mount.is_empty() && child_mount != root_mount {
+        return Err(Error::Conflict(format!(
+            "nested mount or volume boundary at {path}; inspect manually"
+        )));
+    }
+    Ok(())
 }
 
 pub fn absolute(path: &Path) -> Result<()> {
@@ -79,6 +225,16 @@ mod unix {
         // SAFETY: n is NUL terminated; parent owns its live descriptor. The
         // returned descriptor is transferred exactly once to File.
         let fd = unsafe { libc::openat(parent.as_raw_fd(), n.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+    pub fn create_file_exclusive_at(parent: &File, path: &Path) -> Result<File> {
+        let n = name(path)?;
+        let flags =
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), n.as_ptr(), flags, 0o600) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -175,7 +331,7 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{names, open_at, open_dir, unlink};
+pub use unix::{create_file_exclusive_at, names, open_at, open_dir, unlink};
 
 // Windows retains ordinary queue/PP operation and cached inspection. Checked
 // destructive ownership remains unavailable until a handle-relative unlink
@@ -241,6 +397,11 @@ mod windows {
         }
         Ok(file)
     }
+    pub fn create_file_exclusive_at(_: &File, _: &Path) -> Result<File> {
+        Err(Error::Conflict(
+            "descriptor-relative exclusive creation unavailable".into(),
+        ))
+    }
     pub fn names(dir: &File) -> Result<Vec<std::ffi::OsString>> {
         let entries = fs::read_dir(handle_path(dir)?)?
             .take(100002)
@@ -255,7 +416,7 @@ mod windows {
     }
 }
 #[cfg(windows)]
-pub use windows::{names, open_at, open_dir};
+pub use windows::{create_file_exclusive_at, names, open_at, open_dir};
 #[cfg(not(any(unix, windows)))]
 pub fn open_dir(_: &Path) -> Result<File> {
     Err(Error::Conflict("filesystem access unsupported".into()))
@@ -263,6 +424,10 @@ pub fn open_dir(_: &Path) -> Result<File> {
 #[cfg(not(any(unix, windows)))]
 pub fn open_at(_: &File, _: &Path, _: bool) -> Result<File> {
     open_dir(Path::new("/"))
+}
+#[cfg(not(any(unix, windows)))]
+pub fn create_file_exclusive_at(_: &File, _: &Path) -> Result<File> {
+    Err(Error::Conflict("filesystem access unsupported".into()))
 }
 #[cfg(not(any(unix, windows)))]
 pub fn names(_: &File) -> Result<Vec<std::ffi::OsString>> {
@@ -284,9 +449,19 @@ pub fn sync_directory(dir: &File) -> Result<()> {
 }
 
 pub fn manifest(dir: &File, limit: usize) -> Result<Vec<FileEntry>> {
+    #[cfg(target_os = "linux")]
+    let mountinfo = Some(std::fs::read_to_string("/proc/self/mountinfo")?);
+    #[cfg(not(target_os = "linux"))]
+    let mountinfo: Option<String> = None;
+    #[cfg(target_os = "linux")]
+    let mount_id = linux_mount_id(dir, mountinfo.as_deref().unwrap())?;
+    #[cfg(not(target_os = "linux"))]
+    let mount_id = mount_id(dir)?;
     fn walk(
         dir: &File,
         prefix: &Path,
+        mount_id: &str,
+        _mountinfo: Option<&str>,
         out: &mut Vec<FileEntry>,
         limit: usize,
         depth: usize,
@@ -314,21 +489,75 @@ pub fn manifest(dir: &File, limit: usize) -> Result<Vec<FileEntry>> {
             if !meta.is_file() && !meta.is_dir() {
                 return Err(Error::Conflict(format!("special file: {display}")));
             }
+            #[cfg(target_os = "linux")]
+            let identity = identity_for_file_with_mountinfo(
+                &child,
+                _mountinfo.ok_or_else(|| Error::Conflict("mount table unavailable".into()))?,
+            )?;
+            #[cfg(not(target_os = "linux"))]
+            let identity = identity_for_file(&child)?;
+            ensure_same_mount(mount_id, &identity.mount_id, &display)?;
             out.push(FileEntry {
                 path: display,
-                identity: identity(&meta),
+                identity,
                 digest: None,
             });
             if meta.is_dir() {
-                walk(&child, &path, out, limit, depth + 1)?;
+                walk(&child, &path, mount_id, _mountinfo, out, limit, depth + 1)?;
             }
         }
         Ok(())
     }
     let mut out = Vec::new();
-    walk(dir, Path::new(""), &mut out, limit, 0)?;
+    walk(
+        dir,
+        Path::new(""),
+        &mount_id,
+        mountinfo.as_deref(),
+        &mut out,
+        limit,
+        0,
+    )?;
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+#[cfg(test)]
+mod mount_tests {
+    use super::*;
+
+    #[test]
+    fn nested_mount_boundary_is_rejected() {
+        let error = ensure_same_mount("ext4:/source:/", "tmpfs:tmpfs:/", "Season 1").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("nested mount or volume boundary"));
+        assert!(ensure_same_mount("ext4:/source:/", "ext4:/source:/", "Season 1").is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_mount_id_selects_visible_stacked_mount() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let file = File::open(dir.path()).unwrap();
+        let fd = file.as_raw_fd();
+        let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap();
+        let id: u64 = fdinfo
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("mnt_id:")
+                    .and_then(|id| id.trim().parse().ok())
+            })
+            .unwrap();
+        let mountinfo = format!(
+            "{id} 1 0:1 / / rw - ext4 /dev/visible rw\n{} 1 0:2 / / rw - ext4 /dev/hidden rw\n",
+            id + 1
+        );
+        let key = linux_mount_id(&file, &mountinfo).unwrap();
+        assert!(key.contains("/dev/visible"));
+        assert!(!key.contains("/dev/hidden"));
+    }
 }
 
 pub fn open_relative(root: &File, path: &str) -> Result<File> {
@@ -360,7 +589,7 @@ pub fn remove_entry(root: &File, entry: &FileEntry) -> Result<()> {
         .file_name()
         .ok_or_else(|| Error::Conflict("empty file path".into()))?;
     let child = open_at(&parent, Path::new(n), entry.identity.directory)?;
-    let observed = identity(&child.metadata()?);
+    let observed = identity_for_file(&child)?;
     if !entry.identity.same_object(&observed) || (!observed.directory && observed != entry.identity)
     {
         return Err(Error::Conflict(format!("identity changed: {}", entry.path)));
@@ -468,6 +697,7 @@ pub fn rename_exclusive(from: &Path, to: &Path) -> Result<()> {
         if !input.metadata()?.is_file() {
             return Err(error.into());
         }
+        let original_digest = digest_file(&input)?;
         input.sync_all()?;
         if unsafe {
             libc::linkat(
@@ -486,14 +716,20 @@ pub fn rename_exclusive(from: &Path, to: &Path) -> Result<()> {
             // Resume only the two-name state left by link-before-unlink.
             // Equal bytes in a different inode do not authorize deletion.
             let existing = open_at(&target, Path::new(to.file_name().unwrap()), false)?;
-            if identity(&existing.metadata()?) != original {
+            if !rename_identity_matches(&original, &identity(&existing.metadata()?))
+                || digest_file(&existing)? != original_digest
+            {
                 return Err(link_error.into());
             }
         }
         target.sync_all()?;
         let linked = open_at(&target, Path::new(to.file_name().unwrap()), false)?;
         let current = open_at(&source, name, false)?;
-        if identity(&linked.metadata()?) != original || identity(&current.metadata()?) != original {
+        if !rename_identity_matches(&original, &identity(&linked.metadata()?))
+            || !rename_identity_matches(&original, &identity(&current.metadata()?))
+            || digest_file(&linked)? != original_digest
+            || digest_file(&current)? != original_digest
+        {
             return Err(Error::Conflict(
                 "source changed during exclusive file rename; both names retained for review"
                     .into(),
@@ -504,6 +740,32 @@ pub fn rename_exclusive(from: &Path, to: &Path) -> Result<()> {
     target.sync_all()?;
     source.sync_all()?;
     Ok(())
+}
+
+fn rename_identity_matches(before: &Identity, after: &Identity) -> bool {
+    before.same_object(after) && before.bytes == after.bytes && before.modified == after.modified
+}
+
+fn digest_file(file: &File) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let before = identity(&file.metadata()?);
+    let mut input = file.try_clone()?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    if !rename_identity_matches(&before, &identity(&file.metadata()?)) {
+        return Err(Error::Conflict(
+            "file changed while hashing rename input".into(),
+        ));
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn rename_exclusive(_: &Path, _: &Path) -> Result<()> {
@@ -534,7 +796,9 @@ mod exclusive_tests {
             RENAME_FAILURE.with(|v| v.set(Some(code)));
             rename_exclusive(&from, &to).unwrap();
             assert!(!from.exists());
-            assert_eq!(identity(&fs::metadata(&to).unwrap()), before);
+            let after = identity(&fs::metadata(&to).unwrap());
+            assert!(before.same_object(&after));
+            assert_eq!(fs::read(&to).unwrap(), b"payload");
             fs::hard_link(&to, &from).unwrap();
             rename_exclusive(&from, &to).unwrap();
             assert!(!from.exists());

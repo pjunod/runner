@@ -57,9 +57,9 @@ flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-# Keep the workspace MSRV truthful on every target. Tokio 1.53.0's Windows
-# signal path uses OnceLock::wait, which is still unstable on Rust 1.85.
-tokio = { version = "=1.52.4", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs", "process"] }
+# Pin the first release in Tokio's fixed 1.53 line for RUSTSEC-2026-0386.
+# The workspace's Rust 1.95 MSRV also supports Windows OnceLock::wait.
+tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs", "process"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-rustls = "0.26"

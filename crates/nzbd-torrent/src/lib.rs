@@ -25,6 +25,8 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -645,6 +647,10 @@ pub struct TorrentSession {
     output_root: PathBuf,
     proxy_enabled: bool,
     magnet_metadata_timeout: Duration,
+    #[cfg(any(test, feature = "test-support"))]
+    magnet_metadata_timeout_gate: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(any(test, feature = "test-support"))]
+    magnet_metadata_timeout_gate_used: Arc<AtomicBool>,
 }
 
 struct ResolvedMagnet {
@@ -755,6 +761,10 @@ impl TorrentSession {
             output_root,
             proxy_enabled,
             magnet_metadata_timeout: MAGNET_METADATA_TIMEOUT,
+            #[cfg(any(test, feature = "test-support"))]
+            magnet_metadata_timeout_gate: None,
+            #[cfg(any(test, feature = "test-support"))]
+            magnet_metadata_timeout_gate_used: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -764,6 +774,20 @@ impl TorrentSession {
     #[doc(hidden)]
     pub fn with_magnet_metadata_timeout_for_test(mut self, timeout: Duration) -> Self {
         self.magnet_metadata_timeout = timeout;
+        self
+    }
+
+    /// Hold the test-only metadata deadline until a test-controlled readiness
+    /// event, allowing discovery tests to prove the timeout cancels an active
+    /// lookup rather than racing the first network request.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_magnet_metadata_timeout_gate_for_test(
+        mut self,
+        gate: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.magnet_metadata_timeout_gate = Some(gate);
+        self.magnet_metadata_timeout_gate_used = Arc::new(AtomicBool::new(false));
         self
     }
 
@@ -822,6 +846,10 @@ impl TorrentSession {
             output_root,
             proxy_enabled: false,
             magnet_metadata_timeout: MAGNET_METADATA_TIMEOUT,
+            #[cfg(any(test, feature = "test-support"))]
+            magnet_metadata_timeout_gate: None,
+            #[cfg(any(test, feature = "test-support"))]
+            magnet_metadata_timeout_gate_used: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -893,16 +921,33 @@ impl TorrentSession {
     ) -> Result<ResolvedMagnet, TorrentError> {
         let magnet = validate_magnet_contract(&magnet, self.proxy_enabled)?;
         validate_magnet_discovery_available(&magnet, self.dht_enabled, !initial_peers.is_empty())?;
-        let resolved = tokio::time::timeout(
-            timeout,
-            self.inner.add_torrent(
-                AddTorrent::from_url(magnet),
-                Some(magnet_resolution_options(initial_peers)),
-            ),
-        )
-        .await
-        .map_err(|_| TorrentError::MagnetMetadataTimeout)?
-        .map_err(|error| {
+        let resolve = self.inner.add_torrent(
+            AddTorrent::from_url(magnet),
+            Some(magnet_resolution_options(initial_peers)),
+        );
+        #[cfg(any(test, feature = "test-support"))]
+        let result = if let Some(gate) = self.magnet_metadata_timeout_gate.as_ref().filter(|_| {
+            !self
+                .magnet_metadata_timeout_gate_used
+                .swap(true, Ordering::SeqCst)
+        }) {
+            tokio::select! {
+                result = resolve => result,
+                _ = async {
+                    gate.notified().await;
+                    tokio::time::sleep(timeout).await;
+                } => return Err(TorrentError::MagnetMetadataTimeout),
+            }
+        } else {
+            tokio::time::timeout(timeout, resolve)
+                .await
+                .map_err(|_| TorrentError::MagnetMetadataTimeout)?
+        };
+        #[cfg(not(any(test, feature = "test-support")))]
+        let result = tokio::time::timeout(timeout, resolve)
+            .await
+            .map_err(|_| TorrentError::MagnetMetadataTimeout)?;
+        let resolved = result.map_err(|error| {
             if error
                 .downcast_ref::<librqbit::InvalidResolvedMagnetMetadataError>()
                 .is_some()

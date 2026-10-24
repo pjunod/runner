@@ -367,6 +367,7 @@ impl TorrentAdmissionService {
                 stop_seeding_on_complete: pending.stop_seeding_on_complete,
                 params: pending.params.clone(),
                 client: pending.client.clone(),
+                torrent_tags: pending.torrent_tags.clone(),
                 ..Default::default()
             };
             let attempt: Result<AdmissionResult, AdmissionError> = async {
@@ -1559,10 +1560,15 @@ mod tests {
         }
     }
 
-    async fn empty_dht_node(socket: tokio::net::UdpSocket, get_peers_count: Arc<AtomicUsize>) {
+    async fn empty_dht_node(
+        socket: tokio::net::UdpSocket,
+        get_peers_count: Arc<AtomicUsize>,
+        first_get_peers: Option<tokio::sync::oneshot::Sender<()>>,
+    ) {
         let node_id = [0x25; 20];
         let node = socket.local_addr().unwrap();
         let mut packet = [0_u8; 2048];
+        let mut first_get_peers = first_get_peers;
         loop {
             let (length, source) = socket.recv_from(&mut packet).await.unwrap();
             let request = &packet[..length];
@@ -1571,6 +1577,9 @@ mod tests {
                 .any(|window| window == b"9:get_peers")
             {
                 get_peers_count.fetch_add(1, Ordering::SeqCst);
+                if let Some(ready) = first_get_peers.take() {
+                    let _ = ready.send(());
+                }
             }
             let transaction = dht_transaction_id(request);
             socket
@@ -2239,7 +2248,13 @@ mod tests {
             .unwrap();
         let dht_address = dht_socket.local_addr().unwrap();
         let get_peers_count = Arc::new(AtomicUsize::new(0));
-        let dht_task = tokio::spawn(empty_dht_node(dht_socket, get_peers_count.clone()));
+        let (first_query_sent, first_query_received) = tokio::sync::oneshot::channel();
+        let timeout_gate = Arc::new(tokio::sync::Notify::new());
+        let dht_task = tokio::spawn(empty_dht_node(
+            dht_socket,
+            get_peers_count.clone(),
+            Some(first_query_sent),
+        ));
 
         let state = tmp.path().join("timeout-state");
         let engine = Engine::spawn(EngineConfig::single_node(
@@ -2261,20 +2276,27 @@ mod tests {
         )
         .await
         .unwrap()
-        .with_magnet_metadata_timeout_for_test(std::time::Duration::from_millis(300));
+        .with_magnet_metadata_timeout_for_test(std::time::Duration::from_millis(300))
+        .with_magnet_metadata_timeout_gate_for_test(timeout_gate.clone());
         let service =
             TorrentAdmissionService::new(engine.clone(), session, state.clone(), false, true);
         let magnet = "magnet:?xt=urn:btih:1111111111111111111111111111111111111111";
-        let response = router(service.clone())
-            .oneshot(
-                axum::http::Request::post("/api/v1/jobs")
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(
-                        json!({"source":{"type":"magnet","uri":magnet}}).to_string(),
-                    ))
-                    .unwrap(),
-            )
+        let request = axum::http::Request::post("/api/v1/jobs")
+            .header(CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                json!({"source":{"type":"magnet","uri":magnet}}).to_string(),
+            ))
+            .unwrap();
+        let request_task = tokio::spawn(router(service.clone()).oneshot(request));
+        tokio::time::timeout(std::time::Duration::from_secs(5), first_query_received)
             .await
+            .expect("timed out before DHT issued its first get_peers request")
+            .expect("DHT node stopped before reporting its first get_peers request");
+        timeout_gate.notify_one();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), request_task)
+            .await
+            .expect("metadata resolution did not time out after the DHT request")
+            .unwrap()
             .unwrap();
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         let snapshot = nzbd_state::SnapshotStore::open(&state)
@@ -2496,7 +2518,7 @@ mod tests {
 
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(state.join("queue.json")).unwrap()).unwrap();
-        assert_eq!(raw["schema_version"], 4);
+        assert_eq!(raw["schema_version"], nzbd_state::QUEUE_SCHEMA_VERSION);
         assert_eq!(raw["pending_admissions"][0]["job_id"], job.0);
         assert_eq!(raw["pending_admissions"][0]["source"], "url");
         assert_eq!(

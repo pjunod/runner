@@ -28,6 +28,10 @@ use subtle::ConstantTimeEq;
 const SESSION_TTL_SECS: i64 = 3600;
 const MAX_SESSIONS: usize = 256;
 const MAX_FAILED_LOGINS: usize = 64;
+const MAX_QBIT_TAGS: usize = 32;
+const MAX_QBIT_TAG_BYTES: usize = 256;
+const MAX_QBIT_TAGS_BYTES: usize = 1024;
+const TRANSFER_TAG_PREFIX: &str = "monarr-transfer-";
 
 #[derive(Clone)]
 pub struct QbitState {
@@ -373,6 +377,7 @@ async fn torrent_info(
         } else {
             &torrent.payload_root
         };
+        let tags = qbit_tags_from_params(&job.params);
         rows.push(json!({
             "hash": torrent.info_hash_v1,
             "name": job.name,
@@ -381,6 +386,7 @@ async fn torrent_info(
             "eta": summary.remaining_bytes.checked_div(summary.rate_bps).unwrap_or(8640000),
             "state": qbit_state(torrent.phase, summary.useful_peers, summary.upload_rate_bps),
             "category": job.category.unwrap_or_default(),
+            "tags": tags,
             "save_path": save_path,
             "content_path": torrent.content_path.unwrap_or_else(|| save_path.join(&job.name)),
             "ratio": summary.ratio,
@@ -473,6 +479,25 @@ async fn torrent_add(State(state): State<QbitState>, headers: HeaderMap, body: B
             .unwrap_or("")
             .trim()
     };
+    let tag_value = match parts.get("tags") {
+        None => "",
+        Some(bytes) => match std::str::from_utf8(bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid tags: tag data must be UTF-8.",
+                )
+                    .into_response();
+            }
+        },
+    };
+    let torrent_tags = match parse_qbit_tags(tag_value) {
+        Ok(tags) => tags,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, message).into_response();
+        }
+    };
     let opts = AddOpts {
         category: nonempty(text("category")),
         paused: matches!(text("paused"), "true" | "1"),
@@ -482,6 +507,7 @@ async fn torrent_add(State(state): State<QbitState>, headers: HeaderMap, body: B
             .get(header::USER_AGENT)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string),
+        torrent_tags,
         ..Default::default()
     };
     let result = if let Some(bytes) = parts.get("torrents") {
@@ -503,6 +529,61 @@ async fn torrent_add(State(state): State<QbitState>, headers: HeaderMap, body: B
             (StatusCode::BAD_REQUEST, "Fails.").into_response()
         }
     }
+}
+
+fn parse_qbit_tags(value: &str) -> Result<Vec<String>, &'static str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    if value.len() > MAX_QBIT_TAGS_BYTES {
+        return Err("Invalid tags: total tag data exceeds 1024 bytes.");
+    }
+    let mut tags = Vec::new();
+    let mut transfer_tag_seen = false;
+    for part in value.split(',') {
+        let tag = part.trim();
+        if tag.is_empty() {
+            return Err("Invalid tags: empty entries are not supported.");
+        }
+        if tag.len() > MAX_QBIT_TAG_BYTES {
+            return Err("Invalid tags: each tag must be at most 256 bytes.");
+        }
+        if tag.chars().any(char::is_control) {
+            return Err("Invalid tags: control characters are not supported.");
+        }
+        if tags.iter().any(|existing| existing == tag) {
+            return Err("Invalid tags: duplicate entries are not supported.");
+        }
+        if let Some(token) = tag.strip_prefix(TRANSFER_TAG_PREFIX) {
+            if transfer_tag_seen || !valid_transfer_token(token) {
+                return Err("Invalid tags: transfer tag must contain one valid token.");
+            }
+            transfer_tag_seen = true;
+        }
+        tags.push(tag.to_string());
+        if tags.len() > MAX_QBIT_TAGS {
+            return Err("Invalid tags: at most 32 tags are supported.");
+        }
+    }
+    Ok(tags)
+}
+
+fn valid_transfer_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 128
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn qbit_tags_from_params(params: &[(String, String)]) -> String {
+    params
+        .iter()
+        .rev()
+        .find(|(key, _)| key == nzbd_engine::QBIT_TAGS_PARAM)
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default()
 }
 
 async fn torrent_delete(State(state): State<QbitState>, body: Bytes) -> Response {
@@ -844,6 +925,166 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use nzbd_engine::{Engine, EngineConfig, EngineHandle, Tuning};
+    use nzbd_torrent::{TorrentSession, TorrentSessionConfig};
+    use tower::ServiceExt;
+
+    fn multipart_add_request(bytes: &[u8], tags: &str) -> axum::http::Request<Body> {
+        multipart_add_request_with_tag_bytes(bytes, tags.as_bytes())
+    }
+
+    fn multipart_add_request_with_tag_bytes(
+        bytes: &[u8],
+        tag_bytes: &[u8],
+    ) -> axum::http::Request<Body> {
+        let boundary = "qbit-test-boundary";
+        let mut body =
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"tags\"\r\n\r\n")
+                .into_bytes();
+        body.extend_from_slice(tag_bytes);
+        body.extend_from_slice(
+            format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"torrents\"; filename=\"input.torrent\"\r\nContent-Type: application/x-bittorrent\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v2/torrents/add")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .header(header::AUTHORIZATION, "Bearer qbit-test-token")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    fn info_request() -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .uri("/api/v2/torrents/info?category=all")
+            .header(header::AUTHORIZATION, "Bearer qbit-test-token")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn qbit_test_state(root: &std::path::Path, engine: EngineHandle) -> QbitState {
+        let state_dir = root.join("state");
+        let save_path = root.join("payload");
+        std::fs::create_dir_all(&save_path).unwrap();
+        let session = TorrentSession::start(save_path.clone(), TorrentSessionConfig::default())
+            .await
+            .unwrap();
+        let torrent =
+            TorrentAdmissionService::new(engine.clone(), session, state_dir, false, false);
+        QbitState::new(
+            engine,
+            torrent,
+            QbitAuth {
+                username: String::new(),
+                password: None,
+                token: Some("qbit-test-token".into()),
+            },
+            root.join("qbit-state"),
+            save_path,
+            BTreeMap::new(),
+            false,
+            true,
+            0.0,
+            0,
+            None,
+        )
+    }
+
+    fn engine_config(root: &std::path::Path) -> EngineConfig {
+        EngineConfig::single_node(
+            vec![],
+            root.join("state"),
+            root.join("completed"),
+            Tuning::default(),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn qbit_transfer_tag_survives_duplicate_admission_and_snapshot_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::spawn(engine_config(root.path())).await.unwrap();
+        let state = qbit_test_state(root.path(), engine.clone()).await;
+        let app = router(state);
+        let torrent = include_bytes!("../../../fuzz/seeds/metainfo_preflight/valid-v1.torrent");
+
+        let invalid = app
+            .clone()
+            .oneshot(multipart_add_request(
+                torrent,
+                "monarr-transfer-one,monarr-transfer-two",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let invalid_utf8 = app
+            .clone()
+            .oneshot(multipart_add_request_with_tag_bytes(torrent, b"\xff"))
+            .await
+            .unwrap();
+        assert_eq!(invalid_utf8.status(), StatusCode::BAD_REQUEST);
+        let empty = app.clone().oneshot(info_request()).await.unwrap();
+        let empty: Value =
+            serde_json::from_slice(&empty.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert!(empty.as_array().unwrap().is_empty());
+
+        let first = app
+            .clone()
+            .oneshot(multipart_add_request(
+                torrent,
+                "tv, monarr-transfer-first-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let duplicate = app
+            .clone()
+            .oneshot(multipart_add_request(
+                torrent,
+                "tv,monarr-transfer-second-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::OK);
+
+        let before_restart = app.clone().oneshot(info_request()).await.unwrap();
+        let before_restart: Value = serde_json::from_slice(
+            &before_restart
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(before_restart[0]["tags"], "tv,monarr-transfer-first-token");
+
+        engine.shutdown().await;
+        drop(app);
+
+        let restarted = Engine::spawn(engine_config(root.path())).await.unwrap();
+        let state = qbit_test_state(root.path(), restarted.clone()).await;
+        let after_restart = router(state).oneshot(info_request()).await.unwrap();
+        let after_restart: Value = serde_json::from_slice(
+            &after_restart
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(after_restart[0]["tags"], "tv,monarr-transfer-first-token");
+        restarted.shutdown().await;
+    }
 
     #[test]
     fn phase_projection_matches_arr_contract() {
@@ -868,6 +1109,22 @@ mod tests {
         let fields = multipart_fields(&body, boundary);
         assert_eq!(fields.get("category").unwrap(), b"tv");
         assert_eq!(fields.get("torrents").unwrap(), binary);
+    }
+
+    #[test]
+    fn qbit_transfer_tags_are_trimmed_bounded_and_projected_back() {
+        let tags = parse_qbit_tags(" movies , monarr-transfer-a_1-B2 ").unwrap();
+        assert_eq!(tags, ["movies", "monarr-transfer-a_1-B2"]);
+        assert_eq!(
+            qbit_tags_from_params(&[(nzbd_engine::QBIT_TAGS_PARAM.to_string(), tags.join(","),)]),
+            "movies,monarr-transfer-a_1-B2"
+        );
+        assert!(parse_qbit_tags("").unwrap().is_empty());
+        assert!(parse_qbit_tags(" , ").is_err());
+        assert!(parse_qbit_tags("monarr-transfer-one,monarr-transfer-two").is_err());
+        assert!(parse_qbit_tags(&format!("monarr-transfer-{}", "t".repeat(129))).is_err());
+        assert!(parse_qbit_tags(&"x".repeat(MAX_QBIT_TAGS_BYTES + 1)).is_err());
+        assert!(parse_qbit_tags("ok\ninvalid").is_err());
     }
 
     #[test]

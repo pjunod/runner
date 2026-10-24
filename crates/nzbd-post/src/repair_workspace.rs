@@ -28,8 +28,8 @@ pub(crate) struct RepairSession {
     recovered: Vec<PathBuf>,
     pub matching_bytes: u64,
 }
-fn state_error(error: impl std::fmt::Display) -> PostError {
-    PostError::Subprocess(error.to_string())
+fn state_error(error: nzbd_state::artifacts::Error) -> PostError {
+    PostError::Artifact(error)
 }
 impl RepairSession {
     pub fn new(
@@ -454,8 +454,17 @@ impl RepairSession {
             })
             .map_err(state_error)?;
         }
+        let verified_output_paths = self
+            .set
+            .files
+            .iter()
+            .map(|file| {
+                crate::namespace::relative(&file.name)
+                    .map(|path| path.to_string_lossy().into_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         self.inventory
-            .finish_workspace(&self.workspace)
+            .finish_repair_workspace(&self.workspace, &verified_output_paths)
             .map_err(state_error)?;
         Ok(self.recovered.clone())
     }
@@ -489,13 +498,30 @@ pub async fn repair(
     })
     .await
     .map_err(|e| PostError::Subprocess(e.to_string()))??;
-    let verified = tool.verify_full(&session.main()).await?;
+    let verified = match tool.verify_full(&session.main()).await {
+        Ok(verified) => verified,
+        Err(error) => {
+            session.abandon()?;
+            return Err(error);
+        }
+    };
     match verified {
         VerifyResult::Intact => {}
-        VerifyResult::Repairable { .. }
-            if tool.repair(&session.main()).await? == RepairResult::Repaired => {}
-        VerifyResult::Repairable { .. } => return Ok(VerifyResult::Unrepairable),
-        other => return Ok(other),
+        VerifyResult::Repairable { .. } => match tool.repair(&session.main()).await {
+            Ok(RepairResult::Repaired) => {}
+            Ok(RepairResult::Failed) => {
+                session.abandon()?;
+                return Ok(VerifyResult::Unrepairable);
+            }
+            Err(error) => {
+                session.abandon()?;
+                return Err(error);
+            }
+        },
+        other => {
+            session.abandon()?;
+            return Ok(other);
+        }
     }
     let recovered = tokio::task::spawn_blocking(move || session.validate_publish())
         .await

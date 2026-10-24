@@ -2196,6 +2196,7 @@ mod tests {
             name: "Some.Movie.2024.1080p-GRP".into(),
             dir_name: "monarr · drunkenslug · cc310b99".into(),
             name_provisional: false,
+            delivery_lifecycle: false,
             queued_at_unix: 1_799_999_000,
             original_name: "cc310b9901757996b0bdfd880c666e3812e6531d".into(),
             category: Some("monarr".into()),

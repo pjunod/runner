@@ -1,0 +1,100 @@
+{
+  "delivery": {
+    "protocolVersion": 1,
+    "sequence": 23,
+    "status": "ready",
+    "deliveryId": "artifact-α:generation-23",
+    "publicationGeneration": "generation-23",
+    "artifactId": "artifact-α",
+    "sourceArtifactId": "source-β",
+    "sourceGeneration": "source-generation-7",
+    "jobId": 123,
+    "runnerInstanceId": "runner-installation-1",
+    "requestToken": "transfer-123",
+    "keepSourceOnFailure": true,
+    "terminalOutcome": "FAILURE/HEALTH",
+    "failureStage": "health",
+    "failureCause": "health threshold failed after one episode completed",
+    "publicationPath": "/downloads/completed/Épisode <one>/Release",
+    "manifestDigest": "e05a0387d825c3a593d74541ffc7656559f21597686699862a3ee8b0d2d4b714",
+    "files": [
+      {
+        "path": "Épisode <one>/S01E01.mkv",
+        "sizeBytes": 1,
+        "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+      }
+    ],
+    "fileOutcomes": [
+      {
+        "sourcePath": "release.rar",
+        "publicationPath": null,
+        "classification": "archive_input",
+        "outcome": "consumed",
+        "reason": "validated extraction output selected",
+        "repairDependency": false,
+        "sourceCleanupStatus": "removed"
+      },
+      {
+        "sourcePath": "nested/unknown.bin",
+        "publicationPath": null,
+        "classification": "unknown",
+        "outcome": "retained_processing",
+        "reason": "unsupported format needs review",
+        "repairDependency": false,
+        "sourceCleanupStatus": "retained"
+      }
+    ],
+    "readyAt": 1792670400,
+    "acceptedAt": null,
+    "consumerReceiptId": null,
+    "sourceCleanup": {
+      "status": "blocked",
+      "error": "unsupported file remains in Runner source",
+      "attempts": 2,
+      "nextRetryAt": 1792670520,
+      "blockedSince": 1792670400,
+      "warning": null,
+      "startedAt": 1792670300,
+      "lastAttemptAt": 1792670400,
+      "completedAt": null,
+      "attemptHistory": [
+        {
+          "attempt": 1,
+          "startedAtMs": 1792670300000,
+          "endedAtMs": 1792670302400,
+          "workMs": 2400,
+          "waitMs": 0,
+          "outcome": "retry",
+          "error": "source volume temporarily unavailable"
+        },
+        {
+          "attempt": 2,
+          "startedAtMs": 1792670400000,
+          "endedAtMs": 1792670400500,
+          "workMs": 500,
+          "waitMs": 97600,
+          "outcome": "blocked",
+          "error": "unsupported file remains in Runner source"
+        }
+      ]
+    }
+  },
+  "requestAdmission": {
+    "protocolVersion": 1,
+    "requestToken": "transfer-123",
+    "submissionSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "jobId": 123,
+    "generation": "url-123-generation",
+    "runnerInstanceId": "runner-installation-1",
+    "terminalOutcome": "FAILURE/HEALTH",
+    "outcome": "failed",
+    "failureStage": "health",
+    "failureCause": "health threshold failed after one episode completed",
+    "custodyState": "curator",
+    "keepSourceOnFailure": true,
+    "sourceCleanupStatus": "blocked",
+    "publicationPath": "/downloads/completed/Épisode <one>/Release",
+    "sourceArtifactId": "source-β",
+    "sourceGeneration": "source-generation-7"
+  }
+}

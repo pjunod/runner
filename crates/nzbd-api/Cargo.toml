@@ -33,3 +33,4 @@ http-body-util = "0.1"
 nzbd-nserv = { workspace = true }
 nzbd-nzb = { workspace = true }
 sha1 = "0.10"
+serde_urlencoded = "0.7"

@@ -350,7 +350,7 @@ async fn report_completions(
             let _ = engine.remove_job_silent(job_id).await;
             continue;
         }
-        let sealed = match seal_generation(cfg, dest_dir, &job, &lease).await {
+        let sealed = match seal_generation(cfg, dest_dir, &job, &lease, engine.artifacts()).await {
             Ok(sealed) => sealed,
             Err(error) => {
                 tracing::warn!(job = job_id.0, %error, "completion generation could not be sealed");
@@ -906,6 +906,12 @@ async fn prepare_pp_attempt(
     let source_for_copy = source.clone();
     let target_for_copy = target.clone();
     let job_id = job.id.0;
+    let lifecycle_eligible = job.lifecycle_eligible();
+    let delivery_lifecycle = job.delivery_lifecycle;
+    let keep_on_failure = job
+        .params
+        .iter()
+        .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
     tokio::task::spawn_blocking(move || {
         let parent = target_for_copy
             .parent()
@@ -913,7 +919,12 @@ async fn prepare_pp_attempt(
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("create private PP parent: {error}"))?;
         let artifact = inventory
-            .allocate_processing_successor(job_id, parent, &target_for_copy)
+            .allocate_processing_successor_with_policy(
+                job_id,
+                parent,
+                &target_for_copy,
+                Some((lifecycle_eligible, delivery_lifecycle, keep_on_failure)),
+            )
             .map_err(|error| format!("allocate owned private PP input: {error}"))?;
         // The actual copy worker retains custody even if its async caller drops.
         let _use_guard = inventory
@@ -984,7 +995,7 @@ struct GenerationManifest {
     sealed_at_unix_ms: i64,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct GenerationFile {
     path: String,
     bytes: u64,
@@ -996,11 +1007,77 @@ struct SealedGeneration {
     path: PathBuf,
 }
 
+/// Owns the private staging tree until its atomic rename into the immutable
+/// generation slot succeeds. Any copy, hashing, or sync error must release
+/// this duplicate rather than leaving another full payload behind.
+struct BuildingGeneration(PathBuf);
+
+impl Drop for BuildingGeneration {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[derive(Debug)]
+enum SealSource {
+    Selected(nzbd_state::artifacts::SelectedPublication),
+    Legacy(PathBuf),
+}
+
+fn resolve_post_seal_source(
+    inventory: &nzbd_state::artifacts::Inventory,
+    dest_dir: &std::path::Path,
+    job: &nzbd_types::Job,
+) -> Result<Option<SealSource>, String> {
+    let expected_source = dest_dir.join(nzbd_engine::queue::job_dir_name(job));
+    if let Some(publication) = inventory
+        .selected_publication_for_source(job.id.0, &expected_source)
+        .map_err(|error| format!("read selected PP publication journal: {error}"))?
+    {
+        if !publication.path.is_dir() {
+            return Err(format!(
+                "journaled selected PP publication is missing: {}",
+                publication.path.display()
+            ));
+        }
+        return Ok(Some(SealSource::Selected(publication)));
+    }
+
+    // Pre-lifecycle jobs retain their existing whole-directory move contract.
+    // This compatibility path grants no new cleanup or delivery authority.
+    if !job.lifecycle_eligible() {
+        if let Some(artifact) = inventory
+            .for_job(job.id.0)
+            .map_err(|error| format!("read legacy PP artifact: {error}"))?
+        {
+            if artifact.state == "completed" && artifact.path.is_dir() {
+                return Ok(Some(SealSource::Legacy(artifact.path)));
+            }
+        }
+        if expected_source.is_dir() {
+            return Ok(Some(SealSource::Legacy(expected_source)));
+        }
+        if matches!(job.status, JobStatus::Failed | JobStatus::Deleted) {
+            return Ok(None);
+        }
+        return Err(format!(
+            "legacy PP output directory {} is missing",
+            expected_source.display()
+        ));
+    }
+
+    if matches!(job.status, JobStatus::Failed | JobStatus::Deleted) {
+        return Ok(None);
+    }
+    Err("completed PP lease has no selected publication for its private attempt".into())
+}
+
 async fn seal_generation(
     cfg: &ClusterConfig,
     dest_dir: &std::path::Path,
     job: &nzbd_types::Job,
     lease: &LeaseState,
+    inventory: std::sync::Arc<nzbd_state::artifacts::Inventory>,
 ) -> Result<SealedGeneration, String> {
     let cfg = cfg.clone();
     let dest_dir = dest_dir.to_path_buf();
@@ -1041,11 +1118,18 @@ async fn seal_generation(
         ));
         std::fs::create_dir(&building)
             .map_err(|error| format!("create private generation: {error}"))?;
+        let _building_cleanup = BuildingGeneration(building.clone());
         let files_root = building.join("files");
         std::fs::create_dir(&files_root)
             .map_err(|error| format!("create private generation files: {error}"))?;
 
-        let source = dest_dir.join(nzbd_engine::queue::job_dir_name(&job));
+        let source = if lease.kind == LeaseKind::Post {
+            resolve_post_seal_source(&inventory, &dest_dir, &job)?
+        } else {
+            Some(SealSource::Legacy(
+                dest_dir.join(nzbd_engine::queue::job_dir_name(&job)),
+            ))
+        };
         let copy_limit = job
             .totals
             .size
@@ -1053,20 +1137,49 @@ async fn seal_generation(
             .saturating_add(64 * 1024 * 1024);
         let mut files = Vec::new();
         let mut total = 0u64;
-        if source.exists() {
+        if let Some(SealSource::Selected(publication)) = source.as_ref() {
             copy_generation_tree(
-                &source,
+                &publication.path,
                 &files_root,
                 std::path::Path::new(""),
                 copy_limit,
                 &mut total,
                 &mut files,
             )?;
-        } else if !matches!(job.status, JobStatus::Failed | JobStatus::Deleted) {
-            return Err(format!(
-                "completed output directory {} is missing",
-                source.display()
-            ));
+            let expected: Vec<_> = publication
+                .files
+                .iter()
+                .map(|file| GenerationFile {
+                    path: file.path.clone(),
+                    bytes: file.size_bytes,
+                    sha256: file.sha256.clone(),
+                })
+                .collect();
+            files.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+            if files != expected {
+                return Err(
+                    "selected PP publication changed after its durable journal committed".into(),
+                );
+            }
+        } else if let Some(SealSource::Legacy(source)) = source.as_ref() {
+            if !source.is_dir() {
+                return Err(format!(
+                    "completed output directory {} is missing",
+                    source.display()
+                ));
+            }
+            copy_generation_tree(
+                source,
+                &files_root,
+                std::path::Path::new(""),
+                copy_limit,
+                &mut total,
+                &mut files,
+            )?;
+        } else if lease.kind != LeaseKind::Post
+            && !matches!(job.status, JobStatus::Failed | JobStatus::Deleted)
+        {
+            unreachable!("non-post seal source is always a legacy directory");
         }
         files.sort_by(|left, right| left.path.cmp(&right.path));
         let job_bytes = serde_json::to_vec_pretty(&job)
@@ -1350,6 +1463,7 @@ mod tests {
             name: "transition".into(),
             dir_name: "transition".into(),
             name_provisional: false,
+            delivery_lifecycle: false,
             queued_at_unix: 0,
             original_name: String::new(),
             category: None,
@@ -1362,6 +1476,97 @@ mod tests {
             torrent: None,
             stages: Vec::new(),
         }
+    }
+
+    #[test]
+    fn failed_generation_build_releases_private_staging_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let building = tmp.path().join(".building-failed-copy");
+        std::fs::create_dir(&building).unwrap();
+        std::fs::write(building.join("partial.mkv"), vec![0x5a; 4096]).unwrap();
+        {
+            let _cleanup = BuildingGeneration(building.clone());
+            assert!(building.join("partial.mkv").exists());
+            // Returning through any error path drops the same guard.
+        }
+        assert!(!building.exists());
+    }
+
+    #[test]
+    fn post_sealer_uses_current_selected_generation_and_rejects_missing_target() {
+        use nzbd_state::artifacts::DeliveryFileOutcome;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("downloads");
+        std::fs::create_dir(&root).unwrap();
+        let inventory = nzbd_state::artifacts::Inventory::open(&tmp.path().join("state")).unwrap();
+        let source = root.join("private-attempt");
+        inventory
+            .allocate_for_delivery(77, &root, &source, true, true)
+            .unwrap();
+        std::fs::write(source.join("episode.mkv"), b"verified payload").unwrap();
+        inventory.finish(77, &source, &root, "active").unwrap();
+        let selected = inventory
+            .for_job(77)
+            .unwrap()
+            .unwrap()
+            .files
+            .into_iter()
+            .filter(|entry| !entry.identity.directory)
+            .collect();
+        let completed = root.join("completed");
+        std::fs::create_dir(&completed).unwrap();
+        let target = completed.join("episode.runner-generation");
+        let result = inventory
+            .publish_selected_for_delivery_checked(
+                77,
+                &target,
+                selected,
+                vec![DeliveryFileOutcome {
+                    source_path: "episode.mkv".into(),
+                    publication_path: Some("episode.mkv".into()),
+                    classification: "media".into(),
+                    outcome: "published".into(),
+                    reason: Some("verified complete media".into()),
+                    repair_dependency: false,
+                    source_cleanup_status: "pending".into(),
+                }],
+                &|| Ok(()),
+            )
+            .unwrap();
+        inventory
+            .finish(77, &result.published_path, &completed, "completed")
+            .unwrap();
+
+        let mut job = queued_test_job();
+        job.delivery_lifecycle = true;
+        job.dir_name = "private-attempt".into();
+        let resolved = resolve_post_seal_source(&inventory, &root, &job).unwrap();
+        let Some(SealSource::Selected(snapshot)) = resolved else {
+            panic!("expected exact selected publication snapshot");
+        };
+        assert_eq!(snapshot.path, result.published_path);
+        assert_eq!(snapshot.generation, result.generation);
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.files[0].path, "episode.mkv");
+
+        std::fs::remove_dir_all(&result.published_path).unwrap();
+        let error = resolve_post_seal_source(&inventory, &root, &job).unwrap_err();
+        assert!(error.contains("journaled selected PP publication is missing"));
+    }
+
+    #[test]
+    fn post_sealer_keeps_legacy_whole_directory_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("downloads");
+        std::fs::create_dir(&root).unwrap();
+        let inventory = nzbd_state::artifacts::Inventory::open(&tmp.path().join("state")).unwrap();
+        let legacy = root.join("legacy-release");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("payload.mkv"), b"legacy bytes").unwrap();
+        let mut job = queued_test_job();
+        job.dir_name = "legacy-release".into();
+        let resolved = resolve_post_seal_source(&inventory, &root, &job).unwrap();
+        assert!(matches!(resolved, Some(SealSource::Legacy(path)) if path == legacy));
     }
 
     #[tokio::test]

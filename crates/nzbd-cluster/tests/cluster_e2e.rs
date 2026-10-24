@@ -6,9 +6,11 @@ use nzbd_cluster::{ClusterConfig, ClusterRuntime, ControlPeer};
 use nzbd_engine::Tuning;
 use nzbd_nserv::{build_post, prng_bytes, NservBuilder};
 use nzbd_types::{CertLevel, ServerDef, ServerId, TlsMode};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -78,17 +80,31 @@ struct Node {
 #[derive(Clone)]
 struct TestControl {
     id: u64,
+    http_bind: String,
     raft_bind: String,
     api_bind: String,
     peers: Vec<ControlPeer>,
+    reservations: Arc<Mutex<HashMap<String, std::net::TcpListener>>>,
 }
 
 fn control_topology(count: u64) -> Vec<TestControl> {
-    let addresses: Vec<_> = (0..count).map(|_| (free_bind(), free_bind())).collect();
+    let mut reservations = HashMap::new();
+    let addresses: Vec<_> = (0..count)
+        .map(|_| {
+            // Reserve the public API listeners for every node up front too.
+            // Otherwise a later node's :0 bind can steal an earlier node's
+            // Raft port while that node is awaiting database startup.
+            let http = reserve_bind(&mut reservations);
+            let raft = reserve_bind(&mut reservations);
+            let api = reserve_bind(&mut reservations);
+            (http, raft, api)
+        })
+        .collect();
+    let reservations = Arc::new(Mutex::new(reservations));
     let peers: Vec<_> = addresses
         .iter()
         .enumerate()
-        .map(|(index, (raft_addr, api_addr))| ControlPeer {
+        .map(|(index, (_, raft_addr, api_addr))| ControlPeer {
             id: index as u64 + 1,
             raft_addr: raft_addr.clone(),
             api_addr: api_addr.clone(),
@@ -97,11 +113,13 @@ fn control_topology(count: u64) -> Vec<TestControl> {
     addresses
         .into_iter()
         .enumerate()
-        .map(|(index, (raft_bind, api_bind))| TestControl {
+        .map(|(index, (http_bind, raft_bind, api_bind))| TestControl {
             id: index as u64 + 1,
+            http_bind,
             raft_bind,
             api_bind,
             peers: peers.clone(),
+            reservations: reservations.clone(),
         })
         .collect()
 }
@@ -145,11 +163,30 @@ async fn start_node_with_control(
     auth: nzbd_api::AuthConfig,
     control: Option<TestControl>,
 ) -> Node {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let url = format!("127.0.0.1:{port}");
-
     let control = control.unwrap_or_else(|| control_topology(1).remove(0));
+    let listener = control
+        .reservations
+        .lock()
+        .unwrap()
+        .remove(&control.http_bind)
+        .unwrap_or_else(|| {
+            // A stopped node may be restarted with the same TestControl. Its
+            // original listener has been released, so reacquire that exact
+            // address rather than choosing :0 and reintroducing port races.
+            std::net::TcpListener::bind(&control.http_bind)
+                .expect("stopped node's public API address is available for restart")
+        });
+    listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    let url = listener.local_addr().unwrap().to_string();
+    // Keep every planned Raft/API port bound until its owning node is ready
+    // to bind. Otherwise the HTTP listener above may receive a just-released
+    // control port, or another node may claim it before Raft starts.
+    {
+        let mut reservations = control.reservations.lock().unwrap();
+        reservations.remove(&control.raft_bind);
+        reservations.remove(&control.api_bind);
+    }
     let cfg = ClusterConfig {
         cluster_id: "e2e".into(),
         node_name: name.to_string(),
@@ -236,9 +273,11 @@ async fn start_node_with_control(
     }
 }
 
-fn free_bind() -> String {
+fn reserve_bind(reservations: &mut HashMap<String, std::net::TcpListener>) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().to_string()
+    let address = listener.local_addr().unwrap().to_string();
+    reservations.insert(address.clone(), listener);
+    address
 }
 
 impl Node {
@@ -249,6 +288,7 @@ impl Node {
         self.serve_cancel.cancel();
         self.runtime.shutdown().await;
         self.serve_task.abort();
+        let _ = self.serve_task.await;
     }
 }
 
@@ -561,6 +601,24 @@ async fn three_voters_keep_majority_and_reject_mutations_after_quorum_loss() {
             && names.windows(2).all(|w| w[0] == w[1])
             && views[0]["nodes"].as_array().is_some_and(|n| n.len() == 3)
     })
+    .await;
+
+    // The shared worker registry and app-level leader record can converge
+    // before every fixed control-plane voter has joined Raft. Before testing
+    // loss of one voter, require a successful linearizable quorum round trip
+    // from each node; `quorum_commit_healthy` is sampled from the real control
+    // client, not inferred from the app registry.
+    wait_for(
+        "all three control voters have committed through quorum",
+        20,
+        || {
+            [&a, &b, &c].iter().all(|node| {
+                let control = get_json(&node.url, "/api/v1/cluster")["control"].clone();
+                control["mode"] == "hiqlite-fixed-voters"
+                    && control["quorum_commit_healthy"].as_bool() == Some(true)
+            })
+        },
+    )
     .await;
 
     let leader_name = get_json(&a.url, "/api/v1/cluster")["leader"]["node"]
@@ -1284,7 +1342,7 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
 
     let src = tempfile::tempdir().unwrap();
     let payload = prng_bytes(77, 90_000);
-    std::fs::write(src.path().join("payload.bin"), &payload).unwrap();
+    std::fs::write(src.path().join("payload.mkv"), &payload).unwrap();
     let ok = std::process::Command::new("par2")
         .args([
             "create",
@@ -1293,14 +1351,14 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
             "-s8192",
             "-c4",
             "set.par2",
-            "payload.bin",
+            "payload.mkv",
         ])
         .current_dir(src.path())
         .status()
         .expect("par2 binary required (apt-get install par2)")
         .success();
     assert!(ok, "par2 create failed");
-    let mut files: Vec<(String, Vec<u8>)> = vec![("payload.bin".into(), payload.clone())];
+    let mut files: Vec<(String, Vec<u8>)> = vec![("payload.mkv".into(), payload.clone())];
     let mut pars: Vec<_> = std::fs::read_dir(src.path())
         .unwrap()
         .flatten()
@@ -1402,7 +1460,7 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
     .await;
 
     // Payload survived PP bit-identically (no repair was needed).
-    let got = std::fs::read(tmp.path().join("complete/pardl/payload.bin")).unwrap();
+    let got = std::fs::read(tmp.path().join("complete/pardl/payload.mkv")).unwrap();
     assert_eq!(got, payload);
 
     // No staging residue in the job dir.

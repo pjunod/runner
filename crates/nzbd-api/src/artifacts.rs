@@ -14,6 +14,13 @@ use std::{path::PathBuf, sync::Arc};
 
 pub fn router() -> Router<ApiState> {
     Router::new()
+        .route("/api/v1/deliveries", get(deliveries))
+        .route("/api/v1/deliveries/{id}", get(delivery))
+        .route("/api/v1/deliveries/{id}/accept", post(accept_delivery))
+        .route(
+            "/api/v1/deliveries/{id}/source-cleanup/retry",
+            post(retry_delivery_cleanup),
+        )
         .route("/api/v1/artifacts", get(list))
         .route(
             "/api/v1/artifacts/settings",
@@ -57,6 +64,89 @@ pub fn router() -> Router<ApiState> {
             post(prune_source),
         )
         .route("/api/v1/recoveries/{id}/cancel-ack", post(cancel_ack))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryPage {
+    #[serde(default)]
+    after: i64,
+    limit: Option<u32>,
+    #[serde(default)]
+    include_accepted: bool,
+}
+
+#[cfg(test)]
+mod delivery_query_tests {
+    use super::DeliveryPage;
+
+    #[test]
+    fn delivery_query_uses_the_documented_camel_case_flag() {
+        let page: DeliveryPage =
+            serde_urlencoded::from_str("after=41&limit=100&includeAccepted=true").unwrap();
+        assert_eq!(page.after, 41);
+        assert_eq!(page.limit, Some(100));
+        assert!(page.include_accepted);
+    }
+}
+
+async fn deliveries(State(st): State<ApiState>, Query(page): Query<DeliveryPage>) -> Response {
+    let db = st.engine.artifacts();
+    let limit = page.limit.unwrap_or(50);
+    let include_accepted = page.include_accepted;
+    work(move || {
+        let (deliveries, next_cursor) =
+            db.deliveries_page(page.after, limit, include_accepted)?;
+        Ok(json!({
+            "protocolVersion": 1,
+            "deliveries": deliveries,
+            "nextCursor": next_cursor,
+            "cursorRule": "Rescan with after=0 each sweep, or durably persist every returned delivery before advancing the cursor."
+        }))
+    })
+    .await
+}
+
+async fn delivery(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
+    let db = st.engine.artifacts();
+    work(move || db.delivery(&id)).await
+}
+
+async fn retry_delivery_cleanup(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
+    let db = st.engine.artifacts();
+    work(move || db.retry_delivery_source_cleanup(&id)).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryAcceptance {
+    protocol_version: u8,
+    publication_generation: String,
+    manifest_digest: String,
+    consumer_receipt_id: String,
+}
+
+async fn accept_delivery(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<DeliveryAcceptance>,
+) -> Response {
+    let db = st.engine.artifacts();
+    if body.protocol_version != 1 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "unsupported delivery protocol version",
+        );
+    }
+    work(move || {
+        db.accept_delivery(
+            &id,
+            &body.publication_generation,
+            &body.manifest_digest,
+            &body.consumer_receipt_id,
+        )
+    })
+    .await
 }
 fn failure(e: Error) -> Response {
     let status = match e {
@@ -600,8 +690,11 @@ async fn prune_source(State(st): State<ApiState>, Path(id): Path<String>) -> Res
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
     use http_body_util::BodyExt;
     use nzbd_engine::{Engine, EngineConfig, Tuning};
+    use nzbd_state::artifacts::{Receipt, ReceiptFile, Settings};
+    use std::sync::Arc;
     use tower::util::ServiceExt;
 
     async fn get(engine: &nzbd_engine::EngineHandle, uri: &str) -> (u16, serde_json::Value) {
@@ -617,6 +710,11 @@ mod tests {
         let status = response.status().as_u16();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap()
     }
 
     #[test]
@@ -737,6 +835,617 @@ mod tests {
             none["counts"]["live"], 1,
             "counts describe the inventory, not the search"
         );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn recovery_http_routes_enforce_consumer_scope_and_persist_receipts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let working = tmp.path().join("working");
+        let downloads = tmp.path().join("downloads");
+        let source_root = tmp.path().join("source");
+        let recovery_root = tmp.path().join("recovery");
+        for root in [&working, &downloads, &source_root, &recovery_root] {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        let state_dir = tmp.path().join("state");
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            state_dir.clone(),
+            downloads.clone(),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let artifacts = engine.artifacts();
+        let publication = source_root.join("release-generation");
+        artifacts
+            .allocate_for_delivery(801, &source_root, &publication, true, true)
+            .unwrap();
+        std::fs::create_dir_all(&publication).unwrap();
+        std::fs::write(publication.join("episode.mkv"), b"recovery payload").unwrap();
+        let artifact = artifacts
+            .finish(801, &publication, &source_root, "completed")
+            .unwrap();
+        artifacts
+            .set_settings(&Settings {
+                enabled: true,
+                failed_retention_days: 30,
+                recovery_root: recovery_root.clone(),
+                consumer_token: "recovery-secret".into(),
+            })
+            .unwrap();
+
+        let mut cfg = nzbd_config::Config::default();
+        cfg.paths.main_dir = working;
+        cfg.paths.dest_dir = downloads;
+        cfg.paths.queue_dir = Some(state_dir);
+        let setup = Arc::new(crate::SetupHandle::for_running(
+            None,
+            "127.0.0.1:0".into(),
+            cfg,
+        ));
+        let app = crate::router_with(crate::ApiState {
+            engine: engine.clone(),
+            torrent: None,
+            history: None,
+            log: None,
+            setup: Some(setup),
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+
+        let preview = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/artifacts/{}/recoveries", artifact.id))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "preview": true,
+                            "revision": artifact.revision,
+                            "idempotency_key": "preview-recovery",
+                            "files": ["episode.mkv"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+        let preview = response_json(preview).await;
+        assert_eq!(preview["selected_files"], 1);
+        assert_eq!(
+            artifacts.recoveries(0).unwrap().len(),
+            0,
+            "preview is read-only"
+        );
+
+        let stage_uri = format!("/api/v1/artifacts/{}/recoveries", artifact.id);
+        let stage_body = serde_json::json!({
+            "preview": false,
+            "revision": artifact.revision,
+            "idempotency_key": "stage-recovery-task",
+            "files": ["episode.mkv"]
+        });
+        let queued = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&stage_uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(stage_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.status(), StatusCode::ACCEPTED);
+        let queued = response_json(queued).await;
+        assert_eq!(queued["kind"], "stage");
+        let replay = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&stage_uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(stage_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        assert_eq!(response_json(replay).await["id"], queued["id"]);
+
+        // Seed a durable published recovery via the same inventory API used by
+        // the background stage task, then exercise the public claim/receipt
+        // handlers against its exact persisted identity.
+        let staged = artifacts
+            .stage_recovery(
+                &artifact.id,
+                artifact.revision,
+                "api-recovery-request",
+                &["episode.mkv".into()],
+                &recovery_root,
+            )
+            .unwrap();
+        assert_eq!(staged.state, "published");
+        let detail = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!("/api/v1/recoveries/{}", staged.id))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(detail).await["manifest_digest"],
+            staged.manifest_digest
+        );
+
+        let claim_uri = format!("/api/v1/recoveries/{}/claim", staged.id);
+        let claim_body = serde_json::json!({
+            "import_id": "curator-import-801",
+            "manifest_digest": staged.manifest_digest,
+        });
+        for token in [None, Some("wrong-token")] {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri(&claim_uri)
+                .header("content-type", "application/json");
+            if let Some(token) = token {
+                request = request.header("x-recovery-token", token);
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    request
+                        .body(axum::body::Body::from(claim_body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(artifacts.recovery(&staged.id).unwrap().state, "published");
+
+        let claimed = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&claim_uri)
+                    .header("content-type", "application/json")
+                    .header("x-recovery-token", "recovery-secret")
+                    .body(axum::body::Body::from(claim_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed.status(), StatusCode::OK);
+        assert_eq!(response_json(claimed).await["state"], "claimed");
+
+        let wrong_receipt = serde_json::json!({
+            "import_id": "other-import",
+            "manifest_digest": staged.manifest_digest,
+            "files": []
+        });
+        let wrong = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/recoveries/{}/receipt", staged.id))
+                    .header("content-type", "application/json")
+                    .header("x-recovery-token", "recovery-secret")
+                    .body(axum::body::Body::from(wrong_receipt.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::CONFLICT);
+        assert_eq!(artifacts.recovery(&staged.id).unwrap().state, "claimed");
+
+        let receipt = Receipt {
+            import_id: "curator-import-801".into(),
+            manifest_digest: staged.manifest_digest.clone(),
+            files: staged
+                .files
+                .iter()
+                .map(|file| ReceiptFile {
+                    id: file.id.clone(),
+                    bytes: file.bytes,
+                    sha256: file.sha256.clone(),
+                    result: "imported".into(),
+                })
+                .collect(),
+        };
+        let accepted = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/recoveries/{}/receipt", staged.id))
+                    .header("content-type", "application/json")
+                    .header("x-recovery-token", "recovery-secret")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&receipt).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(response_json(accepted).await["state"], "imported");
+
+        let cancel = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post(format!("/api/v1/recoveries/{}/cancel", staged.id))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancel.status(), StatusCode::CONFLICT);
+        let cancel_ack = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post(format!("/api/v1/recoveries/{}/cancel-ack", staged.id))
+                    .header("x-recovery-token", "recovery-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancel_ack.status(), StatusCode::CONFLICT);
+
+        let visible = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/recoveries?include_terminal=true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(visible.status(), StatusCode::OK);
+        assert_eq!(response_json(visible).await[0]["state"], "imported");
+        let hidden = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/recoveries")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json(hidden).await.as_array().unwrap().len(), 0);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn artifact_http_routes_report_inventory_and_refuse_configured_directory_roles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let working = tmp.path().join("working");
+        let protected = tmp.path().join("protected");
+        let downloads = protected.join("downloads");
+        for root in [&working, &downloads] {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            tmp.path().join("state"),
+            downloads.clone(),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let nested_payload = downloads.join("release").join("episode.mkv");
+        std::fs::create_dir_all(nested_payload.parent().unwrap()).unwrap();
+        std::fs::write(&nested_payload, b"protected payload").unwrap();
+        let artifact = engine
+            .artifacts()
+            .discover(tmp.path(), &protected, false)
+            .unwrap();
+        engine.artifacts().inspect(&artifact.id).unwrap();
+
+        let mut cfg = nzbd_config::Config::default();
+        cfg.paths.main_dir = working;
+        cfg.paths.dest_dir = downloads;
+        cfg.paths.queue_dir = Some(tmp.path().join("state"));
+        let setup = Arc::new(crate::SetupHandle::for_running(
+            None,
+            "127.0.0.1:0".into(),
+            cfg,
+        ));
+        let app = crate::router_with(crate::ApiState {
+            engine: engine.clone(),
+            torrent: None,
+            history: None,
+            log: None,
+            setup: Some(setup),
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+
+        let detail = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!("/api/v1/artifacts/{}", artifact.id))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        assert_eq!(response_json(detail).await["id"], artifact.id);
+
+        let files = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!(
+                    "/api/v1/artifacts/{}/files?offset=0",
+                    artifact.id
+                ))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(files.status(), StatusCode::OK);
+        let files = response_json(files).await;
+        assert_eq!(
+            files["total"], 3,
+            "manifest includes nested directories and file"
+        );
+        assert_eq!(files["file_count"], 1);
+        assert_eq!(files["bytes"], b"protected payload".len());
+
+        let events = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!(
+                    "/api/v1/artifacts/{}/events?after=0",
+                    artifact.id
+                ))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.status(), StatusCode::OK);
+        assert!(response_json(events).await.as_array().is_some());
+
+        let delete = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/artifacts/{}/delete", artifact.id))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "revision": artifact.revision,
+                            "idempotency_key": "must-not-delete-configured-root",
+                            "undo_seconds": 0
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), StatusCode::CONFLICT);
+        assert!(response_json(delete).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("configured directory role"));
+        assert_eq!(
+            std::fs::read(&nested_payload).unwrap(),
+            b"protected payload"
+        );
+
+        let missing = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/artifacts/not-an-artifact")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn artifact_settings_http_masks_credentials_and_preserves_on_empty_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let working = tmp.path().join("working");
+        let downloads = tmp.path().join("downloads");
+        std::fs::create_dir_all(&working).unwrap();
+        std::fs::create_dir_all(&downloads).unwrap();
+        let state_dir = tmp.path().join("state");
+        let recovery_root = tmp.path().join("recovery");
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            state_dir.clone(),
+            downloads.clone(),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        engine
+            .artifacts()
+            .set_settings(&Settings {
+                enabled: true,
+                failed_retention_days: 20,
+                recovery_root: recovery_root.clone(),
+                consumer_token: "do-not-erase".into(),
+            })
+            .unwrap();
+        let mut cfg = nzbd_config::Config::default();
+        cfg.paths.main_dir = working;
+        cfg.paths.dest_dir = downloads;
+        cfg.paths.queue_dir = Some(state_dir);
+        let setup = Arc::new(crate::SetupHandle::for_running(
+            None,
+            "127.0.0.1:0".into(),
+            cfg,
+        ));
+        let app = crate::router_with(crate::ApiState {
+            engine: engine.clone(),
+            torrent: None,
+            history: None,
+            log: None,
+            setup: Some(setup),
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+
+        let get_settings = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/artifacts/settings")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_settings.status(), StatusCode::OK);
+        let visible = response_json(get_settings).await;
+        assert_eq!(visible["settings"]["consumer_token"], "");
+        assert_eq!(visible["advisory"][0]["met"], true);
+
+        let updated = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/artifacts/settings")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "enabled": false,
+                            "failed_retention_days": 45,
+                            "recovery_root": recovery_root,
+                            "consumer_token": ""
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        assert_eq!(response_json(updated).await["enabled"], false);
+        let persisted = engine.artifacts().settings().unwrap();
+        assert_eq!(persisted.failed_retention_days, 45);
+        assert_eq!(persisted.consumer_token, "do-not-erase");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_http_errors_distinguish_bad_protocol_from_missing_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            tmp.path().join("state"),
+            tmp.path().join("dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let app = crate::router(engine.clone());
+        let get_missing = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/deliveries/missing-delivery")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_missing.status(), StatusCode::NOT_FOUND);
+
+        let accept_uri = "/api/v1/deliveries/missing-delivery/accept";
+        let unsupported = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(accept_uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "protocolVersion": 2,
+                            "publicationGeneration": "generation",
+                            "manifestDigest": "digest",
+                            "consumerReceiptId": "receipt"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
+        assert!(response_json(unsupported).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported delivery protocol"));
+
+        let missing = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(accept_uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "protocolVersion": 1,
+                            "publicationGeneration": "generation",
+                            "manifestDigest": "digest",
+                            "consumerReceiptId": "receipt"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let retry_missing = app
+            .oneshot(
+                axum::http::Request::post(
+                    "/api/v1/deliveries/missing-delivery/source-cleanup/retry",
+                )
+                .body(axum::body::Body::from("{}"))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry_missing.status(), StatusCode::NOT_FOUND);
         engine.shutdown().await;
     }
 }

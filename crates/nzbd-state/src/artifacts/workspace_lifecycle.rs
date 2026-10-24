@@ -188,6 +188,11 @@ impl Inventory {
                     "terminal delete lacks its live generation owner".into(),
                 ));
             }
+            if artifact.keep_on_failure {
+                return Err(Error::Conflict(
+                    "per-download Keep on failure is enabled".into(),
+                ));
+            }
             let path = artifact.path.clone();
             let root = artifact.root.clone();
             self.finish_artifact_unlocked(artifact, &path, &root, "retained")?

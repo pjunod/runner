@@ -13,7 +13,7 @@ use crate::events::Event;
 use crate::failover::{AttemptOutcome, Ladder, SegmentAttempt, Verdict};
 use crate::queue::{
     active_set, final_status, job_dir_name, next_for_server, pick_par_files, recompute_job_totals,
-    QueueState, SegRef, SelectionCtx,
+    QueueState, SegRef, SelectionCtx, CLIENT_PARAM,
 };
 use crate::rate::{RateLimiter, SpeedMeter};
 use crate::snapshot::{JobSummary, QueueSnapshot, SharedSnapshot, StorageVolumeSnapshot};
@@ -22,11 +22,14 @@ use crate::writer::{spawn_writer, WriteCmd, WriterHandle};
 use crate::{AddOpts, Tuning};
 use arc_swap::ArcSwap;
 use nzbd_nzb::ParsedNzb;
-use nzbd_state::{FsJournal, JobJournals, JournalRecord, SnapshotStore, UncleanMarker};
+use nzbd_state::{
+    FsJournal, JobJournals, JournalRecord, SnapshotStore, UncleanMarker, UrlAdmissionReceipt,
+};
 use nzbd_types::{
     FileId, Health, Job, JobId, JobKind, JobStatus, PostStage, SegmentState, ServerDef, ServerId,
     StageSpan, TorrentControlIntent, TorrentPayloadDisposition, TorrentPhase, TorrentRemovalIntent,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,6 +41,29 @@ use tokio_util::sync::CancellationToken;
 /// Refuse a new control request once this bound is reached rather than growing
 /// owner memory without limit while no adapter is attached.
 const MAX_PENDING_BACKEND_COMMANDS: usize = 64;
+
+fn set_owner_param(params: &mut Vec<(String, String)>, key: &str, value: Option<String>) {
+    if let Some((_, old)) = params.iter_mut().find(|(name, _)| name == key) {
+        if let Some(value) = value {
+            *old = value;
+        } else {
+            params.retain(|(name, _)| name != key);
+        }
+    } else if let Some(value) = value {
+        params.push((key.to_owned(), value));
+    }
+}
+
+fn mark_new_lifecycle_cohort(job: &mut Job) {
+    if !job
+        .params
+        .iter()
+        .any(|(key, value)| key == "*Runner:LifecycleEligible" && value == "1")
+    {
+        job.params
+            .push(("*Runner:LifecycleEligible".into(), "1".into()));
+    }
+}
 use tokio_util::task::TaskTracker;
 
 #[derive(Debug, Clone, Copy)]
@@ -105,9 +131,13 @@ pub(crate) enum QueueCommand {
         dupe: Option<nzbd_types::DupeInfo>,
         paused: bool,
         params: Vec<(String, String)>,
-        /// Replies `(id, created)`. `created == false` means the same URL is
-        /// already fetching — the caller must NOT spawn a second fetch task.
-        reply: oneshot::Sender<(JobId, bool)>,
+        /// `created == false` means the request was already admitted — the
+        /// caller must not spawn a second fetch task.
+        reply: oneshot::Sender<Result<(JobId, bool), crate::EngineError>>,
+    },
+    GetUrlAdmission {
+        request_token: String,
+        reply: oneshot::Sender<Option<UrlAdmissionReceipt>>,
     },
     CompleteUrlFetch {
         job: JobId,
@@ -118,6 +148,11 @@ pub(crate) enum QueueCommand {
         job: JobId,
         error: String,
         reply: oneshot::Sender<()>,
+    },
+    UpdateUrlFetchProgress {
+        job: JobId,
+        progress: crate::fetch::FetchRetryState,
+        reply: oneshot::Sender<bool>,
     },
     SetFilePaused {
         job: JobId,
@@ -150,6 +185,11 @@ pub(crate) enum QueueCommand {
     SetPriority {
         job: JobId,
         priority: i32,
+        reply: oneshot::Sender<bool>,
+    },
+    SetKeepOnFailure {
+        job: JobId,
+        keep: bool,
         reply: oneshot::Sender<bool>,
     },
     SetCategory {
@@ -1345,6 +1385,15 @@ impl Owner {
                 params,
                 reply,
             } => {
+                if params
+                    .iter()
+                    .any(|(key, _)| key.starts_with('*') && key != CLIENT_PARAM)
+                {
+                    let _ = reply.send(Err(nzbd_state::StateError::Corrupt(
+                        "job parameters cannot set Runner internal keys".into(),
+                    )));
+                    return;
+                }
                 let id = self.state.admit_nzb(
                     name.clone(),
                     &parsed,
@@ -1353,6 +1402,7 @@ impl Owner {
                     self.tuning.pause_extra_pars,
                 );
                 if let Some(j) = self.state.job_mut(id) {
+                    mark_new_lifecycle_cohort(j);
                     if let Some(dupe) = dupe {
                         j.dupe = dupe;
                     }
@@ -1360,6 +1410,7 @@ impl Owner {
                         j.status = JobStatus::Paused;
                     }
                     j.params.extend(params);
+                    j.delivery_lifecycle = nzbd_types::has_delivery_intent(&j.params);
                 }
                 // Nothing has been written yet, so a better name may take
                 // the directory with it.
@@ -1389,50 +1440,173 @@ impl Owner {
                 params,
                 reply,
             } => {
-                // Same URL already mid-fetch? Return that job instead of
-                // piling up identical downloads — a client that retries an
-                // add because the fetch looks slow (or a daemon restart hid
-                // its progress) would otherwise queue N copies of the same
-                // 50 GiB download. Failed fetches are NOT matched: re-adding
-                // one is a deliberate retry.
-                let existing = self
-                    .state
-                    .jobs
+                if params
                     .iter()
-                    .find(|j| {
-                        matches!(j.status, JobStatus::Fetching)
-                            && j.params.iter().any(|(k, v)| k == "*URL" && *v == url)
-                    })
-                    .map(|j| j.id);
+                    .any(|(key, _)| key.starts_with('*') && key != CLIENT_PARAM)
+                {
+                    let _ = reply.send(Err(crate::EngineError::RequestConflict(
+                        "job parameters cannot set Runner internal keys".into(),
+                    )));
+                    return;
+                }
+                // A transfer token has a durable tombstone in queue.json,
+                // separate from visible history and the live job row.
+                let transfer_tokens: Vec<&str> = params
+                    .iter()
+                    .find(|(key, _)| key == "monarr-transfer")
+                    .map(|(_, value)| value.as_str())
+                    .into_iter()
+                    .collect();
+                let transfer_count = params
+                    .iter()
+                    .filter(|(key, _)| key == "monarr-transfer")
+                    .count();
+                if transfer_count > 1
+                    || transfer_tokens
+                        .first()
+                        .is_some_and(|token| token.is_empty())
+                {
+                    let _ = reply.send(Err(crate::EngineError::RequestConflict(
+                        "monarr-transfer must be exactly one nonempty value".into(),
+                    )));
+                    return;
+                }
+                let request_token = transfer_tokens.first().map(|token| (*token).to_string());
+                let manual_additional = params
+                    .iter()
+                    .any(|(key, value)| key == "monarr-manual-additional" && value == "1");
+                let delivery_intent = params
+                    .iter()
+                    .any(|(key, value)| key == "monarr-delivery" && value == "1");
+                let submission_sha256 = request_token.as_ref().map(|_| {
+                    url_submission_sha256(
+                        &name,
+                        &url,
+                        category.as_deref(),
+                        priority,
+                        dupe.as_ref(),
+                        paused,
+                        &params,
+                    )
+                });
+                if let (Some(token), Some(fingerprint)) =
+                    (request_token.as_ref(), submission_sha256.as_ref())
+                {
+                    if !self.persist {
+                        let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
+                        return;
+                    }
+                    if let Some(receipt) = self
+                        .state
+                        .url_admission_receipts
+                        .iter()
+                        .find(|receipt| receipt.request_token == *token)
+                    {
+                        if receipt.submission_sha256 != *fingerprint {
+                            let _ = reply.send(Err(crate::EngineError::RequestConflict(
+                                "transfer token was already used for a different submission".into(),
+                            )));
+                        } else {
+                            let _ = reply.send(Ok((JobId(receipt.job_id), false)));
+                        }
+                        return;
+                    }
+                }
+                let existing = find_url_request(
+                    &self.state.jobs,
+                    &url,
+                    request_token.as_deref(),
+                    manual_additional,
+                )
+                .map(|j| j.id);
                 if let Some(id) = existing {
-                    tracing::info!(
-                        job = id.0,
-                        %url,
-                        "url add deduplicated: same URL is already fetching"
-                    );
-                    // The retry still gets its params applied. A client
-                    // that re-adds because the fetch looked stalled is the
-                    // same client that will later look for its tracking id
-                    // on the job; dropping the params here loses the id on
-                    // exactly the adds most likely to be retried, and the
-                    // caller has no way to tell it happened.
+                    if let Some(token) = request_token.as_ref() {
+                        let existing_job = self.state.job(id).expect("matched URL job");
+                        if !url_request_matches(
+                            existing_job,
+                            &url,
+                            manual_additional,
+                            delivery_intent,
+                        ) {
+                            let _ = reply.send(Err(crate::EngineError::RequestConflict(
+                                "transfer token was already used for a different submission".into(),
+                            )));
+                            return;
+                        }
+                        let receipt = UrlAdmissionReceipt {
+                            protocol_version: 1,
+                            request_token: token.clone(),
+                            submission_sha256: submission_sha256.clone().unwrap_or_default(),
+                            job_id: id.0,
+                            generation: url_admission_generation(
+                                id,
+                                token,
+                                &self.artifacts.installation,
+                            ),
+                            runner_instance_id: self.artifacts.installation.clone(),
+                            terminal_outcome: None,
+                            outcome: job_status_name(existing_job.status).into(),
+                            failure_stage: None,
+                            failure_cause: None,
+                            custody_state: "runner_owned".into(),
+                            keep_source_on_failure: false,
+                            source_cleanup_status: None,
+                            publication_path: None,
+                            source_artifact_id: None,
+                            source_generation: None,
+                        };
+                        self.state.url_admission_receipts.push(receipt);
+                        if !self.save_snapshot() {
+                            self.state
+                                .url_admission_receipts
+                                .retain(|receipt| receipt.request_token != *token);
+                            let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
+                            return;
+                        }
+                        let _ = reply.send(Ok((id, false)));
+                        return;
+                    }
+                    tracing::info!(job = id.0, %url, "url add deduplicated by request identity");
                     if !params.is_empty() {
                         if let Some(j) = self.state.job_mut(id) {
                             for (k, v) in params {
+                                if k == "monarr-transfer"
+                                    && j.params.iter().any(|(key, value)| key == &k && value != &v)
+                                {
+                                    continue;
+                                }
                                 match j.params.iter_mut().find(|(pk, _)| *pk == k) {
-                                    Some(slot) => slot.1 = v,
-                                    None => j.params.push((k, v)),
+                                    Some(slot)
+                                        if k != "monarr-transfer"
+                                            && k != "monarr-delivery"
+                                            && k != "monarr-manual-additional" =>
+                                    {
+                                        slot.1 = v
+                                    }
+                                    Some(_) => (),
+                                    None if k != "monarr-transfer"
+                                        && k != "monarr-delivery"
+                                        && k != "monarr-manual-additional" =>
+                                    {
+                                        j.params.push((k, v))
+                                    }
+                                    None => (),
                                 }
                             }
                         }
                         self.save_snapshot();
                         self.publish_now();
                     }
-                    let _ = reply.send((id, false));
+                    let _ = reply.send(Ok((id, false)));
+                    return;
+                }
+                if request_token.is_some() && !self.persist {
+                    let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
                     return;
                 }
                 let id = self.state.admit_url(name.clone(), &url, category, priority);
                 if let Some(j) = self.state.job_mut(id) {
+                    mark_new_lifecycle_cohort(j);
                     if let Some(dupe) = dupe {
                         j.dupe = dupe;
                     }
@@ -1440,14 +1614,81 @@ impl Owner {
                         j.params.push(("*AddPaused".into(), "yes".into()));
                     }
                     j.params.extend(params);
+                    j.delivery_lifecycle = nzbd_types::has_delivery_intent(&j.params);
                 }
                 let name = self.name_from_requestor(id, true).unwrap_or(name);
+                if let (Some(token), Some(fingerprint)) =
+                    (request_token.as_ref(), submission_sha256.as_ref())
+                {
+                    self.state.url_admission_receipts.push(UrlAdmissionReceipt {
+                        protocol_version: 1,
+                        request_token: token.clone(),
+                        submission_sha256: fingerprint.clone(),
+                        job_id: id.0,
+                        generation: url_admission_generation(
+                            id,
+                            token,
+                            &self.artifacts.installation,
+                        ),
+                        runner_instance_id: self.artifacts.installation.clone(),
+                        terminal_outcome: None,
+                        outcome: "fetching".into(),
+                        failure_stage: None,
+                        failure_cause: None,
+                        custody_state: "runner_owned".into(),
+                        keep_source_on_failure: false,
+                        source_cleanup_status: None,
+                        publication_path: None,
+                        source_artifact_id: None,
+                        source_generation: None,
+                    });
+                    if !self.save_snapshot() {
+                        self.state.jobs.retain(|job| job.id != id);
+                        self.state
+                            .url_admission_receipts
+                            .retain(|receipt| receipt.request_token != *token);
+                        let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
+                        return;
+                    }
+                }
                 tracing::info!(job = id.0, %name, %url, "url job added (fetching)");
-                self.save_snapshot();
+                if request_token.is_none() {
+                    self.save_snapshot();
+                }
                 self.publish_now();
                 self.emit(Event::JobAdded { job: id, name });
                 self.bump_epoch();
-                let _ = reply.send((id, true));
+                let _ = reply.send(Ok((id, true)));
+            }
+            QueueCommand::GetUrlAdmission {
+                request_token,
+                reply,
+            } => {
+                let index = self
+                    .state
+                    .url_admission_receipts
+                    .iter()
+                    .position(|receipt| receipt.request_token == request_token);
+                let Some(index) = index else {
+                    let _ = reply.send(None);
+                    return;
+                };
+                let before_refresh = self.state.url_admission_receipts[index].clone();
+
+                // A tombstone outlives the queue row, but its source may still
+                // be explicitly removed or kept from the Files UI. Refresh
+                // only from the exact durable artifact generation; absence or
+                // generation mismatch is not evidence that bytes were deleted.
+                let changed = refresh_url_admission_custody(
+                    &mut self.state.url_admission_receipts[index],
+                    &self.artifacts,
+                );
+                if changed && self.persist && !self.save_snapshot() {
+                    tracing::error!(%request_token, "could not persist refreshed URL admission custody");
+                    self.state.url_admission_receipts[index] = before_refresh;
+                }
+                let receipt = self.state.url_admission_receipts[index].clone();
+                let _ = reply.send(Some(receipt));
             }
             QueueCommand::CompleteUrlFetch { job, parsed, reply } => {
                 let ok = self
@@ -1506,6 +1747,48 @@ impl Owner {
                     self.bump_epoch();
                 }
                 let _ = reply.send(());
+            }
+            QueueCommand::UpdateUrlFetchProgress {
+                job,
+                progress,
+                reply,
+            } => {
+                let changed = if let Some(record) = self
+                    .state
+                    .job_mut(job)
+                    .filter(|record| record.status == JobStatus::Fetching)
+                {
+                    set_owner_param(
+                        &mut record.params,
+                        crate::fetch::RETRY_ATTEMPT_PARAM,
+                        Some(progress.attempts.to_string()),
+                    );
+                    set_owner_param(
+                        &mut record.params,
+                        crate::fetch::NEXT_RETRY_PARAM,
+                        progress.next_retry_at.map(|at| at.to_string()),
+                    );
+                    set_owner_param(
+                        &mut record.params,
+                        crate::fetch::BLOCKED_SINCE_PARAM,
+                        progress.blocked_since.map(|at| at.to_string()),
+                    );
+                    set_owner_param(
+                        &mut record.params,
+                        crate::fetch::LAST_ERROR_PARAM,
+                        progress.last_error,
+                    );
+                    true
+                } else {
+                    false
+                };
+                let durable = if changed {
+                    self.publish_now();
+                    self.save_snapshot()
+                } else {
+                    false
+                };
+                let _ = reply.send(durable);
             }
             QueueCommand::SetFilePaused {
                 job,
@@ -1827,6 +2110,121 @@ impl Owner {
                         }
                         None => false,
                     }
+                };
+                let _ = reply.send(ok);
+            }
+            QueueCommand::SetKeepOnFailure { job, keep, reply } => {
+                let before = self.state.job(job).cloned();
+                let prior_keep = before.as_ref().is_some_and(|record| {
+                    record
+                        .params
+                        .iter()
+                        .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1")
+                });
+                let allowed = before.as_ref().is_some_and(|record| {
+                    if matches!(record.status, JobStatus::Completed | JobStatus::Failed) {
+                        // Inventory resolves post-publication jobs through the
+                        // exact retained Runner source generation. It rejects
+                        // a transferred or already-retired payload, so a
+                        // terminal queue row alone cannot target publication.
+                        true
+                    } else {
+                        record.status != JobStatus::Deleted && !record.held()
+                    }
+                });
+                let changed = if allowed {
+                    self.state.job_mut(job).is_some_and(|record| {
+                        let old = record
+                            .params
+                            .iter()
+                            .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
+                        if old == keep {
+                            return true;
+                        }
+                        record
+                            .params
+                            .retain(|(key, _)| key != "*Runner:KeepOnFailure");
+                        if keep {
+                            record
+                                .params
+                                .push(("*Runner:KeepOnFailure".into(), "1".into()));
+                        }
+                        true
+                    })
+                } else {
+                    false
+                };
+                let mut inventory_updated = false;
+                let inventory_ok = if changed {
+                    match self.artifacts.for_job(job.0) {
+                        Ok(Some(_)) => match self.artifacts.set_keep_on_failure(job.0, keep) {
+                            Ok(updated) => {
+                                inventory_updated = updated;
+                                updated
+                            }
+                            Err(error) => {
+                                tracing::warn!(job = job.0, %error, "could not persist source Keep intent");
+                                if let Some(before) = before.clone() {
+                                    if let Some(record) = self.state.job_mut(job) {
+                                        *record = before;
+                                    }
+                                }
+                                false
+                            }
+                        },
+                        // Before a processing artifact is allocated, the queue
+                        // snapshot is the durable source of the opt-in. New
+                        // allocations inherit this parameter from the job.
+                        Ok(None)
+                            if before.as_ref().is_some_and(|record| {
+                                matches!(
+                                    record.status,
+                                    JobStatus::Fetching | JobStatus::Queued | JobStatus::Paused
+                                )
+                            }) =>
+                        {
+                            true
+                        }
+                        Ok(None) => false,
+                        Err(error) => {
+                            tracing::warn!(job = job.0, %error, "could not inspect source Keep target");
+                            if let Some(before) = before.clone() {
+                                if let Some(record) = self.state.job_mut(job) {
+                                    *record = before;
+                                }
+                            }
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if changed && !inventory_ok {
+                    if let Some(before) = before.clone() {
+                        if let Some(record) = self.state.job_mut(job) {
+                            *record = before;
+                        }
+                    }
+                }
+                let ok = if changed && inventory_ok {
+                    if self.save_snapshot() {
+                        self.dirty = false;
+                        self.bump_epoch();
+                        self.publish_now();
+                        true
+                    } else {
+                        if let Some(before) = before.clone() {
+                            if let Some(record) = self.state.job_mut(job) {
+                                *record = before;
+                            }
+                        }
+                        if inventory_updated {
+                            let _ = self.artifacts.set_keep_on_failure(job.0, prior_keep);
+                        }
+                        false
+                    }
+                } else {
+                    false
                 };
                 let _ = reply.send(ok);
             }
@@ -2179,7 +2577,15 @@ impl Owner {
                 let control = before.as_ref().and_then(|j| j.control()).filter(|c| {
                     c.lifecycle == "held"
                         && c.revision == revision
-                        && matches!(c.cause.as_str(), "unknown" | "post_failure")
+                        && matches!(
+                            c.cause.as_str(),
+                            "unknown"
+                                | "post_failure"
+                                | "io"
+                                | "missing_tool"
+                                | "password_required"
+                                | "mount_unavailable"
+                        )
                         && matches!(
                             c.previous_status,
                             Some(
@@ -2198,6 +2604,7 @@ impl Owner {
                                 | "extract"
                                 | "cleanup"
                                 | "post_unpack_rename"
+                                | "script"
                                 | "move"
                         )
                 });
@@ -2641,6 +3048,16 @@ impl Owner {
             return false;
         };
         let job = self.state.jobs.remove(idx);
+        if !matches!(
+            job.status,
+            JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
+        ) {
+            for receipt in &mut self.state.url_admission_receipts {
+                if receipt.job_id == job_id.0 {
+                    receipt.outcome = "deleted".into();
+                }
+            }
+        }
         for f in &job.files {
             self.writers.remove(&f.id);
             self.file_sizes.remove(&f.id);
@@ -2651,6 +3068,10 @@ impl Owner {
         self.delegated.remove(&job_id);
         self.mirror.remove(&job_id);
         self.post_fetch_files.remove(&job_id);
+        self.dirty = true;
+        if self.persist {
+            self.save_snapshot();
+        }
         self.publish_now();
         self.bump_epoch();
         true
@@ -2836,7 +3257,7 @@ impl Owner {
             }
             let Some(r) = lease else { break };
 
-            if let Err(e) = self.ensure_allocation(r.job) {
+            if let Err(e) = self.ensure_allocation(r.job, false) {
                 if self.retiring_writers.contains_key(&r.job) {
                     // Writer retirement owns its own completion/wake-up. It is
                     // transient, not an allocation needing operator review.
@@ -3179,8 +3600,13 @@ impl Owner {
             lifecycle: "held".into(),
             cause: cause.into(),
             stage: stage.into(),
-            retry_policy: if matches!(cause, "capacity" | "quota" | "allocation") {
+            retry_policy: if matches!(
+                cause,
+                "capacity" | "quota" | "allocation" | "password_required"
+            ) {
                 "resume_same_job"
+            } else if cause == "mount_unavailable" {
+                "reobserve_mount"
             } else {
                 "review"
             }
@@ -3206,6 +3632,12 @@ impl Owner {
             manual_pause: prior
                 .as_ref()
                 .map_or(j.status == JobStatus::Paused, |c| c.manual_pause),
+            retry_attempt: prior.as_ref().map_or(0, |c| c.retry_attempt),
+            next_retry_at_unix: None,
+            blocked_since_unix: prior
+                .as_ref()
+                .and_then(|c| c.blocked_since_unix)
+                .or_else(|| Some(unix_now())),
         };
         j.set_control(&control);
         j.status = JobStatus::Paused;
@@ -3735,10 +4167,14 @@ impl Owner {
                 })?;
             }
         }
-        self.ensure_allocation(job)
+        self.ensure_allocation(job, true)
     }
 
-    fn ensure_allocation(&mut self, job: JobId) -> Result<(), nzbd_state::artifacts::Error> {
+    fn ensure_allocation(
+        &mut self,
+        job: JobId,
+        _new_admission: bool,
+    ) -> Result<(), nzbd_state::artifacts::Error> {
         if self.retiring_writers.contains_key(&job) {
             return Err(nzbd_state::artifacts::Error::Conflict(
                 "writer retirement in progress".into(),
@@ -3752,13 +4188,29 @@ impl Owner {
             .job(job)
             .ok_or(nzbd_state::artifacts::Error::NotFound)?;
         if let Some(existing) = self.artifacts.for_job(job.0)? {
-            self.artifacts
-                .allocate(job.0, &existing.root, &existing.path)?;
+            self.artifacts.allocate_for_delivery(
+                job.0,
+                &existing.root,
+                &existing.path,
+                record.lifecycle_eligible(),
+                record.delivery_lifecycle,
+            )?;
             self.allocated_jobs.insert(job);
             return Ok(());
         }
         let dir = self.dest_dir.join(job_dir_name(record));
-        self.artifacts.allocate(job.0, &self.dest_dir, &dir)?;
+        let keep_on_failure = record
+            .params
+            .iter()
+            .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
+        self.artifacts.allocate_for_delivery_with_keep(
+            job.0,
+            &self.dest_dir,
+            &dir,
+            record.lifecycle_eligible(),
+            record.delivery_lifecycle,
+            keep_on_failure,
+        )?;
         self.allocated_jobs.insert(job);
         Ok(())
     }
@@ -3790,7 +4242,7 @@ impl Owner {
             .flatten()
             .map(|a| a.path)
             .unwrap_or_else(|| self.dest_dir.join(job_dir));
-        if let Err(e) = self.ensure_allocation(job) {
+        if let Err(e) = self.ensure_allocation(job, false) {
             tracing::error!(job = job.0, error = %e, "writer held: allocation not committed");
             let (tx, _) = mpsc::channel(1);
             return tx;
@@ -4795,7 +5247,7 @@ impl Owner {
     /// previous process and died with it, so without a re-spawn they sit at
     /// "FETCHING · 0 B of 0 B" forever. [`crate::Engine::spawn`] feeds this
     /// list through [`plan_url_refetches`] right after recovery.
-    pub(crate) fn pending_url_fetches(&self) -> Vec<(JobId, String)> {
+    pub(crate) fn pending_url_fetches(&self) -> Vec<UrlFetchRequest> {
         self.state
             .jobs
             .iter()
@@ -4804,7 +5256,19 @@ impl Owner {
                 j.params
                     .iter()
                     .find(|(k, _)| k == "*URL")
-                    .map(|(_, url)| (j.id, url.clone()))
+                    .map(|(_, url)| UrlFetchRequest {
+                        job: j.id,
+                        url: url.clone(),
+                        request_token: j
+                            .params
+                            .iter()
+                            .find(|(key, _)| key == "monarr-transfer")
+                            .map(|(_, value)| value.clone()),
+                        manual_additional: j
+                            .params
+                            .iter()
+                            .any(|(key, value)| key == "monarr-manual-additional" && value == "1"),
+                    })
             })
             .collect()
     }
@@ -4844,6 +5308,10 @@ impl Owner {
                         None
                     },
                     control: j.control(),
+                    lifecycle_eligible: j.lifecycle_eligible(),
+                    url_fetch: crate::snapshot::url_fetch_progress(j),
+                    failed_cleanup: crate::snapshot::failed_cleanup_progress(j),
+                    post_timing: crate::snapshot::post_timing(j, crate::snapshot::unix_now()),
                     id: j.id,
                     kind: j.kind,
                     name: j.name.clone(),
@@ -5137,6 +5605,10 @@ impl Owner {
             self.dirty = false;
             return Ok(false);
         }
+        self.state.sync_url_admission_receipts();
+        for receipt in &mut self.state.url_admission_receipts {
+            refresh_url_admission_custody(receipt, &self.artifacts);
+        }
         let doc = self.state.to_doc();
         let write_started = Instant::now();
         let bytes = match &self.persist_guard {
@@ -5203,6 +5675,48 @@ impl Owner {
     }
 }
 
+fn refresh_url_admission_custody(
+    receipt: &mut UrlAdmissionReceipt,
+    inventory: &nzbd_state::artifacts::Inventory,
+) -> bool {
+    let Some((artifact_id, source_generation)) = receipt
+        .source_artifact_id
+        .as_deref()
+        .zip(receipt.source_generation.as_deref())
+    else {
+        return false;
+    };
+    let Ok(artifact) = inventory.get(artifact_id) else {
+        return false;
+    };
+    if artifact.generation != source_generation {
+        return false;
+    }
+    let keep_changed = receipt.keep_source_on_failure != artifact.keep_on_failure;
+    receipt.keep_source_on_failure = artifact.keep_on_failure;
+    if artifact.state == "deleted" {
+        let changed = receipt.custody_state != "deleted_by_runner"
+            || receipt.source_cleanup_status.as_deref() != Some("removed")
+            || keep_changed;
+        receipt.custody_state = "deleted_by_runner".into();
+        receipt.source_cleanup_status = Some("removed".into());
+        changed
+    } else if artifact.keep || artifact.keep_on_failure {
+        let changed = receipt.custody_state != "kept_by_user"
+            || receipt.source_cleanup_status.as_deref() != Some("retained")
+            || keep_changed;
+        receipt.custody_state = "kept_by_user".into();
+        receipt.source_cleanup_status = Some("retained".into());
+        changed
+    } else if artifact.owned && receipt.custody_state != "curator" {
+        let changed = receipt.custody_state != "runner_owned" || keep_changed;
+        receipt.custody_state = "runner_owned".into();
+        changed
+    } else {
+        false
+    }
+}
+
 /// How long after a save the next debounced save may run: 10× the last
 /// save's duration, floored at the historical 2 s, capped at 5 min. A
 /// fast volume keeps the old cadence; a slow one gets its saves spaced so
@@ -5242,15 +5756,114 @@ pub(crate) fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+fn url_submission_sha256(
+    name: &str,
+    url: &str,
+    category: Option<&str>,
+    priority: i32,
+    dupe: Option<&nzbd_types::DupeInfo>,
+    paused: bool,
+    params: &[(String, String)],
+) -> String {
+    let mut canonical_params: Vec<_> = params
+        .iter()
+        .filter(|(key, _)| key != "monarr-transfer" && key != CLIENT_PARAM)
+        .collect();
+    canonical_params.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    let bytes = serde_json::to_vec(&(
+        name,
+        url,
+        category,
+        priority,
+        dupe,
+        paused,
+        canonical_params,
+    ))
+    .expect("canonical URL admission fields serialize");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn url_admission_generation(job: JobId, token: &str, instance: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    format!("{}-url-{}-{:x}", instance, job.0, digest)
+}
+
+fn job_status_name(status: JobStatus) -> &'static str {
+    match status {
+        JobStatus::Fetching => "fetching",
+        JobStatus::Queued => "queued",
+        JobStatus::Downloading => "downloading",
+        JobStatus::Paused => "paused",
+        JobStatus::PostQueued => "post_queued",
+        JobStatus::Post { .. } => "post_processing",
+        JobStatus::Completed => "completed",
+        JobStatus::Failed => "failed",
+        JobStatus::Deleted => "deleted",
+    }
+}
+
 /// A recovered-`Fetching` job that duplicates another job's URL: `job`
 /// should fail as a duplicate of `original`.
 pub(crate) type DupeOf = (JobId, JobId);
+
+fn find_url_request<'a>(
+    jobs: &'a [Job],
+    url: &str,
+    request_token: Option<&str>,
+    manual_additional: bool,
+) -> Option<&'a Job> {
+    jobs.iter().find(|job| {
+        let saved_token = job
+            .params
+            .iter()
+            .find(|(key, _)| key == "monarr-transfer")
+            .map(|(_, value)| value.as_str());
+        if let Some(token) = request_token {
+            saved_token == Some(token)
+        } else if manual_additional {
+            false
+        } else {
+            saved_token.is_none()
+                && matches!(job.status, JobStatus::Fetching)
+                && job
+                    .params
+                    .iter()
+                    .any(|(key, value)| key == "*URL" && value == url)
+        }
+    })
+}
+
+fn url_request_matches(job: &Job, url: &str, manual_additional: bool, delivery: bool) -> bool {
+    let saved_url = job
+        .params
+        .iter()
+        .find(|(key, _)| key == "*URL")
+        .map(|(_, value)| value.as_str());
+    let saved_additional = job
+        .params
+        .iter()
+        .any(|(key, value)| key == "monarr-manual-additional" && value == "1");
+    let saved_delivery = job
+        .params
+        .iter()
+        .any(|(key, value)| key == "monarr-delivery" && value == "1");
+    saved_url == Some(url) && saved_additional == manual_additional && saved_delivery == delivery
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UrlFetchRequest {
+    pub job: JobId,
+    pub url: String,
+    pub request_token: Option<String>,
+    pub manual_additional: bool,
+}
 
 /// Split recovered `Fetching` jobs into fetches to re-spawn and duplicates
 /// to fail. The first job (queue order) of each URL refetches; later
 /// same-URL jobs — the pile-up left by clients re-adding while the original
 /// fetch was invisible after a restart — fail as duplicates of it, instead
 /// of N copies of the same download racing to completion.
+#[cfg(test)]
 pub(crate) fn plan_url_refetches(
     pending: Vec<(JobId, String)>,
 ) -> (Vec<(JobId, String)>, Vec<DupeOf>) {
@@ -5264,6 +5877,36 @@ pub(crate) fn plan_url_refetches(
                 refetch.push((job, url));
             }
             Some(original) => duplicates.push((job, *original)),
+        }
+    }
+    (refetch, duplicates)
+}
+
+/// Refetch recovered URL requests while preserving explicit request identity.
+/// Distinct transfer tokens for one URL represent deliberate separate grabs;
+/// an additional request without a token is never collapsed into another job.
+pub(crate) fn plan_url_refetches_scoped(
+    pending: Vec<UrlFetchRequest>,
+) -> (Vec<(JobId, String)>, Vec<DupeOf>) {
+    let mut first_for_request: HashMap<(String, Option<String>), JobId> = HashMap::new();
+    let mut refetch = Vec::new();
+    let mut duplicates = Vec::new();
+    for request in pending {
+        if request.manual_additional && request.request_token.is_none() {
+            refetch.push((request.job, request.url));
+            continue;
+        }
+        let key = if let Some(token) = request.request_token.clone() {
+            ("token".to_string(), Some(token))
+        } else {
+            (request.url.clone(), None)
+        };
+        match first_for_request.get(&key) {
+            None => {
+                first_for_request.insert(key, request.job);
+                refetch.push((request.job, request.url));
+            }
+            Some(original) => duplicates.push((request.job, *original)),
         }
     }
     (refetch, duplicates)
@@ -5358,6 +6001,57 @@ mod tests {
         control_test_owner_with_persistence(true, None)
     }
 
+    #[test]
+    fn lifecycle_cohort_is_stamped_at_admission_not_later_url_allocation() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let old = owner.state.admit_url(
+            "old-fetching".into(),
+            "http://example.test/old.nzb",
+            None,
+            0,
+        );
+        owner.allocate_new_payload(old).unwrap();
+        let old_row = owner.state.job(old).unwrap();
+        assert!(!old_row.lifecycle_eligible());
+        assert!(
+            !owner
+                .artifacts
+                .for_job(old.0)
+                .unwrap()
+                .unwrap()
+                .automatic_cleanup_eligible
+        );
+
+        let new = owner.state.admit_url(
+            "new-fetching".into(),
+            "http://example.test/new.nzb",
+            None,
+            0,
+        );
+        mark_new_lifecycle_cohort(owner.state.job_mut(new).unwrap());
+        owner.allocate_new_payload(new).unwrap();
+        let new_row = owner.state.job(new).unwrap();
+        assert!(new_row.lifecycle_eligible());
+        assert!(
+            owner
+                .artifacts
+                .for_job(new.0)
+                .unwrap()
+                .unwrap()
+                .automatic_cleanup_eligible
+        );
+
+        let mut torrent = new_row.clone();
+        torrent.kind = nzbd_types::JobKind::Torrent;
+        torrent
+            .params
+            .retain(|(key, _)| key != "*Runner:LifecycleEligible");
+        assert!(
+            !torrent.lifecycle_eligible(),
+            "torrent seeding sources stay outside the NZB cohort"
+        );
+    }
+
     fn control_test_owner_with_persistence(
         persist: bool,
         persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -5395,6 +6089,232 @@ mod tests {
         )
         .unwrap();
         (tmp, owner, adapter)
+    }
+
+    #[tokio::test]
+    async fn keep_on_failure_is_opt_in_and_snapshot_committed_before_ack() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        owner.state.jobs.push(pending_job(1));
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::SetKeepOnFailure {
+            job: JobId(1),
+            keep: true,
+            reply,
+        });
+        assert!(result.await.unwrap());
+        let saved = owner.snap_store.load().unwrap().unwrap();
+        assert!(saved.jobs[0]
+            .params
+            .iter()
+            .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1"));
+
+        // A preallocation opt-in must be copied atomically into the first
+        // source generation, then consulted by the real failed-payload
+        // disposal path. The queue snapshot remains the authority only until
+        // that generation exists.
+        owner.allocate_new_payload(JobId(1)).unwrap();
+        let source = owner.artifacts.for_job(1).unwrap().unwrap();
+        assert!(source.keep_on_failure);
+        std::fs::write(source.path.join("partial.bin"), b"failed partial payload").unwrap();
+        owner
+            .artifacts
+            .finish(1, &source.path, &source.root, "active")
+            .unwrap();
+        let attempt = owner.artifacts.acquire_attempt_use(1).unwrap().unwrap();
+        assert!(owner
+            .artifacts
+            .delete_failed_payload(&attempt, 1, &|| Ok(()))
+            .is_err());
+        assert!(source.path.join("partial.bin").exists());
+
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::SetKeepOnFailure {
+            job: JobId(1),
+            keep: false,
+            reply,
+        });
+        assert!(result.await.unwrap());
+        let saved = owner.snap_store.load().unwrap().unwrap();
+        assert!(!saved.jobs[0]
+            .params
+            .iter()
+            .any(|(key, _)| key == "*Runner:KeepOnFailure"));
+        assert!(owner
+            .artifacts
+            .delete_failed_payload(&attempt, 1, &|| Ok(()))
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn terminal_failed_job_can_keep_only_its_retained_delivery_source() {
+        let (tmp, mut owner, _adapter) = control_test_owner();
+        let mut job = pending_job(57);
+        job.status = JobStatus::Failed;
+        owner.state.jobs.push(job);
+
+        let source = owner.dest_dir.join("failed-source-57");
+        owner
+            .artifacts
+            .allocate_for_delivery(57, &owner.dest_dir, &source, true, true)
+            .unwrap();
+        std::fs::write(source.join("episode.mkv"), b"verified payload").unwrap();
+        owner
+            .artifacts
+            .finish(57, &source, &owner.dest_dir, "active")
+            .unwrap();
+        let selected = owner
+            .artifacts
+            .for_job(57)
+            .unwrap()
+            .unwrap()
+            .files
+            .into_iter()
+            .filter(|entry| entry.path == "episode.mkv")
+            .collect::<Vec<_>>();
+        let completed = tmp.path().join("completed");
+        std::fs::create_dir(&completed).unwrap();
+        owner
+            .artifacts
+            .publish_selected_for_delivery_checked(
+                57,
+                &completed.join("published-generation"),
+                selected,
+                vec![nzbd_state::artifacts::DeliveryFileOutcome {
+                    source_path: "episode.mkv".into(),
+                    publication_path: Some("episode.mkv".into()),
+                    classification: "video".into(),
+                    outcome: "published".into(),
+                    reason: Some("verified complete media".into()),
+                    repair_dependency: false,
+                    source_cleanup_status: "pending".into(),
+                }],
+                &|| Ok(()),
+            )
+            .unwrap();
+        let delivery = owner
+            .artifacts
+            .create_delivery_with_outcome_and_keep(
+                57,
+                true,
+                Some("keep-terminal-source-test"),
+                "FAILURE/HEALTH",
+                Some("health"),
+                Some("partial salvage"),
+                false,
+            )
+            .unwrap();
+        let source_id = delivery.source_artifact_id.clone();
+        let source_generation = delivery.source_generation.clone();
+        owner
+            .state
+            .url_admission_receipts
+            .push(UrlAdmissionReceipt {
+                protocol_version: 1,
+                request_token: "keep-source-tombstone-57".into(),
+                submission_sha256: "submission-hash".into(),
+                job_id: 57,
+                generation: "admission-generation".into(),
+                runner_instance_id: "runner-instance".into(),
+                terminal_outcome: Some("FAILURE/HEALTH".into()),
+                outcome: "failed".into(),
+                failure_stage: Some("health".into()),
+                failure_cause: Some("partial salvage".into()),
+                custody_state: "runner_owned".into(),
+                keep_source_on_failure: false,
+                source_cleanup_status: Some("pending".into()),
+                publication_path: Some(
+                    completed.join("published-generation").display().to_string(),
+                ),
+                source_artifact_id: Some(source_id.clone()),
+                source_generation: Some(source_generation.clone()),
+            });
+
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::SetKeepOnFailure {
+            job: JobId(57),
+            keep: true,
+            reply,
+        });
+        assert!(result.await.unwrap());
+        assert!(owner.artifacts.get(&source_id).unwrap().keep_on_failure);
+        assert!(owner.state.url_admission_receipts[0].keep_source_on_failure);
+        assert_eq!(
+            owner.artifacts.get(&delivery.artifact_id).unwrap().state,
+            "transferred"
+        );
+
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::SetKeepOnFailure {
+            job: JobId(57),
+            keep: false,
+            reply,
+        });
+        assert!(result.await.unwrap());
+        assert!(!owner.artifacts.get(&source_id).unwrap().keep_on_failure);
+        assert!(!owner.state.url_admission_receipts[0].keep_source_on_failure);
+
+        // Once the visible queue/history row is gone, the durable source
+        // generation still refreshes the receipt, and stale queue params no
+        // longer overwrite its live Keep preference.
+        owner.state.jobs.clear();
+        owner.artifacts.set_keep_on_failure(57, true).unwrap();
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::GetUrlAdmission {
+            request_token: "keep-source-tombstone-57".into(),
+            reply,
+        });
+        assert!(result.await.unwrap().unwrap().keep_source_on_failure);
+        owner.artifacts.set_keep_on_failure(57, false).unwrap();
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::GetUrlAdmission {
+            request_token: "keep-source-tombstone-57".into(),
+            reply,
+        });
+        assert!(!result.await.unwrap().unwrap().keep_source_on_failure);
+        assert!(
+            !owner
+                .artifacts
+                .delivery(&delivery.delivery_id)
+                .unwrap()
+                .keep_source_on_failure,
+            "the original Delivery choice remains immutable"
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_request_does_not_succeed_after_source_generation_is_deleted() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let mut job = pending_job(63);
+        job.status = JobStatus::Failed;
+        owner.state.jobs.push(job);
+        let source = owner.dest_dir.join("deleted-source-63");
+        owner
+            .artifacts
+            .allocate_for_delivery(63, &owner.dest_dir, &source, true, false)
+            .unwrap();
+        std::fs::write(source.join("payload.mkv"), b"failed payload").unwrap();
+        owner
+            .artifacts
+            .finish(63, &source, &owner.dest_dir, "parked_failed")
+            .unwrap();
+        let artifact = owner.artifacts.for_job(63).unwrap().unwrap();
+        let deletion = owner
+            .artifacts
+            .request_delete(&artifact.id, artifact.revision, "delete-source-63", 0)
+            .unwrap();
+        owner.artifacts.execute_delete(&deletion.id).unwrap();
+
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::SetKeepOnFailure {
+            job: JobId(63),
+            keep: true,
+            reply,
+        });
+        assert!(!result.await.unwrap());
+        assert!(!owner.state.jobs[0]
+            .params
+            .iter()
+            .any(|(key, _)| key == "*Runner:KeepOnFailure"));
     }
 
     #[tokio::test]
@@ -5469,7 +6389,7 @@ mod tests {
         let job = pending_job(1);
         let file = job.files[0].id;
         owner.state.jobs.push(job);
-        owner.ensure_allocation(JobId(1)).unwrap();
+        owner.ensure_allocation(JobId(1), false).unwrap();
         let (tx, _rx) = mpsc::channel(1);
         let (done, stopped) = watch::channel(false);
         owner.writers.insert(
@@ -5495,7 +6415,7 @@ mod tests {
             reply,
         });
         assert!(!rx.await.unwrap());
-        assert!(owner.ensure_allocation(JobId(1)).is_err());
+        assert!(owner.ensure_allocation(JobId(1), false).is_err());
         let (reply, rx) = oneshot::channel();
         owner.on_command(QueueCommand::QuiescePayload {
             job: JobId(1),
@@ -6040,6 +6960,7 @@ mod tests {
             name: "x".into(),
             dir_name: String::new(),
             name_provisional: false,
+            delivery_lifecycle: false,
             queued_at_unix: 0,
             original_name: String::new(),
             category: None,
@@ -6193,7 +7114,7 @@ mod tests {
         let mut job = bare_job();
         job.dir_name = "pp".into();
         owner.state.jobs.push(job);
-        owner.ensure_allocation(JobId(1)).unwrap();
+        owner.ensure_allocation(JobId(1), false).unwrap();
         assert!(owner.hold_job(JobId(1), "post_failure", "unpack", "tool failed"));
         let revision = owner.state.jobs[0].control().unwrap().revision;
         for expected_revision in ["stale".to_string(), revision.clone()] {
@@ -6213,7 +7134,12 @@ mod tests {
             .unwrap();
         let restored = QueueState::from_doc(persisted);
         assert!(!restored.jobs[0].held());
-        assert!(owner.hold_job(JobId(1), "post_failure", "script", "uncertain script"));
+        assert!(owner.hold_job(
+            JobId(1),
+            "post_failure",
+            "unsupported_stage",
+            "stage is not safe to retry"
+        ));
         let (reply, rx) = oneshot::channel();
         owner.on_command(QueueCommand::RetryPostHold {
             job: JobId(1),
@@ -6225,11 +7151,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mount_unavailable_hold_resumes_only_after_expected_root_returns() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let mut job = bare_job();
+        job.dir_name = "remount".into();
+        job.status = JobStatus::Completed;
+        job.params.push(("monarr-delivery".into(), "1".into()));
+        owner.state.jobs.push(job);
+        owner.ensure_allocation(JobId(1), false).unwrap();
+        assert!(owner.hold_job(
+            JobId(1),
+            "mount_unavailable",
+            "extract",
+            "configured root identity changed or volume is unavailable",
+        ));
+        let revision = owner.state.jobs[0].control().unwrap().revision;
+
+        let root = owner.dest_dir.clone();
+        let offline = root.with_extension("expected-volume-offline");
+        std::fs::rename(&root, &offline).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::RetryPostHold {
+            job: JobId(1),
+            revision: revision.clone(),
+            reply,
+        });
+        assert!(!rx.await.unwrap(), "wrong root must stay fenced");
+        assert!(owner.state.jobs[0].held());
+
+        std::fs::remove_dir(&root).unwrap();
+        std::fs::rename(&offline, &root).unwrap();
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::RetryPostHold {
+            job: JobId(1),
+            revision,
+            reply,
+        });
+        assert!(rx.await.unwrap(), "restored expected root should resume");
+        assert_eq!(owner.state.jobs[0].status, JobStatus::PostQueued);
+    }
+
+    #[tokio::test]
+    async fn admission_tombstone_refreshes_exact_source_keep_and_delete_evidence() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let mut job = bare_job();
+        job.dir_name = "admission-source".into();
+        owner.state.jobs.push(job);
+        owner.ensure_allocation(JobId(1), true).unwrap();
+        let source = owner.artifacts.for_job(1).unwrap().unwrap();
+        owner
+            .artifacts
+            .finish(1, &source.path, &source.root, "retained")
+            .unwrap();
+        let source = owner.artifacts.for_job(1).unwrap().unwrap();
+        owner
+            .state
+            .url_admission_receipts
+            .push(UrlAdmissionReceipt {
+                protocol_version: 1,
+                request_token: "receipt-token".into(),
+                submission_sha256: "hash".into(),
+                job_id: 1,
+                generation: "admission-generation".into(),
+                runner_instance_id: "runner".into(),
+                terminal_outcome: Some("FAILURE/UNPACK".into()),
+                outcome: "failed".into(),
+                failure_stage: Some("unpack".into()),
+                failure_cause: Some("corrupt_archive".into()),
+                custody_state: "runner_owned".into(),
+                keep_source_on_failure: false,
+                source_cleanup_status: None,
+                publication_path: None,
+                source_artifact_id: Some(source.id.clone()),
+                source_generation: Some(source.generation.clone()),
+            });
+
+        let kept = owner
+            .artifacts
+            .retention(&source.id, source.revision, true, None)
+            .unwrap();
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::GetUrlAdmission {
+            request_token: "receipt-token".into(),
+            reply,
+        });
+        let receipt = rx.await.unwrap().unwrap();
+        assert_eq!(receipt.custody_state, "kept_by_user");
+        assert_eq!(
+            receipt.source_generation.as_deref(),
+            Some(kept.generation.as_str())
+        );
+
+        let released = owner
+            .artifacts
+            .retention(&kept.id, kept.revision, false, None)
+            .unwrap();
+        let deletion = owner
+            .artifacts
+            .request_delete(
+                &released.id,
+                released.revision,
+                "delete-admission-source",
+                0,
+            )
+            .unwrap();
+        owner.artifacts.execute_delete(&deletion.id).unwrap();
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::GetUrlAdmission {
+            request_token: "receipt-token".into(),
+            reply,
+        });
+        let receipt = rx.await.unwrap().unwrap();
+        assert_eq!(receipt.custody_state, "deleted_by_runner");
+        assert_eq!(receipt.source_cleanup_status.as_deref(), Some("removed"));
+
+        // A missing or reused artifact ID is not proof of deletion.
+        let mut receipt = owner.state.url_admission_receipts[0].clone();
+        receipt.custody_state = "runner_owned".into();
+        receipt.source_cleanup_status = None;
+        receipt.source_generation = Some("different-generation".into());
+        let unchanged = refresh_url_admission_custody(&mut receipt, &owner.artifacts);
+        assert!(!unchanged);
+        assert_eq!(receipt.custody_state, "runner_owned");
+    }
+
+    #[tokio::test]
     async fn writer_retirement_does_not_create_an_allocation_review_hold() {
         let (_tmp, mut owner, _adapter) = control_test_owner();
         owner.state.jobs.push(pending_job(1));
         owner.retiring_writers.insert(JobId(1), Vec::new());
-        assert!(owner.ensure_allocation(JobId(1)).is_err());
+        assert!(owner.ensure_allocation(JobId(1), false).is_err());
         assert!(!owner.state.jobs[0].held());
     }
 
@@ -6744,6 +7796,64 @@ mod tests {
         let (refetch, dupes) = plan_url_refetches(Vec::new());
         assert!(refetch.is_empty());
         assert!(dupes.is_empty());
+    }
+
+    #[test]
+    fn scoped_url_refetch_preserves_distinct_manual_tokens_and_replays_same_token() {
+        let url = "https://indexer.example/release.nzb".to_string();
+        let request = |job, token: &str| UrlFetchRequest {
+            job: JobId(job),
+            url: url.clone(),
+            request_token: Some(token.into()),
+            manual_additional: true,
+        };
+        let (refetch, dupes) = plan_url_refetches_scoped(vec![
+            request(10, "transfer-a"),
+            request(11, "transfer-b"),
+            request(12, "transfer-a"),
+        ]);
+        assert_eq!(refetch, vec![(JobId(10), url.clone()), (JobId(11), url)]);
+        assert_eq!(dupes, vec![(JobId(12), JobId(10))]);
+    }
+
+    #[test]
+    fn scoped_url_refetch_does_not_collapse_manual_additional_without_token() {
+        let url = "https://indexer.example/release.nzb".to_string();
+        let request = |job| UrlFetchRequest {
+            job: JobId(job),
+            url: url.clone(),
+            request_token: None,
+            manual_additional: true,
+        };
+        let (refetch, dupes) = plan_url_refetches_scoped(vec![request(20), request(21)]);
+        assert_eq!(refetch, vec![(JobId(20), url.clone()), (JobId(21), url)]);
+        assert!(dupes.is_empty());
+    }
+
+    #[test]
+    fn token_replay_matches_terminal_job_without_overwriting_changed_submission() {
+        let url = "https://indexer.example/release.nzb";
+        let mut original = bare_job();
+        original.id = JobId(31);
+        original.status = JobStatus::Failed;
+        original.params = vec![
+            ("*URL".into(), url.into()),
+            ("monarr-transfer".into(), "transfer-31".into()),
+            ("monarr-delivery".into(), "1".into()),
+            ("monarr-manual-additional".into(), "1".into()),
+        ];
+        let jobs = vec![original.clone()];
+        let replay = find_url_request(&jobs, url, Some("transfer-31"), true).unwrap();
+        assert_eq!(replay.id, JobId(31));
+        assert!(url_request_matches(replay, url, true, true));
+        assert!(!url_request_matches(
+            replay,
+            "https://indexer.example/another.nzb",
+            true,
+            true
+        ));
+        assert!(!url_request_matches(replay, url, false, true));
+        assert!(find_url_request(&jobs, url, Some("new-transfer"), true).is_none());
     }
 
     #[test]

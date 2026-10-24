@@ -20,3 +20,9 @@ hex = "0.4"
 subtle = "2"
 tracing = { workspace = true }
 
+[dev-dependencies]
+http-body-util = { workspace = true }
+nzbd-torrent = { workspace = true }
+tempfile = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+
