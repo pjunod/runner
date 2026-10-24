@@ -12,7 +12,7 @@
     "scheme": "nzbd",
     "ios": {
       "bundleIdentifier": "com.pjunod.nzbd",
-      "buildNumber": "11",
+      "buildNumber": "12",
       "supportsTablet": true,
       "requireFullScreen": false,
       "config": {
