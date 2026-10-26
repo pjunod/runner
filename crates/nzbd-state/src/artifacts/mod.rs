@@ -1137,7 +1137,9 @@ impl Inventory {
             // field exactly; filesystem identity equality intentionally has
             // looser remount semantics and is not sidecar authority.
             let marker_identity: Option<Identity> =
-                serde_json::from_value(data["identity"].clone())?;
+                serde_json::from_value(data["identity"].clone()).map_err(|_| {
+                    Error::Conflict("external allocation identity does not match inventory".into())
+                })?;
             if data["installation"] != self.installation
                 || data["artifact"] != a.id
                 || data["generation"] != a.generation

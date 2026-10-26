@@ -74,11 +74,15 @@ fn legacy_allocation_marker_normalizes_only_missing_identity_defaults() {
         ("changed", serde_json::json!("another-change-time")),
         ("inode", serde_json::json!(0)),
         ("bytes", serde_json::json!(0)),
+        ("inode", serde_json::json!("malformed")),
     ] {
         let mut tampered = data.clone();
         tampered["identity"][field] = value;
         std::fs::write(&marker, serde_json::to_vec(&tampered).unwrap()).unwrap();
-        assert!(db.verify(&artifact).is_err(), "{field}");
+        assert!(
+            matches!(db.verify(&artifact), Err(Error::Conflict(_))),
+            "{field}"
+        );
     }
 }
 
