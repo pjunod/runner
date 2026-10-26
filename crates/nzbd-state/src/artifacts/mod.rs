@@ -1131,11 +1131,18 @@ impl Inventory {
                 .join(&a.id)
                 .join(format!("{}.json", a.generation));
             let data: serde_json::Value = serde_json::from_slice(&std::fs::read(marker)?)?;
+            // Normalize schema defaults on both sides. Pre-upgrade sidecars
+            // omit mount_id/changed, while the same inventory identity gains
+            // their empty defaults when deserialized. Compare every recorded
+            // field exactly; filesystem identity equality intentionally has
+            // looser remount semantics and is not sidecar authority.
+            let marker_identity: Option<Identity> =
+                serde_json::from_value(data["identity"].clone())?;
             if data["installation"] != self.installation
                 || data["artifact"] != a.id
                 || data["generation"] != a.generation
                 || data["path"] != a.path.to_string_lossy().as_ref()
-                || data["identity"] != serde_json::to_value(&a.identity)?
+                || serde_json::to_value(&marker_identity)? != serde_json::to_value(&a.identity)?
             {
                 return Err(Error::Conflict(
                     "external allocation identity does not match inventory".into(),
