@@ -49,6 +49,44 @@ fn legacy_mount_identity_requires_same_device() {
 }
 
 #[test]
+fn legacy_allocation_marker_normalizes_only_missing_identity_defaults() {
+    let (_tmp, db, root) = fixture();
+    let mut artifact = parked(&db, &root);
+    let marker = db
+        .state_dir
+        .join("artifact-identities")
+        .join(&artifact.id)
+        .join(format!("{}.json", artifact.generation));
+    artifact.identity.as_mut().unwrap().mount_id.clear();
+    artifact.identity.as_mut().unwrap().changed.clear();
+    db.sidecar(&artifact).unwrap();
+    let mut data: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    data["identity"].as_object_mut().unwrap().remove("mount_id");
+    data["identity"].as_object_mut().unwrap().remove("changed");
+    std::fs::write(&marker, serde_json::to_vec(&data).unwrap()).unwrap();
+    assert!(db.verify(&artifact).is_ok());
+
+    // Normalization must not waive an explicitly different field, even one
+    // ignored by same_object/PartialEq when the other side is legacy.
+    for (field, value) in [
+        ("mount_id", serde_json::json!("another-volume")),
+        ("changed", serde_json::json!("another-change-time")),
+        ("inode", serde_json::json!(0)),
+        ("bytes", serde_json::json!(0)),
+        ("inode", serde_json::json!("malformed")),
+    ] {
+        let mut tampered = data.clone();
+        tampered["identity"][field] = value;
+        std::fs::write(&marker, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        assert!(
+            matches!(db.verify(&artifact), Err(Error::Conflict(_))),
+            "{field}"
+        );
+    }
+}
+
+#[test]
 fn unavailable_root_becoming_available_again_recovers_same_artifact() {
     let (tmp, db, root) = fixture();
     let artifact = parked(&db, &root);
