@@ -1,0 +1,329 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Paul Junod <donujp@gmail.com>
+Date: Tue, 27 Oct 2026 14:11:58 -0400
+Subject: [PATCH] fix(dht_utils): bound the work retained while resolving
+ magnet metadata
+
+read_metainfo_from_peer_receiver wraps each peer connection in a
+128-permit semaphore, but it still creates and keeps one future per
+candidate address before the semaphore is taken, and it keeps every
+unique address in `seen`. The semaphore limits the I/O in flight, not
+the number of queued futures or retained candidates, so a DHT/tracker
+stream that produces peers faster than they are tried grows without
+bound while a magnet is resolving.
+
+Replace the semaphore with explicit queues:
+
+ - at most 128 metadata connections are running (futures are created
+   only when a slot is free);
+ - up to 256 further addresses wait in a pending queue; while both are
+   full, the address stream and the initial address list are not
+   polled, so the producers see backpressure;
+ - `seen` stops growing at 4096 addresses. Past that, new addresses are
+   still tried (they are just no longer de-duplicated), so reaching the
+   limit never ends or stalls the search, and the debug log notes it
+   once.
+
+Initial addresses go through the same admission path as streamed ones
+instead of being pushed up front.
+
+Tests cover the exact queue and de-duplication boundaries, and that
+both an initial and a streamed candidate are actually connected to
+(loopback listeners).
+---
+ crates/librqbit/src/dht_utils.rs | 225 ++++++++++++++++++++++++++++---
+ 1 file changed, 205 insertions(+), 20 deletions(-)
+
+diff --git a/crates/librqbit/src/dht_utils.rs b/crates/librqbit/src/dht_utils.rs
+index f2f35d06..a2fd3ad0 100644
+--- a/crates/librqbit/src/dht_utils.rs
++++ b/crates/librqbit/src/dht_utils.rs
+@@ -1,4 +1,8 @@
+-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
++use std::{
++    collections::{HashSet, VecDeque},
++    net::SocketAddr,
++    sync::Arc,
++};
+ 
+ use anyhow::Context;
+ use buffers::ByteBufOwned;
+@@ -12,6 +16,85 @@ use crate::{
+ };
+ use librqbit_core::hash_id::Id20;
+ 
++const MAX_CONCURRENT_METADATA_PEERS: usize = 128;
++const MAX_PENDING_METADATA_PEERS: usize = 256;
++const MAX_METADATA_PEER_CANDIDATES: usize = 4096;
++
++#[derive(Debug, PartialEq, Eq)]
++enum CandidateAdmission {
++    Admitted,
++    Duplicate,
++    Untracked,
++}
++
++fn admit_metadata_peer(seen: &mut HashSet<SocketAddr>, addr: SocketAddr) -> CandidateAdmission {
++    if seen.contains(&addr) {
++        return CandidateAdmission::Duplicate;
++    }
++    if seen.len() >= MAX_METADATA_PEER_CANDIDATES {
++        return CandidateAdmission::Untracked;
++    }
++    seen.insert(addr);
++    CandidateAdmission::Admitted
++}
++
++struct MetadataPeerQueues<F> {
++    active: FuturesUnordered<F>,
++    pending: VecDeque<SocketAddr>,
++}
++
++impl<F> MetadataPeerQueues<F> {
++    fn new() -> Self {
++        Self {
++            active: FuturesUnordered::new(),
++            pending: VecDeque::new(),
++        }
++    }
++
++    fn can_accept(&self) -> bool {
++        self.active.len() < MAX_CONCURRENT_METADATA_PEERS
++            || self.pending.len() < MAX_PENDING_METADATA_PEERS
++    }
++
++    fn enqueue<M>(&mut self, addr: SocketAddr, make_future: &M) -> bool
++    where
++        M: Fn(SocketAddr) -> F,
++    {
++        if self.active.len() < MAX_CONCURRENT_METADATA_PEERS {
++            self.active.push(make_future(addr));
++            true
++        } else if self.pending.len() < MAX_PENDING_METADATA_PEERS {
++            self.pending.push_back(addr);
++            true
++        } else {
++            false
++        }
++    }
++
++    fn promote_pending<M>(&mut self, make_future: &M)
++    where
++        M: Fn(SocketAddr) -> F,
++    {
++        while self.active.len() < MAX_CONCURRENT_METADATA_PEERS {
++            let Some(addr) = self.pending.pop_front() else {
++                break;
++            };
++            self.active.push(make_future(addr));
++        }
++    }
++
++    fn is_empty(&self) -> bool {
++        self.active.is_empty() && self.pending.is_empty()
++    }
++
++    async fn next(&mut self) -> Option<F::Output>
++    where
++        F: std::future::Future,
++    {
++        self.active.next().await
++    }
++}
++
+ #[derive(Debug)]
+ #[allow(clippy::large_enum_variant)]
+ pub enum ReadMetainfoResult<Rx> {
+@@ -38,16 +121,15 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
+ ) -> ReadMetainfoResult<A> {
+     let mut seen = HashSet::<SocketAddr>::new();
+     let mut addrs = addrs_stream;
+-
+-    let semaphore = tokio::sync::Semaphore::new(128);
++    let mut initial_addrs = VecDeque::from(initial_addrs);
++    let mut initial_addrs_completed = false;
++    let mut candidate_limit_logged = false;
+ 
+     let read_info_guarded = |addr| {
+-        let semaphore = &semaphore;
+         let connector = connector.clone();
+         let client_name_and_version = client_name_and_version.clone();
+         async move {
+-            let token = semaphore.acquire().await?;
+-            let ret = peer_info_reader::read_metainfo_from_peer(
++            peer_info_reader::read_metainfo_from_peer(
+                 addr,
+                 peer_id,
+                 info_hash,
+@@ -60,28 +142,48 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
+             )
+             .instrument(debug_span!("read_metainfo_from_peer", ?addr))
+             .await
+-            .with_context(|| format!("error reading metainfo from {addr}"));
+-            drop(token);
+-            ret
++            .with_context(|| format!("error reading metainfo from {addr}"))
+         }
+     };
+ 
+-    let mut unordered = FuturesUnordered::new();
+-
+-    for a in initial_addrs {
+-        seen.insert(a);
+-        unordered.push(read_info_guarded(a));
+-    }
++    let mut queues = MetadataPeerQueues::new();
+ 
+     let mut addrs_completed = false;
+ 
+     loop {
+-        if addrs_completed && unordered.is_empty() {
++        queues.promote_pending(&read_info_guarded);
++
++        while !initial_addrs_completed && queues.can_accept() {
++            let Some(addr) = initial_addrs.pop_front() else {
++                initial_addrs_completed = true;
++                break;
++            };
++            match admit_metadata_peer(&mut seen, addr) {
++                CandidateAdmission::Admitted => {
++                    let enqueued = queues.enqueue(addr, &read_info_guarded);
++                    debug_assert!(enqueued);
++                }
++                CandidateAdmission::Duplicate => {}
++                CandidateAdmission::Untracked => {
++                    if !candidate_limit_logged {
++                        debug!(
++                            limit = MAX_METADATA_PEER_CANDIDATES,
++                            "metadata peer deduplication limit reached; continuing without tracking new candidates"
++                        );
++                        candidate_limit_logged = true;
++                    }
++                    let enqueued = queues.enqueue(addr, &read_info_guarded);
++                    debug_assert!(enqueued);
++                }
++            }
++        }
++
++        if initial_addrs_completed && addrs_completed && queues.is_empty() {
+             return ReadMetainfoResult::ChannelClosed { seen };
+         }
+ 
+         tokio::select! {
+-            done = unordered.next(), if !unordered.is_empty() => {
++            done = queues.next(), if !queues.active.is_empty() => {
+                 match done {
+                     Some(Ok((info, info_bytes))) => return ReadMetainfoResult::Found { info, info_bytes, seen, rx: addrs },
+                     Some(Err(e)) => {
+@@ -91,11 +193,28 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
+                 }
+             }
+ 
+-            next_addr = addrs.next(), if !addrs_completed => {
++            next_addr = addrs.next(), if initial_addrs_completed
++                && !addrs_completed
++                && queues.can_accept() => {
+                 match next_addr {
+                     Some(addr) => {
+-                        if seen.insert(addr) {
+-                            unordered.push(read_info_guarded(addr));
++                        match admit_metadata_peer(&mut seen, addr) {
++                            CandidateAdmission::Admitted => {
++                                let enqueued = queues.enqueue(addr, &read_info_guarded);
++                                debug_assert!(enqueued);
++                            }
++                            CandidateAdmission::Duplicate => {}
++                            CandidateAdmission::Untracked => {
++                                if !candidate_limit_logged {
++                                    debug!(
++                                        limit = MAX_METADATA_PEER_CANDIDATES,
++                                        "metadata peer deduplication limit reached; continuing without tracking new candidates"
++                                    );
++                                    candidate_limit_logged = true;
++                                }
++                                let enqueued = queues.enqueue(addr, &read_info_guarded);
++                                debug_assert!(enqueued);
++                            }
+                         }
+                         continue;
+                     },
+@@ -114,6 +233,7 @@ mod tests {
+     use librqbit_core::peer_id::generate_peer_id;
+ 
+     use super::*;
++    use crate::stream_connect::StreamConnectorArgs;
+     use std::{
+         str::FromStr,
+         sync::{Arc, Once},
+@@ -121,6 +241,71 @@ mod tests {
+ 
+     static LOG_INIT: Once = Once::new();
+ 
++    #[test]
++    fn production_metadata_queues_close_at_exact_boundaries() {
++        let mut queues = MetadataPeerQueues::new();
++        let make_future = |_| std::future::pending::<()>();
++        for port in 1..=(MAX_CONCURRENT_METADATA_PEERS + MAX_PENDING_METADATA_PEERS) {
++            let addr = SocketAddr::from(([127, 0, 0, 1], u16::try_from(port).unwrap()));
++            assert!(queues.enqueue(addr, &make_future));
++        }
++        assert_eq!(queues.active.len(), MAX_CONCURRENT_METADATA_PEERS);
++        assert_eq!(queues.pending.len(), MAX_PENDING_METADATA_PEERS);
++        assert!(!queues.can_accept());
++        assert!(!queues.enqueue(SocketAddr::from(([127, 0, 0, 2], 1)), &make_future));
++
++        let mut seen = HashSet::new();
++        for port in 1..=MAX_METADATA_PEER_CANDIDATES {
++            let addr = SocketAddr::from(([127, 0, 0, 1], u16::try_from(port).unwrap()));
++            assert_eq!(
++                admit_metadata_peer(&mut seen, addr),
++                CandidateAdmission::Admitted
++            );
++        }
++        let duplicate = SocketAddr::from(([127, 0, 0, 1], 1));
++        assert_eq!(
++            admit_metadata_peer(&mut seen, duplicate),
++            CandidateAdmission::Duplicate
++        );
++        let overflow = SocketAddr::from(([127, 0, 0, 2], 1));
++        assert_eq!(
++            admit_metadata_peer(&mut seen, overflow),
++            CandidateAdmission::Untracked
++        );
++        assert_eq!(seen.len(), MAX_METADATA_PEER_CANDIDATES);
++    }
++
++    #[tokio::test]
++    async fn initial_and_streamed_candidates_are_connected_to() {
++        let initial = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let streamed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let resolver = tokio::spawn(read_metainfo_from_peer_receiver(
++            generate_peer_id(b"-xx1234-"),
++            Id20::new([1; 20]),
++            vec![initial.local_addr().unwrap()],
++            futures::stream::iter([streamed.local_addr().unwrap()])
++                .chain(futures::stream::pending()),
++            None,
++            Arc::new(
++                StreamConnector::new(StreamConnectorArgs {
++                    enable_tcp: true,
++                    ipv4_only: true,
++                    ..Default::default()
++                })
++                .await
++                .unwrap(),
++            ),
++            crate::client_name_and_version().to_owned(),
++        ));
++        for listener in [&initial, &streamed] {
++            tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
++                .await
++                .expect("candidate was never connected to")
++                .unwrap();
++        }
++        resolver.abort();
++    }
++
+     fn init_logging() {
+         #[allow(unused_must_use)]
+         LOG_INIT.call_once(|| {

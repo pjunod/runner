@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Paul Junod <donujp@gmail.com>
+Date: Tue, 27 Oct 2026 13:35:37 -0400
+Subject: [PATCH] feat(peer): let callers cap the BEP 9 metadata size accepted
+ from peers
+
+When fetching a magnet's metadata, the peer advertises the metadata size
+in its extended handshake. rqbit accepts anything up to a hardcoded
+32 MiB and allocates a buffer of that size before it has seen a single
+byte of the metainfo. An application that wants a tighter limit (most
+real info dictionaries are well under 1 MiB) has no way to enforce it.
+
+Add PeerConnectionOptions::max_metadata_size (Option<u32>). It merges
+through the existing session/per-add peer options path like the other
+fields. When unset, the existing 32 MiB ceiling applies, so default
+behaviour does not change.
+
+The size check also moves ahead of the Unchoke/Interested messages, so a
+peer advertising an oversized value is dropped before we send it
+anything. The error message now reports the configured maximum.
+---
+ crates/librqbit/src/peer_connection.rs      |  4 +++
+ crates/librqbit/src/peer_info_reader/mod.rs | 40 +++++++++++++++++----
+ crates/librqbit/src/session.rs              |  1 +
+ 3 files changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/crates/librqbit/src/peer_connection.rs b/crates/librqbit/src/peer_connection.rs
+index ca2690c5..32130faa 100644
+--- a/crates/librqbit/src/peer_connection.rs
++++ b/crates/librqbit/src/peer_connection.rs
+@@ -83,6 +83,10 @@ pub struct PeerConnectionOptions {
+     /// one at a stream's read position after a seek, is requested only after
+     /// those, so a smaller window makes streams react faster to seeks.
+     pub max_request_window: Option<usize>,
++
++    /// Maximum BEP 9 metadata size accepted from a peer before allocation.
++    /// Defaults to 32 MiB when unset.
++    pub max_metadata_size: Option<u32>,
+ }
+ 
+ pub(crate) struct PeerConnection<H> {
+diff --git a/crates/librqbit/src/peer_info_reader/mod.rs b/crates/librqbit/src/peer_info_reader/mod.rs
+index 94fcb878..48a16e1e 100644
+--- a/crates/librqbit/src/peer_info_reader/mod.rs
++++ b/crates/librqbit/src/peer_info_reader/mod.rs
+@@ -30,6 +30,8 @@ use crate::{
+     stream_connect::{ConnectionKind, StreamConnector},
+ };
+ 
++const DEFAULT_MAX_METADATA_SIZE: u32 = 32 * 1024 * 1024;
++
+ pub(crate) async fn read_metainfo_from_peer(
+     addr: SocketAddr,
+     peer_id: Id20,
+@@ -39,6 +41,9 @@ pub(crate) async fn read_metainfo_from_peer(
+     connector: Arc<StreamConnector>,
+     client_name_and_version: String,
+ ) -> anyhow::Result<TorrentAndInfoBytes> {
++    let max_metadata_size = peer_connection_options
++        .and_then(|options| options.max_metadata_size)
++        .unwrap_or(DEFAULT_MAX_METADATA_SIZE);
+     let (result_tx, result_rx) = tokio::sync::oneshot::channel::<
+         Result<(TorrentMetaV1Info<ByteBufOwned>, ByteBufOwned), bencode::DeserializeError>,
+     >();
+@@ -50,6 +55,7 @@ pub(crate) async fn read_metainfo_from_peer(
+         result_tx: Mutex::new(Some(result_tx)),
+         locked: RwLock::new(None),
+         client_name_and_version,
++        max_metadata_size,
+     };
+     let connection = PeerConnection::new(
+         addr,
+@@ -83,9 +89,13 @@ struct HandlerLocked {
+ }
+ 
+ impl HandlerLocked {
+-    fn new(metadata_size: u32) -> anyhow::Result<Self> {
+-        if metadata_size > 32 * 1024 * 1024 {
+-            anyhow::bail!("metadata size {} is too big", metadata_size);
++    fn new(metadata_size: u32, max_metadata_size: u32) -> anyhow::Result<Self> {
++        if metadata_size > max_metadata_size {
++            anyhow::bail!(
++                "metadata size {} exceeds configured maximum {}",
++                metadata_size,
++                max_metadata_size
++            );
+         }
+         let buffer = vec![0u8; metadata_size as usize];
+         let total_pieces: usize = (metadata_size as u64)
+@@ -160,6 +170,7 @@ struct Handler {
+     >,
+     locked: RwLock<Option<HandlerLocked>>,
+     client_name_and_version: String,
++    max_metadata_size: u32,
+ }
+ 
+ impl PeerConnectionHandler for Handler {
+@@ -235,14 +246,14 @@ impl PeerConnectionHandler for Handler {
+             anyhow::bail!("peer does not support ut_metadata");
+         }
+ 
++        let inner = HandlerLocked::new(metadata_size, self.max_metadata_size)?;
++        let total_pieces = inner.total_pieces;
++
+         self.writer_tx
+             .send(WriterRequest::Message(Message::Unchoke))?;
+         self.writer_tx
+             .send(WriterRequest::Message(Message::Interested))?;
+ 
+-        let inner = HandlerLocked::new(metadata_size)?;
+-        let total_pieces = inner.total_pieces;
+-
+         self.locked.write().replace(inner);
+ 
+         for i in 0..total_pieces {
+@@ -262,3 +273,20 @@ impl PeerConnectionHandler for Handler {
+         &self.client_name_and_version
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::HandlerLocked;
++
++    #[test]
++    fn configured_metadata_limit_is_checked_before_allocation() {
++        let accepted = HandlerLocked::new(3, 3).unwrap();
++        assert_eq!(accepted.buffer.len(), 3);
++
++        let error = HandlerLocked::new(4, 3).err().expect("limit must reject");
++        assert_eq!(
++            error.to_string(),
++            "metadata size 4 exceeds configured maximum 3"
++        );
++    }
++}
+diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
+index 5e024154..0bcf7ce8 100644
+--- a/crates/librqbit/src/session.rs
++++ b/crates/librqbit/src/session.rs
+@@ -1048,6 +1048,7 @@ impl Session {
+             max_request_window: other
+                 .max_request_window
+                 .or(self.peer_opts.max_request_window),
++            max_metadata_size: other.max_metadata_size.or(self.peer_opts.max_metadata_size),
+         }
+     }
+ 

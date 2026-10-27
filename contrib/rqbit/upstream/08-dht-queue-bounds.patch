@@ -1,0 +1,715 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Paul Junod <donujp@gmail.com>
+Date: Tue, 27 Oct 2026 14:04:40 -0400
+Subject: [PATCH] fix(dht): bound the DHT worker queues and per-lookup
+ concurrency
+
+Several DHT queues are unbounded channels, and a lookup can start every
+request queued on it, so a slow UDP writer or a slow consumer of
+discovered peers lets work and memory pile up without a limit:
+
+ - the datagram queue feeding the socket writer;
+ - the per-lookup queues of nodes still to be queried and of peers found;
+ - the FuturesUnordered sets that run recursive requests, bucket
+   refreshes and pings (all of them poll as many as are queued).
+
+Make them bounded:
+
+ - Outgoing datagrams: 256. A locally initiated request awaits a free
+   slot before it allocates a transaction id and registers itself as
+   in-flight. Replies and untracked announces are best-effort and are
+   dropped when the queue is full, since awaiting in the receive path
+   would stop reading the socket.
+ - Recursive-node queue: 256, with at most 32 requests running per
+   lookup worker. The future set is a small BoundedFuturesUnordered that
+   refuses a 33rd push, and the select loops stop receiving while it is
+   full. A node dropped because the queue is full is found again by the
+   periodic requery of the routing table. A full root queue is reported
+   as Saturated (normal requery interval) rather than as empty, which
+   would make the worker retry every second.
+ - Delivered-peer queue: 256, best-effort (a full queue drops the peer).
+ - Bucket refresh and questionable-node ping queues: 256 entries and 32
+   concurrent requests per worker.
+
+Bootstrap fan-out is left as it is: its input is the finite configured
+list.
+
+Tests check each limit at its exact boundary (accepts N, rejects N+1,
+accepts again after one is consumed).
+---
+ crates/dht/src/dht.rs | 383 ++++++++++++++++++++++++++++++------------
+ 1 file changed, 279 insertions(+), 104 deletions(-)
+
+diff --git a/crates/dht/src/dht.rs b/crates/dht/src/dht.rs
+index cb418f41..4f3ea40a 100644
+--- a/crates/dht/src/dht.rs
++++ b/crates/dht/src/dht.rs
+@@ -38,7 +38,7 @@ use librqbit_dualstack_sockets::{BindDevice, UdpSocket};
+ use parking_lot::RwLock;
+ 
+ use serde::Serialize;
+-use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel};
++use tokio::sync::mpsc::{Receiver, Sender, channel, error::TrySendError};
+ 
+ use tokio_util::sync::CancellationToken;
+ use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
+@@ -67,6 +67,83 @@ pub struct WorkerSendRequest {
+     addr: SocketAddr,
+ }
+ 
++const MAX_PENDING_DHT_SENDS: usize = 256;
++const MAX_PENDING_DISCOVERED_PEERS: usize = 256;
++const MAX_PENDING_RECURSIVE_NODES: usize = 256;
++const MAX_CONCURRENT_RECURSIVE_REQUESTS: usize = 32;
++const MAX_PENDING_MAINTENANCE_REQUESTS: usize = 256;
++const MAX_CONCURRENT_MAINTENANCE_REQUESTS: usize = 32;
++
++type RecursiveNode = (Option<Id20>, SocketAddr, usize);
++
++fn worker_send_channel() -> (Sender<WorkerSendRequest>, Receiver<WorkerSendRequest>) {
++    channel(MAX_PENDING_DHT_SENDS)
++}
++
++fn discovered_peer_channel() -> (Sender<SocketAddr>, Receiver<SocketAddr>) {
++    channel(MAX_PENDING_DISCOVERED_PEERS)
++}
++
++fn recursive_node_channel() -> (Sender<RecursiveNode>, Receiver<RecursiveNode>) {
++    channel(MAX_PENDING_RECURSIVE_NODES)
++}
++
++fn maintenance_channel<T>() -> (Sender<T>, Receiver<T>) {
++    channel(MAX_PENDING_MAINTENANCE_REQUESTS)
++}
++
++struct BoundedFuturesUnordered<F> {
++    futures: FuturesUnordered<F>,
++    limit: usize,
++}
++
++impl<F> BoundedFuturesUnordered<F> {
++    fn new(limit: usize) -> Self {
++        Self {
++            futures: FuturesUnordered::new(),
++            limit,
++        }
++    }
++
++    fn try_push(&self, future: F) -> Result<(), F> {
++        if self.futures.len() >= self.limit {
++            return Err(future);
++        }
++        self.futures.push(future);
++        Ok(())
++    }
++
++    fn is_empty(&self) -> bool {
++        self.futures.is_empty()
++    }
++
++    fn is_full(&self) -> bool {
++        self.futures.len() >= self.limit
++    }
++
++    async fn next(&mut self) -> Option<F::Output>
++    where
++        F: std::future::Future,
++    {
++        self.futures.next().await
++    }
++}
++
++#[derive(Debug, PartialEq, Eq)]
++enum RootQueueStatus {
++    Empty,
++    Queued(usize),
++    Saturated,
++}
++
++fn root_queue_delay(status: &RootQueueStatus) -> Duration {
++    match status {
++        RootQueueStatus::Empty => Duration::from_secs(1),
++        RootQueueStatus::Queued(n) if *n < 8 => REQUERY_INTERVAL / 8 * (*n as u32),
++        RootQueueStatus::Queued(_) | RootQueueStatus::Saturated => REQUERY_INTERVAL,
++    }
++}
++
+ #[derive(Debug)]
+ struct MaybeUsefulNode {
+     id: Id20,
+@@ -149,11 +226,13 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
+             addr,
+         );
+ 
+-        let _ = req.dht.worker_sender.send(WorkerSendRequest {
++        if let Err(error) = req.dht.try_send_worker(WorkerSendRequest {
+             our_tid: Some(tid),
+             message,
+             addr,
+-        });
++        }) {
++            debug!(?error, "failed to enqueue DHT announce");
++        }
+     }
+ }
+ 
+@@ -192,22 +271,22 @@ struct RecursiveRequest<C: RecursiveRequestCallbacks> {
+     request: Request,
+     dht: Arc<DhtState>,
+     useful_nodes: RwLock<Vec<MaybeUsefulNode>>,
+-    peer_tx: tokio::sync::mpsc::UnboundedSender<SocketAddr>,
+-    node_tx: tokio::sync::mpsc::UnboundedSender<(Option<Id20>, SocketAddr, usize)>,
++    peer_tx: Sender<SocketAddr>,
++    node_tx: Sender<RecursiveNode>,
+     callbacks: C,
+ }
+ 
+ pub struct RequestPeersStream {
+-    rx: tokio::sync::mpsc::UnboundedReceiver<SocketAddr>,
++    rx: Receiver<SocketAddr>,
+     cancel_join_handle_v4: tokio::task::JoinHandle<()>,
+     cancel_join_handle_v6: tokio::task::JoinHandle<()>,
+ }
+ 
+ impl RequestPeersStream {
+     fn new(dht: Arc<DhtState>, info_hash: Id20, announce_port: Option<u16>) -> Self {
+-        let (peer_tx, peer_rx) = unbounded_channel();
+-        let make = |is_v4: bool, dht: Arc<DhtState>, peer_tx: UnboundedSender<SocketAddr>| {
+-            let (node_tx, node_rx) = unbounded_channel();
++        let (peer_tx, peer_rx) = discovered_peer_channel();
++        let make = |is_v4: bool, dht: Arc<DhtState>, peer_tx: Sender<SocketAddr>| {
++            let (node_tx, node_rx) = recursive_node_channel();
+             let rp = Arc::new(RecursiveRequest {
+                 max_depth: 4,
+                 info_hash,
+@@ -264,7 +343,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
+         target: Id20,
+         addrs: impl Iterator<Item = SocketAddr>,
+     ) -> crate::Result<()> {
+-        let (node_tx, mut node_rx) = unbounded_channel();
++        let (node_tx, mut node_rx) = recursive_node_channel();
+         let req = RecursiveRequest {
+             max_depth: 4,
+             info_hash: target,
+@@ -272,7 +351,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
+             dht,
+             useful_nodes_limit: 32,
+             useful_nodes: RwLock::new(Vec::new()),
+-            peer_tx: unbounded_channel().0,
++            peer_tx: discovered_peer_channel().0,
+             node_tx,
+             callbacks: RecursiveRequestCallbacksFindNodes {},
+         };
+@@ -290,33 +369,33 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
+                 ))
+         };
+ 
+-        let mut futs = FuturesUnordered::new();
+-
+         let mut initial_addrs = 0;
+         for addr in addrs {
+-            futs.push(request_one(None, addr, 0));
+-            initial_addrs += 1;
++            match req.node_tx.try_send((None, addr, 0)) {
++                Ok(()) => initial_addrs += 1,
++                Err(TrySendError::Full(_)) => break,
++                Err(TrySendError::Closed(_)) => return Err(Error::DhtDead),
++            }
+         }
+ 
++        let mut futs = BoundedFuturesUnordered::new(MAX_CONCURRENT_RECURSIVE_REQUESTS);
+         let mut successes = 0;
+         let mut errors = 0;
+ 
+         loop {
++            if futs.is_empty() && node_rx.is_empty() {
++                break;
++            }
+             tokio::select! {
+                 biased;
+ 
+-                r = node_rx.recv() => {
+-                    let (id, addr, depth) = r.unwrap();
+-                    futs.push(request_one(id, addr, depth))
+-                },
+-                f = futs.next() => {
+-                    let f = match f {
+-                        Some(f) => f,
+-                        None => {
+-                            // find_node recursion finished.
+-                            break;
+-                        }
++                r = node_rx.recv(), if !futs.is_full() => {
++                    let Some((id, addr, depth)) = r else {
++                        break;
+                     };
++                    assert!(futs.try_push(request_one(id, addr, depth)).is_ok());
++                },
++                Some(f) = futs.next(), if !futs.is_empty() => {
+                     if f.is_ok() {
+                         successes += 1;
+                     } else {
+@@ -338,7 +417,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
+ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
+     fn request_peers_forever(
+         self: &Arc<Self>,
+-        mut node_rx: tokio::sync::mpsc::UnboundedReceiver<(Option<Id20>, SocketAddr, usize)>,
++        mut node_rx: Receiver<RecursiveNode>,
+         is_v4: bool,
+     ) -> tokio::task::JoinHandle<()> {
+         let this = self.clone();
+@@ -354,9 +433,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
+                         loop {
+                             trace!("iteration {}", iteration);
+                             let sleep = match this.get_peers_root(is_v4) {
+-                                Ok(0) => Duration::from_secs(1),
+-                                Ok(n) if n < 8 => REQUERY_INTERVAL / 8 * (n as u32),
+-                                Ok(_) => REQUERY_INTERVAL,
++                                Ok(status) => root_queue_delay(&status),
+                                 Err(e) => {
+                                     error!("dht: error in get_peers_root(): {e:#}");
+                                     return Err::<(), crate::Error>(e);
+@@ -369,16 +446,16 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
+                 };
+                 tokio::pin!(looper);
+ 
+-                let mut futs = FuturesUnordered::new();
++                let mut futs = BoundedFuturesUnordered::new(MAX_CONCURRENT_RECURSIVE_REQUESTS);
+                 loop {
+                     tokio::select! {
+-                        addr = node_rx.recv() => {
++                        addr = node_rx.recv(), if !futs.is_full() => {
+                             let (id, addr, depth) = addr.unwrap();
+-                            futs.push(
++                            assert!(futs.try_push(
+                                 this.request_one(id, addr, depth)
+                                     .map_err(|e| debug!("error: {e:#}"))
+                                     .instrument(debug_span!("addr", addr=addr.to_string()))
+-                            );
++                            ).is_ok());
+                         }
+                         Some(_) = futs.next(), if !futs.is_empty() => {}
+                         r = &mut looper => {
+@@ -390,7 +467,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
+         )
+     }
+ 
+-    fn get_peers_root(&self, is_v4: bool) -> crate::Result<usize> {
++    fn get_peers_root(&self, is_v4: bool) -> crate::Result<RootQueueStatus> {
+         let mut count = 0;
+         let table = if is_v4 {
+             &self.dht.routing_table_v4
+@@ -404,14 +481,18 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
+             .map(|n| (n.id(), n.addr()))
+             .take(8)
+         {
+-            count += 1;
+-            self.node_tx
+-                .send((Some(id), addr, 0))
+-                .ok()
+-                .ok_or(Error::DhtDead)?;
++            match self.node_tx.try_send((Some(id), addr, 0)) {
++                Ok(()) => count += 1,
++                Err(TrySendError::Full(_)) => return Ok(RootQueueStatus::Saturated),
++                Err(TrySendError::Closed(_)) => return Err(Error::DhtDead),
++            }
+         }
+ 
+-        Ok(count)
++        if count == 0 {
++            Ok(RootQueueStatus::Empty)
++        } else {
++            Ok(RootQueueStatus::Queued(count))
++        }
+     }
+ }
+ 
+@@ -451,7 +532,14 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
+ 
+         if let Some(peers) = response.values {
+             for peer in peers {
+-                self.peer_tx.send(peer.0).ok().ok_or(Error::ReceiverDead)?;
++                let addr = peer.0;
++                match self.peer_tx.try_send(addr) {
++                    Ok(()) => {}
++                    Err(TrySendError::Full(_)) => {
++                        trace!(%addr, "discovered peer queue is full, dropping peer")
++                    }
++                    Err(TrySendError::Closed(_)) => return Err(Error::ReceiverDead),
++                }
+             }
+         }
+ 
+@@ -476,10 +564,13 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
+                 should_request, node.id, node.addr, depth, self.max_depth
+             );
+             if should_request {
+-                self.node_tx
+-                    .send((Some(node.id), node.addr, depth + 1))
+-                    .ok()
+-                    .ok_or(Error::ReceiverDead)?;
++                match self.node_tx.try_send((Some(node.id), node.addr, depth + 1)) {
++                    Ok(()) => {}
++                    Err(TrySendError::Full(_)) => {
++                        trace!(addr = %node.addr, "recursive request queue is full, dropping node")
++                    }
++                    Err(TrySendError::Closed(_)) => return Err(Error::ReceiverDead),
++                }
+             }
+         }
+         Ok(())
+@@ -585,7 +676,7 @@ pub struct DhtState {
+     // Sending requests to the worker.
+     rate_limiter: RateLimiter,
+     // This is to send raw messages
+-    worker_sender: UnboundedSender<WorkerSendRequest>,
++    worker_sender: Sender<WorkerSendRequest>,
+ 
+     cancellation_token: CancellationToken,
+ 
+@@ -595,7 +686,7 @@ pub struct DhtState {
+ impl DhtState {
+     fn new_internal(
+         id: Id20,
+-        sender: UnboundedSender<WorkerSendRequest>,
++        sender: Sender<WorkerSendRequest>,
+         routing_table_v4: Option<RoutingTable>,
+         routing_table_v6: Option<RoutingTable>,
+         listen_addr: SocketAddr,
+@@ -618,25 +709,35 @@ impl DhtState {
+         }
+     }
+ 
++    fn try_send_worker(&self, request: WorkerSendRequest) -> crate::Result<()> {
++        match self.worker_sender.try_send(request) {
++            Ok(()) => Ok(()),
++            Err(TrySendError::Full(_)) => {
++                debug!("DHT send queue is full, dropping untracked datagram");
++                Ok(())
++            }
++            Err(TrySendError::Closed(_)) => Err(Error::DhtDead),
++        }
++    }
++
+     async fn request(&self, request: Request, addr: SocketAddr) -> crate::Result<ResponseOrError> {
+         self.rate_limiter.acquire_one().await;
++        let permit = self
++            .worker_sender
++            .reserve()
++            .await
++            .map_err(|_| Error::DhtDead)?;
+         let (tid, message) = self.create_request(request, addr);
+         let key = (tid, addr);
+         let (tx, rx) = tokio::sync::oneshot::channel();
+         self.inflight_by_transaction_id
+             .insert(key, OutstandingRequest { done: tx });
+         trace!("sending {message:?}");
+-        match self.worker_sender.send(WorkerSendRequest {
++        permit.send(WorkerSendRequest {
+             our_tid: Some(tid),
+             message,
+             addr,
+-        }) {
+-            Ok(_) => {}
+-            Err(_) => {
+-                self.inflight_by_transaction_id.remove(&key);
+-                return Err(Error::DhtDead);
+-            }
+-        };
++        });
+         match tokio::time::timeout(RESPONSE_TIMEOUT, rx).await {
+             Ok(Ok(r)) => r.map(|r| {
+                 trace!("received {r:?}");
+@@ -827,14 +928,11 @@ impl DhtState {
+                 self.get_table_for_addr(addr)
+                     .write()
+                     .mark_last_query(&req.id, now());
+-                self.worker_sender
+-                    .send(WorkerSendRequest {
+-                        our_tid: None,
+-                        message,
+-                        addr,
+-                    })
+-                    .ok()
+-                    .ok_or(Error::DhtDead)?;
++                self.try_send_worker(WorkerSendRequest {
++                    our_tid: None,
++                    message,
++                    addr,
++                })?;
+                 Ok(())
+             }
+             MessageKind::AnnouncePeer(ann) => {
+@@ -852,14 +950,11 @@ impl DhtState {
+                         ..Default::default()
+                     }),
+                 };
+-                self.worker_sender
+-                    .send(WorkerSendRequest {
+-                        our_tid: None,
+-                        message,
+-                        addr,
+-                    })
+-                    .ok()
+-                    .ok_or(Error::DhtDead)?;
++                self.try_send_worker(WorkerSendRequest {
++                    our_tid: None,
++                    message,
++                    addr,
++                })?;
+                 Ok(())
+             }
+             MessageKind::GetPeersRequest(req) => {
+@@ -885,14 +980,11 @@ impl DhtState {
+                         )),
+                     }),
+                 };
+-                self.worker_sender
+-                    .send(WorkerSendRequest {
+-                        our_tid: None,
+-                        message,
+-                        addr,
+-                    })
+-                    .ok()
+-                    .ok_or(Error::DhtDead)?;
++                self.try_send_worker(WorkerSendRequest {
++                    our_tid: None,
++                    message,
++                    addr,
++                })?;
+                 Ok(())
+             }
+             MessageKind::FindNodeRequest(req) => {
+@@ -914,14 +1006,11 @@ impl DhtState {
+                         ..Default::default()
+                     }),
+                 };
+-                self.worker_sender
+-                    .send(WorkerSendRequest {
+-                        our_tid: None,
+-                        message,
+-                        addr,
+-                    })
+-                    .ok()
+-                    .ok_or(Error::DhtDead)?;
++                self.try_send_worker(WorkerSendRequest {
++                    our_tid: None,
++                    message,
++                    addr,
++                })?;
+                 Ok(())
+             }
+             _ => unreachable!(),
+@@ -1052,7 +1141,7 @@ impl DhtWorker {
+     }
+ 
+     async fn bucket_refresher(&self, is_v4: bool) -> crate::Result<()> {
+-        let (tx, mut rx) = unbounded_channel();
++        let (tx, mut rx) = maintenance_channel();
+ 
+         let table = if is_v4 {
+             &self.dht.routing_table_v4
+@@ -1060,7 +1149,7 @@ impl DhtWorker {
+             &self.dht.routing_table_v6
+         };
+ 
+-        let mut futs = FuturesUnordered::new();
++        let mut futs = BoundedFuturesUnordered::new(MAX_CONCURRENT_MAINTENANCE_REQUESTS);
+         let filler = async {
+             let mut interval = tokio::time::interval(INACTIVITY_TIMEOUT);
+             interval.tick().await;
+@@ -1074,9 +1163,11 @@ impl DhtWorker {
+                     if now - bucket.leaf.last_refreshed < INACTIVITY_TIMEOUT {
+                         continue;
+                     }
+-                    found += 1;
+                     let random_id = bucket.random_within();
+-                    tx.send(random_id).unwrap();
++                    if tx.try_send(random_id).is_err() {
++                        break;
++                    }
++                    found += 1;
+                 }
+                 trace!("iteration {}, refreshing {} buckets", iteration, found);
+                 iteration += 1;
+@@ -1088,7 +1179,7 @@ impl DhtWorker {
+         loop {
+             tokio::select! {
+                 _ = &mut filler => {},
+-                random_id = rx.recv() => {
++                random_id = rx.recv(), if !futs.is_full() => {
+                     let random_id = random_id.unwrap();
+                     let addrs = table
+                         .read()
+@@ -1096,11 +1187,11 @@ impl DhtWorker {
+                         .iter()
+                         .map(|n| n.addr())
+                         .take(8).collect::<Vec<_>>();
+-                    futs.push(
++                    assert!(futs.try_push(
+                         RecursiveRequest::find_node_for_routing_table(
+                             self.dht.clone(), random_id, addrs.into_iter()
+                         ).instrument(debug_span!("refresh_bucket"))
+-                    );
++                    ).is_ok());
+                 },
+                 _ = futs.next(), if !futs.is_empty() => {},
+             }
+@@ -1113,9 +1204,9 @@ impl DhtWorker {
+         } else {
+             &self.dht.routing_table_v6
+         };
+-        let mut futs = FuturesUnordered::new();
++        let mut futs = BoundedFuturesUnordered::new(MAX_CONCURRENT_MAINTENANCE_REQUESTS);
+         let mut interval = tokio::time::interval(INACTIVITY_TIMEOUT / 4);
+-        let (tx, mut rx) = unbounded_channel();
++        let (tx, mut rx) = maintenance_channel();
+         let looper = async {
+             let mut iteration = 0;
+             loop {
+@@ -1127,8 +1218,10 @@ impl DhtWorker {
+                         node.status(now),
+                         NodeStatus::Questionable | NodeStatus::Unknown
+                     ) {
++                        if tx.try_send((node.id(), node.addr())).is_err() {
++                            break;
++                        }
+                         found += 1;
+-                        tx.send((node.id(), node.addr())).unwrap();
+                     }
+                 }
+                 trace!("iteration {}, pinging {} nodes", iteration, found);
+@@ -1141,9 +1234,9 @@ impl DhtWorker {
+         loop {
+             tokio::select! {
+                 _ = &mut looper => {},
+-                r = rx.recv() => {
++                r = rx.recv(), if !futs.is_full() => {
+                     let (id, addr) = r.unwrap();
+-                    futs.push(async move {
++                    assert!(futs.try_push(async move {
+                         table.write().mark_outgoing_request(&id, now());
+                         match self.dht.request(Request::Ping, addr).await {
+                             Ok(_) => {
+@@ -1154,7 +1247,7 @@ impl DhtWorker {
+                                 debug!("error: {e:#}");
+                             }
+                         }
+-                    }.instrument(debug_span!("ping", addr=addr.to_string())))
++                    }.instrument(debug_span!("ping", addr=addr.to_string()))).is_ok());
+                 },
+                 _ = futs.next(), if !futs.is_empty() => {},
+             }
+@@ -1164,7 +1257,7 @@ impl DhtWorker {
+     async fn framer(
+         &self,
+         socket: &UdpSocket,
+-        mut input_rx: UnboundedReceiver<WorkerSendRequest>,
++        mut input_rx: Receiver<WorkerSendRequest>,
+         output_tx: Sender<(Message<ByteBufOwned>, SocketAddr)>,
+     ) -> crate::Result<()> {
+         let writer = async {
+@@ -1225,7 +1318,7 @@ impl DhtWorker {
+ 
+     async fn start(
+         self,
+-        in_rx: UnboundedReceiver<WorkerSendRequest>,
++        in_rx: Receiver<WorkerSendRequest>,
+         bootstrap_addrs: &[String],
+     ) -> crate::Result<()> {
+         let (out_tx, mut out_rx) = channel(1);
+@@ -1345,7 +1438,7 @@ impl DhtState {
+ 
+             let token = config.cancellation_token.take().unwrap_or_default();
+ 
+-            let (in_tx, in_rx) = unbounded_channel();
++            let (in_tx, in_rx) = worker_send_channel();
+             let state = Arc::new(Self::new_internal(
+                 peer_id,
+                 in_tx,
+@@ -1499,3 +1592,85 @@ mod tests {
+         assert_answers_ping(&dht).await;
+     }
+ }
++
++#[cfg(test)]
++mod queue_budget_tests {
++    use super::*;
++
++    fn worker_request() -> WorkerSendRequest {
++        WorkerSendRequest {
++            our_tid: None,
++            message: Message {
++                transaction_id: ByteBufOwned::from(&[0, 1][..]),
++                version: None,
++                ip: None,
++                kind: MessageKind::PingRequest(PingRequest {
++                    id: Id20::new([0; 20]),
++                }),
++            },
++            addr: SocketAddr::from(([127, 0, 0, 1], 6881)),
++        }
++    }
++
++    #[tokio::test]
++    async fn queue_budgets_close_at_exact_boundaries() {
++        let (worker_tx, mut worker_rx) = worker_send_channel();
++        for _ in 0..MAX_PENDING_DHT_SENDS {
++            worker_tx.try_send(worker_request()).unwrap();
++        }
++        assert!(matches!(
++            worker_tx.try_send(worker_request()),
++            Err(TrySendError::Full(_))
++        ));
++        assert!(worker_rx.recv().await.is_some());
++        worker_tx.try_send(worker_request()).unwrap();
++
++        let addr = SocketAddr::from(([127, 0, 0, 1], 6881));
++        let (peer_tx, mut peer_rx) = discovered_peer_channel();
++        for _ in 0..MAX_PENDING_DISCOVERED_PEERS {
++            peer_tx.try_send(addr).unwrap();
++        }
++        assert!(matches!(peer_tx.try_send(addr), Err(TrySendError::Full(_))));
++        assert_eq!(peer_rx.recv().await, Some(addr));
++        peer_tx.try_send(addr).unwrap();
++
++        let (node_tx, mut node_rx) = recursive_node_channel();
++        for _ in 0..MAX_PENDING_RECURSIVE_NODES {
++            node_tx.try_send((None, addr, 0)).unwrap();
++        }
++        assert!(matches!(
++            node_tx.try_send((None, addr, 0)),
++            Err(TrySendError::Full(_))
++        ));
++        assert!(node_rx.recv().await.is_some());
++        node_tx.try_send((None, addr, 0)).unwrap();
++
++        let recursive = BoundedFuturesUnordered::new(MAX_CONCURRENT_RECURSIVE_REQUESTS);
++        for _ in 0..MAX_CONCURRENT_RECURSIVE_REQUESTS {
++            assert!(recursive.try_push(std::future::pending::<()>()).is_ok());
++        }
++        assert!(recursive.try_push(std::future::pending::<()>()).is_err());
++
++        let (maintenance_tx, mut maintenance_rx) = maintenance_channel();
++        for _ in 0..MAX_PENDING_MAINTENANCE_REQUESTS {
++            maintenance_tx.try_send(Id20::new([0; 20])).unwrap();
++        }
++        assert!(matches!(
++            maintenance_tx.try_send(Id20::new([0; 20])),
++            Err(TrySendError::Full(_))
++        ));
++        assert!(maintenance_rx.recv().await.is_some());
++        maintenance_tx.try_send(Id20::new([0; 20])).unwrap();
++
++        let maintenance = BoundedFuturesUnordered::new(MAX_CONCURRENT_MAINTENANCE_REQUESTS);
++        for _ in 0..MAX_CONCURRENT_MAINTENANCE_REQUESTS {
++            assert!(maintenance.try_push(std::future::pending::<()>()).is_ok());
++        }
++        assert!(maintenance.try_push(std::future::pending::<()>()).is_err());
++
++        assert_eq!(
++            root_queue_delay(&RootQueueStatus::Saturated),
++            REQUERY_INTERVAL
++        );
++    }
++}

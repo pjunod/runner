@@ -1,0 +1,246 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Paul Junod <donujp@gmail.com>
+Date: Tue, 27 Oct 2026 13:43:54 -0400
+Subject: [PATCH] feat(session): add SessionOptions::disable_auto_restore
+
+When persistence is configured, Session::new_with_opts reads every stored
+torrent and adds it back while the session is being constructed. An
+application that keeps its own queue (and wants to decide which torrents
+come back, in what order, and with which options) has no way to opt out
+of this while still using persistence and fast-resume: the only choices
+are to restore everything or to turn persistence off.
+
+Add SessionOptions::disable_auto_restore (default false). When true,
+persistence and fast-resume stay enabled but the constructor does not
+add the stored torrents. The caller re-adds the ones it wants with
+add_torrent, and AddTorrentOptions::preferred_id lets it keep the stored
+torrent id, so the persisted record (and its fast-resume state) is
+picked up again.
+
+The default is unchanged.
+
+The test creates two persisted torrents, then opens the same persistence
+folder three times: with auto-restore disabled (no torrents are
+admitted), re-adding one torrent by preferred_id (it resumes from the
+stored piece state rather than re-checking the files), and with the
+default (both torrents come back).
+---
+ crates/librqbit/src/session.rs           |  15 +++
+ crates/librqbit/src/tests/mod.rs         |   1 +
+ crates/librqbit/src/tests/persistence.rs | 143 +++++++++++++++++++++++
+ crates/rqbit/src/main.rs                 |   1 +
+ 4 files changed, 160 insertions(+)
+ create mode 100644 crates/librqbit/src/tests/persistence.rs
+
+diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
+index 5e024154..418d1352 100644
+--- a/crates/librqbit/src/session.rs
++++ b/crates/librqbit/src/session.rs
+@@ -441,6 +441,14 @@ pub struct SessionOptions {
+     /// all remembered torrents will continue where they left off.
+     pub persistence: Option<SessionPersistenceConfig>,
+ 
++    /// Keep persistence and fast-resume storage enabled without automatically
++    /// admitting every stored torrent while constructing the session.
++    ///
++    /// When this is true, callers remain responsible for explicitly re-adding
++    /// the torrents they consider authoritative. `AddTorrentOptions::preferred_id`
++    /// can select the persisted torrent ID during explicit admission.
++    pub disable_auto_restore: bool,
++
+     /// The peer ID to use. If not specified, a random one will be generated.
+     pub peer_id: Option<Id20>,
+ 
+@@ -496,6 +504,7 @@ impl Default for SessionOptions {
+             disable_trackers: false,
+             fastresume: false,
+             persistence: None,
++            disable_auto_restore: false,
+             peer_id: None,
+             listen: None,
+             connect: None,
+@@ -867,7 +876,13 @@ impl Session {
+ 
+             if let Some(persistence) = session.persistence.as_ref() {
+                 info!("will use {persistence:?} for session persistence");
++            }
+ 
++            if let Some(persistence) = session
++                .persistence
++                .as_ref()
++                .filter(|_| !opts.disable_auto_restore)
++            {
+                 let mut ps = persistence.stream_all().await?;
+                 let mut added_all = false;
+                 let mut futs = FuturesUnordered::new();
+diff --git a/crates/librqbit/src/tests/mod.rs b/crates/librqbit/src/tests/mod.rs
+index 9f6dbd16..924534a9 100644
+--- a/crates/librqbit/src/tests/mod.rs
++++ b/crates/librqbit/src/tests/mod.rs
+@@ -2,4 +2,5 @@ mod e2e;
+ mod e2e_another_local_client;
+ mod e2e_padded_files;
+ mod e2e_stream;
++mod persistence;
+ pub mod test_util;
+diff --git a/crates/librqbit/src/tests/persistence.rs b/crates/librqbit/src/tests/persistence.rs
+new file mode 100644
+index 00000000..27fe4b15
+--- /dev/null
++++ b/crates/librqbit/src/tests/persistence.rs
+@@ -0,0 +1,143 @@
++use crate::{
++    AddTorrent, AddTorrentOptions, CreateTorrentOptions, Session, SessionOptions,
++    SessionPersistenceConfig, create_torrent, spawn_utils::BlockingSpawner,
++};
++
++const PIECE_LENGTH: usize = 16 * 1024;
++
++fn payload(seed: usize) -> Vec<u8> {
++    (0..PIECE_LENGTH * 4)
++        .map(|offset| u8::try_from((offset * 31 + offset / 7 + seed) % 251).unwrap())
++        .collect()
++}
++
++async fn make_torrent_bytes(path: &std::path::Path, payload: &[u8]) -> bytes::Bytes {
++    tokio::fs::write(path, payload).await.unwrap();
++    create_torrent(
++        path,
++        CreateTorrentOptions {
++            piece_length: Some(u32::try_from(PIECE_LENGTH).unwrap()),
++            ..Default::default()
++        },
++        &BlockingSpawner::new(1),
++    )
++    .await
++    .unwrap()
++    .as_bytes()
++    .unwrap()
++}
++
++fn options(persistence: std::path::PathBuf, disable_auto_restore: bool) -> SessionOptions {
++    SessionOptions {
++        dht: None,
++        fastresume: true,
++        persistence: Some(SessionPersistenceConfig::Json {
++            folder: Some(persistence),
++        }),
++        disable_auto_restore,
++        disable_local_service_discovery: true,
++        ..Default::default()
++    }
++}
++
++#[tokio::test(flavor = "multi_thread")]
++async fn persistence_can_skip_implicit_admission_and_restore_an_authoritative_subset() {
++    let root = tempfile::tempdir().unwrap();
++    let output = root.path().join("output");
++    let persistence = root.path().join("persistence");
++    let first_payload = payload(11);
++    let second_payload = payload(29);
++    let first_bytes = make_torrent_bytes(&root.path().join("first.bin"), &first_payload).await;
++    let second_bytes = make_torrent_bytes(&root.path().join("second.bin"), &second_payload).await;
++
++    tokio::fs::create_dir_all(&output).await.unwrap();
++    let mut partial_second = second_payload.clone();
++    partial_second[PIECE_LENGTH..].fill(0);
++    tokio::fs::write(output.join("second.bin"), partial_second)
++        .await
++        .unwrap();
++
++    let first = Session::new_with_opts(output.clone(), options(persistence.clone(), false))
++        .await
++        .unwrap();
++    let first_id = first
++        .add_torrent(
++            AddTorrent::TorrentFileBytes(first_bytes.clone()),
++            Some(AddTorrentOptions {
++                paused: true,
++                overwrite: true,
++                ..Default::default()
++            }),
++        )
++        .await
++        .unwrap()
++        .into_handle()
++        .unwrap()
++        .id();
++    let second = first
++        .add_torrent(
++            AddTorrent::TorrentFileBytes(second_bytes.clone()),
++            Some(AddTorrentOptions {
++                paused: true,
++                overwrite: true,
++                ..Default::default()
++            }),
++        )
++        .await
++        .unwrap()
++        .into_handle()
++        .unwrap();
++    let second_id = second.id();
++    assert_ne!(first_id, second_id);
++    second.wait_until_initialized().await.unwrap();
++    assert_eq!(second.stats().progress_bytes, PIECE_LENGTH as u64);
++    first.stop().await;
++
++    // Diverge on-disk data from persisted piece state. If the restore path fell
++    // back to a full re-check, progress would read 64 KiB and finished would be
++    // true, so the assertions below can only pass via fast-resume.
++    tokio::fs::write(output.join("second.bin"), &second_payload)
++        .await
++        .unwrap();
++
++    let authoritative = Session::new_with_opts(output.clone(), options(persistence.clone(), true))
++        .await
++        .unwrap();
++    assert_eq!(
++        authoritative.with_torrents(|torrents| torrents.count()),
++        0,
++        "constructing the session must not implicitly admit persisted torrents"
++    );
++
++    let restored = authoritative
++        .add_torrent(
++            AddTorrent::TorrentFileBytes(second_bytes),
++            Some(AddTorrentOptions {
++                paused: true,
++                overwrite: true,
++                preferred_id: Some(second_id),
++                ..Default::default()
++            }),
++        )
++        .await
++        .unwrap();
++    let restored = restored.into_handle().unwrap();
++    restored.wait_until_initialized().await.unwrap();
++    let restored_stats = restored.stats();
++    assert_eq!(restored_stats.progress_bytes, PIECE_LENGTH as u64);
++    assert!(!restored_stats.finished);
++    let restored_ids =
++        authoritative.with_torrents(|torrents| torrents.map(|(id, _)| id).collect::<Vec<_>>());
++    assert_eq!(restored_ids, vec![second_id]);
++    authoritative.stop().await;
++
++    let legacy = Session::new_with_opts(output, options(persistence, false))
++        .await
++        .unwrap();
++    assert_eq!(
++        legacy.with_torrents(|torrents| torrents.count()),
++        2,
++        "the default behavior must continue to restore every persisted record"
++    );
++    legacy.stop().await;
++}
+diff --git a/crates/rqbit/src/main.rs b/crates/rqbit/src/main.rs
+index 923587cf..33fab514 100644
+--- a/crates/rqbit/src/main.rs
++++ b/crates/rqbit/src/main.rs
+@@ -645,6 +645,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
+         dht,
+         // This will be overridden by "server start" below if needed.
+         persistence: None,
++        disable_auto_restore: false,
+         peer_id: None,
+         listen,
+         connect: Some(ConnectionOptions {
