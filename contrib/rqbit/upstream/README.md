@@ -34,7 +34,7 @@ contrib/rqbit/upstream/submit.sh all                 # in order; skips slugs who
 
 It needs `gh` authenticated as `pjunod`. `known-peer-limit` is refused until the `session-peer-limit` PR is merged upstream. If a
 patch no longer applies to the then-current `main` the script stops with a message instead of pushing anything; regenerate
-that patch (the local branches `up/<slug>` are in `/home/claude/up/_upstream/rqbit`; heads are listed below) and run again.
+that patch (apply the `.patch` to current upstream `main`, resolve, `git format-patch -1`; heads below are for reference) and run again.
 `--draft` opens the PRs as drafts.
 
 The submitted patches do not conflict with each other (checked pairwise with `git merge-tree`, and by stacking all nine on
@@ -93,8 +93,13 @@ Limits of that, stated precisely:
 
 ## Things for Paul before sending
 
-- Upstream defers to Ghostty's AI policy. As I remember it, it also wants AI-assisted PRs to address an issue the maintainer has accepted; I could not fetch it
-  from here. Check it, and if needed open a short issue/discussion for the larger PRs (`known-peer-limit`, `dht-queue-bounds`, `peer-response-budget`,
-  `tracker-request-bounds`) first.
+- Upstream defers to Ghostty's AI policy (checked 2026-10-27, `ghostty-org/ghostty` `AI_POLICY.md`): disclose the tool and how much it
+  did (each description ends with that section), you must be able to explain every change without AI, and AI-written issue/PR text must
+  be **reviewed and edited by you** before it is posted — so edit each `NN-slug.md` into your own words first. Ghostty also keeps a public
+  denouncement list for low-quality AI contributions that other projects can reuse; rqbit adopted the AI policy only, not Ghostty's vouch
+  system, so no prior approval is required.
+- Pace them: send `metadata-size-limit` and `file-sizing-errors` first and wait for the maintainer's reaction before the rest, rather than
+  nine PRs on one day. For the larger ones (`known-peer-limit`, `dht-queue-bounds`, `peer-response-budget`, `tracker-request-bounds`) a short
+  issue first is the polite route.
 - Read every line of the PRs you send; the descriptions state facts from the runs above in the passive/neutral voice but are not a substitute for that.
 - Open PRs #667, #706, #708 overlap three of these: look at them before sending `known-peer-limit`, `dht-queue-bounds`, `metadata-resolver-bounds`.
