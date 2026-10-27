@@ -44,25 +44,30 @@ Local branch heads: `metadata-size-limit` 34465af1, `file-sizing-errors` 4b7f5eb
 
 ## How it was checked
 
-For each branch, on top of `f4ca7d91`: `cargo fmt --all -- --check`, `cargo check` (what CI runs), `cargo check --workspace --exclude rqbit-desktop`,
-`cargo clippy --all-targets` (origin/main has 0 warnings; no branch adds one), `cargo test -p <crate> --lib`, and the new tests by name. The same
-`fmt`, `check` and `clippy --all-targets` also ran clean on Rust 1.94 (CI's other matrix leg).
+**Full upstream test suite, on a host with IPv6 (2026-10-27).** On a 16-core Ubuntu lab host, with Rust 1.97.1 and `OPENSSL_DIR=/usr`, each branch was checked out and ran exactly what upstream's Ubuntu CI runs, `cargo test` (default workspace):
 
-Limits of that, stated precisely:
+| branch | `cargo test` |
+|---|---|
+| upstream main `f4ca7d91` (baseline) | ok, 168 passed / 0 failed |
+| metadata-size-limit | ok, 169 / 0 |
+| file-sizing-errors | ok, 170 / 0 |
+| tracker-request-bounds | ok, 170 / 0 |
+| disable-auto-restore | ok, 169 / 0 |
+| session-peer-limit | ok, 171 / 0 |
+| peer-response-budget | ok, 170 / 0 |
+| known-peer-limit | ok, 176 / 0; and `cargo test -p librqbit --lib` 10 runs in a row, 10/10 ok |
+| dht-queue-bounds | ok, 169 / 0 |
+| metadata-resolver-bounds | ok, 170 / 0 |
 
-- **No IPv6 in the container.** `UdpTrackerClient::new` fails session creation with `Address family not supported (os error 97)` (open #707), so the
-  four e2e tests (`test_e2e_download_tcp`, `test_e2e_download_utp`, `test_e2e_stream`, `test_e2e_download_duplicate_pad_filenames`) and
-  `disable-auto-restore`'s new persistence test cannot run on a pristine branch. Unmodified main gives 45 passed / 4 failed for the same reason. They
-  were therefore run a second time with #707's diff applied to the working tree only (never committed): all of them pass, see the per-PR descriptions.
-  `tracker-request-bounds` and `dht-queue-bounds` were run in the second form only for the whole `librqbit` lib suite.
-- **Flaky run.** One of 12 full `librqbit` lib runs on `known-peer-limit` (with #707 applied) failed `test_e2e_download_tcp` in `wait_until_i_am_the_last_task`
-  (7 tasks alive); the other 11 runs and 3 isolated runs passed. Not understood; mentioned in that PR's text. Worth a re-run on a machine with IPv6.
-- `cargo test` over the whole default workspace (what CI runs on Ubuntu) was not run, only the touched crates' `--lib` suites and named tests. The
-  desktop crate (`desktop/src-tauri`) cannot be built here (needs GTK); the branches only touch `SessionOptions`/`PeerConnectionOptions` fields that it
-  fills with `..Default::default()`.
-- `dht-queue-bounds`: no automated test drives a real lookup through the changed loops (the network DHT tests are `#[ignore]`d and were not run). Only
-  the limit boundaries, compilation and the existing unit tests are covered. This is the PR to read hardest.
-- Rust 1.94 was checked with `fmt`/`check`/`clippy`, not `test`.
+So the IPv6-dependent e2e tests and `disable-auto-restore`'s persistence test pass on a pristine branch, and the one flaky `test_e2e_download_tcp`
+seen earlier in an IPv6-less container (with #707's diff patched in) did not recur in 10 runs.
+
+**Also, per branch:** `cargo fmt --all -- --check`, `cargo check`, `cargo check --workspace --exclude rqbit-desktop` and `cargo clippy --all-targets`
+on Rust 1.97 and 1.94 (CI's compat matrix), all clean; origin/main has 0 clippy warnings and no branch adds one.
+
+**Not covered:** the Windows and macOS legs of upstream CI; the desktop crate (needs GTK; the branches only add fields it fills with
+`..Default::default()`); and `dht-queue-bounds` has no automated test that drives a real DHT lookup through the changed loops (the network DHT
+tests are `#[ignore]`d) — it is the PR to read hardest.
 
 ## What changed relative to the Runner drafts (semantic changes)
 
