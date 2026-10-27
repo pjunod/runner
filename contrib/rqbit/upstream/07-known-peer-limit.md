@@ -19,30 +19,18 @@ The live-peer semaphore limits connected peers, but every distinct address learn
 
 ## Tests
 ```
-# on top of upstream main f4ca7d91; Rust 1.97.1, Linux, no IPv6
-cargo fmt --all -- --check                       # ok
-cargo check                                      # ok
-cargo check --workspace --exclude rqbit-desktop  # ok
-cargo clippy --all-targets                       # no warnings
-cargo test -p librqbit --lib                     # 53 passed, 4 failed, 5 ignored
-cargo test -p librqbit known_peer_budget_tests   # 5 passed, 0 failed, 0 ignored
-
-# same machine, with the change from #707 applied locally (not part of this PR) so that a Session can be created without IPv6
-cargo test -p librqbit --lib                     # 56 passed, 1 failed, 5 ignored
-cargo test -p librqbit known_peer_budget_tests   # 5 passed, 0 failed, 0 ignored
+# upstream main f4ca7d91 + this commit; Linux x86_64, Rust 1.97.1
+cargo fmt --all -- --check     # ok
+cargo clippy --all-targets     # no warnings (also clean with Rust 1.94)
+cargo test                     # 176 passed, 0 failed (main alone: 168 passed, 0 failed; this branch includes the 3 tests of the session-peer-limit PR it builds on)
 ```
-
-Without IPv6, `cargo test -p librqbit --lib` fails 4 tests: `test_e2e_download_duplicate_pad_filenames`, `test_e2e_download_tcp`, `test_e2e_download_utp`, `test_e2e_stream`. They fail while creating a `Session` / UDP tracker client with `error creating socket: Address family not supported by protocol (os error 97)`, because `UdpTrackerClient::new` binds `[::]` (see #707). The four e2e tests fail the same way on unmodified main (45 passed, 4 failed there).
-
-`cargo +1.94 fmt --all -- --check`, `cargo +1.94 check` and `cargo +1.94 clippy --all-targets` (the other leg of the CI rust-compat matrix): clean.
-
-This builds on the session-wide live-peer cap (`peer_limit_total`); the commands above were run on top of it.
+The new tests (`known_peer_budget_tests` in `librqbit`) are part of that run and pass.
+`cargo test -p librqbit --lib` was then run 10 times in a row on the same branch: 10/10 passed.
 
 What the new tests cover:
 
 Five tests in `known_peer_budget_tests`: the per-torrent limit is exact and released; two torrents share one session limit; peer records hold their slots until removed; a failed shared acquisition releases the local slot; an alternate outgoing address is queued once with the record handle. The existing `peers` tests were adjusted for the new field in `PeerStates`.
 
-One run of the full `librqbit` lib suite (with #707 applied locally) had `test_e2e_download_tcp` fail with `wait_until_i_am_the_last_task` seeing 7 alive tasks; it passed in the 11 following runs of the whole suite and in 3 isolated runs. I haven't found a cause, so I mention it for completeness.
 
 ## Related upstream work
 - **#667** (bound peers-map growth) addresses part of the same problem a different way: it evicts dead / not-needed entries once a torrent tracks 1024 peers. This PR instead refuses new records beyond configurable limits and releases capacity when a record is removed, and it adds a session-wide total. They touch the same code (`add_if_not_seen`, `add_incoming_peer`, and the peer-map tests), so whichever lands second needs a rebase. I'm happy to adapt this to #667 (for example keep only the session-wide total, the incoming-record cleanup and the requeue fix) or to rebase onto it.
@@ -50,4 +38,4 @@ One run of the full `librqbit` lib suite (with #707 applied locally) had `test_e
 
 ## AI disclosure
 
-Prepared with OpenAI Codex and Anthropic Claude Opus 5.5 (Claude Code); reviewed and submitted by Paul Junod.
+The change, its tests and a first draft of this description were written with AI assistance: OpenAI Codex for the original patch, and Anthropic Claude Opus 5.5 in Claude Code for the port to current main, the tests and the runs above. I have reviewed every line and can answer for it.

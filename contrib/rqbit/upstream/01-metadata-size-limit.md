@@ -17,22 +17,12 @@ When resolving a magnet link, the peer tells us the metadata size in its extende
 
 ## Tests
 ```
-# on top of upstream main f4ca7d91; Rust 1.97.1, Linux, no IPv6
-cargo fmt --all -- --check                        # ok
-cargo check                                       # ok
-cargo check --workspace --exclude rqbit-desktop   # ok
-cargo clippy --all-targets                        # no warnings
-cargo test -p librqbit --lib                      # 46 passed, 4 failed, 5 ignored
-cargo test -p librqbit configured_metadata_limit  # 1 passed, 0 failed, 0 ignored
-
-# same machine, with the change from #707 applied locally (not part of this PR) so that a Session can be created without IPv6
-cargo test -p librqbit --lib                      # 50 passed, 0 failed, 5 ignored
-cargo test -p librqbit configured_metadata_limit  # 1 passed, 0 failed, 0 ignored
+# upstream main f4ca7d91 + this commit; Linux x86_64, Rust 1.97.1
+cargo fmt --all -- --check     # ok
+cargo clippy --all-targets     # no warnings (also clean with Rust 1.94)
+cargo test                     # 169 passed, 0 failed (main alone: 168 passed, 0 failed)
 ```
-
-Without IPv6, `cargo test -p librqbit --lib` fails 4 tests: `test_e2e_download_duplicate_pad_filenames`, `test_e2e_download_tcp`, `test_e2e_download_utp`, `test_e2e_stream`. They fail while creating a `Session` / UDP tracker client with `error creating socket: Address family not supported by protocol (os error 97)`, because `UdpTrackerClient::new` binds `[::]` (see #707). The four e2e tests fail the same way on unmodified main (45 passed, 4 failed there).
-
-`cargo +1.94 fmt --all -- --check`, `cargo +1.94 check` and `cargo +1.94 clippy --all-targets` (the other leg of the CI rust-compat matrix): clean.
+The new tests (`configured_metadata_limit` in `librqbit`) are part of that run and pass.
 
 What the new tests cover:
 
@@ -44,4 +34,4 @@ New unit test `configured_metadata_limit_is_checked_before_allocation`: a size e
 
 ## AI disclosure
 
-Prepared with OpenAI Codex and Anthropic Claude Opus 5.5 (Claude Code); reviewed and submitted by Paul Junod.
+The change, its tests and a first draft of this description were written with AI assistance: OpenAI Codex for the original patch, and Anthropic Claude Opus 5.5 in Claude Code for the port to current main, the tests and the runs above. I have reviewed every line and can answer for it.

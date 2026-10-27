@@ -21,24 +21,12 @@ Nothing changes for trackers that answer within those bounds with a normal inter
 
 ## Tests
 ```
-# on top of upstream main f4ca7d91; Rust 1.97.1, Linux, no IPv6
-cargo fmt --all -- --check                                                       # ok
-cargo check                                                                      # ok
-cargo check --workspace --exclude rqbit-desktop                                  # ok
-cargo clippy --all-targets                                                       # no warnings
-cargo test -p librqbit-tracker-comms --lib                                       # 6 passed, 0 failed, 1 ignored
-cargo test -p librqbit-tracker-comms http_tracker_response_is_bounded_and_timed  # 1 passed, 0 failed, 0 ignored
-cargo test -p librqbit-tracker-comms hostile_tracker_intervals_are_clamped       # 1 passed, 0 failed, 0 ignored
-
-# same machine, with the change from #707 applied locally (not part of this PR) so that a Session can be created without IPv6
-cargo test -p librqbit --lib                                                     # 49 passed, 0 failed, 5 ignored
-cargo test -p librqbit-tracker-comms http_tracker_response_is_bounded_and_timed  # 1 passed, 0 failed, 0 ignored
-cargo test -p librqbit-tracker-comms hostile_tracker_intervals_are_clamped       # 1 passed, 0 failed, 0 ignored
+# upstream main f4ca7d91 + this commit; Linux x86_64, Rust 1.97.1
+cargo fmt --all -- --check     # ok
+cargo clippy --all-targets     # no warnings (also clean with Rust 1.94)
+cargo test                     # 170 passed, 0 failed (main alone: 168 passed, 0 failed)
 ```
-
-`cargo +1.94 fmt --all -- --check`, `cargo +1.94 check` and `cargo +1.94 clippy --all-targets` (the other leg of the CI rust-compat matrix): clean.
-
-`cargo test -p librqbit --lib` was only run in the second form (with #707 applied locally): without IPv6 its four e2e tests can't create a Session, as on unmodified main (see #707).
+The new tests (`http_tracker_response_is_bounded_and_timed` in `librqbit-tracker-comms`, `hostile_tracker_intervals_are_clamped` in `librqbit-tracker-comms`) are part of that run and pass.
 
 What the new tests cover:
 
@@ -50,4 +38,4 @@ What the new tests cover:
 
 ## AI disclosure
 
-Prepared with OpenAI Codex and Anthropic Claude Opus 5.5 (Claude Code); reviewed and submitted by Paul Junod.
+The change, its tests and a first draft of this description were written with AI assistance: OpenAI Codex for the original patch, and Anthropic Claude Opus 5.5 in Claude Code for the port to current main, the tests and the runs above. I have reviewed every line and can answer for it.
