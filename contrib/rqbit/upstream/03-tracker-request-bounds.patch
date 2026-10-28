@@ -1,0 +1,244 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Paul Junod <donujp@gmail.com>
+Date: Tue, 27 Oct 2026 13:42:14 -0400
+Subject: [PATCH] fix(tracker): bound HTTP tracker responses and clamp announce
+ intervals
+
+Tracker monitors are long-lived tasks created from torrent metainfo, so
+the tracker is untrusted input. Three things are currently unbounded:
+
+ - the HTTP response body is read with Response::bytes(), which buffers
+   whatever the tracker sends, with no size limit;
+ - the request has no deadline of its own, so a tracker that stalls
+   mid-response holds the monitor task forever;
+ - the announce interval comes from the tracker response: HTTP accepts
+   any value including 0 (a tight announce loop), UDP is clamped to 5s.
+
+Read the HTTP body in chunks into a checked buffer with a 1 MiB limit
+(rejecting an oversized Content-Length up front and re-checking every
+chunk, so a missing or false header does not bypass it) and put a 30 s
+deadline around the whole request and body read.
+
+Clamp tracker-supplied intervals to at least 60 s for both HTTP and UDP.
+force_tracker_interval keeps working as an explicit override and is not
+clamped. Retry backoff is unchanged.
+
+This is a behaviour change: a tracker that asks for a sub-minute interval
+(UDP used to allow down to 5 s) is now announced to at most once a
+minute unless force_tracker_interval is set. The constants are local to
+tracker_comms.rs; if you would rather make them options, the tests carry
+over unchanged.
+
+Tests use a loopback TCP server to cover the exact-limit, declared
+overflow, chunked overflow and timeout cases, and the interval clamp
+boundaries.
+---
+ crates/tracker_comms/src/tracker_comms.rs | 163 ++++++++++++++++++++--
+ 1 file changed, 155 insertions(+), 8 deletions(-)
+
+diff --git a/crates/tracker_comms/src/tracker_comms.rs b/crates/tracker_comms/src/tracker_comms.rs
+index 7614b1dd..76be6314 100644
+--- a/crates/tracker_comms/src/tracker_comms.rs
++++ b/crates/tracker_comms/src/tracker_comms.rs
+@@ -26,6 +26,10 @@ use crate::tracker_comms_udp;
+ use crate::tracker_comms_udp::UdpTrackerClient;
+ use librqbit_core::hash_id::Id20;
+ 
++const HTTP_TRACKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
++const MAX_HTTP_TRACKER_RESPONSE_BYTES: usize = 1024 * 1024;
++const MIN_TRACKER_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
++
+ pub struct TrackerComms {
+     info_hash: Id20,
+     peer_id: Id20,
+@@ -82,6 +86,53 @@ impl TorrentStatsProvider for () {
+ 
+ type Sender = tokio::sync::mpsc::Sender<SocketAddr>;
+ 
++fn normalized_tracker_interval(interval: Duration) -> Duration {
++    interval.max(MIN_TRACKER_ANNOUNCE_INTERVAL)
++}
++
++async fn fetch_http_tracker_response(
++    client: &reqwest::Client,
++    url: Url,
++    request_timeout: Duration,
++    max_response_bytes: usize,
++) -> anyhow::Result<Vec<u8>> {
++    tokio::time::timeout(request_timeout, async {
++        let mut response = client.get(url).send().await?;
++        if !response.status().is_success() {
++            anyhow::bail!("tracker responded with {:?}", response.status());
++        }
++        match response.content_length() {
++            Some(length) if length > max_response_bytes as u64 => anyhow::bail!(
++                "tracker response is too large ({length} bytes; maximum {max_response_bytes})"
++            ),
++            _ => {}
++        }
++
++        let mut bytes = Vec::with_capacity(
++            response
++                .content_length()
++                .map(|length| length as usize)
++                .unwrap_or_default()
++                .min(max_response_bytes),
++        );
++        while let Some(chunk) = response.chunk().await? {
++            let new_length = bytes
++                .len()
++                .checked_add(chunk.len())
++                .context("tracker response length overflow")?;
++            if new_length > max_response_bytes {
++                anyhow::bail!(
++                    "tracker response is too large ({new_length} bytes; maximum {max_response_bytes})"
++                );
++            }
++            bytes.extend_from_slice(&chunk);
++        }
++        Ok(bytes)
++    })
++    .await
++    .context("tracker request timed out")?
++}
++
+ enum SupportedTracker {
+     Udp(Url),
+     Http(Url),
+@@ -254,7 +305,9 @@ impl TrackerComms {
+                 .context("this shouldn't fail")?;
+ 
+             event = None;
+-            let interval = self.force_tracker_interval.unwrap_or(interval);
++            let interval = self
++                .force_tracker_interval
++                .unwrap_or_else(|| normalized_tracker_interval(interval));
+             debug!("sleeping for {:?} after calling tracker", interval);
+             tokio::time::sleep(interval).await;
+         }
+@@ -290,11 +343,13 @@ impl TrackerComms {
+         }
+         url.set_query(Some(&queries));
+ 
+-        let response: reqwest::Response = self.reqwest_client.get(url).send().await?;
+-        if !response.status().is_success() {
+-            anyhow::bail!("tracker responded with {:?}", response.status());
+-        }
+-        let bytes = response.bytes().await?;
++        let bytes = fetch_http_tracker_response(
++            &self.reqwest_client,
++            url,
++            HTTP_TRACKER_REQUEST_TIMEOUT,
++            MAX_HTTP_TRACKER_RESPONSE_BYTES,
++        )
++        .await?;
+         if let Ok((error, _)) =
+             bencode::from_bytes_with_rest::<tracker_comms_http::TrackerError>(&bytes)
+         {
+@@ -425,8 +480,8 @@ impl TrackerComms {
+                 for addr in response.addrs {
+                     self.tx.send(addr).await.context("rx closed")?;
+                 }
+-                let sleep = response.interval.max(5);
+-                let sleep = Duration::from_secs(sleep as u64);
++                let sleep =
++                    normalized_tracker_interval(Duration::from_secs(response.interval as u64));
+                 Ok(sleep)
+             }
+             Err(e) => {
+@@ -436,3 +491,95 @@ impl TrackerComms {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::{Read, Write};
++
++    fn one_response_server(response: Vec<u8>, delay: Duration) -> Url {
++        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        let address = listener.local_addr().unwrap();
++        std::thread::spawn(move || {
++            let (mut stream, _) = listener.accept().unwrap();
++            let mut request = [0u8; 2048];
++            let _ = stream.read(&mut request);
++            std::thread::sleep(delay);
++            let _ = stream.write_all(&response);
++        });
++        Url::parse(&format!("http://{address}/announce")).unwrap()
++    }
++
++    #[tokio::test]
++    async fn http_tracker_response_is_bounded_and_timed() {
++        let client = reqwest::Client::new();
++        let body = b"tracker-response";
++        let mut response = format!(
++            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
++            body.len()
++        )
++        .into_bytes();
++        response.extend_from_slice(body);
++        let exact = fetch_http_tracker_response(
++            &client,
++            one_response_server(response, Duration::ZERO),
++            Duration::from_secs(1),
++            body.len(),
++        )
++        .await
++        .unwrap();
++        assert_eq!(exact, body);
++
++        let oversized = b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\n";
++        let error = fetch_http_tracker_response(
++            &client,
++            one_response_server(oversized.to_vec(), Duration::ZERO),
++            Duration::from_secs(1),
++            16,
++        )
++        .await
++        .unwrap_err();
++        assert!(error.to_string().contains("too large"));
++
++        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n10\r\n0123456789abcdef\r\n1\r\ng\r\n0\r\n\r\n";
++        let error = fetch_http_tracker_response(
++            &client,
++            one_response_server(chunked.to_vec(), Duration::ZERO),
++            Duration::from_secs(1),
++            16,
++        )
++        .await
++        .unwrap_err();
++        assert!(error.to_string().contains("too large"));
++
++        let error = fetch_http_tracker_response(
++            &client,
++            one_response_server(Vec::new(), Duration::from_millis(100)),
++            Duration::from_millis(10),
++            16,
++        )
++        .await
++        .unwrap_err();
++        assert!(error.to_string().contains("timed out"));
++    }
++
++    #[test]
++    fn hostile_tracker_intervals_are_clamped() {
++        assert_eq!(
++            normalized_tracker_interval(Duration::from_secs(0)),
++            MIN_TRACKER_ANNOUNCE_INTERVAL
++        );
++        assert_eq!(
++            normalized_tracker_interval(Duration::from_secs(59)),
++            MIN_TRACKER_ANNOUNCE_INTERVAL
++        );
++        assert_eq!(
++            normalized_tracker_interval(Duration::from_secs(60)),
++            Duration::from_secs(60)
++        );
++        assert_eq!(
++            normalized_tracker_interval(Duration::from_secs(61)),
++            Duration::from_secs(61)
++        );
++    }
++}

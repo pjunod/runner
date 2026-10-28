@@ -1,0 +1,293 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Paul Junod <donujp@gmail.com>
+Date: Tue, 27 Oct 2026 13:41:10 -0400
+Subject: [PATCH] fix(init): fail torrent initialization when a file cannot be
+ sized
+
+During initialization rqbit calls TorrentStorage::ensure_file_length for
+every selected file. If that fails (ENOSPC, EDQUOT, a read-only
+filesystem, ...) the error is only written to the log with warn!() and
+initialization carries on, so the torrent still ends up paused/live as if
+nothing happened. The only trace of the failure is a log line; stats and
+the torrent state never show it.
+
+Move the loop into a small fallible helper that returns the first
+failure, with the file name and requested length as context, and let the
+existing error path in ManagedTorrent::start put the torrent into the
+Error state. Which files are sized (selection, padding files skipped) is
+unchanged, and files after the failing one are not touched.
+
+This interacts with "Allow pausing during the initial file check": that
+code treats any initialization error as a pause when pause was requested
+(`if init.is_pause_requested()`), so a real sizing failure that races
+with a pause would be swallowed again. Give the checksum loop's
+cancellation a typed InitialCheckPaused error and suppress only that
+when pause was requested; any other error still moves the torrent to
+the Error state.
+
+Add tests for the helper (injected StorageFull on the first file) and
+for the pause classification.
+---
+ crates/librqbit/src/file_ops.rs               |   8 +-
+ .../src/torrent_state/initializing.rs         | 146 ++++++++++++++----
+ crates/librqbit/src/torrent_state/mod.rs      |  28 +++-
+ 3 files changed, 151 insertions(+), 31 deletions(-)
+
+diff --git a/crates/librqbit/src/file_ops.rs b/crates/librqbit/src/file_ops.rs
+index febba965..585bd148 100644
+--- a/crates/librqbit/src/file_ops.rs
++++ b/crates/librqbit/src/file_ops.rs
+@@ -3,7 +3,7 @@ use std::{
+     sync::atomic::{AtomicBool, AtomicU64, Ordering},
+ };
+ 
+-use anyhow::{Context, bail};
++use anyhow::Context;
+ use buffers::{ByteBuf, ByteBufOwned};
+ use librqbit_core::{
+     lengths::{ChunkInfo, ValidPieceIndex},
+@@ -19,6 +19,10 @@ use crate::{
+     type_aliases::{BF, FileInfos, PeerHandle},
+ };
+ 
++#[derive(Debug, thiserror::Error)]
++#[error("initial check paused")]
++pub(crate) struct InitialCheckPaused;
++
+ pub fn update_hash_from_file<Sha1: ISha1>(
+     file_id: usize,
+     file_info: &FileInfo,
+@@ -111,7 +115,7 @@ impl<'a> FileOps<'a> {
+ 
+         for piece_info in self.torrent.lengths().iter_piece_infos() {
+             if pause_requested.load(Ordering::Relaxed) {
+-                bail!("initial check paused");
++                return Err(InitialCheckPaused.into());
+             }
+ 
+             piece_files.clear();
+diff --git a/crates/librqbit/src/torrent_state/initializing.rs b/crates/librqbit/src/torrent_state/initializing.rs
+index 37789dc7..b338ab02 100644
+--- a/crates/librqbit/src/torrent_state/initializing.rs
++++ b/crates/librqbit/src/torrent_state/initializing.rs
+@@ -25,6 +25,39 @@ const MAX_FASTRESUME_CHECKS: usize = 64;
+ 
+ use super::{ManagedTorrentShared, TorrentMetadata, paused::TorrentStatePaused};
+ 
++fn ensure_selected_file_lengths(
++    files: &dyn crate::storage::TorrentStorage,
++    file_infos: &crate::FileInfos,
++    only_files: Option<&[usize]>,
++) -> anyhow::Result<()> {
++    for (idx, file_info) in file_infos.iter().enumerate() {
++        if !only_files
++            .map(|selected| selected.contains(&idx))
++            .unwrap_or(true)
++            || file_info.attrs.padding
++        {
++            continue;
++        }
++
++        let started = Instant::now();
++        files
++            .ensure_file_length(idx, file_info.len)
++            .with_context(|| {
++                format!(
++                    "error setting length for file {:?} to {}",
++                    file_info.relative_filename, file_info.len
++                )
++            })?;
++        trace!(
++            "Set length for file {:?} to {} in {:?}",
++            file_info.relative_filename,
++            SF::new(file_info.len),
++            started.elapsed()
++        );
++    }
++    Ok(())
++}
++
+ pub struct TorrentStateInitializing {
+     pub(crate) files: FileStorage,
+     pub(crate) shared: Arc<ManagedTorrentShared>,
+@@ -261,34 +294,11 @@ impl TorrentStateInitializing {
+         self.shared
+             .spawner
+             .block_in_place_with_semaphore(|| {
+-                for (idx, fi) in self.metadata.file_infos.iter().enumerate() {
+-                    if self
+-                        .only_files
+-                        .as_ref()
+-                        .map(|v| v.contains(&idx))
+-                        .unwrap_or(true)
+-                    {
+-                        let now = Instant::now();
+-                        if fi.attrs.padding {
+-                            continue;
+-                        }
+-                        if let Err(err) = self.files.ensure_file_length(idx, fi.len) {
+-                            warn!(
+-                                id=?self.shared.id, info_hash = ?self.shared.info_hash,
+-                                "Error setting length for file {:?} to {}: {:#?}",
+-                                fi.relative_filename, fi.len, err
+-                            );
+-                        } else {
+-                            trace!(
+-                                "Set length for file {:?} to {} in {:?}",
+-                                fi.relative_filename,
+-                                SF::new(fi.len),
+-                                now.elapsed()
+-                            );
+-                        }
+-                    }
+-                }
+-                Ok::<_, anyhow::Error>(())
++                ensure_selected_file_lengths(
++                    self.files.as_ref(),
++                    &self.metadata.file_infos,
++                    self.only_files.as_deref(),
++                )
+             })
+             .await?;
+ 
+@@ -302,3 +312,83 @@ impl TorrentStateInitializing {
+         Ok(paused)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::{
++        io,
++        path::Path,
++        sync::atomic::{AtomicUsize, Ordering},
++    };
++
++    use super::ensure_selected_file_lengths;
++    use crate::{
++        ManagedTorrentShared, TorrentMetadata, file_info::FileInfo, storage::TorrentStorage,
++    };
++
++    #[derive(Default)]
++    struct FailingLengthStorage {
++        attempts: AtomicUsize,
++    }
++
++    impl TorrentStorage for FailingLengthStorage {
++        fn init(
++            &mut self,
++            _shared: &ManagedTorrentShared,
++            _metadata: &TorrentMetadata,
++        ) -> anyhow::Result<()> {
++            Ok(())
++        }
++
++        fn pread_exact(
++            &self,
++            _file_id: usize,
++            _offset: u64,
++            _buf: &mut [u8],
++        ) -> anyhow::Result<()> {
++            unreachable!()
++        }
++
++        fn pwrite_all(&self, _file_id: usize, _offset: u64, _buf: &[u8]) -> anyhow::Result<()> {
++            unreachable!()
++        }
++
++        fn remove_file(&self, _file_id: usize, _filename: &Path) -> anyhow::Result<()> {
++            unreachable!()
++        }
++
++        fn remove_directory_if_empty(&self, _path: &Path) -> anyhow::Result<()> {
++            unreachable!()
++        }
++
++        fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
++            assert_eq!(file_id, 0);
++            assert_eq!(length, 262_144);
++            self.attempts.fetch_add(1, Ordering::SeqCst);
++            Err(io::Error::new(io::ErrorKind::StorageFull, "injected storage full").into())
++        }
++
++        fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
++            unreachable!()
++        }
++    }
++
++    #[test]
++    fn file_sizing_error_stops_initialization() {
++        let storage = FailingLengthStorage::default();
++        let file_infos = vec![FileInfo {
++            relative_filename: "payload.bin".into(),
++            offset_in_torrent: 0,
++            piece_range: 0..16,
++            attrs: Default::default(),
++            len: 262_144,
++        }];
++
++        let error = ensure_selected_file_lengths(&storage, &file_infos, None).unwrap_err();
++        assert_eq!(storage.attempts.load(Ordering::SeqCst), 1);
++        let error = format!("{error:#}");
++        assert!(error.contains("payload.bin"), "{error}");
++        assert!(error.contains("262144"), "{error}");
++        assert!(error.contains("injected storage full"), "{error}");
++    }
++}
+diff --git a/crates/librqbit/src/torrent_state/mod.rs b/crates/librqbit/src/torrent_state/mod.rs
+index db470012..ad416ccd 100644
+--- a/crates/librqbit/src/torrent_state/mod.rs
++++ b/crates/librqbit/src/torrent_state/mod.rs
+@@ -40,6 +40,7 @@ use tracing::warn;
+ use crate::Session;
+ use crate::chunk_tracker::ChunkTracker;
+ use crate::file_info::FileInfo;
++use crate::file_ops::InitialCheckPaused;
+ use crate::limits::LimitsConfig;
+ use crate::session::TorrentId;
+ use crate::spawn_utils::BlockingSpawner;
+@@ -55,6 +56,10 @@ use self::paused::TorrentStatePaused;
+ pub use self::stats::{TorrentStats, TorrentStatsState};
+ pub use self::streaming::FileStream;
+ 
++fn should_suppress_initial_check_error(pause_requested: bool, error: &anyhow::Error) -> bool {
++    pause_requested && error.downcast_ref::<InitialCheckPaused>().is_some()
++}
++
+ // State machine transitions.
+ //
+ // - error -> initializing
+@@ -396,7 +401,10 @@ impl ManagedTorrent {
+                                     _start(&t, peer_rx, start_paused, session, Some(g), token)
+                                 }
+                                 Err(err) => {
+-                                    if init.is_pause_requested() {
++                                    if should_suppress_initial_check_error(
++                                        init.is_pause_requested(),
++                                        &err,
++                                    ) {
+                                         debug!("initial check paused");
+                                         t.state_change_notify.notify_waiters();
+                                         return Ok(());
+@@ -720,3 +728,21 @@ fn spawn_peer_adder(live: &Arc<TorrentStateLive>, mut peer_rx: PeerStream) {
+         },
+     );
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::io;
++
++    use super::{InitialCheckPaused, should_suppress_initial_check_error};
++
++    #[test]
++    fn pause_race_preserves_non_cancellation_initialization_errors() {
++        let storage_error: anyhow::Error =
++            io::Error::new(io::ErrorKind::StorageFull, "injected storage full").into();
++        assert!(!should_suppress_initial_check_error(true, &storage_error));
++
++        let pause_error = anyhow::Error::new(InitialCheckPaused);
++        assert!(should_suppress_initial_check_error(true, &pause_error));
++        assert!(!should_suppress_initial_check_error(false, &pause_error));
++    }
++}

@@ -1,0 +1,48 @@
+{
+  "commit": "3d86ddf65c667e0e2bc65bd19011a48ba8c651b4",
+  "tree": "6dacbddb8e3432c4860664ae2fed46598cc04255",
+  "parent": "0b5cae556103d23d425172beb60bbb118dbbf2f1",
+  "passed": 177,
+  "failed": 0,
+  "logs": {
+    "rqbit-race-red.log": {
+      "bytes": 2421,
+      "sha256": "52a8668b5ba424844b62d453711452cae6db4b1b74bee2ebd13d83270b86c84d"
+    },
+    "rqbit-race-green.log": {
+      "bytes": 534,
+      "sha256": "f1abf64d54a1be009e8fbea53af6aca593768bd2415536b12eaea988773cb875"
+    },
+    "rqbit-race-full.log": {
+      "bytes": 132442,
+      "sha256": "efd52a3809241c9a83f75bbbb096341d936cd962a65315df54001106466e00c6"
+    },
+    "rqbit-race-fmt.log": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "rqbit-race-clippy.log": {
+      "bytes": 11228,
+      "sha256": "b22f381913205d1b949c06c481e43491779fd17871cbb113d22a061a787cb2f2"
+    }
+  },
+  "checked": "2026-10-28",
+  "compiler": "rustc1.97.1 (8bab26f4f2026-07-14)",
+  "patch_sha256": "fd308cced640afc867891471af788bbc8b9aa7cdbe10c502f57f9650e75e80d6",
+  "change": "Atomic conditional removal preserves a replacement incoming Live connection admitted after old disconnect releases the map guard.",
+  "regression": "torrent_state::live::peers::known_peer_budget_tests::old_incoming_disconnect_does_not_remove_replacement_connection",
+  "focused": {
+    "before": "FAIL: old cleanup removes replacement",
+    "after": "PASS: replacement retained and eventual disconnect releases slot"
+  },
+  "commands": [
+    "cargo test -p librqbit --lib old_incoming_disconnect_does_not_remove_replacement_connection",
+    "cargo fmt --all -- --check",
+    "cargo test",
+    "cargo clippy --all-targets"
+  ],
+  "limitations": [
+    "Other eight branch receipts remain inherited and unchanged.",
+    "Cargo UI build generated a package-lock.json working-tree change; it is retained in the owned source worktree and is not included in this Rust patch."
+  ]
+}

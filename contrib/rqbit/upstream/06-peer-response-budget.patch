@@ -1,0 +1,435 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Paul Junod <donujp@gmail.com>
+Date: Tue, 27 Oct 2026 13:52:36 -0400
+Subject: [PATCH] fix(peer): bound the responses queued for a single peer
+
+When a peer sends a request, the piece or metadata response is pushed
+onto unbounded channels (the upload rate-limit scheduler, then the
+peer's writer) with no cap on how many can be outstanding. A peer that
+sends requests faster than its socket drains, or never reads at all,
+makes us queue responses (each a chunk to read from disk and write)
+without limit.
+
+Give every peer connection a PeerResponseBudget: a semaphore whose
+permits travel with each queued piece or metadata response and are
+released only once the writer has flushed it to the socket (or the
+response is dropped). Admission uses try_acquire: a peer that has more
+responses pending than the budget is disconnected rather than blocking
+the reader task behind the torrent-wide upload limiter.
+
+The budget is the per-peer request window, i.e. max_request_window (from
+"feat(peer): make the per-peer request window configurable"; default
+128, unchanged), and it is advertised to the peer as `reqq` in our
+extended handshake so well-behaved clients stay inside it. rqbit did not
+advertise reqq before.
+
+Note that this ties the number of requests we accept from a peer to the
+number we are willing to have outstanding towards a peer; setting
+max_request_window very low (for seek responsiveness) therefore also
+lowers it.
+
+The tests cover the production admission path across the scheduler and
+writer queues, release on completion, and that the writer holds the
+permit until the socket write finishes (and releases it if the write is
+cancelled).
+---
+ crates/librqbit/src/peer_connection.rs        |  88 ++++++++++---
+ crates/librqbit/src/torrent_state/live/mod.rs | 117 +++++++++++++++---
+ .../live/peer_response_budget_tests.rs        |  39 ++++++
+ 3 files changed, 213 insertions(+), 31 deletions(-)
+ create mode 100644 crates/librqbit/src/torrent_state/live/peer_response_budget_tests.rs
+
+diff --git a/crates/librqbit/src/peer_connection.rs b/crates/librqbit/src/peer_connection.rs
+index ca2690c5..49888aa2 100644
+--- a/crates/librqbit/src/peer_connection.rs
++++ b/crates/librqbit/src/peer_connection.rs
+@@ -23,6 +23,7 @@ use peer_binary_protocol::{
+ };
+ use serde::{Deserialize, Serialize};
+ use serde_with::serde_as;
++use tokio::sync::OwnedSemaphorePermit;
+ use tokio::time::timeout;
+ use tracing::{Instrument, debug, trace, trace_span};
+ 
+@@ -60,9 +61,9 @@ pub trait PeerConnectionHandler {
+ #[derive(Debug)]
+ pub enum WriterRequest {
+     Message(Message<'static>),
+-    UtMetadata(UtMetadata<ByteBufOwned>),
++    UtMetadata(UtMetadata<ByteBufOwned>, OwnedSemaphorePermit),
+     UtPex(UtPex<ByteBufOwned>),
+-    ReadChunkRequest(ChunkInfo),
++    ReadChunkRequest(ChunkInfo, OwnedSemaphorePermit),
+     Disconnect(anyhow::Result<()>),
+ }
+ 
+@@ -116,6 +117,25 @@ pub(crate) async fn with_timeout<T>(
+     fut.await
+ }
+ 
++async fn write_with_peer_response_permit(
++    write: &mut (impl tokio::io::AsyncWrite + Unpin),
++    bytes: &[u8],
++    rwtimeout: Duration,
++    peer_response_permit: Option<OwnedSemaphorePermit>,
++) -> crate::Result<()> {
++    use tokio::io::AsyncWriteExt;
++
++    // Keep the admission permit in this future until the socket write has
++    // completed. Dropping/cancelling the future releases it automatically.
++    let _peer_response_permit = peer_response_permit;
++    with_timeout(
++        "writing",
++        rwtimeout,
++        write.write_all(bytes).map_err(Error::Write),
++    )
++    .await
++}
++
+ struct ManagePeerArgs {
+     handshake_supports_extended: bool,
+     read_buf: ReadBuf,
+@@ -391,17 +411,21 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
+                         .unwrap_or_default()
+                 };
+ 
+-                let len = match req {
+-                    WriterRequest::Message(msg) => msg.serialize(&mut *write_buf, ext_msg_ids)?,
+-                    WriterRequest::UtMetadata(utm) => {
+-                        Message::Extended(ExtendedMessage::UtMetadata(utm.as_borrowed()))
+-                            .serialize(&mut *write_buf, ext_msg_ids)?
++                let (len, peer_response_permit) = match req {
++                    WriterRequest::Message(msg) => {
++                        (msg.serialize(&mut *write_buf, ext_msg_ids)?, None)
+                     }
+-                    WriterRequest::UtPex(ut_pex) => {
++                    WriterRequest::UtMetadata(utm, permit) => (
++                        Message::Extended(ExtendedMessage::UtMetadata(utm.as_borrowed()))
++                            .serialize(&mut *write_buf, ext_msg_ids)?,
++                        Some(permit),
++                    ),
++                    WriterRequest::UtPex(ut_pex) => (
+                         Message::Extended(ExtendedMessage::UtPex(ut_pex.as_borrowed()))
+-                            .serialize(&mut *write_buf, ext_msg_ids)?
+-                    }
+-                    WriterRequest::ReadChunkRequest(chunk) => {
++                            .serialize(&mut *write_buf, ext_msg_ids)?,
++                        None,
++                    ),
++                    WriterRequest::ReadChunkRequest(chunk, permit) => {
+                         #[allow(unused_mut)]
+                         let mut skip_reading_for_e2e_tests = false;
+ 
+@@ -447,7 +471,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
+                         }
+ 
+                         uploaded_add = Some(chunk.size);
+-                        full_len
++                        (full_len, Some(permit))
+                     }
+                     WriterRequest::Disconnect(res) => {
+                         trace!("disconnect requested, closing writer");
+@@ -458,10 +482,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
+                     }
+                 };
+ 
+-                with_timeout(
+-                    "writing",
++                write_with_peer_response_permit(
++                    &mut write,
++                    &write_buf[..len],
+                     rwtimeout,
+-                    write.write_all(&write_buf[..len]).map_err(Error::Write),
++                    peer_response_permit,
+                 )
+                 .await?;
+ 
+@@ -520,3 +545,36 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod peer_response_writer_tests {
++    use std::{sync::Arc, time::Duration};
++
++    use tokio::sync::Semaphore;
++
++    use super::write_with_peer_response_permit;
++
++    #[tokio::test]
++    async fn production_writer_holds_permit_until_socket_write_finishes() {
++        let budget = Arc::new(Semaphore::new(1));
++        let permit = budget.clone().acquire_owned().await.unwrap();
++        let (mut write, _read) = tokio::io::duplex(1);
++
++        let writer = tokio::spawn(async move {
++            write_with_peer_response_permit(
++                &mut write,
++                &[0, 1],
++                Duration::from_secs(30),
++                Some(permit),
++            )
++            .await
++        });
++
++        tokio::task::yield_now().await;
++        assert!(budget.clone().try_acquire_owned().is_err());
++
++        writer.abort();
++        let _ = writer.await;
++        assert!(budget.try_acquire_owned().is_ok());
++    }
++}
+diff --git a/crates/librqbit/src/torrent_state/live/mod.rs b/crates/librqbit/src/torrent_state/live/mod.rs
+index 804ef26a..7fe5fc9d 100644
+--- a/crates/librqbit/src/torrent_state/live/mod.rs
++++ b/crates/librqbit/src/torrent_state/live/mod.rs
+@@ -43,6 +43,9 @@ pub mod peer;
+ pub mod peers;
+ pub mod stats;
+ 
++#[cfg(test)]
++mod peer_response_budget_tests;
++
+ use std::{
+     borrow::Cow,
+     collections::HashSet,
+@@ -122,6 +125,74 @@ fn make_piece_bitfield(lengths: &Lengths) -> BF {
+     BF::from_boxed_slice(vec![0; lengths.piece_bitfield_bytes()].into_boxed_slice())
+ }
+ 
++// Bounds the responses a single remote peer can have queued with us: piece
++// and metadata responses triggered by its requests. A permit travels with each
++// response until the peer writer has flushed it. The limit is the same as the
++// per-peer request window (`max_request_window`) and is advertised to the peer
++// as `reqq` in the extended handshake. Admission is deliberately non-blocking:
++// a peer that exceeds the advertised window is disconnected instead of parking
++// the socket reader behind the torrent-global upload rate limiter.
++#[derive(Clone, Debug)]
++struct PeerResponseBudget {
++    limit: usize,
++    permits: Arc<Semaphore>,
++}
++
++impl PeerResponseBudget {
++    fn new(limit: usize) -> Self {
++        Self {
++            limit,
++            permits: Arc::new(Semaphore::new(limit)),
++        }
++    }
++
++    fn try_acquire(&self) -> anyhow::Result<OwnedSemaphorePermit> {
++        self.permits
++            .clone()
++            .try_acquire_owned()
++            .context("peer exceeded advertised response window")
++    }
++
++    fn advertise(&self, handshake: &mut ExtendedHandshake<ByteBuf>) {
++        handshake.reqq = Some(u32::try_from(self.limit).unwrap_or(u32::MAX));
++    }
++}
++
++type PendingUploadRequest = (ChunkInfo, OwnedSemaphorePermit);
++
++fn enqueue_piece_response(
++    budget: &PeerResponseBudget,
++    scheduler_tx: &UnboundedSender<(UnboundedSender<WriterRequest>, PendingUploadRequest)>,
++    peer_tx: &UnboundedSender<WriterRequest>,
++    chunk: ChunkInfo,
++) -> anyhow::Result<()> {
++    let permit = budget.try_acquire()?;
++    scheduler_tx
++        .send((peer_tx.clone(), (chunk, permit)))
++        .context("upload scheduler closed")
++}
++
++fn forward_piece_response(
++    peer_tx: &UnboundedSender<WriterRequest>,
++    request: PendingUploadRequest,
++) -> anyhow::Result<()> {
++    let (chunk, permit) = request;
++    peer_tx
++        .send(WriterRequest::ReadChunkRequest(chunk, permit))
++        .context("peer writer closed")
++}
++
++fn enqueue_metadata_response(
++    budget: &PeerResponseBudget,
++    peer_tx: &UnboundedSender<WriterRequest>,
++    message: UtMetadata<ByteBufOwned>,
++) -> anyhow::Result<()> {
++    let permit = budget.try_acquire()?;
++    peer_tx
++        .send(WriterRequest::UtMetadata(message, permit))
++        .context("peer writer closed")
++}
++
+ pub(crate) struct TorrentStateLocked {
+     // Coordinates piece state: what chunks we have, need, and what pieces are in-flight.
+     // If this is None, the torrent was paused, and this live state is useless, and needs to be dropped.
+@@ -211,7 +282,7 @@ pub struct TorrentStateLive {
+ 
+     ratelimit_upload_tx: tokio::sync::mpsc::UnboundedSender<(
+         tokio::sync::mpsc::UnboundedSender<WriterRequest>,
+-        ChunkInfo,
++        PendingUploadRequest,
+     )>,
+     ratelimits: Limits,
+ }
+@@ -261,7 +332,7 @@ impl TorrentStateLive {
+ 
+         let (ratelimit_upload_tx, ratelimit_upload_rx) = tokio::sync::mpsc::unbounded_channel::<(
+             tokio::sync::mpsc::UnboundedSender<WriterRequest>,
+-            ChunkInfo,
++            PendingUploadRequest,
+         )>();
+         let ratelimits = Limits::new(paused.shared.options.ratelimits);
+ 
+@@ -444,10 +515,10 @@ impl TorrentStateLive {
+         self: Arc<Self>,
+         mut rx: tokio::sync::mpsc::UnboundedReceiver<(
+             tokio::sync::mpsc::UnboundedSender<WriterRequest>,
+-            ChunkInfo,
++            PendingUploadRequest,
+         )>,
+     ) -> crate::Result<()> {
+-        while let Some((tx, ci)) = rx.recv().await {
++        while let Some((tx, (ci, permit))) = rx.recv().await {
+             tokio::select! {
+                 _ = tx.closed() => {
+                     continue;
+@@ -466,7 +537,9 @@ impl TorrentStateLive {
+                     }
+                 }
+             }
+-            let _ = tx.send(WriterRequest::ReadChunkRequest(ci));
++            if let Err(error) = forward_piece_response(&tx, (ci, permit)) {
++                debug!(?error, "peer writer closed before upload response");
++            }
+         }
+         Ok(())
+     }
+@@ -484,6 +557,7 @@ impl TorrentStateLive {
+             incoming: true,
+             on_bitfield_notify: Default::default(),
+             flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
++            peer_response_budget: PeerResponseBudget::new(self.max_request_window()),
+             state: self.clone(),
+             tx,
+             counters,
+@@ -548,6 +622,7 @@ impl TorrentStateLive {
+             incoming: false,
+             on_bitfield_notify: Default::default(),
+             flow_control: Mutex::new(PeerFlowControl::new(state.max_request_window())),
++            peer_response_budget: PeerResponseBudget::new(state.max_request_window()),
+             state: state.clone(),
+             tx,
+             counters,
+@@ -1032,6 +1107,9 @@ struct PeerHandler {
+     // RefCell would do, but tokio is unhappy when we use it.
+     flow_control: Mutex<PeerFlowControl>,
+ 
++    // Bounds remote-triggered piece and metadata responses through the writer.
++    peer_response_budget: PeerResponseBudget,
++
+     // This is used to unpause chunk requester once the bitfield
+     // is received.
+     on_bitfield_notify: Notify,
+@@ -1254,6 +1332,8 @@ impl PeerConnectionHandler for &'_ PeerHandler {
+             handshake.metadata_size = Some(len);
+         }
+ 
++        self.peer_response_budget.advertise(handshake);
++
+         Ok(())
+     }
+ 
+@@ -1526,10 +1606,12 @@ impl PeerHandler {
+             );
+         }
+ 
+-        self.state
+-            .ratelimit_upload_tx
+-            .send((self.tx.clone(), chunk_info))?;
+-        Ok(())
++        enqueue_piece_response(
++            &self.peer_response_budget,
++            &self.state.ratelimit_upload_tx,
++            &self.tx,
++            chunk_info,
++        )
+     }
+ 
+     fn on_have(&self, have: u32) {
+@@ -2025,13 +2107,16 @@ impl PeerHandler {
+             .try_into()
+             .context("can't send metadata: len doesn't fit into u32")?;
+         let data = data.slice(offset as usize..end as usize);
+-
+-        self.tx
+-            .send(WriterRequest::UtMetadata(UtMetadata::Data(
+-                UtMetadataData::from_bytes(piece_id, total_size, data.into()),
+-            )))
+-            .context("error sending UtMetadata: channel closed")?;
+-        Ok(())
++        enqueue_metadata_response(
++            &self.peer_response_budget,
++            &self.tx,
++            UtMetadata::Data(UtMetadataData::from_bytes(
++                piece_id,
++                total_size,
++                data.into(),
++            )),
++        )
++        .context("error sending UtMetadata")
+     }
+ 
+     fn on_pex_message(&self, msg: UtPex<ByteBuf<'_>>) {
+diff --git a/crates/librqbit/src/torrent_state/live/peer_response_budget_tests.rs b/crates/librqbit/src/torrent_state/live/peer_response_budget_tests.rs
+new file mode 100644
+index 00000000..d711f8c4
+--- /dev/null
++++ b/crates/librqbit/src/torrent_state/live/peer_response_budget_tests.rs
+@@ -0,0 +1,39 @@
++use super::*;
++
++fn test_chunk() -> ChunkInfo {
++    let lengths = Lengths::new(1, 1).unwrap();
++    lengths
++        .iter_chunk_infos(lengths.validate_piece_index(0).unwrap())
++        .next()
++        .unwrap()
++}
++
++#[tokio::test]
++async fn production_admission_spans_scheduler_and_writer_queues() {
++    const LIMIT: usize = 4;
++    let budget = PeerResponseBudget::new(LIMIT);
++    let (scheduler_tx, mut scheduler_rx) =
++        unbounded_channel::<(UnboundedSender<WriterRequest>, PendingUploadRequest)>();
++    let (writer_tx, mut writer_rx) = unbounded_channel::<WriterRequest>();
++
++    for _ in 0..LIMIT {
++        enqueue_piece_response(&budget, &scheduler_tx, &writer_tx, test_chunk()).unwrap();
++    }
++
++    assert!(enqueue_piece_response(&budget, &scheduler_tx, &writer_tx, test_chunk()).is_err());
++
++    let (scheduled_writer, request) = scheduler_rx.recv().await.unwrap();
++    forward_piece_response(&scheduled_writer, request).unwrap();
++    assert!(budget.try_acquire().is_err());
++
++    drop(writer_rx.recv().await.unwrap());
++    enqueue_metadata_response(&budget, &writer_tx, UtMetadata::Reject(0)).unwrap();
++    assert!(budget.try_acquire().is_err());
++
++    drop(writer_rx.recv().await.unwrap());
++    assert!(budget.try_acquire().is_ok());
++
++    let mut handshake = ExtendedHandshake::new();
++    budget.advertise(&mut handshake);
++    assert_eq!(handshake.reqq, Some(u32::try_from(LIMIT).unwrap()));
++}
