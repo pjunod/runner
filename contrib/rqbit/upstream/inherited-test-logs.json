@@ -1,0 +1,112 @@
+{
+  "checked_at": "2026-10-28",
+  "kind": "historical-logs-inspected-not-rerun",
+  "results": [
+    {
+      "unit": "BASE",
+      "log": "~/work/upstream-prep/logs/BASE.log",
+      "sha256": "dde166357a680b1142eb4bc9d533036676eb88be5cce874c0fcfc2fee15c08bd",
+      "bytes": 138905,
+      "total_passed": 168,
+      "total_failed": 0,
+      "total_ignored": 6
+    },
+    {
+      "unit": "metadata-size-limit",
+      "log": "~/work/upstream-prep/logs/metadata-size-limit.log",
+      "sha256": "79e1e9d63ba2f2b824427d3d00fa80cb91591ee4d76d03ae87ef34c109a70de7",
+      "bytes": 130629,
+      "total_passed": 169,
+      "total_failed": 0,
+      "total_ignored": 6
+    },
+    {
+      "unit": "file-sizing-errors",
+      "log": "~/work/upstream-prep/logs/file-sizing-errors.log",
+      "sha256": "997e748a40de3b005f85ec56e982df0904e980dab745c3985c47723505ea7ebb",
+      "bytes": 133849,
+      "total_passed": 170,
+      "total_failed": 0,
+      "total_ignored": 6
+    },
+    {
+      "unit": "tracker-request-bounds",
+      "log": "~/work/upstream-prep/logs/tracker-request-bounds.log",
+      "sha256": "19362e0d163e4b39a311a86a36e5a12c0f670127afd1c4221b95e949a82849f8",
+      "bytes": 130315,
+      "total_passed": 170,
+      "total_failed": 0,
+      "total_ignored": 6
+    },
+    {
+      "unit": "disable-auto-restore",
+      "log": "~/work/upstream-prep/logs/disable-auto-restore.log",
+      "sha256": "2866cde93438f6e40898de88a6bea4ca9b64a17eb48cfe995589742eda30931a",
+      "bytes": 133931,
+      "total_passed": 169,
+      "total_failed": 0,
+      "total_ignored": 6
+    },
+    {
+      "unit": "session-peer-limit",
+      "log": "~/work/upstream-prep/logs/session-peer-limit.log",
+      "sha256": "640aadfcfb544256fee12df26ac8d4869b35822428d72bb6a57172ea6fa73cdb",
+      "bytes": 132091,
+      "total_passed": 171,
+      "total_failed": 0,
+      "total_ignored": 6
+    },
+    {
+      "unit": "peer-response-budget",
+      "log": "~/work/upstream-prep/logs/peer-response-budget.log",
+      "sha256": "69d7beaae65fe9b8fe19c877550418ae636e305e13bc1c6ed9f71774583221d5",
+      "bytes": 130421,
+      "total_passed": 170,
+      "total_failed": 0,
+      "total_ignored": 6
+    },
+    {
+      "unit": "known-peer-limit",
+      "log": "~/work/upstream-prep/logs/known-peer-limit.log",
+      "sha256": "ef49bf82ef376babeb057556de11800f884427e53a3fd878d8f1fe5e5f0dd0a8",
+      "bytes": 132350,
+      "total_passed": 176,
+      "total_failed": 0,
+      "total_ignored": 6
+    },
+    {
+      "unit": "dht-queue-bounds",
+      "log": "~/work/upstream-prep/logs/dht-queue-bounds.log",
+      "sha256": "49e1d8a67ac6f1c5a8c9b256d5bd6eaa8a45981d043cb3d433e1ba3c811ae509",
+      "bytes": 129720,
+      "total_passed": 169,
+      "total_failed": 0,
+      "total_ignored": 6
+    },
+    {
+      "unit": "metadata-resolver-bounds",
+      "log": "~/work/upstream-prep/logs/metadata-resolver-bounds.log",
+      "sha256": "716b2527d06c5cde5f468a7bf7ead71400b03133bf1c473dcc5e6c8b5061d08f",
+      "bytes": 130419,
+      "total_passed": 170,
+      "total_failed": 0,
+      "total_ignored": 6
+    }
+  ],
+  "surviving_source_refs": [
+    "main f4ca7d919638a7b8b031ab062a61861a9eb586e4",
+    "up/dht-queue-bounds 93cc7996ef98c61a2713cbeb774c0b6bfd45c5ad",
+    "up/disable-auto-restore 7275cc03e3fdf32e82049b255f1eb669f03a958c",
+    "up/file-sizing-errors 4b7f5ebfbc8c64c3b53083873042cc3d3352792a",
+    "up/known-peer-limit 635237c608ea8725008f2347f4b7df217971a9cd",
+    "up/metadata-resolver-bounds 24865b6223b0c2aa7926f5dbab02868634c88b9d",
+    "up/metadata-size-limit 34465af1d006a4ff5775281bf5c6e7b49973a013",
+    "up/peer-response-budget d877b2fc0c20c6281c4db2a0b190498b030bfc9d",
+    "up/session-peer-limit 0b5cae556103d23d425172beb60bbb118dbbf2f1",
+    "up/tracker-request-bounds 04842f26fa2e66661b07ffcac643d9a5e34df78d"
+  ],
+  "limitations": [
+    "Logs establish historical test totals; they do not embed an immutable source SHA in every test group.",
+    "Historical source identity is inherited from the saved kit and surviving branch refs; no fresh compilation claimed."
+  ]
+}

@@ -1,4 +1,4 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 3d86ddf65c667e0e2bc65bd19011a48ba8c651b4 Mon Sep 17 00:00:00 2001
 From: Paul Junod <donujp@gmail.com>
 Date: Tue, 27 Oct 2026 13:55:51 -0400
 Subject: [PATCH] feat(session): bound the number of retained peer records
@@ -41,14 +41,19 @@ The limits default to None and are read at session/torrent construction
 only. The two fixes above apply whether or not a limit is set. Tests cover the per-torrent and shared ceilings,
 release when a record is removed, release of the local slot when the
 shared acquisition fails, and the alternate-address requeue.
+
+Incoming-only cleanup removes a record only while it is still queued and
+has no outgoing address, under the map lock. A replacement incoming
+connection accepted after the old handler releases its guard is retained;
+a deterministic interleaving regression covers that race and slot release.
 ---
- crates/librqbit/src/session.rs                |  22 +++
- crates/librqbit/src/torrent_state/live/mod.rs |  62 ++++++---
- .../src/torrent_state/live/peer/mod.rs        |  32 +++--
- .../src/torrent_state/live/peers/mod.rs       | 131 +++++++++++++++++-
+ crates/librqbit/src/session.rs                |  22 ++
+ crates/librqbit/src/torrent_state/live/mod.rs |  62 ++++--
+ .../src/torrent_state/live/peer/mod.rs        |  32 +--
+ .../src/torrent_state/live/peers/mod.rs       | 196 +++++++++++++++++-
  crates/librqbit/src/torrent_state/mod.rs      |   2 +
  crates/rqbit/src/main.rs                      |   2 +
- 6 files changed, 220 insertions(+), 31 deletions(-)
+ 6 files changed, 284 insertions(+), 32 deletions(-)
 
 diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
 index 3d64bdcf..0fbbe394 100644
@@ -119,7 +124,7 @@ index 3d64bdcf..0fbbe394 100644
                      _disable_upload: self._disable_upload,
                  },
 diff --git a/crates/librqbit/src/torrent_state/live/mod.rs b/crates/librqbit/src/torrent_state/live/mod.rs
-index ec5be881..56ab4fd3 100644
+index ec5be881..74c60339 100644
 --- a/crates/librqbit/src/torrent_state/live/mod.rs
 +++ b/crates/librqbit/src/torrent_state/live/mod.rs
 @@ -220,8 +220,11 @@ pub enum AddIncomingPeerResult {
@@ -256,7 +261,7 @@ index ec5be881..56ab4fd3 100644
  
 +        if self.incoming && pe.value().outgoing_address.is_none() {
 +            drop(pe);
-+            self.state.peers.drop_peer(handle);
++            self.state.peers.drop_disconnected_incoming_peer(handle);
 +            return Ok(());
 +        }
 +
@@ -386,7 +391,7 @@ index 93f3d018..9d389d96 100644
              }
          } else {
 diff --git a/crates/librqbit/src/torrent_state/live/peers/mod.rs b/crates/librqbit/src/torrent_state/live/peers/mod.rs
-index 3cd34778..63830de3 100644
+index 3cd34778..ad05a165 100644
 --- a/crates/librqbit/src/torrent_state/live/peers/mod.rs
 +++ b/crates/librqbit/src/torrent_state/live/peers/mod.rs
 @@ -3,6 +3,7 @@ use std::{collections::HashSet, net::SocketAddr, sync::Arc};
@@ -451,7 +456,36 @@ index 3cd34778..63830de3 100644
                  atomic_inc(&self.stats.queued);
                  atomic_inc(&self.session_stats.queued);
  
-@@ -203,6 +235,7 @@ mod tests {
+@@ -83,8 +115,27 @@ impl PeerStates {
+             .flatten()
+     }
+ 
++    pub fn drop_disconnected_incoming_peer(&self, handle: PeerHandle) -> Option<Peer> {
++        // The old connection released its map guard after taking its state.
++        // Admission may already have replaced it with another live connection.
++        self.drop_peer_if(handle, |peer| {
++            peer.outgoing_address.is_none() && matches!(peer.get_state(), PeerState::Queued)
++        })
++    }
++
+     pub fn drop_peer(&self, handle: PeerHandle) -> Option<Peer> {
+-        let p = self.states.remove(&handle).map(|r| r.1)?;
++        self.drop_peer_if(handle, |_| true)
++    }
++
++    fn drop_peer_if(
++        &self,
++        handle: PeerHandle,
++        predicate: impl FnOnce(&Peer) -> bool,
++    ) -> Option<Peer> {
++        let p = self
++            .states
++            .remove_if(&handle, |_, peer| predicate(peer))
++            .map(|r| r.1)?;
+         let s = p.get_state();
+         self.stats.dec(s);
+         self.session_stats.dec(s);
+@@ -203,6 +254,7 @@ mod tests {
              live_outgoing_peers: Default::default(),
              stats: Default::default(),
              states: Default::default(),
@@ -459,7 +493,7 @@ index 3cd34778..63830de3 100644
          }
      }
  
-@@ -309,3 +342,99 @@ mod tests {
+@@ -309,3 +361,143 @@ mod tests {
          assert_eq!(live_seeders(&peers), (1, 1));
      }
  }
@@ -557,6 +591,50 @@ index 3cd34778..63830de3 100644
 +            Some((handle, outgoing))
 +        );
 +        assert_eq!(peer.reconnect_not_needed_peer(&peers), None);
++    }
++    #[test]
++    fn old_incoming_disconnect_does_not_remove_replacement_connection() {
++        use crate::stream_connect::ConnectionKind;
++        use librqbit_core::hash_id::Id20;
++        use tokio::sync::mpsc::unbounded_channel;
++
++        let peers = peer_states(1);
++        let handle = SocketAddr::from(([127, 0, 0, 1], 1));
++        assert_eq!(peers.add_if_not_seen(handle), Some(handle));
++        let (old_tx, _old_rx) = unbounded_channel();
++        {
++            let mut peer = peers.states.get_mut(&handle).unwrap();
++            peer.outgoing_address = None;
++            peer.incoming_connection(Id20::new([1; 20]), old_tx, &peers, ConnectionKind::Tcp)
++                .unwrap();
++            // on_peer_died takes the old state, then releases this map guard.
++            assert!(matches!(peer.take_state(&peers), PeerState::Live(_)));
++        }
++        // A replacement connection is accepted before the old cleanup resumes.
++        let (replacement_tx, _replacement_rx) = unbounded_channel();
++        peers
++            .states
++            .get_mut(&handle)
++            .unwrap()
++            .incoming_connection(
++                Id20::new([2; 20]),
++                replacement_tx,
++                &peers,
++                ConnectionKind::Tcp,
++            )
++            .unwrap();
++
++        assert!(peers.drop_disconnected_incoming_peer(handle).is_none());
++        assert!(matches!(
++            peers.states.get(&handle).unwrap().get_state(),
++            PeerState::Live(_)
++        ));
++        assert!(peers.known_peer_semaphores.try_acquire().is_none());
++
++        // Its own eventual disconnect can still free the retained-record slot.
++        peers.states.get_mut(&handle).unwrap().take_state(&peers);
++        drop(peers.drop_disconnected_incoming_peer(handle).unwrap());
++        assert!(peers.known_peer_semaphores.try_acquire().is_some());
 +    }
 +}
 diff --git a/crates/librqbit/src/torrent_state/mod.rs b/crates/librqbit/src/torrent_state/mod.rs

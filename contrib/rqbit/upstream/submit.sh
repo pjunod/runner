@@ -8,7 +8,7 @@
 #   2. skips the slug if a PR from pjunod:up/<slug> already exists (any state);
 #   3. forks ikatson/rqbit to pjunod/rqbit if the fork is missing;
 #   4. creates branch up/<slug> on that fresh upstream main and applies NN-<slug>.patch
-#      with `git am --3way` (it stops with a clear message if the patch no longer applies);
+#      with `git am --3way --signoff` when submitted (it stops with a clear message if the patch no longer applies);
 #   5. pushes the branch to the fork;
 #   6. opens the PR with NN-<slug>.md as the body, the commit subject as the title.
 #
@@ -33,6 +33,7 @@ UPSTREAM_URL="${RQBIT_UPSTREAM_URL:-https://github.com/${UPSTREAM_REPO}.git}"
 UPSTREAM_BRANCH="${RQBIT_UPSTREAM_BRANCH:-main}"
 WORKDIR="${RQBIT_SUBMIT_WORKDIR:-${XDG_CACHE_HOME:-$HOME/.cache}/rqbit-upstream-submit}"
 CLONE="$WORKDIR/rqbit"
+QUALIFIED_BASE=f4ca7d919638a7b8b031ab062a61861a9eb586e4
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Submission order. known-peer-limit depends on session-peer-limit.
@@ -91,27 +92,42 @@ export GIT_COMMITTER_NAME="Paul Junod"
 export GIT_COMMITTER_EMAIL="donujp@gmail.com"
 
 ensure_clone() {
-  mkdir -p "$WORKDIR"
-  if [ ! -d "$CLONE/.git" ]; then
+  mkdir -p "$WORKDIR" || die "cannot create $WORKDIR"
+  if [ -z "${LOCK_OWNED:-}" ]; then
+    mkdir "$WORKDIR/.submit-lock" 2>/dev/null || die "submission cache is locked: $WORKDIR/.submit-lock"
+    LOCK_OWNED=1
+    trap 'rmdir "$WORKDIR/.submit-lock"' EXIT
+  fi
+  if [ ! -e "$CLONE" ]; then
     info "cloning $UPSTREAM_URL into $CLONE"
     # A full clone, not a partial one: pushing from a partial clone to the fork needs objects it does not have.
-    git clone --quiet --no-checkout "$UPSTREAM_URL" "$CLONE"
+    git clone --quiet "$UPSTREAM_URL" "$CLONE" || die "upstream clone failed"
+    printf '%s\n' "$UPSTREAM_URL" > "$CLONE/.git/upstream-submit-owner"
   fi
-  git -C "$CLONE" remote set-url origin "$UPSTREAM_URL"
-  git -C "$CLONE" fetch --quiet origin "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/origin/${UPSTREAM_BRANCH}"
-  BASE_SHA="$(git -C "$CLONE" rev-parse "origin/${UPSTREAM_BRANCH}")"
+  [ -f "$CLONE/.git/upstream-submit-owner" ] && [ "$(cat "$CLONE/.git/upstream-submit-owner")" = "$UPSTREAM_URL" ] ||
+    die "refusing unowned cache $CLONE; choose an empty RQBIT_SUBMIT_WORKDIR"
+  [ "$(git -C "$CLONE" remote get-url origin)" = "$UPSTREAM_URL" ] || die "cache origin changed"
+  [ -z "$(git -C "$CLONE" status --porcelain --untracked-files=all)" ] || die "cache has local changes: $CLONE"
+  [ ! -d "$CLONE/.git/rebase-apply" ] && [ ! -d "$CLONE/.git/rebase-merge" ] || die "cache has an interrupted am/rebase"
+  git -C "$CLONE" fetch --quiet origin "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/origin/${UPSTREAM_BRANCH}" || die "upstream fetch failed; refusing stale source"
+  BASE_SHA="$(git -C "$CLONE" rev-parse "origin/${UPSTREAM_BRANCH}")" || die "cannot resolve fetched upstream"
+  if [ "$DRY_RUN" -eq 0 ] && [ "$BASE_SHA" != "$QUALIFIED_BASE" ]; then
+    die "upstream moved from qualified base $QUALIFIED_BASE to $BASE_SHA; rebase and requalify before real submission"
+  fi
   info "upstream ${UPSTREAM_BRANCH} is at ${BASE_SHA}"
 }
 
-fresh_branch() { # $1 = branch name
-  git -C "$CLONE" am --abort >/dev/null 2>&1 || true
-  git -C "$CLONE" reset --quiet --hard 2>/dev/null || true
-  git -C "$CLONE" clean --quiet -fdx 2>/dev/null || true
-  git -C "$CLONE" checkout --quiet -B "$1" "origin/${UPSTREAM_BRANCH}"
+fresh_branch() { # $1 = branch name; ensure_clone proved the cache clean and owned.
+  if git -C "$CLONE" show-ref --verify --quiet "refs/heads/$1"; then
+    git -C "$CLONE" update-ref "refs/upstream-submit/archive/$(date +%s)-$$/$1" "refs/heads/$1" || die "cannot preserve old branch"
+  fi
+  git -C "$CLONE" checkout --quiet --no-overwrite-ignore -B "$1" "origin/${UPSTREAM_BRANCH}" || die "cannot prepare $1"
 }
 
 apply_patch() { # $1 = patch file, $2 = slug (for the message)
-  if ! git -C "$CLONE" am --quiet --3way "$1" >/dev/null 2>&1; then
+  local am_flags=(--quiet --3way)
+  if [ "$DRY_RUN" -eq 0 ]; then am_flags+=(--signoff); fi
+  if ! git -C "$CLONE" am "${am_flags[@]}" "$1" >/dev/null 2>&1; then
     git -C "$CLONE" am --abort >/dev/null 2>&1 || true
     die "$2: the patch no longer applies to upstream ${UPSTREAM_BRANCH} (${BASE_SHA}). Rebase it by hand (it was cut against f4ca7d919638a7b8b031ab062a61861a9eb586e4) and regenerate the .patch before submitting."
   fi
@@ -119,38 +135,45 @@ apply_patch() { # $1 = patch file, $2 = slug (for the message)
 
 # gh's --head filter takes a bare branch name (no owner:), so filter on the fork owner afterwards.
 pr_url_for_head() { # prints the URL of any PR (open/merged/closed) from the fork branch, or nothing
-  gh pr list --repo "$UPSTREAM_REPO" --head "$1" --state all --json url,headRepositoryOwner \
+  gh pr list --repo "$UPSTREAM_REPO" --head "$1" --base "$UPSTREAM_BRANCH" --state all --json url,headRepositoryOwner \
     --jq "[.[] | select(.headRepositoryOwner.login == \"${FORK_OWNER}\")][0].url // empty"
 }
 
 pr_merged() { # $1 = fork branch
-  [ "$(gh pr list --repo "$UPSTREAM_REPO" --head "$1" --state merged --json number,headRepositoryOwner \
+  [ "$(gh pr list --repo "$UPSTREAM_REPO" --head "$1" --base "$UPSTREAM_BRANCH" --state merged --json number,headRepositoryOwner \
         --jq "[.[] | select(.headRepositoryOwner.login == \"${FORK_OWNER}\")] | length")" -gt 0 ]
 }
 
 ensure_fork() {
-  if gh repo view "${FORK_OWNER}/${FORK_REPO}" >/dev/null 2>&1; then
-    local parent
-    parent="$(gh repo view "${FORK_OWNER}/${FORK_REPO}" --json parent \
-      --jq 'if .parent then (.parent.owner.login + "/" + .parent.name) else "" end')"
-    [ "$parent" = "$UPSTREAM_REPO" ] || die "${FORK_OWNER}/${FORK_REPO} exists but is not a fork of ${UPSTREAM_REPO}"
-  else
+  local parent i appeared=0
+  if ! gh repo view "${FORK_OWNER}/${FORK_REPO}" >/dev/null 2>&1; then
     info "forking ${UPSTREAM_REPO} to ${FORK_OWNER}/${FORK_REPO}"
-    gh repo fork "$UPSTREAM_REPO" --clone=false
-    local i
+    gh repo fork "$UPSTREAM_REPO" --clone=false || die "fork creation failed"
     for i in 1 2 3 4 5 6; do
-      gh repo view "${FORK_OWNER}/${FORK_REPO}" >/dev/null 2>&1 && return 0
+      if gh repo view "${FORK_OWNER}/${FORK_REPO}" >/dev/null 2>&1; then appeared=1; break; fi
       sleep 5
     done
-    die "fork ${FORK_OWNER}/${FORK_REPO} did not appear"
+    [ "$appeared" -eq 1 ] || die "fork ${FORK_OWNER}/${FORK_REPO} did not appear"
   fi
+  parent="$(gh repo view "${FORK_OWNER}/${FORK_REPO}" --json parent \
+    --jq 'if .parent then (.parent.owner.login + "/" + .parent.name) else "" end')" || die "cannot verify fork parent"
+  [ "$parent" = "$UPSTREAM_REPO" ] || die "${FORK_OWNER}/${FORK_REPO} exists but is not a fork of ${UPSTREAM_REPO}"
 }
 
 push_branch() { # $1 = branch
   local i
   for i in 1 2 3; do
+    local expected remote receipt published
+    remote="https://github.com/${FORK_OWNER}/${FORK_REPO}.git"
+    expected="$(git -c credential.helper= -c "credential.helper=!gh auth git-credential" ls-remote "$remote" "refs/heads/$1" | awk '{print $1}')" || die "cannot inspect remote branch"
+    receipt="$CLONE/.git/upstream-submit-published/$1"
+    published=""
+    [ ! -f "$receipt" ] || published="$(cat "$receipt")"
+    [ "$expected" = "$published" ] || die "refusing unowned or changed remote branch $1"
+    mkdir -p "$(dirname "$receipt")" || die "cannot record published branch ownership"
     if git -C "$CLONE" -c credential.helper= -c "credential.helper=!gh auth git-credential" \
-         push --quiet --force "https://github.com/${FORK_OWNER}/${FORK_REPO}.git" "HEAD:refs/heads/$1"; then
+         push --quiet "--force-with-lease=refs/heads/$1:$expected" "$remote" "HEAD:refs/heads/$1"; then
+      git -C "$CLONE" rev-parse HEAD > "$receipt.new" && mv "$receipt.new" "$receipt" || die "cannot save published tip"
       return 0
     fi
     info "push failed (attempt $i), retrying"
@@ -176,7 +199,7 @@ submit_one() {
 
   if [ "$DRY_RUN" -eq 0 ]; then
     local existing
-    existing="$(pr_url_for_head "$branch")"
+    existing="$(pr_url_for_head "$branch")" || die "cannot inspect existing PRs"
     if [ -n "$existing" ]; then
       info "[$slug] a PR from ${FORK_OWNER}:${branch} already exists: $existing (skipping)"
       return 0
@@ -188,8 +211,8 @@ submit_one() {
     fi
   fi
 
-  ensure_clone
-  fresh_branch "$branch"
+  ensure_clone || die "cannot prepare upstream cache"
+  fresh_branch "$branch" || die "cannot prepare submission branch"
 
   if [ -n "$prereq" ] && [ "$DRY_RUN" -eq 1 ]; then
     info "[$slug] dry-run: not asking GitHub whether '${prereq}' is merged; applying its patch first to exercise the stacked apply path"
@@ -197,7 +220,11 @@ submit_one() {
       info "[$slug] dry-run: prerequisite '${prereq}' applied on ${BASE_SHA}"
     else
       git -C "$CLONE" am --abort >/dev/null 2>&1 || true
-      info "[$slug] dry-run: prerequisite does not apply (probably already in upstream); applying '${slug}' on upstream directly"
+      if git -C "$CLONE" apply --reverse --check "$(patch_of "$prereq")" >/dev/null 2>&1; then
+        info "[$slug] dry-run: prerequisite is already present upstream"
+      else
+        die "[$slug] prerequisite '$prereq' neither applies nor is already upstream; rebase before proceeding"
+      fi
     fi
   fi
 
@@ -212,14 +239,14 @@ submit_one() {
     return 0
   fi
 
-  ensure_fork
-  push_branch "$branch"
+  ensure_fork || die "cannot prepare fork"
+  push_branch "$branch" || die "push failed"
   local draft_flag=""
   if [ "$DRAFT" -eq 1 ]; then draft_flag="--draft"; fi
   local url
   # shellcheck disable=SC2086  # draft_flag is empty or a single flag
   url="$(gh pr create --repo "$UPSTREAM_REPO" --base "$UPSTREAM_BRANCH" --head "${FORK_OWNER}:${branch}" \
-          --title "$title" --body-file "$md" $draft_flag)"
+          --title "$title" --body-file "$md" $draft_flag)" || die "PR creation failed"
   info "[$slug] opened $url"
 }
 
