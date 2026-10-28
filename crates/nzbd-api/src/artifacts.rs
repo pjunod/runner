@@ -965,18 +965,23 @@ mod tests {
         assert_eq!(replay.status(), StatusCode::ACCEPTED);
         assert_eq!(response_json(replay).await["id"], queued["id"]);
 
-        // Seed a durable published recovery via the same inventory API used by
-        // the background stage task, then exercise the public claim/receipt
-        // handlers against its exact persisted identity.
+        // Drain the HTTP-admitted task under the runner lock. Creating another
+        // recovery here races the engine's immediate maintenance tick: whichever
+        // stage wins holds the artifact and makes the other's revision stale.
+        artifacts.run_tasks().unwrap();
+        let task_id = queued["id"].as_str().unwrap();
+        let task = artifacts.operation(task_id).unwrap();
+        assert_eq!(
+            task.state, "succeeded",
+            "stage task failed: {:?}",
+            task.error
+        );
         let staged = artifacts
-            .stage_recovery(
-                &artifact.id,
-                artifact.revision,
-                "api-recovery-request",
-                &["episode.mkv".into()],
-                &recovery_root,
-            )
-            .unwrap();
+            .recoveries(0)
+            .unwrap()
+            .into_iter()
+            .find(|recovery| recovery.request_id == task_id)
+            .expect("HTTP stage task must persist its published recovery");
         assert_eq!(staged.state, "published");
         let detail = app
             .clone()
