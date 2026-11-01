@@ -282,3 +282,143 @@ mod tests {
         assert!(source.exists());
     }
 }
+
+/// Delete one newly-created sealed generation through directory descriptors.
+/// The caller supplies its committed result identity and exact byte manifest;
+/// unknown entries or a replacement directory remain untouched for review.
+pub fn remove_cluster_generation_copy(
+    root: &Path,
+    relative: &Path,
+    expected_identity: (u64, u64),
+    files: &[DeliveryFile],
+) -> Result<()> {
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(Error::Conflict("unsafe cluster generation path".into()));
+    }
+    let anchor = fs::open_dir(root)?;
+    let parent_relative = relative.parent().unwrap_or(Path::new(""));
+    let parent = if parent_relative.as_os_str().is_empty() {
+        anchor.try_clone()?
+    } else {
+        fs::open_relative(&anchor, &parent_relative.to_string_lossy())?
+    };
+    let name = Path::new(
+        relative
+            .file_name()
+            .ok_or_else(|| Error::Conflict("generation name missing".into()))?,
+    );
+    let directory = fs::open_at(&parent, name, true)?;
+    let identity = fs::identity_for_file(&directory)?;
+    if (identity.device, identity.inode) != expected_identity {
+        return Err(Error::Conflict(
+            "sealed generation directory identity changed".into(),
+        ));
+    }
+    let mut observed = fs::manifest(&directory, 100_000)?;
+    for entry in observed.iter().filter(|entry| entry.identity.directory) {
+        if !files
+            .iter()
+            .any(|file| file.path.starts_with(&format!("{}/", entry.path)))
+        {
+            return Err(Error::Conflict(format!(
+                "unexpected generation directory: {}",
+                entry.path
+            )));
+        }
+    }
+    for entry in observed.iter().filter(|entry| !entry.identity.directory) {
+        let expected = files
+            .iter()
+            .find(|file| file.path == entry.path)
+            .ok_or_else(|| {
+                Error::Conflict(format!("unexpected generation entry: {}", entry.path))
+            })?;
+        if expected.size_bytes != entry.identity.bytes {
+            return Err(Error::Conflict("sealed generation length changed".into()));
+        }
+        let mut input = fs::open_relative(&directory, &entry.path)?;
+        use std::io::Read;
+        let mut hash = Sha256::new();
+        let mut buffer = [0u8; 65536];
+        loop {
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+        }
+        if format!("{:x}", hash.finalize()) != expected.sha256
+            || fs::identity_for_file(&input)? != entry.identity
+        {
+            return Err(Error::Conflict(
+                "sealed generation bytes changed before retirement".into(),
+            ));
+        }
+    }
+    // Missing entries can be the exact crash-after-unlink boundary of this
+    // durable copy obligation. Unexpected surviving entries cannot.
+    observed.sort_by_key(|entry| std::cmp::Reverse(entry.path.matches('/').count()));
+    for entry in &observed {
+        fs::remove_entry(&directory, entry)?;
+    }
+    fs::remove_entry(
+        &parent,
+        &FileEntry {
+            path: name.to_string_lossy().into_owned(),
+            digest: None,
+            identity,
+        },
+    )
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    #[test]
+    fn sealed_copy_retirement_replays_after_metadata_unlink_and_refuses_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("generations");
+        let path = root.join("job/fence-1");
+        std::fs::create_dir_all(path.join("files")).unwrap();
+        let inputs = [
+            ("files/episode.mkv", b"payload".as_slice()),
+            ("job.json", b"job descriptor".as_slice()),
+            ("manifest.json", b"manifest descriptor".as_slice()),
+        ];
+        let mut files = Vec::new();
+        for (name, bytes) in inputs {
+            std::fs::write(path.join(name), bytes).unwrap();
+            files.push(DeliveryFile {
+                path: name.into(),
+                size_bytes: bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            });
+        }
+        let identity = fs::identity_for_file(&fs::open_dir(&path).unwrap()).unwrap();
+        // The exact copy claim/deletion manifest is durable outside this tree.
+        std::fs::remove_file(path.join("manifest.json")).unwrap();
+        remove_cluster_generation_copy(
+            &root,
+            Path::new("job/fence-1"),
+            (identity.device, identity.inode),
+            &files,
+        )
+        .unwrap();
+        assert!(!path.exists());
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("replacement.mkv"), b"unowned replacement").unwrap();
+        assert!(remove_cluster_generation_copy(
+            &root,
+            Path::new("job/fence-1"),
+            (identity.device, identity.inode),
+            &files
+        )
+        .is_err());
+        assert!(path.join("replacement.mkv").exists());
+    }
+}
