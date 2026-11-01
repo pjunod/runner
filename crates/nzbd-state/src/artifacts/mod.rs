@@ -1470,11 +1470,8 @@ impl Inventory {
         Ok(a)
     }
 
-    /// Persist the per-job failed-source choice in the same inventory journal
-    /// consulted at the physical-delete boundary. Explicit artifact deletion
-    /// remains a separate user action and is not blocked by this preference.
-    pub fn set_keep_on_failure(&self, job: u32, keep: bool) -> Result<bool> {
-        let guard = self.mutation_guard()?;
+    /// Current exact Runner-owned source; Delivery's admission Keep is immutable.
+    pub fn failure_keep_source(&self, job: u32) -> Result<Option<Artifact>> {
         let mut artifact = self.for_job(job)?;
         // After publication, the job handle resolves to the transferred
         // publication artifact. Keep governs the separate Runner-owned
@@ -1499,6 +1496,15 @@ impl Inventory {
                 }
             }
         }
+        Ok(artifact.filter(|artifact| artifact.owned && !artifact.terminal()))
+    }
+
+    /// Persist the per-job failed-source choice in the same inventory journal
+    /// consulted at the physical-delete boundary. Explicit artifact deletion
+    /// remains a separate user action and is not blocked by this preference.
+    pub fn set_keep_on_failure(&self, job: u32, keep: bool) -> Result<bool> {
+        let guard = self.mutation_guard()?;
+        let artifact = self.failure_keep_source(job)?;
         let Some(mut artifact) = artifact else {
             return Ok(false);
         };

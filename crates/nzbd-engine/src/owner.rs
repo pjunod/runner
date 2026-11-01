@@ -2150,7 +2150,7 @@ impl Owner {
                         // terminal queue row alone cannot target publication.
                         true
                     } else {
-                        record.status != JobStatus::Deleted && !record.held()
+                        record.status != JobStatus::Deleted
                     }
                 });
                 let changed = if allowed {

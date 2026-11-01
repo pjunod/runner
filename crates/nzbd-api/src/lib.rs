@@ -974,6 +974,24 @@ struct KeepOnFailureBody {
     keep: bool,
 }
 
+async fn get_failure_keep(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
+    let inventory = st.engine.artifacts();
+    match tokio::task::spawn_blocking(move || inventory.failure_keep_source(id)).await {
+        Ok(Ok(Some(source))) => Json(json!({"available": true, "keep": source.keep_on_failure, "sourceArtifactId": source.id, "sourceGeneration": source.generation})).into_response(),
+        Ok(Ok(None)) => match st.engine.export_job(JobId(id)).await {
+            Ok(Some(job)) if matches!(job.status, nzbd_types::JobStatus::Fetching | nzbd_types::JobStatus::Queued | nzbd_types::JobStatus::Paused) => {
+                let has_source = st.engine.artifacts().for_job(id).ok().flatten().is_some();
+                if has_source { return Json(json!({"available":false,"keep":false})).into_response(); }
+                Json(json!({"available":true,"keep":job.params.iter().any(|(key,value)| key == "*Runner:KeepOnFailure" && value == "1")})).into_response()
+            }
+            Ok(_) => Json(json!({"available":false,"keep":false})).into_response(),
+            Err(failure) => error(StatusCode::SERVICE_UNAVAILABLE, &failure.to_string()),
+        },
+        Ok(Err(failure)) => error(StatusCode::SERVICE_UNAVAILABLE, &failure.to_string()),
+        Err(failure) => error(StatusCode::SERVICE_UNAVAILABLE, &failure.to_string()),
+    }
+}
+
 /// `PUT /api/v1/jobs/{id}/failure-keep` persists this job's explicit choice
 /// to retain its Runner-owned source if the transfer fails.
 async fn set_keep_on_failure(
@@ -1266,13 +1284,16 @@ async fn job_action(
     if action == "delete" || action == "delete-files" {
         let files = action == "delete-files";
         let snapshot = park_snapshot(&st, job).await;
+        let requeue_reason = snapshot
+            .as_ref()
+            .and_then(|parked| history_requeue_refusal(&parked.entry));
         return match engine.delete_job(job, files).await {
             Ok(true) => {
                 let mut parked = false;
                 if let Some(s) = snapshot {
                     parked = park_write(&st, s).await;
                 }
-                Json(json!({ "ok": true, "parked": parked })).into_response()
+                Json(json!({ "ok": true, "parked": parked, "can_requeue": parked && requeue_reason.is_none(), "requeue_reason": requeue_reason })).into_response()
             }
             Ok(false) => not_found(),
             Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
@@ -2633,7 +2654,11 @@ async fn history_requeue(st: &ApiState, db: Arc<HistoryDb>, job: JobId) -> Respo
         return not_found();
     };
     if let Some(reason) = history_requeue_refusal(&entry) {
-        return error(StatusCode::CONFLICT, reason);
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error":reason,"code":"consumer_request_requires_fresh_grab"})),
+        )
+            .into_response();
     }
     let url = entry
         .params
@@ -2854,7 +2879,10 @@ pub fn router_with(state: ApiState) -> Router {
         )
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/priority", put(set_job_priority))
-        .route("/api/v1/jobs/{id}/failure-keep", put(set_keep_on_failure))
+        .route(
+            "/api/v1/jobs/{id}/failure-keep",
+            get(get_failure_keep).put(set_keep_on_failure),
+        )
         .route("/api/v1/jobs/{id}/retry", post(retry_job_now))
         .route("/api/v1/jobs/{id}/files", get(get_job_files))
         .route("/api/v1/jobs/{id}/torrent", get(get_job_torrent))
@@ -3637,6 +3665,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retired_source_keep_route_reports_live_preference_without_exposing_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let engine = test_engine(&temporary).await;
+        let inventory = engine.artifacts();
+        let root = temporary.path().join("retained");
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("failed-source");
+        inventory
+            .allocate_for_delivery(86, &root, &source, true, false)
+            .unwrap();
+        std::fs::write(source.join("partial.mkv"), b"retained failed bytes").unwrap();
+        inventory
+            .finish(86, &source, &root, "parked_failed")
+            .unwrap();
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: None,
+            torrent: None,
+            log: None,
+            setup: None,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+        for keep in [true, false] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::put("/api/v1/jobs/86/failure-keep")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(json!({"keep":keep}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::get("/api/v1/jobs/86/failure-keep")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            assert_eq!(body["available"], true);
+            assert_eq!(body["keep"], keep);
+            assert!(body["sourceArtifactId"].is_string());
+            assert!(body["sourceGeneration"].is_string());
+            assert!(body.get("path").is_none());
+        }
+        let artifact = inventory.for_job(86).unwrap().unwrap();
+        let operation = inventory
+            .request_delete(
+                &artifact.id,
+                artifact.revision,
+                "explicit-retained-delete-86",
+                0,
+            )
+            .unwrap();
+        inventory.execute_delete(&operation.id).unwrap();
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/jobs/86/failure-keep")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(response).await["available"], false);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn consumer_history_requeue_refuses_both_sources_without_retiring_history() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = test_engine(&tmp).await;
@@ -3673,6 +3779,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                body_json(response).await["code"],
+                "consumer_request_requires_fresh_grab"
+            );
             assert!(db.get(JobId(id)).unwrap().is_some());
             assert!(engine.snapshot().jobs.is_empty());
         }
