@@ -29,5 +29,15 @@ test('a rate-limited fetch names the refusal, the wait and the next attempt', ()
 
 test('a retry whose deadline has passed is retrying now', () => {
   const detail = urlFetchDetail({ url_fetch: { attempts: 3, nextRetryAtUnix: now / 1000 - 5 } }, now);
-  expect(detail).toBe('Indexer refused · retrying now · attempt 3');
+  expect(detail).toBe('Fetch failed · retrying now · attempt 3');
+});
+
+test('only an HTTP status is an indexer refusal', () => {
+  expect(urlFetchDetail({ url_fetch: { attempts: 2, lastError: 'timed out', nextRetryAtUnix: now / 1000 + 60 } }, now))
+    .toMatch(/^Fetch failed: timed out · retrying in 1m \(/);
+});
+
+test('a retry in flight (no deadline) reads as retrying now; a future blocked-since clamps to zero', () => {
+  expect(urlFetchDetail({ url_fetch: { attempts: 1, lastError: '', nextRetryAtUnix: null, blockedSinceUnix: now / 1000 + 30 } }, now))
+    .toBe('Fetch failed · retrying now · waiting 0s · attempt 1');
 });

@@ -47,7 +47,7 @@ import { Theme, useDisplayPreferences, useTheme } from '../theme';
 import { useCollapsedSections } from '../storage/queuePreferences';
 import { SeedPolicyEditor } from '../components/SeedPolicyEditor';
 import { torrentDisplayPhase, torrentStatus, torrentPrimaryAction, seedPolicyText, seedStopText } from '../torrentPresentation';
-import { urlFetchDetail } from '../urlFetchPresentation';
+import { urlFetchDetail, useNow } from '../urlFetchPresentation';
 import { HistoryView } from './HistoryView';
 import { LogsView } from './LogsView';
 
@@ -623,7 +623,11 @@ export function JobCard({
   const seed = phase === 'seeding' || phase === 'paused_seed';
   const postProcessing = job.kind !== 'torrent' && isPostProcessingSection(sectionKey);
   const showStatus = !!phase || ['waiting', 'attention', 'paused'].includes(sectionKey);
-  const showProgress = !postProcessing && !seed && !['fetching_source', 'fetching_metadata', 'failed', 'missing_files'].includes(phase ?? '');
+  // An NZB URL job has no bytes until its NZB arrives: no bar, and the card
+  // says why it is waiting instead (urlFetchDetail).
+  const fetchingNzb = statusKey === 'fetching' && !phase;
+  const now = useNow(30_000, fetchingNzb && !hold);
+  const showProgress = !fetchingNzb && !postProcessing && !seed && !['fetching_source', 'fetching_metadata', 'failed', 'missing_files'].includes(phase ?? '');
   return (
     <View
       style={[
@@ -660,7 +664,7 @@ export function JobCard({
             </Text>
           ) : null}
           {hold ? <Text style={styles.statusFailed}>{hold.message}</Text> : null}
-          {statusKey === 'fetching' && !phase ? null : (
+          {fetchingNzb ? null : (
             <Text style={styles.metaText}>
               {seed ? 'Files ready' : `${formatBytes(job.downloaded_bytes)} / ${formatBytes(job.size_bytes)}`}
             </Text>
@@ -679,10 +683,12 @@ export function JobCard({
             <Text style={[styles.metaText, { color: tone.accent }]}>
               {postProcessingDetail(job, sectionKey, sectionLabel)}
             </Text>
-          ) : statusKey === 'fetching' ? (
-            <Text style={[styles.metaText, job.url_fetch?.attempts ? styles.statusFailed : null]}>
-              {urlFetchDetail(job, Date.now())}
-            </Text>
+          ) : fetchingNzb ? (
+            hold ? null : (
+              <Text style={[styles.metaText, job.url_fetch?.attempts ? styles.statusFailed : null]}>
+                {urlFetchDetail(job, now)}
+              </Text>
+            )
           ) : (
             <>
               <Text style={styles.metaText}>{formatBytes(job.rate_bps, '/s')}</Text>
