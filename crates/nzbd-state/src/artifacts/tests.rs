@@ -1156,6 +1156,74 @@ fn live_failure_keep_blocks_runner_disposal_but_not_explicit_delete() {
 }
 
 #[test]
+fn legacy_whole_source_relocation_replays_only_owned_private_staging() {
+    for phase in ["before-staging", "owned-partial", "unknown-nonempty"] {
+        let (tmp, db, root) = fixture();
+        let source = root.join("legacy-source");
+        db.allocate_for_delivery(95, &root, &source, true, true)
+            .unwrap();
+        let bytes = vec![0x35; 256 * 1024];
+        std::fs::write(source.join("episode.mkv"), &bytes).unwrap();
+        db.finish(95, &source, &root, "active").unwrap();
+        let target_root = tmp.path().join("completed-legacy");
+        std::fs::create_dir(&target_root).unwrap();
+        let target = target_root.join("release");
+        relocation::FAULTS.with(|faults| {
+            faults.borrow_mut().insert(
+                if phase == "owned-partial" {
+                    "copy_chunk"
+                } else {
+                    "before_move"
+                },
+                libc::EIO,
+            );
+        });
+        assert!(db
+            .relocate_for_delivery_checked(95, &target, &|| Ok(()))
+            .is_err());
+        let artifact = db.for_job(95).unwrap().unwrap();
+        let op = db.pending_relocations(&artifact.id).unwrap().remove(0);
+        let request: serde_json::Value = serde_json::from_str(&op.request).unwrap();
+        assert!(request["publication_files"].is_null());
+        assert_eq!(request["scratch"].is_null(), phase != "owned-partial");
+        let scratch = target_root.join(format!(".runner-{}", op.id));
+        if phase == "unknown-nonempty" {
+            std::fs::create_dir(&scratch).unwrap();
+            std::fs::write(scratch.join("unknown.bin"), b"unrelated").unwrap();
+        }
+        drop(db);
+        let reopened = Inventory::open(&tmp.path().join("state")).unwrap();
+        reopened.reconcile_startup(&[95]).unwrap();
+        reopened
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE operations SET data=json_set(data,'$.next_retry',0) WHERE id=?1",
+                [&op.id],
+            )
+            .unwrap();
+        reopened.reconcile_relocations().unwrap();
+        if phase == "unknown-nonempty" {
+            assert_eq!(reopened.operation(&op.id).unwrap().state, "review");
+            assert_eq!(
+                std::fs::read(scratch.join("unknown.bin")).unwrap(),
+                b"unrelated"
+            );
+            assert!(!target.exists());
+        } else {
+            assert_eq!(reopened.operation(&op.id).unwrap().state, "succeeded");
+            assert_eq!(std::fs::read(target.join("episode.mkv")).unwrap(), bytes);
+            let delivery = reopened
+                .create_delivery(95, true, Some("legacy-95"))
+                .unwrap();
+            assert_eq!(delivery.files.len(), 1);
+        }
+        assert_eq!(std::fs::read(source.join("episode.mkv")).unwrap(), bytes);
+    }
+}
+
+#[test]
 fn selected_publication_resumes_a_partial_private_copy_after_restart() {
     let (tmp, db, root) = fixture();
     let source = root.join("copy-resume");

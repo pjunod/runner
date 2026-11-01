@@ -247,11 +247,20 @@ pub(crate) enum QueueCommand {
     /// Insert (or replace) a job with its ids preserved — the cluster grant
     /// / completion path. Optionally folds the job's shared journals
     /// (cross-node resume).
+    ImportFence {
+        job: JobId,
+        reply: oneshot::Sender<Result<Option<String>, crate::EngineError>>,
+    },
+    EndImportPreparation {
+        job: JobId,
+        reply: oneshot::Sender<()>,
+    },
     ImportJob {
         job: Box<Job>,
-        fold_journals: bool,
+        preparation: Option<crate::imports::PreparedImport>,
+        authority: crate::imports::ImportAuthority,
         emit_finished: bool,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<Result<(), crate::EngineError>>,
     },
     /// Replace only an authority copy that still exists. This is the fenced
     /// terminal-update path: a demoted worker must never resurrect a job that
@@ -606,6 +615,8 @@ pub(crate) struct Owner {
     /// a post-processing recovery job; only the listed files may receive
     /// leases, even if a user resumes another file while verification waits.
     post_fetch_files: HashMap<JobId, HashSet<FileId>>,
+    import_preparations: HashMap<JobId, u32>,
+    foreign_journal_holds: HashSet<JobId>,
     repair_progress: HashMap<JobId, (String, Option<crate::RepairProgress>)>,
     /// Per-job download-rate EMA, fed from downloaded-byte deltas at
     /// snapshot time (job id → meter).
@@ -1082,6 +1093,8 @@ impl Owner {
             delegated: HashMap::new(),
             mirror: HashMap::new(),
             post_fetch_files,
+            import_preparations: HashMap::new(),
+            foreign_journal_holds: HashSet::new(),
             repair_progress: HashMap::new(),
             job_rates: HashMap::new(),
             job_wire_ema: HashMap::new(),
@@ -2452,14 +2465,64 @@ impl Owner {
                 self.publish_now();
                 let _ = reply.send(n);
             }
+            QueueCommand::ImportFence { job, reply } => {
+                if self.persistence_fenced {
+                    let _ = reply.send(Err(crate::EngineError::OwnershipLost));
+                } else {
+                    self.foreign_journal_holds.insert(job);
+                    *self.import_preparations.entry(job).or_default() += 1;
+                    let _ = reply.send(Ok(crate::imports::intent(self.state.job(job))));
+                }
+            }
+            QueueCommand::EndImportPreparation { job, reply } => {
+                self.finish_import_preparation(job, false);
+                let _ = reply.send(());
+            }
             QueueCommand::ImportJob {
                 job,
-                fold_journals,
+                preparation,
+                authority,
                 emit_finished,
                 reply,
             } => {
-                let committed = self.import_job(*job, fold_journals, emit_finished);
-                let _ = reply.send(committed);
+                let id = job.id;
+                let prepared = preparation.is_some();
+                if !authority.valid()
+                    || preparation
+                        .as_ref()
+                        .is_some_and(|proof| !proof.valid(id, self.state.job(id), &self.artifacts))
+                {
+                    if prepared {
+                        self.finish_import_preparation(id, false);
+                    }
+                    let _ = reply.send(Err(crate::EngineError::StaleImport));
+                    return;
+                }
+                let mut job = *job;
+                if let Some(proof) = preparation.as_ref() {
+                    proof.merge_current_progress(&mut job, self.state.job(id));
+                }
+                let committed = self.import_job(job, false, emit_finished);
+                if committed {
+                    if let Some(proof) = preparation {
+                        self.file_sizes
+                            .extend(proof.file_sizes.iter().map(|(key, value)| (*key, *value)));
+                        let files = proof.imported_files.iter().copied().collect::<Vec<_>>();
+                        drop(proof);
+                        for file in files {
+                            self.after_file_change(id, file);
+                        }
+                    }
+                    if prepared {
+                        self.finish_import_preparation(id, true);
+                    }
+                    let _ = reply.send(Ok(()));
+                } else {
+                    if prepared {
+                        self.finish_import_preparation(id, false);
+                    }
+                    let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
+                }
             }
             QueueCommand::ImportJobIfPresent {
                 job,
@@ -3204,6 +3267,18 @@ impl Owner {
         }
     }
 
+    fn finish_import_preparation(&mut self, job: JobId, applied: bool) {
+        if let Some(count) = self.import_preparations.get_mut(&job) {
+            if applied && *count == 1 {
+                self.foreign_journal_holds.remove(&job);
+            }
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.import_preparations.remove(&job);
+            }
+        }
+    }
+
     fn import_job(&mut self, job: Job, fold_journals: bool, emit_finished: bool) -> bool {
         self.import_job_proven(job, fold_journals, emit_finished, None)
     }
@@ -3374,60 +3449,9 @@ impl Owner {
         } else {
             None
         };
-        // Fold foreign journal facts into the staged row before persistence.
-        // This pass has no owner mutations or finalization side effects: a
-        // failed commit leaves every executor and receipt exactly as before.
-        let mut imported_file_sizes = HashMap::new();
-        let mut imported_files = HashSet::new();
         if fold_journals {
-            let records = match JobJournals::replay_job(&self.state_dir, job.id) {
-                Ok(records) => records,
-                Err(error) => {
-                    tracing::warn!(job=job.id.0, %error, "import journal replay refused");
-                    return false;
-                }
-            };
-            let root = self.dest_dir.join(job_dir_name(&job));
-            for record in records.into_iter().filter(|record| record.job == job.id) {
-                let Some(file) = job.files.iter_mut().find(|file| file.id == record.file) else {
-                    continue;
-                };
-                let stable = root.join(format!(".runner-file-{}.part", file.id.0));
-                let path = if stable.exists() {
-                    stable
-                } else {
-                    root.join(&file.filename)
-                };
-                if !crate::writer::validate_range(
-                    &path,
-                    record.offset,
-                    record.len as u64,
-                    record.crc32,
-                ) {
-                    tracing::warn!(
-                        job = job.id.0,
-                        file = record.file.0,
-                        "import journal bytes require revalidation; original queue preserved"
-                    );
-                    return false;
-                }
-                if record.file_size > 0 {
-                    imported_file_sizes.insert(record.file, record.file_size);
-                }
-                if let Some(segment) = file
-                    .segments
-                    .iter_mut()
-                    .find(|segment| segment.number == record.segment_number)
-                {
-                    segment.state = SegmentState::Done {
-                        offset: record.offset,
-                        len: record.len,
-                        crc: record.crc32,
-                    };
-                    imported_files.insert(file.id);
-                }
-            }
-        }
+            return false;
+        } // callers prepare foreign CRCs off the actor
         let job_id = job.id;
         let max_file = job.files.iter().map(|f| f.id.0).max().unwrap_or(0);
         let previous_ids = (self.state.next_job_id, self.state.next_file_id);
@@ -3501,10 +3525,6 @@ impl Owner {
         self.attempts.retain(|reference, _| reference.job != job_id);
         self.delegated.remove(&job_id);
         self.mirror.remove(&job_id);
-        self.file_sizes.extend(imported_file_sizes);
-        for file in imported_files {
-            self.after_file_change(job_id, file);
-        }
         if let Some(files) = self.state.job(job_id).and_then(recovered_post_fetch_files) {
             self.post_fetch_files.insert(job_id, files);
         } else {
@@ -6158,7 +6178,7 @@ impl Owner {
                 // written. Unknown: orphan from a deleted job or a stale
                 // lease. Delegated: live foreign writer — leave alone.
                 let _ = known; // clarity: both known and orphan compact
-                if !self.delegated.contains_key(&id) {
+                if !self.delegated.contains_key(&id) && !self.foreign_journal_holds.contains(&id) {
                     if let Err(e) = self.journal.remove_job(id) {
                         tracing::debug!(job = id.0, error = %e, "journal compact skip");
                     }
@@ -8414,6 +8434,204 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn foreign_journal_crc_preparation_keeps_actor_responsive_and_rejects_stale_intent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = temporary.path().join("state");
+        let destination = temporary.path().join("dest");
+        let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
+            Vec::new(),
+            state.clone(),
+            destination.clone(),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let mut job = pending_job(88);
+        job.dir_name = "restored-input".into();
+        let file = job.files[0].id;
+        let source = destination.join(&job.dir_name);
+        let inventory = engine.artifacts();
+        inventory
+            .allocate_for_delivery(88, &destination, &source, true, false)
+            .unwrap();
+        let partial = source.join(format!(".runner-file-{}.part", file.0));
+        std::fs::write(&partial, vec![7; 100]).unwrap();
+        inventory
+            .finish(88, &source, &destination, "active")
+            .unwrap();
+        engine.import_job(job.clone(), false, false).await.unwrap();
+        let mut journal = JobJournals::open(&state, "foreign").unwrap();
+        journal
+            .append(&JournalRecord {
+                job: job.id,
+                file,
+                segment_number: 1,
+                offset: 0,
+                len: 100,
+                crc32: crc32fast::hash(&vec![7; 100]),
+                file_size: 100,
+            })
+            .unwrap();
+        journal.sync().unwrap();
+        let gate = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        *crate::imports::PREPARATION_GATE.lock().unwrap() = Some((source.clone(), gate.clone()));
+        let importer = engine.clone();
+        let incoming = job.clone();
+        let pending = tokio::spawn(async move { importer.import_job(incoming, true, false).await });
+        let entered = gate.clone();
+        tokio::task::spawn_blocking(move || entered.0.wait())
+            .await
+            .unwrap();
+        let controls = tokio::time::timeout(Duration::from_secs(2), async {
+            assert!(engine.pause_job(job.id).await.unwrap());
+            assert!(engine.set_priority(job.id, 77).await.unwrap());
+            assert!(engine.set_keep_on_failure(job.id, true).await.unwrap());
+        })
+        .await;
+        let release = gate.clone();
+        tokio::task::spawn_blocking(move || release.1.wait())
+            .await
+            .unwrap();
+        controls.expect("CRC disk work must not block actor controls");
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(crate::EngineError::StaleImport)
+        ));
+        let current = engine.export_job(job.id).await.unwrap().unwrap();
+        assert_eq!(current.priority, 77);
+        assert_eq!(current.status, JobStatus::Paused);
+        assert!(current
+            .params
+            .iter()
+            .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1"));
+        assert_eq!(std::fs::read(&partial).unwrap(), vec![7; 100]);
+        // A control snapshot taken during preparation must not compact foreign
+        // facts that the rejected import never committed.
+        assert_eq!(JobJournals::replay_job(&state, job.id).unwrap().len(), 1);
+        assert!(engine
+            .set_category(job.id, Some("after-stale".into()))
+            .await
+            .unwrap());
+        assert_eq!(JobJournals::replay_job(&state, job.id).unwrap().len(), 1);
+        engine
+            .import_job(
+                engine.export_job(job.id).await.unwrap().unwrap(),
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+        let committed = engine.export_job(job.id).await.unwrap().unwrap();
+        assert!(matches!(
+            committed.files[0].segments[0].state,
+            SegmentState::Done { .. }
+        ));
+        assert_eq!(committed.priority, 77);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn prepared_import_rechecks_live_authority_at_actor_apply() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (temporary, mut owner, _adapter) = control_test_owner();
+        let mut job = pending_job(91);
+        job.dir_name = "expired-grant".into();
+        let live = Arc::new(AtomicBool::new(true));
+        let check = live.clone();
+        let authority =
+            crate::imports::ImportAuthority(Arc::new(move || check.load(Ordering::SeqCst)));
+        let (prepared, proof) = crate::imports::prepare(
+            job,
+            None,
+            &temporary.path().join("state"),
+            &owner.dest_dir,
+            owner.artifacts.clone(),
+            authority.clone(),
+        )
+        .unwrap();
+        live.store(false, Ordering::SeqCst);
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::ImportJob {
+            job: Box::new(prepared),
+            preparation: Some(proof),
+            authority,
+            emit_finished: false,
+            reply,
+        });
+        assert!(matches!(
+            result.await.unwrap(),
+            Err(crate::EngineError::StaleImport)
+        ));
+        assert!(owner.state.job(JobId(91)).is_none());
+        assert!(!owner.dest_dir.join("expired-grant").exists());
+    }
+
+    #[tokio::test]
+    async fn terminal_or_stale_import_preparation_never_creates_an_absent_namespace() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = temporary.path().join("state");
+        let destination = temporary.path().join("dest");
+        let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
+            Vec::new(),
+            state.clone(),
+            destination.clone(),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let mut terminal = pending_job(89);
+        terminal.status = JobStatus::Completed;
+        terminal.dir_name = "already-cleaned".into();
+        let (_, proof) = crate::imports::prepare(
+            terminal,
+            None,
+            &state,
+            &destination,
+            engine.artifacts(),
+            Default::default(),
+        )
+        .unwrap();
+        drop(proof);
+        assert!(!destination.join("already-cleaned").exists());
+        let mut incoming = pending_job(90);
+        incoming.dir_name = "rejected-namespace".into();
+        let gate = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        *crate::imports::PREPARATION_GATE.lock().unwrap() =
+            Some((destination.join(&incoming.dir_name), gate.clone()));
+        let importer = engine.clone();
+        let pending = tokio::spawn(async move { importer.import_job(incoming, true, false).await });
+        let entered = gate.clone();
+        tokio::task::spawn_blocking(move || entered.0.wait())
+            .await
+            .unwrap();
+        let mut newer = pending_job(90);
+        newer.dir_name = "accepted-other-source".into();
+        newer.priority = 42;
+        engine.import_job(newer, false, false).await.unwrap();
+        let release = gate.clone();
+        tokio::task::spawn_blocking(move || release.1.wait())
+            .await
+            .unwrap();
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(crate::EngineError::StaleImport)
+        ));
+        assert!(!destination.join("rejected-namespace").exists());
+        assert_eq!(
+            engine
+                .export_job(JobId(90))
+                .await
+                .unwrap()
+                .unwrap()
+                .priority,
+            42
+        );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn acknowledged_worker_api_import_is_noop_for_late_preterminal_descriptor() {
         use nzbd_state::artifacts::{
             DeliveryFileOutcome, FinalizationProof, WorkerControlContext,
@@ -8752,11 +8970,12 @@ mod tests {
         let (reply, result) = oneshot::channel();
         owner.on_command(QueueCommand::ImportJob {
             job: Box::new(replacement),
-            fold_journals: false,
+            preparation: None,
+            authority: Default::default(),
             emit_finished: true,
             reply,
         });
-        assert!(!result.await.unwrap());
+        assert!(result.await.unwrap().is_err());
         assert_eq!(owner.state.jobs[0].priority, 0);
     }
 

@@ -976,19 +976,26 @@ struct KeepOnFailureBody {
 
 async fn get_failure_keep(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
     let inventory = st.engine.artifacts();
-    match tokio::task::spawn_blocking(move || inventory.failure_keep_source(id)).await {
-        Ok(Ok(Some(source))) => Json(json!({"available": true, "keep": source.keep_on_failure, "sourceArtifactId": source.id, "sourceGeneration": source.generation})).into_response(),
-        Ok(Ok(None)) => match st.engine.export_job(JobId(id)).await {
-            Ok(Some(job)) if matches!(job.status, nzbd_types::JobStatus::Fetching | nzbd_types::JobStatus::Queued | nzbd_types::JobStatus::Paused) => {
-                let has_source = st.engine.artifacts().for_job(id).ok().flatten().is_some();
-                if has_source { return Json(json!({"available":false,"keep":false})).into_response(); }
-                Json(json!({"available":true,"keep":job.params.iter().any(|(key,value)| key == "*Runner:KeepOnFailure" && value == "1")})).into_response()
-            }
-            Ok(_) => Json(json!({"available":false,"keep":false})).into_response(),
-            Err(failure) => error(StatusCode::SERVICE_UNAVAILABLE, &failure.to_string()),
+    let lookup = tokio::task::spawn_blocking(move || -> nzbd_state::artifacts::Result<_> {
+        let source = inventory.failure_keep_source(id)?;
+        let allocated = if source.is_some() {
+            true
+        } else {
+            inventory.for_job(id)?.is_some()
+        };
+        Ok((source, allocated))
+    })
+    .await;
+    match lookup {
+        Ok(Ok((Some(source),_)))=>Json(json!({"available":true,"keep":source.keep_on_failure,"sourceArtifactId":source.id,"sourceGeneration":source.generation})).into_response(),
+        Ok(Ok((None,true)))=>Json(json!({"available":false,"keep":false})).into_response(),
+        Ok(Ok((None,false)))=>match st.engine.export_job(JobId(id)).await {
+            Ok(Some(job)) if matches!(job.status,nzbd_types::JobStatus::Fetching|nzbd_types::JobStatus::Queued|nzbd_types::JobStatus::Paused)=>Json(json!({"available":true,"keep":job.params.iter().any(|(key,value)|key=="*Runner:KeepOnFailure"&&value=="1")})).into_response(),
+            Ok(_)=>Json(json!({"available":false,"keep":false})).into_response(),
+            Err(failure)=>error(StatusCode::SERVICE_UNAVAILABLE,&failure.to_string()),
         },
-        Ok(Err(failure)) => error(StatusCode::SERVICE_UNAVAILABLE, &failure.to_string()),
-        Err(failure) => error(StatusCode::SERVICE_UNAVAILABLE, &failure.to_string()),
+        Ok(Err(failure))=>error(StatusCode::SERVICE_UNAVAILABLE,&failure.to_string()),
+        Err(failure)=>error(StatusCode::SERVICE_UNAVAILABLE,&failure.to_string()),
     }
 }
 

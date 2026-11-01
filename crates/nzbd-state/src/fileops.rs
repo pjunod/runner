@@ -5,6 +5,13 @@ use std::fs::File;
 use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 use std::path::{Component, Path};
 
+pub fn open_directory(path: &Path) -> Result<File> {
+    fs::open_dir(path)
+}
+pub fn identity(file: &File) -> Result<crate::artifacts::Identity> {
+    fs::identity_for_file(file)
+}
+
 pub fn open(path: &Path) -> Result<File> {
     let parent = fs::open_dir(
         path.parent()

@@ -21,6 +21,7 @@ pub mod snapshot;
 pub mod torrent_runtime;
 pub mod volumes;
 
+mod imports;
 mod owner;
 mod pool;
 mod writer;
@@ -145,6 +146,8 @@ pub enum EngineError {
     RequestConflict(String),
     #[error("request-token admission could not be durably saved")]
     AdmissionNotDurable,
+    #[error("job intent or source changed during journal preparation; import was not applied")]
+    StaleImport,
     #[error("queue authority was lost; durable URL work is retained for its owner")]
     OwnershipLost,
     #[error("engine is shutting down")]
@@ -473,6 +476,7 @@ impl Engine {
             artifacts,
             url_resolutions,
             url_dest_dir: cfg.dest_dir.clone(),
+            import_state_dir: cfg.state_dir.clone(),
             url_history: cfg.history.clone(),
             url_outbox_external: cfg.persist_guard.is_some(),
             cmd_tx: engine_tx,
@@ -639,6 +643,7 @@ pub struct EngineHandle {
     artifacts: Arc<nzbd_state::artifacts::Inventory>,
     url_resolutions: Arc<nzbd_state::artifacts::UrlResolutionStore>,
     url_dest_dir: PathBuf,
+    import_state_dir: PathBuf,
     url_history: Option<Arc<nzbd_state::history::HistoryDb>>,
     url_outbox_external: bool,
     cmd_tx: mpsc::Sender<EngineMsg>,
@@ -1580,19 +1585,71 @@ impl EngineHandle {
         fold_journals: bool,
         emit_finished: bool,
     ) -> Result<(), EngineError> {
+        self.import_job_checked(job, fold_journals, emit_finished, Arc::new(|| true))
+            .await
+    }
+
+    /// Import with a memory-only authority checkpoint rechecked during CRCs and at apply.
+    pub async fn import_job_checked(
+        &self,
+        job: nzbd_types::Job,
+        fold_journals: bool,
+        emit_finished: bool,
+        checkpoint: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), EngineError> {
+        let authority = imports::ImportAuthority(checkpoint);
+        let (job, preparation) = if fold_journals {
+            let (tx, rx) = oneshot::channel();
+            self.send(QueueCommand::ImportFence {
+                job: job.id,
+                reply: tx,
+            })
+            .await?;
+            let expected = rx.await.map_err(|_| EngineError::Closed)??;
+            let inventory = self.artifacts.clone();
+            let state = self.import_state_dir.clone();
+            let destination = self.url_dest_dir.clone();
+            let id = job.id;
+            let preparation_authority = authority.clone();
+            match tokio::task::spawn_blocking(move || {
+                imports::prepare(
+                    job,
+                    expected,
+                    &state,
+                    &destination,
+                    inventory,
+                    preparation_authority,
+                )
+            })
+            .await
+            {
+                Ok(Ok((job, proof))) => (job, Some(proof)),
+                failed => {
+                    let _ = self
+                        .roundtrip_unit(|reply| QueueCommand::EndImportPreparation {
+                            job: id,
+                            reply,
+                        })
+                        .await;
+                    return match failed {
+                        Ok(Err(error)) => Err(error),
+                        _ => Err(EngineError::Closed),
+                    };
+                }
+            }
+        } else {
+            (job, None)
+        };
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::ImportJob {
             job: Box::new(job),
-            fold_journals,
+            preparation,
+            authority,
             emit_finished,
             reply: tx,
         })
         .await?;
-        if rx.await.map_err(|_| EngineError::Closed)? {
-            Ok(())
-        } else {
-            Err(EngineError::AdmissionNotDurable)
-        }
+        rx.await.map_err(|_| EngineError::Closed)?
     }
 
     /// Atomically replace an existing authority copy without ever inserting a

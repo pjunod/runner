@@ -416,7 +416,19 @@ async fn finalize(
 }
 
 pub(crate) fn validate_range(path: &std::path::Path, offset: u64, len: u64, crc: u32) -> bool {
+    validate_range_checked(path, offset, len, crc, &|| true)
+}
+pub(crate) fn validate_range_checked(
+    path: &std::path::Path,
+    offset: u64,
+    len: u64,
+    crc: u32,
+    checkpoint: &dyn Fn() -> bool,
+) -> bool {
     use std::io::{Read, Seek};
+    if !checkpoint() {
+        return false;
+    }
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return false;
     };
@@ -436,6 +448,9 @@ pub(crate) fn validate_range(path: &std::path::Path, offset: u64, len: u64, crc:
     let mut remaining = len;
     let mut data = [0; 65536];
     while remaining > 0 {
+        if !checkpoint() {
+            return false;
+        }
         let amount = remaining.min(data.len() as u64) as usize;
         if file.read_exact(&mut data[..amount]).is_err() {
             return false;
@@ -450,6 +465,32 @@ pub(crate) fn validate_range(path: &std::path::Path, offset: u64, len: u64, crc:
 mod tests {
     use super::*;
     use tokio::sync::mpsc::channel;
+
+    #[test]
+    fn range_validation_stops_when_grant_expires_between_chunks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("range");
+        let bytes = vec![7; 3 * 65536];
+        std::fs::write(&path, &bytes).unwrap();
+        let calls = std::cell::Cell::new(0);
+        assert!(!validate_range_checked(
+            &path,
+            0,
+            bytes.len() as u64,
+            crc32fast::hash(&bytes),
+            &|| {
+                calls.set(calls.get() + 1);
+                calls.get() < 3
+            }
+        ));
+        assert_eq!(calls.get(), 3);
+        assert!(validate_range(
+            &path,
+            0,
+            bytes.len() as u64,
+            crc32fast::hash(&bytes)
+        ));
+    }
 
     /// Writes segments out of order with a gap, finalizes, and checks the
     /// assembled bytes (gap zero-filled, exact final size, `.part` renamed).
