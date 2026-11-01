@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub const SECRET_HEADER: &str = "x-nzbd-cluster-secret";
+/// Descriptor admission and transport bounds include all serialized metadata.
+/// Poll emits one grant so a maximum-size descriptor fits the RPC envelope.
+pub const MAX_DESCRIPTOR_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_RPC_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PollRequest {

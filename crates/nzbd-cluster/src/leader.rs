@@ -9,7 +9,7 @@ use crate::http::secret_matches;
 use crate::proto::*;
 use crate::registry::read_nodes;
 use crate::{ClusterConfig, SharedLayout};
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -469,6 +469,23 @@ impl LeaderShared {
         scope: serde_json::Value,
     ) -> Option<Grant> {
         let control = self.control.as_ref()?;
+        if serde_json::to_vec(&(&job, &scope)).ok()?.len() > MAX_DESCRIPTOR_BYTES {
+            let message = format!("job descriptor exceeds the {} MiB cluster limit; split the NZB or reduce its metadata before retrying", MAX_DESCRIPTOR_BYTES / 1024 / 1024);
+            if self
+                .engine
+                .hold_job(job.id, "descriptor_oversize", "cluster", &message)
+                .await
+                .is_ok()
+            {
+                if let Ok(Some(held)) = self.engine.export_job(job.id).await {
+                    let _ = control
+                        .commit_job_delta(&[(u64::from(job.id.0), Some(held))])
+                        .await;
+                }
+            }
+            tracing::warn!(job=job.id.0, %message, "cluster work descriptor refused");
+            return None;
+        }
         let (job_incarnation, job_revision) =
             control.job_identity(job.id.0.into()).await.ok().flatten()?;
         let kind_name = match kind {
@@ -590,6 +607,7 @@ pub fn router(shared: Arc<LeaderShared>) -> Router {
             shared.clone(),
             require_cluster_secret,
         ))
+        .layer(DefaultBodyLimit::max(MAX_RPC_BYTES))
         .with_state(shared)
 }
 
@@ -805,7 +823,8 @@ async fn work_poll(
                 {
                     tracing::info!(job = job_id.0, file = scope.file_id, first = scope.first_article, last = scope.last_article, node = %req.node, "article range granted");
                     grants.push(grant);
-                    break 'jobs;
+                    s.apply_local_budgets().await;
+                    return Json(PollResponse { grants }).into_response();
                 }
             }
             if accepted.len() == scopes.len() {
@@ -844,7 +863,8 @@ async fn work_poll(
                     {
                         tracing::info!(job = job_id.0, node = %req.node, "assembly lease granted");
                         grants.push(grant);
-                        break 'jobs;
+                        s.apply_local_budgets().await;
+                        return Json(PollResponse { grants }).into_response();
                     }
                 }
             }
@@ -889,12 +909,13 @@ async fn work_poll(
         {
             tracing::info!(job = job_id.0, node = %req.node, lease = %grant.lease_id, "download lease granted");
             grants.push(grant);
+            s.apply_local_budgets().await;
+            return Json(PollResponse { grants }).into_response();
         }
     }
 
     // PP grants (C2): completed jobs the scheduler assigned to this node
     // for post-processing, not yet leased, PP not yet done.
-    let mut pp_granted = 0u32;
     let pp_candidates: Vec<JobId> = snap
         .jobs
         .iter()
@@ -906,7 +927,7 @@ async fn work_poll(
         .map(|j| j.id)
         .collect();
     for job_id in pp_candidates {
-        if pp_granted >= req.free_pp_slots {
+        if req.free_pp_slots == 0 {
             break;
         }
         let already = s.leases.lock().unwrap().values().any(|l| l.job == job_id);
@@ -927,8 +948,9 @@ async fn work_poll(
             .await
         {
             tracing::info!(job = job_id.0, node = %req.node, lease = %grant.lease_id, "pp lease granted");
-            pp_granted += 1;
             grants.push(grant);
+            s.apply_local_budgets().await;
+            return Json(PollResponse { grants }).into_response();
         }
     }
 
@@ -1177,6 +1199,10 @@ async fn work_complete(
     }
     let _serial = s.mutation_serial.lock().await;
     let job_id = req.job.id;
+    if serde_json::to_vec(&req.job).map_or(true, |bytes| bytes.len() > MAX_DESCRIPTOR_BYTES) {
+        return (StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "completed job descriptor exceeds 16 MiB; reduce metadata before retrying"}))).into_response();
+    }
     let durable_receipt = match &s.control {
         Some(control) => control
             .publication_record(&req.receipt_id)

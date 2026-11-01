@@ -269,3 +269,20 @@ These checks are advice, not an activation receipt.
   range size; no live resharding or adaptive range migration.
 - Provider accounts are keyed by server name in this release.
 - Deployment and node restarts are separate from merging the software.
+
+## Work descriptor limits
+
+A serialized job plus its grant scope may occupy at most 16 MiB. Larger
+work is held with `descriptor_oversize` and an instruction to split the NZB
+or reduce its metadata; it is not repeatedly leased to workers. Each poll
+returns at most one grant, so metadata cannot multiply past the transport
+budget when a worker advertises many slots. Later polls fill remaining slots.
+Cluster JSON request and response bodies share a 32 MiB cap. Completion
+metadata above the descriptor cap receives an explicit 413 response rather
+than relying on Axum's smaller default JSON limit. These limits cover both
+whole-job and bounded range/assembly grants.
+
+The focused `work_rpc_round_trips_descriptors_above_one_mib_and_bounds_both_directions`
+test sends a real 2 MiB loopback HTTP request and response, then checks refusal
+of oversized request and response bodies. The cluster peer router applies the
+same request cap before JSON extraction.
