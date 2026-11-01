@@ -623,7 +623,10 @@ impl Owner {
             .map(|job| job.id.0)
             .collect::<Vec<_>>();
         let worker_root = root.clone();
-        self.payload_then(root.clone(), move || inventory.reconcile_startup_root(&worker_root, &live).map_err(failure), move |owner, result| {
+        self.payload_then(root.clone(), move || {
+            prepare_unenrolled_payload_root(&inventory, &worker_root)?;
+            inventory.reconcile_startup_root(&worker_root, &live).map_err(failure)
+        }, move |owner, result| {
             let state = owner.startup_reconciliation.get_mut(&root).unwrap();
             state.running = false;
             state.ready = result.is_ok();

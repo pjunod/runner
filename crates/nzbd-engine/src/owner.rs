@@ -58,6 +58,22 @@ use tokio_util::sync::CancellationToken;
 /// owner memory without limit while no adapter is attached.
 const MAX_PENDING_BACKEND_COMMANDS: usize = 64;
 
+// Only an unenrolled configured root may be initialized. A missing enrolled
+// mount remains unavailable; creating a replacement directory cannot prove it.
+fn prepare_unenrolled_payload_root(
+    inventory: &nzbd_state::artifacts::Inventory,
+    root: &Path,
+) -> Result<(), nzbd_state::StateError> {
+    let enrolled = inventory
+        .startup_reconciliation_roots()
+        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+    if !enrolled.iter().any(|known| known == root) {
+        std::fs::create_dir_all(root)
+            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+    }
+    Ok(())
+}
+
 fn set_owner_param(params: &mut Vec<(String, String)>, key: &str, value: Option<String>) {
     if let Some((_, old)) = params.iter_mut().find(|(name, _)| name == key) {
         if let Some(value) = value {
@@ -5984,6 +6000,7 @@ impl Owner {
                         record.delivery_lifecycle,
                     )
                 } else {
+                    prepare_unenrolled_payload_root(&inventory, &root)?;
                     let keep = record
                         .params
                         .iter()
@@ -8467,6 +8484,28 @@ mod tests {
                 .try_exists()
                 .unwrap(),
             "marker clears only after the accepted acknowledgement is durably captured"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_default_root_initializes_in_payload_worker_but_enrolled_missing_root_stays_missing(
+    ) {
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        assert!(
+            !owner.dest_dir.exists(),
+            "metadata recovery must not create the payload root inline"
+        );
+        pump(&mut owner, &mut messages).await;
+        assert!(owner.dest_dir.is_dir());
+        owner.state.jobs.push(pending_job(1));
+        allocate_for_test(&mut owner, &mut messages, JobId(1), true).await;
+        let allocation = owner.allocation_cache[&JobId(1)].clone();
+        std::fs::remove_dir(&allocation.path).unwrap();
+        std::fs::remove_dir(&allocation.root).unwrap();
+        prepare_unenrolled_payload_root(&owner.artifacts, &allocation.root).unwrap();
+        assert!(
+            !allocation.root.exists(),
+            "an absent enrolled mount cannot be recreated as an empty directory"
         );
     }
 
