@@ -1274,6 +1274,18 @@ impl EngineHandle {
         &self,
         job: nzbd_types::Job,
     ) -> Result<bool, EngineError> {
+        if job.params.iter().any(|(key, _)| {
+            key == nzbd_types::PP_DONE_PARAM || key == "*PP:selected-publication-outcome"
+        }) {
+            let inventory = self.artifacts.clone();
+            let checkpoint = job.clone();
+            tokio::task::spawn_blocking(move || {
+                inventory.checkpoint_worker_completion(&checkpoint)
+            })
+            .await
+            .map_err(|_| EngineError::Closed)?
+            .map_err(|error| EngineError::Lifecycle(error.to_string()))?;
+        }
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::ImportJobIfPresent {
             job: Box::new(job),

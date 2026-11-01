@@ -28,6 +28,14 @@ pub struct WorkerRetryAdoption {
     pub source: Artifact,
     pub control: nzbd_types::JobControl,
     pub probe_params: Vec<(String, String)>,
+    pub completed_job: Option<nzbd_types::Job>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WorkerCompletionCheckpoint {
+    context: WorkerControlContext,
+    source: SourceGeneration,
+    job: nzbd_types::Job,
 }
 
 impl WorkerControlContext {
@@ -53,6 +61,78 @@ impl WorkerControlContext {
 }
 
 impl Inventory {
+    /// Persist selected-publication/terminal evidence before a volatile worker
+    /// queue stamp. Call on a blocking preparation thread; descriptors are bulk.
+    pub fn checkpoint_worker_completion(&self, job: &nzbd_types::Job) -> Result<()> {
+        let _guard = self.mutation_guard()?;
+        let context = WorkerControlContext::for_job(job)
+            .ok_or_else(|| Error::Conflict("worker completion has no lease authority".into()))?;
+        if !job.params.iter().any(|(key, _)| {
+            key == nzbd_types::PP_DONE_PARAM || key == "*PP:selected-publication-outcome"
+        }) {
+            return Err(Error::Conflict(
+                "worker completion has no durable publication outcome".into(),
+            ));
+        }
+        let source = self.for_job(job.id.0)?.ok_or(Error::NotFound)?;
+        if !source.owned {
+            return Err(Error::Conflict(
+                "worker completion cannot claim transferred bytes".into(),
+            ));
+        }
+        if !source.terminal() {
+            self.verify(&source)?;
+        }
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let authority: String = tx.query_row(
+            "SELECT data FROM worker_authority WHERE job=?1",
+            [job.id.0],
+            |row| row.get(0),
+        )?;
+        if serde_json::from_str::<WorkerControlContext>(&authority)? != context {
+            return Err(Error::Conflict(
+                "worker completion lease authority changed".into(),
+            ));
+        }
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT data FROM worker_completions WHERE job=?1",
+                [job.id.0],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(previous) = previous {
+            let previous: WorkerCompletionCheckpoint = serde_json::from_str(&previous)?;
+            if previous.context == context
+                && previous
+                    .job
+                    .params
+                    .iter()
+                    .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                && !job
+                    .params
+                    .iter()
+                    .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+            {
+                return Err(Error::Conflict(
+                    "terminal worker completion cannot regress".into(),
+                ));
+            }
+        }
+        let checkpoint = WorkerCompletionCheckpoint {
+            context,
+            source: SourceGeneration {
+                artifact: source.id,
+                generation: source.generation,
+            },
+            job: job.clone(),
+        };
+        tx.execute("INSERT INTO worker_completions(job,data) VALUES(?1,?2) ON CONFLICT(job) DO UPDATE SET data=excluded.data", params![job.id.0, serde_json::to_string(&checkpoint)?])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Explicit adoption after the cluster validates a new lease. Only an
     /// unchanged authoritative job/control revision may continue retained work.
     pub fn adopt_worker_retry(
@@ -61,6 +141,93 @@ impl Inventory {
         context: &WorkerControlContext,
     ) -> Result<Option<WorkerRetryAdoption>> {
         let _guard = self.mutation_guard()?;
+        let completion: Option<String> = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT data FROM worker_completions WHERE job=?1",
+                [job],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = completion {
+            let mut checkpoint: WorkerCompletionCheckpoint = serde_json::from_str(&raw)?;
+            let old = &checkpoint.context;
+            if old.job_incarnation == context.job_incarnation
+                && old.job_revision == context.job_revision
+                && old.control_revision == context.control_revision
+                && context.epoch >= old.epoch
+            {
+                let source = self.get(&checkpoint.source.artifact)?;
+                if source.generation == checkpoint.source.generation
+                    && source.owned
+                    && source.job == Some(job)
+                    && !self.artifact_in_use(&source)?
+                {
+                    if !source.terminal() {
+                        self.verify(&source)?;
+                    }
+                    let mut db = self.db.lock().unwrap();
+                    let tx = db.transaction()?;
+                    let authority: Option<String> = tx
+                        .query_row(
+                            "SELECT data FROM worker_authority WHERE job=?1",
+                            [job],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let allowed = authority
+                        .as_deref()
+                        .map(serde_json::from_str::<WorkerControlContext>)
+                        .transpose()?
+                        .is_none_or(|current| {
+                            current.job_incarnation == context.job_incarnation
+                                && current.job_revision == context.job_revision
+                                && current.control_revision == context.control_revision
+                                && current.epoch <= context.epoch
+                        });
+                    if allowed {
+                        checkpoint.context = context.clone();
+                        checkpoint
+                            .job
+                            .params
+                            .retain(|(key, _)| key != WORKER_CONTROL_CONTEXT_PARAM);
+                        checkpoint.job.params.push((
+                            WORKER_CONTROL_CONTEXT_PARAM.into(),
+                            serde_json::to_string(context)?,
+                        ));
+                        tx.execute("INSERT INTO worker_authority(job,data) VALUES(?1,?2) ON CONFLICT(job) DO UPDATE SET data=excluded.data", params![job, serde_json::to_string(context)?])?;
+                        tx.execute(
+                            "UPDATE worker_completions SET data=?2 WHERE job=?1",
+                            params![job, serde_json::to_string(&checkpoint)?],
+                        )?;
+                        tx.commit()?;
+                        let control = checkpoint.job.control().unwrap_or(nzbd_types::JobControl {
+                            version: 1,
+                            revision: "0".into(),
+                            lifecycle: "running".into(),
+                            cause: String::new(),
+                            stage: "move".into(),
+                            retry_policy: "complete".into(),
+                            message: "durable worker publication ready".into(),
+                            instance: format!("completion-{job}"),
+                            previous_status: Some(nzbd_types::JobStatus::PostQueued),
+                            manual_pause: false,
+                            retry_attempt: 0,
+                            next_retry_at_unix: None,
+                            blocked_since_unix: None,
+                        });
+                        return Ok(Some(WorkerRetryAdoption {
+                            source,
+                            control,
+                            probe_params: Vec::new(),
+                            completed_job: Some(checkpoint.job),
+                        }));
+                    }
+                }
+            }
+        }
         let raw: Option<String> = self
             .db
             .lock()
@@ -123,6 +290,7 @@ impl Inventory {
             source,
             control: checkpoint.control,
             probe_params: checkpoint.probe_params,
+            completed_job: None,
         }))
     }
 
