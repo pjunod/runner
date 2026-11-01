@@ -42,6 +42,10 @@ pub(crate) struct ClusterDelivery {
     pub receipt_id: String,
     pub result_id: String,
     pub copies: Vec<CopyObligation>,
+    #[serde(default)]
+    pub cleanup_only: bool,
+    #[serde(default)]
+    pub source_disposition: Option<String>,
     #[serde(skip)]
     pub revision: i64,
 }
@@ -145,6 +149,8 @@ impl ControlStore {
                     Ok(delivery) => {
                         let record = ClusterDelivery {
                             revision: 0,
+                            cleanup_only: false,
+                            source_disposition: None,
                             receipt_id: String::new(),
                             result_id: String::new(),
                             copies: vec![CopyObligation {
@@ -189,7 +195,7 @@ impl ControlStore {
                         ),
                     ),
                 };
-            writes.push(("INSERT INTO cluster_deliveries(sequence,id,data,discovery_error,public_data,accepted_at) SELECT ?1,?2,?3,?4,?6,?7 WHERE (SELECT value FROM cluster_delivery_meta WHERE key='migration_cursor')=?5 ON CONFLICT(id) DO NOTHING".into(),params!(sequence,id,data,error,after.to_string(),public,accepted_at)));
+            writes.push(("INSERT INTO cluster_deliveries(sequence,id,data,discovery_error,public_data,accepted_at,request_token) SELECT ?1,?2,?3,?4,?6,?7,?8 WHERE (SELECT value FROM cluster_delivery_meta WHERE key='migration_cursor')=?5 ON CONFLICT(id) DO NOTHING".into(),params!(sequence,id,data,error,after.to_string(),public,accepted_at,value.get("requestToken").and_then(Value::as_str))));
         }
         writes.push((
             "UPDATE cluster_delivery_meta SET value=?2 WHERE key='migration_cursor' AND value=?1"
@@ -236,19 +242,42 @@ impl ControlStore {
             .map_err(|e| e.to_string())?;
         rows.into_iter().next().map(decode).transpose()
     }
+    pub(crate) async fn cluster_delivery_for_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<ClusterDelivery>, String> {
+        let row=self.client.query_consistent_map::<ValueRow,_>("SELECT id AS value FROM cluster_deliveries WHERE request_token=?1 ORDER BY sequence DESC LIMIT 1",params!(token)).await.map_err(|error|error.to_string())?.into_iter().next();
+        match row {
+            Some(row) => self.cluster_delivery(&row.value).await,
+            None => Ok(None),
+        }
+    }
+    #[cfg(test)]
     pub(crate) async fn commit_delivery(
         &self,
         record: &ClusterDelivery,
     ) -> Result<ClusterDelivery, String> {
+        self.commit_delivery_selected(record, None).await
+    }
+    pub(crate) async fn commit_delivery_selected(
+        &self,
+        record: &ClusterDelivery,
+        selected: Option<(u32, u64)>,
+    ) -> Result<ClusterDelivery, String> {
         // The row is written only after publication and fsync. Repeated READY
         // creation cannot replace consumer acceptance or cleanup progress.
         let (data, public) = encode_record(record)?;
-        let sql = "INSERT INTO cluster_deliveries(id,data,public_data,accepted_at) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO NOTHING";
+        let sql = "INSERT INTO cluster_deliveries(id,data,public_data,accepted_at,cleanup_only,request_token) SELECT ?1,?2,?3,?4,?8,?9 WHERE ?5 IS NULL OR EXISTS(SELECT 1 FROM control_jobs WHERE job_id=?5 AND revision=?6 AND result_id=?7 AND deleted=0) ON CONFLICT(id) DO NOTHING";
         let params = params!(
             &record.delivery.delivery_id,
             data,
             public,
-            record.delivery.accepted_at
+            record.delivery.accepted_at,
+            selected.map(|(job, _)| i64::from(job)),
+            selected.map(|(_, revision)| revision as i64),
+            &record.result_id,
+            i64::from(record.cleanup_only),
+            &record.delivery.request_token
         );
         bounded_statement(sql, &params)?;
         self.client
@@ -258,7 +287,7 @@ impl ControlStore {
         let current = self
             .cluster_delivery(&record.delivery.delivery_id)
             .await?
-            .ok_or("committed cluster delivery disappeared")?;
+            .ok_or("selected publication changed before READY; current cancellation/control must be rechecked")?;
         if immutable_delivery(&current) != immutable_delivery(record) {
             return Err("immutable cluster delivery identity changed".into());
         }
@@ -403,7 +432,7 @@ fn immutable_delivery(record: &ClusterDelivery) -> Value {
                 .remove("sourceCleanupStatus");
         }
     }
-    json!({"receiptId":record.receipt_id,"resultId":record.result_id,"delivery":value,
+    json!({"receiptId":record.receipt_id,"resultId":record.result_id,"cleanupOnly":record.cleanup_only,"sourceDisposition":record.source_disposition,"delivery":value,
         "copies":record.copies.iter().map(|copy| {let mut value=serde_json::to_value(copy).unwrap();value.as_object_mut().unwrap().remove("status");value.as_object_mut().unwrap().remove("error");
             for key in ["claimId","attempts","nextRetryAt"] {value.as_object_mut().unwrap().remove(key);}value}).collect::<Vec<_>>()})
 }
@@ -412,7 +441,11 @@ pub(crate) fn discovery_value(record: &ClusterDelivery) -> Value {
         return discovery_stub(record.delivery.sequence,&record.delivery.delivery_id,
             "publication has more than 64 source copies; source retained for review; private cleanup obligations remain available to the owning Runner nodes");
     }
-    let mut value = serde_json::to_value(&record.delivery).unwrap_or(Value::Null);
+    let mut value = if record.cleanup_only {
+        json!({"protocolVersion":1,"cleanupOnly":true,"cleanupId":record.delivery.delivery_id,"jobId":record.delivery.job_id,"sourceCleanup":record.delivery.source_cleanup})
+    } else {
+        serde_json::to_value(&record.delivery).unwrap_or(Value::Null)
+    };
     value["sourceCopies"] = json!(record
         .copies
         .iter()
@@ -472,7 +505,7 @@ impl ControlStore {
         limit: u32,
         include_accepted: bool,
     ) -> Result<(Vec<Value>, i64), String> {
-        let rows=self.client.query_consistent_map::<DiscoveryRow,_>("SELECT sequence,id,length(CAST(COALESCE(public_data,data) AS BLOB)) AS bytes,discovery_error,accepted_at IS NOT NULL AS accepted FROM cluster_deliveries WHERE sequence>?1 ORDER BY sequence LIMIT ?2",params!(after,i64::from(limit))).await.map_err(|e|e.to_string())?;
+        let rows=self.client.query_consistent_map::<DiscoveryRow,_>("SELECT sequence,id,length(CAST(COALESCE(public_data,data) AS BLOB)) AS bytes,discovery_error,accepted_at IS NOT NULL AS accepted FROM cluster_deliveries WHERE cleanup_only=0 AND sequence>?1 ORDER BY sequence LIMIT ?2",params!(after,i64::from(limit))).await.map_err(|e|e.to_string())?;
         let mut values = Vec::new();
         let mut cursor = after;
         let mut bytes = 0;
@@ -528,6 +561,44 @@ struct Acceptance {
     consumer_receipt_id: String,
 }
 
+fn decode_delivery_segment(raw: &str) -> Result<String, String> {
+    if raw.len() > 12288 {
+        return Err("delivery identity exceeds supported size".into());
+    }
+    let bytes = raw.as_bytes();
+    let mut value = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err("malformed delivery identity encoding".into());
+            }
+            let digit = |byte: u8| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            };
+            let high = digit(bytes[index + 1]).ok_or("malformed delivery identity encoding")?;
+            let low = digit(bytes[index + 2]).ok_or("malformed delivery identity encoding")?;
+            index += 3;
+            (high << 4) | low
+        } else {
+            let byte = bytes[index];
+            index += 1;
+            byte
+        };
+        if byte == b'/' || byte == b'\\' || byte.is_ascii_control() {
+            return Err("delivery identity must be one path segment".into());
+        }
+        value.push(byte);
+    }
+    if value.is_empty() || value.len() > 4096 {
+        return Err("invalid delivery identity size".into());
+    }
+    String::from_utf8(value).map_err(|_| "delivery identity is not valid UTF-8".into())
+}
+
 pub(crate) async fn serve_cluster_delivery(
     axum::extract::State(shared): axum::extract::State<std::sync::Arc<crate::leader::LeaderShared>>,
     request: axum::extract::Request,
@@ -536,7 +607,10 @@ pub(crate) async fn serve_cluster_delivery(
     use axum::http::{Method, StatusCode};
     use axum::response::IntoResponse;
     let path = request.uri().path().to_owned();
-    if path != "/api/v1/deliveries" && !path.starts_with("/api/v1/deliveries/") {
+    if path != "/api/v1/deliveries"
+        && !path.starts_with("/api/v1/deliveries/")
+        && !path.starts_with("/api/v1/request-admissions/")
+    {
         return next.run(request).await;
     }
     let Some(control) = shared.control.as_ref() else {
@@ -544,6 +618,75 @@ pub(crate) async fn serve_cluster_delivery(
     };
     if !shared.view.borrow().is_me || !shared.authority_ready() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if let Some(raw) = path.strip_prefix("/api/v1/request-admissions/") {
+        if request.method() != Method::GET {
+            return next.run(request).await;
+        }
+        let token = match decode_delivery_segment(raw) {
+            Ok(token) => token,
+            Err(error) => {
+                return (StatusCode::BAD_REQUEST, axum::Json(json!({"error":error})))
+                    .into_response()
+            }
+        };
+        let record = match control.cluster_delivery_for_token(&token).await {
+            Ok(record) => record,
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(json!({"error":error})),
+                )
+                    .into_response()
+            }
+        };
+        if let Some(record) = record {
+            if let Ok(Some(mut receipt)) = shared.engine.url_admission(&token).await {
+                if receipt.job_id == record.delivery.job_id {
+                    let done = record.delivery.source_cleanup.status == "succeeded";
+                    receipt.runner_instance_id = record.delivery.runner_instance_id.clone();
+                    receipt.terminal_outcome = Some(record.delivery.terminal_outcome.clone());
+                    receipt.outcome = if record.delivery.terminal_outcome == "SUCCESS" {
+                        "completed"
+                    } else {
+                        "failed"
+                    }
+                    .into();
+                    receipt.failure_stage = record.delivery.failure_stage.clone();
+                    receipt.failure_cause = record.delivery.failure_cause.clone();
+                    receipt.keep_source_on_failure =
+                        record.delivery.keep_source_on_failure && !done;
+                    receipt.source_artifact_id = Some(record.delivery.source_artifact_id.clone());
+                    receipt.source_generation = Some(record.delivery.source_generation.clone());
+                    receipt.source_cleanup_status = Some(
+                        if done {
+                            "removed"
+                        } else if record.copies.iter().any(|copy| copy.status == "retained") {
+                            "retained"
+                        } else {
+                            "pending"
+                        }
+                        .into(),
+                    );
+                    if record.cleanup_only {
+                        receipt.publication_path = None;
+                        receipt.custody_state = if done {
+                            "deleted_by_runner"
+                        } else if receipt.keep_source_on_failure {
+                            "kept_by_user"
+                        } else {
+                            "runner_owned"
+                        }
+                        .into();
+                    } else {
+                        receipt.publication_path = Some(record.delivery.publication_path.clone());
+                        receipt.custody_state = "curator".into();
+                    }
+                    return axum::Json(receipt).into_response();
+                }
+            }
+        }
+        return next.run(request).await;
     }
     let _serial = shared.delivery_serial.lock().await;
     let method = request.method().clone();
@@ -558,15 +701,16 @@ pub(crate) async fn serve_cluster_delivery(
                 "cursorRule":"Rescan with after=0 each sweep, or durably persist every returned delivery before advancing the cursor."}));
         }
         let relative=path.strip_prefix("/api/v1/deliveries/").ok_or((StatusCode::NOT_FOUND,"delivery not found".into()))?;
-        let mut pieces=relative.split('/');let id=pieces.next().unwrap_or("");let action=pieces.collect::<Vec<_>>().join("/");
-        let mut record=control.cluster_delivery(id).await.map_err(|e|(StatusCode::SERVICE_UNAVAILABLE,e))?.ok_or((StatusCode::NOT_FOUND,"delivery not found".into()))?;
+        let mut pieces=relative.split('/');let id=decode_delivery_segment(pieces.next().unwrap_or("")).map_err(|error|(StatusCode::BAD_REQUEST,error))?;let action=pieces.collect::<Vec<_>>().join("/");
+        let mut record=control.cluster_delivery(&id).await.map_err(|e|(StatusCode::SERVICE_UNAVAILABLE,e))?.ok_or((StatusCode::NOT_FOUND,"delivery not found".into()))?;
         if method==Method::GET && action.is_empty() {return Ok(discovery_value(&record));}
         if method==Method::POST && action=="accept" {
+            if record.cleanup_only {return Err((StatusCode::CONFLICT,"terminal cleanup has no consumer payload to accept".into()));}
             let bytes=axum::body::to_bytes(request.into_body(),16384).await.map_err(|e|(StatusCode::BAD_REQUEST,e.to_string()))?;
             let body:Acceptance=serde_json::from_slice(&bytes).map_err(|e|(StatusCode::BAD_REQUEST,e.to_string()))?;
             if body.protocol_version!=1 {return Err((StatusCode::BAD_REQUEST,"unsupported delivery protocol version".into()));}
-            control.accept_cluster_delivery(id,&body.publication_generation,&body.manifest_digest,&body.consumer_receipt_id).await.map_err(|e|(StatusCode::CONFLICT,e))?;
-            let current=control.cluster_delivery(id).await.map_err(|e|(StatusCode::SERVICE_UNAVAILABLE,e))?.ok_or((StatusCode::NOT_FOUND,"delivery disappeared".into()))?;
+            control.accept_cluster_delivery(&id,&body.publication_generation,&body.manifest_digest,&body.consumer_receipt_id).await.map_err(|e|(StatusCode::CONFLICT,e))?;
+            let current=control.cluster_delivery(&id).await.map_err(|e|(StatusCode::SERVICE_UNAVAILABLE,e))?.ok_or((StatusCode::NOT_FOUND,"delivery disappeared".into()))?;
             return Ok(discovery_value(&current));
         }
         if method==Method::POST && action=="source-cleanup/retry" {
@@ -709,6 +853,7 @@ struct CopyAuthority {
     outcome: String,
     receipt: String,
     accepted_at_ms: i64,
+    source_disposition: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct CopyResult {
@@ -749,6 +894,7 @@ async fn authorized_copy(
             record.receipt_id
         },
         accepted_at_ms: record.delivery.ready_at.saturating_mul(1000),
+        source_disposition: record.source_disposition,
     })
 }
 pub(crate) async fn copy_authority(
@@ -798,7 +944,7 @@ pub(crate) async fn cleanup_copy(
         }
     };
     let copy = authority.copy.clone();
-    if copy.artifact.is_some() || copy.local_delivery_id.is_some() {
+    {
         if copy.owner_node != shared.cfg.node_name {
             return (
                 axum::http::StatusCode::CONFLICT,
@@ -831,13 +977,15 @@ pub(crate) async fn cleanup_copy(
                     }
                     if let Some(artifact) = copy.artifact {
                         return inventory
-                            .retire_cluster_artifact_copy(
+                            .retire_cluster_artifact_copy_with_disposition(
                                 &artifact,
                                 &authority.outcome,
                                 nzbd_state::artifacts::FinalizationProof::Cluster {
                                     receipt: authority.receipt,
                                     accepted_at_ms: authority.accepted_at_ms,
                                 },
+                                authority.source_disposition.as_deref() == Some("unusable"),
+                                copy.deletion_files.as_deref(),
                             )
                             .map_err(|e| e.to_string());
                     }
@@ -958,9 +1106,7 @@ pub(crate) async fn cleanup_one_copy(
         claim_id: claim_id.clone(),
     };
     let client = crate::http::ClusterClient::new(shared.cfg.secret.clone());
-    let url = if copy.artifact.is_none() && copy.local_delivery_id.is_none() {
-        Some(shared.cfg.advertise_url.clone())
-    } else if copy.owner_node == shared.cfg.node_name {
+    let url = if copy.owner_node == shared.cfg.node_name {
         Some(shared.cfg.advertise_url.clone())
     } else {
         crate::registry::read_nodes(&shared.layout)
@@ -1089,6 +1235,8 @@ mod tests {
             result_id: format!("result-{id}"),
             copies: Vec::new(),
             revision: 0,
+            cleanup_only: false,
+            source_disposition: None,
         }
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1588,6 +1736,46 @@ mod tests {
                 .len(),
             65
         );
+        let mut encoded = record(&instance, "encoded:sha256:receipt");
+        encoded.delivery.source_cleanup.status = "succeeded".into();
+        store.commit_delivery(&encoded).await.unwrap();
+        let client = crate::http::ClusterClient::new("secret".into());
+        let acceptance=json!({"protocolVersion":1,"publicationGeneration":"generation","manifestDigest":"digest","consumerReceiptId":"encoded-consumer"}).to_string();
+        for (method, action, body) in [
+            ("GET", "", String::new()),
+            ("POST", "/accept", acceptance),
+            ("POST", "/source-cleanup/retry", String::new()),
+        ] {
+            let request = hyper::Request::builder()
+                .method(method)
+                .uri(format!(
+                    "/api/v1/deliveries/encoded%3Asha256%3Areceipt{action}"
+                ))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            let response = client
+                .forward(&format!("http://{address}"), request)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::OK,
+                "encoded {method} {action}"
+            );
+        }
+        for id in ["bad%ZZ", "bad%2Fsegment", "bad%FF"] {
+            let response = client
+                .forward(
+                    &format!("http://{address}"),
+                    hyper::Request::get(format!("/api/v1/deliveries/{id}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        }
         let final_record = store
             .commit_delivery(&record(&instance, "valid-after-bad"))
             .await

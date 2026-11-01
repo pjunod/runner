@@ -3781,30 +3781,41 @@ async fn process_job_ctx_from_inner(
     // Recognizable usable inputs still have an explicit review action below.
     let mut unusable_source_reason = None;
     let mut assessed_inputs = None;
-    if job.lifecycle_eligible() && outcome == PpFinal::Success && verified_payload_paths.is_empty()
-    {
+    if job.lifecycle_eligible() && outcome == PpFinal::Success {
         if let Some(source) = engine.artifacts().for_job(job_id.0)? {
-            let assessment_job = job.clone();
-            let assessment_source = source.clone();
-            let complete_paths = verified_payload_paths.clone();
-            let diagnostics = crate::attempt::current()
-                .expect("processing control")
-                .blocking(move |control| {
-                    control.checkpoint()?;
-                    assess_file_inputs(&assessment_job, &assessment_source, &complete_paths)
-                })
-                .await?;
-            assessed_inputs = Some(diagnostics.clone());
-            let (selected, outcomes) = select_delivery_payload(
+            // Writer CRCs can prove a readme or sidecar intact without making
+            // it publishable. Only a positive selected payload skips the
+            // checkpointed diagnostic pass; the selector itself is cheap.
+            let (publishable, _) = select_delivery_payload(
                 &source.files,
                 &consumed_archive_paths,
                 &verified_payload_paths,
                 &terminal_unusable_archive_paths,
-                &diagnostics,
+                &Default::default(),
             );
-            if selected.is_empty() && recovery_reason(&outcomes).is_none() {
-                outcome = PpFinal::UnpackFailure;
-                unusable_source_reason = Some("no publishable payload or verified recovery path remains after bounded assessment".to_string());
+            if publishable.is_empty() {
+                let assessment_job = job.clone();
+                let assessment_source = source.clone();
+                let complete_paths = verified_payload_paths.clone();
+                let diagnostics = crate::attempt::current()
+                    .expect("processing control")
+                    .blocking(move |control| {
+                        control.checkpoint()?;
+                        assess_file_inputs(&assessment_job, &assessment_source, &complete_paths)
+                    })
+                    .await?;
+                assessed_inputs = Some(diagnostics.clone());
+                let (selected, outcomes) = select_delivery_payload(
+                    &source.files,
+                    &consumed_archive_paths,
+                    &verified_payload_paths,
+                    &terminal_unusable_archive_paths,
+                    &diagnostics,
+                );
+                if selected.is_empty() && recovery_reason(&outcomes).is_none() {
+                    outcome = PpFinal::UnpackFailure;
+                    unusable_source_reason = Some("no publishable payload or verified recovery path remains after bounded assessment".to_string());
+                }
             }
         }
     }
@@ -3822,7 +3833,18 @@ async fn process_job_ctx_from_inner(
             Some(source) => {
                 let mut diagnostics = match &assessed_inputs {
                     Some(diagnostics) => diagnostics.clone(),
-                    None => assess_file_inputs(&job, &source, &verified_payload_paths)?,
+                    None => {
+                        let assessment_job = job.clone();
+                        let assessment_source = source.clone();
+                        let verified = verified_payload_paths.clone();
+                        crate::attempt::current()
+                            .expect("processing control")
+                            .blocking(move |control| {
+                                control.checkpoint()?;
+                                assess_file_inputs(&assessment_job, &assessment_source, &verified)
+                            })
+                            .await?
+                    }
                 };
                 for path in &password_required_archive_paths {
                     diagnostics.insert(path.clone(), FileAssessment::Repairable(
@@ -3836,7 +3858,20 @@ async fn process_job_ctx_from_inner(
                     &terminal_unusable_archive_paths,
                     &diagnostics,
                 );
-                (!selected.is_empty(), recovery_reason(&outcomes))
+                let recovery = recovery_reason(&outcomes);
+                let usable = !selected.is_empty() || recovery.is_some();
+                let mut reason=recovery.clone().unwrap_or_else(||if usable {"verified sibling payload remains available for publication".into()}else{"bounded post-failure assessment found no usable payload or repairable input".into()});
+                while reason.len() > 2048 {
+                    reason.pop();
+                }
+                inventory.set_failure_assessment(
+                    &source.id,
+                    &source.generation,
+                    if usable { "recoverable" } else { "unusable" },
+                    &reason,
+                )?;
+                assessed_inputs = Some(diagnostics);
+                (!selected.is_empty(), recovery)
             }
             None => (false, None),
         }
@@ -4755,6 +4790,12 @@ fn unpublishable_summary(outcomes: &[DeliveryFileOutcome]) -> String {
             matches!(
                 file.classification.as_str(),
                 "video" | "native_book" | "audio"
+            ) || matches!(
+                file.outcome.as_str(),
+                "unsupported_review"
+                    | "archive_review"
+                    | "unverified_review"
+                    | "retained_processing"
             )
         })
         .collect();
@@ -5250,7 +5291,8 @@ fn bounded_file_diagnostics_with_limit(
             (Some(_), false) => FileAssessment::Incomplete(
                 "recognized signature alone cannot repair an incomplete file; no complete NZB/CRC or transform proof".into(),
             ),
-            (None, _) => FileAssessment::NoSignature,
+            (None,true)=>FileAssessment::Recognized("completed NZB/CRC file has no supported format signature; review its intended content and choose a supported publication format".into()),
+            (None,false)=>FileAssessment::NoSignature,
         };
         results.insert(entry.path.clone(), result);
     }
@@ -5474,7 +5516,7 @@ fn is_incidental_extension(extension: &str) -> bool {
         "par2" | "nzb" | "sfv" | "srr" | "tmp" | "temp" | "part" | "!ut" | "crdownload"
     )
 }
-fn is_disposable_name(name: &str) -> bool {
+pub(crate) fn is_disposable_name(name: &str) -> bool {
     name.starts_with("sample.")
         || matches!(
             name,
@@ -9235,7 +9277,7 @@ mod decision_tests {
         std::fs::write(source.join("orphan.srt"), b"unmatched sidecar").unwrap();
         inventory.finish(41, &source, &downloads, "active").unwrap();
         let cfg = PostConfig {
-            deobfuscate_final: false,
+            deobfuscate_final: true,
             cleanup: false,
             ..PostConfig::default()
         };

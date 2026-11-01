@@ -107,6 +107,16 @@ impl Inventory {
         outcome: &str,
         proof: FinalizationProof,
     ) -> Result<ClusterCopyCleanup> {
+        self.retire_cluster_artifact_copy_with_disposition(copy, outcome, proof, false, None)
+    }
+    pub fn retire_cluster_artifact_copy_with_disposition(
+        &self,
+        copy: &ClusterArtifactCopy,
+        outcome: &str,
+        proof: FinalizationProof,
+        unusable: bool,
+        raw_files: Option<&[DeliveryFile]>,
+    ) -> Result<ClusterCopyCleanup> {
         if copy.storage_instance_id != self.installation
             || !matches!(proof, FinalizationProof::Cluster { .. })
         {
@@ -136,15 +146,86 @@ impl Inventory {
                 })),
             });
         }
-        if !copy.selected && outcome != "SUCCESS" && !artifact.terminal() {
+        if !copy.selected && outcome != "SUCCESS" && !unusable && !artifact.terminal() {
             return Ok(ClusterCopyCleanup { status: "retained".into(), error: Some(
                 "partial failure publication does not prove every raw source dependency redundant; retain this exact source until recovery is resolved".into()) });
         }
         // A delegated download writes into the admission owner's allocation.
         // READY is reached only after that writer's durable completion, so seal
         // its final manifest now; imported/legacy paths never reach this branch.
+        let mut raw_observed = None;
+        if !copy.selected && !artifact.terminal() {
+            if let Some(expected) = raw_files {
+                let directory = self.verify(&artifact)?;
+                let observed = fs::manifest(&directory, 100_000)?;
+                for entry in &observed {
+                    if entry.identity.directory {
+                        if !expected
+                            .iter()
+                            .any(|file| file.path.starts_with(&format!("{}/", entry.path)))
+                        {
+                            return Ok(ClusterCopyCleanup{status:"retained".into(),error:Some(format!("review required: raw directory {} was not in the accepted transfer seal",entry.path))});
+                        }
+                        continue;
+                    }
+                    let Some(file) = expected.iter().find(|file| file.path == entry.path) else {
+                        return Ok(ClusterCopyCleanup{status:"retained".into(),error:Some(format!("review required: raw file {} was not in the accepted transfer seal",entry.path))});
+                    };
+                    let mut input = fs::open_relative(&directory, &entry.path)?;
+                    use std::io::Read;
+                    let mut hash = Sha256::new();
+                    let mut buffer = [0u8; 65536];
+                    loop {
+                        let count = input.read(&mut buffer)?;
+                        if count == 0 {
+                            break;
+                        }
+                        hash.update(&buffer[..count]);
+                    }
+                    if file.size_bytes != entry.identity.bytes
+                        || format!("{:x}", hash.finalize()) != file.sha256
+                        || fs::identity_for_file(&input)? != entry.identity
+                    {
+                        return Ok(ClusterCopyCleanup{status:"retained".into(),error:Some(format!("review required: raw file {} differs from its accepted transfer seal",entry.path))});
+                    }
+                }
+                if observed
+                    .iter()
+                    .filter(|entry| !entry.identity.directory)
+                    .count()
+                    != expected.len()
+                {
+                    return Ok(ClusterCopyCleanup{status:"retained".into(),error:Some("review required: raw copy no longer matches every accepted transfer member".into())});
+                }
+                raw_observed = Some(observed);
+            } else if artifact.files.is_empty() {
+                return Ok(ClusterCopyCleanup {
+                    status: "retained".into(),
+                    error: Some(
+                        "review required: delegated raw allocation lacks its accepted byte seal"
+                            .into(),
+                    ),
+                });
+            }
+            if raw_files.is_some() && raw_observed.is_none() {
+                return Err(Error::Conflict(
+                    "raw retirement proof was not captured".into(),
+                ));
+            }
+        }
         if !copy.selected && artifact.state == "active" {
-            self.finish(copy.job_id, &artifact.path, &artifact.root, "completed")?;
+            if let Some(observed) = raw_observed {
+                let finished =
+                    self.finish(copy.job_id, &artifact.path, &artifact.root, "completed")?;
+                if finished.files != observed {
+                    return Ok(ClusterCopyCleanup {
+                        status: "retained".into(),
+                        error: Some(
+                            "review required: raw manifest changed while sealing retirement".into(),
+                        ),
+                    });
+                }
+            }
         }
         self.accept_cluster_completion(&copy.publication, outcome, proof.clone())?;
         let retained = if copy.selected {
@@ -297,6 +378,67 @@ mod tests {
             "removed"
         );
     }
+    #[test]
+    fn raw_copy_seal_refuses_added_or_changed_bytes_then_drains_exact_match() {
+        let (_temp, inventory, source, copy) = fixture();
+        let expected = [
+            ("episode.mkv", b"verified payload".as_slice()),
+            ("readme.txt", b"junk".as_slice()),
+        ]
+        .into_iter()
+        .map(|(path, bytes)| DeliveryFile {
+            path: path.into(),
+            size_bytes: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        })
+        .collect::<Vec<_>>();
+        std::fs::write(source.join("manual.pdf"), b"recognizable user file").unwrap();
+        assert_eq!(
+            inventory
+                .retire_cluster_artifact_copy_with_disposition(
+                    &copy,
+                    "SUCCESS",
+                    proof(),
+                    false,
+                    Some(&expected)
+                )
+                .unwrap()
+                .status,
+            "retained"
+        );
+        assert!(source.join("manual.pdf").exists());
+        std::fs::remove_file(source.join("manual.pdf")).unwrap();
+        std::fs::write(source.join("episode.mkv"), b"changed payload!").unwrap();
+        assert_eq!(
+            inventory
+                .retire_cluster_artifact_copy_with_disposition(
+                    &copy,
+                    "SUCCESS",
+                    proof(),
+                    false,
+                    Some(&expected)
+                )
+                .unwrap()
+                .status,
+            "retained"
+        );
+        std::fs::write(source.join("episode.mkv"), b"verified payload").unwrap();
+        assert_eq!(
+            inventory
+                .retire_cluster_artifact_copy_with_disposition(
+                    &copy,
+                    "SUCCESS",
+                    proof(),
+                    false,
+                    Some(&expected)
+                )
+                .unwrap()
+                .status,
+            "removed"
+        );
+        assert!(!source.exists());
+    }
+
     #[test]
     fn raw_partial_copy_and_changed_storage_never_gain_deletion_authority() {
         let (_temp, inventory, source, copy) = fixture();

@@ -16,7 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CONTROL_SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS cluster_delivery_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL) STRICT",
-    "CREATE TABLE IF NOT EXISTS cluster_deliveries(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,data TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,discovery_error TEXT,public_data TEXT,accepted_at INTEGER) STRICT",
+    "CREATE TABLE IF NOT EXISTS cluster_deliveries(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,data TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,discovery_error TEXT,public_data TEXT,accepted_at INTEGER,cleanup_only INTEGER NOT NULL DEFAULT 0,request_token TEXT) STRICT",
+    "CREATE INDEX IF NOT EXISTS cluster_deliveries_request_token ON cluster_deliveries(request_token)",
 
     "CREATE TABLE IF NOT EXISTS cluster_meta (
         cluster_id TEXT PRIMARY KEY,
@@ -637,6 +638,21 @@ impl ControlStore {
             .transpose()
     }
 
+    pub(crate) async fn selected_publication_job(
+        &self,
+        job: u32,
+        result: &str,
+    ) -> Result<Option<(nzbd_types::Job, u64)>, String> {
+        let row=self.client.query_consistent_map::<ControlJobRow,_>("SELECT intent_json,revision,incarnation FROM control_jobs WHERE job_id=?1 AND result_id=?2 AND deleted=0",params!(i64::from(job),result)).await.map_err(|error|error.to_string())?.into_iter().next();
+        row.map(|row| {
+            Ok((
+                serde_json::from_str(&row.intent_json).map_err(|error| error.to_string())?,
+                u64::try_from(row.revision).map_err(|error| error.to_string())?,
+            ))
+        })
+        .transpose()
+    }
+
     pub async fn load_jobs(&self) -> Result<Vec<(nzbd_types::Job, u64, String)>, String> {
         let rows = self
             .client
@@ -1069,8 +1085,23 @@ impl ControlStore {
         result_ref: &str,
         result_job_json: &str,
     ) -> Result<MutationOutcome, String> {
-        if let Some(revision) = self.publication_receipt(receipt_id).await? {
-            return Ok(MutationOutcome::Duplicate { revision });
+        if let Some(receipt) = self.publication_record(receipt_id).await? {
+            return Ok(
+                if renewable_receipt_matches(
+                    &receipt,
+                    token,
+                    expected_job_revision,
+                    result_id,
+                    result_ref,
+                    result_job_json,
+                ) {
+                    MutationOutcome::Duplicate {
+                        revision: expected_job_revision.saturating_add(1),
+                    }
+                } else {
+                    MutationOutcome::Conflict
+                },
+            );
         }
         let now = unix_ms()?;
         let sql="INSERT INTO publication_receipts(receipt_id,resource,owner_node_id,owner_incarnation,fence,lease_revision,lease_expiry_ms,expected_job_revision,result_id,result_ref,result_job_json,accepted_at_ms)
@@ -1104,8 +1135,31 @@ impl ControlStore {
                 revision: expected_job_revision.saturating_add(1),
             }),
             Ok(_) => Ok(MutationOutcome::Conflict),
-            Err(error) if error.to_string().contains("stale") => Ok(MutationOutcome::Conflict),
-            Err(error) => Err(format!("publish renewed result: {error}")),
+            Err(error) => {
+                if let Some(receipt) = self.publication_record(receipt_id).await? {
+                    return Ok(
+                        if renewable_receipt_matches(
+                            &receipt,
+                            token,
+                            expected_job_revision,
+                            result_id,
+                            result_ref,
+                            result_job_json,
+                        ) {
+                            MutationOutcome::Duplicate {
+                                revision: expected_job_revision.saturating_add(1),
+                            }
+                        } else {
+                            MutationOutcome::Conflict
+                        },
+                    );
+                }
+                if error.to_string().contains("stale") {
+                    Ok(MutationOutcome::Conflict)
+                } else {
+                    Err(format!("publish renewed result: {error}"))
+                }
+            }
         }
     }
 
@@ -1297,34 +1351,55 @@ impl ControlStore {
         rows.into_iter().next().map(TryInto::try_into).transpose()
     }
 
-    pub async fn published_results(
+    /// Metadata-first bounded receipt scan. Supplying a job avoids decoding
+    /// unrelated historical descriptors while assembling that job's copies.
+    pub(crate) async fn publication_results_page(
         &self,
-    ) -> Result<Vec<(String, String, nzbd_types::Job, u64, i64, String)>, String> {
-        let rows = self
-            .client
-            .query_consistent_map::<PublishedResultRow, _>(
-                "SELECT p.result_id,p.result_ref,p.result_job_json,p.fence,p.accepted_at_ms,l.kind
-                   FROM publication_receipts p
-                   JOIN work_leases l ON l.resource=p.resource
-                  WHERE l.kind <> 'segment' ORDER BY p.accepted_at_ms",
-                params!(),
-            )
-            .await
-            .map_err(|error| format!("load published results: {error}"))?;
-        rows.into_iter()
-            .map(|row| {
-                let job: nzbd_types::Job = serde_json::from_str(&row.result_job_json)
-                    .map_err(|error| format!("decode published result job: {error}"))?;
-                Ok((
-                    row.result_id,
-                    row.result_ref,
-                    job,
-                    u64::try_from(row.fence).map_err(|error| error.to_string())?,
-                    row.accepted_at_ms,
-                    row.kind,
-                ))
-            })
-            .collect()
+        job: Option<u32>,
+        after: i64,
+        limit: u32,
+    ) -> Result<
+        (
+            Vec<(String, String, nzbd_types::Job, u64, i64, String)>,
+            i64,
+        ),
+        String,
+    > {
+        let pointers=self.client.query_consistent_map::<PublicationPointer,_>("SELECT p.rowid AS sequence,length(CAST(p.result_job_json AS BLOB)) AS bytes FROM publication_receipts p JOIN work_leases l ON l.resource=p.resource WHERE (?1 IS NULL OR l.job_id=?1) AND p.rowid>?2 AND l.kind<>'segment' ORDER BY p.rowid LIMIT ?3",params!(job.map(i64::from),after,i64::from(limit.clamp(1,16)))).await.map_err(|error|error.to_string())?;
+        let mut values = Vec::new();
+        let mut cursor = after;
+        let mut bytes = 0;
+        for pointer in pointers {
+            if pointer.bytes > crate::proto::MAX_DESCRIPTOR_BYTES as i64 {
+                tracing::warn!(sequence=pointer.sequence,"historical cluster completion exceeds descriptor limit; source retained for review");
+                cursor = pointer.sequence;
+                continue;
+            }
+            if !values.is_empty() && bytes + pointer.bytes > crate::proto::MAX_RPC_BYTES as i64 {
+                break;
+            }
+            let row=self.client.query_consistent_map::<PublishedResultRow,_>("SELECT p.result_id,p.result_ref,p.result_job_json,p.fence,p.accepted_at_ms,l.kind FROM publication_receipts p JOIN work_leases l ON l.resource=p.resource WHERE p.rowid=?1",params!(pointer.sequence)).await.map_err(|error|error.to_string())?.into_iter().next();
+            cursor = pointer.sequence;
+            if let Some(row) = row {
+                match serde_json::from_str::<nzbd_types::Job>(&row.result_job_json) {
+                    Ok(job) => {
+                        bytes += pointer.bytes;
+                        values.push((
+                            row.result_id,
+                            row.result_ref,
+                            job,
+                            u64::try_from(row.fence).map_err(|error| error.to_string())?,
+                            row.accepted_at_ms,
+                            row.kind,
+                        ));
+                    }
+                    Err(error) => {
+                        tracing::warn!(sequence=pointer.sequence,%error,"historical cluster descriptor is invalid; source retained for review")
+                    }
+                }
+            }
+        }
+        Ok((values, cursor))
     }
 
     async fn scalar_revision(&self, sql: &'static str, id: &str) -> Result<Option<u64>, String> {
@@ -1438,6 +1513,18 @@ struct RevisionRow {
 }
 struct AcceptedAtRow {
     accepted_at_ms: i64,
+}
+struct PublicationPointer {
+    sequence: i64,
+    bytes: i64,
+}
+impl From<&mut Row<'_>> for PublicationPointer {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            sequence: row.get("sequence"),
+            bytes: row.get("bytes"),
+        }
+    }
 }
 struct PublishedResultRow {
     result_id: String,
@@ -1615,6 +1702,26 @@ impl From<&mut Row<'_>> for RevisionRow {
             revision: row.get("revision"),
         }
     }
+}
+
+fn renewable_receipt_matches(
+    receipt: &PublicationReceipt,
+    token: &LeaseToken,
+    expected: u64,
+    result_id: &str,
+    result_ref: &str,
+    result_job_json: &str,
+) -> bool {
+    receipt.resource == token.resource
+        && receipt.owner_node_id == token.owner_node_id
+        && receipt.owner_incarnation == token.owner_incarnation
+        && receipt.fence == token.fence
+        && receipt.lease_revision >= token.revision
+        && receipt.lease_expiry_ms >= token.expires_at_unix_ms
+        && receipt.expected_job_revision == expected
+        && receipt.result_id == result_id
+        && receipt.result_ref == result_ref
+        && receipt.result_job_json == result_job_json
 }
 
 fn validate_identity(resource: &str, node: &str, incarnation: &str) -> Result<(), String> {

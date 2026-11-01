@@ -229,7 +229,12 @@ async fn start_node_with_control(
         let jsonl = shared.join(".nzbd-cluster/history");
         std::fs::create_dir_all(&jsonl).unwrap();
         Some(nzbd_cluster::PpSetup {
-            post: nzbd_post::manager::PostConfig::default(),
+            post: nzbd_post::manager::PostConfig {
+                sevenzip_cmd: std::fs::read_to_string(shared.join(format!("test-sevenzip-{name}")))
+                    .map(|value| value.trim().to_owned())
+                    .unwrap_or_else(|_| "7z".into()),
+                ..Default::default()
+            },
             history: std::sync::Arc::new(
                 nzbd_state::history::HistoryDb::open_tagged(
                     &local.join("history.sqlite"),
@@ -1620,7 +1625,7 @@ async fn delivery_receipts_survive_authority_restart_and_consumer_removed_public
         .clone();
     assert_eq!(delivery["runnerInstanceId"], installation);
     assert!(delivery["sequence"].as_i64().unwrap() > old.sequence);
-    assert_eq!(delivery["runnerStages"]["nodeId"], "c");
+    assert_eq!(delivery["runnerStages"]["nodeId"], "unrecorded");
     assert!(delivery["sourceCopies"]
         .as_array()
         .is_some_and(|copies| copies.len() >= 3));
@@ -1958,4 +1963,503 @@ async fn delivery_receipts_and_copy_acks_survive_actual_majority_authority_chang
     for node in nodes {
         node.kill().await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn worker_restart_regrant_preserves_retry_deadline_and_private_generation() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    if !require_tool("7z") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("archive-fixture");
+    std::fs::create_dir(&archive).unwrap();
+    std::fs::write(archive.join("episode.mkv"), prng_bytes(98, 90_000)).unwrap();
+    let made = std::process::Command::new("7z")
+        .args(["a", "-tzip", "payload.zip", "episode.mkv"])
+        .current_dir(&archive)
+        .output()
+        .unwrap();
+    assert!(made.status.success());
+    let zipped = std::fs::read(archive.join("payload.zip")).unwrap();
+    let post = build_post("retry-regrant", &[("payload.zip", zipped)], 20_000);
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+    std::fs::write(
+        tmp.path().join("test-sevenzip-c"),
+        "/no-such-retry-extractor",
+    )
+    .unwrap();
+    let authority = start_node(
+        tmp.path(),
+        "a",
+        NodeOpts {
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            min_free_disk_bytes: 0,
+        },
+        ns.port(),
+        4,
+    )
+    .await;
+    let downloader = start_node(
+        tmp.path(),
+        "b",
+        NodeOpts {
+            coordinator: false,
+            priority: 9,
+            download: true,
+            max_download_jobs: 2,
+            post_process: false,
+            min_free_disk_bytes: 0,
+        },
+        ns.port(),
+        4,
+    )
+    .await;
+    let control = control_topology(1).remove(0);
+    let opts = || NodeOpts {
+        coordinator: false,
+        priority: 9,
+        download: false,
+        max_download_jobs: 0,
+        post_process: true,
+        min_free_disk_bytes: 0,
+    };
+    let worker = start_node_with_control(
+        tmp.path(),
+        "c",
+        opts(),
+        ns.port(),
+        4,
+        nzbd_api::AuthConfig::default(),
+        Some(control.clone()),
+    )
+    .await;
+    wait_for("retry fixture authority", 15, || {
+        get_json(&authority.url, "/api/v1/cluster")["is_leader"] == true
+    })
+    .await;
+    post_until_created("retry fixture admission",15,||http(&authority.url,"POST","/api/v1/jobs?name=retry-regrant&params=%7B%22monarr-delivery%22%3A%221%22%2C%22monarr-transfer%22%3A%22retry-regrant-token%22%7D",post.nzb.as_bytes())).await;
+    let retry_debug = std::cell::Cell::new(false);
+    let retry_started = tokio::time::Instant::now();
+    wait_for("worker automatic extractor retry held", 25, || {
+        if retry_started.elapsed().as_secs() > 12 && !retry_debug.replace(true) {
+            eprintln!(
+                "retry fixture a={} b={} c={}",
+                get_json(&authority.url, "/api/v1/jobs"),
+                serde_json::to_value(&downloader.runtime.engine.snapshot().jobs).unwrap(),
+                serde_json::to_value(&worker.runtime.engine.snapshot().jobs).unwrap()
+            );
+        }
+        worker.runtime.engine.snapshot().jobs.iter().any(|job| {
+            job.control.as_ref().is_some_and(|control| {
+                control.lifecycle == "held" && control.retry_policy == "scheduled_retry"
+            })
+        })
+    })
+    .await;
+    let held = worker
+        .runtime
+        .engine
+        .snapshot()
+        .jobs
+        .iter()
+        .find(|job| {
+            job.control
+                .as_ref()
+                .is_some_and(|control| control.lifecycle == "held")
+        })
+        .unwrap()
+        .clone();
+    let held = worker
+        .runtime
+        .engine
+        .export_job(held.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let before = held.control().unwrap();
+    let context = nzbd_state::artifacts::WorkerControlContext::for_job(&held).unwrap();
+    let source = worker
+        .runtime
+        .engine
+        .artifacts()
+        .for_job(held.id.0)
+        .unwrap()
+        .unwrap();
+    assert!(source.path.join("payload.zip").is_file());
+    assert!(before.next_retry_at_unix.is_some());
+    assert!(before.blocked_since_unix.is_some());
+    worker.kill().await;
+    let restarted = start_node_with_control(
+        tmp.path(),
+        "c",
+        opts(),
+        ns.port(),
+        4,
+        nzbd_api::AuthConfig::default(),
+        Some(control),
+    )
+    .await;
+    wait_for(
+        "same operation regranted after actual worker restart",
+        20,
+        || {
+            restarted.runtime.engine.snapshot().jobs.iter().any(|job| {
+                job.control.as_ref().is_some_and(|control| {
+                    control.lifecycle == "held" && control.retry_policy == "scheduled_retry"
+                })
+            })
+        },
+    )
+    .await;
+    let recovered = restarted
+        .runtime
+        .engine
+        .export_job(held.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let after = recovered.control().unwrap();
+    let fresh = nzbd_state::artifacts::WorkerControlContext::for_job(&recovered).unwrap();
+    assert_ne!(fresh.lease_id, context.lease_id);
+    assert_eq!(fresh.job_incarnation, context.job_incarnation);
+    assert_eq!(fresh.job_revision, context.job_revision);
+    assert_eq!(fresh.control_revision, context.control_revision);
+    assert_eq!(after.next_retry_at_unix, before.next_retry_at_unix);
+    assert_eq!(after.blocked_since_unix, before.blocked_since_unix);
+    assert_eq!(after.retry_attempt, before.retry_attempt);
+    let adopted = restarted
+        .runtime
+        .engine
+        .artifacts()
+        .for_job(held.id.0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(adopted.id, source.id);
+    assert_eq!(adopted.generation, source.generation);
+    assert_eq!(adopted.path, source.path);
+    let private_parent = source.path.parent().unwrap();
+    assert_eq!(
+        std::fs::read_dir(private_parent)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && entry.file_name().to_string_lossy().starts_with("fence-"))
+            .count(),
+        1,
+        "new lease must reuse exact private generation rather than leak another copied directory"
+    );
+    restarted.kill().await;
+    downloader.kill().await;
+    authority.kill().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn terminal_unusable_cluster_completion_drains_owned_copies_without_empty_delivery() {
+    terminal_empty_cluster_fixture(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn terminal_junk_with_explicit_keep_retains_owned_sources_and_reports_custody() {
+    terminal_empty_cluster_fixture(true).await;
+}
+async fn terminal_empty_cluster_fixture(keep: bool) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let tmp = tempfile::tempdir().unwrap();
+    let post = build_post(
+        "empty-disposition",
+        &[("readme.txt", b"disposable release notes".to_vec())],
+        20_000,
+    );
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let descriptor_port = listener.local_addr().unwrap().port();
+    let nzb = post.nzb.clone();
+    let app = axum::Router::new().route(
+        "/nzb",
+        axum::routing::get(move || {
+            let nzb = nzb.clone();
+            async move { nzb }
+        }),
+    );
+    let descriptor_server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let authority = start_node(
+        tmp.path(),
+        "a",
+        NodeOpts {
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            min_free_disk_bytes: 0,
+        },
+        ns.port(),
+        4,
+    )
+    .await;
+    let downloader = start_node(
+        tmp.path(),
+        "b",
+        NodeOpts {
+            coordinator: false,
+            priority: 9,
+            download: true,
+            max_download_jobs: 2,
+            post_process: false,
+            min_free_disk_bytes: 0,
+        },
+        ns.port(),
+        4,
+    )
+    .await;
+    let worker = start_node(
+        tmp.path(),
+        "c",
+        NodeOpts {
+            coordinator: false,
+            priority: 9,
+            download: false,
+            max_download_jobs: 0,
+            post_process: true,
+            min_free_disk_bytes: 0,
+        },
+        ns.port(),
+        4,
+    )
+    .await;
+    wait_for("empty outcome authority", 15, || {
+        get_json(&authority.url, "/api/v1/cluster")["is_leader"] == true
+    })
+    .await;
+    let params="%7B%22monarr-delivery%22%3A%221%22%2C%22monarr-transfer%22%3A%22empty-disposition-token%22%7D";
+    let admission_path=format!("/api/v1/jobs?name=empty-disposition&paused=true&url=http%3A%2F%2F127.0.0.1%3A{descriptor_port}%2Fnzb&params={params}");
+    let admitted = post_until_created("empty outcome URL admission", 15, || {
+        http(&authority.url, "POST", &admission_path, b"")
+    })
+    .await;
+    let job_id = serde_json::from_str::<serde_json::Value>(&admitted).unwrap()["id"]
+        .as_u64()
+        .unwrap();
+    if keep {
+        let (code, body) = http_with_headers(
+            &authority.url,
+            "PUT",
+            &format!("/api/v1/jobs/{job_id}/failure-keep"),
+            br#"{"keep":true}"#,
+            &[("content-type", "application/json")],
+        );
+        assert_eq!(code, 200, "{body}");
+    }
+    let (code, body) = http(
+        &authority.url,
+        "POST",
+        &format!("/api/v1/jobs/{job_id}/actions/resume"),
+        b"",
+    );
+    assert_eq!(code, 200, "{body}");
+    let history = tmp.path().join(".nzbd-cluster/history/history.c.jsonl");
+    let empty_debug = std::cell::Cell::new(false);
+    let empty_started = tokio::time::Instant::now();
+    wait_for(
+        "failure history names private exact cleanup receipt",
+        25,
+        || {
+            if empty_started.elapsed().as_secs() > 12 && !empty_debug.replace(true) {
+                eprintln!(
+                    "empty a={} c={} history={}",
+                    get_json(&authority.url, "/api/v1/jobs"),
+                    serde_json::to_value(&worker.runtime.engine.snapshot().jobs).unwrap(),
+                    std::fs::read_to_string(&history).unwrap_or_default()
+                );
+            }
+            std::fs::read_to_string(&history)
+                .unwrap_or_default()
+                .contains("Cluster:CleanupId")
+        },
+    )
+    .await;
+    let entry = std::fs::read_to_string(&history)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<nzbd_state::HistoryEntry>(line).ok())
+        .find(|row| row.params.iter().any(|(key, _)| key == "Cluster:CleanupId"))
+        .unwrap();
+    assert!(entry.status.contains("FAILURE"));
+    assert_eq!(entry.final_dir, None);
+    let id = entry
+        .params
+        .iter()
+        .find(|(key, _)| key == "Cluster:CleanupId")
+        .unwrap()
+        .1
+        .clone();
+    let cleanup_debug = std::cell::Cell::new(false);
+    let cleanup_started = tokio::time::Instant::now();
+    wait_for("exact terminal source disposition acknowledged",30,||{
+        let (code,body)=http(&authority.url,"GET",&format!("/api/v1/deliveries/{id}"),b"");
+        if cleanup_started.elapsed().as_secs()>12&&!cleanup_debug.replace(true){eprintln!("private copy disposition code={code} {body}; authority source={:?}; worker source={:?}",authority.runtime.engine.artifacts().for_job(entry.job.0).ok().flatten().map(|a|(a.id,a.generation,a.path,a.state,a.error)),worker.runtime.engine.artifacts().for_job(entry.job.0).ok().flatten().map(|a|(a.id,a.generation,a.path,a.state,a.error)));}
+        code==200&&serde_json::from_str::<serde_json::Value>(&body).is_ok_and(|row|row["cleanupOnly"]==true&&row["sourceCleanup"]["status"]==if keep {"blocked"}else{"succeeded"})
+    }).await;
+    let raw = authority
+        .runtime
+        .engine
+        .artifacts()
+        .for_job(entry.job.0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        raw.path.exists(),
+        keep,
+        "exact admitted raw custody must follow explicitKeep: path={} state={} keep={} detail={}",
+        raw.path.display(),
+        raw.state,
+        raw.keep_on_failure,
+        get_json(&authority.url, &format!("/api/v1/deliveries/{id}"))
+    );
+    if keep {
+        assert!(raw.keep_on_failure);
+    } else {
+        assert_eq!(raw.state, "deleted");
+    }
+    assert!(
+        manifest_paths(&tmp.path().join(".nzbd-cluster/generations")).is_empty(),
+        "all redundant sealed transfer copies must drain"
+    );
+    let admission = get_json(
+        &authority.url,
+        "/api/v1/request-admissions/empty-disposition-token",
+    );
+    assert_eq!(admission["outcome"], "failed");
+    assert_eq!(admission["terminalOutcome"], entry.status);
+    assert_eq!(
+        admission["custodyState"],
+        if keep {
+            "kept_by_user"
+        } else {
+            "deleted_by_runner"
+        }
+    );
+    assert_eq!(
+        admission["sourceCleanupStatus"],
+        if keep { "retained" } else { "removed" }
+    );
+    assert_eq!(admission["keepSourceOnFailure"], keep);
+    assert!(admission["publicationPath"].is_null());
+    let discovery = get_json(
+        &authority.url,
+        "/api/v1/deliveries?after=0&includeAccepted=true",
+    );
+    assert!(discovery["deliveries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["deliveryId"] != id));
+    let detail = get_json(&authority.url, &format!("/api/v1/deliveries/{id}"));
+    assert!(
+        detail.get("files").is_none(),
+        "private cleanup detail must not fabricate an empty consumer manifest"
+    );
+    let (code, _) = http(
+        &authority.url,
+        "POST",
+        &format!("/api/v1/deliveries/{id}/accept"),
+        b"{}",
+    );
+    assert_eq!(code, 409);
+    worker.kill().await;
+    downloader.kill().await;
+    authority.kill().await;
+    descriptor_server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn completed_text_document_is_retained_with_visible_review_action() {
+    let tmp = tempfile::tempdir().unwrap();
+    let text=b"An intended plain text book. Chapter one. This complete document must remain available for review.".to_vec();
+    let post = build_post("Text.Book", &[("Novel.txt", text.clone())], 20_000);
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+    let authority = start_node(
+        tmp.path(),
+        "a",
+        NodeOpts {
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            min_free_disk_bytes: 0,
+        },
+        ns.port(),
+        4,
+    )
+    .await;
+    let worker = start_node(
+        tmp.path(),
+        "b",
+        NodeOpts {
+            coordinator: false,
+            priority: 9,
+            download: true,
+            max_download_jobs: 2,
+            post_process: true,
+            min_free_disk_bytes: 0,
+        },
+        ns.port(),
+        4,
+    )
+    .await;
+    wait_for("text fixture authority", 15, || {
+        get_json(&authority.url, "/api/v1/cluster")["is_leader"] == true
+    })
+    .await;
+    post_until_created("text admission",15,||http(&authority.url,"POST","/api/v1/jobs?name=Text.Book&params=%7B%22monarr-delivery%22%3A%221%22%2C%22monarr-transfer%22%3A%22intended-text-token%22%7D",post.nzb.as_bytes())).await;
+    wait_for("intact unsupported text review", 25, || {
+        worker.runtime.engine.snapshot().jobs.iter().any(|job| {
+            job.control.as_ref().is_some_and(|control| {
+                control.lifecycle == "held"
+                    && control.message.contains("supported publication format")
+            })
+        })
+    })
+    .await;
+    let held = worker
+        .runtime
+        .engine
+        .snapshot()
+        .jobs
+        .iter()
+        .find(|job| job.control.is_some())
+        .unwrap()
+        .id;
+    let source = worker
+        .runtime
+        .engine
+        .artifacts()
+        .for_job(held.0)
+        .unwrap()
+        .unwrap();
+    assert!(source.path.exists());
+    assert!(std::fs::read_dir(&source.path)
+        .unwrap()
+        .flatten()
+        .any(|entry| std::fs::read(entry.path()).ok().as_deref() == Some(text.as_slice())));
+    assert!(get_json(
+        &authority.url,
+        "/api/v1/deliveries?after=0&includeAccepted=true"
+    )["deliveries"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    worker.kill().await;
+    authority.kill().await;
 }

@@ -82,85 +82,47 @@ pub fn spawn_worker(
             }
         });
     }
-    let t2 = tracker.clone();
-    tracker.spawn(worker_task(
-        cfg,
-        servers,
-        engine,
-        view,
-        client,
-        active,
-        pp,
-        dest_dir,
-        owner_incarnation,
-        budget_receipt,
-        cancel,
-        t2,
-    ));
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn worker_task(
-    cfg: ClusterConfig,
-    servers: Vec<ServerDef>,
-    engine: EngineHandle,
-    view: watch::Receiver<LeaderView>,
-    client: ClusterClient,
-    active: ActiveLeases,
-    pp: Option<PpSetup>,
-    dest_dir: PathBuf,
-    owner_incarnation: String,
-    budget_receipt: BudgetReceipt,
-    cancel: CancellationToken,
-    tracker: TaskTracker,
-) {
-    loop {
-        if cancel.is_cancelled() {
-            break;
-        }
-        let v = view.borrow().clone();
-
-        expire_local_leases(&engine, &servers, &active, &budget_receipt).await;
-
-        if v.is_me {
-            // We are the leader: granted leases dissolve into local jobs
-            // (adopt_authority kept them); the scheduler takes over.
-            for state in active.lock().unwrap().values() {
-                state.cancel.cancel();
+    {
+        let cfg = cfg.clone();
+        let servers = servers.clone();
+        let engine = engine.clone();
+        let view = view.clone();
+        let client = client.clone();
+        let active = active.clone();
+        let receipt = budget_receipt.clone();
+        let cancel = cancel.clone();
+        tracker.spawn(async move {
+            loop {
+                if cancel.is_cancelled(){break;}
+                expire_local_leases(&engine,&servers,&active,&receipt).await;
+                let current=view.borrow().clone();
+                if current.is_me {
+                    let cancelled:Vec<_>=active.lock().unwrap().drain().map(|(_,state)|state).collect();
+                    for state in cancelled {state.cancel.cancel();}
+                }else if let Some(url)=current.leader_url().map(str::to_owned) {
+                    heartbeat_and_cancel(&cfg,&servers,&engine,&client,&active,&receipt,&url).await;
+                }
+                tokio::select!{_=cancel.cancelled()=>break,_=tokio::time::sleep(cfg.lease_interval)=>{}}
             }
-            active.lock().unwrap().clear();
-        } else if let Some(url) = v.leader_url().map(|s| s.to_string()) {
-            heartbeat_and_cancel(
-                &cfg,
-                &servers,
-                &engine,
-                &client,
-                &active,
-                &budget_receipt,
-                &url,
-            )
-            .await;
-            poll_for_work(
-                &cfg,
-                &servers,
-                &engine,
-                &client,
-                &active,
-                &pp,
-                &dest_dir,
-                &tracker,
-                &url,
-                &owner_incarnation,
-                &budget_receipt,
-            )
-            .await;
-        }
-
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(cfg.lease_interval) => {}
-        }
+            // Pending CRC preparation and held PP are also owned work. Joiners
+            // can finish only after their exact authority is visibly revoked.
+            let cancelled:Vec<_>=active.lock().unwrap().drain().map(|(_,state)|state).collect();
+            for state in cancelled {state.cancel.cancel();let _=engine.remove_job_silent(state.job).await;}
+        });
     }
+    let work_tracker = tracker.clone();
+    tracker.spawn(async move {
+        loop {
+            if cancel.is_cancelled(){break;}
+            let current=view.borrow().clone();
+            if !current.is_me {
+                if let Some(url)=current.leader_url().map(str::to_owned) {
+                    poll_for_work(&cfg,&servers,&engine,&client,&active,&pp,&dest_dir,&work_tracker,&url,&owner_incarnation,&budget_receipt).await;
+                }
+            }
+            tokio::select!{_=cancel.cancelled()=>break,_=tokio::time::sleep(cfg.lease_interval)=>{}}
+        }
+    });
 }
 
 fn progress_of(engine: &EngineHandle, job: JobId) -> MirrorStats {
@@ -563,12 +525,19 @@ async fn submit_completion(
                         .to_string_lossy()
                         .into_owned()
                 });
+                let mut history_job = req.job.clone();
+                if resp.cleanup_only {
+                    history_job.params.push((
+                        "Cluster:CleanupId".into(),
+                        format!("cluster-delivery:{}", req.result_id),
+                    ));
+                }
                 let history_result = match (pp, resp.accepted_at_unix_ms) {
                     (Some(setup), Some(accepted_at_ms)) => {
                         record_published_pp_history(
                             setup.history.clone(),
-                            &req.job,
-                            &final_dir,
+                            &history_job,
+                            (!resp.cleanup_only).then_some(final_dir.as_str()),
                             accepted_at_ms,
                         )
                         .await
@@ -642,7 +611,7 @@ async fn submit_completion(
 async fn record_published_pp_history(
     history: Arc<nzbd_state::history::HistoryDb>,
     job: &nzbd_types::Job,
-    result_ref: &str,
+    result_ref: Option<&str>,
     accepted_at_ms: i64,
 ) -> Result<(), String> {
     let status = job
@@ -655,7 +624,7 @@ async fn record_published_pp_history(
         job: job.id,
         name: job.name.clone(),
         category: job.category.clone(),
-        final_dir: Some(result_ref.to_owned()),
+        final_dir: result_ref.map(str::to_owned),
         status,
         size: job.totals.size,
         health: nzbd_types::Health::calc(&job.totals).0,
@@ -766,29 +735,68 @@ async fn poll_for_work(
                     budget_receipt,
                 )
                 .await;
-                // Fold shared journals on import: resume work another node did.
-                if engine.import_job(grant.job, true, false).await.is_ok() {
-                    if engine.snapshot().disk_low {
+                // Register before the off-actor CRC preparation so the
+                // independent control lane renews/cancels this exact grant.
+                let lease_id = grant.lease_id.clone();
+                let original_token = grant.token.clone();
+                let expected_job = grant.job_revision;
+                let expected_control = grant.control_revision;
+                active.lock().unwrap().insert(
+                    lease_id.clone(),
+                    LeaseState {
+                        job: job_id,
+                        kind: LeaseKind::Download,
+                        token: grant.token.clone(),
+                        job_incarnation: grant.job_incarnation,
+                        job_revision: expected_job,
+                        control_revision: expected_control,
+                        deadline: conservative_deadline(cfg),
+                        cancel: CancellationToken::new(),
+                        pp_ready: false,
+                        ready_job: None,
+                    },
+                );
+                let checkpoint = {
+                    let active = active.clone();
+                    let lease_id = lease_id.clone();
+                    let token = original_token.clone();
+                    Arc::new(move || {
+                        active.lock().unwrap().get(&lease_id).is_some_and(|state| {
+                            state.job == job_id
+                                && state.job_revision == expected_job
+                                && state.control_revision == expected_control
+                                && state.token.resource == token.resource
+                                && state.token.owner_node_id == token.owner_node_id
+                                && state.token.owner_incarnation == token.owner_incarnation
+                                && state.token.fence == token.fence
+                                && state.token.revision >= token.revision
+                                && state.deadline > Instant::now()
+                                && !state.cancel.is_cancelled()
+                        })
+                    })
+                };
+                if engine
+                    .import_job_checked(grant.job, true, false, checkpoint)
+                    .await
+                    .is_err()
+                    || engine.snapshot().disk_low
+                {
+                    let removed = {
+                        let mut leases = active.lock().unwrap();
+                        if leases.get(&lease_id).is_some_and(|state| {
+                            state.token.fence == original_token.fence
+                                && state.token.owner_incarnation == original_token.owner_incarnation
+                        }) {
+                            leases.remove(&lease_id)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(state) = removed {
+                        state.cancel.cancel();
                         let _ = engine.remove_job_silent(job_id).await;
-                        reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
-                            .await;
-                        continue;
+                        reject_remote_grant(cfg, client, leader_url, &lease_id, &state.token).await;
                     }
-                    active.lock().unwrap().insert(
-                        grant.lease_id,
-                        LeaseState {
-                            job: job_id,
-                            kind: LeaseKind::Download,
-                            token: grant.token,
-                            job_incarnation: grant.job_incarnation,
-                            job_revision: grant.job_revision,
-                            control_revision: grant.control_revision,
-                            deadline: conservative_deadline(cfg),
-                            cancel: CancellationToken::new(),
-                            pp_ready: false,
-                            ready_job: None,
-                        },
-                    );
                 }
             }
             LeaseKind::Post => {
@@ -1315,12 +1323,27 @@ pub(crate) struct GenerationManifest {
     pub(crate) file_outcomes: Vec<nzbd_state::artifacts::DeliveryFileOutcome>,
     #[serde(default)]
     pub(crate) identity_version: u8,
+    #[serde(default)]
+    pub(crate) source_disposition: Option<String>,
 }
 
 impl GenerationManifest {
     fn computed_identity(&self) -> Result<String, String> {
         use sha2::{Digest, Sha256};
-        let bytes = if self.identity_version >= 2 {
+        let bytes = if self.identity_version >= 3 {
+            serde_json::to_vec(&(
+                self.job_id,
+                &self.job_incarnation,
+                &self.owner_node_id,
+                self.fence,
+                &self.job_sha256,
+                &self.files,
+                &self.artifact_copy,
+                &self.directory_identity,
+                &self.file_outcomes,
+                &self.source_disposition,
+            ))
+        } else if self.identity_version >= 2 {
             serde_json::to_vec(&(
                 self.job_id,
                 &self.job_incarnation,
@@ -1572,9 +1595,12 @@ async fn seal_generation(
                     generation: generation.clone(),
                 },
             );
+        let selected_copy = matches!(source.as_ref(), Some(SealSource::Selected(_)));
         let artifact_copy = match exact.filter(|_| lease.kind == LeaseKind::Post) {
-            Some(source) => inventory.cluster_artifact_copy_for_generation(job.id.0, true, &source),
-            None => inventory.cluster_artifact_copy(job.id.0, lease.kind == LeaseKind::Post),
+            Some(source) => {
+                inventory.cluster_artifact_copy_for_generation(job.id.0, selected_copy, &source)
+            }
+            None => inventory.cluster_artifact_copy(job.id.0, selected_copy),
         }
         .map_err(|error| format!("capture cluster copy custody: {error}"))?;
         let file_outcomes = match &artifact_copy {
@@ -1585,7 +1611,15 @@ async fn seal_generation(
         };
         let directory_identity = Some(generation_directory_identity(&building)?);
         let mut manifest = GenerationManifest {
-            identity_version: 2,
+            identity_version: 3,
+            source_disposition: inventory
+                .for_job(job.id.0)
+                .map_err(|error| error.to_string())?
+                .and_then(|artifact| {
+                    artifact
+                        .failure_assessment
+                        .map(|assessment| assessment.disposition)
+                }),
             artifact_copy,
             directory_identity,
             file_outcomes,
@@ -2280,6 +2314,7 @@ mod tests {
             durable_receipt: None,
             accepted_at_unix_ms: Some(10),
             history_recorded_by_authority: true,
+            cleanup_only: false,
         };
         assert!(accept_worker_retirement(&engine, &request, &response)
             .await

@@ -151,6 +151,9 @@ pub struct CompleteResponse {
     /// True when the authority already durably wrote the logical history row.
     #[serde(default)]
     pub history_recorded_by_authority: bool,
+    /// Terminal outcome has no consumer payload; only private copy retirement.
+    #[serde(default)]
+    pub cleanup_only: bool,
 }
 
 /// A worker's local guard changed after it advertised capacity but before it

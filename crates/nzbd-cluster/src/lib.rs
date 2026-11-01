@@ -127,6 +127,7 @@ async fn drain_url_outbox(shared: &Arc<leader::LeaderShared>) -> Result<(), Stri
             // Queue projection is rebuilt only from the just-committed/current
             // intent. A retry never imports a stale resolved Job over user edits.
             shared.restore_control_projection().await?;
+            drop(_serial);
             shared
                 .engine
                 .ack_url_resolution(&record.resolution_id)
