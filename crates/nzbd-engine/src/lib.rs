@@ -411,6 +411,62 @@ impl Engine {
             url_fetches: Arc::new(Mutex::new(HashSet::new())),
         };
 
+        // Probe retained resource holds independently of download admission.
+        // Bound each sweep and rotate it so an unavailable volume cannot starve
+        // later jobs. The owner durably schedules unlimited per-job backoff.
+        {
+            let retries = handle.clone();
+            handle.tracker.spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut cursor = 0usize;
+                loop {
+                    tokio::select! {
+                        _ = retries.cancel.cancelled() => break,
+                        _ = tick.tick() => {}
+                    }
+                    let snapshot = retries.snapshot();
+                    let jobs = snapshot
+                        .jobs
+                        .iter()
+                        .filter(|job| job.kind == nzbd_types::JobKind::Nzb)
+                        .map(|job| job.id)
+                        .collect::<Vec<_>>();
+                    if jobs.is_empty() {
+                        continue;
+                    }
+                    let mut probes = tokio::task::JoinSet::new();
+                    for offset in 0..jobs.len().min(8) {
+                        let job = jobs[(cursor + offset) % jobs.len()];
+                        let retries = retries.clone();
+                        probes.spawn(async move {
+                            let Some(record) = retries.export_job(job).await.ok().flatten() else {
+                                return;
+                            };
+                            if !record.control().is_some_and(|control| {
+                                control.lifecycle == "held"
+                                    && matches!(control.cause.as_str(), "capacity" | "quota")
+                            }) {
+                                return;
+                            }
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(8),
+                                retries.resume_resource_job(job, false),
+                            )
+                            .await;
+                        });
+                    }
+                    cursor = (cursor + jobs.len().min(8)) % jobs.len();
+                    while !probes.is_empty() {
+                        tokio::select! {
+                            _ = retries.cancel.cancelled() => return,
+                            _ = probes.join_next() => {}
+                        }
+                    }
+                }
+            });
+        }
+
         for (job, url) in refetch {
             tracing::info!(job = job.0, %url, "re-spawning NZB fetch for job recovered mid-fetch");
             let retry_state = handle
@@ -871,6 +927,10 @@ impl EngineHandle {
     }
 
     pub async fn resume_job(&self, job: JobId) -> Result<bool, EngineError> {
+        self.resume_resource_job(job, true).await
+    }
+
+    async fn resume_resource_job(&self, job: JobId, force: bool) -> Result<bool, EngineError> {
         if let Some(record) = self.export_job(job).await? {
             if let Some(control) = record.control().filter(|c| c.lifecycle == "held") {
                 // Allocation may have no owned payload yet: do not run the
@@ -893,6 +953,7 @@ impl EngineHandle {
                     .roundtrip_bool(|reply| QueueCommand::BeginResourceProbe {
                         job,
                         revision: revision.clone(),
+                        force,
                         reply,
                     })
                     .await?
@@ -1158,7 +1219,11 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        if rx.await.map_err(|_| EngineError::Closed)? {
+            Ok(())
+        } else {
+            Err(EngineError::AdmissionNotDurable)
+        }
     }
 
     /// Atomically replace an existing authority copy without ever inserting a
@@ -1373,6 +1438,29 @@ impl EngineHandle {
         })
         .await?;
         rx.await.map_err(|_| EngineError::Closed)
+    }
+
+    /// Persist an automatic retry schedule only while the observed hold still owns this job.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn schedule_post_retry(
+        &self,
+        job: JobId,
+        revision: String,
+        retry_attempt: u8,
+        next_retry: i64,
+        blocked_since: i64,
+        message: String,
+    ) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::SchedulePostRetry {
+            job,
+            revision,
+            retry_attempt,
+            next_retry,
+            blocked_since,
+            message,
+            reply,
+        })
+        .await
     }
 
     pub async fn retry_post_hold(&self, job: JobId, revision: String) -> Result<bool, EngineError> {

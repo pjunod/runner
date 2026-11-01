@@ -91,6 +91,9 @@ mod delivery_query_tests {
 }
 
 async fn deliveries(State(st): State<ApiState>, Query(page): Query<DeliveryPage>) -> Response {
+    if page.after < 0 || page.limit.is_some_and(|limit| !(1..=100).contains(&limit)) {
+        return error(StatusCode::BAD_REQUEST, "invalid delivery cursor or limit");
+    }
     let db = st.engine.artifacts();
     let limit = page.limit.unwrap_or(50);
     let include_accepted = page.include_accepted;

@@ -2079,11 +2079,14 @@ async fn get_history(
             let entries = entries
                 .into_iter()
                 .map(|e| {
-                    let can =
-                        spooled.contains(&e.job.0) || e.params.iter().any(|(k, _)| k == "*URL");
+                    let reason = history_requeue_refusal(&e);
+                    let can = reason.is_none()
+                        && (spooled.contains(&e.job.0)
+                            || e.params.iter().any(|(k, _)| k == "*URL"));
                     let mut v = serde_json::to_value(&e).unwrap_or_else(|_| json!({}));
                     if let Some(o) = v.as_object_mut() {
                         o.insert("can_requeue".into(), json!(can));
+                        o.insert("requeue_reason".into(), json!(reason));
                         o.insert(
                             "kind".into(),
                             json!(e
@@ -2609,6 +2612,11 @@ async fn get_clients(State(st): State<ApiState>) -> Response {
 /// NZB, or the `*URL` param when the job was still fetching when it was
 /// deleted. On success the history entry and its spool are removed: the
 /// job is queued again, so a `DELETED` record for it would be a lie.
+fn history_requeue_refusal(entry: &nzbd_state::HistoryEntry) -> Option<&'static str> {
+    entry.params.iter().any(|(key, _)| key == "monarr-transfer")
+        .then_some("This download belongs to a Curator request. Use a fresh Grab in Curator to acquire it again with a new request token, or retry its retained source.")
+}
+
 async fn history_requeue(st: &ApiState, db: Arc<HistoryDb>, job: JobId) -> Response {
     let lookup = db.clone();
     let found = tokio::task::spawn_blocking(move || {
@@ -2624,6 +2632,9 @@ async fn history_requeue(st: &ApiState, db: Arc<HistoryDb>, job: JobId) -> Respo
     let Ok(Some((entry, nzb))) = found else {
         return not_found();
     };
+    if let Some(reason) = history_requeue_refusal(&entry) {
+        return error(StatusCode::CONFLICT, reason);
+    }
     let url = entry
         .params
         .iter()
@@ -2639,13 +2650,11 @@ async fn history_requeue(st: &ApiState, db: Arc<HistoryDb>, job: JobId) -> Respo
             mode: None,
         }),
         paused: false,
-        // A requeue is the same download again, so it carries the same
-        // consumer params — the tracking id that names this transfer must
-        // survive an undo, or the trace it belongs to ends mid-story.
+        // Ordinary Runner history entries retain their consumer parameters.
         params: entry
             .params
             .iter()
-            .filter(|(k, _)| !k.starts_with('*'))
+            .filter(|(key, _)| !key.starts_with('*'))
             .cloned()
             .collect(),
         ..Default::default()
@@ -3536,6 +3545,62 @@ mod tests {
             assert!(!response.status().is_success());
             assert!(db.get(JobId(71)).unwrap().is_some());
             assert_eq!(std::fs::read(&blocked).unwrap(), b"not a directory");
+        }
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn consumer_history_requeue_refuses_both_sources_without_retiring_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let db = Arc::new(HistoryDb::open(&tmp.path().join("history.sqlite"), None).unwrap());
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: Some(db.clone()),
+            torrent: None,
+            log: None,
+            setup: None,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+        for (id, spooled) in [(81u32, false), (82u32, true)] {
+            let entry: nzbd_state::HistoryEntry = serde_json::from_value(json!({
+                "job": id, "name": "consumer", "category": null, "final_dir": null,
+                "status": "DELETED", "size": 0, "completed_at_unix": 1,
+                "params": [["monarr-transfer", format!("request-{id}")], ["*URL", "http://example.test/request.nzb"]]
+            })).unwrap();
+            db.record(&entry).unwrap();
+            if spooled {
+                db.spool_nzb(JobId(id), NZB.as_bytes()).unwrap();
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::post(format!("/api/v1/history/{id}/actions/requeue"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert!(db.get(JobId(id)).unwrap().is_some());
+            assert!(engine.snapshot().jobs.is_empty());
+        }
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/history")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let page = body_json(response).await;
+        for row in page["entries"].as_array().unwrap() {
+            assert_eq!(row["can_requeue"], false);
+            assert!(row["requeue_reason"].as_str().unwrap().contains("Curator"));
         }
         engine.shutdown().await;
     }

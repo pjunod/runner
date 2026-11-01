@@ -653,13 +653,36 @@ impl Inventory {
 
     /// Only after the owning operation commits. A partial cleanup can resume;
     /// unexpected files or identities are retained for explicit review.
-    pub(super) fn retire_publication_source_unlocked(&self, key: &str) -> Result<()> {
+    pub(super) fn retire_publication_source_unlocked<'a>(
+        &'a self,
+        guard: &mut Option<MutationGuard<'a>>,
+        key: &str,
+    ) -> Result<()> {
+        let flight = format!("publish-{key}");
+        if !self
+            .publication_active
+            .lock()
+            .unwrap()
+            .insert(flight.clone())
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+        }
+        let _lease = PublicationLease {
+            inventory: self,
+            id: flight,
+        };
         let mut op = self.operation(&format!("publish-{key}"))?;
         let mut p: Publication = serde_json::from_str(&op.request)?;
         if p.retirement_done {
             return Ok(());
         }
-        let result = self.retire_publication_entries_unlocked(key);
+        let result = self.retire_publication_entries_unlocked(guard, key);
+        let current = self.operation(&op.id)?;
+        if current.request != op.request || current.state != op.state {
+            return Err(Error::Conflict(
+                "publication cleanup journal changed while hashing".into(),
+            ));
+        }
         p.retirement_done = result.is_ok();
         op.error = result
             .as_ref()
@@ -670,7 +693,11 @@ impl Inventory {
         result
     }
 
-    fn retire_publication_entries_unlocked(&self, key: &str) -> Result<()> {
+    fn retire_publication_entries_unlocked<'a>(
+        &'a self,
+        guard: &mut Option<MutationGuard<'a>>,
+        key: &str,
+    ) -> Result<()> {
         #[cfg(test)]
         if RETIRE_FAILURE.with(|f| f.replace(false)) {
             return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
@@ -702,7 +729,8 @@ impl Inventory {
                 if !controlled_link_matches(&expected.identity, &entry.identity) {
                     false
                 } else if let Some(expected_digest) = expected.digest.as_deref() {
-                    digest_file(&dir, &entry.path, &entry.identity)? == expected_digest
+                    self.digest_file_yielding(guard, &dir, &entry.path, &entry.identity)?
+                        == expected_digest
                 } else {
                     false
                 }
@@ -712,6 +740,17 @@ impl Inventory {
                     "publication cleanup source contents changed".into(),
                 ));
             }
+        }
+        // Digest work yields the mutation lease. Revalidate the journal and
+        // complete identity set before the first physical mutation.
+        let current = self.operation(&op.id)?;
+        if current.request != op.request
+            || current.state != op.state
+            || fs::manifest(&dir, 100_000)? != entries
+        {
+            return Err(Error::Conflict(
+                "publication cleanup authority changed while hashing".into(),
+            ));
         }
         for entry in entries.iter().rev() {
             fs::remove_entry(&dir, entry)?;
@@ -774,8 +813,18 @@ mod tests {
         drop(inventory);
         let inventory = Inventory::open(&temp.path().join("state")).unwrap();
         publish(&inventory, &source, &target).unwrap();
-        inventory.retire_publication_source_unlocked("one").unwrap();
-        inventory.retire_publication_source_unlocked("one").unwrap();
+        inventory
+            .retire_publication_source_unlocked(
+                &mut Some(inventory.mutation_guard().unwrap()),
+                "one",
+            )
+            .unwrap();
+        inventory
+            .retire_publication_source_unlocked(
+                &mut Some(inventory.mutation_guard().unwrap()),
+                "one",
+            )
+            .unwrap();
         assert!(!source.exists());
         assert_eq!(
             std::fs::read(target.join("nested/media.mkv")).unwrap(),

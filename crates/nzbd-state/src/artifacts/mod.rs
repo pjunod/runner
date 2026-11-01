@@ -314,6 +314,7 @@ pub struct Inventory {
     // but a competing reconciler must never overwrite this operation's newer
     // publication checkpoint.
     publication_active: Mutex<std::collections::HashSet<String>>,
+    relocation_active: Mutex<std::collections::HashSet<String>>,
     clocks: Mutex<std::collections::HashMap<String, (u64, Instant)>>,
     reconcile_cursor: Mutex<String>,
     // One task runner at a time: the maintenance tick and an API kick can
@@ -520,6 +521,7 @@ impl Inventory {
             installation,
             mutation: Mutex::new(()),
             publication_active: Mutex::new(std::collections::HashSet::new()),
+            relocation_active: Mutex::new(std::collections::HashSet::new()),
             clocks: Mutex::new(std::collections::HashMap::new()),
             reconcile_cursor: Mutex::new(String::new()),
             tasks: Mutex::new(()),
@@ -2096,6 +2098,7 @@ impl Inventory {
             }
         }
         self.run_due_deletes()?;
+        self.reconcile_relocations()?;
         self.reconcile_workspace_retirements()?;
         self.run_workspace_retirements()?;
         self.reconcile_recoveries()?;

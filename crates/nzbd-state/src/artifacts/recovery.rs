@@ -460,9 +460,10 @@ impl Inventory {
                 .operation(&format!("publish-recovery-{}", r.id))
                 .is_ok()
             {
-                if let Err(e) =
-                    self.retire_publication_source_unlocked(&format!("recovery-{}", r.id))
-                {
+                if let Err(e) = self.retire_publication_source_unlocked(
+                    &mut publication_guard,
+                    &format!("recovery-{}", r.id),
+                ) {
                     tracing::warn!(recovery=%r.id, error=%e, "recovery published; scratch cleanup pending");
                 }
             }
@@ -591,9 +592,10 @@ impl Inventory {
                 .operation(&format!("publish-recovery-{}", r.id))
                 .is_ok()
             {
-                if let Err(e) =
-                    self.retire_publication_source_unlocked(&format!("recovery-{}", r.id))
-                {
+                if let Err(e) = self.retire_publication_source_unlocked(
+                    &mut publication_guard,
+                    &format!("recovery-{}", r.id),
+                ) {
                     tracing::warn!(recovery=%r.id, error=%e, "recovery published; scratch cleanup pending");
                 }
             }
@@ -641,7 +643,10 @@ impl Inventory {
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         for id in pending_cleanup {
-            if let Err(e) = self.retire_publication_source_unlocked(&format!("recovery-{id}")) {
+            if let Err(e) = self.retire_publication_source_unlocked(
+                &mut Some(self.mutation_guard()?),
+                &format!("recovery-{id}"),
+            ) {
                 tracing::warn!(recovery=%id, error=%e, "recovery scratch cleanup remains pending");
             }
         }

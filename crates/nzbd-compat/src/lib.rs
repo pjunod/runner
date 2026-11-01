@@ -796,6 +796,7 @@ async fn editqueue(state: &CompatState, params: &Value) -> Result<Value, (i64, &
                 .await
             }
             "GroupSetParameter" => match text.split_once('=') {
+                Some((k, _)) if k.starts_with('*') => false,
                 Some((k, v)) => {
                     let (k, v) = (k.to_string(), v.to_string());
                     edit_job(state, id, move |j| {
@@ -1287,6 +1288,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r, json!(true));
+
+        let forbidden = dispatch(
+            &state,
+            "editqueue",
+            &json!(["GroupSetParameter", "*Runner:LifecycleEligible=1", [id.0]]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(forbidden, json!(false));
+        let job = state.engine.export_job(id).await.unwrap().unwrap();
+        assert!(!job
+            .params
+            .iter()
+            .any(|(key, _)| key == "*Runner:LifecycleEligible"));
 
         // Set a parameter then a category, verify via export.
         let r = dispatch(

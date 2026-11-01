@@ -249,7 +249,7 @@ pub(crate) enum QueueCommand {
         job: Box<Job>,
         fold_journals: bool,
         emit_finished: bool,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<bool>,
     },
     /// Replace only an authority copy that still exists. This is the fenced
     /// terminal-update path: a demoted worker must never resurrect a job that
@@ -338,9 +338,19 @@ pub(crate) enum QueueCommand {
         revision: String,
         reply: oneshot::Sender<bool>,
     },
+    SchedulePostRetry {
+        job: JobId,
+        revision: String,
+        retry_attempt: u8,
+        next_retry: i64,
+        blocked_since: i64,
+        message: String,
+        reply: oneshot::Sender<bool>,
+    },
     BeginResourceProbe {
         job: JobId,
         revision: String,
+        force: bool,
         reply: oneshot::Sender<bool>,
     },
     ReleaseResourceHold {
@@ -661,6 +671,7 @@ pub(crate) struct Owner {
     /// Queue-authority persistence (snapshot save/compact). Worker-mode
     /// engines run with this off; journals stay on regardless.
     persist: bool,
+    persistence_fenced: bool,
     persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     budget_tx: watch::Sender<crate::pool::BudgetEnvelope>,
     budget_generation: u64,
@@ -1063,6 +1074,7 @@ impl Owner {
             pending_sources,
             marker,
             persist,
+            persistence_fenced: false,
             persist_guard,
             budget_tx,
             budget_generation: 0,
@@ -2115,6 +2127,14 @@ impl Owner {
             }
             QueueCommand::SetKeepOnFailure { job, keep, reply } => {
                 let before = self.state.job(job).cloned();
+                if before.is_none() {
+                    let ok = self.artifacts.set_keep_on_failure(job.0, keep).unwrap_or_else(|error| {
+                        tracing::warn!(job=job.0, %error, "retained-source Keep update refused");
+                        false
+                    });
+                    let _ = reply.send(ok);
+                    return;
+                }
                 let prior_keep = before.as_ref().is_some_and(|record| {
                     record
                         .params
@@ -2363,57 +2383,17 @@ impl Owner {
                 emit_finished,
                 reply,
             } => {
-                let _ = self.import_job(*job, fold_journals, emit_finished);
-                let _ = reply.send(());
+                let committed = self.import_job(*job, fold_journals, emit_finished);
+                let _ = reply.send(committed);
             }
             QueueCommand::ImportJobIfPresent {
                 job,
                 require_snapshot,
                 reply,
             } => {
-                let id = job.id;
-                let previous = self.state.job(id).cloned();
-                let previous_delegated = self.delegated.get(&id).cloned();
-                let previous_mirror = self.mirror.get(&id).cloned();
-                let previous_post_fetch = self.post_fetch_files.get(&id).cloned();
-                let committed = previous.is_some()
+                let committed = self.state.job(job.id).is_some()
                     && (!require_snapshot || self.persist)
                     && self.import_job(*job, false, false);
-                if !committed {
-                    // Atomic means memory and disk agree. A failed snapshot
-                    // commit must not leave an in-memory-only PP_DONE or
-                    // finalization key that later scans mistake for durable.
-                    let _ = self.remove_job_silent(id);
-                    if let Some(previous) = previous {
-                        self.state.jobs.push(previous);
-                    }
-                    match previous_delegated {
-                        Some(node) => {
-                            self.delegated.insert(id, node);
-                        }
-                        None => {
-                            self.delegated.remove(&id);
-                        }
-                    }
-                    match previous_mirror {
-                        Some(stats) => {
-                            self.mirror.insert(id, stats);
-                        }
-                        None => {
-                            self.mirror.remove(&id);
-                        }
-                    }
-                    match previous_post_fetch {
-                        Some(files) => {
-                            self.post_fetch_files.insert(id, files);
-                        }
-                        None => {
-                            self.post_fetch_files.remove(&id);
-                        }
-                    }
-                    self.publish_now();
-                    self.bump_epoch();
-                }
                 let _ = reply.send(committed);
             }
             QueueCommand::ExportJob { job, reply } => {
@@ -2585,6 +2565,8 @@ impl Owner {
                                 | "missing_tool"
                                 | "password_required"
                                 | "mount_unavailable"
+                                | "capacity"
+                                | "quota"
                         )
                         && matches!(
                             c.previous_status,
@@ -2658,11 +2640,71 @@ impl Owner {
                 }
                 let _ = reply.send(ok);
             }
+            QueueCommand::SchedulePostRetry {
+                job,
+                revision,
+                retry_attempt,
+                next_retry,
+                blocked_since,
+                message,
+                reply,
+            } => {
+                let before = self.state.job(job).cloned();
+                let mut changed = false;
+                if self.persist && !self.persistence_fenced {
+                    if let Some(row) = self.state.job_mut(job) {
+                        if row.lifecycle_eligible() {
+                            if let Some(mut control) = row.control().filter(|control| {
+                                control.revision == revision
+                                    && control.lifecycle == "held"
+                                    && !control.manual_pause
+                                    && matches!(
+                                        control.cause.as_str(),
+                                        "io" | "missing_tool" | "capacity" | "quota"
+                                    )
+                                    && retry_attempt == control.retry_attempt.saturating_add(1)
+                                    && next_retry >= control.next_retry_at_unix.unwrap_or(0)
+                            }) {
+                                if let Some(next_revision) = control
+                                    .revision
+                                    .parse::<u64>()
+                                    .ok()
+                                    .and_then(|value| value.checked_add(1))
+                                {
+                                    control.revision = next_revision.to_string();
+                                    control.retry_attempt = retry_attempt;
+                                    control.next_retry_at_unix = Some(next_retry);
+                                    control.blocked_since_unix = Some(
+                                        control
+                                            .blocked_since_unix
+                                            .unwrap_or(blocked_since)
+                                            .min(blocked_since),
+                                    );
+                                    control.retry_policy = "scheduled_retry".into();
+                                    control.message = message.chars().take(2048).collect();
+                                    row.set_control(&control);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                let ok = changed && self.save_snapshot();
+                if ok {
+                    self.publish_now();
+                    self.bump_epoch();
+                } else if let Some(before) = before {
+                    *self.state.job_mut(job).unwrap() = before;
+                }
+                let _ = reply.send(ok);
+            }
             QueueCommand::BeginResourceProbe {
                 job,
                 revision,
+                force,
                 reply,
             } => {
+                let before = self.state.job(job).cloned();
                 let quiescent = self.state.job(job).is_some_and(|j| {
                     j.files
                         .iter()
@@ -2689,21 +2731,33 @@ impl Owner {
                             c.revision == revision
                                 && c.lifecycle == "held"
                                 && matches!(c.cause.as_str(), "capacity" | "quota")
-                        }) && after <= now
-                            && count < 8
+                        }) && (force || after <= now)
                         {
                             j.params.retain(|(k, _)| {
                                 k != "*Control:probe_after" && k != "*Control:attempts"
                             });
                             j.params.push((
                                 "*Control:probe_after".into(),
-                                (now + 30 * (1i64 << count.min(6))).to_string(),
+                                (now + {
+                                    let base = [30, 60, 120, 300][count.min(3) as usize];
+                                    base + ((job.0 as i64 ^ now ^ count as i64).unsigned_abs()
+                                        % (base as u64 / 10 + 1))
+                                        as i64
+                                })
+                                .to_string(),
                             ));
-                            j.params
-                                .push(("*Control:attempts".into(), (count + 1).to_string()));
+                            j.params.push((
+                                "*Control:attempts".into(),
+                                count.saturating_add(1).to_string(),
+                            ));
                             self.dirty = true;
                             ok = !self.persist || self.save_snapshot();
                         }
+                    }
+                }
+                if !ok {
+                    if let Some(before) = before {
+                        *self.state.job_mut(job).unwrap() = before;
                     }
                 }
                 let _ = reply.send(ok);
@@ -2748,6 +2802,12 @@ impl Owner {
                                 }
                             };
                             j.set_control(&control);
+                            j.params.retain(|(key, _)| {
+                                !matches!(
+                                    key.as_str(),
+                                    "*Control:attempts" | "*Control:probe_after"
+                                )
+                            });
                             for f in &j.files {
                                 self.writers.remove(&f.id);
                             }
@@ -2910,6 +2970,7 @@ impl Owner {
             }
             QueueCommand::RetainJobs { keep, reply } => {
                 self.persist = false;
+                self.persistence_fenced = false;
                 let keep: HashSet<JobId> = keep.into_iter().collect();
                 let drop_ids: Vec<JobId> = self
                     .state
@@ -2934,6 +2995,9 @@ impl Owner {
     // -- cluster: import / export / delegation / adoption --------------------
 
     fn import_job(&mut self, mut job: Job, fold_journals: bool, emit_finished: bool) -> bool {
+        if self.persistence_fenced {
+            return false;
+        }
         if let Some(control) = self
             .state
             .job(job.id)
@@ -2956,56 +3020,99 @@ impl Owner {
         if matches!(job.status, JobStatus::Downloading) {
             job.status = JobStatus::Queued;
         }
-        if job.torrent.is_none()
-            && !matches!(
-                job.status,
-                JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
-            )
-        {
+        let import_path = if job.torrent.is_none() {
             let relative = std::path::PathBuf::from(job_dir_name(&job));
             if relative
                 .components()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
             {
                 return false;
             }
             let path = self.dest_dir.join(relative);
-            // Cluster grants may use nested, fenced generation directories.
-            // Register their bytes without local deletion authority.
-            if let Err(error) = std::fs::create_dir_all(&path) {
-                tracing::error!(job=job.id.0,%error,"cannot create granted payload directory");
-                return false;
-            }
-            self.allocated_jobs.remove(&job.id);
-            if let Err(error) =
-                self.artifacts
-                    .register_legacy_active(job.id.0, path.parent().unwrap(), &path)
-            {
-                tracing::error!(job=job.id.0, %error, "cluster payload inventory unavailable");
-                return false;
-            }
-        }
-        if job.torrent.is_none() && self.artifacts.for_job(job.id.0).ok().flatten().is_none() {
-            let path = self.dest_dir.join(job_dir_name(&job));
-            if path.is_dir() {
-                if let Err(error) =
-                    self.artifacts
-                        .register_legacy_active(job.id.0, path.parent().unwrap(), &path)
-                {
-                    tracing::error!(%error,"cannot inventory legacy completed payload");
+            if !matches!(
+                job.status,
+                JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
+            ) {
+                if let Err(error) = std::fs::create_dir_all(&path) {
+                    tracing::error!(job=job.id.0,%error,"cannot create granted payload directory");
                     return false;
+                }
+            }
+            path.is_dir().then_some(path)
+        } else {
+            None
+        };
+        // Fold foreign journal facts into the staged row before persistence.
+        // This pass has no owner mutations or finalization side effects: a
+        // failed commit leaves every executor and receipt exactly as before.
+        let mut imported_file_sizes = HashMap::new();
+        let mut imported_files = HashSet::new();
+        if fold_journals {
+            let records = match JobJournals::replay_job(&self.state_dir, job.id) {
+                Ok(records) => records,
+                Err(error) => {
+                    tracing::warn!(job=job.id.0, %error, "import journal replay refused");
+                    return false;
+                }
+            };
+            let root = self.dest_dir.join(job_dir_name(&job));
+            for record in records.into_iter().filter(|record| record.job == job.id) {
+                let Some(file) = job.files.iter_mut().find(|file| file.id == record.file) else {
+                    continue;
+                };
+                let stable = root.join(format!(".runner-file-{}.part", file.id.0));
+                let path = if stable.exists() {
+                    stable
+                } else {
+                    root.join(&file.filename)
+                };
+                if !crate::writer::validate_range(
+                    &path,
+                    record.offset,
+                    record.len as u64,
+                    record.crc32,
+                ) {
+                    tracing::warn!(
+                        job = job.id.0,
+                        file = record.file.0,
+                        "import journal bytes require revalidation; original queue preserved"
+                    );
+                    return false;
+                }
+                if record.file_size > 0 {
+                    imported_file_sizes.insert(record.file, record.file_size);
+                }
+                if let Some(segment) = file
+                    .segments
+                    .iter_mut()
+                    .find(|segment| segment.number == record.segment_number)
+                {
+                    segment.state = SegmentState::Done {
+                        offset: record.offset,
+                        len: record.len,
+                        crc: record.crc32,
+                    };
+                    imported_files.insert(file.id);
                 }
             }
         }
         let job_id = job.id;
         let max_file = job.files.iter().map(|f| f.id.0).max().unwrap_or(0);
+        let previous_ids = (self.state.next_job_id, self.state.next_file_id);
+        let previous_receipts = self.state.url_admission_receipts.clone();
+        let previous_file_sizes = self.file_sizes.clone();
+        let was_dirty = self.dirty;
         self.state.next_job_id = self.state.next_job_id.max(job_id.0);
         self.state.next_file_id = self.state.next_file_id.max(max_file);
 
-        // Replace any existing copy (idempotent re-grant / completion).
-        if self.state.job(job_id).is_some() {
-            self.remove_job_silent(job_id);
-        }
+        // Stage replacement in place. Removing first used to save an
+        // intermediate snapshot without the job and destroy rollback state.
+        let index = self
+            .state
+            .jobs
+            .iter()
+            .position(|existing| existing.id == job_id);
+        let previous = index.map(|index| self.state.jobs.remove(index));
         let terminal = matches!(
             job.status,
             JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
@@ -3013,14 +3120,58 @@ impl Owner {
         let name = job.name.clone();
         let status = job.status;
         let health = Health::calc(&job.totals).0;
-        self.state.jobs.push(job);
+        let index = index.unwrap_or(self.state.jobs.len());
+        self.state.jobs.insert(index, job);
         if let Some(j) = self.state.job_mut(job_id) {
             recompute_job_totals(j);
         }
+        self.dirty = true;
+        let persistence_required = self.persist;
+        let committed = !persistence_required || self.save_snapshot();
+        if !committed {
+            self.state.jobs.remove(index);
+            if let Some(previous) = previous {
+                self.state.jobs.insert(index, previous);
+            }
+            self.state.next_job_id = previous_ids.0;
+            self.state.next_file_id = previous_ids.1;
+            self.state.url_admission_receipts = previous_receipts;
+            self.file_sizes = previous_file_sizes;
+            self.dirty = was_dirty;
+            return false;
+        }
+        // Clear executor state only after the replacement is durable.
+        self.allocated_jobs.remove(&job_id);
+        if let Some(path) = import_path {
+            if let Err(error) =
+                self.artifacts
+                    .register_legacy_active(job_id.0, path.parent().unwrap(), &path)
+            {
+                // The committed row is now authoritative. Retain it on a
+                // durable hold if its inventory association needs repair.
+                self.hold_job(
+                    job_id,
+                    "allocation",
+                    "download_write",
+                    &format!("imported payload inventory: {error}"),
+                );
+                self.save_snapshot();
+            }
+        }
+        if let Some(previous) = previous {
+            for file in previous.files {
+                self.writers.remove(&file.id);
+                self.file_sizes.remove(&file.id);
+                self.finalize_sent.remove(&file.id);
+            }
+        }
+        self.pending_finalize.retain(|(job, _)| *job != job_id);
+        self.attempts.retain(|reference, _| reference.job != job_id);
         self.delegated.remove(&job_id);
         self.mirror.remove(&job_id);
-        if fold_journals {
-            self.fold_job_journals(job_id);
+        self.file_sizes.extend(imported_file_sizes);
+        for file in imported_files {
+            self.after_file_change(job_id, file);
         }
         if let Some(files) = self.state.job(job_id).and_then(recovered_post_fetch_files) {
             self.post_fetch_files.insert(job_id, files);
@@ -3028,8 +3179,6 @@ impl Owner {
             self.post_fetch_files.remove(&job_id);
         }
         tracing::info!(job = job_id.0, %name, ?status, "job imported");
-        self.dirty = true;
-        let committed = !self.persist || self.save_snapshot();
         self.publish_now();
         if terminal && emit_finished {
             self.emit(Event::JobFinished {
@@ -3192,6 +3341,7 @@ impl Owner {
         }
 
         self.persist = true;
+        self.persistence_fenced = false;
 
         // Fold every job's journals (union across lease files).
         let ids: Vec<JobId> = self.state.jobs.iter().map(|j| j.id).collect();
@@ -4388,6 +4538,11 @@ impl Owner {
         let mut stopping = self.retiring_writers.remove(&job_id).unwrap_or_default();
         self.allocated_jobs.remove(&job_id);
         let job = self.state.jobs.remove(idx);
+        for receipt in &mut self.state.url_admission_receipts {
+            if receipt.job_id == job_id.0 {
+                receipt.outcome = "deleted".into();
+            }
+        }
         for f in &job.files {
             if let Some(writer) = self.writers.remove(&f.id) {
                 writer.stop.cancel();
@@ -5597,6 +5752,7 @@ impl Owner {
         );
         if matches!(error, nzbd_state::StateError::Corrupt(_)) {
             self.persist = false;
+            self.persistence_fenced = true;
         }
     }
 
@@ -5679,6 +5835,11 @@ fn refresh_url_admission_custody(
     receipt: &mut UrlAdmissionReceipt,
     inventory: &nzbd_state::artifacts::Inventory,
 ) -> bool {
+    // Consumer custody is terminal for this receipt. Retention of a separate
+    // processing source cannot reclaim the accepted publication.
+    if receipt.custody_state == "curator" {
+        return false;
+    }
     let Some((artifact_id, source_generation)) = receipt
         .source_artifact_id
         .as_deref()
