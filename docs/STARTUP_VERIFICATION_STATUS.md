@@ -1,7 +1,7 @@
 # Startup runtime recovery — implementation and merge status
 
 **Owner:** Codex (`codex/startup-runtime-recovery`) · **Updated:** 2026-11-01
-**State:** draft PR · **PR:** [#262](https://github.com/pjunod/runner/pull/262)
+**State:** implementation complete; independent review next · draft PR · **PR:** [#262](https://github.com/pjunod/runner/pull/262)
 **Base:** `368b500` (fresh remote clone; includes held-job recovery updates)
 
 Companion to [STARTUP_VERIFICATION_PLAN.md](STARTUP_VERIFICATION_PLAN.md)
@@ -10,8 +10,8 @@ Companion to [STARTUP_VERIFICATION_PLAN.md](STARTUP_VERIFICATION_PLAN.md)
 
 | Workstream | Owner | State | Remaining |
 |---|---|---|---|
-| Owner, provenance, verification and async persistence integration | Codex / Sol / Luna | Final integration | Finish callback wiring, formatting and static compile preparation |
-| Writer/recovery helper and PP/torrent admission call sites | Sol | Written, unvalidated | Finish explicit legacy publication repair and freeze candidate |
+| Owner, provenance, verification and async persistence integration | Codex / Sol / Luna | Written; compile checked | Independent review, then affected tests |
+| Writer/recovery helper and PP/torrent admission call sites | Sol | Written; compile checked | Independent review, then affected tests |
 | Persistent control availability and shutdown | Sol | Written, unvalidated | Independent review and final affected checks |
 | Deployment templates/operator docs; web/mobile 503 retention | Luna | Written, unvalidated | Integrate with final runtime interfaces |
 | Enrollment regressions and startup fast-lane wiring | Luna | Written, unvalidated | Run in the final affected lane after review |
@@ -21,9 +21,10 @@ Companion to [STARTUP_VERIFICATION_PLAN.md](STARTUP_VERIFICATION_PLAN.md)
 
 ## Validation policy
 
-No tests, builds, or adversarial implementation review have run. Per user
-instruction, finish integration first, then conduct one combined adversarial
-review. Run each affected fast-lane check once on the merge candidate; rerun
+No tests or adversarial implementation review have run. The integrated workspace
+passes `cargo check --workspace --all-targets --locked`; compile-only integration
+errors were corrected without executing tests. Formatting is applied. Conduct
+one combined adversarial review next. Run each affected fast-lane check once on the merge candidate; rerun
 failed checks only unless a later code change invalidates a passing result.
 Do not mark modules validated or the draft PR ready before that point.
 
@@ -41,6 +42,9 @@ Do not mark modules validated or the draft PR ready before that point.
   Periodic saves coalesce while a prior save is pending. Cluster workers
   checkpoint generations privately without replacing the shared queue or
   compacting foreign journals.
+- Explicit operator Retry safely stages corrupt legacy download-owned final
+  publications back to partial files after durable generation retirement;
+  current-proof integrity contradictions remain review holds.
 - Command revisions are separate from writer/job lifetime generations.
   Background I/O cannot erase newer operator intent or accepted range facts.
 - Protocol 1 metadata-only recovery requires recognized local filesystem
