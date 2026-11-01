@@ -326,6 +326,33 @@ pub(crate) enum QueueCommand {
     AdoptAuthority {
         reply: oneshot::Sender<Result<(), nzbd_state::StateError>>,
     },
+    BeginUrlAdmissionAdoption {
+        reply: oneshot::Sender<bool>,
+    },
+    AdoptUrlAdmissions {
+        rows: Vec<UrlAdmissionReceipt>,
+        reply: oneshot::Sender<bool>,
+    },
+    FinishUrlAdmissionAdoption {
+        reply: oneshot::Sender<bool>,
+    },
+    CheckDiscardUrlAdmission {
+        expected: Box<UrlAdmissionReceipt>,
+        reply: oneshot::Sender<bool>,
+    },
+    DiscardUrlAdmission {
+        expected: Box<UrlAdmissionReceipt>,
+        reply: oneshot::Sender<bool>,
+    },
+    AdoptReplicatedHighwater {
+        next_job_id: u32,
+        next_file_id: u32,
+        reply: oneshot::Sender<bool>,
+    },
+    SetConsumerInstanceId {
+        instance: String,
+        reply: oneshot::Sender<bool>,
+    },
     /// Replace the queue projection from replicated control. Local-only rows
     /// must not survive takeover or rollback after a failed quorum commit.
     AdoptReplicatedAuthority {
@@ -597,6 +624,9 @@ pub(crate) enum EngineMsg {
 
 pub(crate) struct Owner {
     state: QueueState,
+    admission_adoption: Option<HashSet<String>>,
+    authoritative_admissions: HashMap<String, String>,
+    consumer_instance_id: String,
     timing_cache: crate::lifecycle::TimingCache,
     attempts: HashMap<SegRef, SegmentAttempt>,
     blocked: HashMap<ServerId, Instant>,
@@ -1102,6 +1132,9 @@ impl Owner {
         let initial_disk_hold = tuning.min_free_disk_bytes > 0;
         Ok(Owner {
             state,
+            admission_adoption: None,
+            authoritative_admissions: HashMap::new(),
+            consumer_instance_id: artifacts.installation.clone(),
             attempts: HashMap::new(),
             blocked: HashMap::new(),
             writers: HashMap::new(),
@@ -1611,9 +1644,9 @@ impl Owner {
                             generation: url_admission_generation(
                                 id,
                                 token,
-                                &self.artifacts.installation,
+                                &self.consumer_instance_id,
                             ),
-                            runner_instance_id: self.artifacts.installation.clone(),
+                            runner_instance_id: self.consumer_instance_id.clone(),
                             terminal_outcome: None,
                             outcome: job_status_name(existing_job.status).into(),
                             failure_stage: None,
@@ -1707,12 +1740,8 @@ impl Owner {
                         request_token: token.clone(),
                         submission_sha256: fingerprint.clone(),
                         job_id: id.0,
-                        generation: url_admission_generation(
-                            id,
-                            token,
-                            &self.artifacts.installation,
-                        ),
-                        runner_instance_id: self.artifacts.installation.clone(),
+                        generation: url_admission_generation(id, token, &self.consumer_instance_id),
+                        runner_instance_id: self.consumer_instance_id.clone(),
                         terminal_outcome: None,
                         outcome: "fetching".into(),
                         failure_stage: None,
@@ -2634,6 +2663,77 @@ impl Owner {
                 self.publish_conn_budgets();
                 let _ = reply.send(applied);
             }
+            QueueCommand::BeginUrlAdmissionAdoption { reply } => {
+                let ok = !self.persistence_fenced;
+                if ok {
+                    self.admission_adoption = Some(HashSet::new());
+                }
+                let _ = reply.send(ok);
+            }
+            QueueCommand::AdoptUrlAdmissions { rows, reply } => {
+                let _ = reply.send(self.adopt_url_admissions(rows));
+            }
+            QueueCommand::FinishUrlAdmissionAdoption { reply } => {
+                let _ = reply.send(self.finish_url_admission_adoption());
+            }
+            QueueCommand::CheckDiscardUrlAdmission { expected, reply } => {
+                let _ = reply.send(self.can_discard_url_admission(&expected));
+            }
+            QueueCommand::DiscardUrlAdmission { expected, reply } => {
+                let ok = self.can_discard_url_admission(&expected);
+                let before = self.state.url_admission_receipts.clone();
+                let pending_before = self.state.pending_admissions.clone();
+                let mut removed_pending = false;
+                if ok {
+                    self.state
+                        .url_admission_receipts
+                        .retain(|row| row.request_token != expected.request_token);
+                    self.state.pending_admissions.retain(|pending| {
+                        let exact = pending.job_id.0 == expected.job_id
+                            && pending.params.iter().any(|(key, value)| {
+                                key == "monarr-transfer" && value == &expected.request_token
+                            });
+                        removed_pending |= exact;
+                        !exact
+                    });
+                }
+                let committed = ok && (!self.persist || self.save_snapshot());
+                if !committed {
+                    self.state.url_admission_receipts = before;
+                    self.state.pending_admissions = pending_before;
+                } else if removed_pending {
+                    // The exact pending descriptor can no longer be recovered
+                    // after its durable reservation has been removed.
+                    if let Err(error) = self.pending_sources.remove(JobId(expected.job_id)) {
+                        tracing::warn!(job = expected.job_id, %error, "unaccepted admission secret cleanup failed");
+                    }
+                }
+                let _ = reply.send(committed);
+            }
+            QueueCommand::AdoptReplicatedHighwater {
+                next_job_id,
+                next_file_id,
+                reply,
+            } => {
+                let before = (self.state.next_job_id, self.state.next_file_id);
+                self.state.next_job_id = self.state.next_job_id.max(next_job_id);
+                self.state.next_file_id = self.state.next_file_id.max(next_file_id);
+                let committed = !self.persistence_fenced && (!self.persist || self.save_snapshot());
+                if !committed {
+                    (self.state.next_job_id, self.state.next_file_id) = before;
+                }
+                let _ = reply.send(committed);
+            }
+            QueueCommand::SetConsumerInstanceId { instance, reply } => {
+                let ok = !self.persistence_fenced
+                    && !instance.is_empty()
+                    && instance.len() <= 128
+                    && !instance.chars().any(char::is_control);
+                if ok {
+                    self.consumer_instance_id = instance;
+                }
+                let _ = reply.send(ok);
+            }
             QueueCommand::AdoptAuthority { reply } => {
                 let result = self.adopt_authority();
                 let _ = reply.send(result);
@@ -2641,20 +2741,22 @@ impl Owner {
             QueueCommand::AdoptReplicatedAuthority { jobs, reply } => {
                 self.state.jobs = jobs;
                 self.state.pending_admissions.clear();
-                self.state.next_job_id = self
-                    .state
-                    .jobs
-                    .iter()
-                    .map(|job| job.id.0)
-                    .max()
-                    .unwrap_or(0);
-                self.state.next_file_id = self
-                    .state
-                    .jobs
-                    .iter()
-                    .flat_map(|job| job.files.iter().map(|file| file.id.0))
-                    .max()
-                    .unwrap_or(0);
+                self.state.next_job_id = self.state.next_job_id.max(
+                    self.state
+                        .jobs
+                        .iter()
+                        .map(|job| job.id.0)
+                        .max()
+                        .unwrap_or(0),
+                );
+                self.state.next_file_id = self.state.next_file_id.max(
+                    self.state
+                        .jobs
+                        .iter()
+                        .flat_map(|job| job.files.iter().map(|file| file.id.0))
+                        .max()
+                        .unwrap_or(0),
+                );
                 self.state.recompute_all_totals();
                 self.dirty = true;
                 self.save_snapshot();
@@ -3225,6 +3327,104 @@ impl Owner {
                 false
             }
         }
+    }
+
+    fn adopt_url_admissions(&mut self, rows: Vec<UrlAdmissionReceipt>) -> bool {
+        if self.persistence_fenced || !crate::admissions::valid_page(&rows) {
+            return false;
+        }
+        for row in &rows {
+            if self
+                .authoritative_admissions
+                .get(&row.request_token)
+                .is_some_and(|accepted| accepted != &crate::admissions::identity(row))
+            {
+                return false;
+            }
+            if self
+                .admission_adoption
+                .as_ref()
+                .is_some_and(|seen| seen.contains(&row.request_token))
+                && self.state.url_admission_receipts.iter().any(|current| {
+                    current.request_token == row.request_token
+                        && crate::admissions::identity(current) != crate::admissions::identity(row)
+                })
+            {
+                return false;
+            }
+        }
+        let before = self.state.url_admission_receipts.clone();
+        let next_id = self.state.next_job_id;
+        let accepted = self.authoritative_admissions.clone();
+        let seen = self.admission_adoption.clone();
+        for row in rows {
+            self.state.next_job_id = self.state.next_job_id.max(row.job_id);
+            if let Some(current) = self
+                .state
+                .url_admission_receipts
+                .iter_mut()
+                .find(|current| current.request_token == row.request_token)
+            {
+                *current = crate::admissions::merge_current(current, &row);
+            } else {
+                self.state.url_admission_receipts.push(row.clone());
+            }
+            self.authoritative_admissions
+                .insert(row.request_token.clone(), crate::admissions::identity(&row));
+            if let Some(seen) = self.admission_adoption.as_mut() {
+                seen.insert(row.request_token);
+            }
+        }
+        if self.persist && !self.save_snapshot() {
+            self.state.url_admission_receipts = before;
+            self.state.next_job_id = next_id;
+            self.authoritative_admissions = accepted;
+            self.admission_adoption = seen;
+            return false;
+        }
+        true
+    }
+    fn finish_url_admission_adoption(&mut self) -> bool {
+        if self.persistence_fenced {
+            return false;
+        }
+        let Some(seen) = self.admission_adoption.clone() else {
+            return false;
+        };
+        let before = self.state.url_admission_receipts.clone();
+        self.state
+            .url_admission_receipts
+            .retain(|row| seen.contains(&row.request_token));
+        if self.persist && !self.save_snapshot() {
+            self.state.url_admission_receipts = before;
+            return false;
+        }
+        self.authoritative_admissions
+            .retain(|token, _| seen.contains(token));
+        self.admission_adoption = None;
+        true
+    }
+    fn can_discard_url_admission(&self, expected: &UrlAdmissionReceipt) -> bool {
+        !self.persistence_fenced
+            && self.admission_adoption.is_none()
+            && !self
+                .authoritative_admissions
+                .contains_key(&expected.request_token)
+            && self.state.job(JobId(expected.job_id)).is_none_or(|job| {
+                !job.params.iter().any(|(key, value)| {
+                    key == "monarr-transfer" && value == &expected.request_token
+                })
+            })
+            && self
+                .state
+                .url_admission_receipts
+                .iter()
+                .find(|row| row.request_token == expected.request_token)
+                .is_none_or(|current| {
+                    crate::admissions::identity(current) == crate::admissions::identity(expected)
+                        && current.custody_state != "curator"
+                        && current.terminal_outcome.is_none()
+                })
     }
 
     fn finish_import_preparation(&mut self, job: JobId, applied: bool) {
@@ -9303,6 +9503,107 @@ mod tests {
         );
         assert_eq!(receipt.source_cleanup_status.as_deref(), Some("removed"));
         assert!(receipt.keep_source_on_failure);
+    }
+
+    fn catalog_receipt(token: &str, id: u32) -> UrlAdmissionReceipt {
+        serde_json::from_value(serde_json::json!({"protocolVersion":1,"requestToken":token,"submissionSha256":"catalog-fingerprint","jobId":id,"generation":format!("generation-{id}"),"runnerInstanceId":"cluster-consumer"})).unwrap()
+    }
+    #[tokio::test]
+    async fn catalog_adoption_replaces_only_unaccepted_identity_and_rolls_back_on_fence() {
+        let (temporary, mut owner, _adapter) = control_test_owner();
+        owner.state.url_admission_receipts =
+            vec![catalog_receipt("token", 4), catalog_receipt("orphan", 5)];
+        owner.admission_adoption = Some(HashSet::new());
+        let accepted = catalog_receipt("token", 8);
+        assert!(owner.adopt_url_admissions(vec![accepted.clone()]));
+        assert_eq!(
+            owner
+                .state
+                .url_admission_receipts
+                .iter()
+                .find(|row| row.request_token == "token")
+                .unwrap()
+                .job_id,
+            8
+        );
+        assert!(owner.finish_url_admission_adoption());
+        assert_eq!(owner.state.url_admission_receipts.len(), 1);
+        assert!(owner.state.next_job_id >= 8);
+        assert!(
+            !owner.adopt_url_admissions(vec![catalog_receipt("token", 9)]),
+            "accepted tuple cannot fork"
+        );
+        let before = serde_json::to_value(&owner.state.url_admission_receipts).unwrap();
+        owner.persist_guard = Some(Arc::new(|| false));
+        for _ in 0..2 {
+            assert!(!owner.adopt_url_admissions(vec![catalog_receipt("later", 99)]));
+            assert_eq!(
+                serde_json::to_value(&owner.state.url_admission_receipts).unwrap(),
+                before
+            );
+            assert!(owner.state.next_job_id < 99);
+        }
+        let persisted = SnapshotStore::open(&temporary.path().join("state"))
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(persisted.url_admission_receipts).unwrap(),
+            before
+        );
+    }
+    #[tokio::test]
+    async fn orphan_receipt_discard_never_restores_or_changes_an_authoritative_id_collision() {
+        let (_temporary, mut owner, _adapter) = control_test_owner();
+        let expected = catalog_receipt("unaccepted", 6);
+        owner.state.url_admission_receipts.push(expected.clone());
+        let mut occupied = pending_job(6);
+        occupied.params.push((
+            "monarr-transfer".into(),
+            "different-accepted-request".into(),
+        ));
+        occupied.priority = 88;
+        owner.state.jobs.push(occupied.clone());
+        owner.state.next_job_id = 90;
+        // A metadata reservation for the orphan must disappear with its
+        // receipt, without removing a different reservation at the same ID.
+        let pending_id = owner.state.reserve_torrent_admission(
+            nzbd_types::TorrentSource::Metainfo,
+            AddOpts {
+                params: vec![("monarr-transfer".into(), "unaccepted".into())],
+                ..Default::default()
+            },
+        );
+        owner.state.pending_admissions.last_mut().unwrap().job_id = JobId(6);
+        owner
+            .pending_sources
+            .write(JobId(6), b"orphan descriptor")
+            .unwrap();
+        owner.state.next_job_id = 90;
+        assert!(pending_id.0 > 90);
+        // Snapshot bookkeeping can observe an existing job; establish that
+        // observation before checking that discard preserves its contents.
+        owner.sync_lifecycle_timings();
+        occupied = owner.state.job(JobId(6)).unwrap().clone();
+        assert!(owner.can_discard_url_admission(&expected));
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::DiscardUrlAdmission {
+            expected: Box::new(expected),
+            reply,
+        });
+        assert!(result.await.unwrap());
+        assert!(owner.state.url_admission_receipts.is_empty());
+        assert!(owner.state.pending_admissions.is_empty());
+        assert!(owner.pending_sources.read(JobId(6)).is_err());
+        assert_eq!(
+            serde_json::to_value(owner.state.job(JobId(6)).unwrap()).unwrap(),
+            serde_json::to_value(occupied).unwrap()
+        );
+        assert_eq!(owner.state.next_job_id, 90);
+        let accepted = catalog_receipt("accepted", 6);
+        assert!(owner.adopt_url_admissions(vec![accepted.clone()]));
+        assert!(!owner.can_discard_url_admission(&accepted));
     }
 
     #[tokio::test]

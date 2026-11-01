@@ -11,6 +11,7 @@
 //!
 //! Public surface: [`Engine::spawn`] → [`EngineHandle`].
 
+mod admissions;
 pub mod backend;
 pub mod events;
 pub mod failover;

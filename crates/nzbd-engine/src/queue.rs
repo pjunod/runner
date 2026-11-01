@@ -1683,8 +1683,9 @@ mod tests {
             .push(("Delivery:SourceGeneration".into(), "new-source-gen".into()));
         state.sync_url_admission_receipts();
         let receipt = &state.url_admission_receipts[0];
-        assert_eq!(receipt.source_artifact_id.as_deref(), Some("new-source"));
-        assert_eq!(receipt.source_generation.as_deref(), Some("new-source-gen"));
+        assert_eq!(receipt.source_artifact_id.as_deref(), Some("pinned-source"));
+        assert_eq!(receipt.source_generation.as_deref(), Some("pinned-gen"));
+        assert_eq!(receipt.custody_state, "curator");
         assert!(
             !receipt.keep_source_on_failure,
             "a historical queue param cannot overwrite the pinned source preference"
