@@ -26,14 +26,14 @@ outside compiler caches in the task's durable evidence directory.
 
 | Slice | State | Evidence |
 |---|---|---|
-| Runner publication retries, resource holds, custody, Keep and durable queue mutations | Core checkpoints integrated; URL and broader timing still active | State 3f47dce, d70609c9, 2ecfc5c and ce4cdd3 integrated; focused failure/race and actual writer recovery regressions pass |
+| Runner publication retries, resource holds, custody, Keep and durable queue mutations | Core and URL checkpoints integrated; journal preparation and broader timing still active | State through8ad43dc integrated; focused custody/retry, actual writer recovery, cached URL restart and storage-retry regressions pass |
 | Runner real partial repair, native books, safe sidecars and classification | Integrated; focused regressions pass | POST a2aa622 and bf4c21ca; integration 78555830 and 8727681a |
 | Curator discovery, atomic import ledger, replacement ownership and manual intent | Core and follow-up integrated; focused service fault tests pass | Curator 2665a8b and 21a9bec |
 | Curator upgrade distinction, stale batches, storage explanation and reviewed acceptance | Committed; focused migration/service/storage tests pass | Curator 2665a8b, 21a9bec and 176fd58; desktop/iPhone action and geometry regressions pass |
-| Cluster durable Delivery, copy retirement, URL replay and RPC bounds | RPC bounds and exact local copy helper integrated; Delivery/copy implementation active | Runner 2e36b491 and bf539031; actual authority-change and complete-copy-drain evidence pending |
+| Cluster durable Delivery, copy retirement, URL replay and RPC bounds | Durable receipt/copy cleanup and failover checkpoints integrated; partial recovery and worker regrant remain active | Runner0ae1fb85/a70b552; actual three-node source drain, different-authority receipt survival and WAL upgrade regressions pass |
 | Native torrent independent publication and seeding custody | Pending | None yet |
 | Joined timing, usable controls and desktop/mobile acceptance | Curator timing and phone workflows committed; Runner controls integrated, major-stage capture active | Curator9b091fd/f23a76c/f0b4510; Runner current-source controls33db58ca/2f6021c8/94bc3648; focused UI checks pass |
-| Real Runner–Curator/cluster/torrent integration evidence | Pending | None yet |
+| Real Runner–Curator/cluster/torrent integration evidence | Focused paired Usenet and cluster cases pass; final candidate and torrent pending | Runner978bfb3e + Curatorc24ad27 actual NNTP/import/permission failure/restart/retry; final physical-drain assertions being strengthened |
 | Primary integration review | Active | Review found retry scheduling CAS, intact partial dependency, probe routing and discovery bounds gaps; fixes underway |
 | Final Astra review | Pending | None yet |
 | Full tests, coverage and required CI | Pending | None yet |
