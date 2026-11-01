@@ -21,6 +21,86 @@ pub struct WorkerControlCheckpoint {
     pub source: SourceGeneration,
     pub control: nzbd_types::JobControl,
     pub probe_params: Vec<(String, String)>,
+    #[serde(default)]
+    delegated_source: Option<DelegatedWorkerSource>,
+}
+
+/// Remote custody identifies the source; local identity only authorizes
+/// resuming this observed shadow. It never grants deletion ownership.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct DelegatedAuthoritySource {
+    owner_node: String,
+    copy: ClusterArtifactCopy,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DelegatedWorkerSource {
+    authority: DelegatedAuthoritySource,
+    root: PathBuf,
+    path: PathBuf,
+    root_identity: Identity,
+    identity: Identity,
+}
+impl DelegatedAuthoritySource {
+    fn for_job(job: &nzbd_types::Job) -> Option<Self> {
+        let mut values = job
+            .params
+            .iter()
+            .filter(|(key, _)| key == "*Cluster:AuthoritySourceCopy");
+        let (_, raw) = values.next()?;
+        if values.next().is_some() || raw.len() > 4096 {
+            return None;
+        }
+        let source: Self = serde_json::from_str(raw).ok()?;
+        let bounded = |value: &str| {
+            !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+        };
+        (bounded(&source.owner_node)
+            && bounded(&source.copy.storage_instance_id)
+            && bounded(&source.copy.source.artifact)
+            && bounded(&source.copy.source.generation)
+            && source.copy.job_id == job.id.0
+            && !source.copy.selected
+            && source.copy.source == source.copy.publication)
+            .then_some(source)
+    }
+}
+impl DelegatedWorkerSource {
+    fn capture(job: &nzbd_types::Job, source: &Artifact) -> Option<Self> {
+        let relative = Path::new(&job.dir_name);
+        if relative.components().count() != 1
+            || !matches!(
+                relative.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+            || source.path != source.root.join(relative)
+            || source.job != Some(job.id.0)
+            || source.owned
+        {
+            return None;
+        }
+        Some(Self {
+            authority: DelegatedAuthoritySource::for_job(job)?,
+            root: source.root.clone(),
+            path: source.path.clone(),
+            root_identity: source.root_identity.clone(),
+            identity: source.identity.clone()?,
+        })
+    }
+    fn matches_source(&self, source: &Artifact) -> bool {
+        !source.owned
+            && source.root == self.root
+            && source.path == self.path
+            && self.root_identity.same_object(&source.root_identity)
+            && source
+                .identity
+                .as_ref()
+                .is_some_and(|identity| self.identity.same_object(identity))
+    }
+    fn matches_grant(&self, job: &nzbd_types::Job, source: &Artifact) -> bool {
+        Self::capture(job, source).is_some_and(|current| {
+            current.authority == self.authority && self.matches_source(source)
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -69,6 +149,16 @@ impl WorkerControlContext {
 }
 
 impl Inventory {
+    /// Off-actor physical identity check before resuming download writes.
+    /// Unowned legacy/delegated sources remain unowned after this check.
+    pub fn validate_download_retry(&self, job: u32) -> Result<()> {
+        let source = self.for_job(job)?.ok_or(Error::NotFound)?;
+        if source.terminal() {
+            return Err(Error::Conflict("download source is terminal".into()));
+        }
+        self.verify(&source).map(|_| ())
+    }
+
     /// Persist selected-publication/terminal evidence before a volatile worker
     /// queue stamp. Call on a blocking preparation thread; descriptors are bulk.
     pub fn checkpoint_worker_completion(&self, job: &nzbd_types::Job) -> Result<()> {
@@ -296,6 +386,35 @@ impl Inventory {
         job: u32,
         context: &WorkerControlContext,
     ) -> Result<Option<WorkerRetryAdoption>> {
+        self.adopt_worker_retry_inner(job, context, None)
+    }
+
+    /// A validated new grant may resume an exact delegated Download shadow.
+    /// The original owned-only API deliberately cannot adopt unowned bytes.
+    pub fn adopt_worker_retry_for_job(
+        &self,
+        job: &nzbd_types::Job,
+        context: &WorkerControlContext,
+    ) -> Result<Option<WorkerRetryAdoption>> {
+        if DelegatedAuthoritySource::for_job(job).is_none() {
+            return Err(Error::Conflict(
+                "Download retry adoption requires exact authority source provenance".into(),
+            ));
+        }
+        if WorkerControlContext::for_job(job).as_ref() != Some(context) {
+            return Err(Error::Conflict(
+                "incoming worker grant context differs from adoption authority".into(),
+            ));
+        }
+        self.adopt_worker_retry_inner(job.id.0, context, Some(job))
+    }
+
+    fn adopt_worker_retry_inner(
+        &self,
+        job: u32,
+        context: &WorkerControlContext,
+        grant: Option<&nzbd_types::Job>,
+    ) -> Result<Option<WorkerRetryAdoption>> {
         let _guard = self.mutation_guard()?;
         let completion: Option<String> = self
             .db
@@ -307,7 +426,7 @@ impl Inventory {
                 |row| row.get(0),
             )
             .optional()?;
-        if let Some(raw) = completion {
+        if let Some(raw) = completion.filter(|_| grant.is_none()) {
             let mut checkpoint: WorkerCompletionCheckpoint = serde_json::from_str(&raw)?;
             let old = &checkpoint.context;
             if old.job_incarnation == context.job_incarnation
@@ -446,8 +565,23 @@ impl Inventory {
             return Ok(None);
         }
         let source = self.get(&checkpoint.source.artifact)?;
+        let delegated = checkpoint
+            .delegated_source
+            .as_ref()
+            .is_some_and(|delegated| {
+                grant.is_some_and(|job| delegated.matches_grant(job, &source))
+            });
+        let owned_grant = grant.is_none_or(|job| {
+            DelegatedAuthoritySource::for_job(job).is_some_and(|authority| {
+                source.path == source.root.join(&job.dir_name)
+                    && authority.copy.storage_instance_id == self.installation
+                    && authority.copy.source.artifact == source.id
+                    && authority.copy.source.generation == source.generation
+            })
+        });
         if source.generation != checkpoint.source.generation
-            || !source.owned
+            || (source.owned && !owned_grant)
+            || (!source.owned && !delegated)
             || source.terminal()
             || source.job != Some(job)
             || self.artifact_in_use(&source)?
@@ -524,12 +658,19 @@ impl Inventory {
         let context = WorkerControlContext::for_job(job)
             .ok_or_else(|| Error::Conflict("worker control has no lease authority".into()))?;
         let source = self.for_job(job.id.0)?.ok_or(Error::NotFound)?;
-        if !source.owned || source.terminal() {
+        let delegated_source = if source.owned {
+            None
+        } else {
+            DelegatedWorkerSource::capture(job, &source)
+        };
+        if source.terminal() || (!source.owned && delegated_source.is_none()) {
             return Err(Error::Conflict(
-                "worker control requires an owned source generation".into(),
+                "worker control requires owned or exactly delegated source custody".into(),
             ));
         }
-        self.verify(&source)?;
+        // This is a bounded durable intent commit, including while the mount
+        // is unavailable. Physical identity is checked off-actor before a
+        // release; no checkpoint can upgrade source ownership.
         let control = job
             .control()
             .ok_or_else(|| Error::Conflict("worker control missing".into()))?;
@@ -559,7 +700,12 @@ impl Inventory {
             if previous.context == context
                 && previous.source == source_generation
                 && (previous.control.instance != control.instance
-                    || previous.control.revision != expected_revision)
+                    || previous.control.revision != expected_revision
+                    || previous
+                        .delegated_source
+                        .as_ref()
+                        .map(|source| &source.authority)
+                        != delegated_source.as_ref().map(|source| &source.authority))
             {
                 return Err(Error::Conflict("worker control revision changed".into()));
             }
@@ -568,6 +714,7 @@ impl Inventory {
             context,
             source: source_generation,
             control,
+            delegated_source,
             probe_params: job
                 .params
                 .iter()
@@ -583,6 +730,42 @@ impl Inventory {
     }
 
     pub fn worker_control(
+        &self,
+        job: u32,
+        context: &WorkerControlContext,
+    ) -> Result<Option<WorkerControlCheckpoint>> {
+        let checkpoint = self.worker_control_metadata(job, context)?;
+        if checkpoint.is_some() {
+            let source = self.for_job(job)?.ok_or(Error::NotFound)?;
+            self.verify(&source)?;
+        }
+        Ok(checkpoint)
+    }
+
+    /// Match the current validated grant as well as its local checkpoint.
+    pub fn worker_control_for_job_metadata(
+        &self,
+        job: &nzbd_types::Job,
+        context: &WorkerControlContext,
+    ) -> Result<Option<WorkerControlCheckpoint>> {
+        let checkpoint = self.worker_control_metadata(job.id.0, context)?;
+        if let Some(delegated) = checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.delegated_source.as_ref())
+        {
+            let source = self.for_job(job.id.0)?.ok_or(Error::NotFound)?;
+            if !delegated.matches_grant(job, &source) {
+                return Err(Error::Conflict(
+                    "delegated source differs from current worker grant".into(),
+                ));
+            }
+        }
+        Ok(checkpoint)
+    }
+
+    /// Database-only exact checkpoint lookup for the owner actor. Mount
+    /// identity checks belong to the off-actor preparation/probe lane.
+    pub fn worker_control_metadata(
         &self,
         job: u32,
         context: &WorkerControlContext,
@@ -628,12 +811,15 @@ impl Inventory {
         };
         if source.id != checkpoint.source.artifact
             || source.generation != checkpoint.source.generation
-            || !source.owned
+            || (!source.owned
+                && !checkpoint
+                    .delegated_source
+                    .as_ref()
+                    .is_some_and(|delegated| delegated.matches_source(&source)))
             || source.terminal()
         {
             return Ok(None);
         }
-        self.verify(&source)?;
         Ok(Some(checkpoint))
     }
 }
@@ -641,6 +827,148 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delegated_download_checkpoint_regrant_preserves_hold_without_ownership() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = temporary.path().join("state");
+        let root = temporary.path().join("shared");
+        let path = root.join("source");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("payload.part"), b"shared raw bytes").unwrap();
+        let inventory = Inventory::open(&state).unwrap();
+        inventory.register_legacy_active(42, &root, &path).unwrap();
+        let source = inventory.for_job(42).unwrap().unwrap();
+        assert!(!source.owned);
+        let context = WorkerControlContext {
+            lease_id: "first".into(),
+            job_incarnation: "download-42".into(),
+            job_revision: 4,
+            control_revision: 2,
+            epoch: 1,
+        };
+        let mut job = nzbd_types::Job {
+            id: nzbd_types::JobId(42),
+            kind: nzbd_types::JobKind::Nzb,
+            name: "publication".into(),
+            dir_name: "source".into(),
+            name_provisional: false,
+            delivery_lifecycle: true,
+            queued_at_unix: 1,
+            original_name: String::new(),
+            category: None,
+            priority: 0,
+            dupe: Default::default(),
+            params: vec![
+                (
+                    WORKER_CONTROL_CONTEXT_PARAM.into(),
+                    serde_json::to_string(&context).unwrap(),
+                ),
+                ("*PP:selected-publication-outcome".into(), "SUCCESS".into()),
+            ],
+            files: Vec::new(),
+            totals: Default::default(),
+            status: nzbd_types::JobStatus::PostQueued,
+            torrent: None,
+            stages: Vec::new(),
+        };
+        let control = nzbd_types::JobControl {
+            version: 1,
+            revision: "2".into(),
+            lifecycle: "held".into(),
+            cause: "capacity".into(),
+            stage: "move".into(),
+            retry_policy: "scheduled_retry".into(),
+            message: "retry in 300 seconds".into(),
+            instance: "attempt-42".into(),
+            previous_status: Some(nzbd_types::JobStatus::PostQueued),
+            manual_pause: false,
+            retry_attempt: 9,
+            next_retry_at_unix: Some(999999),
+            blocked_since_unix: Some(123),
+            released_at_unix: None,
+        };
+        job.status = nzbd_types::JobStatus::Downloading;
+        job.params
+            .retain(|(key, _)| key != "*PP:selected-publication-outcome");
+        let authority = serde_json::json!({"owner_node":"authority-a","copy":{"storageInstanceId":"owner-storage","publication":{"artifact":"remote-raw","generation":"remote-generation"},"source":{"artifact":"remote-raw","generation":"remote-generation"},"jobId":42,"selected":false}});
+        job.params
+            .push(("*Cluster:AuthoritySourceCopy".into(), authority.to_string()));
+        let mut control = control;
+        control.previous_status = Some(nzbd_types::JobStatus::Downloading);
+        control.stage = "download_write".into();
+        job.set_control(&control);
+        inventory.bind_worker_context(42, &context).unwrap();
+        inventory.checkpoint_worker_control(&job, "1").unwrap();
+        drop(inventory);
+        let inventory = Inventory::open(&state).unwrap();
+        assert!(inventory.worker_control(42, &context).unwrap().is_some());
+        let mut next = context.clone();
+        next.epoch = 2;
+        next.lease_id = "second".into();
+        assert!(inventory.adopt_worker_retry(42, &next).unwrap().is_none());
+        job.params
+            .retain(|(key, _)| key != WORKER_CONTROL_CONTEXT_PARAM);
+        job.params.push((
+            WORKER_CONTROL_CONTEXT_PARAM.into(),
+            serde_json::to_string(&next).unwrap(),
+        ));
+        let mut wrong = job.clone();
+        wrong
+            .params
+            .retain(|(key, _)| key != "*Cluster:AuthoritySourceCopy");
+        let mut changed = authority.clone();
+        changed["owner_node"] = "authority-other".into();
+        wrong
+            .params
+            .push(("*Cluster:AuthoritySourceCopy".into(), changed.to_string()));
+        assert!(inventory
+            .adopt_worker_retry_for_job(&wrong, &next)
+            .unwrap()
+            .is_none());
+        let mut changed_intent = next.clone();
+        changed_intent.control_revision += 1;
+        let mut changed_job = job.clone();
+        changed_job
+            .params
+            .retain(|(key, _)| key != WORKER_CONTROL_CONTEXT_PARAM);
+        changed_job.params.push((
+            WORKER_CONTROL_CONTEXT_PARAM.into(),
+            serde_json::to_string(&changed_intent).unwrap(),
+        ));
+        assert!(inventory
+            .adopt_worker_retry_for_job(&changed_job, &changed_intent)
+            .unwrap()
+            .is_none());
+        let adopted = inventory
+            .adopt_worker_retry_for_job(&job, &next)
+            .unwrap()
+            .unwrap();
+        assert_eq!(adopted.control.next_retry_at_unix, Some(999999));
+        assert_eq!(adopted.control.retry_attempt, 9);
+        assert!(!adopted.source.owned);
+        assert_eq!(adopted.source.id, source.id);
+        assert!(inventory
+            .request_delete(&source.id, source.revision, "not-owner", 0)
+            .is_err());
+        assert_eq!(
+            std::fs::read(path.join("payload.part")).unwrap(),
+            b"shared raw bytes"
+        );
+        // A replaced observed namespace cannot be rebound merely because the
+        // remote custody tuple and leader revision still match.
+        std::fs::rename(&path, root.join("old-source")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        next.epoch = 3;
+        next.lease_id = "third".into();
+        job.params
+            .retain(|(key, _)| key != WORKER_CONTROL_CONTEXT_PARAM);
+        job.params.push((
+            WORKER_CONTROL_CONTEXT_PARAM.into(),
+            serde_json::to_string(&next).unwrap(),
+        ));
+        assert!(inventory.adopt_worker_retry_for_job(&job, &next).is_err());
+    }
+
     #[test]
     fn selected_publication_adoption_keeps_newer_retry_and_compacts_on_acceptance() {
         let temporary = tempfile::tempdir().unwrap();

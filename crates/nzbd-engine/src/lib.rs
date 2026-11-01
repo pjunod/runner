@@ -17,6 +17,7 @@ pub mod events;
 pub mod failover;
 pub mod fetch;
 mod hold_recovery;
+mod hold_release;
 pub mod queue;
 pub mod rate;
 pub mod snapshot;
@@ -1365,6 +1366,32 @@ impl EngineHandle {
         revision: String,
         by: RetryBy,
     ) -> Result<Result<(), String>, EngineError> {
+        self.release_hold_prepared(job, revision, by, None).await
+    }
+
+    /// A leased execution lane must prove that the exact grant remains live
+    /// before touching its source and again at the owner commit.
+    pub async fn release_hold_checked(
+        &self,
+        job: JobId,
+        revision: String,
+        by: RetryBy,
+        authority: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Result<(), String>, EngineError> {
+        self.release_hold_prepared(job, revision, by, Some(authority))
+            .await
+    }
+
+    async fn release_hold_prepared(
+        &self,
+        job: JobId,
+        revision: String,
+        by: RetryBy,
+        authority: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> Result<Result<(), String>, EngineError> {
+        if authority.as_ref().is_some_and(|check| !check()) {
+            return Ok(Err("the worker grant is no longer live".into()));
+        }
         let Some(record) = self.export_job(job).await? else {
             return Ok(Err("job not found".into()));
         };
@@ -1376,6 +1403,15 @@ impl EngineHandle {
                 "the hold changed since it was read; reload and retry".into()
             ));
         };
+        let source = self
+            .artifacts()
+            .for_job(job.0)
+            .map_err(|error| EngineError::Lifecycle(error.to_string()))?;
+        let mut guard =
+            hold_release::HoldReleaseGuard::prepare(&record, source.as_ref(), authority);
+        if !self.snapshot().queue_authority && !guard.matches(&self.artifacts(), &record, false) {
+            return Ok(Err("a live execution grant is required on this node".into()));
+        }
         let cause = control.hold_cause();
         if cause == nzbd_types::HoldCause::Allocation {
             // Allocation may have no owned payload yet: no capacity probe,
@@ -1385,6 +1421,7 @@ impl EngineHandle {
                     job,
                     revision,
                     by,
+                    guard,
                     reply,
                 })
                 .await?
@@ -1395,16 +1432,31 @@ impl EngineHandle {
             if by == RetryBy::Recovery && self.snapshot().disk_low {
                 return Ok(Err("waiting for free space".into()));
             }
-            return self.release_capacity_hold(&record, revision, by).await;
+            return self
+                .release_capacity_hold(&record, revision, by, guard)
+                .await;
         }
         let custody_checked = if control.post_side() {
             let inventory = self.artifacts();
+            let probe_guard = guard.clone();
             match bounded_probe(self.hold_probes.clone(), job, move || {
-                inventory.validate_post_retry(job.0)
+                if !probe_guard.live() {
+                    return Err(nzbd_state::artifacts::Error::Conflict(
+                        "worker grant expired before custody probe".into(),
+                    ));
+                }
+                inventory.prepare_post_retry(job.0)
             })
             .await
             {
-                Ok(Ok(())) => true,
+                Ok(Ok(source)) => {
+                    guard = hold_release::HoldReleaseGuard::prepare(
+                        &record,
+                        Some(&source),
+                        guard.authority_callback(),
+                    );
+                    true
+                }
                 Ok(Err(e)) => return Ok(Err(format!("post-processing retry refused: {e}"))),
                 Err(why) => return Ok(Err(format!("custody check {why}"))),
             }
@@ -1417,6 +1469,7 @@ impl EngineHandle {
             revision,
             by,
             custody_checked,
+            guard,
             reply: tx,
         })
         .await?;
@@ -1430,6 +1483,7 @@ impl EngineHandle {
         record: &Job,
         revision: String,
         by: RetryBy,
+        guard: hold_release::HoldReleaseGuard,
     ) -> Result<Result<(), String>, EngineError> {
         let job = record.id;
         if !self
@@ -1437,6 +1491,7 @@ impl EngineHandle {
                 job,
                 revision: revision.clone(),
                 by,
+                guard: guard.clone(),
                 reply,
             })
             .await?
@@ -1463,7 +1518,17 @@ impl EngineHandle {
             .sum();
         let token = format!("{}-{}", job.0, revision);
         // Admission and a write/flush probe must pass before writes resume.
+        let inventory = self.artifacts();
+        let probe_guard = guard.clone();
         let health = bounded_probe(self.hold_probes.clone(), job, move || {
+            if !probe_guard.live() {
+                return Err(std::io::Error::other(
+                    "worker grant expired before storage probe",
+                ));
+            }
+            inventory
+                .validate_download_retry(job.0)
+                .map_err(std::io::Error::other)?;
             nzbd_state::capacity::health(&path, bytes, &token)
         })
         .await;
@@ -1477,6 +1542,7 @@ impl EngineHandle {
                 job,
                 revision,
                 by,
+                guard,
                 reply,
             })
             .await?

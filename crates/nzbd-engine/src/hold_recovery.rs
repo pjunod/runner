@@ -61,6 +61,7 @@ pub(crate) async fn pass(
     let eligible = snapshot
         .jobs
         .iter()
+        .filter(|job| job.assigned_node.is_none())
         .filter(|job| job.kind != JobKind::Torrent)
         .filter_map(|job| {
             let control = job

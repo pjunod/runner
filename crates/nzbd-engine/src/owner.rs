@@ -393,12 +393,14 @@ pub(crate) enum QueueCommand {
         job: JobId,
         revision: String,
         by: RetryBy,
+        guard: crate::hold_release::HoldReleaseGuard,
         reply: oneshot::Sender<bool>,
     },
     ReleaseResourceHold {
         job: JobId,
         revision: String,
         by: RetryBy,
+        guard: crate::hold_release::HoldReleaseGuard,
         reply: oneshot::Sender<bool>,
     },
     /// End a non-storage hold (`Owner::retry_hold`); the error says why not.
@@ -408,6 +410,7 @@ pub(crate) enum QueueCommand {
         job: JobId,
         revision: String,
         by: RetryBy,
+        guard: crate::hold_release::HoldReleaseGuard,
         custody_checked: bool,
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -2829,10 +2832,12 @@ impl Owner {
                 job,
                 revision,
                 by,
+                guard,
                 custody_checked,
                 reply,
             } => {
-                let _ = reply.send(self.retry_hold(job, &revision, by, custody_checked));
+                let _ =
+                    reply.send(self.retry_hold_proven(job, &revision, by, custody_checked, &guard));
             }
             QueueCommand::RescheduleHold {
                 job,
@@ -2901,9 +2906,14 @@ impl Owner {
                 job,
                 revision,
                 by,
+                guard,
                 reply,
             } => {
-                if self.persistence_fenced {
+                if self.persistence_fenced
+                    || !self.state.job(job).is_some_and(|current| {
+                        guard.matches(&self.artifacts, current, self.persist)
+                    })
+                {
                     let _ = reply.send(false);
                     return;
                 }
@@ -2972,9 +2982,14 @@ impl Owner {
                 job,
                 revision,
                 by,
+                guard,
                 reply,
             } => {
-                if self.persistence_fenced {
+                if self.persistence_fenced
+                    || !self.state.job(job).is_some_and(|current| {
+                        guard.matches(&self.artifacts, current, self.persist)
+                    })
+                {
                     let _ = reply.send(false);
                     return;
                 }
@@ -3541,7 +3556,10 @@ impl Owner {
                     tracing::warn!(job=job.id.0, %error, "worker grant binding refused");
                     return false;
                 }
-                match self.artifacts.worker_control(job.id.0, context) {
+                match self
+                    .artifacts
+                    .worker_control_for_job_metadata(&job, context)
+                {
                     Ok(Some(checkpoint)) => {
                         worker_control_restored = true;
                         job.set_control(&checkpoint.control);
@@ -4403,12 +4421,24 @@ impl Owner {
     /// `PostQueued`, which the post scan claims through its own guards and
     /// runs from the beginning. Storage causes release through
     /// `ReleaseResourceHold` after their capacity probe instead.
+    #[cfg(test)]
     pub(crate) fn retry_hold(
         &mut self,
         job: JobId,
         revision: &str,
         by: RetryBy,
         custody_checked: bool,
+    ) -> Result<(), String> {
+        self.retry_hold_proven(job, revision, by, custody_checked, &Default::default())
+    }
+
+    fn retry_hold_proven(
+        &mut self,
+        job: JobId,
+        revision: &str,
+        by: RetryBy,
+        custody_checked: bool,
+        guard: &crate::hold_release::HoldReleaseGuard,
     ) -> Result<(), String> {
         if self.persistence_fenced {
             return Err("durable queue ownership is fenced".into());
@@ -4418,23 +4448,11 @@ impl Owner {
             .job(job)
             .cloned()
             .ok_or_else(|| "job not found".to_string())?;
-        if by == RetryBy::Recovery && !self.persist {
-            let authorized = nzbd_state::artifacts::WorkerControlContext::for_job(&before)
-                .and_then(|context| {
-                    self.artifacts
-                        .worker_control(job.0, &context)
-                        .ok()
-                        .flatten()
-                })
-                .is_some_and(|checkpoint| {
-                    before.control().is_some_and(|control| {
-                        checkpoint.control.instance == control.instance
-                            && checkpoint.control.revision == control.revision
-                    })
-                });
-            if !authorized {
-                return Err("this node is not the queue authority".into());
-            }
+        if !self.persist && !guard.checked() {
+            return Err("this node is not the queue authority".into());
+        }
+        if !guard.matches(&self.artifacts, &before, self.persist) {
+            return Err("the source, control authority or live worker grant changed".into());
         }
         let mut control = before
             .control()
@@ -8654,6 +8672,7 @@ mod tests {
             by: RetryBy::Operator,
             job: JobId(1),
             revision: revision.clone(),
+            guard: Default::default(),
             reply,
         });
         assert!(rx.await.unwrap());
@@ -8666,6 +8685,7 @@ mod tests {
             by: RetryBy::Operator,
             job: JobId(1),
             revision,
+            guard: Default::default(),
             reply,
         });
         assert!(!rx.await.unwrap(), "stale release must be rejected");
@@ -8677,6 +8697,7 @@ mod tests {
             by: RetryBy::Operator,
             job: JobId(1),
             revision: owner.state.jobs[0].control().unwrap().revision,
+            guard: Default::default(),
             reply,
         });
         assert!(rx.await.unwrap());
@@ -8948,6 +8969,7 @@ mod tests {
                         by: RetryBy::Operator,
                         job: JobId(1),
                         revision: control.revision,
+                        guard: Default::default(),
                         reply,
                     });
                     assert!(rx.await.unwrap(), "{cause} post={post} has no exit");
@@ -9098,6 +9120,7 @@ mod tests {
                 job: JobId(1),
                 revision: c.revision.clone(),
                 by,
+                guard: Default::default(),
                 reply,
             });
             assert_eq!(rx.await.unwrap(), expected, "{by:?}");
@@ -9107,6 +9130,7 @@ mod tests {
             job: JobId(1),
             revision: c.revision.clone(),
             by: RetryBy::Operator,
+            guard: Default::default(),
             reply,
         });
         assert!(rx.await.unwrap());
@@ -9634,7 +9658,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        for id in 101..121 {
+        for id in 101..122 {
             let mut row = pending_job(id);
             mark_new_lifecycle_cohort(&mut row);
             row.status = JobStatus::Paused;
@@ -9657,16 +9681,37 @@ mod tests {
             });
             engine.import_job(row, false, false).await.unwrap();
         }
+        assert!(engine
+            .set_delegated(JobId(121), Some("lease-worker".into()))
+            .await
+            .unwrap());
         for expected in [8, 8, 4] {
             assert_eq!(
                 crate::hold_recovery::pass(&engine, false).await.unwrap(),
                 expected
             );
         }
-        assert!(engine.snapshot().jobs.iter().all(|row| row
-            .control
-            .as_ref()
-            .is_none_or(|control| control.lifecycle != "held")));
+        assert!(engine
+            .snapshot()
+            .jobs
+            .iter()
+            .filter(|row| row.id != JobId(121))
+            .all(|row| row
+                .control
+                .as_ref()
+                .is_none_or(|control| control.lifecycle != "held")));
+        assert_eq!(
+            engine
+                .export_job(JobId(121))
+                .await
+                .unwrap()
+                .unwrap()
+                .control()
+                .unwrap()
+                .lifecycle,
+            "held",
+            "delegated holds belong to the live execution lane"
+        );
         engine.shutdown().await;
     }
 
@@ -10214,6 +10259,211 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checked_release_public_api_refuses_expiry_after_custody_probe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("working");
+        let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
+            Vec::new(),
+            temporary.path().join("state"),
+            destination.clone(),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let mut row = pending_job(94);
+        row.status = JobStatus::PostQueued;
+        mark_new_lifecycle_cohort(&mut row);
+        let path = destination.join(&row.dir_name);
+        let inventory = engine.artifacts();
+        inventory
+            .allocate_for_delivery(94, &destination, &path, true, true)
+            .unwrap();
+        std::fs::write(path.join("payload.bin"), b"retained processing source").unwrap();
+        inventory.finish(94, &path, &destination, "active").unwrap();
+        engine.import_job(row, false, false).await.unwrap();
+        engine
+            .hold_job(
+                JobId(94),
+                nzbd_types::HoldCause::MissingTool,
+                "unpack",
+                "7z unavailable",
+            )
+            .await
+            .unwrap();
+        let revision = engine
+            .export_job(JobId(94))
+            .await
+            .unwrap()
+            .unwrap()
+            .control()
+            .unwrap()
+            .revision;
+        let checks = Arc::new(AtomicUsize::new(0));
+        let observed = checks.clone();
+        let expired = engine
+            .release_hold_checked(
+                JobId(94),
+                revision.clone(),
+                RetryBy::Operator,
+                Arc::new(move || observed.fetch_add(1, Ordering::SeqCst) < 2),
+            )
+            .await
+            .unwrap();
+        assert!(expired.is_err());
+        assert_eq!(
+            checks.load(Ordering::SeqCst),
+            3,
+            "checked before preparation, before mount probe, and at actor commit"
+        );
+        assert_eq!(
+            engine
+                .export_job(JobId(94))
+                .await
+                .unwrap()
+                .unwrap()
+                .control()
+                .unwrap()
+                .lifecycle,
+            "held"
+        );
+        assert_eq!(
+            std::fs::read(path.join("payload.bin")).unwrap(),
+            b"retained processing source"
+        );
+        assert!(engine
+            .release_hold_checked(JobId(94), revision, RetryBy::Operator, Arc::new(|| true))
+            .await
+            .unwrap()
+            .is_ok());
+        assert_eq!(
+            engine.export_job(JobId(94)).await.unwrap().unwrap().status,
+            JobStatus::PostQueued
+        );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn worker_release_rechecks_live_grant_and_source_at_actor_commit() {
+        use nzbd_state::artifacts::{WorkerControlContext, WORKER_CONTROL_CONTEXT_PARAM};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_tmp, mut owner, _adapter) = control_test_owner_with_persistence(false, None);
+        let mut row = pending_job(77);
+        mark_new_lifecycle_cohort(&mut row);
+        let context = WorkerControlContext {
+            lease_id: "live-77".into(),
+            job_incarnation: "incarnation-77".into(),
+            job_revision: 1,
+            control_revision: 1,
+            epoch: 1,
+        };
+        row.params.push((
+            WORKER_CONTROL_CONTEXT_PARAM.into(),
+            serde_json::to_string(&context).unwrap(),
+        ));
+        let path = owner.dest_dir.join(&row.dir_name);
+        owner
+            .artifacts
+            .allocate_for_delivery(77, &owner.dest_dir, &path, true, true)
+            .unwrap();
+        owner.artifacts.bind_worker_context(77, &context).unwrap();
+        owner.state.jobs.push(row);
+        assert!(owner.hold_job(
+            JobId(77),
+            nzbd_types::HoldCause::Capacity,
+            "download_write",
+            "destination full"
+        ));
+        let row = owner.state.job(JobId(77)).unwrap().clone();
+        let source = owner.artifacts.for_job(77).unwrap().unwrap();
+        let live = Arc::new(AtomicBool::new(true));
+        let observed = live.clone();
+        let guard = crate::hold_release::HoldReleaseGuard::prepare(
+            &row,
+            Some(&source),
+            Some(Arc::new(move || observed.load(Ordering::SeqCst))),
+        );
+        let revision = row.control().unwrap().revision;
+        // A checkpoint alone never establishes a currently live lease.
+        assert!(
+            !crate::hold_release::HoldReleaseGuard::prepare(&row, Some(&source), None).matches(
+                &owner.artifacts,
+                &row,
+                false
+            )
+        );
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::BeginResourceProbe {
+            job: row.id,
+            revision: revision.clone(),
+            by: RetryBy::Operator,
+            guard: guard.clone(),
+            reply,
+        });
+        assert!(result.await.unwrap());
+        live.store(false, Ordering::SeqCst);
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::ReleaseResourceHold {
+            job: row.id,
+            revision: revision.clone(),
+            by: RetryBy::Operator,
+            guard: guard.clone(),
+            reply,
+        });
+        assert!(!result.await.unwrap());
+        assert_eq!(
+            owner
+                .state
+                .job(row.id)
+                .unwrap()
+                .control()
+                .unwrap()
+                .lifecycle,
+            "held"
+        );
+        live.store(true, Ordering::SeqCst);
+        owner.artifacts.set_keep_on_failure(77, true).unwrap();
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::ReleaseResourceHold {
+            job: row.id,
+            revision: revision.clone(),
+            by: RetryBy::Operator,
+            guard,
+            reply,
+        });
+        assert!(
+            !result.await.unwrap(),
+            "source revision changed after probe"
+        );
+        let source = owner.artifacts.for_job(77).unwrap().unwrap();
+        let guard = crate::hold_release::HoldReleaseGuard::prepare(
+            &row,
+            Some(&source),
+            Some(Arc::new(|| true)),
+        );
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::ReleaseResourceHold {
+            job: row.id,
+            revision,
+            by: RetryBy::Operator,
+            guard,
+            reply,
+        });
+        assert!(result.await.unwrap());
+        assert_eq!(
+            owner
+                .state
+                .job(row.id)
+                .unwrap()
+                .control()
+                .unwrap()
+                .lifecycle,
+            "running"
+        );
+    }
+
+    #[tokio::test]
     async fn worker_retry_schedule_survives_regrant_without_overriding_new_leader_intent() {
         use nzbd_state::artifacts::{WorkerControlContext, WORKER_CONTROL_CONTEXT_PARAM};
         let (_tmp, mut owner, _adapter) = control_test_owner_with_persistence(false, None);
@@ -10406,6 +10656,7 @@ mod tests {
             job: JobId(79),
             revision,
             by: RetryBy::Operator,
+            guard: Default::default(),
             reply,
         });
         assert!(result.await.unwrap());
@@ -10457,6 +10708,7 @@ mod tests {
                 job: JobId(1),
                 revision: revision.clone(),
                 by: RetryBy::Recovery,
+                guard: Default::default(),
                 reply,
             });
             assert!(
@@ -10469,6 +10721,7 @@ mod tests {
             job: JobId(1),
             revision: revision.clone(),
             by: RetryBy::Recovery,
+            guard: Default::default(),
             reply,
         });
         assert!(
@@ -10480,6 +10733,7 @@ mod tests {
             job: JobId(1),
             revision,
             by: RetryBy::Operator,
+            guard: Default::default(),
             reply,
         });
         assert!(

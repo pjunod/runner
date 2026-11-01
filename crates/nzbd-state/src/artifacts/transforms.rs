@@ -1355,6 +1355,12 @@ impl Inventory {
     /// guard. The guarded re-check afterwards proves the row it verified is
     /// still the row (same id, generation and revision).
     pub fn validate_post_retry(&self, job: u32) -> Result<()> {
+        self.prepare_post_retry(job).map(|_| ())
+    }
+
+    /// Return the exact version whose physical custody was checked. A caller
+    /// can carry this version to a short actor CAS without rereading paths.
+    pub fn prepare_post_retry(&self, job: u32) -> Result<Artifact> {
         // A journaled rename may already have moved the old source path.
         // Resume only its exact retryable operation before checking the new
         // committed source; review and deletion operations remain fenced.
@@ -1395,7 +1401,7 @@ impl Inventory {
                 "resolve pending relocation or deletion before retrying post-processing".into(),
             ));
         }
-        Ok(())
+        Ok(current)
     }
 
     /// The custody facts a post retry needs, read from the row alone.
