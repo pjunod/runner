@@ -336,11 +336,13 @@ pub(crate) enum QueueCommand {
     BeginResourceProbe {
         job: JobId,
         revision: String,
+        by: RetryBy,
         reply: oneshot::Sender<bool>,
     },
     ReleaseResourceHold {
         job: JobId,
         revision: String,
+        by: RetryBy,
         reply: oneshot::Sender<bool>,
     },
     /// End a non-storage hold (`Owner::retry_hold`); the error says why not.
@@ -2602,6 +2604,7 @@ impl Owner {
             QueueCommand::BeginResourceProbe {
                 job,
                 revision,
+                by,
                 reply,
             } => {
                 let quiescent = self.state.job(job).is_some_and(|j| {
@@ -2630,8 +2633,11 @@ impl Owner {
                             c.revision == revision
                                 && c.lifecycle == "held"
                                 && matches!(c.cause.as_str(), "capacity" | "quota")
-                        }) && after <= now
+                        }) && (after <= now || by == RetryBy::Operator)
                         {
+                            // The spacing paces the recovery task; a person
+                            // asking is the health probe's to answer, not
+                            // the backoff's.
                             j.params.retain(|(k, _)| {
                                 k != "*Control:probe_after" && k != "*Control:attempts"
                             });
@@ -2651,6 +2657,7 @@ impl Owner {
             QueueCommand::ReleaseResourceHold {
                 job,
                 revision,
+                by,
                 reply,
             } => {
                 let before = self.state.job(job).cloned();
@@ -2675,6 +2682,19 @@ impl Owner {
                                 "Storage admitted; resuming this job"
                             }
                             .into();
+                            control.next_retry_at_unix = None;
+                            control.released_at_unix = Some(unix_now());
+                            // An operator retry runs the job, as every other
+                            // hold's does; only the automatic path keeps a
+                            // pause the operator set before the fault.
+                            if by == RetryBy::Operator {
+                                control.manual_pause = false;
+                                control.retry_attempt = 0;
+                            }
+                            // The probe's spacing belongs to this episode.
+                            j.params.retain(|(k, _)| {
+                                k != "*Control:probe_after" && k != "*Control:attempts"
+                            });
                             j.status = if control.manual_pause {
                                 JobStatus::Paused
                             } else {
@@ -3548,7 +3568,19 @@ impl Owner {
         // exactly when the state volume is what failed, and an import of the
         // row cannot carry it at all (`import_job` keeps a held fence).
         let policy = cause.policy();
-        let attempts_made = prior.as_ref().map_or(0, |c| c.retry_attempt);
+        let now = unix_now();
+        // Only a hold still in force speaks for where the job is now. A
+        // released control keeps the status from its own hold, and reading
+        // that back would route a post-processing failure to the download
+        // queue (or the reverse) and skip the custody check.
+        let prior_held = prior.as_ref().filter(|c| c.lifecycle == "held");
+        let same_episode = prior_held.is_some()
+            || prior.as_ref().is_some_and(|c| {
+                c.released_at_unix
+                    .is_some_and(|at| now.saturating_sub(at) < nzbd_types::HOLD_EPISODE_SECONDS)
+            });
+        let episode = prior.as_ref().filter(|_| same_episode);
+        let attempts_made = episode.map_or(0, |c| c.retry_attempt);
         let timed = policy.timed();
         let control = nzbd_types::JobControl {
             version: 1,
@@ -3571,25 +3603,19 @@ impl Owner {
                         job.0
                     )
                 }),
-            previous_status: prior
-                .as_ref()
+            previous_status: prior_held
                 .and_then(|c| c.previous_status)
                 .or(Some(j.status)),
-            manual_pause: prior
-                .as_ref()
-                .map_or(j.status == JobStatus::Paused, |c| c.manual_pause),
+            manual_pause: prior_held.map_or(j.status == JobStatus::Paused, |c| c.manual_pause),
             retry_attempt: if timed {
                 attempts_made.saturating_add(1)
             } else {
                 attempts_made
             },
-            next_retry_at_unix: timed.then(|| {
-                unix_now().saturating_add(nzbd_types::hold_retry_delay_seconds(attempts_made))
-            }),
-            blocked_since_unix: prior
-                .as_ref()
-                .and_then(|c| c.blocked_since_unix)
-                .or_else(|| Some(unix_now())),
+            next_retry_at_unix: timed
+                .then(|| now.saturating_add(nzbd_types::hold_retry_delay_seconds(attempts_made))),
+            blocked_since_unix: episode.and_then(|c| c.blocked_since_unix).or(Some(now)),
+            released_at_unix: None,
         };
         j.set_control(&control);
         j.status = JobStatus::Paused;
@@ -3689,6 +3715,7 @@ impl Owner {
         control.revision = next.to_string();
         control.lifecycle = "running".into();
         control.next_retry_at_unix = None;
+        control.released_at_unix = Some(unix_now());
         control.message = match by {
             RetryBy::Operator => format!(
                 "Retry requested by the operator after {} at {}",
@@ -3739,6 +3766,9 @@ impl Owner {
     /// the original reason and recording the refusal beside it. The new time
     /// lives in memory even if this save fails; the next snapshot carries it.
     fn reschedule_hold(&mut self, job: JobId, revision: &str, reason: &str) -> bool {
+        if !self.persist {
+            return false;
+        }
         let Some(j) = self.state.job_mut(job) else {
             return false;
         };
@@ -3747,19 +3777,39 @@ impl Owner {
         }) else {
             return false;
         };
-        let delay = nzbd_types::hold_retry_delay_seconds(control.retry_attempt);
-        control.retry_attempt = control.retry_attempt.saturating_add(1);
-        control.next_retry_at_unix = Some(unix_now().saturating_add(delay));
+        // A timed hold moves its next attempt out; a re-observed one keeps
+        // its cadence and only records why it is still held.
+        let timed = control.hold_cause().policy().timed();
+        if timed {
+            let delay = nzbd_types::hold_retry_delay_seconds(control.retry_attempt);
+            control.retry_attempt = control.retry_attempt.saturating_add(1);
+            control.next_retry_at_unix = Some(unix_now().saturating_add(delay));
+        }
         let original = control
             .message
             .split("; retry refused: ")
             .next()
             .unwrap_or("")
             .to_string();
-        control.message = format!("{original}; retry refused: {reason}")
+        let message: String = format!("{original}; retry refused: {reason}")
             .chars()
             .take(2048)
             .collect();
+        if !timed && message == control.message {
+            return true; // nothing new to say; no save every pass
+        }
+        control.message = message;
+        // A changed hold is a new revision, so a second actor that read the
+        // old one (another pass, an operator click) cannot apply on top.
+        let Some(next) = control
+            .revision
+            .parse::<u64>()
+            .ok()
+            .and_then(|r| r.checked_add(1))
+        else {
+            return false;
+        };
+        control.revision = next.to_string();
         j.set_control(&control);
         self.dirty = true;
         if self.persist {
@@ -7258,6 +7308,7 @@ mod tests {
         let revision = owner.state.jobs[0].control().unwrap().revision;
         let (reply, rx) = oneshot::channel();
         owner.on_command(QueueCommand::ReleaseResourceHold {
+            by: RetryBy::Operator,
             job: JobId(1),
             revision: revision.clone(),
             reply,
@@ -7269,6 +7320,7 @@ mod tests {
         assert!(held.revision.parse::<u64>().unwrap() > revision.parse::<u64>().unwrap());
         let (reply, rx) = oneshot::channel();
         owner.on_command(QueueCommand::ReleaseResourceHold {
+            by: RetryBy::Operator,
             job: JobId(1),
             revision,
             reply,
@@ -7279,6 +7331,7 @@ mod tests {
         epoch.borrow_and_update();
         let (reply, rx) = oneshot::channel();
         owner.on_command(QueueCommand::ReleaseResourceHold {
+            by: RetryBy::Operator,
             job: JobId(1),
             revision: owner.state.jobs[0].control().unwrap().revision,
             reply,
@@ -7419,7 +7472,11 @@ mod tests {
         assert!(pushed
             .message
             .ends_with("; retry refused: volume still unavailable"));
-        assert!(owner.reschedule_hold(JobId(1), &revision, "and again"));
+        assert!(
+            !owner.reschedule_hold(JobId(1), &revision, "stale"),
+            "a reschedule is a new revision; a second actor on the old one is refused"
+        );
+        assert!(owner.reschedule_hold(JobId(1), &pushed.revision, "and again"));
         assert_eq!(
             owner.state.jobs[0]
                 .control()
@@ -7536,6 +7593,7 @@ mod tests {
                 if cause.is_storage() {
                     let (reply, rx) = oneshot::channel();
                     owner.on_command(QueueCommand::ReleaseResourceHold {
+                        by: RetryBy::Operator,
                         job: JobId(1),
                         revision: control.revision,
                         reply,
@@ -7588,6 +7646,162 @@ mod tests {
             held,
             "imports cannot rewrite a fence"
         );
+        // RescheduleHold is an owner write: it does change a fence.
+        let mut storage = held.clone();
+        storage.cause = "storage_unavailable".into();
+        storage.retry_policy = "scheduled_retry".into();
+        owner.state.jobs[0].set_control(&storage);
+        assert!(owner.reschedule_hold(JobId(1), &storage.revision, "still down"));
+        assert_ne!(owner.state.jobs[0].control().unwrap(), storage);
+    }
+
+    /// Review finding: `previous_status` was sticky across holds, so a job
+    /// first held while downloading and later held in post-processing was
+    /// released to the download queue without its custody check.
+    #[tokio::test]
+    async fn rehold_after_release_routes_by_where_the_job_is_now() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        owner.state.jobs.push(pending_job(1));
+        assert!(owner.hold_job(
+            JobId(1),
+            HoldCause::StorageUnavailable,
+            "download_write",
+            "x (os error 107)"
+        ));
+        let first = owner.state.jobs[0].control().unwrap();
+        assert!(!first.post_side());
+        owner
+            .retry_hold(JobId(1), &first.revision, RetryBy::Recovery, false)
+            .unwrap();
+        // The download finished; post-processing hits the dead mount.
+        owner.state.jobs[0].status = JobStatus::Post {
+            stage: nzbd_types::PostStage::PostUnpackRename,
+        };
+        assert!(owner.hold_job(
+            JobId(1),
+            HoldCause::StorageUnavailable,
+            "post_unpack_rename",
+            "y (os error 5)"
+        ));
+        let second = owner.state.jobs[0].control().unwrap();
+        assert!(second.post_side(), "this hold happened in post-processing");
+        assert!(
+            owner
+                .retry_hold(JobId(1), &second.revision, RetryBy::Recovery, false)
+                .is_err(),
+            "so its release must go through the custody check"
+        );
+        assert_eq!(
+            second.retry_attempt, 2,
+            "a re-hold right after a release is the same outage"
+        );
+        assert_eq!(second.blocked_since_unix, first.blocked_since_unix);
+        assert!(!second.manual_pause);
+
+        // An hour after the last release, a new hold is a new episode.
+        let mut released = second.clone();
+        released.lifecycle = "running".into();
+        released.released_at_unix = Some(unix_now() - nzbd_types::HOLD_EPISODE_SECONDS - 1);
+        released.blocked_since_unix = Some(1);
+        owner.state.jobs[0].set_control(&released);
+        owner.state.jobs[0].status = JobStatus::Downloading;
+        assert!(owner.hold_job(
+            JobId(1),
+            HoldCause::StorageUnavailable,
+            "download_write",
+            "z (os error 107)"
+        ));
+        let fresh = owner.state.jobs[0].control().unwrap();
+        assert_eq!(fresh.retry_attempt, 1, "backoff starts over");
+        assert_ne!(
+            fresh.blocked_since_unix,
+            Some(1),
+            "so does the outage clock"
+        );
+        assert!(!fresh.post_side());
+    }
+
+    /// Review finding: an operator retry on a paused storage hold left the
+    /// job paused, and the probe's spacing outlived its episode.
+    #[tokio::test]
+    async fn operator_storage_release_runs_the_job_and_resets_the_probe() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        owner.state.jobs.push(pending_job(1));
+        assert!(owner.hold_job(JobId(1), HoldCause::Capacity, "download_write", "full"));
+        let mut c = owner.state.jobs[0].control().unwrap();
+        c.manual_pause = true;
+        owner.state.jobs[0].set_control(&c);
+        // A probe just ran: the recovery task must wait, a person need not.
+        owner.state.jobs[0].params.extend([
+            (
+                "*Control:probe_after".to_string(),
+                (unix_now() + 999).to_string(),
+            ),
+            ("*Control:attempts".to_string(), "6".to_string()),
+        ]);
+        for (by, expected) in [(RetryBy::Recovery, false), (RetryBy::Operator, true)] {
+            let (reply, rx) = oneshot::channel();
+            owner.on_command(QueueCommand::BeginResourceProbe {
+                job: JobId(1),
+                revision: c.revision.clone(),
+                by,
+                reply,
+            });
+            assert_eq!(rx.await.unwrap(), expected, "{by:?}");
+        }
+        let (reply, rx) = oneshot::channel();
+        owner.on_command(QueueCommand::ReleaseResourceHold {
+            job: JobId(1),
+            revision: c.revision.clone(),
+            by: RetryBy::Operator,
+            reply,
+        });
+        assert!(rx.await.unwrap());
+        let job = &owner.state.jobs[0];
+        assert_eq!(
+            job.status,
+            JobStatus::Queued,
+            "an operator retry runs the job"
+        );
+        let c = job.control().unwrap();
+        assert!(!c.manual_pause && c.retry_attempt == 0 && c.next_retry_at_unix.is_none());
+        assert!(c.released_at_unix.is_some());
+        assert!(
+            !job.params
+                .iter()
+                .any(|(k, _)| k.starts_with("*Control:probe_after")
+                    || k.starts_with("*Control:attempts")),
+            "the probe's spacing belongs to the episode that ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn reobserve_refusal_records_why_without_moving_its_cadence() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        owner.state.jobs.push(pending_job(1));
+        assert!(owner.hold_job(
+            JobId(1),
+            HoldCause::MountUnavailable,
+            "extract",
+            "root changed"
+        ));
+        let c = owner.state.jobs[0].control().unwrap();
+        assert_eq!(c.next_retry_at_unix, None);
+        assert!(owner.reschedule_hold(JobId(1), &c.revision, "wrong root mounted"));
+        let after = owner.state.jobs[0].control().unwrap();
+        assert_eq!(
+            after.next_retry_at_unix, None,
+            "re-observed every pass, not timed"
+        );
+        assert_eq!(after.retry_attempt, c.retry_attempt);
+        assert!(after
+            .message
+            .ends_with("; retry refused: wrong root mounted"));
+        owner.persist = false;
+        assert!(
+            !owner.reschedule_hold(JobId(1), &c.revision, "follower"),
+            "a node that is not the authority writes nothing"
+        );
     }
 
     #[test]
@@ -7606,6 +7820,7 @@ mod tests {
             retry_attempt: 0,
             next_retry_at_unix: None,
             blocked_since_unix: Some(1),
+            released_at_unix: None,
         };
         // #2181 exactly.
         let fixed = rearmed_hold(
@@ -7678,6 +7893,7 @@ mod tests {
             retry_attempt: 0,
             next_retry_at_unix: None,
             blocked_since_unix: Some(1),
+            released_at_unix: None,
         });
         job.status = JobStatus::Paused;
         let mut doc_state = QueueState::default();

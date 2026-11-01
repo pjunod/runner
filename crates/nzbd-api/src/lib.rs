@@ -3452,9 +3452,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!engine.export_job(id).await.unwrap().unwrap().held());
 
-        // A refused release says why, as a conflict, not as the service
-        // being down: the second capacity probe inside its backoff window.
-        for expected in [StatusCode::OK, StatusCode::CONFLICT] {
+        // An operator retry is answered by the health probe, not by the
+        // recovery task's backoff: two in a row both run.
+        for _ in 0..2 {
             engine
                 .hold_job(
                     id,
@@ -3464,17 +3464,48 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let response = resume(app.clone()).await;
-            assert_eq!(response.status(), expected);
-            if expected == StatusCode::CONFLICT {
-                let body = body_json(response).await;
-                assert!(
-                    body["error"].as_str().unwrap().contains("backing off"),
-                    "{body}"
-                );
-            }
+            assert_eq!(resume(app.clone()).await.status(), StatusCode::OK);
         }
-        assert!(engine.export_job(id).await.unwrap().unwrap().held());
+        // A refused release says why, as a conflict, not as the service
+        // being down: a job far larger than the volume's free space.
+        let segments: String = (1..=64)
+            .map(|n| format!(r#"<segment bytes="4000000000" number="{n}">h{n}@x</segment>"#))
+            .collect();
+        let huge = format!(
+            r#"<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><file poster="p" date="1720000000" subject="&quot;h.bin&quot; yEnc (1/64)"><groups><group>a.b</group></groups><segments>{segments}</segments></file></nzb>"#
+        );
+        let big = engine
+            .add_nzb("huge", huge.as_bytes(), None, 0)
+            .await
+            .unwrap();
+        engine
+            .hold_job(
+                big,
+                nzbd_types::HoldCause::Capacity,
+                "download_write",
+                "storage full",
+            )
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post(format!("/api/v1/jobs/{}/actions/resume", big.0))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("not admitting writes"),
+            "{body}"
+        );
+        assert!(engine.export_job(big).await.unwrap().unwrap().held());
         let response = app
             .oneshot(
                 axum::http::Request::post("/api/v1/jobs/999999/actions/resume")

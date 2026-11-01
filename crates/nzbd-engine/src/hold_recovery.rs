@@ -25,7 +25,9 @@ const PASS: Duration = Duration::from_secs(5);
 const REOBSERVE_EVERY: u64 = 6;
 
 pub(crate) async fn run(handle: EngineHandle, cancel: CancellationToken) {
-    let mut tick = tokio::time::interval(PASS);
+    // The first pass waits one interval: boot has just re-armed every stored
+    // hold, and the engine should be serving before it starts retrying them.
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + PASS, PASS);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut passes = 0u64;
     loop {
@@ -43,7 +45,9 @@ pub(crate) async fn run(handle: EngineHandle, cancel: CancellationToken) {
     }
 }
 
-/// One recovery pass; returns how many holds it released.
+/// One recovery pass; returns how many holds it released. Due holds are
+/// released concurrently: each release may wait on its own volume (bounded
+/// by the probe deadline), and one wedged job must not hold up the rest.
 pub(crate) async fn pass(
     handle: &EngineHandle,
     reobserve: bool,
@@ -53,7 +57,7 @@ pub(crate) async fn pass(
         return Ok(0);
     }
     let now = crate::owner::unix_now();
-    let mut released = 0;
+    let mut releases = tokio::task::JoinSet::new();
     for job in snapshot.jobs.iter() {
         if job.kind == JobKind::Torrent {
             continue;
@@ -65,8 +69,7 @@ pub(crate) async fn pass(
         else {
             continue;
         };
-        let policy = control.hold_cause().policy();
-        let due = match policy {
+        let due = match control.hold_cause().policy() {
             HoldPolicy::Review => false,
             HoldPolicy::ReobserveMount => reobserve,
             HoldPolicy::ScheduledRetry | HoldPolicy::ResumeSameJob => {
@@ -76,20 +79,31 @@ pub(crate) async fn pass(
         if !due {
             continue;
         }
-        match handle
-            .release_hold(job.id, control.revision.clone(), RetryBy::Recovery)
-            .await?
-        {
-            Ok(()) => released += 1,
-            Err(reason) if policy.timed() => {
-                tracing::info!(job = job.id.0, cause = %control.cause, %reason, "automatic retry refused; rescheduled");
-                handle
-                    .reschedule_hold(job.id, control.revision.clone(), reason)
-                    .await?;
+        let handle = handle.clone();
+        let (id, revision, cause) = (job.id, control.revision.clone(), control.cause.clone());
+        releases.spawn(async move {
+            match handle
+                .release_hold(id, revision.clone(), RetryBy::Recovery)
+                .await?
+            {
+                Ok(()) => Ok(true),
+                Err(reason) => {
+                    // Every refusal lands on the job: a timed hold moves its
+                    // next attempt out, a re-observed one records why.
+                    tracing::info!(job = id.0, %cause, %reason, "automatic hold release refused");
+                    handle.reschedule_hold(id, revision, reason).await?;
+                    Ok(false)
+                }
             }
-            Err(reason) => {
-                tracing::debug!(job = job.id.0, cause = %control.cause, %reason, "volume still unavailable");
-            }
+        });
+    }
+    let mut released = 0;
+    while let Some(joined) = releases.join_next().await {
+        match joined {
+            Ok(Ok(true)) => released += 1,
+            Ok(Ok(false)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => tracing::warn!(error = %e, "hold release task failed"),
         }
     }
     Ok(released)

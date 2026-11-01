@@ -542,6 +542,12 @@ pub struct JobControl {
     /// long-wait warning even after the bounded retry schedule is exhausted.
     #[serde(default)]
     pub blocked_since_unix: Option<i64>,
+    /// When the last hold in this control's history was released. A new
+    /// hold within [`HOLD_EPISODE_SECONDS`] of it is the same outage coming
+    /// back (backoff and `blocked_since_unix` carry on); a later one is a
+    /// new episode and starts fresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at_unix: Option<i64>,
 }
 impl JobControl {
     pub fn hold_cause(&self) -> HoldCause {
@@ -709,6 +715,11 @@ impl std::fmt::Display for HoldCause {
 /// capped at the last entry: a dead mount is re-tried every five minutes for
 /// as long as it stays held, and every attempt is visible on the job.
 pub const HOLD_RETRY_DELAYS_SECONDS: [i64; 4] = [30, 60, 120, 300];
+
+/// How long after a release a new hold still counts as the same episode:
+/// well past the longest backoff step, so a mount that flaps keeps backing
+/// off, while a job that ran fine for an hour starts its next blip at 30 s.
+pub const HOLD_EPISODE_SECONDS: i64 = 3600;
 
 pub fn hold_retry_delay_seconds(attempts_made: u8) -> i64 {
     HOLD_RETRY_DELAYS_SECONDS[usize::from(attempts_made).min(HOLD_RETRY_DELAYS_SECONDS.len() - 1)]

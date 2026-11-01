@@ -2084,6 +2084,7 @@ async fn legacy_coverage_hold_recovers_without_repeating_valid_articles() {
             retry_attempt: 0,
             next_retry_at_unix: None,
             blocked_since_unix: None,
+            released_at_unix: None,
         });
         job.status = JobStatus::Paused;
         engine.import_job(job, false, false).await.unwrap();
@@ -2147,6 +2148,7 @@ async fn stranded_storage_hold_recovers_after_restart_without_a_click() {
             retry_attempt: 0,
             next_retry_at_unix: None,
             blocked_since_unix: Some(1),
+            released_at_unix: None,
         });
         job.status = JobStatus::Paused;
         engine.import_job(job, false, false).await.unwrap();
@@ -2185,6 +2187,92 @@ async fn stranded_storage_hold_recovers_after_restart_without_a_click() {
             assert!(!engine.export_job(JobId(992)).await.unwrap().unwrap().held());
         } else {
             assert_ne!(job.status, JobStatus::Paused);
+        }
+        engine.shutdown().await;
+    }
+}
+
+/// The recovery pass end to end on the post side (#2181's path): a held
+/// post-processing job whose payload passes the custody check goes back to
+/// post-processing; one whose payload is gone stays held, rescheduled, with
+/// the refusal on the job. A review hold is never touched.
+#[tokio::test]
+async fn recovery_pass_releases_post_holds_through_custody_and_skips_review() {
+    for (cause, payload_present) in [
+        ("storage_unavailable", true),
+        ("storage_unavailable", false),
+        ("identity_conflict", true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = spawn_engine(tmp.path(), vec![]).await;
+        // A real admission, so the payload is owned the way a live job's is.
+        let nzb = r#"<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><file poster="p" date="1720000000" subject="&quot;f.bin&quot; yEnc (1/1)"><groups><group>a.b</group></groups><segments><segment bytes="1000" number="1">post-held@x</segment></segments></file></nzb>"#;
+        let id = engine
+            .add_nzb_opts("post-held", nzb.as_bytes(), AddOpts::default())
+            .await
+            .unwrap();
+        let dir = engine.artifacts().for_job(id.0).unwrap().unwrap().path;
+        let mut job = engine.export_job(id).await.unwrap().unwrap();
+        job.set_control(&nzbd_types::JobControl {
+            version: 1,
+            revision: "1".into(),
+            lifecycle: "held".into(),
+            cause: cause.into(),
+            stage: "post_unpack_rename".into(),
+            retry_policy: if cause == "identity_conflict" {
+                "review"
+            } else {
+                "scheduled_retry"
+            }
+            .into(),
+            message: "io: read /processing/post-held/x: Input/output error (os error 5)".into(),
+            instance: "field".into(),
+            previous_status: Some(JobStatus::Post {
+                stage: nzbd_types::PostStage::PostUnpackRename,
+            }),
+            manual_pause: false,
+            retry_attempt: 0,
+            next_retry_at_unix: None,
+            blocked_since_unix: Some(1),
+            released_at_unix: None,
+        });
+        job.status = JobStatus::Paused;
+        engine.import_job(job, false, false).await.unwrap();
+        engine.shutdown().await;
+
+        let engine = spawn_engine(tmp.path(), vec![]).await;
+        if !payload_present {
+            // The volume answers, but the payload is not what custody
+            // recorded: the retry must be refused and say so.
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        let released = engine.run_hold_recovery_pass().await.unwrap();
+        let job = engine.export_job(id).await.unwrap().unwrap();
+        let control = job.control().unwrap();
+        match (cause, payload_present) {
+            ("identity_conflict", _) => {
+                assert_eq!(released, 0, "a review hold waits for a person");
+                assert!(job.held());
+                assert!(!control.message.contains("retry refused"));
+            }
+            (_, true) => {
+                assert_eq!(released, 1, "{}", control.message);
+                assert!(!job.held());
+                assert_eq!(job.status, JobStatus::PostQueued, "back to post-processing");
+            }
+            (_, false) => {
+                assert_eq!(released, 0);
+                assert!(job.held());
+                assert!(
+                    control
+                        .message
+                        .contains("retry refused: post-processing retry refused"),
+                    "{}",
+                    control.message
+                );
+                assert!(control.next_retry_at_unix.unwrap() > 0);
+                assert_eq!(control.retry_attempt, 1, "pushed out on the backoff");
+            }
         }
         engine.shutdown().await;
     }

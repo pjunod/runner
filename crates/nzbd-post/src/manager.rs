@@ -600,6 +600,12 @@ async fn manager_task(
                             let _ = reply.send(Err(RestartPostError::NotOwned));
                             continue;
                         }
+                        // A post-processing restart cannot release a hold
+                        // that stopped the download; `resume` is its exit.
+                        if !control.post_side() {
+                            let _ = reply.send(Err(RestartPostError::NotReady));
+                            continue;
+                        }
                         if !engine.retry_post_hold(job, control.revision).await.unwrap_or(false) {
                             let _ = reply.send(Err(RestartPostError::NotReady));
                             continue;
@@ -4421,7 +4427,14 @@ fn post_hold_cause(error: &PostError) -> HoldCause {
         } else {
             HoldCause::Capacity
         }
-    } else if nzbd_engine::is_storage_unavailable(&detail) {
+    } else if nzbd_engine::is_storage_unavailable(&detail)
+        // SQLite reports a failing volume as SQLITE_IOERR, whose message has
+        // no errno suffix; matched only on the inventory's SQL variant.
+        || (matches!(
+            error,
+            PostError::Artifact(nzbd_state::artifacts::Error::Sql(_))
+        ) && detail.contains("disk I/O error"))
+    {
         // Whatever wrapper the error crossed (inventory, subprocess, a
         // rename), a volume that stopped answering is not a verdict on the
         // job's content: it retries on its own.
@@ -7275,6 +7288,13 @@ mod decision_tests {
         }
     }
 
+    fn rusqlite_disk_io_error() -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+            Some("disk I/O error".into()),
+        )
+    }
+
     #[test]
     fn dropped_volume_errors_hold_as_storage_unavailable_through_any_wrapper() {
         for error in [
@@ -7287,6 +7307,14 @@ mod decision_tests {
         ] {
             assert_eq!(post_hold_cause(&error), HoldCause::StorageUnavailable, "{error}");
         }
+        let sqlite_ioerr = rusqlite_disk_io_error();
+        assert_eq!(
+            post_hold_cause(&PostError::Artifact(nzbd_state::artifacts::Error::Sql(
+                sqlite_ioerr
+            ))),
+            HoldCause::StorageUnavailable,
+            "SQLITE_IOERR on the state volume carries no errno suffix"
+        );
         assert_eq!(
             post_hold_cause(&PostError::Io(std::io::Error::other(
                 "No such file or directory (os error 2)"

@@ -498,3 +498,24 @@ classification is unaffected. #2181's message would have read `io: read
 - **`EngineHandle::run_hold_recovery_pass`** exposes one pass for tests and
   future tooling; the e2e `stranded_storage_hold_recovers_after_restart_…`
   drives #2183's exact stored state through a restart and a pass.
+
+### Code review (Fable, 2026-11-01) and what changed
+
+| # | Finding | Landed |
+|---|---|---|
+| 1 | `previous_status` was sticky across holds, so a re-hold routed by the *first* hold's side and could skip the custody check | `hold_job` reads side, pause and episode only from a prior control that is still held; test `rehold_after_release_routes_by_where_the_job_is_now` |
+| 2 | `validate_post_retry` held the inventory's global mutex across filesystem I/O; a hung mount would freeze allocation and leases | the filesystem proof runs outside the guard, re-checked under it by id/generation/revision; every release probe has a 20 s deadline (`bounded_probe`); the pass releases due jobs concurrently (`JoinSet`) and its first pass waits one interval |
+| 3 | operator retry on a paused storage hold left it paused | `ReleaseResourceHold` takes `RetryBy`; Operator clears pause and backoff |
+| 4 | the probe's attempt counter outlived its episode; operator clicks hit the recovery backoff | release clears `*Control:probe_after`/`attempts`; `BeginResourceProbe` lets an Operator through (the health probe is the gate) |
+| 5 | the recovery pass was untested on the post side | e2e `recovery_pass_releases_post_holds_through_custody_and_skips_review` (release, custody refusal rescheduled with its reason, review skipped) |
+| 6 | a PP restart on a download-side hold released it, then reported failure | `ManagerCommand::Restart` refuses download-side holds before releasing |
+| 7 | SQLITE_IOERR on the state volume classified `io` | `post_hold_cause` maps the inventory's SQL `disk I/O error` to `storage_unavailable` |
+| 8 | `reobserve_mount` refusals never reached the job | the pass reschedules every refusal; a re-observed hold records the reason without moving its cadence, and an unchanged reason writes nothing |
+| 9 | backoff and `blocked_since` never decayed | `JobControl.released_at_unix` (additive, optional); a hold more than `HOLD_EPISODE_SECONDS` (1 h) after the last release starts a new episode |
+| 10 | `reschedule_hold` wrote on a follower; a reschedule kept its revision | it refuses without authority and bumps the revision, so a second actor on the old one is refused |
+
+**Mixed-version clusters:** a node running an older build that adopts
+authority re-arms a hold with a cause it does not know as `review`. That is
+the closed-set design working as intended (the unknown cause still has the
+operator exit), but a rolling upgrade should upgrade the leader-eligible
+nodes together.

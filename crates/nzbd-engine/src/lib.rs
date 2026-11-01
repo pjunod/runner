@@ -86,6 +86,28 @@ pub fn is_storage_unavailable(msg: &str) -> bool {
         .any(|n| msg.contains(&format!("(os error {n})")))
 }
 
+/// How long a hold release waits on a filesystem probe (custody check,
+/// capacity probe) against the volume that failed. A hung NFS/FUSE mount
+/// blocks the probe's thread in the kernel; the release gives up on it and
+/// treats that as a refusal, so one wedged job cannot stall the recovery of
+/// every other job or the daemon's shutdown.
+const HOLD_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Run a blocking filesystem probe off the runtime with a deadline. The
+/// error says why there is no answer.
+async fn bounded_probe<T: Send + 'static>(
+    probe: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    match tokio::time::timeout(HOLD_PROBE_TIMEOUT, tokio::task::spawn_blocking(probe)).await {
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(e)) => Err(format!("did not finish: {e}")),
+        Err(_) => Err(format!(
+            "got no answer from the volume within {} s",
+            HOLD_PROBE_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 /// The hold cause for a failed write or filesystem step, by errno.
 pub fn io_hold_cause(msg: &str) -> nzbd_types::HoldCause {
     if is_out_of_space(msg) {
@@ -963,6 +985,7 @@ impl EngineHandle {
                 .roundtrip_bool(|reply| QueueCommand::ReleaseResourceHold {
                     job,
                     revision,
+                    by,
                     reply,
                 })
                 .await?
@@ -973,14 +996,14 @@ impl EngineHandle {
             if by == RetryBy::Recovery && self.snapshot().disk_low {
                 return Ok(Err("waiting for free space".into()));
             }
-            return self.release_capacity_hold(&record, revision).await;
+            return self.release_capacity_hold(&record, revision, by).await;
         }
         let custody_checked = if control.post_side() {
             let inventory = self.artifacts();
-            match tokio::task::spawn_blocking(move || inventory.validate_post_retry(job.0)).await {
+            match bounded_probe(move || inventory.validate_post_retry(job.0)).await {
                 Ok(Ok(())) => true,
                 Ok(Err(e)) => return Ok(Err(format!("post-processing retry refused: {e}"))),
-                Err(e) => return Ok(Err(format!("custody check did not finish: {e}"))),
+                Err(why) => return Ok(Err(format!("custody check {why}"))),
             }
         } else {
             false
@@ -1003,12 +1026,14 @@ impl EngineHandle {
         &self,
         record: &Job,
         revision: String,
+        by: RetryBy,
     ) -> Result<Result<(), String>, EngineError> {
         let job = record.id;
         if !self
             .roundtrip_bool(|reply| QueueCommand::BeginResourceProbe {
                 job,
                 revision: revision.clone(),
+                by,
                 reply,
             })
             .await?
@@ -1036,17 +1061,17 @@ impl EngineHandle {
         let token = format!("{}-{}", job.0, revision);
         // Admission and a write/flush probe must pass before writes resume.
         let health =
-            tokio::task::spawn_blocking(move || nzbd_state::capacity::health(&path, bytes, &token))
-                .await;
+            bounded_probe(move || nzbd_state::capacity::health(&path, bytes, &token)).await;
         match health {
             Ok(Ok(_reservation)) => {}
             Ok(Err(e)) => return Ok(Err(format!("storage is still not admitting writes: {e}"))),
-            Err(e) => return Ok(Err(format!("storage probe did not finish: {e}"))),
+            Err(why) => return Ok(Err(format!("storage probe {why}"))),
         }
         Ok(self
             .roundtrip_bool(|reply| QueueCommand::ReleaseResourceHold {
                 job,
                 revision,
+                by,
                 reply,
             })
             .await?
