@@ -26,11 +26,11 @@ outside compiler caches in the task's durable evidence directory.
 
 | Slice | State | Evidence |
 |---|---|---|
-| Runner publication retries, resource holds, custody, Keep and durable queue mutations | First checkpoint integrated; review fixes and regressions active | State commit 3f47dce; integration 7bfb82ea |
+| Runner publication retries, resource holds, custody, Keep and durable queue mutations | Core checkpoints integrated; URL and broader timing still active | State 3f47dce, d70609c9 and 2ecfc5c integrated; focused failure/race regressions pass |
 | Runner real partial repair, native books, safe sidecars and classification | Integrated; focused regressions pass | POST a2aa622 and bf4c21ca; integration 78555830 and 8727681a |
-| Curator discovery, atomic import ledger, replacement ownership and manual intent | Implementation and primary review active | No final checkpoint yet |
-| Curator upgrade distinction, stale batches, storage explanation and reviewed acceptance | Pending | None yet |
-| Cluster durable Delivery, copy retirement, URL replay and RPC bounds | Cluster design reviewed; implementation active | Stable replicated consumer identity; separate node storage identities |
+| Curator discovery, atomic import ledger, replacement ownership and manual intent | Core checkpoint integrated; service fault tests active | Curator 2665a8b |
+| Curator upgrade distinction, stale batches, storage explanation and reviewed acceptance | Upgrade distinction and cancellation committed; storage acceptance active | Curator 2665a8b; narrow migration/service tests underway |
+| Cluster durable Delivery, copy retirement, URL replay and RPC bounds | RPC bounds integrated; Delivery/copy implementation active | Runner 2e36b491; stable replicated consumer identity, separate node storage identities |
 | Native torrent independent publication and seeding custody | Pending | None yet |
 | Joined timing, usable controls and desktop/mobile acceptance | Pending | None yet |
 | Real Runner–Curator/cluster/torrent integration evidence | Pending | None yet |
