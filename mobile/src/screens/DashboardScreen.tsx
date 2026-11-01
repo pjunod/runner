@@ -50,6 +50,7 @@ import { torrentDisplayPhase, torrentStatus, torrentPrimaryAction, seedPolicyTex
 import { urlFetchDetail, useNow } from '../urlFetchPresentation';
 import { HistoryView } from './HistoryView';
 import { LogsView } from './LogsView';
+import { holdAction } from '../holdAction';
 
 type AppSection = 'queue' | 'history' | 'logs';
 
@@ -617,7 +618,8 @@ export function JobCard({
   const statusKey = jobStatusKey(job.status);
   const hold = job.control?.lifecycle === 'held' ? job.control : undefined;
   const canPause = !hold && ['queued', 'downloading', 'fetching'].includes(statusKey);
-  const canResume = isJobPaused(job.status) && (!hold || hold.retry_policy === 'resume_same_job');
+  const canResume = isJobPaused(job.status) && !hold;
+  const heldAction = holdAction(hold);
   const phase = torrentDisplayPhase(job);
   const torrentAction = torrentPrimaryAction(job);
   const seed = phase === 'seeding' || phase === 'paused_seed';
@@ -742,6 +744,9 @@ export function JobCard({
             ) : null}
             {!phase && canResume ? (
               <ActionButton compact disabled={busy} label="Resume" onPress={() => onAction('resume')} />
+            ) : null}
+            {!phase && heldAction ? (
+              <ActionButton compact disabled={busy} label={heldAction.label} onPress={() => onAction(heldAction.action)} />
             ) : null}
             {movable ? (
               <>
