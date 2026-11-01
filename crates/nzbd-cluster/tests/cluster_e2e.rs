@@ -1654,6 +1654,16 @@ async fn delivery_receipts_survive_authority_restart_and_consumer_removed_public
         },
     )
     .await;
+    let (code, retried) = http_with_headers(
+        &authority.url,
+        "POST",
+        &format!("/api/v1/deliveries/{id}/source-cleanup/retry"),
+        b"",
+        &[],
+    );
+    assert_eq!(code, 200, "{retried}");
+    let retried: serde_json::Value = serde_json::from_str(&retried).unwrap();
+    assert_eq!(retried["sourceCleanup"]["status"], "succeeded");
     assert!(
         !tmp.path().join("complete/cluster-ready").exists(),
         "download source must drain independently of the publication: {:?}; receipt {}",
@@ -1722,4 +1732,230 @@ async fn delivery_receipts_survive_authority_restart_and_consumer_removed_public
     downloader.kill().await;
     post_worker.kill().await;
     successor.kill().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn delivery_receipts_and_copy_acks_survive_actual_majority_authority_change() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let tmp = tempfile::tempdir().unwrap();
+    let bytes = prng_bytes(83, 90_000);
+    let post = build_post("cluster-ready", &[("episode.mkv", bytes.clone())], 20_000);
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+    let topology = control_topology(3);
+    let opts = |priority| NodeOpts {
+        coordinator: true,
+        priority,
+        download: true,
+        max_download_jobs: 2,
+        post_process: true,
+        min_free_disk_bytes: 0,
+    };
+    let (authority, downloader, post_worker) = tokio::join!(
+        start_node_with_control(
+            tmp.path(),
+            "a",
+            opts(0),
+            ns.port(),
+            4,
+            nzbd_api::AuthConfig::default(),
+            Some(topology[0].clone())
+        ),
+        start_node_with_control(
+            tmp.path(),
+            "b",
+            opts(1),
+            ns.port(),
+            4,
+            nzbd_api::AuthConfig::default(),
+            Some(topology[1].clone())
+        ),
+        start_node_with_control(
+            tmp.path(),
+            "c",
+            opts(2),
+            ns.port(),
+            4,
+            nzbd_api::AuthConfig::default(),
+            Some(topology[2].clone())
+        )
+    );
+    wait_for("three nodes and catalog adoption", 20, || {
+        let cluster = get_json(&authority.url, "/api/v1/cluster");
+        let (code, body) = http(
+            &authority.url,
+            "GET",
+            "/api/v1/deliveries?after=0&includeAccepted=true",
+            b"",
+        );
+        cluster["nodes"]
+            .as_array()
+            .is_some_and(|nodes| nodes.len() == 3)
+            && code == 200
+            && serde_json::from_str::<serde_json::Value>(&body)
+                .is_ok_and(|page| page["catalogAdoptionComplete"] == true)
+    })
+    .await;
+    let admitted=post_until_created("lifecycle NZB admission",15,||http(&authority.url,"POST",
+        "/api/v1/jobs?name=cluster-ready&params=%7B%22monarr-delivery%22%3A%221%22%2C%22monarr-transfer%22%3A%22cluster-ready-token%22%7D",post.nzb.as_bytes())).await;
+    assert!(admitted.contains("id"));
+    let debug_started = tokio::time::Instant::now();
+    wait_for("remote POST creates cluster-visible READY", 45, || {
+        if debug_started.elapsed().as_secs() % 10 == 9 {
+            eprintln!(
+                "authority={} downloader={} pp={}",
+                get_json(&authority.url, "/api/v1/jobs"),
+                serde_json::to_value(&downloader.runtime.engine.snapshot().jobs).unwrap(),
+                serde_json::to_value(&post_worker.runtime.engine.snapshot().jobs).unwrap()
+            );
+        }
+        let (code, body) = http(
+            &authority.url,
+            "GET",
+            "/api/v1/deliveries?after=0&includeAccepted=true",
+            b"",
+        );
+        code == 200
+            && serde_json::from_str::<serde_json::Value>(&body).is_ok_and(|page| {
+                page["deliveries"].as_array().is_some_and(|rows| {
+                    rows.iter()
+                        .any(|row| row["requestToken"] == "cluster-ready-token")
+                })
+            })
+    })
+    .await;
+    let page = get_json(
+        &authority.url,
+        "/api/v1/deliveries?after=0&includeAccepted=true",
+    );
+    let delivery = page["deliveries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["requestToken"] == "cluster-ready-token")
+        .unwrap()
+        .clone();
+    assert!(delivery["runnerInstanceId"].is_string());
+    assert!(delivery["runnerStages"]["nodeId"].is_string());
+    assert!(delivery["sourceCopies"]
+        .as_array()
+        .is_some_and(|copies| copies.len() >= 3));
+    let path = std::path::PathBuf::from(delivery["publicationPath"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read(path.join(delivery["files"][0]["path"].as_str().unwrap())).unwrap(),
+        bytes
+    );
+    let id = delivery["deliveryId"].as_str().unwrap();
+    let acceptance=serde_json::to_vec(&serde_json::json!({"protocolVersion":1,"publicationGeneration":delivery["publicationGeneration"],"manifestDigest":delivery["manifestDigest"],"consumerReceiptId":"curator-accepted-cluster"})).unwrap();
+    let (status, accepted) = http_with_headers(
+        &post_worker.url,
+        "POST",
+        &format!("/api/v1/deliveries/{id}/accept"),
+        &acceptance,
+        &[("Content-Type", "application/json")],
+    );
+    assert_eq!(status, 200, "acceptance through worker proxy: {accepted}");
+    assert!(accepted.contains("sourceCopies"));
+    // Consumer is entitled to remove its transferred publication immediately.
+    std::fs::remove_dir_all(&path).unwrap();
+    wait_for(
+        "all exact successful source copies acknowledged removed",
+        30,
+        || {
+            let value = get_json(&authority.url, &format!("/api/v1/deliveries/{id}"));
+            value["sourceCleanup"]["status"] == "succeeded"
+                && value["sourceCopies"].as_array().is_some_and(|copies| {
+                    !copies.is_empty() && copies.iter().all(|copy| copy["status"] == "removed")
+                })
+        },
+    )
+    .await;
+    let (code, retried) = http_with_headers(
+        &authority.url,
+        "POST",
+        &format!("/api/v1/deliveries/{id}/source-cleanup/retry"),
+        b"",
+        &[],
+    );
+    assert_eq!(code, 200, "{retried}");
+    let retried: serde_json::Value = serde_json::from_str(&retried).unwrap();
+    assert_eq!(retried["sourceCleanup"]["status"], "succeeded");
+    assert!(
+        !tmp.path().join("complete/cluster-ready").exists(),
+        "download source must drain independently of the publication: {:?}; receipt {}",
+        std::fs::read_dir(tmp.path().join("complete/cluster-ready"))
+            .ok()
+            .map(|entries| entries
+                .flatten()
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>()),
+        get_json(&authority.url, &format!("/api/v1/deliveries/{id}"))
+    );
+    assert!(
+        manifest_paths(&tmp.path().join(".nzbd-cluster/generations")).is_empty(),
+        "all exact sealed duplicates must drain"
+    );
+    let initial = get_json(&authority.url, "/api/v1/cluster")["leader"]["node"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut nodes = vec![authority, downloader, post_worker];
+    let index = nodes.iter().position(|node| node.name == initial).unwrap();
+    nodes.remove(index).kill().await;
+    wait_for("different majority coordinator takes office", 25, || {
+        nodes
+            .iter()
+            .any(|node| get_json(&node.url, "/api/v1/cluster")["is_leader"] == true)
+    })
+    .await;
+    let successor = nodes
+        .iter()
+        .find(|node| get_json(&node.url, "/api/v1/cluster")["is_leader"] == true)
+        .unwrap();
+    assert_ne!(successor.name, initial);
+    wait_for(
+        "authoritative receipt recovery without payload rehash",
+        25,
+        || {
+            let (code, body) = http(
+                &successor.url,
+                "GET",
+                &format!("/api/v1/deliveries/{id}"),
+                b"",
+            );
+            code == 200 && body.contains("curator-accepted-cluster")
+        },
+    )
+    .await;
+    let replay = get_json(&successor.url, &format!("/api/v1/deliveries/{id}"));
+    for key in [
+        "deliveryId",
+        "runnerInstanceId",
+        "sequence",
+        "publicationGeneration",
+        "manifestDigest",
+        "files",
+        "runnerStages",
+    ] {
+        assert_eq!(
+            replay[key], delivery[key],
+            "immutable {key} changed across authority restart"
+        );
+    }
+    assert!(
+        !path.exists(),
+        "replay must not republish a consumer-removed path"
+    );
+    assert_eq!(replay["consumerReceiptId"], "curator-accepted-cluster");
+    assert_eq!(replay["sourceCleanup"]["status"], "succeeded");
+    assert!(replay["sourceCopies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|copy| copy["status"] == "removed"));
+    for node in nodes {
+        node.kill().await;
+    }
 }

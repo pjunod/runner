@@ -408,6 +408,10 @@ fn immutable_delivery(record: &ClusterDelivery) -> Value {
             for key in ["claimId","attempts","nextRetryAt"] {value.as_object_mut().unwrap().remove(key);}value}).collect::<Vec<_>>()})
 }
 pub(crate) fn discovery_value(record: &ClusterDelivery) -> Value {
+    if record.copies.len() > 64 {
+        return discovery_stub(record.delivery.sequence,&record.delivery.delivery_id,
+            "publication has more than 64 source copies; source retained for review; private cleanup obligations remain available to the owning Runner nodes");
+    }
     let mut value = serde_json::to_value(&record.delivery).unwrap_or(Value::Null);
     value["sourceCopies"] = json!(record
         .copies
@@ -566,9 +570,12 @@ pub(crate) async fn serve_cluster_delivery(
             return Ok(discovery_value(&current));
         }
         if method==Method::POST && action=="source-cleanup/retry" {
-            for copy in &mut record.copies {if copy.status!="removed" && copy.status!="review_required" {copy.next_retry_at=None;}}
-            record.delivery.source_cleanup.status="pending".into();record.delivery.source_cleanup.next_retry_at=None;
-            control.update_cluster_delivery(&record).await.map_err(|e|(StatusCode::SERVICE_UNAVAILABLE,e))?;
+            let mut queued=false;
+            for copy in &mut record.copies {if copy.status!="removed" && copy.status!="review_required" {copy.next_retry_at=None;queued=true;}}
+            if queued {
+                record.delivery.source_cleanup.status="pending".into();record.delivery.source_cleanup.next_retry_at=None;
+                control.update_cluster_delivery(&record).await.map_err(|e|(StatusCode::SERVICE_UNAVAILABLE,e))?;
+            }
             return Ok(discovery_value(&record));
         }
         Err((StatusCode::METHOD_NOT_ALLOWED,"unsupported delivery operation".into()))
@@ -802,65 +809,99 @@ pub(crate) async fn cleanup_copy(
     }
     let inventory = shared.engine.artifacts();
     let root = shared.cfg.shared_dir.join(".nzbd-cluster/generations");
-    let result = tokio::task::spawn_blocking(
-        move || -> Result<nzbd_state::artifacts::ClusterCopyCleanup, String> {
-            if let Some(local) = copy.local_delivery_id {
-                let delivery = inventory
-                    .retire_delivery_source(&local)
-                    .map_err(|e| e.to_string())?;
-                return Ok(nzbd_state::artifacts::ClusterCopyCleanup {
-                    status: if delivery.source_cleanup.status == "succeeded" {
-                        "removed"
-                    } else {
-                        "retained"
+    let operation_key = format!("{}:{}", request.delivery_id, request.copy_id);
+    let result = shared
+        .copy_operations
+        .run(operation_key, async move {
+            let result = tokio::task::spawn_blocking(
+                move || -> Result<nzbd_state::artifacts::ClusterCopyCleanup, String> {
+                    if let Some(local) = copy.local_delivery_id {
+                        let delivery = inventory
+                            .retire_delivery_source(&local)
+                            .map_err(|e| e.to_string())?;
+                        return Ok(nzbd_state::artifacts::ClusterCopyCleanup {
+                            status: if delivery.source_cleanup.status == "succeeded" {
+                                "removed"
+                            } else {
+                                "retained"
+                            }
+                            .into(),
+                            error: delivery.source_cleanup.error,
+                        });
                     }
-                    .into(),
-                    error: delivery.source_cleanup.error,
-                });
-            }
-            if let Some(artifact) = copy.artifact {
-                return inventory
-                    .retire_cluster_artifact_copy(
-                        &artifact,
-                        &authority.outcome,
-                        nzbd_state::artifacts::FinalizationProof::Cluster {
-                            receipt: authority.receipt,
-                            accepted_at_ms: authority.accepted_at_ms,
-                        },
+                    if let Some(artifact) = copy.artifact {
+                        return inventory
+                            .retire_cluster_artifact_copy(
+                                &artifact,
+                                &authority.outcome,
+                                nzbd_state::artifacts::FinalizationProof::Cluster {
+                                    receipt: authority.receipt,
+                                    accepted_at_ms: authority.accepted_at_ms,
+                                },
+                            )
+                            .map_err(|e| e.to_string());
+                    }
+                    let path =
+                        std::path::PathBuf::from(copy.result_ref.ok_or("copy has no result path")?);
+                    let relative = path
+                        .strip_prefix(&root)
+                        .map_err(|_| "copy is outside sealed generation namespace")?;
+                    let identity = copy
+                        .directory_identity
+                        .ok_or("legacy copy has no owned directory identity; review required")?;
+                    if !path.try_exists().map_err(|e| e.to_string())? {
+                        return Ok(nzbd_state::artifacts::ClusterCopyCleanup {
+                            status: "removed".into(),
+                            error: None,
+                        });
+                    }
+                    let files = copy
+                        .deletion_files
+                        .ok_or("copy lacks a durable deletion manifest; retain it for review")?;
+                    nzbd_state::artifacts::remove_cluster_generation_copy(
+                        &root, relative, identity, &files,
                     )
-                    .map_err(|e| e.to_string());
-            }
-            let path = std::path::PathBuf::from(copy.result_ref.ok_or("copy has no result path")?);
-            let relative = path
-                .strip_prefix(&root)
-                .map_err(|_| "copy is outside sealed generation namespace")?;
-            let identity = copy
-                .directory_identity
-                .ok_or("legacy copy has no owned directory identity; review required")?;
-            if !path.try_exists().map_err(|e| e.to_string())? {
-                return Ok(nzbd_state::artifacts::ClusterCopyCleanup {
-                    status: "removed".into(),
-                    error: None,
-                });
-            }
-            let files = copy
-                .deletion_files
-                .ok_or("copy lacks a durable deletion manifest; retain it for review")?;
-            nzbd_state::artifacts::remove_cluster_generation_copy(
-                &root, relative, identity, &files,
+                    .map_err(|e| e.to_string())?;
+                    Ok(nzbd_state::artifacts::ClusterCopyCleanup {
+                        status: "removed".into(),
+                        error: None,
+                    })
+                },
             )
-            .map_err(|e| e.to_string())?;
-            Ok(nzbd_state::artifacts::ClusterCopyCleanup {
-                status: "removed".into(),
-                error: None,
-            })
-        },
-    )
-    .await;
+            .await;
+            let (status, error) = match result {
+                Ok(Ok(result)) => (result.status, result.error),
+                Ok(Err(error)) => ("retry".into(), Some(error)),
+                Err(error) => ("retry".into(), Some(error.to_string())),
+            };
+            // Retained/retry answers may be rechecked after a control change;
+            // a removed answer is exact immutable-copy completion evidence.
+            let code = if status == "removed" {
+                axum::http::StatusCode::OK
+            } else {
+                axum::http::StatusCode::CONFLICT
+            };
+            (
+                code,
+                axum::Json(nzbd_state::artifacts::ClusterCopyCleanup {
+                    status: status.into(),
+                    error,
+                }),
+            )
+                .into_response()
+        })
+        .await;
     let (status, error) = match result {
-        Ok(Ok(result)) => (result.status, result.error),
-        Ok(Err(error)) => ("retry".into(), Some(error)),
-        Err(error) => ("retry".into(), Some(error.to_string())),
+        Ok((_, body)) => {
+            match serde_json::from_slice::<nzbd_state::artifacts::ClusterCopyCleanup>(&body) {
+                Ok(result) => (result.status, result.error),
+                Err(error) => (
+                    "retry".into(),
+                    Some(format!("invalid owned copy completion: {error}")),
+                ),
+            }
+        }
+        Err(error) => ("retry".into(), Some(error)),
     };
     axum::Json(CopyResult {
         copy_id: request.copy_id,
@@ -1051,6 +1092,211 @@ mod tests {
         }
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_wal_reopens_preserving_authority_and_accepts_bounded_large_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let address = "127.0.0.1:1";
+        let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let raft_address = raft.local_addr().unwrap();
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_address = api.local_addr().unwrap();
+        let cfg = crate::ClusterConfig {
+            cluster_id: "receipt-test".into(),
+            node_name: "leader".into(),
+            shared_dir: temp.path().join("shared"),
+            advertise_url: format!("http://{address}"),
+            secret: "secret".into(),
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            pp_slots: 0,
+            lease_interval: Duration::from_millis(100),
+            takeover_after: Duration::from_secs(1),
+            worker_ttl: Duration::from_secs(2),
+            control_dir: temp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: raft_address.to_string(),
+            control_api_bind: api_address.to_string(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
+            disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
+        };
+        drop(raft);
+        drop(api);
+        let old = ControlStore::start_with_wal_size(&cfg, 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        old.seed_job(7, "old-incarnation", "{}").await.unwrap();
+        let claim = old
+            .acquire(
+                "work/job/7/post",
+                "receipt-test",
+                7,
+                "old-incarnation",
+                "worker",
+                "worker-boot",
+                "post",
+                "{}",
+                1,
+                Duration::from_secs(180),
+            )
+            .await
+            .unwrap();
+        let crate::control::LeaseClaim::Acquired(token) = claim else {
+            panic!("fresh lease")
+        };
+        assert!(matches!(
+            old.publish_result(
+                "old-publication",
+                &token,
+                1,
+                "old-result",
+                "/sealed/old",
+                "{}"
+            )
+            .await
+            .unwrap(),
+            crate::control::MutationOutcome::Applied { .. }
+        ));
+        old.seed_job(8, "live-incarnation", "{}").await.unwrap();
+        let claim = old
+            .acquire(
+                "work/job/8/download",
+                "receipt-test",
+                8,
+                "live-incarnation",
+                "worker",
+                "worker-boot",
+                "download",
+                "{}",
+                1,
+                Duration::from_secs(180),
+            )
+            .await
+            .unwrap();
+        let crate::control::LeaseClaim::Acquired(live) = claim else {
+            panic!("fresh live lease")
+        };
+        old.initialize_delivery_identity("old-installation", "leader")
+            .await
+            .unwrap();
+        old.commit_delivery(&record("old-installation", "old-delivery"))
+            .await
+            .unwrap();
+        old.accept_cluster_delivery(
+            "old-delivery",
+            "generation",
+            "digest",
+            "old-consumer-receipt",
+        )
+        .await
+        .unwrap();
+        old.shutdown().await.unwrap();
+        drop(old);
+        let store = ControlStore::start(&cfg).await.unwrap();
+        assert_eq!(
+            store.job_identity(7).await.unwrap(),
+            Some(("old-incarnation".into(), 2))
+        );
+        assert_eq!(
+            store.current_lease("work/job/8/download").await.unwrap(),
+            Some(live)
+        );
+        assert_eq!(
+            store
+                .publication_record("old-publication")
+                .await
+                .unwrap()
+                .unwrap()
+                .result_id,
+            "old-result"
+        );
+        assert_eq!(
+            store
+                .cluster_delivery("old-delivery")
+                .await
+                .unwrap()
+                .unwrap()
+                .delivery
+                .consumer_receipt_id
+                .as_deref(),
+            Some("old-consumer-receipt")
+        );
+        let mut large = record("old-installation", "large-after-upgrade");
+        large.copies.push(CopyObligation {
+            id: "large-proof".into(),
+            owner_node: "offline-owner".into(),
+            artifact: None,
+            local_delivery_id: None,
+            result_ref: Some("/sealed/large".into()),
+            result_id: Some("large-result".into()),
+            directory_identity: Some((1, 2)),
+            deletion_files: Some(
+                (0..60000)
+                    .map(|index| nzbd_state::artifacts::DeliveryFile {
+                        path: format!("files/{index:08}-{}", "p".repeat(80)),
+                        size_bytes: 1,
+                        sha256: "00".repeat(32),
+                    })
+                    .collect(),
+            ),
+            status: "review_required".into(),
+            error: None,
+            claim_id: None,
+            attempts: 0,
+            next_retry_at: None,
+        });
+        assert!(serde_json::to_vec(&large).unwrap().len() > 8 * 1024 * 1024);
+        store.commit_delivery(&large).await.unwrap();
+        assert_eq!(
+            store
+                .cluster_delivery("large-after-upgrade")
+                .await
+                .unwrap()
+                .unwrap()
+                .copies[0]
+                .deletion_files
+                .as_ref()
+                .unwrap()
+                .len(),
+            60000
+        );
+        let escaped = params!("\n".repeat(33 * 1024 * 1024));
+        assert!(bounded_statement(
+            "INSERT INTO cluster_delivery_meta(key,value) VALUES('oversize',?1)",
+            &escaped
+        )
+        .unwrap_err()
+        .contains("64 MiB"));
+        let mut oversized = store
+            .cluster_delivery("old-delivery")
+            .await
+            .unwrap()
+            .unwrap();
+        oversized.delivery.failure_cause = Some("x".repeat(crate::proto::MAX_RPC_BYTES));
+        assert!(store
+            .update_cluster_delivery(&oversized)
+            .await
+            .unwrap_err()
+            .contains("32 MiB"));
+        assert_eq!(
+            store
+                .cluster_delivery("old-delivery")
+                .await
+                .unwrap()
+                .unwrap()
+                .delivery
+                .consumer_receipt_id
+                .as_deref(),
+            Some("old-consumer-receipt")
+        );
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn replicated_delivery_cas_and_real_discovery_preserve_progress_past_bad_rows() {
         let temp = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1111,6 +1357,108 @@ mod tests {
         }
         let store = runtime.control.as_ref().unwrap();
         let instance = store.delivery_instance().await.unwrap();
+        // No broadcast is emitted: the cluster must poll/replay durable facts.
+        let origin = nzbd_types::Job {
+            id: nzbd_types::JobId(800),
+            kind: nzbd_types::JobKind::Nzb,
+            name: "provisional".into(),
+            dir_name: "provisional".into(),
+            name_provisional: true,
+            delivery_lifecycle: false,
+            queued_at_unix: 123,
+            original_name: String::new(),
+            category: Some("old-category".into()),
+            priority: 0,
+            dupe: Default::default(),
+            params: vec![
+                (
+                    "*URL".into(),
+                    "https://invalid.example/admission.nzb".into(),
+                ),
+                ("*URL:AdmissionGeneration".into(), "exact-generation".into()),
+            ],
+            files: Vec::new(),
+            totals: Default::default(),
+            status: nzbd_types::JobStatus::Fetching,
+            torrent: None,
+            stages: Vec::new(),
+        };
+        let mut resolved = origin.clone();
+        resolved.name = "provider-name".into();
+        resolved.dir_name = "provider-dir".into();
+        resolved.name_provisional = false;
+        resolved.category = Some("provider-category".into());
+        resolved.status = nzbd_types::JobStatus::Failed;
+        resolved
+            .params
+            .push(("Failure:Reason".into(), "unsupported NZB".into()));
+        let mut current = origin.clone();
+        current.name = "user-name".into();
+        current.dir_name = "user-dir".into();
+        current.name_provisional = false;
+        current.category = None;
+        current.priority = 9;
+        current
+            .params
+            .push(("*Runner:KeepOnFailure".into(), "1".into()));
+        let serial = runtime.leader_shared.mutation_serial.lock().await;
+        store
+            .seed_job(
+                800,
+                "url-incarnation",
+                &serde_json::to_string(&current).unwrap(),
+            )
+            .await
+            .unwrap();
+        let spool = nzbd_state::artifacts::UrlResolutionStore::open(
+            &runtime.leader_shared.layout.state_dir(),
+        )
+        .unwrap();
+        let prepared = spool.stage(&origin, &resolved).unwrap();
+        drop(spool);
+        let reopened = nzbd_state::artifacts::UrlResolutionStore::open(
+            &runtime.leader_shared.layout.state_dir(),
+        )
+        .unwrap();
+        assert!(reopened
+            .pending(8)
+            .unwrap()
+            .iter()
+            .any(|row| row.resolution_id == prepared.resolution_id));
+        // Crash boundary: replicated commit won, old process died before ACK.
+        assert!(store.commit_url_outbox(&prepared).await.unwrap());
+        drop(serial);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while runtime
+            .engine
+            .url_resolution_outbox(8)
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.resolution_id == prepared.resolution_id)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "startup/poll outbox did not acknowledge durable replay"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let selected = store
+            .load_jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(job, _, _)| job.id.0 == 800)
+            .unwrap()
+            .0;
+        assert_eq!(selected.name, "user-name");
+        assert_eq!(selected.dir_name, "user-dir");
+        assert_eq!(selected.category, None);
+        assert_eq!(selected.priority, 9);
+        assert!(selected
+            .params
+            .contains(&("*Runner:KeepOnFailure".into(), "1".into())));
+        assert_eq!(selected.status, nzbd_types::JobStatus::Failed);
         let mut legacy = record(&instance, "accepted-local").delivery;
         legacy.sequence = 41;
         legacy.accepted_at = Some(5);
@@ -1220,6 +1568,26 @@ mod tests {
         });
         assert!(serde_json::to_vec(&private).unwrap().len() > 8 * 1024 * 1024);
         store.commit_delivery(&private).await.unwrap();
+        let mut excess = record(&instance, "too-many-copies");
+        excess.copies = (0..65)
+            .map(|index| {
+                let mut copy = private.copies[0].clone();
+                copy.id = format!("small-copy-{index}");
+                copy.deletion_files = None;
+                copy
+            })
+            .collect();
+        store.commit_delivery(&excess).await.unwrap();
+        assert_eq!(
+            store
+                .cluster_delivery("too-many-copies")
+                .await
+                .unwrap()
+                .unwrap()
+                .copies
+                .len(),
+            65
+        );
         let final_record = store
             .commit_delivery(&record(&instance, "valid-after-bad"))
             .await
@@ -1246,6 +1614,10 @@ mod tests {
             .collect();
         assert!(by_id["invalid"]["discoveryError"].is_string());
         assert!(by_id["oversized"]["discoveryError"].is_string());
+        assert!(by_id["too-many-copies"]["discoveryError"]
+            .as_str()
+            .unwrap()
+            .contains("64 source copies"));
         assert!(
             by_id["private-proof"].get("discoveryError").is_none(),
             "private deletion proof bytes cannot reject a small public envelope"

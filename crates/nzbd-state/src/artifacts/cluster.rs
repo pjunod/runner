@@ -124,6 +124,18 @@ impl Inventory {
                 "cluster cleanup copy generation or admission changed".into(),
             ));
         }
+        if !artifact.terminal()
+            && (artifact.keep
+                || artifact.hold.is_some()
+                || (!copy.selected && outcome != "SUCCESS" && artifact.keep_on_failure))
+        {
+            return Ok(ClusterCopyCleanup {
+                status: "retained".into(),
+                error: Some(artifact.hold.clone().unwrap_or_else(|| {
+                    "this exact source is retained by its current Keep setting".into()
+                })),
+            });
+        }
         if !copy.selected && outcome != "SUCCESS" && !artifact.terminal() {
             return Ok(ClusterCopyCleanup { status: "retained".into(), error: Some(
                 "partial failure publication does not prove every raw source dependency redundant; retain this exact source until recovery is resolved".into()) });

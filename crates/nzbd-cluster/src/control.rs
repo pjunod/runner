@@ -229,6 +229,12 @@ pub struct PublicationReceipt {
 
 impl ControlStore {
     pub async fn start(cfg: &ClusterConfig) -> Result<Self, String> {
+        Self::start_with_wal_size(cfg, (crate::proto::MAX_RPC_BYTES * 4) as u32).await
+    }
+    pub(crate) async fn start_with_wal_size(
+        cfg: &ClusterConfig,
+        wal_size: u32,
+    ) -> Result<Self, String> {
         std::fs::create_dir_all(&cfg.control_dir)
             .map_err(|error| format!("create control directory: {error}"))?;
         let local_raft: SocketAddr = cfg
@@ -273,7 +279,7 @@ impl ControlStore {
             // One bounded 32 MiB private copy record plus its bounded public
             // projection/transaction overhead must fit a Raft entry. The WAL
             // writer cannot split an entry across segments.
-            wal_size: (crate::proto::MAX_RPC_BYTES * 4) as u32,
+            wal_size,
             raft_config,
             ..NodeConfig::default()
         };
@@ -860,6 +866,101 @@ impl ControlStore {
         }
     }
 
+    /// Drain the durable URL outbox against current replicated intent. Events
+    /// are wake hints only; the immutable resolution ID is the command key.
+    /// True means durable acceptance/replay or a definite durable cancellation.
+    pub(crate) async fn commit_url_outbox(
+        &self,
+        record: &nzbd_state::artifacts::UrlResolutionRecord,
+    ) -> Result<bool, String> {
+        use nzbd_state::artifacts::url_source_identity;
+        if record.resolution_id != record.source_identity
+            || url_source_identity(&record.origin).map_err(|error| error.to_string())?
+                != record.source_identity
+            || record.origin.id != record.resolved.id
+        {
+            return Err("URL outbox identity is invalid; retain record for review".into());
+        }
+        let command_id = format!("url-resolution-outbox:{}", record.resolution_id);
+        if self.command_receipt(&command_id).await?.is_some() {
+            return Ok(true);
+        }
+        let row = self
+            .client
+            .query_consistent_map::<ControlJobStateRow, _>(
+                "SELECT incarnation,revision,intent_json,deleted FROM control_jobs WHERE job_id=?1",
+                params!(i64::from(record.origin.id.0)),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next();
+        let Some(row) = row else { return Ok(false) }; // Admission may still be committing.
+        if row.deleted {
+            return Ok(true);
+        }
+        let prior: nzbd_types::Job =
+            serde_json::from_str(&row.intent_json).map_err(|error| error.to_string())?;
+        if url_source_identity(&prior).ok().as_deref() != Some(record.source_identity.as_str()) {
+            return Ok(true); // The durable row names another request/incarnation.
+        }
+        if !matches!(
+            prior.status,
+            nzbd_types::JobStatus::Fetching | nzbd_types::JobStatus::Paused
+        ) || !prior.files.is_empty()
+        {
+            // A previous authority already resolved this exact admission (or
+            // durable user intent superseded it). Never overwrite later work.
+            return Ok(true);
+        }
+        let mut next = prior.clone();
+        if prior.name == record.origin.name
+            && prior.name_provisional == record.origin.name_provisional
+        {
+            next.name = record.resolved.name.clone();
+            next.name_provisional = record.resolved.name_provisional;
+        }
+        if prior.category.is_none() && record.origin.category.is_none() {
+            next.category = record.resolved.category.clone();
+        }
+        if prior.dir_name == record.origin.dir_name {
+            next.dir_name = record.resolved.dir_name.clone();
+        }
+        next.files = record.resolved.files.clone();
+        next.totals = record.resolved.totals.clone();
+        next.status = if record.resolved.status == nzbd_types::JobStatus::Failed {
+            nzbd_types::JobStatus::Failed
+        } else if prior.status == nzbd_types::JobStatus::Paused
+            || prior.params.iter().any(|(key, _)| key == "*AddPaused")
+            || prior
+                .control()
+                .is_some_and(|control| control.manual_pause || control.lifecycle == "held")
+        {
+            nzbd_types::JobStatus::Paused
+        } else {
+            nzbd_types::JobStatus::Queued
+        };
+        next.params.retain(|(key, _)| key != "*AddPaused");
+        for (key, value) in record
+            .resolved
+            .params
+            .iter()
+            .filter(|(key, _)| matches!(key.as_str(), "Failure:Stage" | "Failure:Reason"))
+        {
+            next.params.retain(|(existing, _)| existing != key);
+            next.params.push((key.clone(), value.clone()));
+        }
+        let next = serde_json::to_string(&next).map_err(|error| error.to_string())?;
+        if next.len() > crate::proto::MAX_DESCRIPTOR_BYTES {
+            return Err("resolved URL descriptor exceeds 16 MiB; retain source for review".into());
+        }
+        let expected = u64::try_from(row.revision).map_err(|error| error.to_string())?;
+        match self.apply_command(&command_id,u64::from(prior.id.0),expected,&serde_json::json!({"op":"url_resolution_outbox","resolutionId":record.resolution_id,"sourceIdentity":record.source_identity}).to_string(),&next,false).await? {
+            MutationOutcome::Applied{..}|MutationOutcome::Duplicate{..}=>Ok(true),
+            MutationOutcome::Conflict=>Ok(false),
+        }
+    }
+
     pub async fn apply_command(
         &self,
         command_id: &str,
@@ -953,6 +1054,58 @@ impl ControlStore {
             Ok(_) => Ok(MutationOutcome::Conflict),
             Err(error) if error.to_string().contains("stale") => Ok(MutationOutcome::Conflict),
             Err(error) => Err(format!("publish result: {error}")),
+        }
+    }
+
+    /// Bulk verification may span heartbeat renewals. The short receipt
+    /// transaction selects the latest exact same operation token, while the
+    /// existing trigger still fences job intent, owner/incarnation and expiry.
+    pub async fn publish_result_renewable(
+        &self,
+        receipt_id: &str,
+        token: &LeaseToken,
+        expected_job_revision: u64,
+        result_id: &str,
+        result_ref: &str,
+        result_job_json: &str,
+    ) -> Result<MutationOutcome, String> {
+        if let Some(revision) = self.publication_receipt(receipt_id).await? {
+            return Ok(MutationOutcome::Duplicate { revision });
+        }
+        let now = unix_ms()?;
+        let sql="INSERT INTO publication_receipts(receipt_id,resource,owner_node_id,owner_incarnation,fence,lease_revision,lease_expiry_ms,expected_job_revision,result_id,result_ref,result_job_json,accepted_at_ms)
+            SELECT ?1,l.resource,l.owner_node_id,l.owner_incarnation,l.fence,l.revision,l.expires_at_ms,?2,?3,?4,?5,?6 FROM work_leases l
+            WHERE l.resource=?7 AND l.owner_node_id=?8 AND l.owner_incarnation=?9 AND l.fence=?10 AND l.revision>=?11 AND l.expires_at_ms>=?12 AND l.expires_at_ms>?6 AND l.terminal=0 AND l.job_revision=?2";
+        let parameters = params!(
+            receipt_id,
+            i64_value("expected job revision", expected_job_revision)?,
+            result_id,
+            result_ref,
+            result_job_json,
+            now,
+            &token.resource,
+            &token.owner_node_id,
+            &token.owner_incarnation,
+            i64_value("fence", token.fence)?,
+            i64_value("lease revision", token.revision)?,
+            token.expires_at_unix_ms
+        );
+        // Binary Raft encoding has no JSON string escaping; this conservative
+        // bound leaves at least half the 128 MiB segment for framing.
+        if serde_json::to_vec(&(sql, &parameters))
+            .map_err(|error| error.to_string())?
+            .len()
+            > 64 * 1024 * 1024
+        {
+            return Err("completion receipt exceeds 64 MiB encoded transaction limit; retain source and reduce metadata".into());
+        }
+        match self.client.execute(sql, parameters).await {
+            Ok(1) => Ok(MutationOutcome::Applied {
+                revision: expected_job_revision.saturating_add(1),
+            }),
+            Ok(_) => Ok(MutationOutcome::Conflict),
+            Err(error) if error.to_string().contains("stale") => Ok(MutationOutcome::Conflict),
+            Err(error) => Err(format!("publish renewed result: {error}")),
         }
     }
 

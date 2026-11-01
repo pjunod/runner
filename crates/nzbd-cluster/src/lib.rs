@@ -108,6 +108,35 @@ pub struct ClusterRuntime {
     tracker: TaskTracker,
 }
 
+async fn drain_url_outbox(shared: &Arc<leader::LeaderShared>) -> Result<(), String> {
+    let records = shared
+        .engine
+        .url_resolution_outbox(8)
+        .await
+        .map_err(|error| error.to_string())?;
+    for record in records {
+        let _serial = shared.mutation_serial.lock().await;
+        if !shared.view.borrow().is_me || !shared.authority_ready() {
+            return Ok(());
+        }
+        let control = shared
+            .control
+            .as_ref()
+            .ok_or("replicated control unavailable")?;
+        if control.commit_url_outbox(&record).await? {
+            // Queue projection is rebuilt only from the just-committed/current
+            // intent. A retry never imports a stale resolved Job over user edits.
+            shared.restore_control_projection().await?;
+            shared
+                .engine
+                .ack_url_resolution(&record.resolution_id)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 impl ClusterRuntime {
     /// Boot the node: engine in worker mode (empty queue; per-node fenced
     /// journals on the shared volume), election, registry, worker loop,
@@ -242,37 +271,22 @@ impl ClusterRuntime {
             cancel.clone(),
             &tracker,
         );
-        // URL fetch is the one queue transition that completes after its API
-        // request. Its placeholder is already durable; resolve only that
-        // exact row, under the same revision and serialization rules.
+        // A URL event is only a wake hint. The shared durable outbox survives
+        // missed broadcasts, failed snapshots and authority process loss.
         {
             let mut events = engine.subscribe();
-            let event_engine = engine.clone();
             let event_shared = leader_shared.clone();
             let event_cancel = cancel.clone();
             tracker.spawn(async move {
                 loop {
-                    let job = tokio::select! {
-                        _ = event_cancel.cancelled() => break,
-                        event = events.recv() => match event {
-                            Ok(nzbd_engine::Event::UrlFetchResolved { job }) => job,
-                            Ok(_) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        }
-                    };
-                    if !event_shared.view.borrow().is_me {
-                        continue;
+                    if event_cancel.is_cancelled(){break;}
+                    if event_shared.view.borrow().is_me && event_shared.authority_ready() {
+                        if let Err(error)=drain_url_outbox(&event_shared).await {tracing::warn!(%error,"URL resolution awaits durable cluster acceptance");}
                     }
-                    let _serial = event_shared.mutation_serial.lock().await;
-                    let desired = event_engine.export_job(job).await.ok().flatten();
-                    let result = match (&event_shared.control, desired) {
-                        (Some(control), Some(job)) => control.commit_url_resolution(&job).await,
-                        _ => Err("resolved URL job disappeared".into()),
-                    };
-                    if let Err(error) = result {
-                        tracing::error!(job = job.0, %error, "URL resolution rolled back");
-                        let _ = event_shared.restore_control_projection().await;
+                    tokio::select! {
+                        _=event_cancel.cancelled()=>break,
+                        _=tokio::time::sleep(Duration::from_secs(1))=>{},
+                        event=events.recv()=>match event {Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,_=>{}}
                     }
                 }
             });

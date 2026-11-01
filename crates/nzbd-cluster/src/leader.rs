@@ -49,6 +49,79 @@ struct BudgetHandoff {
     awaiting_shrink: HashSet<String>,
 }
 
+type CompletionReply = (StatusCode, Vec<u8>);
+#[derive(Default)]
+pub(crate) struct CompletionOperations {
+    entries: Mutex<HashMap<String, watch::Receiver<Option<CompletionReply>>>>,
+}
+impl CompletionOperations {
+    /// Own the whole verified completion through its durable receipt and
+    /// publication, independently of a caller's shorter network deadline.
+    pub(crate) async fn run<F>(&self, key: String, work: F) -> Result<CompletionReply, String>
+    where
+        F: std::future::Future<Output = Response> + Send + 'static,
+    {
+        let mut receiver = {
+            let mut entries = self.entries.lock().unwrap();
+            if entries.get(&key).is_some_and(|receiver| {
+                receiver
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|(status, _)| !status.is_success())
+            }) {
+                entries.remove(&key);
+            }
+            if let Some(receiver) = entries.get(&key) {
+                receiver.clone()
+            } else {
+                while entries.len() >= 32 {
+                    let finished = entries
+                        .iter()
+                        .find(|(_, receiver)| receiver.borrow().is_some())
+                        .map(|(key, _)| key.clone());
+                    match finished {
+                        Some(key) => {
+                            entries.remove(&key);
+                        }
+                        None => {
+                            return Err(
+                                "32 completion operations are active; retry after one finishes"
+                                    .into(),
+                            )
+                        }
+                    }
+                }
+                let (sender, receiver) = watch::channel(None);
+                entries.insert(key, receiver.clone());
+                tokio::spawn(async move {
+                    let response = work.await;
+                    let status = response.status();
+                    let reply = match axum::body::to_bytes(response.into_body(), MAX_RPC_BYTES)
+                        .await
+                    {
+                        Ok(body) => (status, body.to_vec()),
+                        Err(error) => (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("completion reply could not be retained: {error}").into_bytes(),
+                        ),
+                    };
+                    let _ = sender.send(Some(reply));
+                });
+                receiver
+            }
+        };
+        loop {
+            if let Some(reply) = receiver.borrow().clone() {
+                return Ok(reply);
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| "completion operation ended without a durable result".to_owned())?;
+        }
+    }
+}
+
 pub struct LeaderShared {
     pub engine: EngineHandle,
     pub layout: SharedLayout,
@@ -73,6 +146,15 @@ pub struct LeaderShared {
     /// With one descriptor per poll, alternate the first lane so a stream of
     /// downloads cannot starve a worker's free post-processing capacity.
     post_poll_turn: Mutex<HashSet<String>>,
+    completion_operations: CompletionOperations,
+    pub(crate) copy_operations: CompletionOperations,
+    #[cfg(test)]
+    verification_gate: Mutex<Option<Arc<VerificationGate>>>,
+}
+#[cfg(test)]
+struct VerificationGate {
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
 }
 
 pub(crate) struct LeaderDurability {
@@ -129,6 +211,10 @@ impl LeaderShared {
             delivery_serial: tokio::sync::Mutex::new(()),
             authority_ready: AtomicBool::new(false),
             post_poll_turn: Mutex::new(HashSet::new()),
+            completion_operations: CompletionOperations::default(),
+            copy_operations: CompletionOperations::default(),
+            #[cfg(test)]
+            verification_gate: Mutex::new(None),
         })
     }
 
@@ -1260,6 +1346,37 @@ async fn work_complete(
     if !authed(&s, &headers) {
         return denied();
     }
+    if !s.is_leader() || !s.authority_ready() {
+        return authority_not_ready();
+    }
+    use sha2::{Digest, Sha256};
+    let key = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&req).expect("completion serializes"))
+    );
+    let operation_owner = s.clone();
+    match s
+        .completion_operations
+        .run(key, async move {
+            complete_operation(operation_owner, req).await
+        })
+        .await
+    {
+        Ok((status, body)) => (
+            status,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":error})),
+        )
+            .into_response(),
+    }
+}
+
+async fn complete_operation(s: Arc<LeaderShared>, req: CompleteRequest) -> Response {
     if !s.is_leader() {
         return not_leader();
     }
@@ -1372,29 +1489,34 @@ async fn work_complete(
     };
     let verify_job = req.job.clone();
     let verify_fence = req.token.fence;
+    #[cfg(test)]
+    {
+        let gate = s.verification_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.entered.add_permits(1);
+            let _permit = gate.release.acquire().await.unwrap();
+        }
+    }
     let verified = if already_ready.is_some() {
-        Ok(Ok(Ok(())))
+        Ok(Ok(()))
     } else {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            tokio::task::spawn_blocking(move || {
-                verify_generation(
-                    &verify_root,
-                    &verify_ref,
-                    &verify_id,
-                    verify_job_incarnation.as_deref(),
-                    verify_fence,
-                    &verify_job,
-                )
-            }),
-        )
+        tokio::task::spawn_blocking(move || {
+            verify_generation(
+                &verify_root,
+                &verify_ref,
+                &verify_id,
+                verify_job_incarnation.as_deref(),
+                verify_fence,
+                &verify_job,
+            )
+        })
         .await
     };
-    if !matches!(verified, Ok(Ok(Ok(())))) {
-        tracing::warn!(job = job_id.0, owner_incarnation = %verify_incarnation, "completion generation validation failed or timed out");
+    if !matches!(verified, Ok(Ok(()))) {
+        tracing::warn!(job=job_id.0,owner_incarnation=%verify_incarnation,"completion generation validation failed");
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({"error": "invalid completion generation"})),
+            Json(serde_json::json!({"error":"invalid completion generation"})),
         )
             .into_response();
     }
@@ -1412,7 +1534,7 @@ async fn work_complete(
                     }
                 };
             control
-                .publish_result(
+                .publish_result_renewable(
                     &req.receipt_id,
                     &req.token,
                     req.expected_job_revision,
@@ -1620,8 +1742,8 @@ fn publication_retry_matches(
         && receipt.owner_node_id == request.token.owner_node_id
         && receipt.owner_incarnation == request.token.owner_incarnation
         && receipt.fence == request.token.fence
-        && receipt.lease_revision == request.token.revision
-        && receipt.lease_expiry_ms == request.token.expires_at_unix_ms
+        && receipt.lease_revision >= request.token.revision
+        && receipt.lease_expiry_ms >= request.token.expires_at_unix_ms
         && receipt.expected_job_revision == request.expected_job_revision
         && receipt.result_id == request.result_id
         && receipt.result_ref == request.result_ref
@@ -2649,6 +2771,275 @@ mod tests {
             torrent: None,
             stages: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn completion_request_timeout_joins_one_whole_operation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let operations = Arc::new(CompletionOperations::default());
+        let count = Arc::new(AtomicUsize::new(0));
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        let first = operations.clone();
+        let runs = count.clone();
+        let caller = tokio::spawn(async move {
+            first
+                .run("exact-receipt-and-token".into(), async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    entered.send(()).unwrap();
+                    blocked.await.unwrap();
+                    // This represents the final durable receipt/publication response,
+                    // never a cached standalone hash verdict.
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({"durableReceipt":"committed"})),
+                    )
+                        .into_response()
+                })
+                .await
+        });
+        started.await.unwrap();
+        caller.abort(); // Network deadline expires while verification owns work.
+        let second = operations.clone();
+        let runs = count.clone();
+        let retry = tokio::spawn(async move {
+            second
+                .run("exact-receipt-and-token".into(), async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    panic!("retry must join the active completion instead of hashing again")
+                })
+                .await
+        });
+        release.send(()).unwrap();
+        let (status, body) = retry.await.unwrap().unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert!(String::from_utf8(body).unwrap().contains("committed"));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn slow_actual_completion_survives_caller_drop_and_lease_renewal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = SharedLayout::new(tmp.path(), "leader").unwrap();
+        let mut cfg = ClusterConfig {
+            cluster_id: "test".into(),
+            node_name: "leader".into(),
+            shared_dir: tmp.path().to_path_buf(),
+            advertise_url: "http://leader.invalid".into(),
+            secret: "secret".into(),
+            coordinator: true,
+            priority: 0,
+            download: true,
+            max_download_jobs: 1,
+            post_process: true,
+            pp_slots: 1,
+            lease_interval: std::time::Duration::from_secs(1),
+            takeover_after: std::time::Duration::from_secs(2),
+            worker_ttl: std::time::Duration::from_secs(3),
+            control_dir: tmp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: "127.0.0.1:38110".into(),
+            control_api_bind: "127.0.0.1:38210".into(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
+            disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
+        };
+        let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        cfg.control_raft_bind = raft.local_addr().unwrap().to_string();
+        cfg.control_api_bind = api.local_addr().unwrap().to_string();
+        cfg.control_dir = tmp.path().join("control");
+        drop(raft);
+        drop(api);
+        let control = ControlStore::start(&cfg).await.unwrap();
+        let engine = Engine::spawn(EngineConfig::single_node(
+            Vec::new(),
+            tmp.path().join("engine"),
+            tmp.path().join("dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let (_view_tx, view) = watch::channel(LeaderView {
+            record: Some(LeaderRecord {
+                epoch: 1,
+                node: "leader".into(),
+                api_url: "http://leader.invalid".into(),
+                seq: 1,
+            }),
+            is_me: true,
+        });
+        let shared = LeaderShared::new(
+            engine.clone(),
+            layout,
+            tmp.path().join("dest"),
+            cfg,
+            Vec::new(),
+            view,
+            LeaderDurability::new(Some(control.clone()), None, "leader-boot".into()),
+        );
+        shared.authority_ready.store(true, Ordering::Release);
+        let mut job = test_job(7);
+        job.status = JobStatus::Completed;
+        job.params
+            .push(("large-metadata".into(), "x".repeat(2 * 1024 * 1024)));
+        control
+            .seed_job(
+                7,
+                "exact-job-incarnation",
+                &serde_json::to_string(&job).unwrap(),
+            )
+            .await
+            .unwrap();
+        let claim = control
+            .acquire(
+                "work/job/7/download",
+                "test",
+                7,
+                "exact-job-incarnation",
+                "worker",
+                "worker-boot",
+                "download",
+                "{}",
+                1,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let LeaseClaim::Acquired(token) = claim else {
+            panic!("fresh lease")
+        };
+        let generation = tmp.path().join(".nzbd-cluster/generations/slow");
+        std::fs::create_dir_all(generation.join("files")).unwrap();
+        let payload = b"durable payload";
+        std::fs::write(generation.join("files/payload.mkv"), payload).unwrap();
+        let bytes = serde_json::to_vec(&job).unwrap();
+        std::fs::write(generation.join("job.json"), &bytes).unwrap();
+        use sha2::{Digest, Sha256};
+        let files = vec![crate::worker::GenerationFile {
+            path: "payload.mkv".into(),
+            bytes: payload.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(payload)),
+        }];
+        let job_sha = format!("{:x}", Sha256::digest(&bytes));
+        let id = format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(7u32, "exact-job-incarnation", token.fence, &job_sha, &files))
+                    .unwrap()
+            )
+        );
+        let manifest = crate::worker::GenerationManifest {
+            job_id: 7,
+            job_incarnation: "exact-job-incarnation".into(),
+            owner_node_id: "worker".into(),
+            fence: token.fence,
+            result_id: id.clone(),
+            job_sha256: job_sha,
+            files,
+            total_bytes: payload.len() as u64,
+            sealed_at_unix_ms: 1,
+            artifact_copy: None,
+            directory_identity: None,
+            file_outcomes: Vec::new(),
+            identity_version: 0,
+        };
+        std::fs::write(
+            generation.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let lease_id = "work/job/7/download@1".to_owned();
+        shared.leases.lock().unwrap().insert(
+            lease_id.clone(),
+            LeaseInfo {
+                job: job.id,
+                node: "worker".into(),
+                kind: LeaseKind::Download,
+                token: token.clone(),
+                job_revision: 1,
+                control_revision: 1,
+                last_hb: Instant::now(),
+            },
+        );
+        let gate = Arc::new(VerificationGate {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        *shared.verification_gate.lock().unwrap() = Some(gate.clone());
+        let request = CompleteRequest {
+            lifecycle_protocol: LIFECYCLE_PROTOCOL,
+            node: "worker".into(),
+            lease_id,
+            token: token.clone(),
+            expected_job_revision: 1,
+            result_id: id.clone(),
+            result_ref: generation.to_string_lossy().into_owned(),
+            receipt_id: "slow-receipt".into(),
+            job,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(SECRET_HEADER, "secret".parse().unwrap());
+        let first = tokio::spawn(work_complete(
+            State(shared.clone()),
+            headers.clone(),
+            Json(request.clone()),
+        ));
+        gate.entered.acquire().await.unwrap().forget();
+        first.abort(); // Simulate network deadline while bulk verification owns work.
+        let renewed = control
+            .renew(&token, std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        let renewed = control
+            .renew(&renewed, std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        shared
+            .leases
+            .lock()
+            .unwrap()
+            .get_mut(&request.lease_id)
+            .unwrap()
+            .token = renewed.clone();
+        let retry = tokio::spawn(work_complete(
+            State(shared.clone()),
+            headers,
+            Json(request.clone()),
+        ));
+        gate.release.add_permits(1);
+        let response = retry.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            gate.entered.available_permits(),
+            0,
+            "retry did not start another verification"
+        );
+        let receipt = control
+            .publication_record("slow-receipt")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.lease_revision, renewed.revision);
+        assert!(publication_retry_matches(
+            &receipt,
+            &request,
+            LeaseKind::Download
+        ));
+        let mut stale = request;
+        stale.token.owner_incarnation.push_str("-different");
+        assert!(!publication_retry_matches(
+            &receipt,
+            &stale,
+            LeaseKind::Download
+        ));
+        engine.shutdown().await;
+        control.shutdown().await.unwrap();
     }
 
     #[test]
