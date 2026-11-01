@@ -199,6 +199,38 @@ impl Inventory {
         })
     }
 
+    pub fn worker_completion_accepted(
+        &self,
+        context: &WorkerControlContext,
+        source: &SourceGeneration,
+    ) -> Result<bool> {
+        let id = format!("{}:{}", source.artifact, source.generation);
+        let receipt: Option<String> = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT data FROM worker_completion_receipts WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(receipt) = receipt else {
+            return Ok(false);
+        };
+        let (accepted_context, accepted_source, _): (
+            WorkerControlContext,
+            SourceGeneration,
+            FinalizationProof,
+        ) = serde_json::from_str(&receipt)?;
+        if accepted_context != *context || accepted_source != *source {
+            return Err(Error::Conflict(
+                "accepted worker completion identity changed".into(),
+            ));
+        }
+        Ok(true)
+    }
+
     /// Compact the duplicate descriptor only after a durable cluster receipt
     /// and cleanup obligation exist. Keep the exact small acceptance proof.
     pub fn acknowledge_worker_completion(

@@ -3068,8 +3068,29 @@ impl Owner {
             }
             // Acceptance is terminal. Late selected-outcome preparations may
             // acknowledge it but must never regress PP_DONE or queue state.
+            match self
+                .artifacts
+                .worker_completion_accepted(&proof.context, &proof.source)
+            {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(_) => return false,
+            }
             if proof.accepted {
                 return true;
+            }
+            if let Some(done) = self.state.job(job.id).and_then(|current| {
+                current
+                    .params
+                    .iter()
+                    .find(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                    .map(|(_, value)| value)
+            }) {
+                return job
+                    .params
+                    .iter()
+                    .find(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                    .is_none_or(|(_, value)| value == done);
             }
             true
         } else {
@@ -7806,6 +7827,8 @@ mod tests {
             .import_worker_job_if_present(marker.clone())
             .await
             .unwrap());
+        let prepared_before_acceptance = inventory.prepare_worker_completion(&marker).unwrap();
+        assert!(!prepared_before_acceptance.accepted);
         let mut terminal = marker.clone();
         terminal.status = JobStatus::Completed;
         terminal
@@ -7828,6 +7851,20 @@ mod tests {
                 },
             )
             .unwrap();
+        let (reply, result) = oneshot::channel();
+        engine
+            .send(QueueCommand::ImportJobIfPresent {
+                job: Box::new(marker.clone()),
+                require_snapshot: false,
+                completion_proof: Some(prepared_before_acceptance),
+                reply,
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.await.unwrap(),
+            "actor must recheck acceptance committed after preparation"
+        );
         assert!(engine.import_worker_job_if_present(marker).await.unwrap());
         let job = engine.export_job(JobId(85)).await.unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Completed);
