@@ -37,10 +37,12 @@ opening History does not claim that the app imported a job or replace its
 ## Queue activity and torrent seeding
 
 The native queue uses the same lifecycle rules as the web: Downloading,
-Fetching NZB, Fetching torrent metadata, Checking torrent files, post-processing stages, Seeding, Completed, and Waiting. Completed means a
-verified torrent is retained with seeding stopped; it does not mean an import
-into a library or a move to History. Checking, missing files, and failures take
-precedence over stale readiness.
+Fetching NZB, Fetching torrent metadata, Checking torrent files,
+post-processing stages, Seeding, Completed, and Waiting. For an ordinary seed
+source, Completed means its verified payload is retained with seeding stopped;
+it does not mean a library import or a move to History. An acquisition child
+completes through publication and handoff instead of this seed-retention rule.
+Checking, missing files, and failures take precedence over stale readiness.
 
 Tap Seeding, Completed, or Waiting to collapse it. Counts and transfer totals
 continue updating while cards are hidden. The device remembers these display
