@@ -1,6 +1,6 @@
 # Lifecycle remediation — remaining fixes and delivery status
 
-**Status:** implementation active; not reviewed, tested, merged or deployed.
+**Status:** implementation and primary review active; final gates and merge pending.
 **Started:** 2026-11-01.
 
 Companion to the approved download lifecycle proposal and API documentation.
@@ -26,15 +26,15 @@ outside compiler caches in the task's durable evidence directory.
 
 | Slice | State | Evidence |
 |---|---|---|
-| Runner publication retries, resource holds, custody, Keep and durable queue mutations | Assigned | None yet |
-| Runner real partial repair, native books, safe sidecars and classification | Assigned | None yet |
-| Curator discovery, atomic import ledger, replacement ownership and manual intent | Assigned | None yet |
+| Runner publication retries, resource holds, custody, Keep and durable queue mutations | First checkpoint integrated; review fixes and regressions active | State commit 3f47dce; integration 7bfb82ea |
+| Runner real partial repair, native books, safe sidecars and classification | Integrated; focused regressions pass | POST a2aa622 and bf4c21ca; integration 78555830 and 8727681a |
+| Curator discovery, atomic import ledger, replacement ownership and manual intent | Implementation and primary review active | No final checkpoint yet |
 | Curator upgrade distinction, stale batches, storage explanation and reviewed acceptance | Pending | None yet |
-| Cluster durable Delivery, copy retirement, URL replay and RPC bounds | Pending | None yet |
+| Cluster durable Delivery, copy retirement, URL replay and RPC bounds | Cluster design reviewed; implementation active | Stable replicated consumer identity; separate node storage identities |
 | Native torrent independent publication and seeding custody | Pending | None yet |
 | Joined timing, usable controls and desktop/mobile acceptance | Pending | None yet |
 | Real Runner–Curator/cluster/torrent integration evidence | Pending | None yet |
-| Primary integration review | Pending | None yet |
+| Primary integration review | Active | Review found retry scheduling CAS, intact partial dependency, probe routing and discovery bounds gaps; fixes underway |
 | Final Astra review | Pending | None yet |
 | Full tests, coverage and required CI | Pending | None yet |
 | PRs and merge | Pending | None yet |
@@ -42,8 +42,11 @@ outside compiler caches in the task's durable evidence directory.
 
 ## 3. Validation and claims
 
-No test result is claimed for this continuation yet. Narrow regressions may
-establish a specific fix; they do not replace final gates. Final reports must
+Focused POST regressions pass for native book publication, failed-health repair,
+retained dependencies, deletion replay, exact repair IDs, title classification,
+junk-only completion and persistent retry scheduling against the integrated
+state checkpoint. State compilation passed; additional fault regressions remain
+active. These checks establish specific fixes and do not replace final gates. Final reports must
 name exact tested commits, toolchains, commands, limitations and review outcome.
 
 Curator gates include lint, Go tests, coverage, web tests/build, mobile checks,
