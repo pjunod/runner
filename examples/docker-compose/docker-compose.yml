@@ -25,6 +25,7 @@ services:
     #     NZBD_GIT_DESCRIBE: ${NZBD_GIT_DESCRIBE:-}
     container_name: nzbd
     restart: unless-stopped
+    stop_grace_period: 30s
     depends_on:
       nzbd-init:
         condition: service_completed_successfully
@@ -45,8 +46,8 @@ services:
       - TZ=Etc/UTC
       # - RUST_LOG=info
     healthcheck:
-      # The binary doubles as its own health probe (hits the local API).
-      test: ["CMD", "nzbd", "status", "--url", "127.0.0.1:6789"]
+      # Local bootstrap monitor starts before config or storage recovery.
+      test: ["CMD", "nzbd", "health"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -80,7 +81,7 @@ services:
     command: ["advertise", "--name", "${NZBD_DISCOVERY_NAME:-nzbd}", "--port", "6789"]
     depends_on:
       nzbd:
-        condition: service_healthy
+        condition: service_started
 
   # Typical companion — uncomment to run Sonarr alongside and add nzbd as
   # its NZBGet download client at host "nzbd", port 6789.

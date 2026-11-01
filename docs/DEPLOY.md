@@ -175,6 +175,8 @@ Useful lifecycle commands:
 
 ```sh
 docker exec -it nzbd nzbd status --url 127.0.0.1:6789   # queue as JSON
+docker exec nzbd nzbd health                            # local control health
+docker exec nzbd nzbd health --ready                    # secure public listener ready
 docker cp show.nzb nzbd:/tmp/ && docker exec nzbd nzbd add /tmp/show.nzb
 
 # Upgrade to the latest image
@@ -291,6 +293,46 @@ python3 scripts/check-compose-permissions.py
 
 Compose applies a config-file change on `docker compose up -d`, not on
 `restart`.
+
+### Container health and discovery startup
+
+The shipped Compose recipes run `nzbd health` as an exec healthcheck. It
+uses the local bootstrap monitor at `127.0.0.1:6790`, independent of the
+public API port and configuration. The monitor starts before volume-backed
+configuration and storage work, and its `/healthz` and `/readyz` responses
+contain only nonsecret status. The health command has a 2-second deadline;
+Compose allows 5 seconds for process startup and response.
+
+Compose health means the control service can answer local checks. It does
+not mean the queue has loaded, payload verification is complete, or every
+storage root is usable. `nzbd health --ready` instead exits successfully
+when the configured secure public control listener responds. Check the
+application status for queue loading, blocked storage, and recovery
+progress.
+
+Discovery depends on `service_started`, so its advertiser can start while
+nzbd is recovering. This service advertises an endpoint; it does not promise
+that downloads are ready. `docker compose up -d` can therefore start both
+services without waiting for health. `docker compose up --wait` still waits
+for the daemon's healthcheck according to Compose's own wait behavior.
+
+The monitor bind address defaults to `127.0.0.1:6790`. Set
+`NZBD_MONITOR_BIND` in the container environment if you need another local
+port; daemon and exec health processes inherit the same setting. The value
+must be a numeric loopback address. Do not use the CLI flag only for the
+daemon when a separate health process must reach it. Monitor bind failures,
+including port conflicts, fail startup before configuration or storage I/O.
+The monitor has no configuration-file or trust-material dependency.
+
+When a probe command changes, deploy the image and Compose recipe as one
+versioned pair. Rollback restores both together because an older binary
+without `nzbd health` will fail the new check. Keep the previous image
+reference and recipe available, and do not apply the new probe before the
+supporting image exists. The transitional
+`nzbd health --url http://127.0.0.1:6789` form checks the public listener
+for deployments intentionally using the earlier interface; it remains
+available in the final image. HTTPS is also accepted for a literal loopback
+target only, without reading configuration or credentials.
 
 ## Kubernetes
 
