@@ -10475,15 +10475,15 @@ mod tests {
                 JobId(94),
                 revision.clone(),
                 RetryBy::Operator,
-                Arc::new(move || observed.fetch_add(1, Ordering::SeqCst) < 2),
+                Arc::new(move || observed.fetch_add(1, Ordering::SeqCst) < 6),
             )
             .await
             .unwrap();
         assert!(expired.is_err());
         assert_eq!(
             checks.load(Ordering::SeqCst),
-            3,
-            "checked before preparation, before mount probe, and at actor commit"
+            7,
+            "checked throughout custody preparation and again at actor commit"
         );
         assert_eq!(
             engine

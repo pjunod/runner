@@ -1361,10 +1361,28 @@ impl Inventory {
     /// Return the exact version whose physical custody was checked. A caller
     /// can carry this version to a short actor CAS without rereading paths.
     pub fn prepare_post_retry(&self, job: u32) -> Result<Artifact> {
+        self.prepare_post_retry_inner(job, &|| Ok(()), true)
+    }
+
+    pub fn prepare_post_retry_checked(
+        &self,
+        job: u32,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> Result<Artifact> {
+        self.prepare_post_retry_inner(job, checkpoint, false)
+    }
+
+    fn prepare_post_retry_inner(
+        &self,
+        job: u32,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+        retire_sources: bool,
+    ) -> Result<Artifact> {
+        checkpoint()?;
         // A journaled rename may already have moved the old source path.
         // Resume only its exact retryable operation before checking the new
         // committed source; review and deletion operations remain fenced.
-        self.resume_post_relocation(job)?;
+        self.resume_post_relocation_checked(job, checkpoint, retire_sources)?;
         let source = {
             let _guard = self.mutation_guard()?;
             let source = self.for_job(job)?.ok_or(Error::NotFound)?;
@@ -1373,6 +1391,7 @@ impl Inventory {
         };
         let root = self.verify(&source)?;
         for entry in source.files.iter().filter(|e| !e.identity.directory) {
+            checkpoint()?;
             let file = fs::open_relative(&root, &entry.path)?;
             if fs::identity_for_file(&file)? != entry.identity {
                 return Err(Error::Conflict(
@@ -1380,6 +1399,7 @@ impl Inventory {
                 ));
             }
         }
+        checkpoint()?;
         let _guard = self.mutation_guard()?;
         let current = self.for_job(job)?.ok_or(Error::NotFound)?;
         if (&current.id, &current.generation, current.revision)

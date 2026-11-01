@@ -147,7 +147,13 @@ impl Drop for RelocationLease<'_> {
     }
 }
 impl Inventory {
-    pub(super) fn resume_post_relocation(&self, job: u32) -> Result<()> {
+    pub(super) fn resume_post_relocation_checked(
+        &self,
+        job: u32,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+        retire_sources: bool,
+    ) -> Result<()> {
+        checkpoint()?;
         let (artifact, key) = {
             let _guard = self.mutation_guard()?;
             let Some(source) = self.for_job(job)? else {
@@ -177,11 +183,18 @@ impl Inventory {
                 ));
             }
             let mut operation = pending.into_iter().next().unwrap();
+            checkpoint()?;
             operation.next_retry = 0;
             save_operation(&self.db.lock().unwrap(), &operation)?;
             (source.id, operation.id)
         };
-        self.reconcile_relocations_filtered(false, Some(&artifact))?;
+        self.reconcile_relocations_filtered_checked(
+            false,
+            Some(&artifact),
+            checkpoint,
+            retire_sources,
+        )?;
+        checkpoint()?;
         let current = self.operation(&key)?;
         if current.state != "succeeded" {
             return Err(Error::Conflict(current.error.unwrap_or_else(|| {
@@ -601,6 +614,7 @@ impl Inventory {
             }
         }
         for directory in &directories {
+            checkpoint()?;
             crate::fileops::parents(&scratch.path, directory)?;
             fs::open_relative(
                 &scratch_root,
@@ -688,8 +702,10 @@ impl Inventory {
                     .into_iter()
                     .find(|observed| observed.path == temp_name)
                     .ok_or_else(|| Error::Conflict("temporary copy disappeared".into()))?;
+                checkpoint()?;
                 fs::remove_entry(&scratch_root, &temp_entry)?;
             }
+            checkpoint()?;
             let mut output = fs::create_file_exclusive_at(&scratch_root, temp_path)?;
             let created_identity = fs::identity_for_file(&output)?;
             let mut bytes = 0u64;
@@ -739,6 +755,7 @@ impl Inventory {
                 ));
             }
             drop(output);
+            checkpoint()?;
             fs::rename_exclusive(&scratch.path.join(&temp_name), &scratch.path.join(relative))?;
             fs::sync_directory(&target_parent)?;
         }
@@ -2056,6 +2073,17 @@ impl Inventory {
         include_review: bool,
         artifact: Option<&str>,
     ) -> Result<()> {
+        self.reconcile_relocations_filtered_checked(include_review, artifact, &|| Ok(()), true)
+    }
+
+    fn reconcile_relocations_filtered_checked(
+        &self,
+        include_review: bool,
+        artifact: Option<&str>,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+        retire_sources: bool,
+    ) -> Result<()> {
+        checkpoint()?;
         let mut guard = Some(self.mutation_guard()?);
         let raws = {
             let db = self.db.lock().unwrap();
@@ -2067,6 +2095,7 @@ impl Inventory {
         };
         let mut retired = Vec::new();
         for raw in raws {
+            checkpoint()?;
             let mut op: Operation = serde_json::from_str(&raw)?;
             if !self.relocation_active.lock().unwrap().insert(op.id.clone()) {
                 continue;
@@ -2091,6 +2120,7 @@ impl Inventory {
                 continue;
             }
             let recovered = (|| {
+                checkpoint()?;
                 if movement.publication.is_none() && !movement.registry {
                     let (source_path, suffix) = match &movement.scratch {
                         Some(scratch) => (scratch.path.clone(), "copy"),
@@ -2103,12 +2133,13 @@ impl Inventory {
                         .operation(&format!("publish-{publication_key}"))
                         .is_ok()
                     {
-                        movement.publication = Some(self.publish_directory_unlocked(
+                        movement.publication = Some(self.publish_directory_unlocked_checked(
                             &mut guard,
                             &source_path,
                             &movement.destination,
                             &op.artifact,
                             &publication_key,
+                            checkpoint,
                         )?);
                         let current_op = self.operation(&op.id)?;
                         if current_op.request != op.request
@@ -2135,6 +2166,7 @@ impl Inventory {
                         drop(guard.take());
                         let checkpoints = std::sync::atomic::AtomicUsize::new(0);
                         let copy_checkpoint = || {
+                            checkpoint()?;
                             use std::sync::atomic::Ordering;
                             if checkpoints
                                 .fetch_add(1, Ordering::Relaxed)
@@ -2173,6 +2205,7 @@ impl Inventory {
                             &copy_checkpoint,
                         )?;
                         guard = Some(self.mutation_guard()?);
+                        checkpoint()?;
                         let current_op = self.operation(&op.id)?;
                         if current_op.request != op.request
                             || !matches!(current_op.state.as_str(), "running" | "review" | "retry")
@@ -2206,12 +2239,13 @@ impl Inventory {
                         save_operation(&tx, &op)?;
                         tx.commit()?;
                         drop(db);
-                        let published = self.publish_directory_unlocked(
+                        let published = self.publish_directory_unlocked_checked(
                             &mut guard,
                             &scratch.path,
                             &movement.destination,
                             &op.artifact,
                             &publication_key,
+                            checkpoint,
                         )?;
                         let current_op = self.operation(&op.id)?;
                         if current_op.request != op.request
@@ -2254,6 +2288,7 @@ impl Inventory {
                         drop(guard.take());
                         let _capacity = crate::capacity::reserve(root, bytes)?;
                         guard = Some(self.mutation_guard()?);
+                        checkpoint()?;
                         let current_op = self.operation(&op.id)?;
                         if !matches!(current_op.state.as_str(), "running" | "review" | "retry")
                             || current_op.request != op.request
@@ -2263,6 +2298,7 @@ impl Inventory {
                                 "relocation authority changed before staging retry".into(),
                             ));
                         }
+                        checkpoint()?;
                         let scratch_path = root.join(format!(".runner-{}", op.id));
                         match fs::open_dir(&scratch_path) {
                             Ok(existing) if fs::names(&existing)?.is_empty() => {}
@@ -2274,6 +2310,7 @@ impl Inventory {
                             Err(Error::Io(error))
                                 if error.kind() == std::io::ErrorKind::NotFound =>
                             {
+                                checkpoint()?;
                                 std::fs::create_dir(&scratch_path)?;
                                 fs::sync_directory(&root_dir)?;
                             }
@@ -2293,6 +2330,7 @@ impl Inventory {
                         scratch.owned = true;
                         scratch.keep = true;
                         scratch.hold = Some("review: relocation staging".into());
+                        checkpoint()?;
                         self.sidecar(&scratch)?;
                         movement.scratch = Some(scratch.clone());
                         op.request = serde_json::to_string(&movement)?;
@@ -2306,6 +2344,7 @@ impl Inventory {
 
                         let checkpoints = std::sync::atomic::AtomicUsize::new(0);
                         let copy_checkpoint = || {
+                            checkpoint()?;
                             use std::sync::atomic::Ordering;
                             if checkpoints
                                 .fetch_add(1, Ordering::Relaxed)
@@ -2344,6 +2383,7 @@ impl Inventory {
                             &copy_checkpoint,
                         )?;
                         guard = Some(self.mutation_guard()?);
+                        checkpoint()?;
                         let current_op = self.operation(&op.id)?;
                         if current_op.request != op.request
                             || !matches!(current_op.state.as_str(), "running" | "review" | "retry")
@@ -2369,12 +2409,13 @@ impl Inventory {
                         tx.commit()?;
                         drop(db);
                         let publication_key = format!("{}-copy", op.id);
-                        movement.publication = Some(self.publish_directory_unlocked(
+                        movement.publication = Some(self.publish_directory_unlocked_checked(
                             &mut guard,
                             &scratch.path,
                             &movement.destination,
                             &op.artifact,
                             &publication_key,
+                            checkpoint,
                         )?);
                         let current_op = self.operation(&op.id)?;
                         if current_op.request != op.request
@@ -2390,6 +2431,7 @@ impl Inventory {
                         save_operation(&self.db.lock().unwrap(), &op)?;
                     }
                 }
+                checkpoint()?;
                 self.commit_relocation(&mut op, &mut movement)
             })();
             if let Err(e) = recovered {
@@ -2448,6 +2490,9 @@ impl Inventory {
             {
                 retired.push(op.id);
             }
+        }
+        if !retire_sources {
+            return Ok(());
         }
         {
             let db = self.db.lock().unwrap();
@@ -2581,5 +2626,128 @@ impl Inventory {
         event(&tx, &source.id, "relocation_abandoned", &op.id)?;
         tx.commit()?;
         Ok(source)
+    }
+}
+
+#[cfg(test)]
+mod lease_replay_tests {
+    use super::*;
+    #[test]
+    fn checked_relocation_stops_on_midcopy_lease_expiry_then_recovers_same_attempt() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("working");
+        let completed = temporary.path().join("completed");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&completed).unwrap();
+        let inventory = Inventory::open(&temporary.path().join("state")).unwrap();
+        let source = root.join("source");
+        let target = completed.join("release");
+        inventory
+            .allocate_for_delivery(19, &root, &source, true, true)
+            .unwrap();
+        let bytes = vec![9u8; 256 * 1024];
+        std::fs::write(source.join("episode.mkv"), &bytes).unwrap();
+        let artifact = inventory.finish(19, &source, &root, "active").unwrap();
+        let outcomes = vec![DeliveryFileOutcome {
+            source_path: "episode.mkv".into(),
+            publication_path: Some("episode.mkv".into()),
+            classification: "media".into(),
+            outcome: "published".into(),
+            reason: None,
+            repair_dependency: false,
+            source_cleanup_status: "pending".into(),
+        }];
+        FAULTS.with(|faults| faults.borrow_mut().insert("copy_chunk", libc::ENOSPC));
+        assert!(inventory
+            .publish_selected_for_delivery_checked(
+                19,
+                &target,
+                artifact.files,
+                outcomes,
+                &|| Ok(())
+            )
+            .is_err());
+        let operation = inventory
+            .pending_relocations(&artifact.id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let movement: Relocation = serde_json::from_str(&operation.request).unwrap();
+        let scratch = movement.scratch.unwrap().path;
+        let armed = std::cell::Cell::new(false);
+        let expired = std::cell::Cell::new(false);
+        let checkpoint = || {
+            if expired.get() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "lease expired during resumed relocation",
+                ));
+            }
+            for entry in std::fs::read_dir(&scratch)?.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".runner-copy-")
+                {
+                    let length = entry.metadata()?.len();
+                    if length == 0 {
+                        armed.set(true);
+                    }
+                    if armed.get() && length >= 65536 {
+                        expired.set(true);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "lease expired during resumed relocation",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        };
+        assert!(inventory
+            .prepare_post_retry_checked(19, &checkpoint)
+            .is_err());
+        assert!(
+            expired.get(),
+            "grant expires after the new copy wrote its first chunk"
+        );
+        assert!(
+            !target.exists(),
+            "expired grant cannot publish or commit its partial copy"
+        );
+        assert_eq!(std::fs::read(source.join("episode.mkv")).unwrap(), bytes);
+        let pending = inventory.pending_relocations(&artifact.id).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, operation.id);
+        assert_eq!(pending[0].state, "retry");
+        assert!(inventory.for_job(19).unwrap().unwrap().hold.is_none());
+        let copied = std::fs::read_dir(&scratch)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".runner-copy-")
+            })
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum::<u64>();
+        assert_eq!(
+            copied, 65536,
+            "no later chunk is written after authority expiry"
+        );
+        let recovered = inventory
+            .prepare_post_retry_checked(19, &|| Ok(()))
+            .unwrap();
+        assert_eq!(recovered.path, target);
+        let delivery = inventory
+            .create_delivery(19, true, Some("same-acquisition-token"))
+            .unwrap();
+        assert_eq!(delivery.files.len(), 1);
+        assert_eq!(std::fs::read(target.join("episode.mkv")).unwrap(), bytes);
+        assert_eq!(
+            inventory.operation(&operation.id).unwrap().state,
+            "succeeded"
+        );
     }
 }

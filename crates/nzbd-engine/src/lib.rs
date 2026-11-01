@@ -1445,7 +1445,19 @@ impl EngineHandle {
                         "worker grant expired before custody probe".into(),
                     ));
                 }
-                inventory.prepare_post_retry(job.0)
+                if !probe_guard.checked() {
+                    return inventory.prepare_post_retry(job.0);
+                }
+                inventory.prepare_post_retry_checked(job.0, &|| {
+                    if probe_guard.live() {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "worker grant expired during relocation preparation",
+                        ))
+                    }
+                })
             })
             .await
             {

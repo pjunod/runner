@@ -191,6 +191,7 @@ fn link_file<'a>(
     source: &File,
     target: &File,
     entry: &FileEntry,
+    checkpoint: &dyn Fn() -> std::io::Result<()>,
 ) -> Result<()> {
     use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
     let (src, name) = parent(source, &entry.path)?;
@@ -207,8 +208,10 @@ fn link_file<'a>(
     {
         return Err(Error::Conflict("publication source file changed".into()));
     }
+    checkpoint()?;
     inventory.ensure_publication_active(operation_id)?;
     input.sync_all()?;
+    checkpoint()?;
     let name_c = std::ffi::CString::new(name.as_os_str().as_bytes())
         .map_err(|_| Error::Conflict("invalid publication file name".into()))?;
     if unsafe {
@@ -244,7 +247,15 @@ fn link_file<'a>(
     Ok(())
 }
 #[cfg(not(unix))]
-fn link_file(_: &File, _: &File, _: &FileEntry) -> Result<()> {
+fn link_file(
+    _: &Inventory,
+    _: &mut Option<MutationGuard<'_>>,
+    _: &str,
+    _: &File,
+    _: &File,
+    _: &FileEntry,
+    _: &dyn Fn() -> std::io::Result<()>,
+) -> Result<()> {
     Err(Error::Conflict(
         "descriptor link publication unsupported".into(),
     ))
@@ -401,6 +412,19 @@ impl Inventory {
         artifact: &str,
         key: &str,
     ) -> Result<PublishedDirectory> {
+        self.publish_directory_unlocked_checked(guard, source, target, artifact, key, &|| Ok(()))
+    }
+
+    pub(super) fn publish_directory_unlocked_checked<'a>(
+        &'a self,
+        guard: &mut Option<MutationGuard<'a>>,
+        source: &Path,
+        target: &Path,
+        artifact: &str,
+        key: &str,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> Result<PublishedDirectory> {
+        checkpoint()?;
         let key = format!("publish-{key}");
         if !self.publication_active.lock().unwrap().insert(key.clone()) {
             return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
@@ -481,6 +505,7 @@ impl Inventory {
                 if entry.digest.is_some() {
                     continue;
                 }
+                checkpoint()?;
                 entry.digest = Some(self.digest_file_yielding(
                     guard,
                     &hash_root,
@@ -491,6 +516,7 @@ impl Inventory {
             }
         }
         if hashes_added {
+            checkpoint()?;
             self.ensure_publication_active(&op.id)?;
             let current_source = fs::open_dir(source)?;
             let current_parent = fs::open_dir(target.parent().unwrap())?;
@@ -524,6 +550,7 @@ impl Inventory {
                     "publication journal advanced during manifest capture".into(),
                 ));
             }
+            checkpoint()?;
             op.request = serde_json::to_string(&p)?;
             save_operation(&self.db.lock().unwrap(), &op)?;
         }
@@ -538,6 +565,7 @@ impl Inventory {
             return verified_target(self, guard, &p);
         }
         let persist = |op: &mut Operation, p: &Publication| -> Result<()> {
+            checkpoint()?;
             op.request = serde_json::to_string(p)?;
             save_operation(&self.db.lock().unwrap(), op)
         };
@@ -563,6 +591,7 @@ impl Inventory {
                 {
                     return Err(Error::Conflict("publication source changed".into()));
                 }
+                checkpoint()?;
                 self.ensure_publication_active(&op.id)?;
                 match fs::rename_exclusive(source, target) {
                     Ok(()) => p.published = Some(verified_target(self, guard, &p)?),
@@ -603,6 +632,7 @@ impl Inventory {
             {
                 return Err(Error::Conflict("publication source changed".into()));
             }
+            checkpoint()?;
             self.ensure_publication_active(&op.id)?;
             let root = if let Some(expected) = p.directories.get("") {
                 let dir = fs::open_dir(target)?;
@@ -613,6 +643,7 @@ impl Inventory {
             } else {
                 // If creation survived but its checkpoint did not, EEXIST
                 // requires review. Never infer ownership of that directory.
+                checkpoint()?;
                 self.ensure_publication_active(&op.id)?;
                 let dir = mkdir_at(&target_parent, Path::new(target.file_name().unwrap()))?;
                 p.directories
@@ -621,6 +652,7 @@ impl Inventory {
                 dir
             };
             for entry in p.files.clone().iter().filter(|e| e.identity.directory) {
+                checkpoint()?;
                 if let Some(expected) = p.directories.get(&entry.path) {
                     let dir = fs::open_relative(&root, &entry.path)?;
                     if !expected.same_object(&fs::identity_for_file(&dir)?) {
@@ -635,16 +667,19 @@ impl Inventory {
                 }
             }
             for entry in p.files.iter().filter(|e| !e.identity.directory) {
+                checkpoint()?;
                 self.ensure_publication_active(&op.id)?;
-                link_file(self, guard, &op.id, &src, &root, entry)?;
+                link_file(self, guard, &op.id, &src, &root, entry, checkpoint)?;
             }
             for entry in p.files.iter().rev().filter(|e| e.identity.directory) {
+                checkpoint()?;
                 fs::sync_directory(&fs::open_relative(&root, &entry.path)?)?;
             }
             fs::sync_directory(&root)?;
             fs::sync_directory(&target_parent)?;
             p.published = Some(verified_target(self, guard, &p)?);
         }
+        checkpoint()?;
         self.ensure_publication_active(&op.id)?;
         op.state = "succeeded".into();
         persist(&mut op, &p)?;
