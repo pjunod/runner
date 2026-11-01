@@ -23,6 +23,13 @@ pub struct WorkerControlCheckpoint {
     pub probe_params: Vec<(String, String)>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerRetryAdoption {
+    pub source: Artifact,
+    pub control: nzbd_types::JobControl,
+    pub probe_params: Vec<(String, String)>,
+}
+
 impl WorkerControlContext {
     pub fn for_job(job: &nzbd_types::Job) -> Option<Self> {
         let values = job
@@ -46,6 +53,79 @@ impl WorkerControlContext {
 }
 
 impl Inventory {
+    /// Explicit adoption after the cluster validates a new lease. Only an
+    /// unchanged authoritative job/control revision may continue retained work.
+    pub fn adopt_worker_retry(
+        &self,
+        job: u32,
+        context: &WorkerControlContext,
+    ) -> Result<Option<WorkerRetryAdoption>> {
+        let _guard = self.mutation_guard()?;
+        let raw: Option<String> = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT data FROM worker_controls WHERE job=?1",
+                [job],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let mut checkpoint: WorkerControlCheckpoint = serde_json::from_str(&raw)?;
+        let old = &checkpoint.context;
+        if old.job_incarnation != context.job_incarnation
+            || old.job_revision != context.job_revision
+            || old.control_revision != context.control_revision
+            || context.epoch < old.epoch
+        {
+            return Ok(None);
+        }
+        let source = self.get(&checkpoint.source.artifact)?;
+        if source.generation != checkpoint.source.generation
+            || !source.owned
+            || source.terminal()
+            || source.job != Some(job)
+            || self.artifact_in_use(&source)?
+        {
+            return Ok(None);
+        }
+        self.verify(&source)?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT data FROM worker_authority WHERE job=?1",
+                [job],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = current {
+            let current: WorkerControlContext = serde_json::from_str(&raw)?;
+            if current.job_incarnation != context.job_incarnation
+                || current.job_revision != context.job_revision
+                || current.control_revision != context.control_revision
+                || current.epoch > context.epoch
+            {
+                return Ok(None);
+            }
+        }
+        checkpoint.context = context.clone();
+        tx.execute("INSERT INTO worker_authority(job,data) VALUES(?1,?2) ON CONFLICT(job) DO UPDATE SET data=excluded.data", params![job, serde_json::to_string(context)?])?;
+        tx.execute(
+            "UPDATE worker_controls SET data=?2 WHERE job=?1",
+            params![job, serde_json::to_string(&checkpoint)?],
+        )?;
+        tx.commit()?;
+        Ok(Some(WorkerRetryAdoption {
+            source,
+            control: checkpoint.control,
+            probe_params: checkpoint.probe_params,
+        }))
+    }
+
     /// Bind an externally validated grant before publishing a volatile worker
     /// queue row. This prevents a later restart replaying an older checkpoint.
     pub fn bind_worker_context(&self, job: u32, context: &WorkerControlContext) -> Result<()> {

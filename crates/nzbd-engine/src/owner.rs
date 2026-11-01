@@ -2842,6 +2842,7 @@ impl Owner {
                         .map(|f| f.id)
                         .collect();
                     for file in files {
+                        self.writers.remove(&file);
                         self.after_file_change(job, file);
                     }
                 } else if let Some(before) = before {
@@ -7834,6 +7835,76 @@ mod tests {
         });
         assert!(!result.await.unwrap());
         assert_eq!(owner.state.jobs[0].priority, 0);
+    }
+
+    #[tokio::test]
+    async fn storage_recovery_recreates_stopped_writer_and_writes_pending_segment() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (engine_tx, mut messages) = mpsc::channel(16);
+        owner.engine_tx = engine_tx;
+        let job = pending_job(79);
+        let file = job.files[0].id;
+        owner.state.jobs.push(job);
+        let old_writer = owner.writer_for(JobId(79), file);
+        old_writer
+            .send(WriteCmd::InjectFailure("write", libc::ENOSPC))
+            .await
+            .unwrap();
+        old_writer
+            .send(WriteCmd::Segment {
+                seg_number: 1,
+                offset: 0,
+                data: b"recovered".to_vec(),
+                crc: crc32fast::hash(b"recovered"),
+                file_size: 9,
+                server: ServerId(1),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !owner.state.jobs[0].held() {
+                owner.on_msg(messages.recv().await.unwrap());
+            }
+            let mut stopped = owner.writers[&file].stopped.clone();
+            stopped.wait_for(|stopped| *stopped).await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(old_writer.is_closed());
+        let revision = owner.state.jobs[0].control().unwrap().revision;
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::ReleaseResourceHold {
+            job: JobId(79),
+            revision,
+            reply,
+        });
+        assert!(result.await.unwrap());
+        let writer = owner.writer_for(JobId(79), file);
+        writer
+            .send(WriteCmd::Segment {
+                seg_number: 1,
+                offset: 0,
+                data: b"recovered".to_vec(),
+                crc: crc32fast::hash(b"recovered"),
+                file_size: 9,
+                server: ServerId(1),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let message = messages.recv().await.unwrap();
+                let written = matches!(&message, EngineMsg::SegmentWritten { job, file: observed, .. } if *job == JobId(79) && *observed == file);
+                owner.on_msg(message);
+                if written { break; }
+            }
+        }).await.unwrap();
+        let source = owner.artifacts.for_job(79).unwrap().unwrap();
+        assert_eq!(
+            std::fs::read(source.path.join(format!(".runner-file-{}.part", file.0))).unwrap(),
+            b"recovered"
+        );
+        owner.writers[&file].stop.cancel();
     }
 
     #[tokio::test]

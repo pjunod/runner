@@ -27,7 +27,8 @@ use std::{
 };
 pub use transforms::{CustodyEvidence, Workspace};
 pub use worker_controls::{
-    WorkerControlCheckpoint, WorkerControlContext, WORKER_CONTROL_CONTEXT_PARAM,
+    WorkerControlCheckpoint, WorkerControlContext, WorkerRetryAdoption,
+    WORKER_CONTROL_CONTEXT_PARAM,
 };
 pub use workspace_lifecycle::{
     AttemptUse, FinalizationProof, SourceGeneration, StagedCompletion, WorkspaceAssessment,
