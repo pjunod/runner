@@ -1,7 +1,7 @@
 # Startup runtime recovery — implementation and merge status
 
 **Owner:** Codex (`codex/startup-runtime-recovery`) · **Updated:** 2026-11-01
-**State:** independent Astra review running · draft PR · **PR:** [#262](https://github.com/pjunod/runner/pull/262)
+**State:** Astra implementation review complete; changes required · fixes in progress · draft PR · **PR:** [#262](https://github.com/pjunod/runner/pull/262)
 **Base:** `368b500` (fresh remote clone; includes held-job recovery updates)
 
 Companion to [STARTUP_VERIFICATION_PLAN.md](STARTUP_VERIFICATION_PLAN.md)
@@ -15,18 +15,35 @@ Companion to [STARTUP_VERIFICATION_PLAN.md](STARTUP_VERIFICATION_PLAN.md)
 | Persistent control availability and shutdown | Sol | Written, unvalidated | Independent review and final affected checks |
 | Deployment templates/operator docs; web/mobile 503 retention | Luna | Written, unvalidated | Integrate with final runtime interfaces |
 | Enrollment regressions and startup fast-lane wiring | Luna | Written, unvalidated | Run in the final affected lane after review |
-| Combined adversarial implementation review | Astra | Running | Review candidate `5c7b80b`; Hermes card `t_6c60a23f` |
+| Combined adversarial implementation review | Astra | Complete; changes required | Findings R1–R10 below; fixes in progress |
 | Fast lane | Codex | Wired, not run | Run once after review fixes; rerun failed checks only |
 | Merge and cleanup | Codex | Pending | Merge after required checks pass; finish owned clone |
 
 ## Validation policy
 
-No tests or adversarial implementation review have run. The integrated workspace
-passes `cargo check --workspace --all-targets --locked`; compile-only integration
-errors were corrected without executing tests. Formatting is applied. Conduct
-one combined adversarial review next. Run each affected fast-lane check once on the merge candidate; rerun
-failed checks only unless a later code change invalidates a passing result.
-Do not mark modules validated or the draft PR ready before that point.
+The independent Astra implementation review of candidate `5c7b80b` against
+base `368b500` is complete and requires changes. The earlier
+`cargo check --workspace --all-targets --locked` pass predates the review fixes;
+it does not validate the current work. No tests have run. Fixes are in progress,
+and every review item remains open until its correction and evidence are
+recorded below. Run each affected fast-lane check once on the merge candidate;
+rerun failed checks only. Do not mark modules validated or the draft PR ready
+before that point.
+
+## Astra findings — all corrections remain in progress
+
+| Finding | Required correction | State |
+|---|---|---|
+| R1 · Secure startup fallback | Preserve established secure identity when configuration or mirrors are missing; distinguish proven first install. | In progress |
+| R2 · Deferred PP admission | Keep admitted same-lifetime updates scoped; cancel external replacement before waiting for custody. | In progress |
+| R3 · Durable PP replacement | Persist replacement as one acknowledged document instead of remove-then-insert. | In progress |
+| R4 · Delegated journal ownership | Fence delegation transitions and compact only the journal generation covered by the snapshot. | In progress |
+| R5 · Recovery startup latency | Move payload checks out of synchronous owner recovery into per-root workers. | In progress |
+| R6 · Inventory lock scope | Keep root and payload I/O outside the global inventory mutation lock; separate bounded payload work from ordered commits. | In progress |
+| R7 · Writer fairness | Exclude jobs with pending allocation and continue selection past ineligible candidates. | In progress |
+| R8 · Replicated authority adoption | Reclassify recovered metadata, rebuild allocation caches, and report durable adoption failures. | In progress |
+| R9 · Resume persistence fence | Block operational dispatch until the exact Resume revision is durably saved. | In progress |
+| R10 · Bounded verification | Verify identity-bound batches with scheduler yields and visible intermediate progress. | In progress |
 
 ## Decisions and operating limits
 
@@ -58,7 +75,7 @@ Do not mark modules validated or the draft PR ready before that point.
 
 ## Next steps
 
-Complete integration → one combined adversarial review → fast lane → rerun
-failed checks only → merge. Root owns integration, status, and merge; Sol's
-runtime and Luna's UI/deployment work remain unvalidated until the combined
-review and fast lane are complete.
+Complete review fixes → affected fast lane → rerun failed checks only → merge.
+Root owns fixes, integration, PR and status updates, and merge. PR ownership
+remains Codex; Sol's runtime and Luna's UI/deployment work remain unvalidated
+until the affected checks pass.
