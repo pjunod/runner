@@ -180,7 +180,13 @@ impl Inventory {
             params![movement.source.id, movement.source.generation],
             |row| row.get(0),
         )?;
-        Ok(Some(ready))
+        Ok(Some(
+            ready
+                || self.cluster_retirement_accepted(
+                    &movement.source.id,
+                    &movement.source.generation,
+                )?,
+        ))
     }
 
     /// Called inside the transaction transferring authority to deletion.
@@ -1166,6 +1172,11 @@ impl Inventory {
                 params![movement.source.id, movement.source.generation],
                 |row| row.get(0),
             )?;
+            let ready = ready
+                || self.cluster_retirement_accepted(
+                    &movement.source.id,
+                    &movement.source.generation,
+                )?;
             if !ready || !movement.source.delivery_lifecycle {
                 return Err(Error::Conflict(
                     "deferred relocation source cannot retire before durable delivery".into(),
@@ -1416,6 +1427,8 @@ impl Inventory {
         let successful: bool = self.db.lock().unwrap().query_row(
             "SELECT EXISTS(SELECT 1 FROM deliveries WHERE artifact=?1 AND generation=?2 AND json_extract(data,'$.terminalOutcome')='SUCCESS')",
             params![movement.source.id, movement.source.generation], |row| row.get(0))?;
+        let successful = successful
+            || self.cluster_retirement_success(&movement.source.id, &movement.source.generation)?;
         let root_is_missing = matches!(
             std::fs::symlink_metadata(&source.path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound
