@@ -2631,7 +2631,7 @@ impl Owner {
                     }
                 }
                 self.dirty |= changed.is_some();
-                let ok = changed.is_some() && (!self.persist || self.save_snapshot());
+                let ok = changed.is_some() && self.commit_control_change(job, before.as_ref());
                 if ok {
                     self.bump_epoch();
                     self.publish_now();
@@ -2655,7 +2655,7 @@ impl Owner {
             } => {
                 let before = self.state.job(job).cloned();
                 let mut changed = false;
-                if self.persist && !self.persistence_fenced {
+                if !self.persistence_fenced {
                     if let Some(row) = self.state.job_mut(job) {
                         if row.lifecycle_eligible() {
                             if let Some(mut control) = row.control().filter(|control| {
@@ -2693,7 +2693,7 @@ impl Owner {
                         }
                     }
                 }
-                let ok = changed && self.save_snapshot();
+                let ok = changed && self.commit_control_change(job, before.as_ref());
                 if ok {
                     self.publish_now();
                     self.bump_epoch();
@@ -2759,7 +2759,7 @@ impl Owner {
                                 count.saturating_add(1).to_string(),
                             ));
                             self.dirty = true;
-                            ok = !self.persist || self.save_snapshot();
+                            ok = self.commit_control_change(job, before.as_ref());
                         }
                     }
                 }
@@ -2820,15 +2820,12 @@ impl Owner {
                                     "*Control:attempts" | "*Control:probe_after"
                                 )
                             });
-                            for f in &j.files {
-                                self.writers.remove(&f.id);
-                            }
                             changed = Some(control);
                         }
                     }
                 }
                 self.dirty |= changed.is_some();
-                let ok = changed.is_some() && (!self.persist || self.save_snapshot());
+                let ok = changed.is_some() && self.commit_control_change(job, before.as_ref());
                 if ok {
                     self.bump_epoch();
                     self.publish_now();
@@ -3006,15 +3003,99 @@ impl Owner {
 
     // -- cluster: import / export / delegation / adoption --------------------
 
+    /// A worker owns no shared queue snapshot. Its retry intent commits to
+    /// the local inventory under the exact lease/source tuple instead.
+    fn commit_control_change(&mut self, job: JobId, before: Option<&Job>) -> bool {
+        if self.persistence_fenced {
+            return false;
+        }
+        if self.persist {
+            return self.save_snapshot();
+        }
+        let Some(record) = self.state.job(job) else {
+            return false;
+        };
+        let expected = before
+            .and_then(|record| record.control())
+            .map(|control| control.revision)
+            .unwrap_or_default();
+        match self.artifacts.checkpoint_worker_control(record, &expected) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(job=job.0, %error, "worker control checkpoint refused");
+                false
+            }
+        }
+    }
+
     fn import_job(&mut self, mut job: Job, fold_journals: bool, emit_finished: bool) -> bool {
         if self.persistence_fenced {
             return false;
+        }
+        let mut worker_control_restored = false;
+        let incoming_context = nzbd_state::artifacts::WorkerControlContext::for_job(&job);
+        let current_context = self
+            .state
+            .job(job.id)
+            .and_then(nzbd_state::artifacts::WorkerControlContext::for_job);
+        if let (Some(incoming), Some(current)) = (&incoming_context, &current_context) {
+            if incoming.job_incarnation == current.job_incarnation
+                && (incoming.epoch < current.epoch
+                    || incoming.job_revision < current.job_revision
+                    || incoming.control_revision < current.control_revision)
+            {
+                return false;
+            }
+        }
+        if !self.persist {
+            if let Some(context) = incoming_context.as_ref() {
+                if let Err(error) = self.artifacts.bind_worker_context(job.id.0, context) {
+                    tracing::warn!(job=job.id.0, %error, "worker grant binding refused");
+                    return false;
+                }
+                match self.artifacts.worker_control(job.id.0, context) {
+                    Ok(Some(checkpoint)) => {
+                        worker_control_restored = true;
+                        job.set_control(&checkpoint.control);
+                        job.status = if checkpoint.control.lifecycle == "held" {
+                            JobStatus::Paused
+                        } else if checkpoint.control.manual_pause {
+                            JobStatus::Paused
+                        } else if matches!(
+                            checkpoint.control.previous_status,
+                            Some(
+                                JobStatus::Post { .. }
+                                    | JobStatus::PostQueued
+                                    | JobStatus::Completed
+                            )
+                        ) {
+                            JobStatus::PostQueued
+                        } else {
+                            JobStatus::Queued
+                        };
+                        job.params.retain(|(key, _)| {
+                            !matches!(key.as_str(), "*Control:attempts" | "*Control:probe_after")
+                        });
+                        job.params.extend(checkpoint.probe_params);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(job=job.id.0, %error, "worker control recovery refused");
+                        return false;
+                    }
+                }
+            }
         }
         if let Some(control) = self
             .state
             .job(job.id)
             .and_then(|j| j.control())
-            .filter(|c| c.lifecycle == "held")
+            .filter(|c| {
+                c.lifecycle == "held"
+                    && !worker_control_restored
+                    && (incoming_context.is_none() && current_context.is_none()
+                        || incoming_context == current_context)
+            })
         {
             // Remote/exported legacy snapshots cannot erase a newer local fence.
             job.set_control(&control);
@@ -5849,9 +5930,6 @@ fn refresh_url_admission_custody(
 ) -> bool {
     // Consumer custody is terminal for this receipt. Retention of a separate
     // processing source cannot reclaim the accepted publication.
-    if receipt.custody_state == "curator" {
-        return false;
-    }
     let Some((artifact_id, source_generation)) = receipt
         .source_artifact_id
         .as_deref()
@@ -5867,6 +5945,21 @@ fn refresh_url_admission_custody(
     }
     let keep_changed = receipt.keep_source_on_failure != artifact.keep_on_failure;
     receipt.keep_source_on_failure = artifact.keep_on_failure;
+    if receipt.custody_state == "curator" {
+        let cleanup = if artifact.state == "deleted" {
+            Some("removed")
+        } else if artifact.keep || artifact.keep_on_failure {
+            Some("retained")
+        } else {
+            None
+        };
+        let changed =
+            cleanup.is_some_and(|status| receipt.source_cleanup_status.as_deref() != Some(status));
+        if let Some(status) = cleanup {
+            receipt.source_cleanup_status = Some(status.into());
+        }
+        return keep_changed || changed;
+    }
     if artifact.state == "deleted" {
         let changed = receipt.custody_state != "deleted_by_runner"
             || receipt.source_cleanup_status.as_deref() != Some("removed")
@@ -7461,10 +7554,7 @@ mod tests {
         assert_eq!(receipt.custody_state, "runner_owned");
         receipt.source_generation = Some(source.generation.clone());
         receipt.custody_state = "curator".into();
-        assert!(!refresh_url_admission_custody(
-            &mut receipt,
-            &owner.artifacts
-        ));
+        refresh_url_admission_custody(&mut receipt, &owner.artifacts);
         assert_eq!(
             receipt.custody_state, "curator",
             "Runner source deletion cannot reclaim consumer custody"
@@ -7554,6 +7644,135 @@ mod tests {
             reply,
         });
         assert!(received.blocking_recv().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn consumer_receipt_refresh_pins_publication_while_source_progress_remains_mutable() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let mut stale = pending_job(78);
+        stale.params.extend([
+            ("monarr-transfer".into(), "request-78".into()),
+            ("Delivery:Custody".into(), "runner_owned".into()),
+            ("Delivery:SourceCleanup".into(), "removed".into()),
+        ]);
+        owner.state.jobs.push(stale);
+        owner
+            .state
+            .url_admission_receipts
+            .push(UrlAdmissionReceipt {
+                protocol_version: 1,
+                request_token: "request-78".into(),
+                submission_sha256: "hash".into(),
+                job_id: 78,
+                generation: "admission-78".into(),
+                runner_instance_id: "runner".into(),
+                terminal_outcome: Some("SUCCESS".into()),
+                outcome: "completed".into(),
+                failure_stage: None,
+                failure_cause: None,
+                custody_state: "curator".into(),
+                keep_source_on_failure: true,
+                source_cleanup_status: Some("pending".into()),
+                publication_path: Some("/verified/publication".into()),
+                source_artifact_id: Some("source-78".into()),
+                source_generation: Some("generation-78".into()),
+            });
+        owner.state.sync_url_admission_receipts();
+        let receipt = &owner.state.url_admission_receipts[0];
+        assert_eq!(receipt.custody_state, "curator");
+        assert_eq!(receipt.outcome, "completed");
+        assert_eq!(receipt.terminal_outcome.as_deref(), Some("SUCCESS"));
+        assert_eq!(
+            receipt.publication_path.as_deref(),
+            Some("/verified/publication")
+        );
+        assert_eq!(receipt.source_cleanup_status.as_deref(), Some("removed"));
+        assert!(receipt.keep_source_on_failure);
+    }
+
+    #[tokio::test]
+    async fn worker_retry_schedule_survives_regrant_without_overriding_new_leader_intent() {
+        use nzbd_state::artifacts::{WorkerControlContext, WORKER_CONTROL_CONTEXT_PARAM};
+        let (_tmp, mut owner, _adapter) = control_test_owner_with_persistence(false, None);
+        let mut original = pending_job(77);
+        original.status = JobStatus::PostQueued;
+        original.dir_name = "worker-private-77".into();
+        mark_new_lifecycle_cohort(&mut original);
+        let context = WorkerControlContext {
+            lease_id: "lease-77".into(),
+            job_incarnation: "incarnation-77".into(),
+            job_revision: 1,
+            control_revision: 1,
+            epoch: 1,
+        };
+        original.params.push((
+            WORKER_CONTROL_CONTEXT_PARAM.into(),
+            serde_json::to_string(&context).unwrap(),
+        ));
+        let path = owner.dest_dir.join(&original.dir_name);
+        owner
+            .artifacts
+            .allocate_for_delivery(77, &owner.dest_dir, &path, true, true)
+            .unwrap();
+        std::fs::write(path.join("episode.mkv"), b"retained payload").unwrap();
+        owner
+            .artifacts
+            .finish(77, &path, &owner.dest_dir, "active")
+            .unwrap();
+        owner.artifacts.bind_worker_context(77, &context).unwrap();
+        owner.state.jobs.push(original.clone());
+        assert!(owner.hold_job(JobId(77), "capacity", "move", "destination full"));
+        let control = owner.state.jobs[0].control().unwrap();
+        let deadline = unix_now() + 300;
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::SchedulePostRetry {
+            job: JobId(77),
+            revision: control.revision,
+            retry_attempt: 1,
+            next_retry: deadline,
+            blocked_since: unix_now(),
+            message: "retry scheduled".into(),
+            reply,
+        });
+        assert!(
+            result.await.unwrap(),
+            "worker must commit to local inventory rather than a shared snapshot"
+        );
+        let durable = owner
+            .artifacts
+            .worker_control(77, &context)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.control.next_retry_at_unix, Some(deadline));
+        owner.state.jobs.clear();
+        owner.artifacts.close().unwrap();
+        owner.artifacts =
+            Arc::new(nzbd_state::artifacts::Inventory::open(&owner.state_dir).unwrap());
+        assert!(owner.import_job(original.clone(), false, false));
+        assert_eq!(
+            owner.state.jobs[0].control().unwrap().next_retry_at_unix,
+            Some(deadline)
+        );
+        assert_eq!(owner.state.jobs[0].status, JobStatus::Paused);
+        let mut newer = original.clone();
+        let mut newer_context = context.clone();
+        newer_context.control_revision += 1;
+        newer
+            .params
+            .retain(|(key, _)| key != WORKER_CONTROL_CONTEXT_PARAM);
+        newer.params.push((
+            WORKER_CONTROL_CONTEXT_PARAM.into(),
+            serde_json::to_string(&newer_context).unwrap(),
+        ));
+        assert!(owner.import_job(newer, false, false));
+        assert!(
+            owner.state.jobs[0].control().is_none(),
+            "new leader intent replaces the old local hold"
+        );
+        assert!(
+            !owner.import_job(original, false, false),
+            "late old authority cannot overwrite the newer grant"
+        );
     }
 
     #[tokio::test]

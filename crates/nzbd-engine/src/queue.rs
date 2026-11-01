@@ -230,31 +230,35 @@ impl QueueState {
                     .iter()
                     .any(|(key, value)| key == "monarr-transfer" && value == &receipt.request_token)
             }) {
-                receipt.outcome = match job.status {
-                    JobStatus::Fetching => "fetching",
-                    JobStatus::Queued => "queued",
-                    JobStatus::Downloading => "downloading",
-                    JobStatus::Paused => "paused",
-                    JobStatus::PostQueued => "post_queued",
-                    JobStatus::Post { .. } => "post_processing",
-                    JobStatus::Completed => "completed",
-                    JobStatus::Failed => "failed",
-                    JobStatus::Deleted => "deleted",
+                if receipt.custody_state != "curator" {
+                    receipt.outcome = match job.status {
+                        JobStatus::Fetching => "fetching",
+                        JobStatus::Queued => "queued",
+                        JobStatus::Downloading => "downloading",
+                        JobStatus::Paused => "paused",
+                        JobStatus::PostQueued => "post_queued",
+                        JobStatus::Post { .. } => "post_processing",
+                        JobStatus::Completed => "completed",
+                        JobStatus::Failed => "failed",
+                        JobStatus::Deleted => "deleted",
+                    }
+                    .to_string();
                 }
-                .to_string();
                 let param = |name: &str| {
                     job.params
                         .iter()
                         .find(|(key, _)| key == name)
                         .map(|(_, value)| value.clone())
                 };
-                if let Some(stage) = param("Failure:Stage") {
-                    receipt.failure_stage = Some(stage);
+                if receipt.custody_state != "curator" {
+                    if let Some(stage) = param("Failure:Stage") {
+                        receipt.failure_stage = Some(stage);
+                    }
+                    receipt.failure_cause = param("Failure:Reason")
+                        .or_else(|| param("*Failure:Reason"))
+                        .or_else(|| param("Failure:Files"));
+                    receipt.terminal_outcome = param(nzbd_types::PP_DONE_PARAM);
                 }
-                receipt.failure_cause = param("Failure:Reason")
-                    .or_else(|| param("*Failure:Reason"))
-                    .or_else(|| param("Failure:Files"));
-                receipt.terminal_outcome = param(nzbd_types::PP_DONE_PARAM);
                 // Once source custody is pinned to an artifact generation,
                 // its live preference is authoritative. Queue params are only
                 // a fallback before that durable relation exists.
@@ -262,7 +266,9 @@ impl QueueState {
                     receipt.keep_source_on_failure = param("Failure:KeepOnFailure")
                         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
                 }
-                receipt.source_cleanup_status = param("Delivery:SourceCleanup");
+                if let Some(status) = param("Delivery:SourceCleanup") {
+                    receipt.source_cleanup_status = Some(status);
+                }
                 if let Some(custody) =
                     param("Delivery:Custody").or_else(|| param("Artifact:Custody"))
                 {
@@ -270,8 +276,10 @@ impl QueueState {
                         receipt.custody_state = custody;
                     }
                 }
-                receipt.publication_path =
-                    param("Delivery:Path").or_else(|| param("*Cluster:final-dir"));
+                if receipt.custody_state != "curator" {
+                    receipt.publication_path =
+                        param("Delivery:Path").or_else(|| param("*Cluster:final-dir"));
+                }
                 let nonempty = |value: Option<String>| value.filter(|value| !value.is_empty());
                 let delivery_source = (
                     nonempty(param("Delivery:SourceArtifactId")),
@@ -292,7 +300,9 @@ impl QueueState {
                     // both fields arrive; do not fall back to Artifact data.
                     _ => None,
                 };
-                if let Some((source_id, source_generation)) = source {
+                if let Some((source_id, source_generation)) =
+                    source.filter(|_| receipt.custody_state != "curator")
+                {
                     receipt.source_artifact_id = Some(source_id);
                     receipt.source_generation = Some(source_generation);
                 }

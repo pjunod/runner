@@ -13,6 +13,7 @@ pub use delivery::{Delivery, DeliveryFile, DeliveryFileOutcome, DeliveryRunnerSt
 pub use relocation::{RelocationResult, SelectedPublication};
 mod tasks;
 mod transforms;
+mod worker_controls;
 mod workspace_lifecycle;
 pub use recovery::{Receipt, ReceiptFile, Recovery, RecoveryFile};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -25,6 +26,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 pub use transforms::{CustodyEvidence, Workspace};
+pub use worker_controls::{
+    WorkerControlCheckpoint, WorkerControlContext, WORKER_CONTROL_CONTEXT_PARAM,
+};
 pub use workspace_lifecycle::{
     AttemptUse, FinalizationProof, SourceGeneration, StagedCompletion, WorkspaceAssessment,
 };
@@ -396,6 +400,8 @@ impl Inventory {
           CREATE INDEX IF NOT EXISTS artifacts_path ON artifacts(path);
           CREATE INDEX IF NOT EXISTS artifacts_state ON artifacts(state,updated_at);
           CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,artifact TEXT NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS worker_controls(job INTEGER PRIMARY KEY,data TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS worker_authority(job INTEGER PRIMARY KEY,data TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS operations_state ON operations(state);
           CREATE TABLE IF NOT EXISTS recoveries(id TEXT PRIMARY KEY,artifact TEXT NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS workspace_finalizations(source TEXT NOT NULL,generation TEXT NOT NULL,outcome TEXT NOT NULL,proof TEXT NOT NULL,job INTEGER,activated INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(source,generation));
