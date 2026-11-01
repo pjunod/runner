@@ -12,7 +12,7 @@ outside compiler caches in the task's durable evidence directory.
 ## 1. Baseline and constraints
 
 - Runner baseline: a2535623af1a7a5623677350895b49e8c2a840ab.
-- Curator baseline: dae74249195b97f7af0f0b649b3ea79109e8aae7.
+- Curator baseline: dae74249195b97f7af0f0b649b3ea79109e8aae7; independent PR #76 (990e768) preserved via merge225cfd6.
 - Lower-model agents implement isolated slices; primary reviews integration.
 - Final Astra adversarial review precedes the full required test gates.
 - Merge only after findings are resolved and required tests/checks pass.
@@ -29,10 +29,10 @@ outside compiler caches in the task's durable evidence directory.
 | Runner publication retries, resource holds, custody, Keep and durable queue mutations | Core checkpoints integrated; URL and broader timing still active | State 3f47dce, d70609c9, 2ecfc5c and ce4cdd3 integrated; focused failure/race and actual writer recovery regressions pass |
 | Runner real partial repair, native books, safe sidecars and classification | Integrated; focused regressions pass | POST a2aa622 and bf4c21ca; integration 78555830 and 8727681a |
 | Curator discovery, atomic import ledger, replacement ownership and manual intent | Core and follow-up integrated; focused service fault tests pass | Curator 2665a8b and 21a9bec |
-| Curator upgrade distinction, stale batches, storage explanation and reviewed acceptance | Committed; focused migration/service/storage tests pass | Curator 2665a8b, 21a9bec and 176fd58; rendered UI acceptance remains pending |
+| Curator upgrade distinction, stale batches, storage explanation and reviewed acceptance | Committed; focused migration/service/storage tests pass | Curator 2665a8b, 21a9bec and 176fd58; desktop/iPhone action and geometry regressions pass |
 | Cluster durable Delivery, copy retirement, URL replay and RPC bounds | RPC bounds and exact local copy helper integrated; Delivery/copy implementation active | Runner 2e36b491 and bf539031; actual authority-change and complete-copy-drain evidence pending |
 | Native torrent independent publication and seeding custody | Pending | None yet |
-| Joined timing, usable controls and desktop/mobile acceptance | Pending | None yet |
+| Joined timing, usable controls and desktop/mobile acceptance | Curator timing and phone workflows committed; Runner controls integrated, major-stage capture active | Curator9b091fd/f23a76c/f0b4510; Runner current-source controls33db58ca/2f6021c8/94bc3648; focused UI checks pass |
 | Real Runner–Curator/cluster/torrent integration evidence | Pending | None yet |
 | Primary integration review | Active | Review found retry scheduling CAS, intact partial dependency, probe routing and discovery bounds gaps; fixes underway |
 | Final Astra review | Pending | None yet |
@@ -46,7 +46,7 @@ Focused POST regressions pass for native book publication, failed-health repair,
 retained dependencies, deletion replay, exact repair IDs, title classification,
 junk-only completion and persistent retry scheduling against the integrated
 state checkpoint. State compilation and focused owner/custody/resource fault regressions passed.
-Cluster, URL, torrent and full lifecycle integration remain active. These checks establish specific fixes and do not replace final gates. Final reports must
+Cluster, URL, torrent and full lifecycle integration remain active. Curator PR #76 cleanup workers and immediate-import optimization are preserved. Worker late-completion and phone identity-switch races have focused passing regressions. These checks establish specific fixes and do not replace final gates. Final reports must
 name exact tested commits, toolchains, commands, limitations and review outcome.
 
 Curator gates include lint, Go tests, coverage, web tests/build, mobile checks,
