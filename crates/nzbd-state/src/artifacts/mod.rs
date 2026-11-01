@@ -41,6 +41,8 @@ pub use workspace_lifecycle::{
     AttemptUse, FinalizationProof, SourceGeneration, StagedCompletion, WorkspaceAssessment,
 };
 
+#[cfg(test)]
+thread_local! {static DELETE_FAIL_AFTER:std::cell::Cell<Option<usize>>=const{std::cell::Cell::new(None)};}
 pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -212,12 +214,16 @@ pub struct Operation {
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum DeleteRequest {
+    Cluster((String, u64, u64, bool, String, bool)),
     Scoped((String, u64, u64, bool, String)),
     Legacy((String, u64, u64, bool)),
 }
 impl DeleteRequest {
     fn fields(&self) -> (&str, u64, u64, bool, Option<&str>) {
         match self {
+            Self::Cluster((id, rev, undo, auto, generation, _)) => {
+                (id, *rev, *undo, *auto, Some(generation))
+            }
             Self::Scoped((id, rev, undo, auto, generation)) => {
                 (id, *rev, *undo, *auto, Some(generation))
             }
@@ -1786,6 +1792,27 @@ impl Inventory {
         automatic: bool,
         authority: Option<(&AttemptUse, &dyn Fn() -> std::io::Result<()>)>,
     ) -> Result<Operation> {
+        self.request_delete_with_policy(
+            key,
+            revision,
+            request_id,
+            undo_seconds,
+            automatic,
+            authority,
+            false,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn request_delete_with_policy(
+        &self,
+        key: &str,
+        revision: u64,
+        request_id: &str,
+        undo_seconds: u64,
+        automatic: bool,
+        authority: Option<(&AttemptUse, &dyn Fn() -> std::io::Result<()>)>,
+        failure_keep_guard: bool,
+    ) -> Result<Operation> {
         let _guard = self.mutation_guard()?;
         if let Some((_, checkpoint)) = authority {
             checkpoint()?;
@@ -1797,8 +1824,18 @@ impl Inventory {
             ));
         }
         let a = self.get(key)?;
-        let request =
-            serde_json::to_string(&(key, revision, undo_seconds, automatic, &a.generation))?;
+        let request = if request_id.starts_with("cluster-copy-") {
+            serde_json::to_string(&(
+                key,
+                revision,
+                undo_seconds,
+                automatic,
+                &a.generation,
+                failure_keep_guard,
+            ))?
+        } else {
+            serde_json::to_string(&(key, revision, undo_seconds, automatic, &a.generation))?
+        };
         match self.operation(request_id) {
             Ok(op) => {
                 let previous: DeleteRequest = serde_json::from_str(&op.request)?;
@@ -1912,6 +1949,22 @@ impl Inventory {
         }
         let request: DeleteRequest = serde_json::from_str(&op.request)?;
         let (_, revision, _, automatic, generation) = request.fields();
+        let failure_guard = match &request {
+            DeleteRequest::Cluster((_, _, _, _, _, guard)) => *guard,
+            _ => {
+                op.id.starts_with("cluster-copy-")
+                    && !self.cluster_retirement_success(&a.id, &a.generation)?
+            }
+        };
+        if failure_guard && a.keep_on_failure {
+            op.state = "retry".into();
+            op.error = Some(
+                "per-download Keep on failure is enabled; exact cluster source retained".into(),
+            );
+            op.next_retry = now().saturating_add(30);
+            save_operation(&self.db.lock().unwrap(), &op)?;
+            return Ok(op);
+        }
         if automatic && !a.automatic_cleanup_eligible {
             op.state = "review".into();
             op.error = Some("pre-existing artifact is exempt from automatic deletion pending reviewed migration".into());
@@ -2014,10 +2067,19 @@ impl Inventory {
         let observed = fs::manifest(&dir, 100_000)?;
         // A restarted partial deletion may have fewer entries, never more
         // or different ones. Every surviving regular file is revalidated.
+        let owned: std::collections::HashMap<_, _> = a
+            .files
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect();
+        if owned.len() != a.files.len() {
+            return Err(Error::Conflict(
+                "deletion manifest has duplicate paths".into(),
+            ));
+        }
         for f in &observed {
-            if !a.files.iter().any(|owned| {
-                owned.path == f.path
-                    && owned.identity.same_object(&f.identity)
+            if !owned.get(f.path.as_str()).is_some_and(|owned| {
+                owned.identity.same_object(&f.identity)
                     && (f.identity.directory || owned.identity == f.identity)
             }) {
                 return Err(Error::Conflict(format!(
@@ -2031,6 +2093,17 @@ impl Inventory {
         for f in &files {
             if !f.identity.directory {
                 fs::remove_entry(&dir, f)?;
+                #[cfg(test)]
+                DELETE_FAIL_AFTER.with(|counter| {
+                    if let Some(remaining) = counter.get() {
+                        if remaining <= 1 {
+                            counter.set(None);
+                            return Err(Error::Io(std::io::Error::from_raw_os_error(libc::EIO)));
+                        }
+                        counter.set(Some(remaining - 1));
+                    }
+                    Ok(())
+                })?;
             }
         }
         for f in &files {

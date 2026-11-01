@@ -134,6 +134,15 @@ impl Inventory {
                 "cluster cleanup copy generation or admission changed".into(),
             ));
         }
+        let key = format!(
+            "cluster-copy-{:x}",
+            Sha256::digest(serde_json::to_vec(&(copy, &proof))?)
+        );
+        let existing = match self.operation(&key) {
+            Ok(operation) => Some(operation),
+            Err(Error::NotFound) => None,
+            Err(error) => return Err(error),
+        };
         if !artifact.terminal()
             && (artifact.keep
                 || artifact.hold.is_some()
@@ -146,6 +155,28 @@ impl Inventory {
                 })),
             });
         }
+        if let Some(operation) = existing.as_ref() {
+            let request: DeleteRequest = serde_json::from_str(&operation.request)?;
+            if operation.kind != "delete"
+                || operation.artifact != artifact.id
+                || request.fields().0 != artifact.id
+                || request.fields().4 != Some(copy.publication.generation.as_str())
+            {
+                return Err(Error::Conflict(
+                    "cluster deletion journal identity changed".into(),
+                ));
+            }
+            let operation = self.execute_delete(&key)?;
+            return Ok(ClusterCopyCleanup {
+                status: match operation.state.as_str() {
+                    "succeeded" => "removed",
+                    "cancelled" | "review" => "retained",
+                    _ => "retry",
+                }
+                .into(),
+                error: operation.error,
+            });
+        }
         if !copy.selected && outcome != "SUCCESS" && !unusable && !artifact.terminal() {
             return Ok(ClusterCopyCleanup { status: "retained".into(), error: Some(
                 "partial failure publication does not prove every raw source dependency redundant; retain this exact source until recovery is resolved".into()) });
@@ -156,19 +187,35 @@ impl Inventory {
         let mut raw_observed = None;
         if !copy.selected && !artifact.terminal() {
             if let Some(expected) = raw_files {
+                if expected.len() > 100_000 {
+                    return Err(Error::Conflict(
+                        "raw byte seal exceeds100000 members; retained for review".into(),
+                    ));
+                }
+                let mut by_path = std::collections::HashMap::with_capacity(expected.len());
+                let mut directories = std::collections::HashSet::new();
+                for file in expected {
+                    if by_path.insert(file.path.as_str(), file).is_some() {
+                        return Err(Error::Conflict(
+                            "raw byte seal has duplicate paths; retained for review".into(),
+                        ));
+                    }
+                    let mut parent = std::path::Path::new(&file.path).parent();
+                    while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
+                        directories.insert(path.to_string_lossy().into_owned());
+                        parent = path.parent();
+                    }
+                }
                 let directory = self.verify(&artifact)?;
                 let observed = fs::manifest(&directory, 100_000)?;
                 for entry in &observed {
                     if entry.identity.directory {
-                        if !expected
-                            .iter()
-                            .any(|file| file.path.starts_with(&format!("{}/", entry.path)))
-                        {
+                        if !directories.contains(&entry.path) {
                             return Ok(ClusterCopyCleanup{status:"retained".into(),error:Some(format!("review required: raw directory {} was not in the accepted transfer seal",entry.path))});
                         }
                         continue;
                     }
-                    let Some(file) = expected.iter().find(|file| file.path == entry.path) else {
+                    let Some(file) = by_path.get(entry.path.as_str()) else {
                         return Ok(ClusterCopyCleanup{status:"retained".into(),error:Some(format!("review required: raw file {} was not in the accepted transfer seal",entry.path))});
                     };
                     let mut input = fs::open_relative(&directory, &entry.path)?;
@@ -242,15 +289,6 @@ impl Inventory {
         } else {
             None
         };
-        let key = format!(
-            "cluster-copy-{:x}",
-            Sha256::digest(serde_json::to_vec(&(copy, &proof))?)
-        );
-        let existing = match self.operation(&key) {
-            Ok(operation) => Some(operation),
-            Err(Error::NotFound) => None,
-            Err(error) => return Err(error),
-        };
         if !artifact.terminal() && existing.is_none() {
             let revision = {
                 let _guard = self.mutation_guard()?;
@@ -275,7 +313,15 @@ impl Inventory {
                 }
                 current.revision
             };
-            self.request_delete(&artifact.id, revision, &key, 0)?;
+            self.request_delete_with_policy(
+                &artifact.id,
+                revision,
+                &key,
+                0,
+                false,
+                None,
+                !copy.selected && outcome != "SUCCESS",
+            )?;
         }
         if !self.get(&artifact.id)?.terminal() {
             self.execute_delete(&key)?;
@@ -377,6 +423,120 @@ mod tests {
                 .status,
             "removed"
         );
+    }
+    #[test]
+    fn raw_copy_partial_unlink_replays_owned_journal_and_honors_current_keep() {
+        for reopen in [false, true] {
+            let (temp, mut inventory, source, copy) = fixture();
+            let expected = [
+                ("episode.mkv", b"verified payload".as_slice()),
+                ("readme.txt", b"junk".as_slice()),
+            ]
+            .into_iter()
+            .map(|(path, bytes)| DeliveryFile {
+                path: path.into(),
+                size_bytes: bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            })
+            .collect::<Vec<_>>();
+            DELETE_FAIL_AFTER.with(|counter| counter.set(Some(1)));
+            let first = inventory
+                .retire_cluster_artifact_copy_with_disposition(
+                    &copy,
+                    "FAILURE",
+                    proof(),
+                    true,
+                    Some(&expected),
+                )
+                .unwrap();
+            assert_eq!(first.status, "retry");
+            let remaining = std::fs::read_dir(&source).unwrap().count();
+            assert_eq!(remaining, 1, "fault must occur after one real unlink");
+            let key = format!(
+                "cluster-copy-{:x}",
+                Sha256::digest(serde_json::to_vec(&(&copy, &proof())).unwrap())
+            );
+            let mut operation = inventory.operation(&key).unwrap();
+            operation.next_retry = 0;
+            save_operation(&inventory.db.lock().unwrap(), &operation).unwrap();
+            assert!(inventory.set_keep_on_failure(7, true).unwrap());
+            assert_eq!(inventory.execute_delete(&key).unwrap().state, "retry");
+            assert_eq!(
+                std::fs::read_dir(&source).unwrap().count(),
+                remaining,
+                "executor must recheck Keep after wrapper validation"
+            );
+            inventory.set_keep_on_failure(7, false).unwrap();
+            let mut operation = inventory.operation(&key).unwrap();
+            operation.next_retry = 0;
+            save_operation(&inventory.db.lock().unwrap(), &operation).unwrap();
+            if reopen {
+                drop(inventory);
+                inventory = Inventory::open(&temp.path().join("state")).unwrap();
+            }
+            let resumed = inventory
+                .retire_cluster_artifact_copy_with_disposition(
+                    &copy,
+                    "FAILURE",
+                    proof(),
+                    true,
+                    Some(&expected),
+                )
+                .unwrap();
+            assert_eq!(resumed.status, "removed", "reopen={reopen}: {resumed:?}");
+            assert!(!source.exists());
+        }
+        let (_temp, inventory, source, copy) = fixture();
+        let expected = [
+            ("episode.mkv", b"verified payload".as_slice()),
+            ("readme.txt", b"junk".as_slice()),
+        ]
+        .into_iter()
+        .map(|(path, bytes)| DeliveryFile {
+            path: path.into(),
+            size_bytes: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        })
+        .collect::<Vec<_>>();
+        DELETE_FAIL_AFTER.with(|counter| counter.set(Some(1)));
+        assert_eq!(
+            inventory
+                .retire_cluster_artifact_copy_with_disposition(
+                    &copy,
+                    "SUCCESS",
+                    proof(),
+                    false,
+                    Some(&expected)
+                )
+                .unwrap()
+                .status,
+            "retry"
+        );
+        let remaining = std::fs::read_dir(&source)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(&remaining, b"replacement bytes").unwrap();
+        let key = format!(
+            "cluster-copy-{:x}",
+            Sha256::digest(serde_json::to_vec(&(&copy, &proof())).unwrap())
+        );
+        let mut operation = inventory.operation(&key).unwrap();
+        operation.next_retry = 0;
+        save_operation(&inventory.db.lock().unwrap(), &operation).unwrap();
+        let resumed = inventory
+            .retire_cluster_artifact_copy_with_disposition(
+                &copy,
+                "SUCCESS",
+                proof(),
+                false,
+                Some(&expected),
+            )
+            .unwrap();
+        assert_eq!(resumed.status, "retained");
+        assert_eq!(std::fs::read(remaining).unwrap(), b"replacement bytes");
     }
     #[test]
     fn raw_copy_seal_refuses_added_or_changed_bytes_then_drains_exact_match() {
