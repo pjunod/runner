@@ -11,6 +11,7 @@ mod recovery;
 mod relocation;
 pub use delivery::{Delivery, DeliveryFile, DeliveryFileOutcome};
 pub use relocation::{RelocationResult, SelectedPublication};
+mod startup;
 mod tasks;
 mod transforms;
 mod workspace_lifecycle;
@@ -302,6 +303,8 @@ pub struct ListPage {
 
 pub struct Inventory {
     db: Mutex<Connection>,
+    allocation_uses: Mutex<std::collections::HashSet<u32>>,
+    reconciliation_uses: Mutex<std::collections::HashSet<(String, String)>>,
     workspace_uses: Mutex<std::collections::HashMap<(String, String), usize>>,
     workspace_cursor: Mutex<String>,
     _process_lock: File,
@@ -319,6 +322,21 @@ pub struct Inventory {
     // One task runner at a time: the maintenance tick and an API kick can
     // both drain the queue, and a task must never execute twice.
     tasks: Mutex<()>,
+}
+
+struct AllocationReservation<'a> {
+    inventory: &'a Inventory,
+    job: u32,
+}
+impl Drop for AllocationReservation<'_> {
+    fn drop(&mut self) {
+        let _coordinator = self.inventory.mutation.lock().unwrap();
+        self.inventory
+            .allocation_uses
+            .lock()
+            .unwrap()
+            .remove(&self.job);
+    }
 }
 
 pub fn now() -> i64 {
@@ -677,6 +695,8 @@ impl Inventory {
         fs::sync_directory(&fs::open_dir(state_dir)?)?;
         Ok(Self {
             db: Mutex::new(db),
+            allocation_uses: Mutex::new(std::collections::HashSet::new()),
+            reconciliation_uses: Mutex::new(std::collections::HashSet::new()),
             workspace_uses: Mutex::new(std::collections::HashMap::new()),
             workspace_cursor: Mutex::new(String::new()),
             _process_lock: process_lock,
@@ -696,6 +716,24 @@ impl Inventory {
             return Err(Error::Conflict("inventory has stopped".into()));
         }
         Ok(guard)
+    }
+    fn reserve_allocation(&self, job: u32) -> Result<AllocationReservation<'_>> {
+        let _coordinator = self.mutation_guard()?;
+        if self.for_job(job)?.is_some_and(|artifact| {
+            self.source_in_use(&SourceGeneration {
+                artifact: artifact.id,
+                generation: artifact.generation,
+            })
+        }) || !self.allocation_uses.lock().unwrap().insert(job)
+        {
+            return Err(Error::Conflict(
+                "allocation or processing custody is already active".into(),
+            ));
+        }
+        Ok(AllocationReservation {
+            inventory: self,
+            job,
+        })
     }
     /// Called only after the engine's writers and maintenance tasks finish.
     /// Old API handles retain read access but cannot mutate a restarted daemon.
@@ -899,7 +937,7 @@ impl Inventory {
     /// Commit allocation intent before the directory exists or a writer opens
     /// a file. A directory already on disk must be explicitly adopted instead.
     pub fn allocate(&self, job: u32, root: &Path, path: &Path) -> Result<Artifact> {
-        let _guard = self.mutation_guard()?;
+        let _reservation = self.reserve_allocation(job)?;
         self.allocate_unlocked(job, root, path, false, false, false)
     }
     pub fn allocate_for_delivery(
@@ -910,7 +948,7 @@ impl Inventory {
         automatic_cleanup_eligible: bool,
         delivery_lifecycle: bool,
     ) -> Result<Artifact> {
-        let _guard = self.mutation_guard()?;
+        let _reservation = self.reserve_allocation(job)?;
         self.allocate_for_delivery_unlocked(
             job,
             root,
@@ -932,7 +970,7 @@ impl Inventory {
         delivery_lifecycle: bool,
         keep_on_failure: bool,
     ) -> Result<Artifact> {
-        let _guard = self.mutation_guard()?;
+        let _reservation = self.reserve_allocation(job)?;
         self.allocate_for_delivery_unlocked(
             job,
             root,
@@ -982,7 +1020,7 @@ impl Inventory {
         path: &Path,
         admitted_policy: Option<(bool, bool, bool)>,
     ) -> Result<Artifact> {
-        let _guard = self.mutation_guard()?;
+        let _reservation = self.reserve_allocation(job)?;
         fs::absolute(path)?;
         if path.parent() != Some(root) || std::fs::symlink_metadata(path).is_ok() {
             return Err(Error::Conflict(
@@ -990,6 +1028,7 @@ impl Inventory {
             ));
         }
         fs::open_dir(root)?;
+        let coordinator = self.mutation_guard()?;
         let previous = self.for_job(job)?;
         // A cluster grant is shared, non-owned input, so its private successor
         // can inherit the immutable admission cohort. An already-owned source
@@ -1011,7 +1050,10 @@ impl Inventory {
             (None, None) => (false, false, false),
         };
         if let Some(mut previous) = previous {
-            if self.artifact_in_use(&previous)? {
+            if self.source_in_use(&SourceGeneration {
+                artifact: previous.id.clone(),
+                generation: previous.generation.clone(),
+            }) {
                 return Err(Error::Conflict(
                     "previous processing workers have not quiesced".into(),
                 ));
@@ -1026,6 +1068,7 @@ impl Inventory {
             previous.revision += 1;
             save_artifact(&self.db.lock().unwrap(), &previous)?;
         }
+        drop(coordinator);
         self.allocate_unlocked(job, root, path, cohort.0, cohort.1, cohort.2)
     }
     fn allocate_unlocked(
@@ -1040,7 +1083,18 @@ impl Inventory {
         if let Some(a) = self.for_job(job)? {
             if a.path == path && a.state == "active" {
                 self.verify(&a)?;
-                return Ok(a);
+                let _coordinator = self.mutation_guard()?;
+                let current = self.get(&a.id)?;
+                if current.generation != a.generation
+                    || current.path != a.path
+                    || current.state != "active"
+                    || current.hold.is_some()
+                {
+                    return Err(Error::Conflict(
+                        "allocation changed while validating root".into(),
+                    ));
+                }
+                return Ok(current);
             }
             return Err(Error::Conflict(
                 "job already owns a different or terminal allocation".into(),
@@ -1057,6 +1111,12 @@ impl Inventory {
         if std::fs::symlink_metadata(path).is_ok() {
             return Err(Error::Conflict(
                 "existing payload needs explicit ownership review".into(),
+            ));
+        }
+        let coordinator = self.mutation_guard()?;
+        if self.for_job(job)?.is_some() {
+            return Err(Error::Conflict(
+                "allocation appeared during root validation".into(),
             ));
         }
         let db = self.db.lock().unwrap();
@@ -1089,10 +1149,21 @@ impl Inventory {
         };
         save_artifact(&db, &a)?;
         drop(db);
+        drop(coordinator);
         std::fs::create_dir(path)?;
         fs::sync_directory(&root_file)?;
         a.identity = Some(fs::identity_for_file(&fs::open_dir(path)?)?);
         self.sidecar(&a)?;
+        let _coordinator = self.mutation_guard()?;
+        let current = self.get(&a.id)?;
+        if current.generation != a.generation
+            || current.revision != a.revision
+            || current.state != "allocating"
+        {
+            return Err(Error::Conflict(
+                "allocation intent changed before completion".into(),
+            ));
+        }
         a.state = "active".into();
         save_artifact(&self.db.lock().unwrap(), &a)?;
         Ok(a)
@@ -1108,6 +1179,9 @@ impl Inventory {
                 return Ok(());
             }
             let _guard = self.mutation_guard()?;
+            if self.artifact_in_use(&previous)? {
+                return Err(Error::Conflict("legacy allocation remains in use".into()));
+            }
             previous.job = None;
             previous.state = if previous.path == path {
                 "source_gone"
@@ -1127,66 +1201,11 @@ impl Inventory {
         save_artifact(&self.db.lock().unwrap(), &a)
     }
 
-    /// Called once before queue writers start, never from the periodic worker.
+    /// Compatibility entry point for callers without a payload scheduler.
+    /// Engine startup dispatches these roots independently instead.
     pub fn reconcile_startup(&self, live_jobs: &[u32]) -> Result<()> {
-        self.reconcile_deleted_artifacts()?;
-        self.reconcile_relocations()?;
-        self.reconcile_transforms()?;
-        let _guard = self.mutation_guard()?;
-        let rows = {
-            let db = self.db.lock().unwrap();
-            let mut stmt = db.prepare(
-                "SELECT data FROM artifacts WHERE state IN ('allocating','retiring','active')",
-            )?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        for raw in rows {
-            let mut a: Artifact = serde_json::from_str(&raw)?;
-            // A scratch artifact intentionally has no job ID. Its transform
-            // operation supplies custody; it is not an orphaned download.
-            if self.is_transform_scratch(&a)? {
-                continue;
-            }
-            let live = a.job.is_some_and(|job| live_jobs.contains(&job));
-            if a.state == "active" && live {
-                continue;
-            }
-            if self.verify_root(&a).is_err() {
-                continue;
-            }
-            if a.state == "allocating" {
-                if !a.path.try_exists()? && live {
-                    std::fs::create_dir(&a.path)?;
-                    fs::sync_directory(&fs::open_dir(&a.root)?)?;
-                }
-                if !a.path.try_exists()? {
-                    a.state = "source_gone".into();
-                } else {
-                    // A crash between mkdir and sidecar cannot prove which
-                    // actor created the directory. Resume without deletion authority.
-                    a.identity = Some(fs::identity_for_file(&fs::open_dir(&a.path)?)?);
-                    a.owned = false;
-                    a.keep = true;
-                    a.hold = Some("review".into());
-                    a.state = if live { "active" } else { "retained" }.into();
-                }
-            } else if let Ok(dir) = self.verify(&a) {
-                a.files = fs::manifest(&dir, 100_000)?;
-                a.inspected_at = Some(now());
-                a.state = "retained".into();
-                a.hold = if a.owned { None } else { Some("review".into()) };
-            } else {
-                a.hold = Some("review: interrupted writer retirement".into());
-            }
-            if !live {
-                a.job = None;
-                a.keep = true;
-                a.hold = Some("review: allocation has no recovered job".into());
-            }
-            a.revision += 1;
-            a.updated_at = now();
-            save_artifact(&self.db.lock().unwrap(), &a)?;
+        for root in self.startup_reconciliation_roots()? {
+            self.reconcile_startup_root(&root, live_jobs)?;
         }
         Ok(())
     }
@@ -1211,7 +1230,6 @@ impl Inventory {
     }
 
     pub fn reconcile_missing(&self) -> Result<()> {
-        let _guard = self.mutation_guard()?;
         let raws = {
             let db = self.db.lock().unwrap();
             let mut stmt = db.prepare("SELECT data FROM artifacts WHERE state IN ('completed','retained','unknown','retiring') AND id>?1 ORDER BY id LIMIT 1000")?;
@@ -1223,19 +1241,29 @@ impl Inventory {
             self.reconcile_cursor.lock().unwrap().clear();
         }
         for raw in raws {
-            let mut a: Artifact = serde_json::from_str(&raw)?;
-            *self.reconcile_cursor.lock().unwrap() = a.id.clone();
-            if self.verify_root(&a).is_err() {
+            let original: Artifact = serde_json::from_str(&raw)?;
+            *self.reconcile_cursor.lock().unwrap() = original.id.clone();
+            let Some(_lease) = self.reserve_reconciliation(std::slice::from_ref(&original))? else {
+                continue;
+            };
+            if self.verify_root(&original).is_err() {
                 continue;
             }
-            match std::fs::symlink_metadata(&a.path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    a.state = "source_gone".into();
-                    a.updated_at = now();
-                    a.revision += 1;
-                    save_artifact(&self.db.lock().unwrap(), &a)?;
+            if matches!(std::fs::symlink_metadata(&original.path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            {
+                let _coordinator = self.mutation_guard()?;
+                let mut current = self.get(&original.id)?;
+                if current.generation != original.generation
+                    || current.path != original.path
+                    || current.root != original.root
+                    || current.revision != original.revision
+                {
+                    continue;
                 }
-                _ => {}
+                current.state = "source_gone".into();
+                current.updated_at = now();
+                current.revision += 1;
+                save_artifact(&self.db.lock().unwrap(), &current)?;
             }
         }
         Ok(())
@@ -1247,6 +1275,8 @@ impl Inventory {
         Ok(())
     }
     fn verify_root(&self, a: &Artifact) -> Result<File> {
+        #[cfg(test)]
+        startup::before_root_open(&a.root);
         let raw: Option<String> = self
             .db
             .lock()
@@ -1320,7 +1350,6 @@ impl Inventory {
     }
     /// Called at a writer/PP quiescence boundary, before publishing History.
     pub fn finish(&self, job: u32, path: &Path, root: &Path, state: &str) -> Result<Artifact> {
-        let _guard = self.mutation_guard()?;
         let a = self.for_job(job)?.ok_or(Error::NotFound)?;
         self.finish_artifact_unlocked(a, path, root, state)
     }
@@ -1328,8 +1357,8 @@ impl Inventory {
     /// Refresh the full Runner-owned source snapshot at the post-script
     /// quiescence boundary before selecting files for publication.
     pub fn refresh_for_delivery(&self, job: u32) -> Result<Artifact> {
-        let _guard = self.mutation_guard()?;
         let mut artifact = self.for_job(job)?.ok_or(Error::NotFound)?;
+        let original = artifact.clone();
         if !artifact.automatic_cleanup_eligible
             || !artifact.owned
             || artifact.state != "active"
@@ -1345,9 +1374,26 @@ impl Inventory {
         artifact.inspected_at = Some(now());
         artifact.revision += 1;
         artifact.updated_at = now();
+        let _coordinator = self.mutation_guard()?;
+        self.check_payload_capture(&original)?;
         self.sidecar(&artifact)?;
         save_artifact(&self.db.lock().unwrap(), &artifact)?;
         Ok(artifact)
+    }
+    // Namespace mutation changes the generation/revision under the coordinator;
+    // a read-only capture may run without it and commit only its exact snapshot.
+    fn check_payload_capture(&self, original: &Artifact) -> Result<()> {
+        let current = self.get(&original.id)?;
+        if current.generation != original.generation
+            || current.revision != original.revision
+            || current.path != original.path
+            || current.root != original.root
+        {
+            return Err(Error::Conflict(
+                "source changed during payload capture".into(),
+            ));
+        }
+        Ok(())
     }
     pub(super) fn finish_artifact_unlocked(
         &self,
@@ -1356,6 +1402,7 @@ impl Inventory {
         root: &Path,
         state: &str,
     ) -> Result<Artifact> {
+        let original = a.clone();
         // History may record a bounded PP failure while its independent
         // deletion journal keeps retrying. Do not erase that pending authority.
         if matches!(a.state.as_str(), "deleting" | "delete_failed")
@@ -1382,6 +1429,8 @@ impl Inventory {
                     a.inspected_at = Some(now());
                     a.revision += 1;
                     a.updated_at = now();
+                    let _coordinator = self.mutation_guard()?;
+                    self.check_payload_capture(&original)?;
                     self.sidecar(&a)?;
                     save_artifact(&self.db.lock().unwrap(), &a)?;
                 }
@@ -1418,6 +1467,8 @@ impl Inventory {
             a.deadline = Some(now().saturating_add(a.retention_seconds as i64));
             a.eligible_seconds = 0;
         }
+        let _coordinator = self.mutation_guard()?;
+        self.check_payload_capture(&original)?;
         self.sidecar(&a)?;
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
@@ -1428,26 +1479,50 @@ impl Inventory {
     }
     /// Capture an unknown directory without granting deletion authority.
     pub fn discover(&self, root: &Path, path: &Path, active: bool) -> Result<Artifact> {
-        let _guard = self.mutation_guard()?;
         self.discover_record(root, path, active)
     }
     fn discover_unlocked(&self, root: &Path, path: &Path) -> Result<Artifact> {
         self.discover_record(root, path, false)
     }
     fn discover_record(&self, root: &Path, path: &Path, active: bool) -> Result<Artifact> {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::Conflict("inventory has stopped".into()));
+        }
         fs::absolute(path)?;
         if path.parent() != Some(root) {
             return Err(Error::Conflict(
                 "discovery must be an immediate child".into(),
             ));
         }
-        let db = self.db.lock().unwrap();
-        let existing: Option<String> = db.query_row("SELECT data FROM artifacts WHERE path=?1 AND state NOT IN ('deleted','source_gone') LIMIT 1", [path.to_string_lossy()], |r| r.get(0)).optional()?;
+        // Discovery observes a candidate; it never grants namespace or
+        // cleanup authority. Check first to avoid unnecessary mount access,
+        // then recheck under the mutation coordinator before recording it.
+        let existing = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT data FROM artifacts WHERE path=?1 AND state NOT IN ('deleted','source_gone') LIMIT 1",
+                [path.to_string_lossy()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
         if let Some(raw) = existing {
             return Ok(serde_json::from_str(&raw)?);
         }
         let dir = fs::open_dir(path)?;
         let root_file = fs::open_dir(root)?;
+        let root_identity = fs::identity_for_file(&root_file)?;
+        let identity = Some(fs::identity_for_file(&dir)?);
+        drop(root_file);
+        drop(dir);
+
+        let _guard = self.mutation_guard()?;
+        let db = self.db.lock().unwrap();
+        let existing: Option<String> = db.query_row("SELECT data FROM artifacts WHERE path=?1 AND state NOT IN ('deleted','source_gone') LIMIT 1", [path.to_string_lossy()], |r| r.get(0)).optional()?;
+        if let Some(raw) = existing {
+            return Ok(serde_json::from_str(&raw)?);
+        }
         let a = Artifact {
             id: id(&db)?,
             generation: id(&db)?,
@@ -1456,8 +1531,8 @@ impl Inventory {
             path: path.into(),
             origin_path: path.into(),
             root: root.into(),
-            root_identity: fs::identity_for_file(&root_file)?,
-            identity: Some(fs::identity_for_file(&dir)?),
+            root_identity,
+            identity,
             state: if active {
                 "active_unverified"
             } else {
@@ -1484,11 +1559,9 @@ impl Inventory {
         Ok(a)
     }
     pub fn inspect(&self, key: &str) -> Result<Artifact> {
-        let _guard = self.mutation_guard()?;
-        let mut a = self.get(key)?;
-        let dir = self.verify(&a)?;
+        let original = self.get(key)?;
         if matches!(
-            a.state.as_str(),
+            original.state.as_str(),
             "active"
                 | "active_unverified"
                 | "transitioning"
@@ -1500,7 +1573,30 @@ impl Inventory {
                 "writers must finish before inspection".into(),
             ));
         }
+        // Reserve this exact metadata generation briefly, then inspect the
+        // payload without either the mutation coordinator or SQLite held.
+        // The final revision check below rejects an obsolete observation.
+        let Some(_lease) = self.reserve_reconciliation(std::slice::from_ref(&original))? else {
+            return Err(Error::Conflict(
+                "artifact changed or is in use; retry inspection".into(),
+            ));
+        };
+        let dir = self.verify(&original)?;
         let files = fs::manifest(&dir, 100_000)?;
+        drop(dir);
+
+        let _guard = self.mutation_guard()?;
+        let mut a = self.get(key)?;
+        if a.id != original.id
+            || a.generation != original.generation
+            || a.path != original.path
+            || a.root != original.root
+            || a.revision != original.revision
+        {
+            return Err(Error::Conflict(
+                "artifact policy or identity changed during inspection; retry".into(),
+            ));
+        }
         if a.owned && files != a.files {
             a.owned = false;
             a.keep = true;
@@ -1530,12 +1626,11 @@ impl Inventory {
                     .into(),
             ));
         }
-        let _guard = self.mutation_guard()?;
-        let mut a = self.get(key)?;
-        if a.revision != revision
-            || a.owned
+        let original = self.get(key)?;
+        if original.revision != revision
+            || original.owned
             || !matches!(
-                a.state.as_str(),
+                original.state.as_str(),
                 "unknown" | "retained" | "parked_failed" | "completed"
             )
         {
@@ -1543,19 +1638,29 @@ impl Inventory {
                 "stale preview or artifact is not unknown".into(),
             ));
         }
-        let dir = self.verify(&a)?;
+        let Some(_lease) = self.reserve_reconciliation(std::slice::from_ref(&original))? else {
+            return Err(Error::Conflict(
+                "artifact changed or is in use; retry adoption".into(),
+            ));
+        };
+        let dir = self.verify(&original)?;
         let files = fs::manifest(&dir, 100_000)?;
-        if files != a.files {
+        drop(dir);
+        if files != original.files {
             return Err(Error::Conflict(
                 "files changed; inspect before adopting".into(),
             ));
         }
+        let mut a = original.clone();
         a.owned = true;
         a.keep = true;
         a.hold = None;
         a.state = "retained".into();
         a.revision += 1;
         self.sidecar(&a)?;
+
+        let _guard = self.mutation_guard()?;
+        self.check_payload_capture(&original)?;
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         save_artifact(&tx, &a)?;
@@ -1572,6 +1677,11 @@ impl Inventory {
     ) -> Result<Artifact> {
         let _guard = self.mutation_guard()?;
         let mut a = self.get(key)?;
+        if self.reconciliation_in_use(&a) {
+            return Err(Error::Conflict(
+                "payload lifecycle custody is active".into(),
+            ));
+        }
         if a.revision != revision
             || !a.owned
             || a.state == "transferred"
@@ -1654,6 +1764,11 @@ impl Inventory {
         let Some(mut artifact) = artifact else {
             return Ok(false);
         };
+        if self.reconciliation_in_use(&artifact) {
+            return Err(Error::Conflict(
+                "payload lifecycle custody is active".into(),
+            ));
+        }
         if !artifact.owned || artifact.terminal() {
             return Ok(false);
         }
@@ -1840,6 +1955,11 @@ impl Inventory {
         }
         let _guard = self.mutation_guard()?;
         let mut artifact = self.get(artifact_id)?;
+        if self.reconciliation_in_use(&artifact) {
+            return Err(Error::Conflict(
+                "payload lifecycle custody is active".into(),
+            ));
+        }
         if artifact.generation != generation
             || !artifact.automatic_cleanup_eligible
             || !artifact.owned
@@ -1864,10 +1984,9 @@ impl Inventory {
         Ok(artifact)
     }
     pub fn release_review(&self, key: &str, revision: u64) -> Result<Artifact> {
-        let _guard = self.mutation_guard()?;
-        let mut a = self.get(key)?;
-        if a.revision != revision
-            || !a
+        let original = self.get(key)?;
+        if original.revision != revision
+            || !original
                 .hold
                 .as_deref()
                 .is_some_and(|h| h.starts_with("review") || h.starts_with("restored backup"))
@@ -1876,18 +1995,29 @@ impl Inventory {
                 "stale revision or hold is owned by an active operation".into(),
             ));
         }
-        let dir = self.verify(&a)?;
-        if fs::manifest(&dir, 100_000)? != a.files {
+        let Some(_lease) = self.reserve_reconciliation(std::slice::from_ref(&original))? else {
+            return Err(Error::Conflict(
+                "artifact changed or is in use; retry releasing review hold".into(),
+            ));
+        };
+        let dir = self.verify(&original)?;
+        let files = fs::manifest(&dir, 100_000)?;
+        drop(dir);
+        if files != original.files {
             return Err(Error::Conflict(
                 "files changed; inspect before releasing review hold".into(),
             ));
         }
+
+        let _guard = self.mutation_guard()?;
+        self.check_payload_capture(&original)?;
         let pending:bool=self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM recoveries WHERE artifact=?1 AND state NOT IN ('imported','cancelled','partial'))",[key],|r|r.get(0))?;
         if pending {
             return Err(Error::Conflict(
                 "recovery is still active or ambiguous".into(),
             ));
         }
+        let mut a = self.get(key)?;
         a.hold = None;
         a.eligible_seconds = 0;
         a.deadline = Some(now().saturating_add(a.retention_seconds as i64));
@@ -2018,7 +2148,10 @@ impl Inventory {
         key: &str,
         authority: Option<(&AttemptUse, &dyn Fn() -> std::io::Result<()>)>,
     ) -> Result<Operation> {
-        let _guard = self.mutation_guard()?;
+        // Declared first so error unwinding drops the coordinator before the
+        // reservation's Drop needs it.
+        let _lease;
+        let guard = self.mutation_guard()?;
         if let Some((_, checkpoint)) = authority {
             checkpoint()?;
         }
@@ -2085,6 +2218,9 @@ impl Inventory {
         {
             return Err(Error::Conflict("payload acquired a hold".into()));
         }
+        _lease = self
+            .reserve_reconciliation_locked(std::slice::from_ref(&a), use_guard, &guard)?
+            .ok_or_else(|| Error::Conflict("deletion custody is already active".into()))?;
         op.state = "running".into();
         op.attempts += 1;
         a.state = "deleting".into();
@@ -2098,9 +2234,23 @@ impl Inventory {
             save_artifact(&tx, &a)?;
             tx.commit()?;
         }
+        drop(guard);
         let result = authority
             .map_or(Ok(()), |(_, checkpoint)| checkpoint().map_err(Error::from))
             .and_then(|()| self.delete_manifest_checked(&a, op.attempts));
+        let _coordinator = self.mutation_guard()?;
+        let current = self.get(&a.id)?;
+        let saved = self.operation(&op.id)?;
+        if current.generation != a.generation
+            || current.path != a.path
+            || current.root != a.root
+            || saved.state != op.state
+            || saved.request != op.request
+        {
+            return Ok(saved);
+        }
+        // Retain policy edits made while the actual worker owned the bytes.
+        a = current;
         match result {
             Ok(()) => {
                 op.state = "succeeded".into();
@@ -2140,8 +2290,8 @@ impl Inventory {
         tx.commit()?;
         Ok(op)
     }
-    /// Shared identity/manifest-checked deletion. Call only while holding the
-    /// mutation coordinator and after generation-specific authorization.
+    /// Shared identity/manifest-checked deletion. Call only with a live
+    /// exact-generation reservation and generation-specific authorization.
     fn delete_manifest_checked(&self, a: &Artifact, attempts: u32) -> Result<()> {
         let root = self.verify_root(a)?;
         if attempts > 1 {
@@ -2341,8 +2491,18 @@ impl Inventory {
     fn register_publication(&self, recovery: &Recovery) -> Result<()> {
         if let Ok(existing) = self.get(&format!("recovery-{}", recovery.id)) {
             self.verify(&existing)?;
+            let _coordinator = self.mutation_guard()?;
+            self.check_payload_capture(&existing)?;
+            let current = self.recovery(&recovery.id)?;
+            if current.generation != recovery.generation || current.published != recovery.published
+            {
+                return Err(Error::Conflict(
+                    "recovery publication generation changed".into(),
+                ));
+            }
             return Ok(());
         }
+        let source = self.get(&recovery.artifact)?;
         let root = recovery
             .published
             .parent()
@@ -2388,7 +2548,28 @@ impl Inventory {
             inspected_at: Some(now()),
         };
         self.sidecar(&a)?;
-        save_artifact(&self.db.lock().unwrap(), &a)
+        let _coordinator = self.mutation_guard()?;
+        self.check_payload_capture(&source)?;
+        let current = self.recovery(&recovery.id)?;
+        if current.generation != recovery.generation || current.published != recovery.published {
+            return Err(Error::Conflict(
+                "recovery publication generation changed before enrollment".into(),
+            ));
+        }
+        match self.get(&a.id) {
+            Ok(existing)
+                if existing.generation == a.generation
+                    && existing.path == a.path
+                    && existing.root == a.root =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(Error::Conflict(
+                "recovery publication enrollment was superseded".into(),
+            )),
+            Err(Error::NotFound) => save_artifact(&self.db.lock().unwrap(), &a),
+            Err(error) => Err(error),
+        }
     }
 
     /// Explicit restore quarantine; run before serving requests from a restored

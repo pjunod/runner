@@ -1931,7 +1931,7 @@ fn queued_expiry_is_invalidated_by_a_fresh_policy_or_disabled_automation() {
     }
 }
 #[test]
-fn startup_orphaned_active_allocation_is_reviewable_and_detached_from_job_id() {
+fn startup_orphaned_active_allocation_preserves_binding_until_explicit_successor() {
     let (_tmp, db, root) = fixture();
     let a = db.allocate(42, &root, &root.join("orphan")).unwrap();
     std::fs::write(a.path.join("media.mkv"), b"keep").unwrap();
@@ -1939,9 +1939,11 @@ fn startup_orphaned_active_allocation_is_reviewable_and_detached_from_job_id() {
     let orphan = db.get(&a.id).unwrap();
     assert_eq!(orphan.state, "retained");
     assert!(orphan.keep && orphan.hold.is_some());
-    assert!(db.for_job(42).unwrap().is_none());
+    assert_eq!(db.for_job(42).unwrap().unwrap().id, a.id);
     assert!(db.inspect(&a.id).is_ok());
-    assert!(db.allocate(42, &root, &root.join("new-job")).is_ok());
+    assert!(db
+        .allocate_processing_successor(42, &root, &root.join("new-job"))
+        .is_ok());
 }
 #[test]
 fn enabled_discovery_coalesces_and_scans_explicit_nested_category_roots() {
@@ -2523,4 +2525,71 @@ fn recovery_cleanup_failure_keeps_publication_claimable_and_retries_after_restar
         assert!(!scratch.exists());
         assert!(r.published.join("payload/episode.mkv").is_file());
     }
+}
+
+#[test]
+fn blocked_startup_root_does_not_block_other_root_or_durable_metadata() {
+    use std::sync::{mpsc, Condvar};
+    let (_tmp, inventory, root_a) = fixture();
+    let root_b = root_a.parent().unwrap().join("other-root");
+    std::fs::create_dir(&root_b).unwrap();
+    inventory
+        .allocate(81, &root_a, &root_a.join("retiring"))
+        .unwrap();
+    inventory.prepare_forget(81).unwrap();
+    let inventory = Arc::new(inventory);
+    let (arrive, arrival) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    *startup::ROOT_OPEN_GATE.lock().unwrap() = Some((root_a.clone(), arrive, release.clone()));
+    let recovering = inventory.clone();
+    let recovery = std::thread::spawn(move || recovering.reconcile_startup_root(&root_a, &[81]));
+    if arrival.recv_timeout(Duration::from_secs(2)).is_err() {
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        *startup::ROOT_OPEN_GATE.lock().unwrap() = None;
+        panic!("root recovery did not reach the payload-open boundary");
+    }
+    let healthy = inventory.clone();
+    let (send, receive) = mpsc::channel();
+    let admission = std::thread::spawn(move || {
+        let result = (|| {
+            let mut settings = healthy.settings()?;
+            settings.failed_retention_days = 3;
+            healthy.set_settings(&settings)?;
+            healthy.allocate(82, &root_b, &root_b.join("new-job"))?;
+            Ok::<_, Error>(())
+        })();
+        send.send(result).unwrap();
+    });
+    let result = receive.recv_timeout(Duration::from_secs(2));
+    // Always release the worker before asserting, even on regression.
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    recovery.join().unwrap().unwrap();
+    admission.join().unwrap();
+    result
+        .expect("healthy root and durable metadata waited for the blocked payload root")
+        .unwrap();
+    assert_eq!(inventory.settings().unwrap().failed_retention_days, 3);
+    assert!(inventory.for_job(82).unwrap().is_some());
+}
+
+#[test]
+fn adopted_startup_orphan_restores_only_automatic_keep_and_hold() {
+    let (_tmp, inventory, root) = fixture();
+    let artifact = inventory
+        .allocate(83, &root, &root.join("adopted"))
+        .unwrap();
+    inventory.reconcile_startup_root(&root, &[]).unwrap();
+    let recovered = inventory.reclaim_recovered_orphan(83).unwrap().unwrap();
+    assert_eq!(recovered.id, artifact.id);
+    assert_eq!(recovered.state, "active");
+    assert_eq!(recovered.keep, artifact.keep);
+    assert_eq!(recovered.hold, artifact.hold);
+    let kept = inventory
+        .retention(&recovered.id, recovered.revision, true, None)
+        .unwrap();
+    inventory.reconcile_startup_root(&root, &[]).unwrap();
+    let recovered = inventory.reclaim_recovered_orphan(83).unwrap().unwrap();
+    assert!(recovered.keep && kept.keep);
 }

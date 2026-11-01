@@ -223,7 +223,19 @@ impl JobJournals {
         fsx::create_dir_all(&jobs_dir)?;
         Ok(JobJournals {
             jobs_dir,
-            suffix: sanitize_suffix(suffix),
+            suffix: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                format!(
+                    "{}.{}.{stamp:x}.{}",
+                    sanitize_suffix(suffix),
+                    std::process::id(),
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                )
+            },
             open: Default::default(),
             dirty: false,
         })
@@ -238,7 +250,16 @@ impl JobJournals {
             let dir = self.jobs_dir.join(job.0.to_string());
             fsx::create_dir_all(&dir)?;
             let path = dir.join(format!("journal.{}", self.suffix));
-            let file = fsx::open_append(&path)?;
+            // Each incarnation owns an exclusive journal inode. Compaction can
+            // remove only that inode; a foreign append descriptor is never unlinked.
+            let file = fsx::ctx(
+                std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .append(true)
+                    .open(&path),
+                "create incarnation journal",
+                &path,
+            )?;
             self.open.insert(job.0, OpenJournal { path, file });
         }
         Ok(self.open.get_mut(&job.0).unwrap())
@@ -337,9 +358,22 @@ impl JobJournals {
         Ok(out)
     }
 
-    /// Remove every journal file of a job — call ONLY as the queue
-    /// authority, immediately after a snapshot that folds the job's state,
-    /// and never while the job is delegated (a live foreign writer).
+    /// Retire only this instance's serialized, snapshot-covered journal.
+    /// Foreign suffixes/incarnations (including live descriptors) remain intact.
+    pub fn compact_local(&mut self, job: JobId) -> Result<(), StateError> {
+        let Some(open) = self.open.remove(&job.0) else {
+            return Ok(());
+        };
+        let path = open.path.clone();
+        drop(open);
+        match fsx::remove_file(&path) {
+            Err(error) if error.is_not_found() => Ok(()),
+            other => other,
+        }
+    }
+
+    /// Explicit whole-job maintenance, requiring every writer incarnation to
+    /// be stopped. Runtime snapshot compaction must use `compact_local`.
     pub fn remove_job(&mut self, job: JobId) -> Result<(), StateError> {
         self.open.remove(&job.0);
         let dir = self.jobs_dir.join(job.0.to_string());
