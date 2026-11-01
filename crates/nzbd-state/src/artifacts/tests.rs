@@ -2862,7 +2862,7 @@ fn selected_publication_reserves_only_selected_bytes() {
 
 #[test]
 fn delivery_stage_snapshot_is_bounded_optional_and_immutable_on_replay() {
-    let (_tmp, db, root) = fixture();
+    let (tmp, db, root) = fixture();
     let source = root.join("stage-snapshot");
     db.allocate_for_delivery(74, &root, &source, true, true)
         .unwrap();
@@ -2877,8 +2877,27 @@ fn delivery_stage_snapshot_is_bounded_optional_and_immutable_on_replay() {
             ms: None,
         }],
     };
+    let timing = nzbd_types::LifecycleTiming {
+        version: 1,
+        intervals: vec![nzbd_types::LifecycleInterval {
+            stage: nzbd_types::LifecycleStage::Download,
+            node_id: "worker-one".into(),
+            clock_domain: "worker-one:boot-one".into(),
+            start_unix_ms: 1000,
+            end_unix_ms: Some(900),
+            start_monotonic_ms: Some(0),
+            end_monotonic_ms: Some(10),
+            duration_ms: Some(10),
+            state: nzbd_types::LifecycleIntervalState::Completed,
+            observations: 1,
+        }],
+        omitted_intervals: std::collections::BTreeMap::from([(
+            nzbd_types::LifecycleStage::Queue,
+            2,
+        )]),
+    };
     let delivery = db
-        .create_delivery_with_outcome_keep_and_stages(
+        .create_delivery_with_lifecycle_snapshot(
             74,
             true,
             Some("stage-74"),
@@ -2887,9 +2906,17 @@ fn delivery_stage_snapshot_is_bounded_optional_and_immutable_on_replay() {
             None,
             false,
             Some(snapshot.clone()),
+            Some(timing.clone()),
         )
         .unwrap();
     assert_eq!(delivery.runner_stages, Some(snapshot.clone()));
+    assert_eq!(delivery.lifecycle_timing, Some(timing.clone()));
+    drop(db);
+    let db = Inventory::open(&tmp.path().join("state")).unwrap();
+    assert_eq!(
+        db.delivery(&delivery.delivery_id).unwrap().lifecycle_timing,
+        Some(timing.clone())
+    );
     let mut later = snapshot.clone();
     later.spans[0].ms = Some(99);
     let replay = db
@@ -2904,6 +2931,7 @@ fn delivery_stage_snapshot_is_bounded_optional_and_immutable_on_replay() {
             Some(later),
         )
         .unwrap();
+    assert_eq!(replay.lifecycle_timing, Some(timing));
     assert_eq!(
         replay.runner_stages,
         Some(snapshot.clone()),

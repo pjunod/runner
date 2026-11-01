@@ -5453,14 +5453,15 @@ function jobDeliveryHtml(id, params) {
 function deliveryTraceHtml(delivery) {
   const duration = value => Number.isSafeInteger(value) && value >= 0 ? fmtDur(value) + " measured time" : "duration unknown";
   const lanes = measuredDeliveryLanes(delivery);
+  const omitted = Object.entries(delivery.lifecycleTiming?.omittedIntervals || {}).filter(([,count]) => Number.isInteger(count) && count > 0);
   const timing = lanes.length ? lanes.map(lane => `<section><b>Runner · ${esc(lane.node || "node unknown")}</b>` +
-    `<p>${lane.measuredMs == null ? "Measured time unavailable" : "Measured time (overlapping steps counted once): " + esc(fmtDur(lane.measuredMs))}${lane.unknown ? " · Some steps have no complete timing" : ""}</p>` +
+    `<p>${lane.measuredMs == null ? "Measured time unavailable" : (omitted.length ? "Recorded subset · " : "") + "Measured time (overlapping steps counted once): " + esc(fmtDur(lane.measuredMs))}${lane.unknown ? " · Some steps have no complete timing" : ""}</p>` +
     `<ol>${lane.intervals.map(i => `<li><b>${esc(String(i.stage || "unknown").replaceAll("_", " "))}</b> · ${esc(i.state || "unknown")} · ${esc(duration(deliveryMeasuredMs(i)))}</li>`).join("")}</ol>` +
     `<details><summary>Timing reference</summary><code>${esc(lane.clock)}</code></details></section>`).join("") : `<p>Earlier step timings were not recorded.</p>`;
   const stages = delivery.runnerStages;
-  const post = stages && Array.isArray(stages.spans) ? `<details><summary>Processing details · ${esc(stages.nodeId || "node unknown")}</summary><p>These details expand processing steps above and are not added again.</p><ol>${stages.spans.slice(0, 128).map(span => `<li>${esc(String(span.stage || "unknown").replaceAll("_", " "))} · ${esc(duration(span.ms))}</li>`).join("")}</ol></details>` : "";
+  const post = stages && Array.isArray(stages.spans) ? `<details><summary>Processing details · ${esc(stages.nodeId === "unrecorded" ? "origin not recorded" : stages.nodeId || "node unknown")}</summary><p>These details expand processing steps above and are not added again.${stages.nodeId === "unrecorded" ? " Original machine/session provenance was not recorded for these spans." : ""}</p><ol>${stages.spans.slice(0, 128).map(span => `<li>${esc(String(span.stage || "unknown").replaceAll("_", " "))} · ${esc(duration(span.ms))}</li>`).join("")}</ol></details>` : "";
   const copies = Array.isArray(delivery.sourceCopies) ? delivery.sourceCopies.slice(0, 64) : [];
-  return `<p>Times from different machines or restarts stay separate.</p>${timing}${post}` +
+  return `<p>Times from different machines or restarts stay separate.</p>${omitted.length ? `<p>Recorded subset: at least ${omitted.map(([stage,count]) => esc(count) + " " + esc(stage.replaceAll("_", " ")) + " intervals").join(", ")} omitted. Totals include only recorded intervals.</p>` : ""}${timing}${post}` +
     `<section><b>Publication and handoff</b><p>Ready ${esc(fmtTime(delivery.readyAt))} · ${delivery.acceptedAt ? "Consumer acceptance recorded " + esc(fmtTime(delivery.acceptedAt)) : "Awaiting consumer acceptance"}</p></section>` +
     (copies.length ? `<section><b>Processing source copies</b><ul>${copies.map(copy => `<li><b>${esc(copy.ownerNode || "node unknown")}</b> · ${esc(String(copy.status || "unknown").replaceAll("_", " "))}<p>${esc(copy.attempts ?? 0)} cleanup attempts${copy.nextRetryAt ? " · next " + esc(fmtTime(copy.nextRetryAt)) : ""}</p>${copy.error ? `<p class="err">${esc(copy.error)}</p>` : ""}<details><summary>Copy reference</summary><code>${esc(copy.id)}</code></details></li>`).join("")}</ul></section>` : `<p>Separate source-copy details were not reported.</p>`);
 }

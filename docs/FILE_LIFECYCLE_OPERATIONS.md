@@ -67,7 +67,18 @@ opening a job never scans the Delivery collection to guess its receipt.
 
 Measured queue, fetch, download and processing steps remain separate for each
 machine and process session. A subtotal counts overlapping completed steps once,
-using recorded monotonic endpoints. Missing or interrupted measurements stay
+using recorded monotonic endpoints. The immutable publication snapshot measures
+queue, URL fetch, download and processing through READY. Consumer acceptance
+and handoff retry observations remain in the separate mutable receipt lane;
+Runner does not invent a handoff duration ending after the snapshot. The wire
+contract also accepts a future explicit `handoff` interval.
+
+Evidence stays bounded at 128 major intervals. Omission counters are conservative
+lower bounds: **at least N omitted**, and any subtotal describes the **recorded
+subset**. Replay keeps stable observation identities so foreign completed worker
+measurements survive late imports without being counted twice. StageSpan-based
+processing details lack historical per-span machine/session identity; their
+origin remains explicitly unrecorded, including after restart. Missing or interrupted measurements stay
 unknown. Processing details expand the major steps and are not added again.
 Publication/consumer acceptance and source-copy cleanup follow separately. Copy
 status, retry attempts and errors lead; exact references can be expanded. Retry

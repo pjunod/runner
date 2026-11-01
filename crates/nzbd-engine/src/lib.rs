@@ -22,6 +22,8 @@ pub mod torrent_runtime;
 pub mod volumes;
 
 mod imports;
+pub mod lifecycle;
+pub use lifecycle::frozen_lifecycle_timing;
 mod owner;
 mod pool;
 mod writer;

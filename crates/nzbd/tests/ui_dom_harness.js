@@ -1218,6 +1218,8 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     startMonotonicMs: start, endMonotonicMs: end, durationMs: end - start });
   timed.lifecycleTiming = { version: 1, intervals: [span("download", 0, 2000), span("post_processing", 1000, 3000), span("queue", 0, 1000, "worker-b"),
     { ...span("url_fetch", 0, 9999), state: "interrupted" }, { stage: "queue", nodeId: "worker-a", clockDomain: "legacy", state: "completed", startUnixMs: 1, endUnixMs: 99999, durationMs: 99998 }] };
+  timed.lifecycleTiming.omittedIntervals = { queue: 2 };
+  ok(T.deliveryTraceHtml(timed).includes("Recorded subset"), "omitted intervals label timing totals as recorded subset");
   timed.sourceCopies = [{ id: "copy-long-reference", ownerNode: "worker-a", status: "retry", attempts: 2, error: "Mount unavailable" }];
   const lanes = T.measuredDeliveryLanes(timed);
   eq(lanes.length, 3, "node and session identities keep separate subtotals");

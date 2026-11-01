@@ -80,6 +80,8 @@ pub struct Delivery {
     pub file_outcomes: Vec<DeliveryFileOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_stages: Option<DeliveryRunnerStages>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_timing: Option<nzbd_types::LifecycleTiming>,
     pub ready_at: i64,
     pub accepted_at: Option<i64>,
     pub consumer_receipt_id: Option<String>,
@@ -333,6 +335,40 @@ impl Inventory {
         keep_source_on_failure: bool,
         runner_stages: Option<DeliveryRunnerStages>,
     ) -> Result<Delivery> {
+        self.create_delivery_with_lifecycle_snapshot(
+            job,
+            admitted_for_delivery,
+            request_token,
+            terminal_outcome,
+            failure_stage,
+            failure_cause,
+            keep_source_on_failure,
+            runner_stages,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_delivery_with_lifecycle_snapshot(
+        &self,
+        job: u32,
+        admitted_for_delivery: bool,
+        request_token: Option<&str>,
+        terminal_outcome: &str,
+        failure_stage: Option<&str>,
+        failure_cause: Option<&str>,
+        keep_source_on_failure: bool,
+        runner_stages: Option<DeliveryRunnerStages>,
+        lifecycle_timing: Option<nzbd_types::LifecycleTiming>,
+    ) -> Result<Delivery> {
+        if lifecycle_timing
+            .as_ref()
+            .is_some_and(|timing| !timing.valid())
+        {
+            return Err(Error::Conflict(
+                "invalid measured lifecycle snapshot".into(),
+            ));
+        }
         if runner_stages.as_ref().is_some_and(|snapshot| {
             snapshot.spans.len() > 128
                 || snapshot.node_id.is_empty()
@@ -463,6 +499,7 @@ impl Inventory {
             files,
             file_outcomes,
             runner_stages,
+            lifecycle_timing,
             ready_at: now(),
             accepted_at: None,
             consumer_receipt_id: None,

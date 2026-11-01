@@ -33,6 +33,7 @@ export function DeliveryLifecyclePanel({ client, receiptId }: { client: NzbdClie
   };
   const duration = (ms?: number | null) => typeof ms === 'number' && Number.isSafeInteger(ms) && ms >= 0 ? formatDuration(ms / 1000) : 'unknown';
   const time = (unix?: number | null) => typeof unix === 'number' && unix > 0 && Number.isFinite(new Date(unix * 1000).getTime()) ? new Date(unix * 1000).toLocaleString() : 'time unknown';
+  const omitted = Object.entries(delivery?.lifecycleTiming?.omittedIntervals || {}).filter(([,count]) => Number.isInteger(count) && count > 0);
   const retryable = ['pending', 'retry', 'blocked'].includes(delivery?.sourceCleanup?.status || '') || delivery?.sourceCopies?.some(copy => ['pending', 'retry', 'blocked'].includes(copy.status));
   return <View style={styles.panel}>
     <Text accessibilityRole="header" style={styles.title}>Publication lifecycle</Text>
@@ -40,15 +41,16 @@ export function DeliveryLifecyclePanel({ client, receiptId }: { client: NzbdClie
     {error ? <Text accessibilityRole="alert" style={styles.error}>{error}</Text> : null}
     {!delivery && !error ? <Text style={styles.note}>Loading lifecycle details…</Text> : null}
     {delivery ? <>
+      {omitted.length ? <Text style={styles.note}>Recorded subset: at least {omitted.map(([stage,count]) => `${count} ${stage.replaceAll('_', ' ')} intervals`).join(', ')} omitted. Totals include only recorded intervals.</Text> : null}
       <Text style={styles.note}>Times from different machines or restarts stay separate.</Text>
       {deliveryLanes(delivery).length ? deliveryLanes(delivery).map(lane => <View key={JSON.stringify([lane.node, lane.clock])} style={styles.lane}>
         <Text style={styles.title}>Runner · {lane.node || 'node unknown'}</Text>
-        <Text style={styles.note}>Measured time (overlapping steps counted once): {duration(lane.measuredMs)}</Text>
+        <Text style={styles.note}>{omitted.length ? 'Recorded subset · ' : ''}Measured time (overlapping steps counted once): {duration(lane.measuredMs)}</Text>
         {lane.unknown ? <Text style={styles.note}>Some steps have no complete timing.</Text> : null}
         {lane.intervals.map((interval, index) => <Text key={index} style={styles.text}>{interval.stage.replaceAll('_', ' ')} · {interval.state} · {measuredIntervalDuration(interval) === undefined ? 'duration unknown' : `${duration(measuredIntervalDuration(interval))} measured time`}</Text>)}
         {references ? <Text selectable style={styles.note}>{lane.clock}</Text> : null}
       </View>) : <Text style={styles.note}>Earlier step timings were not recorded.</Text>}
-      {delivery.runnerStages ? <View style={styles.lane}><Text style={styles.title}>Processing details · {delivery.runnerStages.nodeId}</Text><Text style={styles.note}>These details expand the processing steps above and are not added again.</Text>{delivery.runnerStages.spans.slice(0, 128).map((span, index) => <Text key={index} style={styles.text}>{span.stage.replaceAll('_', ' ')} · {duration(span.ms)} measured time</Text>)}</View> : null}
+      {delivery.runnerStages ? <View style={styles.lane}><Text style={styles.title}>Processing details · {delivery.runnerStages.nodeId === 'unrecorded' ? 'origin not recorded' : delivery.runnerStages.nodeId}</Text><Text style={styles.note}>These details expand the processing steps above and are not added again.{delivery.runnerStages.nodeId === 'unrecorded' ? ' Original machine/session provenance was not recorded for these spans.' : ''}</Text>{delivery.runnerStages.spans.slice(0, 128).map((span, index) => <Text key={index} style={styles.text}>{span.stage.replaceAll('_', ' ')} · {duration(span.ms)} measured time</Text>)}</View> : null}
       <Text style={styles.title}>Publication and handoff</Text><Text style={styles.text}>Ready {time(delivery.readyAt)} · {delivery.acceptedAt ? `Consumer acceptance recorded ${time(delivery.acceptedAt)}` : 'Awaiting consumer acceptance'}</Text>
       {delivery.sourceCleanup ? <Text style={styles.text}>Source cleanup: {delivery.sourceCleanup.status.replaceAll('_', ' ')} · {delivery.sourceCleanup.attempts} attempts{delivery.sourceCleanup.error ? ` · ${delivery.sourceCleanup.error}` : ''}</Text> : null}
       {delivery.sourceCopies?.slice(0, 64).map(copy => <View key={copy.id} style={styles.lane}><Text style={styles.title}>{copy.ownerNode || 'node unknown'} · {copy.status.replaceAll('_', ' ')}</Text><Text style={styles.note}>{copy.attempts} cleanup attempts{copy.nextRetryAt ? ` · next ${time(copy.nextRetryAt)}` : ''}</Text>{copy.error ? <Text style={styles.error}>{copy.error}</Text> : null}{references ? <Text selectable style={styles.note}>{copy.id}</Text> : null}</View>)}

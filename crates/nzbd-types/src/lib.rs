@@ -7,7 +7,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub mod lifecycle;
 pub mod metrics;
+pub use lifecycle::*;
 
 // ---------------------------------------------------------------------------
 // Identifiers

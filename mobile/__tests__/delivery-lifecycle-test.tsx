@@ -12,7 +12,7 @@ const text = () => tree.root.findAllByType(Text).map((n: any) => n.props.childre
 const button = (label: string) => tree.root.findAll((n: any) => n.props.accessibilityLabel === label && typeof n.props.onPress === 'function')[0];
 const interval = (stage: string, start: number, end: number, nodeId = 'worker-a', clockDomain = 'boot-a') => ({ stage, nodeId, clockDomain, state: 'completed', startUnixMs: 100000, startMonotonicMs: start, endMonotonicMs: end, durationMs: end - start });
 const receipt: DeliveryTrace = { deliveryId: 'receipt-a', status: 'accepted', readyAt: 1, acceptedAt: 2,
-  lifecycleTiming: { version: 1, intervals: [interval('download', 0, 2000), interval('post_processing', 1000, 3000), interval('queue', 0, 1000, 'worker-b'), { ...interval('url_fetch', 0, 9000), state: 'interrupted' }, { stage: 'queue', nodeId: 'worker-a', clockDomain: 'legacy', state: 'completed', startUnixMs: 1, endUnixMs: 99999, durationMs: 99998 }] },
+  lifecycleTiming: { version: 1, omittedIntervals: { queue: 2 }, intervals: [interval('download', 0, 2000), interval('post_processing', 1000, 3000), interval('queue', 0, 1000, 'worker-b'), { ...interval('url_fetch', 0, 9000), state: 'interrupted' }, { stage: 'queue', nodeId: 'worker-a', clockDomain: 'legacy', state: 'completed', startUnixMs: 1, endUnixMs: 99999, durationMs: 99998 }] },
   sourceCleanup: { status: 'retry', attempts: 2 }, sourceCopies: [{ id: 'long-copy-identity', ownerNode: 'worker-a', status: 'retry', attempts: 2, error: 'Mount unavailable' }] };
 test('measured subtotals union only same-session monotonic endpoints', () => {
   const lanes = deliveryLanes(receipt);
@@ -24,6 +24,7 @@ test('expanded exact receipt shows timings/copies and real retry request feedbac
   await act(async () => { tree = create(<DeliveryLifecyclePanel client={client} receiptId="receipt-a" />); });
   expect(client.getDelivery).toHaveBeenCalledWith('receipt-a'); expect(text()).toContain('overlapping steps counted once'); expect(text()).toContain('Mount unavailable'); expect(text()).toContain('Consumer acceptance recorded');
   expect(text()).not.toContain('long-copy-identity');
+  expect(text()).toContain('Recorded subset');
   expect(text().replace(/\s+/g, ' ')).toContain('queue · completed · duration unknown');
   await act(async () => button('Retry source cleanup').props.onPress());
   expect(client.retryDeliveryCleanup).toHaveBeenCalledWith('receipt-a'); expect(text()).toContain('Source cleanup retry requested');

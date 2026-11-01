@@ -55,6 +55,9 @@ fn set_owner_param(params: &mut Vec<(String, String)>, key: &str, value: Option<
 }
 
 fn mark_new_lifecycle_cohort(job: &mut Job) {
+    if job.lifecycle_ledger().is_none() {
+        job.set_lifecycle_ledger(&nzbd_types::LifecycleLedger::default());
+    }
     if !job
         .params
         .iter()
@@ -580,6 +583,7 @@ pub(crate) enum EngineMsg {
 
 pub(crate) struct Owner {
     state: QueueState,
+    timing_cache: crate::lifecycle::TimingCache,
     attempts: HashMap<SegRef, SegmentAttempt>,
     blocked: HashMap<ServerId, Instant>,
     writers: HashMap<FileId, WriterHandle>,
@@ -1136,6 +1140,7 @@ impl Owner {
             engine_tx,
             tracker,
             cancel,
+            timing_cache: crate::lifecycle::TimingCache::default(),
             up_since_unix: unix_now(),
             dirty: false,
             last_save: Instant::now(),
@@ -2536,6 +2541,7 @@ impl Owner {
                 let _ = reply.send(committed);
             }
             QueueCommand::ExportJob { job, reply } => {
+                self.sync_lifecycle_timings();
                 let _ = reply.send(self.state.job(job).cloned().map(Box::new));
             }
             QueueCommand::RemoveJobSilent { job, reply } => {
@@ -3170,6 +3176,7 @@ impl Owner {
         {
             return Ok(false);
         }
+        let timing_checkpoint = self.timing_cache.checkpoint(job);
         let receipts = self.state.url_admission_receipts.clone();
         let prior_allocated = self.allocated_jobs.clone();
         let failed = prepared.resolved.status == JobStatus::Failed;
@@ -3219,6 +3226,7 @@ impl Owner {
             }
         }
         if !self.save_snapshot() {
+            self.timing_cache.restore(job, timing_checkpoint);
             *self.state.job_mut(job).unwrap() = before;
             self.state.url_admission_receipts = receipts;
             self.allocated_jobs = prior_allocated;
@@ -3781,9 +3789,24 @@ impl Owner {
                 let msgid = seg.message_id.to_string();
                 (msgid, self.writer_for(r.job, r.file))
             };
-            if let Some(job) = self.state.job_mut(r.job) {
+            let started = if let Some(job) = self.state.job_mut(r.job) {
                 if matches!(job.status, JobStatus::Queued) {
                     job.status = JobStatus::Downloading;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if started {
+                if let Some(job) = self.state.job_mut(r.job) {
+                    if self
+                        .timing_cache
+                        .sync(job, &self.artifacts.installation, false)
+                    {
+                        self.dirty = true;
+                    }
                 }
             }
             // Advance the cursor for the NEXT lease, whichever connection
@@ -5797,7 +5820,22 @@ impl Owner {
             .collect()
     }
 
+    fn sync_lifecycle_timings(&mut self) {
+        let node = self.artifacts.installation.as_str();
+        let ids = self.state.jobs.iter().map(|job| job.id).collect();
+        self.timing_cache.retain(&ids);
+        for job in &mut self.state.jobs {
+            if self
+                .timing_cache
+                .sync(job, node, self.delegated.contains_key(&job.id))
+            {
+                self.dirty = true;
+            }
+        }
+    }
+
     fn publish_snapshot(&mut self, rate: u64) {
+        self.sync_lifecycle_timings();
         let jobs = self
             .state
             .jobs
@@ -6126,6 +6164,7 @@ impl Owner {
     }
 
     fn save_snapshot_result(&mut self) -> Result<bool, nzbd_state::StateError> {
+        self.sync_lifecycle_timings();
         if !self.persist {
             self.dirty = false;
             return Ok(false);
@@ -7713,6 +7752,8 @@ mod tests {
             Some("old-category".into()),
             0,
         );
+        mark_new_lifecycle_cohort(owner.state.job_mut(id).unwrap());
+        owner.sync_lifecycle_timings();
         let origin = owner.state.job(id).unwrap().clone();
         let identity = nzbd_state::artifacts::url_source_identity(&origin).unwrap();
         owner
@@ -7753,6 +7794,21 @@ mod tests {
         assert_eq!(job.name, "user rename");
         assert_eq!(job.dir_name, "user-private-name");
         assert_eq!(job.status, JobStatus::Paused);
+        let timing = job.lifecycle_ledger().unwrap().snapshot();
+        assert_eq!(
+            timing
+                .intervals
+                .iter()
+                .filter(|interval| interval.stage == nzbd_types::LifecycleStage::UrlFetch)
+                .count(),
+            1
+        );
+        assert!(timing.intervals.iter().any(|interval| interval.stage
+            == nzbd_types::LifecycleStage::UrlFetch
+            && interval.state == nzbd_types::LifecycleIntervalState::Completed));
+        assert!(timing.intervals.iter().any(|interval| interval.stage
+            == nzbd_types::LifecycleStage::Queue
+            && interval.state == nzbd_types::LifecycleIntervalState::Running));
         assert!(job
             .params
             .iter()
@@ -7890,6 +7946,7 @@ mod tests {
         let origin = owner.state.job(id).unwrap().clone();
         let identity = nzbd_state::artifacts::url_source_identity(&origin).unwrap();
         assert!(owner.save_snapshot());
+        let timing_before = owner.state.job(id).unwrap().lifecycle_ledger().unwrap();
         owner
             .url_resolutions
             .cache_source(&origin, post.nzb.as_bytes())
@@ -7919,6 +7976,8 @@ mod tests {
             Err(crate::EngineError::AdmissionNotDurable)
         ));
         assert_eq!(owner.state.job(id).unwrap().status, JobStatus::Fetching);
+        owner.sync_lifecycle_timings();
+        assert_eq!(owner.state.job(id).unwrap().lifecycle_ledger().unwrap(), timing_before, "failed prepared apply must not commit an ephemeral queue stage or reopen a closed observation");
         assert_eq!(owner.url_resolutions.pending(100).unwrap().len(), 1);
         std::fs::remove_dir(blocked).unwrap();
         let state_dir = owner.state_dir.clone();

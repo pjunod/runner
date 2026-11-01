@@ -266,7 +266,7 @@ export interface DeliveryInterval {
 export interface DeliveryTrace {
   deliveryId: string; readyAt: number; acceptedAt?: number | null; status: string;
   discoveryError?: string;
-  lifecycleTiming?: { version: number; intervals: DeliveryInterval[] } | null;
+  lifecycleTiming?: { version: number; intervals: DeliveryInterval[]; omittedIntervals?: Record<string, number> } | null;
   runnerStages?: { nodeId: string; clockDomain: string; spans: StageSpan[] } | null;
   sourceCleanup?: { status: string; attempts: number; error?: string | null; nextRetryAt?: number | null };
   sourceCopies?: { id: string; ownerNode: string; status: string; attempts: number; error?: string | null; nextRetryAt?: number | null }[];

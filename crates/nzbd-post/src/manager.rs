@@ -1830,7 +1830,7 @@ fn salvage_failed_delivery(
             .map(|(_, value)| value.as_str());
         Some(
             inventory
-                .create_delivery_with_outcome_and_keep(
+                .create_delivery_with_lifecycle_snapshot(
                     job.id.0,
                     true,
                     token,
@@ -1838,6 +1838,8 @@ fn salvage_failed_delivery(
                     Some(failure_stage),
                     Some(failure_cause),
                     job_keeps_failed_source(job),
+                    delivery_stage_snapshot(&inventory, job),
+                    nzbd_engine::frozen_lifecycle_timing(job),
                 )
                 .map_err(|error| error.to_string())?,
         )
@@ -2862,6 +2864,19 @@ async fn resume_committed_publication(
     resume_durable_delivery(engine, history, job_id).await
 }
 
+fn delivery_stage_snapshot(
+    _inventory: &nzbd_state::artifacts::Inventory,
+    job: &Job,
+) -> Option<nzbd_state::artifacts::DeliveryRunnerStages> {
+    (!job.stages.is_empty()).then(|| nzbd_state::artifacts::DeliveryRunnerStages {
+        // StageSpan persists without per-span node/boot context. A later
+        // process must not relabel mixed historical spans as its own clock.
+        node_id: "unrecorded".into(),
+        clock_domain: "unrecorded".into(),
+        spans: job.stages.iter().take(128).cloned().collect(),
+    })
+}
+
 fn finish_committed_publication_receipt(
     inventory: &Arc<nzbd_state::artifacts::Inventory>,
     job: &Job,
@@ -2908,7 +2923,7 @@ fn finish_committed_publication_receipt(
         )
         .map_err(PostError::from)?;
     let delivery = inventory
-        .create_delivery_with_outcome_and_keep(
+        .create_delivery_with_lifecycle_snapshot(
             job.id.0,
             true,
             request_token,
@@ -2916,6 +2931,8 @@ fn finish_committed_publication_receipt(
             failure_stage,
             failure_cause,
             outcome != PpFinal::Success.as_str() && job_keeps_failed_source(job),
+            delivery_stage_snapshot(inventory, job),
+            nzbd_engine::frozen_lifecycle_timing(job),
         )
         .map_err(PostError::from)?;
     Ok(Some(delivery))
@@ -4189,12 +4206,21 @@ async fn process_job_ctx_from_inner(
                     .iter()
                     .find(|(key, _)| key == "Failure:Reason" || key == "Failure:Files")
                     .map(|(_, value)| value.clone());
+                let timing_job = engine
+                    .export_job(job_id)
+                    .await
+                    .map_err(|error| {
+                        PostError::Subprocess(format!("publication timing snapshot: {error}"))
+                    })?
+                    .unwrap_or_else(|| job.clone());
+                let runner_stages = delivery_stage_snapshot(&inventory, &timing_job);
+                let lifecycle_timing = nzbd_engine::frozen_lifecycle_timing(&timing_job);
                 let delivery_inventory = inventory.clone();
                 let delivery = crate::attempt::current()
                     .expect("processing control")
                     .blocking(move |_| {
                         delivery_inventory
-                            .create_delivery_with_outcome_and_keep(
+                            .create_delivery_with_lifecycle_snapshot(
                                 job_id.0,
                                 true,
                                 request_token.as_deref(),
@@ -4202,6 +4228,8 @@ async fn process_job_ctx_from_inner(
                                 failure_stage.as_deref(),
                                 failure_cause.as_deref(),
                                 outcome != PpFinal::Success && job_keeps_failed_source(&job),
+                                runner_stages,
+                                lifecycle_timing,
                             )
                             .map_err(PostError::from)
                     })
@@ -7384,6 +7412,34 @@ mod decision_tests {
             torrent: None,
             stages: Vec::new(),
         }
+    }
+
+    #[test]
+    fn historical_post_spans_do_not_acquire_a_current_process_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state");
+        let inventory = nzbd_state::artifacts::Inventory::open(&path).unwrap();
+        let mut row = job(Vec::new(), Vec::new());
+        row.stages = vec![
+            nzbd_types::StageSpan {
+                stage: nzbd_types::PostStage::ParVerify,
+                started_at_unix: 100,
+                ms: Some(17),
+            },
+            nzbd_types::StageSpan {
+                stage: nzbd_types::PostStage::Move,
+                started_at_unix: 200,
+                ms: None,
+            },
+        ];
+        let first = delivery_stage_snapshot(&inventory, &row).unwrap();
+        drop(inventory);
+        let restarted = nzbd_state::artifacts::Inventory::open(&path).unwrap();
+        let replay = delivery_stage_snapshot(&restarted, &row).unwrap();
+        assert_eq!(first, replay);
+        assert_eq!(replay.node_id, "unrecorded");
+        assert_eq!(replay.clock_domain, "unrecorded");
+        assert_eq!(replay.spans, row.stages);
     }
 
     #[tokio::test]
