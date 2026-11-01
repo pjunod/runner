@@ -1,5 +1,26 @@
 # nzbd — Project Status
 
+## Stuck "Fetching NZB" jobs — 2026-11-01
+
+**Status:** root cause fixed in Curator (monarr v0.38.3); Runner app shows the
+fetch retry state (mobile 1.1.3).
+
+Field report: two URL jobs sat in **Fetching NZB** for most of a day showing
+`0 B / 0 B · ETA —`. Runner was correct: the indexer answered 429 with a
+22-hour `Retry-After` and the job was parked until then (`url_fetch` on the
+job carried it; the web UI showed it, the app did not). The quota was spent by
+Curator, which had grabbed the same two obfuscated releases thirteen times
+each since 2026-10-27. Runner delivered all 26 and Curator accepted all 26,
+but every import failed with `cannot determine episodes from
+"321d96….mkv"`, and each failure released the episode for another grab.
+Curator now imports a sole anonymous file under its grabbed release, never
+re-grabs a release whose payload is already retained awaiting import, and
+applies its regrab cap to RSS.
+
+Runner changes: the app renders `url_fetch` on fetching jobs (refusal, next
+retry, time waited, attempt) instead of empty byte counters, and
+`formatDuration` no longer prints "9h 60m".
+
 ## Download incident recovery — 2026-10-01
 
 Implementation in progress in an isolated agent clone. See [live progress and merge status](docs/DOWNLOAD_INCIDENT_STATUS.md). One combined PR; adversarial review at merge readiness, followed by required validation.
