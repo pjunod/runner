@@ -113,3 +113,31 @@ test('a pending response from a previous connection cannot open a same-ID editor
   expect(tree.root.findAllByType(SeedPolicyEditor)).toHaveLength(0);
   expect(text()).not.toContain('Old server refusal');
 });
+
+// Field report 2026-11-01: a URL job parked behind a 22-hour Retry-After
+// showed "0 B / 0 B · 0 B/s · ETA —" and a 0% bar.
+test('a parked NZB fetch says why it waits, with no byte counters or bar, and the countdown ticks', async () => {
+  jest.useFakeTimers();
+  try {
+    const base = fixtures.find((f) => f.name === 'seeding idle')!.job as JobSummary;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const job = { ...base, kind: 'nzb', status: 'fetching', torrent_phase: null, size_bytes: 0, downloaded_bytes: 0,
+      url_fetch: { attempts: 1, lastError: 'http: status 429 Too Many Requests', blockedSinceUnix: nowSec - 600, nextRetryAtUnix: nowSec + 3600 } } as JobSummary;
+    const card = (j: JobSummary) => <JobCard job={j} index={0} total={1} expanded={false} busy={false}
+      onToggle={jest.fn()} onAction={jest.fn()} onDelete={jest.fn()} onPriorityChange={jest.fn()} onSeedOptions={jest.fn()}
+      movable={false} sectionKey={queueSectionKey(j)} sectionLabel="Fetching NZB" styles={styles} tone={{ accent: theme.accent, background: theme.panel }} />;
+    await act(async () => { tree = create(card(job)); });
+    expect(text()).toContain('Indexer refused: http: status 429 Too Many Requests');
+    expect(text()).toContain('retrying in 1h');
+    expect(text()).not.toContain('0 B / 0 B');
+    expect(text()).not.toContain('ETA');
+    expect(text()).not.toContain('%');
+    await act(async () => { jest.advanceTimersByTime(31 * 60 * 1000); });
+    expect(text()).toContain('retrying in 29m');
+    const held = { ...job, control: { lifecycle: 'held', message: 'Held for review' } } as unknown as JobSummary;
+    await act(async () => tree.update(card(held)));
+    expect(text()).not.toContain('Indexer refused');
+  } finally {
+    jest.useRealTimers();
+  }
+});

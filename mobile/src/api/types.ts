@@ -90,6 +90,15 @@ export interface JobSummary {
   dupe_score: number;
   params: [string, string][];
   stages: StageSpan[];
+  /** Retry state of a URL job's NZB fetch; null until a fetch has failed. */
+  url_fetch?: UrlFetchProgress | null;
+}
+
+export interface UrlFetchProgress {
+  attempts: number;
+  nextRetryAtUnix?: number | null;
+  blockedSinceUnix?: number | null;
+  lastError?: string | null;
 }
 
 export interface ServerVolume {

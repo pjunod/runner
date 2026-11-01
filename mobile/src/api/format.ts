@@ -18,9 +18,12 @@ export function formatBytes(value: number, suffix = ''): string {
 export function formatDuration(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return '—';
   if (seconds < 60) return `${Math.ceil(seconds)}s`;
-  if (seconds < 3600) return `${Math.ceil(seconds / 60)}m`;
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.ceil((seconds % 3600) / 60);
+  // Round once, on the total: rounding the minutes of the last hour on their
+  // own turned 9h 59m 30s into "9h 60m".
+  const totalMinutes = Math.ceil(seconds / 60);
+  if (totalMinutes < 60) return `${totalMinutes}m`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
   return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
 }
 
