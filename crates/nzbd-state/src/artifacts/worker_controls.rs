@@ -24,6 +24,13 @@ pub struct WorkerControlCheckpoint {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerCompletionProof {
+    pub job: nzbd_types::JobId,
+    pub context: WorkerControlContext,
+    pub source: SourceGeneration,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerRetryAdoption {
     pub source: Artifact,
     pub control: nzbd_types::JobControl,
@@ -64,7 +71,16 @@ impl Inventory {
     /// Persist selected-publication/terminal evidence before a volatile worker
     /// queue stamp. Call on a blocking preparation thread; descriptors are bulk.
     pub fn checkpoint_worker_completion(&self, job: &nzbd_types::Job) -> Result<()> {
-        let _guard = self.mutation_guard()?;
+        self.prepare_worker_completion(job).map(|_| ())
+    }
+    pub fn prepare_worker_completion(
+        &self,
+        job: &nzbd_types::Job,
+    ) -> Result<WorkerCompletionProof> {
+        let encoded_job = serde_json::to_string(job)?;
+        if encoded_job.len() > 16 * 1024 * 1024 {
+            return Err(Error::Conflict("worker completion exceeds supported 16 MiB descriptor limit; source retained for review".into()));
+        }
         let context = WorkerControlContext::for_job(job)
             .ok_or_else(|| Error::Conflict("worker completion has no lease authority".into()))?;
         if !job.params.iter().any(|(key, _)| {
@@ -82,6 +98,26 @@ impl Inventory {
         }
         if !source.terminal() {
             self.verify(&source)?;
+        }
+        let encoded = format!(
+            "{{\"context\":{},\"source\":{},\"job\":{}}}",
+            serde_json::to_string(&context)?,
+            serde_json::to_string(&SourceGeneration {
+                artifact: source.id.clone(),
+                generation: source.generation.clone()
+            })?,
+            encoded_job
+        );
+        let _guard = self.mutation_guard()?;
+        let current = self.for_job(job.id.0)?.ok_or(Error::NotFound)?;
+        if current.id != source.id
+            || current.generation != source.generation
+            || current.path != source.path
+            || !current.owned
+        {
+            return Err(Error::Conflict(
+                "worker publication generation changed before checkpoint".into(),
+            ));
         }
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
@@ -120,17 +156,74 @@ impl Inventory {
                 ));
             }
         }
-        let checkpoint = WorkerCompletionCheckpoint {
+        tx.execute("INSERT INTO worker_completions(job,data) VALUES(?1,?2) ON CONFLICT(job) DO UPDATE SET data=excluded.data", params![job.id.0, encoded])?;
+        tx.commit()?;
+        Ok(WorkerCompletionProof {
+            job: job.id,
             context,
             source: SourceGeneration {
                 artifact: source.id,
                 generation: source.generation,
             },
-            job: job.clone(),
+        })
+    }
+
+    /// Compact the duplicate descriptor only after a durable cluster receipt
+    /// and cleanup obligation exist. Keep the exact small acceptance proof.
+    pub fn acknowledge_worker_completion(
+        &self,
+        job: u32,
+        context: &WorkerControlContext,
+        source: &SourceGeneration,
+        proof: &FinalizationProof,
+    ) -> Result<bool> {
+        let FinalizationProof::Cluster {
+            receipt,
+            accepted_at_ms,
+            ..
+        } = proof
+        else {
+            return Err(Error::Conflict(
+                "worker completion requires cluster acceptance".into(),
+            ));
         };
-        tx.execute("INSERT INTO worker_completions(job,data) VALUES(?1,?2) ON CONFLICT(job) DO UPDATE SET data=excluded.data", params![job.id.0, serde_json::to_string(&checkpoint)?])?;
+        if receipt.is_empty() || *accepted_at_ms <= 0 {
+            return Err(Error::Conflict(
+                "worker completion acceptance proof is incomplete".into(),
+            ));
+        }
+        let _guard = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let matches: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM worker_completions WHERE job=?1 AND json_extract(data,'$.context')=json(?2) AND json_extract(data,'$.source')=json(?3))", params![job, serde_json::to_string(context)?, serde_json::to_string(source)?], |row| row.get(0))?;
+        let receipt_id = format!("{}:{}", source.artifact, source.generation);
+        let encoded = serde_json::to_string(&(context, source, proof))?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT data FROM worker_completion_receipts WHERE id=?1",
+                [&receipt_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(previous) = previous {
+            return if previous == encoded {
+                Ok(true)
+            } else {
+                Err(Error::Conflict(
+                    "worker completion acceptance identity changed".into(),
+                ))
+            };
+        }
+        if !matches {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO worker_completion_receipts(id,job,data) VALUES(?1,?2,?3)",
+            params![receipt_id, job, encoded],
+        )?;
+        tx.execute("DELETE FROM worker_completions WHERE job=?1", [job])?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Explicit adoption after the cluster validates a new lease. Only an
@@ -188,6 +281,44 @@ impl Inventory {
                                 && current.epoch <= context.epoch
                         });
                     if allowed {
+                        let local: Option<String> = tx
+                            .query_row(
+                                "SELECT data FROM worker_controls WHERE job=?1",
+                                [job],
+                                |row| row.get(0),
+                            )
+                            .optional()?;
+                        let mut probe_params = Vec::new();
+                        if let Some(raw) = local {
+                            let mut local: WorkerControlCheckpoint = serde_json::from_str(&raw)?;
+                            if local.context == checkpoint.context
+                                && local.source == checkpoint.source
+                            {
+                                let completed_revision = checkpoint
+                                    .job
+                                    .control()
+                                    .and_then(|control| control.revision.parse::<u64>().ok())
+                                    .unwrap_or(0);
+                                let local_revision =
+                                    local.control.revision.parse::<u64>().unwrap_or(0);
+                                if local_revision >= completed_revision {
+                                    checkpoint.job.set_control(&local.control);
+                                    checkpoint.job.status = if local.control.lifecycle == "held"
+                                        || local.control.manual_pause
+                                    {
+                                        nzbd_types::JobStatus::Paused
+                                    } else {
+                                        checkpoint.job.status
+                                    };
+                                    probe_params = local.probe_params.clone();
+                                    local.context = context.clone();
+                                    tx.execute(
+                                        "UPDATE worker_controls SET data=?2 WHERE job=?1",
+                                        params![job, serde_json::to_string(&local)?],
+                                    )?;
+                                }
+                            }
+                        }
                         checkpoint.context = context.clone();
                         checkpoint
                             .job
@@ -221,7 +352,7 @@ impl Inventory {
                         return Ok(Some(WorkerRetryAdoption {
                             source,
                             control,
-                            probe_params: Vec::new(),
+                            probe_params,
                             completed_job: Some(checkpoint.job),
                         }));
                     }
@@ -440,5 +571,130 @@ impl Inventory {
         }
         self.verify(&source)?;
         Ok(Some(checkpoint))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn selected_publication_adoption_keeps_newer_retry_and_compacts_on_acceptance() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = temporary.path().join("state");
+        let root = temporary.path().join("private");
+        std::fs::create_dir(&root).unwrap();
+        let inventory = Inventory::open(&state).unwrap();
+        let path = root.join("source");
+        inventory
+            .allocate_for_delivery(42, &root, &path, true, true)
+            .unwrap();
+        std::fs::write(path.join("episode.mkv"), b"verified bytes").unwrap();
+        inventory.finish(42, &path, &root, "active").unwrap();
+        let context = WorkerControlContext {
+            lease_id: "old-lease".into(),
+            job_incarnation: "job-incarnation".into(),
+            job_revision: 7,
+            control_revision: 3,
+            epoch: 1,
+        };
+        let mut job = nzbd_types::Job {
+            id: nzbd_types::JobId(42),
+            kind: nzbd_types::JobKind::Nzb,
+            name: "publication".into(),
+            dir_name: "source".into(),
+            name_provisional: false,
+            delivery_lifecycle: true,
+            queued_at_unix: 1,
+            original_name: String::new(),
+            category: None,
+            priority: 0,
+            dupe: Default::default(),
+            params: vec![
+                (
+                    WORKER_CONTROL_CONTEXT_PARAM.into(),
+                    serde_json::to_string(&context).unwrap(),
+                ),
+                ("*PP:selected-publication-outcome".into(), "SUCCESS".into()),
+            ],
+            files: Vec::new(),
+            totals: Default::default(),
+            status: nzbd_types::JobStatus::PostQueued,
+            torrent: None,
+            stages: Vec::new(),
+        };
+        inventory.bind_worker_context(42, &context).unwrap();
+        inventory.checkpoint_worker_completion(&job).unwrap();
+        let control = nzbd_types::JobControl {
+            version: 1,
+            revision: "2".into(),
+            lifecycle: "held".into(),
+            cause: "capacity".into(),
+            stage: "move".into(),
+            retry_policy: "scheduled_retry".into(),
+            message: "retry in 300 seconds".into(),
+            instance: "attempt-42".into(),
+            previous_status: Some(nzbd_types::JobStatus::PostQueued),
+            manual_pause: false,
+            retry_attempt: 9,
+            next_retry_at_unix: Some(999999),
+            blocked_since_unix: Some(123),
+        };
+        job.set_control(&control);
+        inventory.checkpoint_worker_control(&job, "1").unwrap();
+        drop(inventory);
+        let inventory = Inventory::open(&state).unwrap();
+        let mut next = context;
+        next.epoch = 2;
+        next.lease_id = "new-lease".into();
+        let adopted = inventory.adopt_worker_retry(42, &next).unwrap().unwrap();
+        assert_eq!(adopted.control.next_retry_at_unix, Some(999999));
+        assert_eq!(
+            adopted
+                .completed_job
+                .as_ref()
+                .unwrap()
+                .control()
+                .unwrap()
+                .retry_attempt,
+            9
+        );
+        assert_eq!(
+            adopted.completed_job.as_ref().unwrap().status,
+            nzbd_types::JobStatus::Paused
+        );
+        let source = SourceGeneration {
+            artifact: adopted.source.id,
+            generation: adopted.source.generation,
+        };
+        let proof = FinalizationProof::Cluster {
+            receipt: "accepted-copy-receipt".into(),
+            accepted_at_ms: 1000,
+        };
+        assert!(inventory
+            .acknowledge_worker_completion(42, &next, &source, &proof)
+            .unwrap());
+        assert!(inventory
+            .acknowledge_worker_completion(42, &next, &source, &proof)
+            .unwrap());
+        let count: i64 = inventory
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM worker_completions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "accepted full descriptors must not accumulate");
+        let count: i64 = inventory
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM worker_completion_receipts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "small exact acceptance proof survives compaction");
     }
 }

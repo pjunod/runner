@@ -257,6 +257,7 @@ pub(crate) enum QueueCommand {
     ImportJobIfPresent {
         job: Box<Job>,
         require_snapshot: bool,
+        completion_proof: Option<nzbd_state::artifacts::WorkerCompletionProof>,
         reply: oneshot::Sender<bool>,
     },
     /// Clone a job's full current state out (for grants and completion
@@ -2389,11 +2390,12 @@ impl Owner {
             QueueCommand::ImportJobIfPresent {
                 job,
                 require_snapshot,
+                completion_proof,
                 reply,
             } => {
                 let committed = self.state.job(job.id).is_some()
                     && (!require_snapshot || self.persist)
-                    && self.import_job(*job, false, false);
+                    && self.import_job_proven(*job, false, false, completion_proof.as_ref());
                 let _ = reply.send(committed);
             }
             QueueCommand::ExportJob { job, reply } => {
@@ -3029,10 +3031,45 @@ impl Owner {
         }
     }
 
-    fn import_job(&mut self, mut job: Job, fold_journals: bool, emit_finished: bool) -> bool {
+    fn import_job(&mut self, job: Job, fold_journals: bool, emit_finished: bool) -> bool {
+        self.import_job_proven(job, fold_journals, emit_finished, None)
+    }
+    fn import_job_proven(
+        &mut self,
+        mut job: Job,
+        fold_journals: bool,
+        emit_finished: bool,
+        completion_proof: Option<&nzbd_state::artifacts::WorkerCompletionProof>,
+    ) -> bool {
         if self.persistence_fenced {
             return false;
         }
+        let preserve_publication = if let Some(proof) = completion_proof {
+            let exact_context = nzbd_state::artifacts::WorkerControlContext::for_job(&job).as_ref()
+                == Some(&proof.context)
+                && self
+                    .state
+                    .job(job.id)
+                    .and_then(nzbd_state::artifacts::WorkerControlContext::for_job)
+                    .as_ref()
+                    == Some(&proof.context);
+            let exact_source =
+                self.artifacts
+                    .for_job(job.id.0)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|artifact| {
+                        artifact.id == proof.source.artifact
+                            && artifact.generation == proof.source.generation
+                            && artifact.owned
+                    });
+            if proof.job != job.id || !exact_context || !exact_source {
+                return false;
+            }
+            true
+        } else {
+            false
+        };
         let mut worker_control_restored = false;
         let incoming_context = nzbd_state::artifacts::WorkerControlContext::for_job(&job);
         let current_context = self
@@ -3114,7 +3151,9 @@ impl Owner {
         if matches!(job.status, JobStatus::Downloading) {
             job.status = JobStatus::Queued;
         }
-        let import_path = if job.torrent.is_none() {
+        let import_path = if preserve_publication {
+            None
+        } else if job.torrent.is_none() {
             let relative = std::path::PathBuf::from(job_dir_name(&job));
             if relative
                 .components()
@@ -7692,6 +7731,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proven_worker_completion_preserves_selected_publication_and_separate_source() {
+        use nzbd_state::artifacts::{
+            DeliveryFileOutcome, WorkerControlContext, WORKER_CONTROL_CONTEXT_PARAM,
+        };
+        let (tmp, mut owner, _adapter) = control_test_owner_with_persistence(false, None);
+        let mut job = pending_job(84);
+        job.status = JobStatus::PostQueued;
+        job.dir_name = "worker-source-84".into();
+        mark_new_lifecycle_cohort(&mut job);
+        job.delivery_lifecycle = true;
+        let context = WorkerControlContext {
+            lease_id: "lease-84".into(),
+            job_incarnation: "incarnation-84".into(),
+            job_revision: 1,
+            control_revision: 1,
+            epoch: 1,
+        };
+        job.params.push((
+            WORKER_CONTROL_CONTEXT_PARAM.into(),
+            serde_json::to_string(&context).unwrap(),
+        ));
+        let original = owner.dest_dir.join(&job.dir_name);
+        owner
+            .artifacts
+            .allocate_for_delivery(84, &owner.dest_dir, &original, true, true)
+            .unwrap();
+        std::fs::write(original.join("episode.mkv"), b"selected verified bytes").unwrap();
+        owner
+            .artifacts
+            .finish(84, &original, &owner.dest_dir, "active")
+            .unwrap();
+        owner.artifacts.bind_worker_context(84, &context).unwrap();
+        owner.state.jobs.push(job.clone());
+        let selected = owner.artifacts.for_job(84).unwrap().unwrap().files;
+        let target = tmp.path().join("published/private-84");
+        let movement = owner
+            .artifacts
+            .publish_selected_for_delivery_checked(
+                84,
+                &target,
+                selected,
+                vec![DeliveryFileOutcome {
+                    source_path: "episode.mkv".into(),
+                    publication_path: Some("episode.mkv".into()),
+                    classification: "video".into(),
+                    outcome: "published".into(),
+                    reason: None,
+                    repair_dependency: false,
+                    source_cleanup_status: "pending".into(),
+                }],
+                &|| Ok(()),
+            )
+            .unwrap();
+        job.params
+            .push(("*PP:selected-publication-outcome".into(), "SUCCESS".into()));
+        let proof = owner.artifacts.prepare_worker_completion(&job).unwrap();
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::ImportJobIfPresent {
+            job: Box::new(job),
+            require_snapshot: false,
+            completion_proof: Some(proof),
+            reply,
+        });
+        assert!(result.await.unwrap());
+        let publication = owner.artifacts.for_job(84).unwrap().unwrap();
+        assert_eq!(publication.path, target);
+        assert!(publication.owned);
+        assert_eq!(publication.job, Some(84));
+        let retained = owner
+            .artifacts
+            .get(&format!("source-{}", movement.operation_id))
+            .unwrap();
+        assert_eq!(retained.path, original);
+        assert!(retained.owned);
+        assert!(retained.job.is_none());
+        assert!(original.join("episode.mkv").exists());
+        assert!(target.join("episode.mkv").exists());
+    }
+
+    #[tokio::test]
     async fn worker_retry_schedule_survives_regrant_without_overriding_new_leader_intent() {
         use nzbd_state::artifacts::{WorkerControlContext, WORKER_CONTROL_CONTEXT_PARAM};
         let (_tmp, mut owner, _adapter) = control_test_owner_with_persistence(false, None);
@@ -7806,6 +7925,7 @@ mod tests {
             owner.on_command(QueueCommand::ImportJobIfPresent {
                 job: Box::new(replacement),
                 require_snapshot,
+                completion_proof: None,
                 reply,
             });
             assert!(
@@ -7990,6 +8110,7 @@ mod tests {
         owner.on_command(QueueCommand::ImportJobIfPresent {
             job: Box::new(replacement),
             require_snapshot: true,
+            completion_proof: None,
             reply,
         });
 
