@@ -24,6 +24,7 @@ pub mod volumes;
 
 mod owner;
 mod pool;
+mod recovery;
 mod writer;
 
 pub use events::Event;
@@ -218,6 +219,8 @@ pub struct EngineConfig {
     pub state_dir: PathBuf,
     /// Node-local lifecycle database, separate from cluster journals.
     pub artifact_dir: Option<PathBuf>,
+    /// Independently enrolled inventory identity; never create a new store on mismatch.
+    pub expected_installation_id: Option<String>,
     /// Completed jobs are written to `<dest_dir>/<job name>/`.
     pub dest_dir: PathBuf,
     /// Ordered configured torrent payload roots used only for removal safety.
@@ -260,6 +263,7 @@ impl EngineConfig {
             download_enabled: true,
             state_dir,
             artifact_dir: None,
+            expected_installation_id: None,
             disk_guard_roots: vec![DiskGuardRoot {
                 label: "downloads".into(),
                 path: dest_dir.clone(),
@@ -335,9 +339,11 @@ impl Engine {
             });
         }
 
+        let owner_heartbeat = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let owner = Owner::recover(
             &cfg.state_dir,
             cfg.artifact_dir.as_deref(),
+            cfg.expected_installation_id.as_deref(),
             cfg.dest_dir.clone(),
             cfg.torrent_payload_roots.clone(),
             cfg.history.clone(),
@@ -359,6 +365,7 @@ impl Engine {
             engine_tx.clone(),
             tracker.clone(),
             cancel.clone(),
+            owner_heartbeat.clone(),
         )?;
         // Seed the shared snapshot with recovered state synchronously, so
         // the API never serves an empty queue in the window before the
@@ -366,6 +373,7 @@ impl Engine {
         let mut owner = owner;
         owner.seed_snapshot();
         let artifacts = owner.artifacts.clone();
+        let shutdown_complete = owner.shutdown_complete.clone();
         {
             let inventory = artifacts.clone();
             let stop = cancel.clone();
@@ -469,6 +477,9 @@ impl Engine {
             backend_adapter: Arc::new(std::sync::Mutex::new(Some(backend_adapter))),
             budget_tracker,
             url_fetches: Arc::new(Mutex::new(HashSet::new())),
+            post_scope: None,
+            owner_heartbeat,
+            shutdown_complete,
         };
 
         // Automatic hold recovery: one task, off the owner loop, for every
@@ -561,6 +572,13 @@ fn validate_external_params(params: &[(String, String)]) -> Result<(), EngineErr
     Ok(())
 }
 
+/// Owner-issued permission for one generation of post-processing work.
+#[derive(Clone, Debug)]
+pub struct PostAdmission {
+    pub job: JobId,
+    pub generation: u64,
+}
+
 /// Cloneable handle to a running engine.
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -573,6 +591,9 @@ pub struct EngineHandle {
     backend_adapter: Arc<std::sync::Mutex<Option<backend::BackendAdapterPort>>>,
     budget_tracker: Arc<pool::BudgetTracker>,
     url_fetches: Arc<Mutex<HashSet<JobId>>>,
+    post_scope: Option<PostAdmission>,
+    owner_heartbeat: Arc<std::sync::atomic::AtomicU64>,
+    shutdown_complete: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct UrlFetchGuard {
@@ -599,6 +620,50 @@ pub struct BudgetApplyReceipt {
 }
 
 impl EngineHandle {
+    pub fn owner_last_progress_unix(&self) -> u64 {
+        self.owner_heartbeat
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn installation_id(&self) -> String {
+        self.artifacts.installation.clone()
+    }
+
+    pub async fn begin_post_admission(
+        &self,
+        job: JobId,
+    ) -> Result<Option<PostAdmission>, EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(QueueCommand::BeginPostAdmission { job, reply })
+            .await?;
+        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+    }
+    pub fn for_post_admission(&self, admission: &PostAdmission) -> Self {
+        let mut scoped = self.clone();
+        scoped.post_scope = Some(admission.clone());
+        scoped
+    }
+    pub async fn end_post_admission(&self, admission: PostAdmission) -> Result<(), EngineError> {
+        self.roundtrip_unit(|reply| QueueCommand::EndPostAdmission { admission, reply })
+            .await
+    }
+    pub async fn recovery_document(&self) -> Result<nzbd_state::QueueSnapshotDoc, EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(QueueCommand::RecoveryDocument { reply }).await?;
+        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+    }
+    pub async fn remove_orphan_torrent_source(&self, job: JobId) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::RemoveOrphanTorrentSource { job, reply })
+            .await
+    }
+    fn command_message(&self, command: QueueCommand) -> EngineMsg {
+        match &self.post_scope {
+            Some(admission) => EngineMsg::ScopedCommand {
+                admission: admission.clone(),
+                command: Box::new(command),
+            },
+            None => EngineMsg::Command(command),
+        }
+    }
     pub async fn register_repair_attempt(
         &self,
         job: JobId,
@@ -617,7 +682,7 @@ impl EngineHandle {
             .await;
     }
     pub fn close_repair_attempt(&self, job: JobId, attempt: String) {
-        let command = EngineMsg::Command(QueueCommand::CloseRepairAttempt { job, attempt });
+        let command = self.command_message(QueueCommand::CloseRepairAttempt { job, attempt });
         if let Err(tokio::sync::mpsc::error::TrySendError::Full(command)) =
             self.cmd_tx.try_send(command)
         {
@@ -656,7 +721,8 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        rx.await
+        owner_reply(rx)
+            .await
             .map_err(|_| EngineError::Closed)?
             .map_err(EngineError::State)
     }
@@ -684,14 +750,15 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await.map_err(|_| EngineError::Closed)
     }
 
     pub async fn cancel_torrent_admission(&self, job: JobId) -> Result<bool, EngineError> {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::CancelTorrentAdmission { job, reply: tx })
             .await?;
-        rx.await
+        owner_reply(rx)
+            .await
             .map_err(|_| EngineError::Closed)?
             .map_err(EngineError::State)
     }
@@ -780,7 +847,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await.map_err(|_| EngineError::Closed)
     }
 
     /// Background NZB download for a URL job. Shutdown-aware: an in-flight
@@ -885,7 +952,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await.map_err(|_| EngineError::Closed)
     }
 
     async fn record_url_fetch_progress(
@@ -900,7 +967,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await.map_err(|_| EngineError::Closed)
     }
 
     /// [`EngineHandle::add_nzb`] with the full option set (dupe metadata,
@@ -926,7 +993,8 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        rx.await
+        owner_reply(rx)
+            .await
             .map_err(|_| EngineError::Closed)?
             .map_err(EngineError::State)
     }
@@ -966,7 +1034,13 @@ impl EngineHandle {
         revision: String,
         by: RetryBy,
     ) -> Result<Result<(), String>, EngineError> {
-        let Some(record) = self.export_job(job).await? else {
+        let Some(record) = self
+            .recovery_document()
+            .await?
+            .jobs
+            .into_iter()
+            .find(|record| record.id == job)
+        else {
             return Ok(Err("job not found".into()));
         };
         let Some(control) = record
@@ -1017,7 +1091,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await.map_err(|_| EngineError::Closed)
     }
 
     /// Capacity/quota release: the owner's probe backoff, then an admission
@@ -1295,7 +1369,7 @@ impl EngineHandle {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::SetMaxActiveDownloads { n, reply: tx })
             .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await.map_err(|_| EngineError::Closed)
     }
 
     // -- cluster operations (used by nzbd-cluster; harmless elsewhere) ------
@@ -1316,7 +1390,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await.map_err(|_| EngineError::Closed)
     }
 
     /// Atomically replace an existing authority copy without ever inserting a
@@ -1332,7 +1406,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await.map_err(|_| EngineError::Closed)
     }
 
     /// Stamp an existing executor copy. Worker queues are intentionally
@@ -1349,16 +1423,27 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await.map_err(|_| EngineError::Closed)
     }
 
     pub async fn export_job(&self, job: JobId) -> Result<Option<nzbd_types::Job>, EngineError> {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::ExportJob { job, reply: tx })
             .await?;
-        rx.await
-            .map(|o| o.map(|b| *b))
-            .map_err(|_| EngineError::Closed)
+        let result = owner_reply(rx).await?.map(|job| *job);
+        if result.is_none()
+            && self
+                .recovery_document()
+                .await?
+                .jobs
+                .iter()
+                .any(|record| record.id == job)
+        {
+            return Err(EngineError::Lifecycle(
+                "job verification or writer retirement is still in progress; retry later".into(),
+            ));
+        }
+        Ok(result)
     }
 
     /// Enter a post-processing stage. Sets the status *and* appends the
@@ -1404,11 +1489,7 @@ impl EngineHandle {
     pub fn close_post_stage_now(&self, job: JobId, at_unix: i64, ms: Option<u64>) {
         let _ = self
             .cmd_tx
-            .try_send(EngineMsg::Command(QueueCommand::ClosePostStage {
-                job,
-                at_unix,
-                ms,
-            }));
+            .try_send(self.command_message(QueueCommand::ClosePostStage { job, at_unix, ms }));
     }
 
     pub async fn remove_job_silent(&self, job: JobId) -> Result<bool, EngineError> {
@@ -1429,7 +1510,7 @@ impl EngineHandle {
     pub fn mirror_progress(&self, job: JobId, stats: MirrorStats) {
         let _ = self
             .cmd_tx
-            .try_send(EngineMsg::Command(QueueCommand::MirrorProgress {
+            .try_send(self.command_message(QueueCommand::MirrorProgress {
                 job,
                 node: None,
                 stats,
@@ -1439,7 +1520,7 @@ impl EngineHandle {
     pub fn mirror_progress_from(&self, job: JobId, node: String, stats: MirrorStats) {
         let _ = self
             .cmd_tx
-            .try_send(EngineMsg::Command(QueueCommand::MirrorProgress {
+            .try_send(self.command_message(QueueCommand::MirrorProgress {
                 job,
                 node: Some(node),
                 stats,
@@ -1487,7 +1568,7 @@ impl EngineHandle {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::SetServerConnectionCaps { caps, reply: tx })
             .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await.map_err(|_| EngineError::Closed)
     }
 
     /// Become the queue authority (cluster leader took office).
@@ -1495,7 +1576,8 @@ impl EngineHandle {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::AdoptAuthority { reply: tx })
             .await?;
-        rx.await
+        owner_reply(rx)
+            .await
             .map_err(|_| EngineError::Closed)?
             .map_err(EngineError::State)
     }
@@ -1530,7 +1612,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await.map_err(|_| EngineError::Closed)
     }
 
     /// Operator retry from post-processing's own surfaces (restart, Retry):
@@ -1615,7 +1697,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await.map_err(|_| EngineError::Closed)
     }
 
     /// Lock-free snapshot of the queue (never blocks the engine).
@@ -1647,24 +1729,47 @@ impl EngineHandle {
     }
 
     pub fn emit(&self, event: Event) {
-        let _ = self.events.send(event);
+        if let Some(admission) = &self.post_scope {
+            let _ = self.cmd_tx.try_send(EngineMsg::ScopedEvent {
+                admission: admission.clone(),
+                event,
+            });
+        } else {
+            let _ = self.events.send(event);
+        }
     }
 
     /// Graceful shutdown: stop leasing, flush journal + snapshot, clear the
     /// unclean marker, wait for every task.
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self) -> bool {
         self.cancel.cancel();
         self.tracker.wait().await;
-        if let Err(error) = self.artifacts.close() {
-            tracing::error!(%error,"inventory shutdown failed");
-        }
+        let inventory = self.artifacts.clone();
+        let closed = match tokio::task::spawn_blocking(move || inventory.close()).await {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                tracing::error!(%error, "inventory shutdown failed");
+                false
+            }
+            Err(error) => {
+                tracing::error!(%error, "inventory shutdown worker failed");
+                false
+            }
+        };
+        closed
+            && self
+                .shutdown_complete
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     async fn send(&self, cmd: QueueCommand) -> Result<(), EngineError> {
-        self.cmd_tx
-            .send(EngineMsg::Command(cmd))
-            .await
-            .map_err(|_| EngineError::Closed)
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            self.cmd_tx.send(self.command_message(cmd)),
+        )
+        .await
+        .map_err(|_| EngineError::Closed)?
+        .map_err(|_| EngineError::Closed)
     }
 
     async fn roundtrip_bool(
@@ -1673,7 +1778,7 @@ impl EngineHandle {
     ) -> Result<bool, EngineError> {
         let (tx, rx) = oneshot::channel();
         self.send(make(tx)).await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await.map_err(|_| EngineError::Closed)
     }
 
     async fn roundtrip_unit(
@@ -1682,8 +1787,17 @@ impl EngineHandle {
     ) -> Result<(), EngineError> {
         let (tx, rx) = oneshot::channel();
         self.send(make(tx)).await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await.map_err(|_| EngineError::Closed)
     }
+}
+
+/// Bound control-plane waits independently of a storage worker's lifetime.
+/// A timeout does not cancel issued storage I/O or permit a replacement worker.
+async fn owner_reply<T>(reply: oneshot::Receiver<T>) -> Result<T, EngineError> {
+    tokio::time::timeout(Duration::from_secs(10), reply)
+        .await
+        .map_err(|_| EngineError::Closed)?
+        .map_err(|_| EngineError::Closed)
 }
 
 /// Reserved durable queue key for qBittorrent tag passthrough. Admission

@@ -5,6 +5,11 @@ use std::fs::File;
 use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 use std::path::{Component, Path};
 
+/// Object identity captured from the already-open descriptor, including mount identity.
+pub fn identity(file: &File) -> Result<crate::artifacts::Identity> {
+    fs::identity_for_file(file)
+}
+
 pub fn open(path: &Path) -> Result<File> {
     let parent = fs::open_dir(
         path.parent()

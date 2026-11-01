@@ -102,6 +102,29 @@ pub struct JournalRecord {
     pub file_size: u64,
 }
 
+/// A journal record plus optional provenance metadata. Legacy records have
+/// `provenance: None`; their presence is not evidence of durable provenance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProvenJournalRecord {
+    pub record: JournalRecord,
+    pub provenance: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct JournalEnvelopeRef<'a> {
+    #[serde(flatten)]
+    record: &'a JournalRecord,
+    provenance: &'a serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct JournalEnvelope {
+    #[serde(flatten)]
+    record: JournalRecord,
+    #[serde(default)]
+    provenance: Option<serde_json::Value>,
+}
+
 /// Append-only segment journal backed by a single file of JSON lines.
 /// Replay tolerates a torn trailing line (crash mid-append).
 pub struct FsJournal {
@@ -230,6 +253,25 @@ impl JobJournals {
         Ok(())
     }
 
+    /// Append a record with caller-supplied provenance in the same JSON
+    /// object. Like `append`, this writes to the page cache and defers fsync
+    /// to `sync`.
+    pub fn append_with_provenance(
+        &mut self,
+        rec: &JournalRecord,
+        provenance: &serde_json::Value,
+    ) -> Result<(), StateError> {
+        let mut line = serde_json::to_vec(&JournalEnvelopeRef {
+            record: rec,
+            provenance,
+        })?;
+        line.push(b'\n');
+        let j = self.file_for(rec.job)?;
+        fsx::write_all(&mut j.file, &line, &j.path)?;
+        self.dirty = true;
+        Ok(())
+    }
+
     /// fsync every journal touched since the last sync.
     pub fn sync(&mut self) -> Result<(), StateError> {
         if self.dirty {
@@ -259,6 +301,37 @@ impl JobJournals {
         for entry in entries.flatten() {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 out.extend(replay_dir(&entry.path())?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Replay all journal files for one job while retaining optional
+    /// provenance fields. A missing field remains `None` for legacy rows.
+    pub fn replay_job_with_provenance(
+        state_dir: &Path,
+        job: JobId,
+    ) -> Result<Vec<ProvenJournalRecord>, StateError> {
+        let dir = state_dir.join("jobs").join(job.0.to_string());
+        replay_dir_with_provenance(&dir)
+    }
+
+    /// Replay every job journal with optional provenance fields retained.
+    pub fn replay_all_with_provenance(
+        state_dir: &Path,
+    ) -> Result<Vec<ProvenJournalRecord>, StateError> {
+        let jobs_dir = state_dir.join("jobs");
+        let mut out = Vec::new();
+        let entries = match fsx::read_dir(&jobs_dir) {
+            Ok(e) => e,
+            Err(e) if e.is_not_found() => return Ok(out),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = fsx::ctx(entry, "read directory entry", &jobs_dir)?;
+            let path = entry.path();
+            if fsx::ctx(entry.file_type(), "inspect directory entry", &path)?.is_dir() {
+                out.extend(replay_dir_with_provenance(&path)?);
             }
         }
         Ok(out)
@@ -302,6 +375,38 @@ fn replay_dir(dir: &Path) -> Result<Vec<JournalRecord>, StateError> {
             match serde_json::from_slice::<JournalRecord>(&line) {
                 Ok(rec) => out.push(rec),
                 Err(_) => break, // torn tail of this file; others still count
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn replay_dir_with_provenance(dir: &Path) -> Result<Vec<ProvenJournalRecord>, StateError> {
+    let mut out = Vec::new();
+    let entries = match fsx::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.is_not_found() => return Ok(out),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = fsx::ctx(entry, "read directory entry", dir)?;
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("journal.") {
+            continue;
+        }
+        let path = entry.path();
+        let file = fsx::open(&path)?;
+        for line in BufReader::new(file).split(b'\n') {
+            let line = fsx::ctx(line, "read", &path)?;
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_slice::<JournalEnvelope>(&line) {
+                Ok(envelope) => out.push(ProvenJournalRecord {
+                    record: envelope.record,
+                    provenance: envelope.provenance,
+                }),
+                Err(_) => break, // torn tail of this file; other files still count
             }
         }
     }
@@ -1304,6 +1409,62 @@ mod tests {
         assert!(JobJournals::replay_job(dir.path(), JobId(1))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn job_journal_provenance_round_trips_and_legacy_records_stay_unproven() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journals = JobJournals::open(dir.path(), "proof").unwrap();
+        let proof = serde_json::json!({"writer": "direct", "version": 1});
+        journals.append_with_provenance(&rec(0), &proof).unwrap();
+        journals.append(&rec(1)).unwrap();
+        journals.sync().unwrap();
+
+        let records = JobJournals::replay_job_with_provenance(dir.path(), JobId(1)).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].record, rec(0));
+        assert_eq!(records[0].provenance, Some(proof));
+        assert_eq!(records[1].record, rec(1));
+        assert_eq!(records[1].provenance, None);
+
+        // The legacy reader continues to ignore the additional JSON field.
+        let legacy = JobJournals::replay_job(dir.path(), JobId(1)).unwrap();
+        assert_eq!(legacy, vec![rec(0), rec(1)]);
+        assert_eq!(
+            JobJournals::replay_all_with_provenance(dir.path())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn provenance_replay_stops_at_torn_tail_and_keeps_other_journals() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = JobJournals::open(dir.path(), "first").unwrap();
+        first
+            .append_with_provenance(&rec(0), &serde_json::json!({"durable": true}))
+            .unwrap();
+        first.sync().unwrap();
+        let first_path = dir.path().join("jobs/1/journal.first");
+        drop(first);
+        let mut tail = OpenOptions::new().append(true).open(first_path).unwrap();
+        tail.write_all(b"{\"job\":").unwrap();
+        drop(tail);
+
+        let mut second = JobJournals::open(dir.path(), "second").unwrap();
+        second.append(&rec(2)).unwrap();
+        second.sync().unwrap();
+
+        let records = JobJournals::replay_job_with_provenance(dir.path(), JobId(1)).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].record, rec(0));
+        assert_eq!(
+            records[0].provenance,
+            Some(serde_json::json!({"durable": true}))
+        );
+        assert_eq!(records[1].record, rec(2));
+        assert_eq!(records[1].provenance, None);
     }
 
     #[test]

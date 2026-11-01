@@ -371,12 +371,158 @@ fn event(db: &Connection, artifact: &str, kind: &str, detail: &str) -> Result<()
 }
 
 impl Inventory {
+    /// Whether generation-bound transform journals own the current payload shape.
+    /// Recovery must not apply old download CRCs after these operations.
+    pub fn has_transform_custody(&self, job: u32) -> Result<bool> {
+        let Some(source) = self.for_job(job)? else {
+            return Ok(false);
+        };
+        let raws = {
+            let db = self.db.lock().unwrap();
+            let mut stmt=db.prepare("SELECT data FROM operations WHERE artifact=?1 AND state NOT IN ('cancelled','preview') AND json_extract(data,'$.kind') IN ('par_restore','par_repair','extract')")?;
+            let rows = stmt.query_map([&source.id], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in raws {
+            let op: Operation = serde_json::from_str(&raw)?;
+            let request: serde_json::Value = serde_json::from_str(&op.request)?;
+            let generation = if op.kind == "par_restore" {
+                request
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.get("generation"))
+                    .and_then(|v| v.as_str())
+            } else {
+                request
+                    .get("source")
+                    .and_then(|v| v.get("generation"))
+                    .and_then(|v| v.as_str())
+            };
+            match generation {
+                Some(g) if g == source.generation => return Ok(true),
+                Some(_) => (),
+                None => {
+                    return Err(Error::Conflict(
+                        "transform journal lacks generation evidence".into(),
+                    ))
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Check the enrolled identity before any component may initialize this
+    /// storage root. No database, lock, WAL, SHM, or directory is created.
+    /// The real open repeats the check immediately before schema mutation.
+    pub fn validate_expected(state_dir: &Path, expected: Option<&str>) -> Result<()> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        if expected.is_empty() {
+            return Err(Error::Conflict(
+                "empty enrolled installation identity".into(),
+            ));
+        }
+        let database = state_dir.join("artifacts.sqlite");
+        let metadata = std::fs::metadata(&database)?;
+        if !metadata.is_file() {
+            return Err(Error::Conflict(
+                "enrolled inventory is not an existing regular database".into(),
+            ));
+        }
+        // This existing-file lock prevents a cooperating inventory owner from
+        // checkpointing/removing WAL while the preflight observes it. It is
+        // released before the normal open; two inventory locks are never held.
+        let lock = File::open(state_dir.join("artifacts.lock"))?;
+        lock.try_lock().map_err(|error| {
+            Error::Conflict(format!(
+                "inventory identity preflight cannot acquire existing ownership lock: {error}"
+            ))
+        })?;
+        let rollback = state_dir.join("artifacts.sqlite-journal");
+        match std::fs::metadata(&rollback) {
+            Ok(metadata) if metadata.len() > 0 => return Err(Error::Conflict("inventory has unresolved rollback evidence; preflight refuses to recover an unvalidated store".into())),
+            Ok(_) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error.into()),
+        }
+        let wal_exists = state_dir.join("artifacts.sqlite-wal").try_exists()?;
+        let db = if wal_exists {
+            // SQLite's ordinary READ_ONLY WAL open can initialize/write SHM.
+            // Existing-file RW permits byte-range EXCLUSIVE locking; query_only
+            // prevents SQL writes, EXCLUSIVE uses an in-memory WAL index, and
+            // NO_CKPT_ON_CLOSE prevents checkpoint/WAL removal on every exit.
+            // WAL already exists under the ownership lock, so SQLite cannot
+            // create it. No CREATE or persistent pragma is used in this path.
+            let db = Connection::open_with_flags(
+                &database,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )?;
+            db.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )?;
+            db.pragma_update(None, "query_only", true)?;
+            db.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+            db
+        } else {
+            // Immutable mode avoids creation of a WAL even for a checkpointed
+            // WAL-mode main file. It is safe here only because no WAL exists
+            // and the existing ownership lock excludes cooperative writers.
+            let absolute = std::fs::canonicalize(&database)?;
+            let mut uri = String::from("file:");
+            for byte in absolute.as_os_str().as_encoded_bytes() {
+                if byte.is_ascii_alphanumeric()
+                    || matches!(*byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~')
+                {
+                    uri.push(*byte as char);
+                } else {
+                    uri.push_str(&format!("%{byte:02X}"));
+                }
+            }
+            uri.push_str("?mode=ro&immutable=1");
+            Connection::open_with_flags(
+                uri,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            )?
+        };
+        let actual: String = db.query_row(
+            "SELECT value FROM meta WHERE key='installation'",
+            [],
+            |row| row.get(0),
+        )?;
+        if actual != expected {
+            return Err(Error::Conflict(
+                "inventory installation identity differs from the enrolled store".into(),
+            ));
+        }
+        // Drop the no-checkpoint connection while the ownership lock is held.
+        drop(db);
+        drop(lock);
+        Ok(())
+    }
+
     pub fn open(state_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(state_dir)?;
+        Self::open_expected(state_dir, None)
+    }
+
+    /// An enrolled store must exist and match before schema creation or migration.
+    pub fn open_expected(state_dir: &Path, expected: Option<&str>) -> Result<Self> {
+        Self::validate_expected(state_dir, expected)?;
+        if let Some(expected) = expected {
+            if expected.is_empty()
+                || !state_dir.try_exists()?
+                || !state_dir.join("artifacts.sqlite").try_exists()?
+            {
+                return Err(Error::Conflict("enrolled inventory is unavailable; refusing to create a replacement installation".into()));
+            }
+        } else {
+            std::fs::create_dir_all(state_dir)?;
+        }
         let process_lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(expected.is_none())
             .truncate(false)
             .open(state_dir.join("artifacts.lock"))?;
         process_lock.try_lock().map_err(|e| {
@@ -384,8 +530,27 @@ impl Inventory {
                 "inventory is already open; stop the daemon before restore: {e}"
             ))
         })?;
-        let mut db = Connection::open(state_dir.join("artifacts.sqlite"))?;
+        let mut db = if expected.is_some() {
+            Connection::open_with_flags(
+                state_dir.join("artifacts.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )?
+        } else {
+            Connection::open(state_dir.join("artifacts.sqlite"))?
+        };
         db.busy_timeout(Duration::from_secs(5))?;
+        if let Some(expected) = expected {
+            let actual: String = db.query_row(
+                "SELECT value FROM meta WHERE key='installation'",
+                [],
+                |row| row.get(0),
+            )?;
+            if actual != expected {
+                return Err(Error::Conflict(
+                    "inventory installation identity differs from the enrolled store".into(),
+                ));
+            }
+        }
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS artifacts(id TEXT PRIMARY KEY,job INTEGER,path TEXT NOT NULL,state TEXT NOT NULL,updated_at INTEGER NOT NULL,data TEXT NOT NULL);
@@ -2278,3 +2443,70 @@ mod tests;
 
 #[cfg(test)]
 mod relocation_failure_tests;
+
+#[cfg(test)]
+mod identity_preflight_tests {
+    use super::*;
+
+    fn contents(root: &Path) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn expected_identity_checks_wal_without_creating_shm_or_checkpointing() {
+        let tmp = tempfile::tempdir().unwrap();
+        File::create(tmp.path().join("artifacts.lock")).unwrap();
+        let path = tmp.path().join("artifacts.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.pragma_update(None, "journal_mode", "WAL").unwrap();
+        db.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .unwrap();
+        db.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT INTO meta VALUES('installation','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');").unwrap();
+        drop(db);
+        let shm = tmp.path().join("artifacts.sqlite-shm");
+        if shm.try_exists().unwrap() {
+            std::fs::remove_file(shm).unwrap();
+        }
+        assert!(tmp
+            .path()
+            .join("artifacts.sqlite-wal")
+            .try_exists()
+            .unwrap());
+        let before = contents(tmp.path());
+        Inventory::validate_expected(tmp.path(), Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")).unwrap();
+        assert_eq!(
+            contents(tmp.path()),
+            before,
+            "successful preflight must not checkpoint or create shared-memory files"
+        );
+        assert!(
+            Inventory::validate_expected(tmp.path(), Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
+                .is_err()
+        );
+        assert_eq!(
+            contents(tmp.path()),
+            before,
+            "wrong installation must leave all durable bytes and names unchanged"
+        );
+    }
+
+    #[test]
+    fn missing_enrolled_root_is_never_initialized_by_preflight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("wrong-mount");
+        assert!(
+            Inventory::validate_expected(&absent, Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+                .is_err()
+        );
+        assert!(!absent.try_exists().unwrap());
+    }
+}

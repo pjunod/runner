@@ -2169,7 +2169,7 @@ fn spawn_job(
     retire_local: bool,
     from: RestartPoint,
 ) -> ActiveAttempt {
-    let engine = engine.clone();
+    let base_engine = engine.clone();
     let cfg = cfg.clone();
     let history = history.clone();
     let dest = dest_dir.to_path_buf();
@@ -2192,6 +2192,25 @@ fn spawn_job(
                 .await;
         if let Some(permit) = permit {
             let _permit = permit;
+            // Queue status and placement alone do not authorize reading or
+            // modifying recovered inputs. Acquire owner evidence at this common
+            // entry point, after waiting for capacity and before pipeline I/O.
+            // Do not drop an in-flight admission request on cancellation: an
+            // issued lease must be received and released explicitly.
+            let admission = match base_engine.begin_post_admission(job).await {
+                Ok(Some(admission)) => admission,
+                Ok(None) => {
+                    tracing::debug!(job = job.0, "post-processing admission deferred until inputs are verified");
+                    let _ = finished.send(job);
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(job = job.0, %error, "post-processing admission unavailable; rescan may retry");
+                    let _ = finished.send(job);
+                    return;
+                }
+            };
+            let engine = base_engine.for_post_admission(&admission);
             let ctx = PpCtx {
                 cancel: task_cancel.child_token(),
                 commit_ok: Arc::new({ let global = global_cancel.clone(); let task = task_cancel.clone(); move || !global.is_cancelled() && !task.is_cancelled() }),
@@ -2250,6 +2269,11 @@ fn spawn_job(
                     tracing::error!(job = job.0, error = %e, "post-processing crashed");
                 }
             }
+            // Keep admission custody until actual reader/tool worker shutdown,
+            // including cancelled attempts. Release through the unscoped handle.
+            if let Err(error) = base_engine.end_post_admission(admission).await {
+                tracing::warn!(job = job.0, %error, "post-processing admission release remains unresolved");
+            }
         }
         let _ = finished.send(job);
     });
@@ -2302,6 +2326,58 @@ mod admission_tests {
         sem.add_permits(1);
         assert!(wait.await.unwrap().is_none());
         assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn refused_owner_admission_finishes_without_pipeline_or_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let history = Arc::new(
+            HistoryDb::open(&temp.path().join("history.sqlite"), Some(temp.path())).unwrap(),
+        );
+        let engine = nzbd_engine::Engine::spawn(nzbd_engine::EngineConfig::single_node(
+            vec![],
+            temp.path().join("state"),
+            temp.path().join("downloads"),
+            nzbd_engine::Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let tracker = TaskTracker::new();
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let cancel = CancellationToken::new();
+        let (finished, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let dest = temp.path().join("pipeline-output");
+        let job = JobId(404);
+        // Simulate a queued attempt whose job disappeared before owner admission.
+        // Every spawn path must return a completion notification even though no
+        // processing authority was issued, allowing the manager to clear active.
+        let _attempt = spawn_job(
+            &tracker,
+            &engine,
+            &PostConfig::default(),
+            &history,
+            &dest,
+            &sem,
+            &cancel,
+            &finished,
+            job,
+            None,
+            true,
+            RestartPoint::Beginning,
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap(),
+            Some(job)
+        );
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(sem.available_permits(), 1);
+        assert!(history.get(job).unwrap().is_none());
+        assert!(!dest.exists());
+        engine.shutdown().await;
     }
 
     #[test]
@@ -2798,7 +2874,7 @@ async fn resume_durable_delivery(
         other => {
             return Err(PostError::Subprocess(format!(
                 "unknown durable delivery outcome {other:?}"
-            )))
+            )));
         }
     };
     job.params
@@ -4862,14 +4938,20 @@ fn bounded_file_diagnostics_with_limit(
             )));
         }
         let evidence = if prefix.starts_with(b"\x1a\x45\xdf\xa3") {
-            Some("EBML/Matroska signature; rename to .mkv after confirming the file, then Retry publication")
+            Some(
+                "EBML/Matroska signature; rename to .mkv after confirming the file, then Retry publication",
+            )
         } else if prefix.len() >= 8 && &prefix[4..8] == b"ftyp" {
-            Some("ISO base media signature; rename to a supported video/audio extension after confirmation, then Retry publication")
+            Some(
+                "ISO base media signature; rename to a supported video/audio extension after confirmation, then Retry publication",
+            )
         } else if prefix.starts_with(b"ID3")
             || prefix.starts_with(b"fLaC")
             || prefix.starts_with(b"OggS")
         {
-            Some("recognized audio container signature; rename to a supported audio extension after confirmation, then Retry publication")
+            Some(
+                "recognized audio container signature; rename to a supported audio extension after confirmation, then Retry publication",
+            )
         } else if prefix.starts_with(b"%PDF-") {
             Some("PDF signature; rename to .pdf after confirmation, then Retry publication")
         } else if prefix.starts_with(b"PK\x03\x04") {
@@ -6054,7 +6136,9 @@ mod decision_tests {
         assert_eq!(failed.outcome, "excluded_source_cleanup");
         assert_eq!(
             failed.reason.as_deref(),
-            Some("archive extraction failed after configured tools and available repair; no verified output remains")
+            Some(
+                "archive extraction failed after configured tools and available repair; no verified output remains"
+            )
         );
     }
 

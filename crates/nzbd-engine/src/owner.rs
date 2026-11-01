@@ -16,9 +16,15 @@ use crate::queue::{
     QueueState, SegRef, SelectionCtx, CLIENT_PARAM,
 };
 use crate::rate::{RateLimiter, SpeedMeter};
+use crate::recovery::{DurableFileProof, ProvenRange, WRITER_PROTOCOL};
 use crate::snapshot::{JobSummary, QueueSnapshot, SharedSnapshot, StorageVolumeSnapshot};
 use crate::volumes::DiskGuardReading;
-use crate::writer::{spawn_writer, WriteCmd, WriterHandle};
+use crate::writer::{spawn_writer_scoped, WriteCmd, WriterFact, WriterHandle, WriterScope};
+#[path = "owner_recovery.rs"]
+mod recovery_worker;
+use recovery_worker::{VerificationResult, VerificationState};
+#[path = "owner_persistence.rs"]
+mod persistence_worker;
 use crate::{AddOpts, Tuning};
 use arc_swap::ArcSwap;
 use nzbd_nzb::ParsedNzb;
@@ -29,6 +35,7 @@ use nzbd_types::{
     FileId, Health, Job, JobId, JobKind, JobStatus, PostStage, SegmentState, ServerDef, ServerId,
     StageSpan, TorrentControlIntent, TorrentPayloadDisposition, TorrentPhase, TorrentRemovalIntent,
 };
+use persistence_worker::{IoResult, PersistResult, Persistence};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -90,6 +97,11 @@ fn durable_seed_checkpoints(state: &QueueState) -> HashMap<JobId, SeedCheckpoint
         .collect()
 }
 
+fn fresh_epoch() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
@@ -97,6 +109,21 @@ fn durable_seed_checkpoints(state: &QueueState) -> HashMap<JobId, SeedCheckpoint
 /// External commands (wrapped by `EngineHandle` methods).
 #[derive(Debug)]
 pub(crate) enum QueueCommand {
+    BeginPostAdmission {
+        job: JobId,
+        reply: oneshot::Sender<Option<crate::PostAdmission>>,
+    },
+    EndPostAdmission {
+        admission: crate::PostAdmission,
+        reply: oneshot::Sender<()>,
+    },
+    RecoveryDocument {
+        reply: oneshot::Sender<nzbd_state::QueueSnapshotDoc>,
+    },
+    RemoveOrphanTorrentSource {
+        job: JobId,
+        reply: oneshot::Sender<bool>,
+    },
     ReserveTorrentAdmission {
         source: nzbd_types::TorrentSource,
         secret: Vec<u8>,
@@ -503,11 +530,54 @@ pub(crate) struct Lease {
     pub r: SegRef,
     pub message_id: String,
     pub writer: mpsc::Sender<WriteCmd>,
+    pub generation: u64,
 }
 
 /// Everything that reaches the owner task.
 #[derive(Debug)]
 pub(crate) enum EngineMsg {
+    WritersStopped {
+        job: JobId,
+        generation: u64,
+    },
+    ScopedNameInspected {
+        job: JobId,
+        generation: u64,
+        name: Option<String>,
+    },
+    PersistenceFinished {
+        revision: u64,
+        result: PersistResult,
+    },
+    IoFinished {
+        revision: u64,
+        result: IoResult,
+    },
+    ScopedCommand {
+        admission: crate::PostAdmission,
+        command: Box<QueueCommand>,
+    },
+    ScopedEvent {
+        admission: crate::PostAdmission,
+        event: Event,
+    },
+    ScopedWriter {
+        job: JobId,
+        file: FileId,
+        generation: u64,
+        fact: crate::writer::WriterFact,
+    },
+    ScopedOutcome {
+        job: JobId,
+        file: FileId,
+        generation: u64,
+        message: Box<EngineMsg>,
+    },
+    VerificationFinished {
+        job: JobId,
+        generation: u64,
+        result: VerificationResult,
+    },
     Command(QueueCommand),
     WorkRequest {
         server: ServerId,
@@ -558,13 +628,6 @@ pub(crate) enum EngineMsg {
     OutOfSpace {
         whence: String,
     },
-    /// A completed file has finished its background par2-name inspection.
-    /// `None` matters: terminal completion waits for every inspection that
-    /// was already started, so it needs an explicit negative result too.
-    JobNameInspected {
-        job: JobId,
-        name: Option<String>,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -576,7 +639,21 @@ pub(crate) struct Owner {
     attempts: HashMap<SegRef, SegmentAttempt>,
     blocked: HashMap<ServerId, Instant>,
     writers: HashMap<FileId, WriterHandle>,
+    writer_epochs: HashMap<FileId, u64>,
+    job_epochs: HashMap<JobId, u64>,
+    control_epochs: HashMap<JobId, u64>,
+    post_admissions: HashMap<JobId, u64>,
+    verification: HashMap<JobId, VerificationState>,
+    verification_roots: HashSet<PathBuf>,
+    allocation_cache: HashMap<JobId, nzbd_state::artifacts::Artifact>,
+    owner_heartbeat: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) shutdown_complete: Arc<std::sync::atomic::AtomicBool>,
     retiring_writers: HashMap<JobId, Vec<WriterHandle>>,
+    retirement_epochs: HashMap<JobId, u64>,
+    deferred_replacements: VecDeque<QueueCommand>,
+    pending_writer_birth: HashMap<FileId, u64>,
+    allocating_jobs: HashSet<JobId>,
+    pending_control_commits: HashSet<JobId>,
     allocated_jobs: HashSet<JobId>,
     finalize_sent: HashSet<FileId>,
     pending_finalize: Vec<(JobId, FileId)>,
@@ -651,13 +728,16 @@ pub(crate) struct Owner {
     history: Option<Arc<nzbd_state::history::HistoryDb>>,
 
     state_dir: PathBuf,
-    journal: JobJournals,
-    snap_store: SnapshotStore,
+    persistence: Persistence,
+    persistence_callbacks: HashMap<u64, Box<dyn FnOnce(&mut Owner, bool) + Send>>,
+    journal_suffix: String,
+    io_callbacks: HashMap<u64, Box<dyn FnOnce(&mut Owner, IoResult) + Send>>,
     pending_sources: nzbd_state::torrent_sources::PendingSourceStore,
     /// How long the last snapshot write took — feeds [`save_spacing`], so a
     /// slow state volume stretches the save cadence instead of consuming
     /// the owner loop.
     last_save_ms: u64,
+    background_save_pending: bool,
     /// Lowest free-space reading across every configured write root, updated
     /// by a dedicated prober task (engine spawn wires it). The owner NEVER
     /// calls statvfs itself: on a
@@ -672,10 +752,10 @@ pub(crate) struct Owner {
     /// publish a newer value between decision and status publication, which
     /// would pair one cycle's hold with another cycle's evidence.
     evaluated_disk_guard: Arc<DiskGuardReading>,
-    marker: UncleanMarker,
     /// Queue-authority persistence (snapshot save/compact). Worker-mode
     /// engines run with this off; journals stay on regardless.
     persist: bool,
+    worker_mode: bool,
     persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     budget_tx: watch::Sender<crate::pool::BudgetEnvelope>,
     budget_generation: u64,
@@ -716,6 +796,7 @@ pub(crate) struct Owner {
 
     /// Per-server volume counters + quota/disk guards.
     volumes: crate::volumes::VolumeBook,
+    quota_probe_pending: bool,
     quota_reached: bool,
     disk_low: bool,
     /// Latched by an out-of-space error observed on a real write. statvfs
@@ -811,6 +892,7 @@ impl Owner {
     pub(crate) fn recover(
         state_dir: &Path,
         artifact_dir: Option<&Path>,
+        expected_installation_id: Option<&str>,
         dest_dir: PathBuf,
         torrent_payload_roots: Vec<PathBuf>,
         history: Option<Arc<nzbd_state::history::HistoryDb>>,
@@ -832,10 +914,14 @@ impl Owner {
         engine_tx: mpsc::Sender<EngineMsg>,
         tracker: TaskTracker,
         cancel: CancellationToken,
+        owner_heartbeat: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<Owner, nzbd_state::StateError> {
         let artifacts = Arc::new(
-            nzbd_state::artifacts::Inventory::open(artifact_dir.unwrap_or(state_dir))
-                .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?,
+            nzbd_state::artifacts::Inventory::open_expected(
+                artifact_dir.unwrap_or(state_dir),
+                expected_installation_id,
+            )
+            .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?,
         );
         std::fs::create_dir_all(&dest_dir).map_err(|source| nzbd_state::StateError::Io {
             op: "create download root",
@@ -876,15 +962,31 @@ impl Owner {
             }
             // Legacy phase-1 global journal: fold once, then retire it.
             let legacy = FsJournal::open(state_dir)?;
-            let mut replayed = legacy.replay()?;
+            let mut replayed = legacy
+                .replay()?
+                .into_iter()
+                .map(|record| nzbd_state::ProvenJournalRecord {
+                    record,
+                    provenance: None,
+                })
+                .collect::<Vec<_>>();
             drop(legacy);
             if !replayed.is_empty() {
                 tracing::info!(records = replayed.len(), "migrating legacy global journal");
                 let _ = std::fs::remove_file(state_dir.join("segments.journal"));
             }
-            replayed.extend(JobJournals::replay_all(state_dir)?);
+            replayed.extend(JobJournals::replay_all_with_provenance(state_dir)?);
             replay_count = replayed.len();
-            for rec in replayed {
+            for envelope in replayed {
+                let rec = envelope.record;
+                if !merge_replayed_proof(
+                    &mut state,
+                    &rec,
+                    envelope.provenance.as_ref(),
+                    &artifacts.installation,
+                ) {
+                    continue;
+                }
                 let r = SegRef {
                     job: rec.job,
                     file: rec.file,
@@ -904,13 +1006,7 @@ impl Owner {
                 }
             }
             for j in &mut state.jobs {
-                let dir = artifacts
-                    .for_job(j.id.0)
-                    .ok()
-                    .flatten()
-                    .map(|a| a.path)
-                    .unwrap_or_else(|| dest_dir.join(job_dir_name(j)));
-                for f in &mut j.files {
+                for f in &j.files {
                     let key = format!("*File:size:{}", f.id.0);
                     if let Some(size) = j
                         .params
@@ -919,65 +1015,6 @@ impl Owner {
                         .and_then(|(_, v)| v.parse::<u64>().ok())
                     {
                         file_sizes.insert(f.id, size);
-                    }
-                    // Revalidate even old page-cache acknowledgements. Sparse length
-                    // alone proves nothing; only matching range bytes retain Done.
-                    let stable = dir.join(format!(".runner-file-{}.part", f.id.0));
-                    let repair_key = format!("*File:repair:{}", f.id.0);
-                    let repair_pending = j.params.iter().any(|(key, _)| key == &repair_key);
-                    let path = if f.finalized && !repair_pending {
-                        dir.join(&f.filename)
-                    } else if stable.exists() {
-                        stable
-                    } else {
-                        dir.join(format!("{}.part", f.filename))
-                    };
-                    for segment in &mut f.segments {
-                        if let SegmentState::Done { offset, len, crc } = segment.state {
-                            if !crate::writer::validate_range(&path, offset, len as u64, crc) {
-                                segment.state = SegmentState::Pending;
-                                f.finalized = false;
-                                f.crc32 = None;
-                            }
-                        }
-                    }
-                }
-                if let Some(mut control) = j.control().filter(|c| {
-                    c.version == 1
-                        && c.lifecycle == "held"
-                        && !c.manual_pause
-                        && c.cause == "identity_conflict"
-                        && c.stage == "finalize"
-                        && c.message
-                            == "file coverage or expected size is unverified; partial retained"
-                }) {
-                    if let Some(revision) = control
-                        .revision
-                        .parse::<u64>()
-                        .ok()
-                        .and_then(|r| r.checked_add(1))
-                    {
-                        control.revision = revision.to_string();
-                        control.lifecycle = "running".into();
-                        control.message = "rechecking retained download for repair".into();
-                        j.set_control(&control);
-                        j.status = JobStatus::Queued;
-                    }
-                }
-                if let Some(mut control) = j.control().filter(|c|
-                    c.version == 1 && c.lifecycle == "held" && !c.manual_pause
-                    && matches!(c.cause.as_str(), "unknown" | "post_failure")
-                    && c.stage == "rar_rename"
-                    && c.message == "subprocess failed: RAR set lacks checked order/membership evidence; filenames preserved")
-                {
-                    if artifacts.validate_post_retry(j.id.0).is_ok() {
-                        if let Some(revision) = control.revision.parse::<u64>().ok().and_then(|r| r.checked_add(1)) {
-                            control.revision = revision.to_string();
-                            control.lifecycle = "running".into();
-                            control.message = "retrying archive restoration with SFV evidence".into();
-                            j.set_control(&control);
-                            j.status = JobStatus::PostQueued;
-                        }
                     }
                 }
                 if j.held() {
@@ -1024,7 +1061,8 @@ impl Owner {
         }
 
         let mut allocated_jobs = HashSet::new();
-        let mut retiring_writers = HashMap::new();
+        let retiring_writers = HashMap::new();
+        let mut allocation_cache = HashMap::new();
         // Validate recovered allocations before the actor starts. Segment
         // scheduling subsequently consults only actor-owned admission state.
         for job in &mut state.jobs {
@@ -1035,6 +1073,7 @@ impl Owner {
                 .for_job(job.id.0)
                 .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?
             {
+                allocation_cache.insert(job.id, a.clone());
                 if a.state == "active" {
                     artifacts
                         .allocate(job.id.0, &a.root, &a.path)
@@ -1042,17 +1081,33 @@ impl Owner {
                     allocated_jobs.insert(job.id);
                 } else if a.state == "retained" {
                     job.status = JobStatus::Paused;
-                    retiring_writers.insert(job.id, Vec::new());
+                    // Retained custody is verified asynchronously. There is no
+                    // live writer from the previous process to wait for.
                 }
             }
         }
         let initial_disk_hold = tuning.min_free_disk_bytes > 0;
-        Ok(Owner {
+        let initial_quota_hold = tuning.daily_quota_bytes > 0 || tuning.monthly_quota_bytes > 0;
+        let mut owner = Owner {
             state,
             attempts: HashMap::new(),
             blocked: HashMap::new(),
             writers: HashMap::new(),
+            writer_epochs: HashMap::new(),
+            job_epochs: HashMap::new(),
+            control_epochs: HashMap::new(),
+            post_admissions: HashMap::new(),
+            verification: HashMap::new(),
+            verification_roots: HashSet::new(),
+            allocation_cache,
+            owner_heartbeat,
+            shutdown_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             retiring_writers,
+            retirement_epochs: HashMap::new(),
+            deferred_replacements: VecDeque::new(),
+            pending_writer_birth: HashMap::new(),
+            allocating_jobs: HashSet::new(),
+            pending_control_commits: HashSet::new(),
             allocated_jobs,
             finalize_sent: HashSet::new(),
             pending_finalize: Vec::new(),
@@ -1077,11 +1132,31 @@ impl Owner {
             applied_torrent_limit: None,
             history,
             state_dir: state_dir.to_path_buf(),
-            journal,
-            snap_store,
+            persistence: Persistence::start(
+                journal,
+                SnapshotStore::open(state_dir)?,
+                SnapshotStore::open(
+                    &state_dir.join("workers").join(
+                        journal_suffix
+                            .chars()
+                            .map(|c| {
+                                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                                    c
+                                } else {
+                                    '_'
+                                }
+                            })
+                            .collect::<String>(),
+                    ),
+                )?,
+                engine_tx.clone(),
+            ),
+            persistence_callbacks: HashMap::new(),
+            io_callbacks: HashMap::new(),
+            journal_suffix: journal_suffix.to_owned(),
             pending_sources,
-            marker,
             persist,
+            worker_mode: !persist,
             persist_guard,
             budget_tx,
             budget_generation: 0,
@@ -1105,10 +1180,12 @@ impl Owner {
             dirty: false,
             last_save: Instant::now(),
             last_save_ms: 0,
+            background_save_pending: false,
             disk_guard: Arc::new(ArcSwap::from_pointee(DiskGuardReading::default())),
             evaluated_disk_guard: Arc::new(DiskGuardReading::default()),
             volumes: crate::volumes::VolumeBook::load(state_dir, journal_suffix),
-            quota_reached: false,
+            quota_probe_pending: false,
+            quota_reached: initial_quota_hold,
             // A configured floor starts fail-safe until the first complete
             // asynchronous probe. Startup remains nonblocking, but no work
             // can slip through the measurement window.
@@ -1118,7 +1195,23 @@ impl Owner {
             enospc_where: None,
             rotate: 0,
             guard_tick: 0,
-        })
+        };
+        let pending = owner
+            .state
+            .jobs
+            .iter()
+            .filter(|j| {
+                j.torrent.is_none()
+                    && !j.params.iter().any(|(k, _)| k == nzbd_types::PP_DONE_PARAM)
+                    && (j.files.iter().any(|f| f.has_any_done())
+                        || j.params.iter().any(|(k, _)| k == "*Recovery:pending"))
+            })
+            .map(|j| j.id)
+            .collect::<Vec<_>>();
+        for job in pending {
+            owner.queue_verification(job);
+        }
+        Ok(owner)
     }
 
     pub(crate) async fn run(mut self, mut rx: mpsc::Receiver<EngineMsg>) {
@@ -1126,6 +1219,8 @@ impl Owner {
         // that completed just before the crash.
         self.save_snapshot();
         self.startup_pass();
+        self.drain_replacements();
+        self.start_verifications();
         self.publish_snapshot(0);
         self.bump_epoch();
 
@@ -1143,17 +1238,105 @@ impl Owner {
             }
         }
 
-        // Graceful shutdown = fast crash with a flush (§4.6).
-        if let Err(e) = self.journal.sync() {
-            tracing::warn!(error = %e, "journal sync at shutdown failed");
+        self.drain_shutdown_results(&mut rx).await;
+        // The ordered persistence lane captures only after every accepted
+        // acknowledgement and its durability continuation has been applied.
+        // It owns journal sync, final snapshot and marker disarm; no actor
+        // filesystem operation can deadlock an acknowledgement producer.
+        let durable = self.flush_shutdown_state().await;
+        self.shutdown_complete
+            .store(durable, std::sync::atomic::Ordering::Release);
+        self.writers.clear();
+        self.retiring_writers.clear();
+        if durable {
+            tracing::info!("queue owner stopped after worker and acknowledgement drain");
+        } else {
+            tracing::error!("queue owner stopped with final durability unresolved; unclean marker and recovery evidence retained");
         }
-        self.volumes.save_if_dirty();
-        self.save_snapshot();
-        if let Err(e) = self.marker.disarm() {
-            tracing::warn!(error = %e, "could not clear unclean marker");
+    }
+
+    /// Fence new work, then keep consuming the result channel until every
+    /// actual producer has returned. Cancellation alone does not release a
+    /// writer or verifier's custody, and awaiting producers without receiving
+    /// would deadlock any final acknowledgement behind a full channel.
+    async fn drain_shutdown_results(&mut self, rx: &mut mpsc::Receiver<EngineMsg>) {
+        self.cancel.cancel();
+        self.download_enabled = false;
+        self.post_admissions.clear();
+        for verification in self.verification.values() {
+            verification.cancel.cancel();
         }
-        self.writers.clear(); // writers drain and exit
-        tracing::info!("queue owner stopped");
+        let writers: Vec<WriterHandle> = self
+            .writers
+            .values()
+            .chain(
+                self.retiring_writers
+                    .values()
+                    .flat_map(|writers| writers.iter()),
+            )
+            .cloned()
+            .collect();
+        for writer in &writers {
+            writer.stop.cancel();
+        }
+        let mut poll = tokio::time::interval(Duration::from_millis(20));
+        poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            // A producer publishes `stopped` only after its last send. Drain
+            // buffered results before checking that all producers are gone.
+            while let Ok(message) = rx.try_recv() {
+                self.on_shutdown_message(message);
+            }
+            let writers_stopped = writers.iter().all(|writer| *writer.stopped.borrow());
+            let workers_stopped = self.tracker.len() <= 1;
+            let callbacks_drained = self.persistence_callbacks.is_empty()
+                && self.io_callbacks.is_empty()
+                && self.persistence.in_flight() == 0;
+            if writers_stopped
+                && workers_stopped
+                && callbacks_drained
+                && self.verification_roots.is_empty()
+                && self.pending_name_inspections.is_empty()
+            {
+                break;
+            }
+            tokio::select! {
+                message = rx.recv() => match message {
+                    Some(message) => self.on_shutdown_message(message),
+                    None => { poll.tick().await; },
+                },
+                _ = poll.tick() => {},
+            }
+        }
+    }
+
+    fn on_shutdown_message(&mut self, message: EngineMsg) {
+        match message {
+            // An unacknowledged control request cannot acquire new work or
+            // persist a new user intent once shutdown has fenced admission.
+            EngineMsg::Command(_)
+            | EngineMsg::ScopedCommand { .. }
+            | EngineMsg::ScopedEvent { .. } => {}
+            EngineMsg::WorkRequest { reply, .. } => {
+                let _ = reply.send(Vec::new());
+            }
+            EngineMsg::ScopedOutcome {
+                job,
+                file,
+                generation,
+                message,
+            } => {
+                if self.state.job(job).is_some()
+                    && self.writer_epochs.get(&file) == Some(&generation)
+                {
+                    self.on_shutdown_message(*message);
+                }
+            }
+            // Includes writer facts, verification/name results, and ordered
+            // persistence/IO completions. Their ordinary generation checks
+            // still apply, while cancelled scheduling paths admit no work.
+            message => self.on_msg(message),
+        }
     }
 
     /// Return jobs to `Queued` once they are neither in the active set
@@ -1216,9 +1399,18 @@ impl Owner {
     }
 
     fn startup_pass(&mut self) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
         let mut to_finalize = Vec::new();
         let mut to_check = Vec::new();
         for job in &self.state.jobs {
+            if self.pending_control_commits.contains(&job.id)
+                || self.verification.contains_key(&job.id)
+                || self.retiring_writers.contains_key(&job.id)
+            {
+                continue;
+            }
             if !matches!(job.status, JobStatus::Queued | JobStatus::Downloading) {
                 continue;
             }
@@ -1240,7 +1432,88 @@ impl Owner {
     // -- message dispatch ----------------------------------------------------
 
     fn on_msg(&mut self, msg: EngineMsg) {
+        self.owner_heartbeat
+            .store(unix_now() as u64, std::sync::atomic::Ordering::Relaxed);
         match msg {
+            EngineMsg::ScopedNameInspected {
+                job,
+                generation,
+                name,
+            } => {
+                if self.job_epochs.get(&job) == Some(&generation)
+                    && !self.verification.contains_key(&job)
+                {
+                    self.on_job_name_inspected(job, name);
+                } else {
+                    match self.pending_name_inspections.get_mut(&job) {
+                        Some(count) if *count > 1 => *count -= 1,
+                        Some(_) => {
+                            self.pending_name_inspections.remove(&job);
+                        }
+                        None => {}
+                    }
+                }
+                self.drain_replacements();
+            }
+            EngineMsg::WritersStopped { job, generation } => {
+                if self.retirement_epochs.get(&job) == Some(&generation)
+                    && self.retiring_writers.get(&job).is_some_and(|writers| {
+                        writers.iter().all(|writer| *writer.stopped.borrow())
+                    })
+                {
+                    self.retirement_epochs.remove(&job);
+                    self.retiring_writers.remove(&job);
+                    self.drain_replacements();
+                    self.startup_pass();
+                    self.publish_now();
+                    self.bump_epoch();
+                }
+            }
+            EngineMsg::PersistenceFinished { revision, result } => {
+                self.persistence_finished(revision, result)
+            }
+            EngineMsg::IoFinished { revision, result } => self.io_finished(revision, result),
+            EngineMsg::VerificationFinished {
+                job,
+                generation,
+                result,
+            } => self.on_verification_result(job, generation, result),
+            EngineMsg::ScopedCommand { admission, command } => {
+                if self.post_admissions.get(&admission.job) == Some(&admission.generation)
+                    && self.job_epochs.get(&admission.job) == Some(&admission.generation)
+                {
+                    if matches!(&*command, QueueCommand::RemoveJobSilent { .. }) {
+                        self.post_admissions.remove(&admission.job);
+                    }
+                    self.on_command(*command);
+                }
+            }
+            EngineMsg::ScopedEvent { admission, event } => {
+                if self.post_admissions.get(&admission.job) == Some(&admission.generation)
+                    && self.job_epochs.get(&admission.job) == Some(&admission.generation)
+                {
+                    self.emit(event);
+                }
+            }
+            EngineMsg::ScopedOutcome {
+                job,
+                file,
+                generation,
+                message,
+            } => {
+                if self.state.job(job).is_some()
+                    && !self.verification.contains_key(&job)
+                    && self.writer_epochs.get(&file) == Some(&generation)
+                {
+                    self.on_msg(*message);
+                }
+            }
+            EngineMsg::ScopedWriter {
+                job,
+                file,
+                generation,
+                fact,
+            } => self.on_scoped_writer(job, file, generation, fact),
             EngineMsg::Command(cmd) => self.on_command(cmd),
             EngineMsg::WorkRequest { server, max, reply } => {
                 let leases = self.grant_work(server, max.max(1));
@@ -1295,7 +1568,6 @@ impl Owner {
                 final_path,
                 combined_crc,
             } => self.on_writer_finalized(job, file, ok, final_path, combined_crc),
-            EngineMsg::JobNameInspected { job, name } => self.on_job_name_inspected(job, name),
             EngineMsg::OutOfSpace { whence } => self.observe_out_of_space(&whence),
             EngineMsg::WriterError { job, file, error } => {
                 tracing::warn!(job = job.0, file = file.0, %error, "writer error; failing file");
@@ -1317,7 +1589,199 @@ impl Owner {
     }
 
     fn on_command(&mut self, cmd: QueueCommand) {
+        let replacement = match &cmd {
+            QueueCommand::ImportJob { job, .. } | QueueCommand::ImportJobIfPresent { job, .. } => {
+                Some(job.id)
+            }
+            QueueCommand::RemoveJobSilent { job, .. } | QueueCommand::Delete { job, .. } => {
+                Some(*job)
+            }
+            _ => None,
+        };
+        if let Some(job) = replacement {
+            let busy = self
+                .pending_name_inspections
+                .get(&job)
+                .is_some_and(|count| *count > 0)
+                || self.retiring_writers.contains_key(&job)
+                || self.post_admissions.contains_key(&job)
+                || self
+                    .verification
+                    .get(&job)
+                    .is_some_and(|state| state.running)
+                || self.state.job(job).is_some_and(|job| {
+                    job.files.iter().any(|file| {
+                        self.writers
+                            .get(&file.id)
+                            .is_some_and(|writer| !*writer.stopped.borrow())
+                    })
+                });
+            if busy {
+                if let Some(state) = self.verification.get(&job) {
+                    state.cancel.cancel();
+                }
+                self.retire_job_writers(job);
+                self.control_epochs.insert(job, fresh_epoch());
+                self.deferred_replacements.push_back(cmd);
+                self.publish_now();
+                self.bump_epoch();
+                return;
+            }
+        }
+        if matches!(cmd, QueueCommand::AdoptReplicatedAuthority { .. }) {
+            let busy_jobs = self
+                .state
+                .jobs
+                .iter()
+                .filter_map(|job| {
+                    let id = job.id;
+                    let busy = self.retiring_writers.contains_key(&id)
+                        || self.post_admissions.contains_key(&id)
+                        || self
+                            .verification
+                            .get(&id)
+                            .is_some_and(|state| state.running)
+                        || job.files.iter().any(|file| {
+                            self.writers
+                                .get(&file.id)
+                                .is_some_and(|writer| !*writer.stopped.borrow())
+                        });
+                    busy.then_some(id)
+                })
+                .collect::<Vec<_>>();
+            if !busy_jobs.is_empty() {
+                for job in busy_jobs {
+                    if let Some(state) = self.verification.get(&job) {
+                        state.cancel.cancel();
+                    }
+                    self.retire_job_writers(job);
+                    self.job_epochs.insert(job, fresh_epoch());
+                }
+                self.deferred_replacements.push_back(cmd);
+                self.publish_now();
+                self.bump_epoch();
+                return;
+            }
+        }
         match cmd {
+            QueueCommand::BeginPostAdmission { job, reply } => {
+                let allowed = !self.cancel.is_cancelled()
+                    && self.state.job(job).is_some_and(|j| {
+                        !j.held()
+                            && matches!(
+                                j.status,
+                                JobStatus::Completed
+                                    | JobStatus::PostQueued
+                                    | JobStatus::Post { .. }
+                            )
+                    })
+                    && !self.post_admissions.contains_key(&job)
+                    && !self.pending_control_commits.contains(&job)
+                    && !self.verification.contains_key(&job)
+                    && !self.retiring_writers.contains_key(&job);
+                if !allowed {
+                    let _ = reply.send(None);
+                    return;
+                }
+                if self.state.job(job).is_some_and(|job| {
+                    job.files.iter().any(|file| {
+                        self.writers
+                            .get(&file.id)
+                            .is_some_and(|writer| !*writer.stopped.borrow())
+                    })
+                }) {
+                    self.retire_job_writers(job);
+                    let _ = reply.send(None);
+                    return;
+                }
+                let generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+                let file_ids = self
+                    .state
+                    .job(job)
+                    .unwrap()
+                    .files
+                    .iter()
+                    .map(|file| file.id)
+                    .collect::<Vec<_>>();
+                for file in file_ids {
+                    self.writer_epochs.remove(&file);
+                    self.pending_writer_birth.remove(&file);
+                    self.writers.remove(&file);
+                }
+                self.post_admissions.insert(job, generation);
+                if let Some(record) = self.state.job_mut(job) {
+                    let proofs = record
+                        .params
+                        .iter()
+                        .filter(|(key, _)| key.starts_with("*File:proof:"))
+                        .map(|(key, value)| {
+                            (
+                                key.replacen("*File:proof:", "*File:publication-proof:", 1),
+                                value.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    record
+                        .params
+                        .retain(|(key, _)| !key.starts_with("*File:proof:"));
+                    for (key, value) in proofs {
+                        set_owner_param(&mut record.params, &key, Some(value));
+                    }
+                    set_owner_param(
+                        &mut record.params,
+                        "*Recovery:download-retired",
+                        Some(generation.to_string()),
+                    );
+                }
+                self.dirty = true;
+                self.persist_then(move |owner, ok| {
+                    let current = owner.post_admissions.get(&job) == Some(&generation)
+                        && owner.job_epochs.get(&job) == Some(&generation)
+                        && !owner.verification.contains_key(&job)
+                        && owner.state.job(job).is_some()
+                        && !owner.cancel.is_cancelled();
+                    if ok && current {
+                        if reply
+                            .send(Some(crate::PostAdmission { job, generation }))
+                            .is_err()
+                        {
+                            owner.post_admissions.remove(&job);
+                        }
+                    } else {
+                        owner.post_admissions.remove(&job);
+                        let _ = reply.send(None);
+                    }
+                });
+            }
+            QueueCommand::EndPostAdmission { admission, reply } => {
+                if self.post_admissions.get(&admission.job) == Some(&admission.generation) {
+                    self.post_admissions.remove(&admission.job);
+                }
+                self.drain_replacements();
+                let _ = reply.send(());
+            }
+            QueueCommand::RecoveryDocument { reply } => {
+                let _ = reply.send(self.state.to_doc());
+            }
+            QueueCommand::RemoveOrphanTorrentSource { job, reply } => {
+                let linked = self
+                    .state
+                    .pending_admissions
+                    .iter()
+                    .any(|pending| pending.job_id == job)
+                    || self.state.job(job).is_some();
+                if linked {
+                    let _ = reply.send(false);
+                } else {
+                    let sources = self.pending_sources.clone();
+                    self.io_then(
+                        move || sources.remove(job),
+                        move |_, result| {
+                            let _ = reply.send(result.is_ok());
+                        },
+                    );
+                }
+            }
             QueueCommand::ReserveTorrentAdmission {
                 source,
                 secret,
@@ -1327,65 +1791,181 @@ impl Owner {
                 // Reserve from the queue owner first: it alone allocates ids. The
                 // reservation is not durable until the protected sidecar exists.
                 let id = self.state.reserve_torrent_admission(source, opts);
-                let result = match self.pending_sources.write(id, &secret) {
-                    Ok(secret_ref) => {
-                        // The reference is derived from the allocated id, never a
-                        // separately predicted identity.
-                        if let Some(pending) = self
-                            .state
-                            .pending_admissions
-                            .iter_mut()
-                            .find(|pending| pending.job_id == id)
-                        {
-                            pending.secret_ref = secret_ref;
-                        }
-                        self.save_snapshot();
-                        self.publish_now();
-                        Ok(id)
-                    }
-                    Err(error) => {
-                        self.state.cancel_torrent_admission(id);
-                        Err(error)
-                    }
-                };
-                let _ = reply.send(result);
-            }
-            QueueCommand::CommitTorrentAdmission { job, commit, reply } => {
-                let result = self.state.commit_torrent_admission(job, *commit);
-                if result.is_some() {
-                    self.save_snapshot();
-                    let _ = self.pending_sources.remove(job);
-                    self.publish_now();
-                    self.bump_epoch();
-                }
-                let _ = reply.send(result);
-            }
-            QueueCommand::CancelTorrentAdmission { job, reply } => {
-                let before = self.state.pending_admissions.clone();
-                let removed = self.state.cancel_torrent_admission(job);
-                let result = if !removed {
-                    Ok(false)
-                } else {
-                    match self.save_snapshot_result() {
-                        Ok(true) => {
-                            self.publish_now();
-                            self.pending_sources.remove(job).map(|()| true)
-                        }
-                        Ok(false) => {
-                            self.state.pending_admissions = before;
-                            Err(nzbd_state::StateError::Corrupt(
-                                "torrent admission cancellation requires durable queue ownership"
-                                    .into(),
-                            ))
+                let generation = fresh_epoch();
+                self.job_epochs.insert(id, generation);
+                let sources = self.pending_sources.clone();
+                self.io_then(
+                    move || sources.write(id, &secret),
+                    move |owner, written| match written {
+                        Ok(secret_ref) => {
+                            if owner.job_epochs.get(&id) != Some(&generation) {
+                                let sources = owner.pending_sources.clone();
+                                owner.io_then(move || sources.remove(id), move |_, _| {
+                                    let _ = reply.send(Err(nzbd_state::StateError::Corrupt(
+                                        "torrent admission was superseded before reservation".into(),
+                                    )));
+                                });
+                                return;
+                            }
+                            if let Some(pending) = owner
+                                .state
+                                .pending_admissions
+                                .iter_mut()
+                                .find(|pending| pending.job_id == id)
+                            {
+                                pending.secret_ref = secret_ref;
+                            } else {
+                                let sources = owner.pending_sources.clone();
+                                owner.io_then(move || sources.remove(id), move |_, _| {
+                                    let _ = reply.send(Err(nzbd_state::StateError::Corrupt(
+                                        "torrent admission reservation disappeared".into(),
+                                    )));
+                                });
+                                return;
+                            }
+                            owner.persist_then(move |owner, committed| {
+                                let current = owner.job_epochs.get(&id) == Some(&generation);
+                                if committed && current {
+                                    owner.bump_epoch();
+                                    owner.publish_now();
+                                    let _ = reply.send(Ok(id));
+                                    return;
+                                }
+                                if current {
+                                    owner.state.cancel_torrent_admission(id);
+                                    owner.job_epochs.remove(&id);
+                                    owner.dirty = true;
+                                }
+                                let sources = owner.pending_sources.clone();
+                                owner.io_then(move || sources.remove(id), move |_, removed| {
+                                    if let Err(error) = removed {
+                                        tracing::warn!(job=id.0,%error,"could not remove uncommitted torrent source");
+                                    }
+                                    let _ = reply.send(Err(nzbd_state::StateError::Corrupt(
+                                        "torrent admission requires durable queue ownership".into(),
+                                    )));
+                                });
+                            });
                         }
                         Err(error) => {
-                            self.state.pending_admissions = before;
-                            self.on_snapshot_save_error(&error);
-                            Err(error)
+                            owner.state.cancel_torrent_admission(id);
+                            owner.job_epochs.remove(&id);
+                            let _ = reply.send(Err(error));
                         }
+                    },
+                );
+            }
+            QueueCommand::CommitTorrentAdmission { job, commit, reply } => {
+                let pending_index = self
+                    .state
+                    .pending_admissions
+                    .iter()
+                    .position(|pending| pending.job_id == job);
+                let pending_before = pending_index
+                    .and_then(|index| self.state.pending_admissions.get(index).cloned());
+                let info_hash = commit.record.info_hash_v1.clone();
+                let existing_before = self
+                    .state
+                    .jobs
+                    .iter()
+                    .find(|record| {
+                        record.torrent.as_ref().is_some_and(|torrent| {
+                            torrent.info_hash_v1 == info_hash
+                                && !matches!(record.status, JobStatus::Failed | JobStatus::Deleted)
+                        })
+                    })
+                    .cloned();
+                let result = self.state.commit_torrent_admission(job, *commit);
+                if let Some(result) = result {
+                    let generation = fresh_epoch();
+                    self.job_epochs.insert(job, generation);
+                    self.dirty = true;
+                    self.persist_then(move |owner, committed| {
+                        if owner.job_epochs.get(&job) != Some(&generation) {
+                            let _ = reply.send(None);
+                            return;
+                        }
+                        if !committed {
+                            match &result {
+                                Ok(created) => owner.state.jobs.retain(|record| record.id != *created),
+                                Err(existing) => {
+                                    if let Some(before) = existing_before {
+                                        if let Some(record) = owner.state.job_mut(*existing) { *record = before; }
+                                    }
+                                }
+                            }
+                            if let (Some(index), Some(before)) = (pending_index, pending_before) {
+                                let index = index.min(owner.state.pending_admissions.len());
+                                owner.state.pending_admissions.insert(index, before);
+                            }
+                            owner.job_epochs.remove(&job);
+                            owner.dirty = true;
+                            let _ = reply.send(None);
+                            return;
+                        }
+                        owner.bump_epoch();
+                        let sources = owner.pending_sources.clone();
+                        owner.io_then(move || sources.remove(job), move |owner, removed| {
+                            if let Err(error) = removed {
+                                tracing::warn!(job=job.0,%error,"could not remove committed torrent source");
+                            }
+                            owner.publish_now();
+                            let _ = reply.send(Some(result));
+                        });
+                    });
+                } else {
+                    let _ = reply.send(None);
+                }
+            }
+            QueueCommand::CancelTorrentAdmission { job, reply } => {
+                let before = self
+                    .state
+                    .pending_admissions
+                    .iter()
+                    .position(|pending| pending.job_id == job)
+                    .and_then(|index| self.state.pending_admissions.get(index).cloned());
+                let removed = self.state.cancel_torrent_admission(job);
+                if !removed {
+                    let _ = reply.send(Ok(false));
+                    return;
+                }
+                let generation = fresh_epoch();
+                self.job_epochs.insert(job, generation);
+                self.dirty = true;
+                self.persist_then(move |owner, committed| {
+                    if owner.job_epochs.get(&job) != Some(&generation) {
+                        let _ = reply.send(Err(nzbd_state::StateError::Corrupt(
+                            "torrent admission cancellation was superseded".into(),
+                        )));
+                        return;
                     }
-                };
-                let _ = reply.send(result);
+                    if !committed {
+                        if let Some(before) = before {
+                            owner.state.pending_admissions.push(before);
+                            owner
+                                .state
+                                .pending_admissions
+                                .sort_by_key(|pending| pending.job_id.0);
+                        }
+                        owner.job_epochs.remove(&job);
+                        owner.dirty = true;
+                        let _ = reply.send(Err(nzbd_state::StateError::Corrupt(
+                            "torrent admission cancellation requires durable queue ownership"
+                                .into(),
+                        )));
+                        return;
+                    }
+                    owner.bump_epoch();
+                    owner.publish_now();
+                    let sources = owner.pending_sources.clone();
+                    owner.io_then(
+                        move || sources.remove(job),
+                        move |_, removed| {
+                            let result = removed.map(|()| true);
+                            let _ = reply.send(result);
+                        },
+                    );
+                });
             }
             QueueCommand::AddParsed {
                 name,
@@ -1427,20 +2007,49 @@ impl Owner {
                 // Nothing has been written yet, so a better name may take
                 // the directory with it.
                 let name = self.name_from_requestor(id, true).unwrap_or(name);
-                let allocation = self.allocate_new_payload(id);
-                if let Err(e) = allocation {
-                    self.state.jobs.retain(|j| j.id != id);
-                    let _ = reply.send(Err(nzbd_state::StateError::Corrupt(format!(
-                        "payload allocation: {e}"
-                    ))));
-                    return;
-                }
-                tracing::info!(job = id.0, %name, "job added");
-                self.save_snapshot(); // adds are durable immediately
-                self.publish_now();
-                self.emit(Event::JobAdded { job: id, name });
-                self.bump_epoch();
-                let _ = reply.send(Ok(id));
+                let generation = fresh_epoch();
+                self.job_epochs.insert(id, generation);
+                let persistent = self.persist;
+                self.allocate_new_payload_then(id, move |owner, allocated| {
+                    if let Err(error) = allocated {
+                        owner.state.jobs.retain(|record| record.id != id);
+                        owner.allocated_jobs.remove(&id);
+                        owner.allocation_cache.remove(&id);
+                        owner.job_epochs.remove(&id);
+                        let _ = reply.send(Err(error));
+                        return;
+                    }
+                    if owner.job_epochs.get(&id) != Some(&generation) {
+                        let _ = reply.send(Err(nzbd_state::StateError::Corrupt(
+                            "job admission was superseded before allocation completed".into(),
+                        )));
+                        return;
+                    }
+                    let name = owner
+                        .state
+                        .job(id)
+                        .map(|record| record.name.clone())
+                        .unwrap_or(name);
+                    owner.persist_then(move |owner, committed| {
+                        let current = owner.job_epochs.get(&id) == Some(&generation);
+                        if (!persistent || committed) && current {
+                            tracing::info!(job = id.0, %name, "job added");
+                            owner.publish_now();
+                            owner.emit(Event::JobAdded { job: id, name });
+                            owner.bump_epoch();
+                            let _ = reply.send(Ok(id));
+                        } else {
+                            if current {
+                                owner.state.jobs.retain(|record| record.id != id);
+                                owner.allocated_jobs.remove(&id);
+                                owner.allocation_cache.remove(&id);
+                            }
+                            let _ = reply.send(Err(nzbd_state::StateError::Corrupt(
+                                "job admission requires durable queue ownership".into(),
+                            )));
+                        }
+                    });
+                });
             }
             QueueCommand::AddUrl {
                 name,
@@ -1568,18 +2177,28 @@ impl Owner {
                             source_generation: None,
                         };
                         self.state.url_admission_receipts.push(receipt);
-                        if !self.save_snapshot() {
-                            self.state
-                                .url_admission_receipts
-                                .retain(|receipt| receipt.request_token != *token);
-                            let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
-                            return;
-                        }
-                        let _ = reply.send(Ok((id, false)));
+                        let token = token.clone();
+                        let generation = fresh_epoch();
+                        self.job_epochs.insert(id, generation);
+                        self.persist_then(move |owner, committed| {
+                            let current = owner.job_epochs.get(&id) == Some(&generation);
+                            if committed && current {
+                                let _ = reply.send(Ok((id, false)));
+                            } else {
+                                if current {
+                                    owner
+                                        .state
+                                        .url_admission_receipts
+                                        .retain(|receipt| receipt.request_token != token);
+                                }
+                                let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
+                            }
+                        });
                         return;
                     }
                     tracing::info!(job = id.0, %url, "url add deduplicated by request identity");
                     if !params.is_empty() {
+                        let before = self.state.job(id).cloned();
                         if let Some(j) = self.state.job_mut(id) {
                             for (k, v) in params {
                                 if k == "monarr-transfer"
@@ -1606,8 +2225,27 @@ impl Owner {
                                 }
                             }
                         }
-                        self.save_snapshot();
-                        self.publish_now();
+                        let generation = fresh_epoch();
+                        self.job_epochs.insert(id, generation);
+                        let persistent = self.persist;
+                        self.persist_then(move |owner, committed| {
+                            let current = owner.job_epochs.get(&id) == Some(&generation);
+                            if (!persistent || committed) && current {
+                                owner.publish_now();
+                                owner.bump_epoch();
+                                let _ = reply.send(Ok((id, false)));
+                            } else {
+                                if current {
+                                    if let Some(before) = before {
+                                        if let Some(record) = owner.state.job_mut(id) {
+                                            *record = before;
+                                        }
+                                    }
+                                }
+                                let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
+                            }
+                        });
+                        return;
                     }
                     let _ = reply.send(Ok((id, false)));
                     return;
@@ -1654,23 +2292,29 @@ impl Owner {
                         source_artifact_id: None,
                         source_generation: None,
                     });
-                    if !self.save_snapshot() {
-                        self.state.jobs.retain(|job| job.id != id);
-                        self.state
-                            .url_admission_receipts
-                            .retain(|receipt| receipt.request_token != *token);
+                }
+                let generation = fresh_epoch();
+                self.job_epochs.insert(id, generation);
+                let persistent = self.persist;
+                self.persist_then(move |owner, committed| {
+                    let current = owner.job_epochs.get(&id) == Some(&generation);
+                    if (!persistent || committed) && current {
+                        tracing::info!(job = id.0, %name, %url, "url job added (fetching)");
+                        owner.publish_now();
+                        owner.emit(Event::JobAdded { job: id, name });
+                        owner.bump_epoch();
+                        let _ = reply.send(Ok((id, true)));
+                    } else {
+                        if current {
+                            owner.state.jobs.retain(|record| record.id != id);
+                            owner
+                                .state
+                                .url_admission_receipts
+                                .retain(|receipt| receipt.job_id != id.0);
+                        }
                         let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
-                        return;
                     }
-                }
-                tracing::info!(job = id.0, %name, %url, "url job added (fetching)");
-                if request_token.is_none() {
-                    self.save_snapshot();
-                }
-                self.publish_now();
-                self.emit(Event::JobAdded { job: id, name });
-                self.bump_epoch();
-                let _ = reply.send(Ok((id, true)));
+                });
             }
             QueueCommand::GetUrlAdmission {
                 request_token,
@@ -1686,59 +2330,124 @@ impl Owner {
                     return;
                 };
                 let before_refresh = self.state.url_admission_receipts[index].clone();
-
-                // A tombstone outlives the queue row, but its source may still
-                // be explicitly removed or kept from the Files UI. Refresh
-                // only from the exact durable artifact generation; absence or
-                // generation mismatch is not evidence that bytes were deleted.
-                let changed = refresh_url_admission_custody(
-                    &mut self.state.url_admission_receipts[index],
-                    &self.artifacts,
+                let mut refreshed = before_refresh.clone();
+                let inventory = self.artifacts.clone();
+                let request_token = request_token.clone();
+                let job = JobId(before_refresh.job_id);
+                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+                self.io_then(
+                    move || {
+                        // A tombstone outlives the queue row, but its source may still
+                        // be explicitly removed or kept from the Files UI. Refresh
+                        // only from the exact durable artifact generation; absence or
+                        // generation mismatch is not evidence that bytes were deleted.
+                        let changed = refresh_url_admission_custody(&mut refreshed, &inventory);
+                        Ok((refreshed, changed))
+                    },
+                    move |owner, refreshed| {
+                        let Ok((refreshed, changed)) = refreshed else {
+                            let _ = reply.send(Some(before_refresh));
+                            return;
+                        };
+                        if !changed {
+                            let _ = reply.send(Some(refreshed));
+                            return;
+                        }
+                        let Some(index) = owner.state.url_admission_receipts.iter()
+                            .position(|receipt| receipt.request_token == request_token) else {
+                                let _ = reply.send(None);
+                                return;
+                            };
+                        owner.state.url_admission_receipts[index] = refreshed.clone();
+                let generation = fresh_epoch();
+                        owner.control_epochs.insert(job, generation);
+                        let persistent = owner.persist;
+                        owner.persist_then(move |owner, committed| {
+                            let current = owner.control_epochs.get(&job) == Some(&generation) && owner.job_epochs.get(&job) == Some(&scope_generation);
+                            if (!persistent || committed) && current {
+                                let _ = reply.send(Some(refreshed));
+                            } else {
+                                if current {
+                                    if let Some(index) = owner.state.url_admission_receipts.iter()
+                                        .position(|receipt| receipt.request_token == request_token) {
+                                        owner.state.url_admission_receipts[index] = before_refresh.clone();
+                                    }
+                                }
+                                tracing::error!(%request_token, "could not persist refreshed URL admission custody");
+                                let _ = reply.send(Some(before_refresh));
+                            }
+                        });
+                    },
                 );
-                if changed && self.persist && !self.save_snapshot() {
-                    tracing::error!(%request_token, "could not persist refreshed URL admission custody");
-                    self.state.url_admission_receipts[index] = before_refresh;
-                }
-                let receipt = self.state.url_admission_receipts[index].clone();
-                let _ = reply.send(Some(receipt));
             }
             QueueCommand::CompleteUrlFetch { job, parsed, reply } => {
+                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 let ok = self
                     .state
                     .complete_url_fetch(job, &parsed, self.tuning.pause_extra_pars);
-                if ok {
-                    if let Some(j) = self.state.job_mut(job) {
-                        if let Some(pos) = j.params.iter().position(|(k, _)| k == "*AddPaused") {
-                            j.params.remove(pos);
-                            j.status = JobStatus::Paused;
-                        }
+                if !ok {
+                    let _ = reply.send(false);
+                    return;
+                }
+                if let Some(record) = self.state.job_mut(job) {
+                    if let Some(pos) = record
+                        .params
+                        .iter()
+                        .position(|(key, _)| key == "*AddPaused")
+                    {
+                        record.params.remove(pos);
+                        record.status = JobStatus::Paused;
                     }
-                    // `complete_url_fetch` has just re-run the evidence
-                    // pass against the fetched NZB. If that still came up
-                    // with nothing, fall back to who asked. Still no files
-                    // on disk, so the directory follows the name.
-                    self.name_from_requestor(job, true);
-                    // URL admissions need the same fresh allocation as direct
-                    // uploads. A retained release directory belongs to the old
-                    // job, even when the newly fetched NZB has the same name.
-                    if let Err(error) = self.allocate_new_payload(job) {
+                }
+                // `complete_url_fetch` has just re-run the evidence pass
+                // against the fetched NZB. Allocation is asynchronous and
+                // must finish before this completion is acknowledged.
+                self.name_from_requestor(job, true);
+                let generation = fresh_epoch();
+                self.control_epochs.insert(job, generation);
+                let persistent = self.persist;
+                self.allocate_new_payload_then(job, move |owner, allocated| {
+                    if let Err(error) = allocated {
                         let message = format!("payload allocation: {error}");
-                        self.hold_job(
+                        owner.hold_job(
                             job,
                             allocation_hold_cause(&message),
                             "download_write",
                             &message,
                         );
                     }
-                    tracing::info!(job = job.0, "url fetch complete");
-                    self.save_snapshot();
-                    self.publish_now();
-                    self.emit(Event::UrlFetchResolved { job });
-                    self.bump_epoch();
-                }
-                let _ = reply.send(ok);
+                    if owner.control_epochs.get(&job) != Some(&generation)
+                        || owner.job_epochs.get(&job) != Some(&scope_generation)
+                    {
+                        let _ = reply.send(false);
+                        return;
+                    }
+                    owner.persist_then(move |owner, committed| {
+                        let current = owner.control_epochs.get(&job) == Some(&generation)
+                            && owner.job_epochs.get(&job) == Some(&scope_generation);
+                        if (!persistent || committed) && current {
+                            tracing::info!(job = job.0, "url fetch complete");
+                            owner.publish_now();
+                            owner.emit(Event::UrlFetchResolved { job });
+                            owner.bump_epoch();
+                            let _ = reply.send(true);
+                        } else {
+                            if current {
+                                owner.hold_job(
+                                    job,
+                                    nzbd_types::HoldCause::StorageUnavailable,
+                                    "snapshot",
+                                    "URL fetch completion could not be persisted",
+                                );
+                            }
+                            let _ = reply.send(false);
+                        }
+                    });
+                });
             }
             QueueCommand::FailUrlFetch { job, error, reply } => {
+                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+                let before_status = self.state.job(job).map(|record| record.status.clone());
                 let name = match self.state.job_mut(job) {
                     Some(j) if matches!(j.status, JobStatus::Fetching) => {
                         j.status = JobStatus::Failed;
@@ -1748,16 +2457,33 @@ impl Owner {
                 };
                 if let Some(name) = name {
                     tracing::warn!(job = job.0, %error, "url fetch failed");
-                    self.save_snapshot();
-                    self.publish_now();
-                    self.emit(Event::JobFinished {
-                        job,
-                        name,
-                        status: JobStatus::Failed,
-                        health: 0,
+                    let generation = fresh_epoch();
+                    self.control_epochs.insert(job, generation);
+                    let persistent = self.persist;
+                    self.persist_then(move |owner, committed| {
+                        let current = owner.control_epochs.get(&job) == Some(&generation)
+                            && owner.job_epochs.get(&job) == Some(&scope_generation);
+                        if (!persistent || committed) && current {
+                            owner.publish_now();
+                            owner.emit(Event::JobFinished {
+                                job,
+                                name,
+                                status: JobStatus::Failed,
+                                health: 0,
+                            });
+                            owner.emit(Event::UrlFetchResolved { job });
+                            owner.bump_epoch();
+                        } else if current {
+                            if let (Some(status), Some(record)) =
+                                (before_status, owner.state.job_mut(job))
+                            {
+                                record.status = status;
+                            }
+                            owner.dirty = true;
+                        }
+                        let _ = reply.send(());
                     });
-                    self.emit(Event::UrlFetchResolved { job });
-                    self.bump_epoch();
+                    return;
                 }
                 let _ = reply.send(());
             }
@@ -1766,6 +2492,7 @@ impl Owner {
                 progress,
                 reply,
             } => {
+                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 let changed = if let Some(record) = self
                     .state
                     .job_mut(job)
@@ -1795,13 +2522,30 @@ impl Owner {
                 } else {
                     false
                 };
-                let durable = if changed {
-                    self.publish_now();
-                    self.save_snapshot()
-                } else {
-                    false
-                };
-                let _ = reply.send(durable);
+                if !changed {
+                    let _ = reply.send(false);
+                    return;
+                }
+                let generation = fresh_epoch();
+                self.control_epochs.insert(job, generation);
+                let persistent = self.persist;
+                self.persist_then(move |owner, committed| {
+                    let current = owner.control_epochs.get(&job) == Some(&generation)
+                        && owner.job_epochs.get(&job) == Some(&scope_generation);
+                    let durable = (!persistent || committed) && current;
+                    if durable {
+                        owner.publish_now();
+                    } else if current {
+                        owner.dirty = true;
+                        owner.hold_job(
+                            job,
+                            nzbd_types::HoldCause::StorageUnavailable,
+                            "snapshot",
+                            "URL fetch progress could not be persisted",
+                        );
+                    }
+                    let _ = reply.send(durable);
+                });
             }
             QueueCommand::SetFilePaused {
                 job,
@@ -1866,6 +2610,7 @@ impl Owner {
                 let _ = reply.send(ok);
             }
             QueueCommand::Pause { job, reply } => {
+                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 if let Some(mut control) = self
                     .state
                     .job(job)
@@ -1885,15 +2630,23 @@ impl Owner {
                     control.revision = revision.to_string();
                     self.state.job_mut(job).unwrap().set_control(&control);
                     self.dirty = true;
-                    let committed = !self.persist || self.save_snapshot();
-                    if committed {
-                        self.publish_now();
-                        self.emit(Event::JobControlChanged { job, control });
-                    }
-                    let _ = reply.send(committed);
+                    let generation = fresh_epoch();
+                    self.control_epochs.insert(job, generation);
+                    let persistent = self.persist;
+                    self.persist_then(move |owner, committed| {
+                        let current = owner.control_epochs.get(&job) == Some(&generation)
+                            && owner.job_epochs.get(&job) == Some(&scope_generation);
+                        let ok = (!persistent || committed) && current;
+                        if ok {
+                            owner.publish_now();
+                            owner.emit(Event::JobControlChanged { job, control });
+                        } else if current {
+                            owner.dirty = true;
+                        }
+                        let _ = reply.send(ok);
+                    });
                     return;
                 }
-                let before = self.state.job(job).cloned();
                 let torrent = match self.state.job_mut(job) {
                     Some(j)
                         if j.kind == JobKind::Torrent
@@ -1909,34 +2662,57 @@ impl Owner {
                     _ => false,
                 };
                 let ok = if torrent {
-                    self.dirty = true;
-                    if self.persist_then_command(BackendCommand::Pause { job }) {
-                        self.bump_epoch();
-                        self.publish_now();
-                        true
-                    } else {
-                        if let Some(before) = before {
-                            *self.state.job_mut(job).unwrap() = before;
-                        }
-                        false
-                    }
+                    true
                 } else {
-                    match self.state.job_mut(job) {
-                        Some(j)
-                            if matches!(j.status, JobStatus::Queued | JobStatus::Downloading) =>
-                        {
-                            j.status = JobStatus::Paused;
-                            self.dirty = true;
-                            self.bump_epoch();
-                            self.publish_now();
+                    self.state.job_mut(job).is_some_and(|record| {
+                        if matches!(record.status, JobStatus::Queued | JobStatus::Downloading) {
+                            record.status = JobStatus::Paused;
                             true
+                        } else {
+                            false
                         }
-                        _ => false,
-                    }
+                    })
                 };
-                let _ = reply.send(ok);
+                if !ok {
+                    let _ = reply.send(false);
+                    return;
+                }
+                self.dirty = true;
+                let generation = fresh_epoch();
+                self.control_epochs.insert(job, generation);
+                let persistent = self.persist;
+                self.persist_then(move |owner, committed| {
+                    let current = owner.control_epochs.get(&job) == Some(&generation)
+                        && owner.job_epochs.get(&job) == Some(&scope_generation);
+                    let ok = (!persistent || committed) && current;
+                    if ok {
+                        if torrent && !owner.enqueue_backend_command(BackendCommand::Pause { job })
+                        {
+                            owner.hold_job(
+                                job,
+                                nzbd_types::HoldCause::StorageUnavailable,
+                                "snapshot",
+                                "Pause could not be delivered to the torrent backend",
+                            );
+                            let _ = reply.send(false);
+                            return;
+                        }
+                        owner.bump_epoch();
+                        owner.publish_now();
+                    } else if current {
+                        owner.dirty = true;
+                        owner.hold_job(
+                            job,
+                            nzbd_types::HoldCause::StorageUnavailable,
+                            "snapshot",
+                            "Pause intent could not be persisted",
+                        );
+                    }
+                    let _ = reply.send(ok);
+                });
             }
             QueueCommand::Resume { job, reply } => {
+                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 // Resource/custody release has its own admission protocol. Manual
                 // resume cannot erase a hold merely because statvfs looks healthy.
                 if self.state.job(job).is_some_and(|j| j.held()) {
@@ -1960,7 +2736,6 @@ impl Owner {
                     let _ = reply.send(false);
                     return;
                 }
-                let before = self.state.job(job).cloned();
                 let torrent = match self.state.job_mut(job) {
                     Some(j)
                         if j.kind == JobKind::Torrent
@@ -1986,77 +2761,133 @@ impl Owner {
                     _ => false,
                 };
                 let ok = if torrent {
-                    self.dirty = true;
-                    if !self.persist || self.save_snapshot() {
-                        self.bump_epoch();
-                        self.publish_now();
-                        true
-                    } else {
-                        if let Some(before) = before {
-                            *self.state.job_mut(job).unwrap() = before;
-                        }
-                        false
-                    }
+                    true
                 } else {
-                    match self.state.job_mut(job) {
-                        Some(j) if matches!(j.status, JobStatus::Paused) => {
-                            j.status = JobStatus::Queued;
-                            self.dirty = true;
-                            self.bump_epoch();
-                            self.publish_now();
+                    self.state.job_mut(job).is_some_and(|record| {
+                        if matches!(record.status, JobStatus::Paused) {
+                            record.status = JobStatus::Queued;
                             true
+                        } else {
+                            false
                         }
-                        _ => false,
-                    }
+                    })
                 };
-                let _ = reply.send(ok);
+                if !ok {
+                    let _ = reply.send(false);
+                    return;
+                }
+                self.dirty = true;
+                let generation = fresh_epoch();
+                self.control_epochs.insert(job, generation);
+                let persistent = self.persist;
+                self.persist_then(move |owner, committed| {
+                    let current = owner.control_epochs.get(&job) == Some(&generation)
+                        && owner.job_epochs.get(&job) == Some(&scope_generation);
+                    let ok = (!persistent || committed) && current;
+                    if ok {
+                        owner.bump_epoch();
+                        owner.publish_now();
+                    } else if current {
+                        owner.dirty = true;
+                        owner.hold_job(
+                            job,
+                            nzbd_types::HoldCause::StorageUnavailable,
+                            "snapshot",
+                            "Resume intent could not be persisted",
+                        );
+                    }
+                    let _ = reply.send(ok);
+                });
             }
             QueueCommand::QuiescePayload { job, reply } => {
-                let result = (|| {
-                    if self.delegated.contains_key(&job) {
-                        return Err(
-                            "remote writer lease must be retired before payload deletion".into(),
-                        );
-                    }
-                    let record = self.state.job_mut(job).ok_or("job not found")?;
-                    if record.torrent.is_some()
-                        || matches!(
-                            record.status,
-                            JobStatus::Post { .. } | JobStatus::PostQueued
-                        )
-                    {
-                        return Err(
-                            "post-processing or torrent ownership must quiesce before deletion"
-                                .to_string(),
-                        );
-                    }
-                    self.artifacts
-                        .prepare_forget(job.0)
-                        .map_err(|e| e.to_string())?;
-                    record.status = JobStatus::Paused;
-                    self.allocated_jobs.remove(&job);
-                    let writers = self.retiring_writers.entry(job).or_default();
-                    for file in &record.files {
-                        if let Some(writer) = self.writers.remove(&file.id) {
-                            writer.stop.cancel();
-                            writers.push(writer);
+                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+                if self.delegated.contains_key(&job) {
+                    let _ = reply.send(Err(
+                        "remote writer lease must be retired before payload deletion".into(),
+                    ));
+                    return;
+                }
+                let Some(record) = self.state.job(job) else {
+                    let _ = reply.send(Err("job not found".into()));
+                    return;
+                };
+                if record.torrent.is_some()
+                    || matches!(
+                        record.status,
+                        JobStatus::Post { .. } | JobStatus::PostQueued
+                    )
+                {
+                    let _ = reply.send(Err(
+                        "post-processing or torrent ownership must quiesce before deletion".into(),
+                    ));
+                    return;
+                }
+                let generation = self.control_epochs.get(&job).copied();
+                let artifacts = self.artifacts.clone();
+                self.io_then(
+                    move || {
+                        artifacts.prepare_forget(job.0).map(|_| ()).map_err(|e| {
+                            nzbd_state::StateError::Corrupt(format!("artifact inventory: {e}"))
+                        })
+                    },
+                    move |owner, result| {
+                        if let Err(error) = result {
+                            let _ = reply.send(Err(error.to_string()));
+                            return;
                         }
-                    }
-                    let writers = writers.clone();
-                    self.attempts.retain(|r, _| r.job != job);
-                    self.pending_finalize.retain(|(j, _)| *j != job);
-                    self.save_snapshot();
-                    self.publish_now();
-                    Ok(writers)
-                })();
-                let _ = reply.send(result);
+                        if owner.control_epochs.get(&job).copied() != generation
+                            || owner.job_epochs.get(&job) != Some(&scope_generation)
+                            || owner.state.job(job).is_none()
+                        {
+                            let _ = reply.send(Err(
+                                "job changed while payload retirement was being prepared".into(),
+                            ));
+                            return;
+                        }
+                        let record = owner.state.job_mut(job).unwrap();
+                        record.status = JobStatus::Paused;
+                        let file_ids = record.files.iter().map(|file| file.id).collect::<Vec<_>>();
+                        owner.allocated_jobs.remove(&job);
+                        let writers = owner.retiring_writers.entry(job).or_default();
+                        for file in file_ids {
+                            if let Some(writer) = owner.writers.remove(&file) {
+                                writer.stop.cancel();
+                                writers.push(writer);
+                            }
+                        }
+                        let writers = writers.clone();
+                        owner.attempts.retain(|r, _| r.job != job);
+                        owner.pending_finalize.retain(|(j, _)| *j != job);
+                        let generation = fresh_epoch();
+                        owner.control_epochs.insert(job, generation);
+                        owner.dirty = true;
+                        let persistent = owner.persist;
+                        owner.persist_then(move |owner, committed| {
+                            let current = owner.control_epochs.get(&job) == Some(&generation)
+                                && owner.job_epochs.get(&job) == Some(&scope_generation);
+                            if (!persistent || committed) && current {
+                                owner.publish_now();
+                                let _ = reply.send(Ok(writers));
+                            } else {
+                                owner.dirty = true;
+                                let _ =
+                                    reply.send(Err("could not persist payload retirement".into()));
+                            }
+                        });
+                    },
+                );
             }
             QueueCommand::Delete {
                 job,
                 delete_files,
                 reply,
             } => {
-                let before = self.state.job(job).cloned();
+                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+                let previous_removal_intent = self
+                    .state
+                    .job(job)
+                    .and_then(|record| record.torrent.as_ref())
+                    .and_then(|torrent| torrent.removal_intent.clone());
                 let torrent_command = self.state.job_mut(job).and_then(|record| {
                     let torrent = record.torrent.as_mut()?;
                     torrent.removal_intent = Some(TorrentRemovalIntent {
@@ -2070,29 +2901,57 @@ impl Owner {
                         allowed_roots: self.torrent_payload_roots.clone(),
                     })
                 });
-                let ok = if let Some(command) = torrent_command {
+                if let Some(command) = torrent_command {
                     self.dirty = true;
-                    if self.persist_then_command(command) {
-                        self.bump_epoch();
-                        self.publish_now();
-                        true
-                    } else {
-                        if let Some(before) = before {
-                            *self.state.job_mut(job).unwrap() = before;
+                    let generation = fresh_epoch();
+                    self.control_epochs.insert(job, generation);
+                    let persistent = self.persist;
+                    self.persist_then(move |owner, committed| {
+                        let current = owner.control_epochs.get(&job) == Some(&generation)
+                            && owner.job_epochs.get(&job) == Some(&scope_generation);
+                        let ok = (!persistent || committed) && current;
+                        if ok {
+                            if !owner.enqueue_backend_command(command) {
+                                if let Some(torrent) = owner
+                                    .state
+                                    .job_mut(job)
+                                    .and_then(|record| record.torrent.as_mut())
+                                {
+                                    torrent.removal_intent = previous_removal_intent.clone();
+                                }
+                                let _ = reply.send(false);
+                                return;
+                            }
+                            owner.bump_epoch();
+                            owner.publish_now();
+                        } else if current {
+                            if let Some(torrent) = owner
+                                .state
+                                .job_mut(job)
+                                .and_then(|record| record.torrent.as_mut())
+                            {
+                                torrent.removal_intent = previous_removal_intent;
+                            }
                         }
-                        false
-                    }
-                } else {
-                    self.delete_job(job, delete_files)
-                };
-                let _ = reply.send(ok);
+                        let _ = reply.send(ok);
+                    });
+                    return;
+                }
+                self.delete_job_then(job, delete_files, move |_, ok| {
+                    let _ = reply.send(ok);
+                });
             }
             QueueCommand::SetPriority {
                 job,
                 priority,
                 reply,
             } => {
-                let before = self.state.job(job).cloned();
+                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+                let previous_priority = self
+                    .state
+                    .job(job)
+                    .map(|record| record.priority)
+                    .unwrap_or(priority);
                 let torrent = match self.state.job_mut(job) {
                     Some(j) if j.kind == JobKind::Torrent && j.priority != priority => {
                         j.priority = priority;
@@ -2102,16 +2961,34 @@ impl Owner {
                 };
                 let ok = if torrent {
                     self.dirty = true;
-                    if self.persist_then_command(BackendCommand::SetPriority { job, priority }) {
-                        self.bump_epoch();
-                        self.publish_now();
-                        true
-                    } else {
-                        if let Some(before) = before {
-                            *self.state.job_mut(job).unwrap() = before;
+                    let generation = fresh_epoch();
+                    self.control_epochs.insert(job, generation);
+                    let persistent = self.persist;
+                    self.persist_then(move |owner, committed| {
+                        let current = owner.control_epochs.get(&job) == Some(&generation)
+                            && owner.job_epochs.get(&job) == Some(&scope_generation);
+                        let ok = (!persistent || committed) && current;
+                        if ok {
+                            if !owner.enqueue_backend_command(BackendCommand::SetPriority {
+                                job,
+                                priority,
+                            }) {
+                                if let Some(record) = owner.state.job_mut(job) {
+                                    record.priority = previous_priority;
+                                }
+                                let _ = reply.send(false);
+                                return;
+                            }
+                            owner.bump_epoch();
+                            owner.publish_now();
+                        } else if current {
+                            if let Some(record) = owner.state.job_mut(job) {
+                                record.priority = previous_priority;
+                            }
                         }
-                        false
-                    }
+                        let _ = reply.send(ok);
+                    });
+                    return;
                 } else {
                     match self.state.job_mut(job) {
                         Some(j) => {
@@ -2127,6 +3004,7 @@ impl Owner {
                 let _ = reply.send(ok);
             }
             QueueCommand::SetKeepOnFailure { job, keep, reply } => {
+                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 let before = self.state.job(job).cloned();
                 let prior_keep = before.as_ref().is_some_and(|record| {
                     record
@@ -2136,128 +3014,154 @@ impl Owner {
                 });
                 let allowed = before.as_ref().is_some_and(|record| {
                     if matches!(record.status, JobStatus::Completed | JobStatus::Failed) {
-                        // Inventory resolves post-publication jobs through the
-                        // exact retained Runner source generation. It rejects
-                        // a transferred or already-retired payload, so a
-                        // terminal queue row alone cannot target publication.
                         true
                     } else {
                         record.status != JobStatus::Deleted && !record.held()
                     }
                 });
-                let changed = if allowed {
-                    self.state.job_mut(job).is_some_and(|record| {
-                        let old = record
-                            .params
-                            .iter()
-                            .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
-                        if old == keep {
-                            return true;
-                        }
-                        record
-                            .params
-                            .retain(|(key, _)| key != "*Runner:KeepOnFailure");
-                        if keep {
-                            record
-                                .params
-                                .push(("*Runner:KeepOnFailure".into(), "1".into()));
-                        }
-                        true
-                    })
-                } else {
-                    false
-                };
-                let mut inventory_updated = false;
-                let inventory_ok = if changed {
-                    match self.artifacts.for_job(job.0) {
-                        Ok(Some(_)) => match self.artifacts.set_keep_on_failure(job.0, keep) {
-                            Ok(updated) => {
-                                inventory_updated = updated;
-                                updated
-                            }
-                            Err(error) => {
-                                tracing::warn!(job = job.0, %error, "could not persist source Keep intent");
-                                if let Some(before) = before.clone() {
-                                    if let Some(record) = self.state.job_mut(job) {
-                                        *record = before;
-                                    }
-                                }
-                                false
-                            }
-                        },
-                        // Before a processing artifact is allocated, the queue
-                        // snapshot is the durable source of the opt-in. New
-                        // allocations inherit this parameter from the job.
-                        Ok(None)
-                            if before.as_ref().is_some_and(|record| {
-                                matches!(
-                                    record.status,
-                                    JobStatus::Fetching | JobStatus::Queued | JobStatus::Paused
-                                )
-                            }) =>
-                        {
-                            true
-                        }
-                        Ok(None) => false,
-                        Err(error) => {
-                            tracing::warn!(job = job.0, %error, "could not inspect source Keep target");
-                            if let Some(before) = before.clone() {
-                                if let Some(record) = self.state.job_mut(job) {
-                                    *record = before;
-                                }
-                            }
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
-                if changed && !inventory_ok {
-                    if let Some(before) = before.clone() {
-                        if let Some(record) = self.state.job_mut(job) {
-                            *record = before;
-                        }
-                    }
+                if !allowed {
+                    let _ = reply.send(false);
+                    return;
                 }
-                let ok = if changed && inventory_ok {
-                    if self.save_snapshot() {
-                        self.dirty = false;
-                        self.bump_epoch();
-                        self.publish_now();
-                        true
-                    } else {
-                        if let Some(before) = before.clone() {
-                            if let Some(record) = self.state.job_mut(job) {
-                                *record = before;
+                let generation = fresh_epoch();
+                self.control_epochs.insert(job, generation);
+                let artifacts = self.artifacts.clone();
+                let early_queue_job = before.as_ref().is_some_and(|record| {
+                    matches!(
+                        record.status,
+                        JobStatus::Fetching | JobStatus::Queued | JobStatus::Paused
+                    )
+                });
+                self.io_then(
+                    move || {
+                        let existing = artifacts.for_job(job.0).map_err(|e| nzbd_state::StateError::Corrupt(format!("artifact inventory: {e}")))?;
+                        match existing {
+                            Some(_) => artifacts.set_keep_on_failure(job.0, keep)
+                                .map(|updated| (true, updated))
+                                .map_err(|e| nzbd_state::StateError::Corrupt(format!("artifact inventory: {e}"))),
+                            None if early_queue_job => Ok((true, false)),
+                            None => Ok((false, false)),
+                        }
+                    },
+                    move |owner, inventory_result| {
+                        let (valid, inventory_updated) = match inventory_result {
+                            Ok(value) => value,
+                            Err(error) => {
+                                tracing::warn!(job = job.0, %error, "could not update source Keep intent");
+                                let _ = reply.send(false);
+                                return;
                             }
+                        };
+                        if !valid {
+                            let _ = reply.send(false);
+                            return;
                         }
-                        if inventory_updated {
-                            let _ = self.artifacts.set_keep_on_failure(job.0, prior_keep);
+                        if owner.control_epochs.get(&job) != Some(&generation)
+                            || owner.job_epochs.get(&job) != Some(&scope_generation)
+                            || owner.state.job(job).is_none()
+                        {
+                            if inventory_updated {
+                                let artifacts = owner.artifacts.clone();
+                                owner.io_then(
+                                    move || artifacts.set_keep_on_failure(job.0, prior_keep)
+                                        .map(|_| ())
+                                        .map_err(|error| nzbd_state::StateError::Corrupt(format!("artifact inventory rollback: {error}"))),
+                                    move |_, result| {
+                                        if let Err(error) = result {
+                                            tracing::error!(job = job.0, %error, "could not roll back stale source Keep intent");
+                                        }
+                                        let _ = reply.send(false);
+                                    },
+                                );
+                            } else {
+                                let _ = reply.send(false);
+                            }
+                            return;
                         }
-                        false
-                    }
-                } else {
-                    false
-                };
-                let _ = reply.send(ok);
+                        let Some(record) = owner.state.job_mut(job) else {
+                            let _ = reply.send(false);
+                            return;
+                        };
+                        record.params.retain(|(key, _)| key != "*Runner:KeepOnFailure");
+                        if keep {
+                            record.params.push(("*Runner:KeepOnFailure".into(), "1".into()));
+                        }
+                        owner.dirty = true;
+                        owner.persist_then(move |owner, committed| {
+                            let current = owner.control_epochs.get(&job) == Some(&generation) && owner.job_epochs.get(&job) == Some(&scope_generation);
+                            if (!owner.persist || committed) && current {
+                                owner.dirty = false;
+                                owner.bump_epoch();
+                                owner.publish_now();
+                                let _ = reply.send(true);
+                            } else {
+                                if current {
+                                    if let Some(record) = owner.state.job_mut(job) {
+                                        record.params.retain(|(key, _)| key != "*Runner:KeepOnFailure");
+                                        if prior_keep {
+                                            record.params.push(("*Runner:KeepOnFailure".into(), "1".into()));
+                                        }
+                                    }
+                                    owner.dirty = true;
+                                }
+                                if inventory_updated {
+                                    let artifacts = owner.artifacts.clone();
+                                    owner.io_then(
+                                        move || artifacts.set_keep_on_failure(job.0, prior_keep)
+                                            .map(|_| ())
+                                            .map_err(|e| nzbd_state::StateError::Corrupt(format!("artifact inventory rollback: {e}"))),
+                                        move |_, result| {
+                                            if let Err(error) = result {
+                                                tracing::error!(job = job.0, %error, "could not roll back source Keep intent");
+                                            }
+                                            let _ = reply.send(false);
+                                        },
+                                    );
+                                } else {
+                                    let _ = reply.send(false);
+                                }
+                            }
+                        });
+                    },
+                );
             }
             QueueCommand::SetCategory {
                 job,
                 category,
                 reply,
             } => {
+                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+                let before_category = self.state.job(job).map(|record| record.category.clone());
                 let ok = self.state.job_mut(job).is_some_and(|record| {
                     record.category = category;
                     true
                 });
-                if ok {
-                    self.save_snapshot();
-                    self.publish_now();
-                    self.bump_epoch();
+                if !ok {
+                    let _ = reply.send(false);
+                    return;
                 }
-                let _ = reply.send(ok);
+                let generation = fresh_epoch();
+                self.control_epochs.insert(job, generation);
+                let persistent = self.persist;
+                self.persist_then(move |owner, committed| {
+                    let current = owner.control_epochs.get(&job) == Some(&generation)
+                        && owner.job_epochs.get(&job) == Some(&scope_generation);
+                    let ok = (!persistent || committed) && current;
+                    if ok {
+                        owner.publish_now();
+                        owner.bump_epoch();
+                    } else if current {
+                        if let (Some(category), Some(record)) =
+                            (before_category, owner.state.job_mut(job))
+                        {
+                            record.category = category;
+                        }
+                    }
+                    let _ = reply.send(ok);
+                });
             }
             QueueCommand::SetTorrentSeedPolicy { job, policy, reply } => {
+                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 if policy
                     .ratio_limit
                     .is_some_and(|v| !v.is_finite() || v <= 0.0)
@@ -2266,7 +3170,11 @@ impl Owner {
                     let _ = reply.send(false);
                     return;
                 }
-                let before = self.state.job(job).cloned();
+                let before_policy = self
+                    .state
+                    .job(job)
+                    .and_then(|record| record.torrent.as_ref())
+                    .map(|torrent| torrent.seed_policy.clone());
                 let ok = self.state.job_mut(job).is_some_and(|record| {
                     let Some(torrent) = record.torrent.as_mut() else {
                         return false;
@@ -2274,23 +3182,35 @@ impl Owner {
                     torrent.seed_policy = policy;
                     true
                 });
-                let ok = if ok {
-                    self.dirty = true;
-                    if self.persist && !self.save_snapshot() {
-                        if let Some(before) = before {
-                            *self.state.job_mut(job).unwrap() = before;
+                if !ok {
+                    let _ = reply.send(false);
+                    return;
+                }
+                self.dirty = true;
+                let generation = fresh_epoch();
+                self.control_epochs.insert(job, generation);
+                let persistent = self.persist;
+                self.persist_then(move |owner, committed| {
+                    let current = owner.control_epochs.get(&job) == Some(&generation)
+                        && owner.job_epochs.get(&job) == Some(&scope_generation);
+                    let ok = (!persistent || committed) && current;
+                    if ok {
+                        owner.update_seed_policies(unix_now());
+                        owner.publish_now();
+                        owner.bump_epoch();
+                    } else if current {
+                        if let (Some(policy), Some(torrent)) = (
+                            before_policy,
+                            owner
+                                .state
+                                .job_mut(job)
+                                .and_then(|record| record.torrent.as_mut()),
+                        ) {
+                            torrent.seed_policy = policy;
                         }
-                        false
-                    } else {
-                        self.update_seed_policies(unix_now());
-                        self.publish_now();
-                        self.bump_epoch();
-                        true
                     }
-                } else {
-                    false
-                };
-                let _ = reply.send(ok);
+                    let _ = reply.send(ok);
+                });
             }
             QueueCommand::Move { job, op, reply } => {
                 let ok = self.move_job(job, op);
@@ -2430,13 +3350,49 @@ impl Owner {
                 let _ = reply.send(committed);
             }
             QueueCommand::ExportJob { job, reply } => {
-                let _ = reply.send(self.state.job(job).cloned().map(Box::new));
+                let replacement_pending =
+                    self.deferred_replacements
+                        .iter()
+                        .any(|command| match command {
+                            QueueCommand::ImportJob { job: pending, .. }
+                            | QueueCommand::ImportJobIfPresent { job: pending, .. } => {
+                                pending.id == job
+                            }
+                            QueueCommand::RemoveJobSilent { job: pending, .. } => *pending == job,
+                            QueueCommand::AdoptReplicatedAuthority { .. } => true,
+                            _ => false,
+                        });
+                let exportable = !self.verification.contains_key(&job)
+                    && !self.retiring_writers.contains_key(&job)
+                    && !replacement_pending;
+                let result = if exportable {
+                    self.state.job(job).cloned().map(Box::new)
+                } else {
+                    None
+                };
+                let _ = reply.send(result);
             }
             QueueCommand::RemoveJobSilent { job, reply } => {
                 let _ = reply.send(self.remove_job_silent(job));
             }
             QueueCommand::SetDelegated { job, node, reply } => {
-                let ok = self.state.job(job).is_some();
+                let replacement_pending =
+                    self.deferred_replacements
+                        .iter()
+                        .any(|command| match command {
+                            QueueCommand::ImportJob { job: pending, .. }
+                            | QueueCommand::ImportJobIfPresent { job: pending, .. } => {
+                                pending.id == job
+                            }
+                            QueueCommand::RemoveJobSilent { job: pending, .. } => *pending == job,
+                            QueueCommand::AdoptReplicatedAuthority { .. } => true,
+                            _ => false,
+                        });
+                let ok = self.state.job(job).is_some()
+                    && (node.is_none()
+                        || (!self.verification.contains_key(&job)
+                            && !self.retiring_writers.contains_key(&job)
+                            && !replacement_pending));
                 if ok {
                     match &node {
                         Some(n) => {
@@ -2471,8 +3427,12 @@ impl Owner {
                 }
             }
             QueueCommand::FoldJobJournals { job, reply } => {
-                self.fold_job_journals(job);
-                let _ = reply.send(());
+                self.fold_job_journals_then(job, move |_, result| {
+                    if let Err(error) = result {
+                        tracing::warn!(job = job.0, %error, "journal fold did not complete durably");
+                    }
+                    let _ = reply.send(());
+                });
             }
             QueueCommand::SetServerBudgets { budgets, reply } => {
                 tracing::info!(?budgets, "connection budgets updated");
@@ -2512,10 +3472,23 @@ impl Owner {
                 let _ = reply.send(applied);
             }
             QueueCommand::AdoptAuthority { reply } => {
-                let result = self.adopt_authority();
-                let _ = reply.send(result);
+                self.adopt_authority_then(move |_, result| {
+                    let _ = reply.send(result);
+                });
             }
             QueueCommand::AdoptReplicatedAuthority { jobs, reply } => {
+                for old in &self.state.jobs {
+                    if let Some(state) = self.verification.get(&old.id) {
+                        state.cancel.cancel();
+                    }
+                    self.job_epochs.insert(old.id, fresh_epoch());
+                }
+                self.verification.clear();
+                self.writer_epochs.clear();
+                self.pending_writer_birth.clear();
+                for job in &jobs {
+                    self.job_epochs.insert(job.id, fresh_epoch());
+                }
                 self.state.jobs = jobs;
                 self.state.pending_admissions.clear();
                 self.state.next_job_id = self
@@ -2534,10 +3507,34 @@ impl Owner {
                     .unwrap_or(0);
                 self.state.recompute_all_totals();
                 self.dirty = true;
-                self.save_snapshot();
-                self.publish_now();
+                let verify =
+                    self.state
+                        .jobs
+                        .iter()
+                        .filter_map(|job| {
+                            (!matches!(
+                                job.status,
+                                JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
+                            ) && job.torrent.is_none()
+                                && job.files.iter().flat_map(|file| &file.segments).any(
+                                    |segment| matches!(segment.state, SegmentState::Done { .. }),
+                                ))
+                            .then_some(job.id)
+                        })
+                        .collect::<Vec<_>>();
+                for job in verify {
+                    self.queue_verification(job);
+                }
                 self.bump_epoch();
-                let _ = reply.send(());
+                self.persist_then(move |owner, committed| {
+                    if !committed {
+                        owner.dirty = true;
+                        tracing::error!("replicated authority replacement is not durable");
+                    } else {
+                        owner.publish_now();
+                    }
+                    let _ = reply.send(());
+                });
             }
             QueueCommand::AbandonRelocation {
                 operation,
@@ -2545,44 +3542,64 @@ impl Owner {
                 generation,
                 reply,
             } => {
-                let result = (|| {
-                    let op = self
-                        .artifacts
-                        .operation(&operation)
-                        .map_err(|e| e.to_string())?;
-                    let artifact = self
-                        .artifacts
-                        .get(&op.artifact)
-                        .map_err(|e| e.to_string())?;
-                    if let Some(job) = artifact.job.map(JobId) {
-                        if self.retiring_writers.contains_key(&job) {
-                            return Err("payload retirement is in progress".into());
-                        }
-                        if let Some(j) = self.state.job(job) {
-                            let held_move = j.control().is_some_and(|c| {
-                                c.lifecycle == "held"
-                                    // Any cause at the move stage: a relocation
-                                    // has its own retry/abandon machinery, and a
-                                    // hold the post retry can never clear while
-                                    // the relocation is open must stay abandonable.
-                                    && c.stage == "move"
-                            });
-                            if !held_move
-                                || j.files.iter().any(|f| {
-                                    self.writers
-                                        .get(&f.id)
-                                        .is_some_and(|w| !*w.stopped.borrow())
-                                })
-                            {
-                                return Err("only a quiescent post-processing move hold can be abandoned while the job is queued".into());
+                let artifacts = self.artifacts.clone();
+                let job_facts = self
+                    .state
+                    .jobs
+                    .iter()
+                    .map(|job| {
+                        let held_move = job.control().is_some_and(|control| {
+                            control.lifecycle == "held" && control.stage == "move"
+                        });
+                        let quiescent = job.files.iter().all(|file| {
+                            self.writers
+                                .get(&file.id)
+                                .is_none_or(|writer| *writer.stopped.borrow())
+                        });
+                        (
+                            job.id,
+                            (
+                                self.retiring_writers.contains_key(&job.id),
+                                held_move,
+                                quiescent,
+                            ),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+                self.io_then(
+                    move || {
+                        let result = (|| {
+                            let op = artifacts
+                                .operation(&operation)
+                                .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                            let artifact = artifacts
+                                .get(&op.artifact)
+                                .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                            if let Some(job) = artifact.job.map(JobId) {
+                                if let Some((retiring, held_move, quiescent)) = job_facts.get(&job) {
+                                    if *retiring {
+                                        return Err(nzbd_state::StateError::Corrupt(
+                                            "payload retirement is in progress".into(),
+                                        ));
+                                    }
+                                    if !held_move || !quiescent {
+                                        return Err(nzbd_state::StateError::Corrupt(
+                                            "only a quiescent post-processing move hold can be abandoned while the job is queued".into(),
+                                        ));
+                                    }
+                                }
                             }
-                        }
-                    }
-                    self.artifacts
-                        .abandon_relocation(&operation, revision, &generation)
-                        .map_err(|e| e.to_string())
-                })();
-                let _ = reply.send(result);
+                            artifacts
+                                .abandon_relocation(&operation, revision, &generation)
+                                .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))
+                        })();
+                        result
+                    },
+                    move |_, result| {
+                        let result = result.map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                    },
+                );
             }
             QueueCommand::RetryHold {
                 job,
@@ -2591,7 +3608,19 @@ impl Owner {
                 custody_checked,
                 reply,
             } => {
-                let _ = reply.send(self.retry_hold(job, &revision, by, custody_checked));
+                let publication_repair = self.state.job(job).is_some_and(|record| {
+                    record
+                        .params
+                        .iter()
+                        .any(|(key, _)| key == "*Recovery:publication-repair")
+                });
+                if publication_repair {
+                    self.retry_publication_repair_then(job, revision, by, move |_, result| {
+                        let _ = reply.send(result);
+                    });
+                } else {
+                    let _ = reply.send(self.retry_hold(job, &revision, by, custody_checked));
+                }
             }
             QueueCommand::RescheduleHold {
                 job,
@@ -2607,13 +3636,14 @@ impl Owner {
                 by,
                 reply,
             } => {
+                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 let quiescent = self.state.job(job).is_some_and(|j| {
                     j.files
                         .iter()
                         .all(|f| self.writers.get(&f.id).is_none_or(|w| *w.stopped.borrow()))
                 });
                 let now = unix_now();
-                let mut ok = false;
+                let mut accepted = false;
                 if quiescent {
                     if let Some(j) = self.state.job_mut(job) {
                         let current = j.control();
@@ -2648,11 +3678,35 @@ impl Owner {
                             j.params
                                 .push(("*Control:attempts".into(), (count + 1).to_string()));
                             self.dirty = true;
-                            ok = !self.persist || self.save_snapshot();
+                            accepted = true;
                         }
                     }
                 }
-                let _ = reply.send(ok);
+                if !accepted {
+                    let _ = reply.send(false);
+                    return;
+                }
+                let generation = fresh_epoch();
+                self.control_epochs.insert(job, generation);
+                let persistent = self.persist;
+                self.persist_then(move |owner, committed| {
+                    let current = owner.control_epochs.get(&job) == Some(&generation)
+                        && owner.job_epochs.get(&job) == Some(&scope_generation);
+                    let ok = (!persistent || committed) && current;
+                    if ok {
+                        owner.bump_epoch();
+                        owner.publish_now();
+                    } else if current {
+                        owner.dirty = true;
+                        owner.hold_job(
+                            job,
+                            nzbd_types::HoldCause::StorageUnavailable,
+                            "snapshot",
+                            "Resource probe request could not be persisted",
+                        );
+                    }
+                    let _ = reply.send(ok);
+                });
             }
             QueueCommand::ReleaseResourceHold {
                 job,
@@ -2660,7 +3714,7 @@ impl Owner {
                 by,
                 reply,
             } => {
-                let before = self.state.job(job).cloned();
+                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 let mut changed = None;
                 if let Some(j) = self.state.job_mut(job) {
                     if let Some(mut control) = j.control().filter(|c| {
@@ -2716,29 +3770,42 @@ impl Owner {
                     }
                 }
                 self.dirty |= changed.is_some();
-                let ok = changed.is_some() && (!self.persist || self.save_snapshot());
-                if ok {
-                    self.bump_epoch();
-                    self.publish_now();
-                    self.emit(Event::JobControlChanged {
-                        job,
-                        control: changed.unwrap(),
-                    });
-                    let files: Vec<_> = self
-                        .state
-                        .job(job)
-                        .unwrap()
-                        .files
-                        .iter()
-                        .map(|f| f.id)
-                        .collect();
-                    for file in files {
-                        self.after_file_change(job, file);
-                    }
-                } else if let Some(before) = before {
-                    *self.state.job_mut(job).unwrap() = before;
+                if changed.is_none() {
+                    let _ = reply.send(false);
+                    return;
                 }
-                let _ = reply.send(ok);
+                let control = changed.unwrap();
+                let generation = fresh_epoch();
+                self.control_epochs.insert(job, generation);
+                let persistent = self.persist;
+                self.persist_then(move |owner, committed| {
+                    let current = owner.control_epochs.get(&job) == Some(&generation)
+                        && owner.job_epochs.get(&job) == Some(&scope_generation);
+                    let ok = (!persistent || committed) && current;
+                    if ok {
+                        owner.bump_epoch();
+                        owner.publish_now();
+                        owner.emit(Event::JobControlChanged { job, control });
+                        let files: Vec<_> = owner
+                            .state
+                            .job(job)
+                            .into_iter()
+                            .flat_map(|record| record.files.iter().map(|file| file.id))
+                            .collect();
+                        for file in files {
+                            owner.after_file_change(job, file);
+                        }
+                    } else if current {
+                        owner.dirty = true;
+                        owner.hold_job(
+                            job,
+                            nzbd_types::HoldCause::StorageUnavailable,
+                            "snapshot",
+                            "Resource hold release could not be persisted",
+                        );
+                    }
+                    let _ = reply.send(ok);
+                });
             }
             QueueCommand::HoldJob {
                 job,
@@ -2751,6 +3818,7 @@ impl Owner {
                 let _ = reply.send(committed);
             }
             QueueCommand::SetJobStatus { job, status, reply } => {
+                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 if self.state.job(job).is_some_and(|j| j.held()) {
                     let _ = reply.send(false);
                     return;
@@ -2759,6 +3827,7 @@ impl Owner {
                     let _ = reply.send(false);
                     return;
                 }
+                let before_status = self.state.job(job).map(|record| record.status.clone());
                 let ok = match self.state.job_mut(job) {
                     Some(j) => {
                         j.status = status;
@@ -2766,19 +3835,39 @@ impl Owner {
                     }
                     None => false,
                 };
-                if ok {
-                    self.dirty = true;
-                    if self.persist
-                        && matches!(
-                            status,
-                            JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
-                        )
-                    {
-                        self.save_snapshot();
-                    }
-                    self.publish_now();
+                if !ok {
+                    let _ = reply.send(false);
+                    return;
                 }
-                let _ = reply.send(ok);
+                self.dirty = true;
+                if self.persist
+                    && matches!(
+                        status,
+                        JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
+                    )
+                {
+                    let generation = fresh_epoch();
+                    self.control_epochs.insert(job, generation);
+                    self.persist_then(move |owner, committed| {
+                        let current = owner.control_epochs.get(&job) == Some(&generation)
+                            && owner.job_epochs.get(&job) == Some(&scope_generation);
+                        let accepted = committed && current;
+                        if accepted {
+                            owner.publish_now();
+                        } else if current {
+                            if let (Some(status), Some(record)) =
+                                (before_status, owner.state.job_mut(job))
+                            {
+                                record.status = status;
+                            }
+                            owner.dirty = true;
+                        }
+                        let _ = reply.send(accepted);
+                    });
+                } else {
+                    self.publish_now();
+                    let _ = reply.send(true);
+                }
             }
             QueueCommand::RegisterRepairAttempt {
                 job,
@@ -2894,286 +3983,463 @@ impl Owner {
     // -- cluster: import / export / delegation / adoption --------------------
 
     fn import_job(&mut self, mut job: Job, fold_journals: bool, emit_finished: bool) -> bool {
+        let job_id = job.id;
+        if self.retiring_writers.contains_key(&job_id)
+            || self.post_admissions.contains_key(&job_id)
+            || self
+                .verification
+                .get(&job_id)
+                .is_some_and(|state| state.running)
+        {
+            return false;
+        }
         if let Some(control) = self
             .state
-            .job(job.id)
-            .and_then(|j| j.control())
-            .filter(|c| c.lifecycle == "held")
+            .job(job_id)
+            .and_then(Job::control)
+            .filter(|control| control.lifecycle == "held")
         {
-            // Remote/exported legacy snapshots cannot erase a newer local fence.
             job.set_control(&control);
             job.status = JobStatus::Paused;
-            job.params.retain(|(k, _)| k != nzbd_types::PP_DONE_PARAM);
+            job.params
+                .retain(|(key, _)| key != nzbd_types::PP_DONE_PARAM);
         }
-        // Normalize transient state from the wire.
-        for f in &mut job.files {
-            for s in &mut f.segments {
-                if matches!(s.state, SegmentState::Leased { .. }) {
-                    s.state = SegmentState::Pending;
+        let relative = PathBuf::from(job_dir_name(&job));
+        if relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return false;
+        }
+        for file in &mut job.files {
+            for segment in &mut file.segments {
+                if matches!(segment.state, SegmentState::Leased { .. }) {
+                    segment.state = SegmentState::Pending;
                 }
             }
         }
-        if matches!(job.status, JobStatus::Downloading) {
+        if job.status == JobStatus::Downloading {
             job.status = JobStatus::Queued;
         }
-        if job.torrent.is_none()
-            && !matches!(
-                job.status,
-                JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
-            )
-        {
-            let relative = std::path::PathBuf::from(job_dir_name(&job));
-            if relative
-                .components()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)))
-            {
-                return false;
-            }
-            let path = self.dest_dir.join(relative);
-            // Cluster grants may use nested, fenced generation directories.
-            // Register their bytes without local deletion authority.
-            if let Err(error) = std::fs::create_dir_all(&path) {
-                tracing::error!(job=job.id.0,%error,"cannot create granted payload directory");
-                return false;
-            }
-            self.allocated_jobs.remove(&job.id);
-            if let Err(error) =
-                self.artifacts
-                    .register_legacy_active(job.id.0, path.parent().unwrap(), &path)
-            {
-                tracing::error!(job=job.id.0, %error, "cluster payload inventory unavailable");
-                return false;
-            }
-        }
-        if job.torrent.is_none() && self.artifacts.for_job(job.id.0).ok().flatten().is_none() {
-            let path = self.dest_dir.join(job_dir_name(&job));
-            if path.is_dir() {
-                if let Err(error) =
-                    self.artifacts
-                        .register_legacy_active(job.id.0, path.parent().unwrap(), &path)
-                {
-                    tracing::error!(%error,"cannot inventory legacy completed payload");
-                    return false;
-                }
-            }
-        }
-        let job_id = job.id;
-        let max_file = job.files.iter().map(|f| f.id.0).max().unwrap_or(0);
-        self.state.next_job_id = self.state.next_job_id.max(job_id.0);
-        self.state.next_file_id = self.state.next_file_id.max(max_file);
-
-        // Replace any existing copy (idempotent re-grant / completion).
         if self.state.job(job_id).is_some() {
             self.remove_job_silent(job_id);
         }
-        let terminal = matches!(
-            job.status,
-            JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
-        );
-        let name = job.name.clone();
-        let status = job.status;
-        let health = Health::calc(&job.totals).0;
-        self.state.jobs.push(job);
-        if let Some(j) = self.state.job_mut(job_id) {
-            recompute_job_totals(j);
-        }
+        let epoch = fresh_epoch();
+        self.job_epochs.insert(job_id, epoch);
+        self.state.next_job_id = self.state.next_job_id.max(job_id.0);
+        self.state.next_file_id = self
+            .state
+            .next_file_id
+            .max(job.files.iter().map(|file| file.id.0).max().unwrap_or(0));
+        let needs_verification = job.torrent.is_none()
+            && !job
+                .params
+                .iter()
+                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM);
+        recompute_job_totals(&mut job);
+        self.state.jobs.push(job.clone());
         self.delegated.remove(&job_id);
         self.mirror.remove(&job_id);
-        if fold_journals {
-            self.fold_job_journals(job_id);
-        }
-        if let Some(files) = self.state.job(job_id).and_then(recovered_post_fetch_files) {
+        if let Some(files) = recovered_post_fetch_files(&job) {
             self.post_fetch_files.insert(job_id, files);
         } else {
             self.post_fetch_files.remove(&job_id);
         }
-        tracing::info!(job = job_id.0, %name, ?status, "job imported");
-        self.dirty = true;
-        let committed = !self.persist || self.save_snapshot();
-        self.publish_now();
-        if terminal && emit_finished {
-            self.emit(Event::JobFinished {
-                job: job_id,
-                name,
-                status,
-                health,
-            });
+        if needs_verification {
+            self.queue_verification(job_id);
         }
-        self.bump_epoch();
-        committed
-    }
-
-    fn remove_job_silent(&mut self, job_id: JobId) -> bool {
-        let Some(idx) = self.state.jobs.iter().position(|j| j.id == job_id) else {
-            return false;
-        };
-        let job = self.state.jobs.remove(idx);
-        if !matches!(
-            job.status,
-            JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
-        ) {
-            for receipt in &mut self.state.url_admission_receipts {
-                if receipt.job_id == job_id.0 {
-                    receipt.outcome = "deleted".into();
+        if job.torrent.is_none() {
+            let inventory = self.artifacts.clone();
+            let path = self.dest_dir.join(relative);
+            self.io_then(
+                move || {
+                    if let Some(allocation) = inventory
+                        .for_job(job_id.0)
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
+                    {
+                        return Ok(Some(allocation));
+                    }
+                    std::fs::create_dir_all(&path)
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    inventory
+                        .register_legacy_active(job_id.0, path.parent().unwrap(), &path)
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    inventory
+                        .for_job(job_id.0)
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))
+                },
+                move |owner, result| {
+                    if owner.job_epochs.get(&job_id) != Some(&epoch) {
+                        return;
+                    }
+                    match result {
+                        Ok(Some(allocation)) => {
+                            owner.allocation_cache.insert(job_id, allocation);
+                            if let Some(state) = owner.verification.get_mut(&job_id) {
+                                state.retry_at = Instant::now();
+                            }
+                        }
+                        Ok(None) => {
+                            owner.hold_job(
+                                job_id,
+                                nzbd_types::HoldCause::Allocation,
+                                "recovery",
+                                "import allocation metadata is unavailable",
+                            );
+                        }
+                        Err(error) => {
+                            owner.hold_job(
+                                job_id,
+                                allocation_hold_cause(&error.to_string()),
+                                "recovery",
+                                &error.to_string(),
+                            );
+                        }
+                    }
+                    owner.start_verifications();
+                    owner.publish_now();
+                    owner.bump_epoch();
+                },
+            );
+        }
+        if fold_journals {
+            self.fold_job_journals(job_id);
+        }
+        self.dirty = true;
+        if emit_finished
+            && !needs_verification
+            && matches!(
+                job.status,
+                JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
+            )
+        {
+            self.persist_then(move |owner, ok| {
+                if ok && owner.job_epochs.get(&job_id) == Some(&epoch) {
+                    owner.publish_now();
+                    owner.emit(Event::JobFinished {
+                        job: job_id,
+                        name: job.name,
+                        status: job.status,
+                        health: Health::calc(&job.totals).0,
+                    });
                 }
-            }
-        }
-        for f in &job.files {
-            self.writers.remove(&f.id);
-            self.file_sizes.remove(&f.id);
-            self.finalize_sent.remove(&f.id);
-        }
-        self.pending_finalize.retain(|(j, _)| *j != job_id);
-        self.attempts.retain(|r, _| r.job != job_id);
-        self.delegated.remove(&job_id);
-        self.mirror.remove(&job_id);
-        self.post_fetch_files.remove(&job_id);
-        self.dirty = true;
-        if self.persist {
-            self.save_snapshot();
+            });
         }
         self.publish_now();
         self.bump_epoch();
         true
     }
 
-    fn fold_job_journals(&mut self, job_id: JobId) {
-        let recs = match JobJournals::replay_job(&self.state_dir, job_id) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(job = job_id.0, error = %e, "journal fold failed");
+    fn remove_job_silent(&mut self, job: JobId) -> bool {
+        if self.post_admissions.contains_key(&job)
+            || self
+                .verification
+                .get(&job)
+                .is_some_and(|state| state.running)
+            || self.state.job(job).is_some_and(|record| {
+                record.files.iter().any(|file| {
+                    self.writers
+                        .get(&file.id)
+                        .is_some_and(|writer| !*writer.stopped.borrow())
+                })
+            })
+        {
+            if let Some(state) = self.verification.get(&job) {
+                state.cancel.cancel();
+            }
+            self.retire_job_writers(job);
+            return false;
+        }
+        let Some(index) = self.state.jobs.iter().position(|record| record.id == job) else {
+            return false;
+        };
+        let record = self.state.jobs.remove(index);
+        self.job_epochs.insert(job, fresh_epoch());
+        if let Some(state) = self.verification.remove(&job) {
+            state.cancel.cancel();
+        }
+        for file in &record.files {
+            self.writer_epochs.remove(&file.id);
+            self.pending_writer_birth.remove(&file.id);
+            if let Some(writer) = self.writers.remove(&file.id) {
+                self.retire_writer_handle(job, writer);
+            }
+            self.file_sizes.remove(&file.id);
+            self.finalize_sent.remove(&file.id);
+        }
+        self.pending_name_inspections.remove(&job);
+        self.allocated_jobs.remove(&job);
+        self.allocation_cache.remove(&job);
+        self.pending_finalize
+            .retain(|(candidate, _)| *candidate != job);
+        self.attempts.retain(|reference, _| reference.job != job);
+        self.delegated.remove(&job);
+        self.mirror.remove(&job);
+        self.post_fetch_files.remove(&job);
+        if !matches!(
+            record.status,
+            JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
+        ) {
+            for receipt in &mut self.state.url_admission_receipts {
+                if receipt.job_id == job.0 {
+                    receipt.outcome = "deleted".into();
+                }
+            }
+        }
+        // Persist the retirement before clearing old journals or allowing a
+        // same-ID import to open another descriptor at this namespace.
+        let retirement = fresh_epoch();
+        self.retirement_epochs.insert(job, retirement);
+        self.retiring_writers.entry(job).or_default();
+        self.dirty = true;
+        self.persist_then(move |owner, committed| {
+            if owner.retirement_epochs.get(&job) != Some(&retirement) {
                 return;
             }
-        };
-        let mut touched: HashSet<FileId> = HashSet::new();
-        let mut applied = 0usize;
-        for rec in recs {
-            if rec.job != job_id {
-                continue;
-            }
-            let r = SegRef {
-                job: rec.job,
-                file: rec.file,
-                seg_number: rec.segment_number,
-            };
-            if rec.file_size > 0 {
-                self.file_sizes.insert(rec.file, rec.file_size);
-            }
-            let path = self.state.job(job_id).and_then(|j| {
-                j.files.iter().find(|f| f.id == rec.file).map(|f| {
-                    let root = self.dest_dir.join(job_dir_name(j));
-                    let stable = root.join(format!(".runner-file-{}.part", rec.file.0));
-                    if stable.exists() {
-                        stable
-                    } else {
-                        root.join(&f.filename)
-                    }
-                })
-            });
-            if !path.is_some_and(|p| {
-                crate::writer::validate_range(&p, rec.offset, rec.len as u64, rec.crc32)
-            }) {
-                self.hold_job(
-                    job_id,
-                    nzbd_types::HoldCause::IdentityConflict,
-                    "download_write",
-                    "foreign journal bytes require revalidation; evidence retained",
-                );
-                continue;
-            }
-            let Some(seg) = self.state.segment_mut(r) else {
-                continue;
-            };
-            if !matches!(seg.state, SegmentState::Done { .. }) {
-                seg.state = SegmentState::Done {
-                    offset: rec.offset,
-                    len: rec.len,
-                    crc: rec.crc32,
-                };
-                self.attempts.remove(&r);
-                touched.insert(rec.file);
-                applied += 1;
-            }
-        }
-        if applied > 0 {
-            tracing::info!(job = job_id.0, applied, "folded journal records");
-            if let Some(j) = self.state.job_mut(job_id) {
-                recompute_job_totals(j);
-            }
-            for file in touched {
-                self.after_file_change(job_id, file);
-            }
-            self.bump_epoch();
-        }
-    }
-
-    fn adopt_authority(&mut self) -> Result<(), nzbd_state::StateError> {
-        match self.snap_store.load() {
-            Ok(Some(doc)) => {
-                // Cluster takeover is a production recovery path just like
-                // daemon startup. Validate before flipping persistence or
-                // touching local state: an M1b node must not generically
-                // recover, publish, or rewrite a dormant torrent row.
-                let snapshot_state = match QueueState::from_runtime_doc(doc) {
-                    Ok(state) => state,
-                    Err(error) => {
-                        self.persist = false;
-                        tracing::error!(
-                            error = %error,
-                            "authority adoption refused; shared snapshot and local queue unchanged"
-                        );
-                        return Err(error);
-                    }
-                };
-                self.state.next_job_id = self.state.next_job_id.max(snapshot_state.next_job_id);
-                self.state.next_file_id = self.state.next_file_id.max(snapshot_state.next_file_id);
-                self.state.download_paused = snapshot_state.download_paused;
-                if self.state.speed_limit_bps.is_none() {
-                    self.state.speed_limit_bps = snapshot_state.speed_limit_bps;
-                    self.limiter.set(snapshot_state.speed_limit_bps);
-                }
-                for job in snapshot_state.jobs {
-                    // Local executor copies are fresher than the late
-                    // leader's snapshot — keep them.
-                    if self.state.job(job.id).is_none() {
-                        self.state.jobs.push(job);
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                self.persist = false;
+            if committed {
+                owner.remove_journal(job);
+                owner.retirement_epochs.remove(&job);
+                owner.retiring_writers.remove(&job);
+                owner.drain_replacements();
+                owner.bump_epoch();
+            } else {
                 tracing::error!(
-                    error = %error,
-                    "authority adoption refused; unreadable shared snapshot left unchanged"
+                    job = job.0,
+                    "job generation retirement is not durable; replacement remains fenced"
                 );
-                return Err(error);
             }
-        }
-
-        self.persist = true;
-
-        // Fold every job's journals (union across lease files).
-        let ids: Vec<JobId> = self.state.jobs.iter().map(|j| j.id).collect();
-        for id in &ids {
-            self.fold_job_journals(*id);
-        }
-        self.state.recompute_all_totals();
-        rearm_holds(&mut self.state, unix_now());
-
-        // Finish anything that completed right before the takeover.
-        self.startup_pass();
-        self.save_snapshot();
+            owner.publish_now();
+        });
         self.publish_now();
         self.bump_epoch();
-        tracing::info!(jobs = self.state.jobs.len(), "adopted queue authority");
+        true
+    }
+
+    fn fold_job_journals(&mut self, job: JobId) {
+        self.fold_job_journals_then(job, |_, result| {
+            if let Err(error) = result {
+                tracing::warn!(%error,"journal fold deferred");
+            }
+        });
+    }
+
+    fn fold_job_journals_then(
+        &mut self,
+        job: JobId,
+        callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
+    ) {
+        let state_dir = self.state_dir.clone();
+        let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+        if let Some(state) = self.verification.get(&job) {
+            state.cancel.cancel();
+        }
+        self.retire_job_writers(job);
+        self.queue_verification(job);
+        if let Some(state) = self.verification.get_mut(&job) {
+            state.phase = "loading".into();
+        }
+        if let Some(record) = self.state.job_mut(job) {
+            set_owner_param(
+                &mut record.params,
+                "*Recovery:journal-loading",
+                Some("1".into()),
+            );
+        }
+        self.io_then(
+            move || JobJournals::replay_job_with_provenance(&state_dir, job),
+            move |owner, result| {
+                if owner.job_epochs.get(&job) != Some(&epoch) {
+                    callback(
+                        owner,
+                        Err(nzbd_state::StateError::Corrupt(
+                            "journal fold generation retired".into(),
+                        )),
+                    );
+                    return;
+                }
+                let records = match result {
+                    Ok(records) => records,
+                    Err(error) => {
+                        owner.hold_job(
+                            job,
+                            nzbd_types::HoldCause::StorageUnavailable,
+                            "recovery",
+                            &error.to_string(),
+                        );
+                        callback(owner, Err(error));
+                        return;
+                    }
+                };
+                for envelope in records {
+                    let record = envelope.record;
+                    if record.job != job
+                        || !merge_replayed_proof(
+                            &mut owner.state,
+                            &record,
+                            envelope.provenance.as_ref(),
+                            &owner.artifacts.installation,
+                        )
+                    {
+                        continue;
+                    }
+                    if record.file_size > 0 {
+                        owner.file_sizes.insert(record.file, record.file_size);
+                    }
+                    let reference = SegRef {
+                        job,
+                        file: record.file,
+                        seg_number: record.segment_number,
+                    };
+                    if let Some(segment) = owner.state.segment_mut(reference) {
+                        if !matches!(segment.state, SegmentState::Done { .. }) {
+                            segment.state = SegmentState::Done {
+                                offset: record.offset,
+                                len: record.len,
+                                crc: record.crc32,
+                            };
+                        }
+                    }
+                }
+                if let Some(record) = owner.state.job_mut(job) {
+                    recompute_job_totals(record);
+                    set_owner_param(&mut record.params, "*Recovery:journal-loading", None);
+                }
+                owner.queue_verification(job);
+                owner.dirty = true;
+                owner.publish_now();
+                owner.bump_epoch();
+                owner.persist_then(move |owner, ok| {
+                    callback(
+                        owner,
+                        if ok {
+                            Ok(())
+                        } else {
+                            Err(nzbd_state::StateError::Corrupt(
+                                "journal recovery transition is not durable".into(),
+                            ))
+                        },
+                    )
+                });
+            },
+        );
+    }
+
+    #[cfg(test)]
+    fn adopt_authority(&mut self) -> Result<(), nzbd_state::StateError> {
+        self.adopt_authority_then(|_, result| {
+            if let Err(error) = result {
+                tracing::error!(%error,"authority adoption failed");
+            }
+        });
         Ok(())
+    }
+
+    fn adopt_authority_then(
+        &mut self,
+        callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
+    ) {
+        let state_dir = self.state_dir.clone();
+        self.io_then(
+            move || SnapshotStore::open(&state_dir)?.load(),
+            move |owner, result| {
+                let doc = match result {
+                    Ok(doc) => doc,
+                    Err(error) => {
+                        owner.persist = false;
+                        callback(owner, Err(error));
+                        return;
+                    }
+                };
+                let recovered = match doc.map(QueueState::from_runtime_doc).transpose() {
+                    Ok(state) => state,
+                    Err(error) => {
+                        owner.persist = false;
+                        callback(owner, Err(error));
+                        return;
+                    }
+                };
+                if let Some(state) = recovered {
+                    owner.state.next_job_id = owner.state.next_job_id.max(state.next_job_id);
+                    owner.state.next_file_id = owner.state.next_file_id.max(state.next_file_id);
+                    owner.state.download_paused = state.download_paused;
+                    for job in state.jobs {
+                        if owner.state.job(job.id).is_none() {
+                            owner.import_job(job, false, false);
+                        }
+                    }
+                }
+                owner.persist = true;
+                let jobs = owner
+                    .state
+                    .jobs
+                    .iter()
+                    .filter(|job| job.torrent.is_none())
+                    .map(|job| job.id)
+                    .collect::<Vec<_>>();
+                if jobs.is_empty() {
+                    owner.persist_then(move |owner, ok| {
+                        callback(
+                            owner,
+                            if ok {
+                                Ok(())
+                            } else {
+                                Err(nzbd_state::StateError::Corrupt(
+                                    "authority adoption is not durable".into(),
+                                ))
+                            },
+                        )
+                    });
+                    return;
+                }
+                type Done = Box<dyn FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send>;
+                let pending = Arc::new(std::sync::Mutex::new((
+                    jobs.len(),
+                    Some(Box::new(callback) as Done),
+                    None::<nzbd_state::StateError>,
+                )));
+                for job in jobs {
+                    let pending = pending.clone();
+                    owner.fold_job_journals_then(job, move |owner, result| {
+                        let completed = {
+                            let mut pending = pending.lock().unwrap();
+                            pending.0 -= 1;
+                            if let Err(error) = result {
+                                pending.2 = Some(error);
+                            }
+                            if pending.0 == 0 {
+                                Some((pending.1.take().unwrap(), pending.2.take()))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some((done, error)) = completed {
+                            if let Some(error) = error {
+                                done(owner, Err(error));
+                            } else {
+                                owner.persist_then(move |owner, ok| {
+                                    done(
+                                        owner,
+                                        if ok {
+                                            Ok(())
+                                        } else {
+                                            Err(nzbd_state::StateError::Corrupt(
+                                                "authority adoption is not durable".into(),
+                                            ))
+                                        },
+                                    )
+                                });
+                            }
+                        }
+                    });
+                }
+            },
+        );
     }
 
     // -- scheduling ----------------------------------------------------------
 
     fn grant_work(&mut self, server_id: ServerId, max: usize) -> Vec<Lease> {
-        if self.disk_low || self.is_blocked(server_id) {
+        if self.cancel.is_cancelled() || self.disk_low || self.is_blocked(server_id) {
             return Vec::new();
         }
         let servers = self.servers.clone();
@@ -3189,6 +4455,30 @@ impl Owner {
             .collect();
         let is_blocked = move |id: ServerId| blocked_now.contains(&id);
 
+        let mut excluded = self.delegated.clone();
+        for job in self
+            .verification
+            .keys()
+            .chain(self.retiring_writers.keys())
+            .chain(self.pending_control_commits.iter())
+        {
+            excluded.insert(*job, "verification/replacement".into());
+        }
+        let allowed_post = self
+            .post_fetch_files
+            .iter()
+            .filter(|(job, _)| {
+                !self.verification.contains_key(job)
+                    && !self.retiring_writers.contains_key(job)
+                    && !self.pending_control_commits.contains(job)
+            })
+            .map(|(job, files)| (*job, files.clone()))
+            .collect::<HashMap<_, _>>();
+        for job in self.post_admissions.keys() {
+            if !allowed_post.contains_key(job) {
+                excluded.insert(*job, "post-processing custody".into());
+            }
+        }
         let mut leases = Vec::new();
         // A refused allocation removes one job from eligibility; it must not
         // consume the lease budget or prevent another eligible job progressing.
@@ -3201,8 +4491,8 @@ impl Owner {
                 ladder: &ladder,
                 attempts: &mut self.attempts,
                 is_blocked: &is_blocked,
-                delegated: &self.delegated,
-                post_fetch_files: &self.post_fetch_files,
+                delegated: &excluded,
+                post_fetch_files: &allowed_post,
                 regular_downloads: self.download_enabled,
                 article_retries: self.tuning.article_retries,
                 now_unix: unix_now(),
@@ -3219,7 +4509,9 @@ impl Owner {
             let Some(r) = lease else { break };
 
             if let Err(e) = self.ensure_allocation(r.job, false) {
-                if self.retiring_writers.contains_key(&r.job) {
+                if self.retiring_writers.contains_key(&r.job)
+                    || self.allocating_jobs.contains(&r.job)
+                {
                     // Writer retirement owns its own completion/wake-up. It is
                     // transient, not an allocation needing operator review.
                     break;
@@ -3233,14 +4525,15 @@ impl Owner {
                 );
                 continue;
             }
-            let (message_id, writer) = {
-                let Some(seg) = self.state.segment_mut(r) else {
-                    break;
-                };
-                seg.state = SegmentState::Leased { server: server_id };
-                let msgid = seg.message_id.to_string();
-                (msgid, self.writer_for(r.job, r.file))
+            let writer = self.writer_for(r.job, r.file);
+            let Some(generation) = self.writers.get(&r.file).map(|writer| writer.generation) else {
+                continue;
             };
+            let Some(seg) = self.state.segment_mut(r) else {
+                break;
+            };
+            seg.state = SegmentState::Leased { server: server_id };
+            let message_id = seg.message_id.to_string();
             if let Some(job) = self.state.job_mut(r.job) {
                 if matches!(job.status, JobStatus::Queued) {
                     job.status = JobStatus::Downloading;
@@ -3256,12 +4549,225 @@ impl Owner {
                 r,
                 message_id,
                 writer,
+                generation,
             });
         }
         leases
     }
 
     // -- outcomes ------------------------------------------------------------
+
+    fn on_scoped_writer(&mut self, job: JobId, file: FileId, generation: u64, fact: WriterFact) {
+        if self.writer_epochs.get(&file) != Some(&generation)
+            || self.state.job(job).is_none()
+            || self.verification.contains_key(&job)
+        {
+            return;
+        }
+        match fact {
+            WriterFact::Written {
+                seg_number,
+                offset,
+                len,
+                crc,
+                file_size,
+                server,
+                identity,
+            } => {
+                let reference = SegRef {
+                    job,
+                    file,
+                    seg_number,
+                };
+                let Some(segment) = self.state.segment_mut(reference) else {
+                    return;
+                };
+                if let SegmentState::Done {
+                    offset: old,
+                    len: old_len,
+                    crc: old_crc,
+                } = segment.state
+                {
+                    if (old, old_len, old_crc) != (offset, len, crc) {
+                        self.hold_job(
+                            job,
+                            nzbd_types::HoldCause::IdentityConflict,
+                            "download_write",
+                            "writer acknowledgement contradicts completed logical segment",
+                        );
+                    }
+                    return;
+                }
+                let Some(allocation) = self.allocation_cache.get(&job) else {
+                    return;
+                };
+                let record = self.state.job(job).unwrap();
+                let key = format!("*File:proof:{}", file.0);
+                let file_generation = record
+                    .params
+                    .iter()
+                    .find(|(key, _)| key == &format!("*File:generation:{}", file.0))
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default();
+                if file_generation != generation.to_string() {
+                    return;
+                }
+                let mut proof = record
+                    .params
+                    .iter()
+                    .find(|(candidate, _)| candidate == &key)
+                    .and_then(|(_, value)| serde_json::from_str::<DurableFileProof>(value).ok())
+                    .filter(|proof| {
+                        proof.protocol == WRITER_PROTOCOL
+                            && proof.generation == file_generation
+                            && proof.allocation_generation == allocation.generation
+                            && proof.installation == self.artifacts.installation
+                            && proof.identity.same_object(&identity)
+                    })
+                    .unwrap_or_else(|| DurableFileProof {
+                        protocol: WRITER_PROTOCOL,
+                        generation: file_generation.clone(),
+                        allocation_generation: allocation.generation.clone(),
+                        installation: self.artifacts.installation.clone(),
+                        identity: identity.clone(),
+                        ranges: vec![],
+                        publication_name: None,
+                    });
+                let range = ProvenRange {
+                    seg_number,
+                    offset,
+                    len,
+                    crc,
+                };
+                if proof
+                    .ranges
+                    .iter()
+                    .any(|prior| prior.seg_number == seg_number || prior.overlaps(&range))
+                {
+                    self.hold_job(
+                        job,
+                        nzbd_types::HoldCause::IdentityConflict,
+                        "download_write",
+                        "writer acknowledgement overlaps durable evidence",
+                    );
+                    return;
+                }
+                proof.identity = identity;
+                proof.ranges.push(range.clone());
+                let mut journal_proof = proof.clone();
+                journal_proof.ranges = vec![range];
+                self.append_journal(
+                    JournalRecord {
+                        job,
+                        file,
+                        segment_number: seg_number,
+                        offset,
+                        len,
+                        crc32: crc,
+                        file_size,
+                    },
+                    serde_json::to_value(&journal_proof).ok(),
+                );
+                if let Some(segment) = self.state.segment_mut(reference) {
+                    segment.state = SegmentState::Done { offset, len, crc };
+                }
+                if let Some(record) = self.state.job_mut(job) {
+                    set_owner_param(&mut record.params, &key, serde_json::to_string(&proof).ok());
+                    recompute_job_totals(record);
+                }
+                if file_size > 0 {
+                    self.file_sizes.insert(file, file_size);
+                }
+                self.volumes.add(
+                    server,
+                    u64::from(len),
+                    unix_now(),
+                    self.tuning.quota_start_day,
+                );
+                self.attempts.remove(&reference);
+                self.dirty = true;
+                self.after_file_change(job, file);
+            }
+            WriterFact::Finalized {
+                ok,
+                final_path,
+                combined_crc,
+                identity,
+            } => {
+                if !ok {
+                    self.on_writer_finalized(job, file, false, final_path, combined_crc);
+                    return;
+                }
+                let proof_key = format!("*File:proof:{}", file.0);
+                if let Some(record) = self.state.job_mut(job) {
+                    if let Some(identity) = identity {
+                        if let Some((_, raw)) =
+                            record.params.iter_mut().find(|(key, _)| key == &proof_key)
+                        {
+                            if let Ok(mut proof) = serde_json::from_str::<DurableFileProof>(raw) {
+                                proof.identity = identity;
+                                proof.publication_name = final_path
+                                    .as_ref()
+                                    .and_then(|path| path.file_name())
+                                    .map(|name| name.to_string_lossy().into_owned());
+                                if let Ok(json) = serde_json::to_string(&proof) {
+                                    *raw = json;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(entry) = record.files.iter_mut().find(|entry| entry.id == file) {
+                        entry.finalized = true;
+                        entry.crc32 = combined_crc;
+                    }
+                }
+                self.dirty = true;
+                self.persist_then(move |owner, committed| {
+                    if owner.writer_epochs.get(&file) != Some(&generation)
+                        || owner.state.job(job).is_none()
+                    {
+                        return;
+                    }
+                    if committed {
+                        owner.on_writer_finalized(job, file, true, final_path, combined_crc);
+                    } else {
+                        if let Some(entry) = owner.state.file_mut(job, file) {
+                            entry.finalized = false;
+                        }
+                        owner.hold_job(
+                            job,
+                            nzbd_types::HoldCause::StorageUnavailable,
+                            "finalize",
+                            "publication evidence could not be persisted",
+                        );
+                    }
+                });
+            }
+            WriterFact::Error { error } => {
+                if let Some(writer) = self.writers.remove(&file) {
+                    self.retire_writer_handle(job, writer);
+                }
+                self.writer_epochs.remove(&file);
+                self.on_msg(EngineMsg::WriterError { job, file, error });
+            }
+            WriterFact::Rejected {
+                seg_number,
+                server,
+                reason,
+            } => {
+                tracing::warn!(job=job.0,file=file.0,seg_number,%reason,"malformed segment rejected before disk mutation");
+                self.on_segment_failed(
+                    SegRef {
+                        job,
+                        file,
+                        seg_number,
+                    },
+                    server,
+                    AttemptOutcome::Other,
+                );
+            }
+        }
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn on_segment_written(
@@ -3292,17 +4798,18 @@ impl Owner {
             return; // duplicate (e.g. recovery overlap)
         }
         seg.state = SegmentState::Done { offset, len, crc };
-        if let Err(e) = self.journal.append(&JournalRecord {
-            job,
-            file,
-            segment_number: seg_number,
-            offset,
-            len,
-            crc32: crc,
-            file_size,
-        }) {
-            tracing::error!(error = %e, "journal append failed");
-        }
+        self.append_journal(
+            JournalRecord {
+                job,
+                file,
+                segment_number: seg_number,
+                offset,
+                len,
+                crc32: crc,
+                file_size,
+            },
+            None,
+        );
         self.attempts.remove(&r);
         if let Some(j) = self.state.job_mut(job) {
             recompute_job_totals(j);
@@ -3519,14 +5026,17 @@ impl Owner {
         self.file_sizes.insert(file, size);
         self.dirty = true;
         // Name authority is committed before any Finalize can publish it.
-        if self.persist && !self.save_snapshot() {
-            self.hold_job(
-                job,
-                nzbd_types::HoldCause::StorageUnavailable,
-                "download_write",
-                "filename metadata could not be persisted",
-            );
-        }
+        let epoch = self.job_epochs.get(&job).copied();
+        self.persist_then(move |owner, ok| {
+            if !ok && owner.job_epochs.get(&job).copied() == epoch {
+                owner.hold_job(
+                    job,
+                    nzbd_types::HoldCause::StorageUnavailable,
+                    "download_write",
+                    "filename metadata could not be persisted",
+                );
+            }
+        });
     }
 
     fn hold_job(
@@ -3635,13 +5145,23 @@ impl Owner {
         self.pending_finalize.retain(|(id, _)| *id != job);
         self.dirty = true;
         self.bump_epoch();
-        // Failed persistence leaves the local fence in place, but emits no fact.
-        if self.persist && !self.save_snapshot() {
-            return false;
-        }
+        // The local fence is immediate. Emit only the durably acknowledged
+        // control revision; stale callbacks cannot describe a newer hold.
+        let epoch = self.job_epochs.get(&job).copied();
+        self.persist_then(move |owner, ok| {
+            if ok
+                && owner.job_epochs.get(&job).copied() == epoch
+                && owner
+                    .state
+                    .job(job)
+                    .and_then(Job::control)
+                    .is_some_and(|current| current.revision == control.revision)
+            {
+                owner.publish_now();
+                owner.emit(Event::JobControlChanged { job, control });
+            }
+        });
         self.publish_now();
-        tracing::warn!(job = job.0, cause = %cause_str, stage, policy = policy.as_str(), message = %control.message, "job held");
-        self.emit(Event::JobControlChanged { job, control });
         true
     }
 
@@ -3745,20 +5265,43 @@ impl Owner {
             }
         }
         self.dirty = true;
-        if self.persist && !self.save_snapshot() {
-            *self.state.job_mut(job).unwrap() = before;
-            return Err("the retry could not be persisted; the state volume is unavailable".into());
-        }
-        self.bump_epoch();
-        self.publish_now();
-        tracing::info!(job = job.0, by = ?by, cause = %control.cause, stage = %control.stage, "hold released");
-        self.emit(Event::JobControlChanged { job, control });
-        if !post_side {
-            let files: Vec<_> = before.files.iter().map(|f| f.id).collect();
-            for file in files {
-                self.after_file_change(job, file);
+        self.pending_control_commits.insert(job);
+        let epoch = self.job_epochs.get(&job).copied();
+        self.persist_then(move |owner, ok| {
+            if owner.job_epochs.get(&job).copied() != epoch {
+                return;
             }
-        }
+            owner.pending_control_commits.remove(&job);
+            let still_current = owner
+                .state
+                .job(job)
+                .and_then(Job::control)
+                .is_some_and(|current| current.revision == control.revision);
+            if !still_current {
+                return;
+            }
+            if !ok {
+                if let Some(current) = owner.state.job_mut(job) {
+                    let paused = current.status == JobStatus::Paused;
+                    current.set_control(&before.control().unwrap());
+                    current.status = if paused {
+                        JobStatus::Paused
+                    } else {
+                        before.status
+                    };
+                }
+            } else {
+                owner.emit(Event::JobControlChanged { job, control });
+                if !post_side {
+                    for file in before.files {
+                        owner.after_file_change(job, file.id);
+                    }
+                }
+            }
+            owner.publish_now();
+            owner.bump_epoch();
+        });
+        self.publish_now();
         Ok(())
     }
 
@@ -3823,6 +5366,13 @@ impl Owner {
     // -- completion cascade --------------------------------------------------
 
     fn after_file_change(&mut self, job: JobId, file: FileId) {
+        if self.pending_control_commits.contains(&job)
+            || self.cancel.is_cancelled()
+            || self.verification.contains_key(&job)
+            || self.retiring_writers.contains_key(&job)
+        {
+            return;
+        }
         if self.state.job(job).is_some_and(|j| j.held()) {
             return;
         }
@@ -3853,6 +5403,49 @@ impl Owner {
     }
 
     fn send_finalize(&mut self, job: JobId, file: FileId) {
+        if self.pending_control_commits.contains(&job)
+            || self.cancel.is_cancelled()
+            || self.verification.contains_key(&job)
+            || self.retiring_writers.contains_key(&job)
+        {
+            return;
+        }
+        let publication_key = format!("*File:publication:{}", file.0);
+        let Some(record) = self.state.job(job) else {
+            return;
+        };
+        let Some(entry) = record.files.iter().find(|entry| entry.id == file) else {
+            return;
+        };
+        let filename = entry.filename.clone();
+        if !record
+            .params
+            .iter()
+            .any(|(key, value)| key == &publication_key && value == &filename)
+        {
+            let owner_epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+            set_owner_param(
+                &mut self.state.job_mut(job).unwrap().params,
+                &publication_key,
+                Some(filename),
+            );
+            self.dirty = true;
+            self.persist_then(move |owner, ok| {
+                if owner.job_epochs.get(&job) == Some(&owner_epoch) {
+                    if ok {
+                        owner.send_finalize(job, file);
+                    } else {
+                        owner.hold_job(
+                            job,
+                            nzbd_types::HoldCause::StorageUnavailable,
+                            "finalize",
+                            "publication intent could not be persisted",
+                        );
+                    }
+                }
+            });
+            return;
+        }
         let Some(f) = self.state.file_mut(job, file) else {
             return;
         };
@@ -3926,15 +5519,22 @@ impl Owner {
             if !j.params.iter().any(|(k, _)| k == &key) {
                 j.params.push((key, file_size.to_string()));
                 self.dirty = true;
-                if self.persist && !self.save_snapshot() {
-                    self.hold_job(
-                        job,
-                        nzbd_types::HoldCause::StorageUnavailable,
-                        "finalize",
-                        "partial checkpoint metadata could not be persisted",
-                    );
-                    return;
-                }
+                let epoch = self.job_epochs.get(&job).copied();
+                self.persist_then(move |owner, ok| {
+                    if owner.job_epochs.get(&job).copied() == epoch {
+                        if ok {
+                            owner.send_finalize(job, file);
+                        } else {
+                            owner.hold_job(
+                                job,
+                                nzbd_types::HoldCause::StorageUnavailable,
+                                "finalize",
+                                "partial checkpoint metadata could not be persisted",
+                            );
+                        }
+                    }
+                });
+                return;
             }
             let tx = self.writer_for(job, file);
             match tx.try_send(WriteCmd::SealPartial {
@@ -3946,7 +5546,9 @@ impl Owner {
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => self.pending_finalize.push((job, file)),
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    self.writers.remove(&file);
+                    if let Some(writer) = self.writers.remove(&file) {
+                        self.retire_writer_handle(job, writer);
+                    }
                     self.pending_finalize.push((job, file));
                 }
             }
@@ -3965,15 +5567,22 @@ impl Owner {
                 .params
                 .retain(|(name, _)| name != &key);
             self.dirty = true;
-            if self.persist && !self.save_snapshot() {
-                self.hold_job(
-                    job,
-                    nzbd_types::HoldCause::StorageUnavailable,
-                    "finalize",
-                    "complete checkpoint metadata could not be persisted",
-                );
-                return;
-            }
+            let epoch = self.job_epochs.get(&job).copied();
+            self.persist_then(move |owner, ok| {
+                if owner.job_epochs.get(&job).copied() == epoch {
+                    if ok {
+                        owner.send_finalize(job, file);
+                    } else {
+                        owner.hold_job(
+                            job,
+                            nzbd_types::HoldCause::StorageUnavailable,
+                            "finalize",
+                            "complete checkpoint metadata could not be persisted",
+                        );
+                    }
+                }
+            });
+            return;
         }
         let filename = self
             .state
@@ -3996,7 +5605,9 @@ impl Owner {
                 self.pending_finalize.push((job, file)); // retried on tick
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.writers.remove(&file);
+                if let Some(writer) = self.writers.remove(&file) {
+                    self.retire_writer_handle(job, writer);
+                }
                 self.pending_finalize.push((job, file)); // respawn on retry
             }
         }
@@ -4010,7 +5621,10 @@ impl Owner {
         final_path: Option<PathBuf>,
         combined_crc: Option<u32>,
     ) {
-        self.writers.remove(&file);
+        if let Some(writer) = self.writers.remove(&file) {
+            self.retire_writer_handle(job, writer);
+        }
+        self.writer_epochs.remove(&file);
         self.finalize_sent.remove(&file);
         self.file_sizes.remove(&file);
         let Some(f) = self.state.file_mut(job, file) else {
@@ -4073,12 +5687,33 @@ impl Owner {
         }
         *self.pending_name_inspections.entry(job).or_default() += 1;
         let tx = self.engine_tx.clone();
+        let generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+        let inventory = self.artifacts.clone();
+        let cancellation = self.cancel.clone();
         self.tracker.spawn_blocking(move || {
-            let name = read_par2_name(&path);
+            let checkpoint = || {
+                if cancellation.is_cancelled() {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "name inspection cancelled",
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+            let guard = inventory.acquire_terminal_use(job.0, &checkpoint);
+            let name = match guard {
+                Ok(Some(_guard)) if checkpoint().is_ok() => read_par2_name(&path),
+                _ => None,
+            };
             // This runs on the blocking pool, so waiting for channel room
             // cannot stall the queue owner. Every inspection must answer,
             // including a negative one, or completion could wait forever.
-            let _ = tx.blocking_send(EngineMsg::JobNameInspected { job, name });
+            let _ = tx.blocking_send(EngineMsg::ScopedNameInspected {
+                job,
+                generation,
+                name,
+            });
         });
     }
 
@@ -4151,6 +5786,13 @@ impl Owner {
     }
 
     fn check_job_complete(&mut self, job_id: JobId) {
+        if self.pending_control_commits.contains(&job_id)
+            || self.cancel.is_cancelled()
+            || self.verification.contains_key(&job_id)
+            || self.retiring_writers.contains_key(&job_id)
+        {
+            return;
+        }
         if self.state.job(job_id).is_some_and(|j| j.held()) {
             return;
         }
@@ -4248,17 +5890,38 @@ impl Owner {
         }
         // Persist and publish BEFORE emitting: an event subscriber that
         // immediately reads the snapshot must see the resulting state.
-        self.save_snapshot();
-        self.publish_now();
-        if resume_post_stage.is_some() {
-            return;
-        }
-        self.emit(Event::JobFinished {
-            job: job_id,
-            name,
-            status,
-            health: health.0,
+        let epoch = self.job_epochs.get(&job_id).copied();
+        self.pending_control_commits.insert(job_id);
+        self.persist_then(move |owner, ok| {
+            if owner.job_epochs.get(&job_id).copied() != epoch {
+                return;
+            }
+            owner.pending_control_commits.remove(&job_id);
+            if ok
+                && owner
+                    .state
+                    .job(job_id)
+                    .is_some_and(|job| job.status == status && !job.held())
+            {
+                owner.publish_now();
+                if resume_post_stage.is_none() {
+                    owner.emit(Event::JobFinished {
+                        job: job_id,
+                        name,
+                        status,
+                        health: health.0,
+                    });
+                }
+            } else if !ok {
+                owner.hold_job(
+                    job_id,
+                    nzbd_types::HoldCause::StorageUnavailable,
+                    "completion",
+                    "download completion checkpoint is not durable",
+                );
+            }
         });
+        self.publish_now();
     }
 
     // -- servers -------------------------------------------------------------
@@ -4293,34 +5956,110 @@ impl Owner {
     /// Only for new admissions, before any segments or writers exist. Existing
     /// jobs must retain their committed allocation and go through ownership
     /// review if it becomes unavailable.
-    fn allocate_new_payload(&mut self, job: JobId) -> Result<(), nzbd_state::artifacts::Error> {
-        let record = self
-            .state
-            .job(job)
-            .ok_or(nzbd_state::artifacts::Error::NotFound)?;
-        let base = job_dir_name(record);
-        let occupied = |name: &str| {
-            self.dest_dir.join(name).symlink_metadata().is_ok()
-                || self
-                    .state
-                    .jobs
-                    .iter()
-                    .any(|j| j.id != job && job_dir_name(j) == name)
+    fn allocate_new_payload_then(
+        &mut self,
+        job: JobId,
+        callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
+    ) {
+        let Some(record) = self.state.job(job).cloned() else {
+            callback(
+                self,
+                Err(nzbd_state::StateError::Corrupt(
+                    "job vanished before allocation".into(),
+                )),
+            );
+            return;
         };
-        if occupied(&base) {
-            let mut suffix = 0u32;
-            loop {
-                let candidate = format!("{base}.job-{}-{suffix}", job.0);
-                if !occupied(&candidate) {
-                    self.state.job_mut(job).unwrap().dir_name = candidate;
-                    break;
+        let inventory = self.artifacts.clone();
+        let root = self.dest_dir.clone();
+        let occupied = self
+            .state
+            .jobs
+            .iter()
+            .filter(|candidate| candidate.id != job)
+            .map(job_dir_name)
+            .collect::<HashSet<_>>();
+        let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+        self.allocating_jobs.insert(job);
+        self.io_then(
+            move || {
+                let base = job_dir_name(&record);
+                let mut suffix = 0_u32;
+                let (name, path) = loop {
+                    let name = if suffix == 0 {
+                        base.clone()
+                    } else {
+                        format!("{base}.job-{}-{}", job.0, suffix - 1)
+                    };
+                    let path = root.join(&name);
+                    let on_disk = path
+                        .try_exists()
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    let inventoried = inventory
+                        .for_path(&path)
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
+                        .is_some();
+                    if !occupied.contains(&name) && !on_disk && !inventoried {
+                        break (name, path);
+                    }
+                    suffix = suffix.checked_add(1).ok_or_else(|| {
+                        nzbd_state::StateError::Corrupt("no free payload directory name".into())
+                    })?;
+                };
+                let keep = record
+                    .params
+                    .iter()
+                    .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
+                let allocation = inventory
+                    .allocate_for_delivery_with_keep(
+                        job.0,
+                        &root,
+                        &path,
+                        record.lifecycle_eligible(),
+                        record.delivery_lifecycle,
+                        keep,
+                    )
+                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                Ok((name, allocation))
+            },
+            move |owner, result| {
+                owner.allocating_jobs.remove(&job);
+                if owner.job_epochs.get(&job) != Some(&epoch) {
+                    callback(
+                        owner,
+                        Err(nzbd_state::StateError::Corrupt(
+                            "allocation generation retired".into(),
+                        )),
+                    );
+                    return;
                 }
-                suffix = suffix.checked_add(1).ok_or_else(|| {
-                    nzbd_state::artifacts::Error::Conflict("no free payload directory name".into())
-                })?;
-            }
+                let result = result.map(|(name, allocation)| {
+                    if let Some(record) = owner.state.job_mut(job) {
+                        record.dir_name = name;
+                    }
+                    owner.allocation_cache.insert(job, allocation);
+                    owner.allocated_jobs.insert(job);
+                    owner.bump_epoch();
+                });
+                callback(owner, result);
+            },
+        );
+    }
+
+    #[cfg(test)]
+    fn allocate_new_payload(&mut self, job: JobId) -> Result<(), nzbd_state::artifacts::Error> {
+        if self.allocated_jobs.contains(&job) {
+            return Ok(());
         }
-        self.ensure_allocation(job, true)
+        self.allocate_new_payload_then(job, |owner, result| {
+            if let Err(error) = result {
+                tracing::warn!(%error,"payload allocation failed");
+                owner.publish_now();
+            }
+        });
+        Err(nzbd_state::artifacts::Error::Conflict(
+            "payload allocation pending".into(),
+        ))
     }
 
     fn ensure_allocation(
@@ -4333,84 +6072,345 @@ impl Owner {
                 "writer retirement in progress".into(),
             ));
         }
-        if self.allocated_jobs.contains(&job) {
+        if self.allocated_jobs.contains(&job) && self.allocation_cache.contains_key(&job) {
             return Ok(());
+        }
+        if self.allocating_jobs.contains(&job) {
+            return Err(nzbd_state::artifacts::Error::Conflict(
+                "payload allocation pending".into(),
+            ));
         }
         let record = self
             .state
             .job(job)
+            .cloned()
             .ok_or(nzbd_state::artifacts::Error::NotFound)?;
-        if let Some(existing) = self.artifacts.for_job(job.0)? {
-            self.artifacts.allocate_for_delivery(
-                job.0,
-                &existing.root,
-                &existing.path,
-                record.lifecycle_eligible(),
-                record.delivery_lifecycle,
-            )?;
-            self.allocated_jobs.insert(job);
-            return Ok(());
-        }
-        let dir = self.dest_dir.join(job_dir_name(record));
-        let keep_on_failure = record
-            .params
-            .iter()
-            .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
-        self.artifacts.allocate_for_delivery_with_keep(
-            job.0,
-            &self.dest_dir,
-            &dir,
-            record.lifecycle_eligible(),
-            record.delivery_lifecycle,
-            keep_on_failure,
-        )?;
-        self.allocated_jobs.insert(job);
-        Ok(())
+        let inventory = self.artifacts.clone();
+        let root = self.dest_dir.clone();
+        let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+        self.allocating_jobs.insert(job);
+        self.io_then(
+            move || {
+                let result = if let Some(existing) = inventory
+                    .for_job(job.0)
+                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
+                {
+                    inventory.allocate_for_delivery(
+                        job.0,
+                        &existing.root,
+                        &existing.path,
+                        record.lifecycle_eligible(),
+                        record.delivery_lifecycle,
+                    )
+                } else {
+                    let keep = record
+                        .params
+                        .iter()
+                        .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
+                    inventory.allocate_for_delivery_with_keep(
+                        job.0,
+                        &root,
+                        &root.join(job_dir_name(&record)),
+                        record.lifecycle_eligible(),
+                        record.delivery_lifecycle,
+                        keep,
+                    )
+                };
+                result.map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))
+            },
+            move |owner, result| {
+                owner.allocating_jobs.remove(&job);
+                if owner.job_epochs.get(&job) != Some(&epoch) {
+                    return;
+                }
+                match result {
+                    Ok(allocation) => {
+                        owner.allocation_cache.insert(job, allocation);
+                        owner.allocated_jobs.insert(job);
+                        owner.bump_epoch();
+                    }
+                    Err(error) => {
+                        owner.hold_job(
+                            job,
+                            allocation_hold_cause(&error.to_string()),
+                            "download_write",
+                            &error.to_string(),
+                        );
+                    }
+                }
+                owner.publish_now();
+            },
+        );
+        Err(nzbd_state::artifacts::Error::Conflict(
+            "payload allocation pending".into(),
+        ))
     }
 
     fn writer_for(&mut self, job: JobId, file: FileId) -> mpsc::Sender<WriteCmd> {
-        if let Some(h) = self.writers.get(&file) {
-            if !h.tx.is_closed() {
-                return h.tx.clone();
+        let closed = || {
+            let (tx, rx) = mpsc::channel(1);
+            drop(rx);
+            tx
+        };
+        if self.pending_control_commits.contains(&job)
+            || self.cancel.is_cancelled()
+            || self.verification.contains_key(&job)
+            || self.retiring_writers.contains_key(&job)
+        {
+            return closed();
+        }
+        if let Some(writer) = self.writers.get(&file) {
+            if !writer.tx.is_closed() && !writer.stop.is_cancelled() {
+                return writer.tx.clone();
+            }
+            if !*writer.stopped.borrow() {
+                self.retire_job_writers(job);
+                return closed();
             }
         }
-        let (job_dir, filename) = match self.state.job(job) {
-            Some(j) => (
-                job_dir_name(j),
-                j.files
-                    .iter()
-                    .find(|f| f.id == file)
-                    .map(|f| f.filename.clone())
-                    .unwrap_or_else(|| format!("file-{}", file.0)),
-            ),
-            None => (format!("job-{}", job.0), format!("file-{}", file.0)),
-        };
-        // `job_dir`, never `job.name`: a job that renamed itself from its
-        // par2 metadata mid-download must not split its files across two
-        // directories.
-        let dir = self
-            .artifacts
-            .for_job(job.0)
-            .ok()
-            .flatten()
-            .map(|a| a.path)
-            .unwrap_or_else(|| self.dest_dir.join(job_dir));
-        if let Err(e) = self.ensure_allocation(job, false) {
-            tracing::error!(job = job.0, error = %e, "writer held: allocation not committed");
-            let (tx, _) = mpsc::channel(1);
-            return tx;
+        if self.pending_writer_birth.contains_key(&file) {
+            return closed();
         }
-        let h = spawn_writer(
-            &self.tracker,
-            job,
-            file,
-            dir,
-            filename,
-            self.engine_tx.clone(),
+        self.writers.remove(&file);
+        self.writer_epochs.remove(&file);
+        if let Err(error) = self.ensure_allocation(job, false) {
+            tracing::warn!(job=job.0,%error,"writer allocation unavailable");
+            return closed();
+        }
+        let Some(allocation) = self.allocation_cache.get(&job).cloned() else {
+            return closed();
+        };
+        let Some(record) = self.state.job(job) else {
+            return closed();
+        };
+        let Some(entry) = record.files.iter().find(|entry| entry.id == file) else {
+            return closed();
+        };
+        let proven = entry
+            .segments
+            .iter()
+            .filter_map(|segment| match segment.state {
+                SegmentState::Done { offset, len, crc } => Some(ProvenRange {
+                    seg_number: segment.number,
+                    offset,
+                    len,
+                    crc,
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let proof_key = format!("*File:proof:{}", file.0);
+        let generation_key = format!("*File:generation:{}", file.0);
+        let mut proof = record
+            .params
+            .iter()
+            .find(|(key, _)| key == &proof_key)
+            .and_then(|(_, value)| serde_json::from_str::<DurableFileProof>(value).ok());
+        let old_generation = record
+            .params
+            .iter()
+            .find(|(key, _)| key == &generation_key)
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("");
+        if !proven.is_empty()
+            && !proof.as_ref().is_some_and(|proof| {
+                proof.covers(
+                    old_generation,
+                    &allocation.generation,
+                    &self.artifacts.installation,
+                    &proof.identity,
+                    &proven,
+                )
+            })
+        {
+            self.queue_verification(job);
+            return closed();
+        }
+        let expected_identity = proof.as_ref().map(|proof| proof.identity.clone());
+        let filename = record
+            .params
+            .iter()
+            .find(|(key, _)| key == &format!("*File:publication:{}", file.0))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| entry.filename.clone());
+        let generation = fresh_epoch();
+        let owner_epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+        if let Some(proof) = proof.as_mut() {
+            proof.generation = generation.to_string();
+            proof.ranges = proven.clone();
+        }
+        let record = self.state.job_mut(job).unwrap();
+        set_owner_param(
+            &mut record.params,
+            &generation_key,
+            Some(generation.to_string()),
         );
-        let tx = h.tx.clone();
-        self.writers.insert(file, h);
-        tx
+        if let Some(proof) = proof {
+            set_owner_param(
+                &mut record.params,
+                &proof_key,
+                serde_json::to_string(&proof).ok(),
+            );
+        }
+        self.pending_writer_birth.insert(file, generation);
+        self.dirty = true;
+        self.persist_then(move |owner, ok| {
+            if owner.pending_writer_birth.get(&file) != Some(&generation) {
+                return;
+            }
+            owner.pending_writer_birth.remove(&file);
+            if !ok
+                || owner.cancel.is_cancelled()
+                || owner.job_epochs.get(&job) != Some(&owner_epoch)
+                || owner.verification.contains_key(&job)
+                || owner.retiring_writers.contains_key(&job)
+                || owner
+                    .state
+                    .job(job)
+                    .is_none_or(|record| !record.files.iter().any(|entry| entry.id == file))
+            {
+                return;
+            }
+            let scope = WriterScope {
+                generation,
+                proven,
+                expected_identity,
+            };
+            let writer = spawn_writer_scoped(
+                &owner.tracker,
+                job,
+                file,
+                allocation.path,
+                filename,
+                owner.engine_tx.clone(),
+                scope,
+            );
+            owner.writer_epochs.insert(file, generation);
+            owner.writers.insert(file, writer);
+            owner.bump_epoch();
+        });
+        closed()
+    }
+
+    fn retire_writer_handle(&mut self, job: JobId, writer: WriterHandle) {
+        writer.stop.cancel();
+        if *writer.stopped.borrow() {
+            return;
+        }
+        let mut writers = self.retiring_writers.remove(&job).unwrap_or_default();
+        writers.push(writer);
+        let generation = fresh_epoch();
+        self.retirement_epochs.insert(job, generation);
+        self.retiring_writers.insert(job, writers.clone());
+        let engine = self.engine_tx.clone();
+        self.tracker.spawn(async move {
+            for mut writer in writers {
+                if writer.stopped.wait_for(|stopped| *stopped).await.is_err() {
+                    return;
+                }
+            }
+            let _ = engine
+                .send(EngineMsg::WritersStopped { job, generation })
+                .await;
+        });
+    }
+
+    fn retire_job_writers(&mut self, job: JobId) {
+        let files = self
+            .state
+            .job(job)
+            .map(|job| job.files.iter().map(|file| file.id).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let had_retirement = self.retiring_writers.contains_key(&job);
+        let mut writers = self.retiring_writers.remove(&job).unwrap_or_default();
+        for file in files {
+            self.writer_epochs.remove(&file);
+            self.pending_writer_birth.remove(&file);
+            if let Some(writer) = self.writers.remove(&file) {
+                writer.stop.cancel();
+                writers.push(writer);
+            }
+        }
+        if writers.is_empty() {
+            if had_retirement {
+                self.retiring_writers.insert(job, vec![]);
+            }
+            return;
+        }
+        let generation = fresh_epoch();
+        self.retirement_epochs.insert(job, generation);
+        self.retiring_writers.insert(job, writers.clone());
+        let engine = self.engine_tx.clone();
+        self.tracker.spawn(async move {
+            for mut writer in writers {
+                writer.stop.cancel();
+                if writer.stopped.wait_for(|stopped| *stopped).await.is_err() {
+                    return;
+                }
+            }
+            let _ = engine
+                .send(EngineMsg::WritersStopped { job, generation })
+                .await;
+        });
+    }
+
+    fn drain_replacements(&mut self) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        let count = self.deferred_replacements.len();
+        for _ in 0..count {
+            let Some(command) = self.deferred_replacements.pop_front() else {
+                break;
+            };
+            if matches!(&command, QueueCommand::AdoptReplicatedAuthority { .. }) {
+                let busy = self.state.jobs.iter().any(|job| {
+                    self.pending_name_inspections
+                        .get(&job.id)
+                        .is_some_and(|count| *count > 0)
+                        || self.retiring_writers.contains_key(&job.id)
+                        || self.post_admissions.contains_key(&job.id)
+                        || self
+                            .verification
+                            .get(&job.id)
+                            .is_some_and(|state| state.running)
+                        || job.files.iter().any(|file| {
+                            self.writers
+                                .get(&file.id)
+                                .is_some_and(|writer| !*writer.stopped.borrow())
+                        })
+                });
+                if busy {
+                    self.deferred_replacements.push_back(command);
+                } else {
+                    self.on_command(command);
+                }
+                continue;
+            }
+            let job = match &command {
+                QueueCommand::ImportJob { job, .. }
+                | QueueCommand::ImportJobIfPresent { job, .. } => job.id,
+                QueueCommand::RemoveJobSilent { job, .. } | QueueCommand::Delete { job, .. } => {
+                    *job
+                }
+                _ => continue,
+            };
+            if self
+                .pending_name_inspections
+                .get(&job)
+                .is_some_and(|count| *count > 0)
+                || self.retiring_writers.contains_key(&job)
+                || self.post_admissions.contains_key(&job)
+                || self
+                    .verification
+                    .get(&job)
+                    .is_some_and(|state| state.running)
+            {
+                self.deferred_replacements.push_back(command);
+                continue;
+            }
+            self.on_command(command);
+        }
     }
 
     // -- jobs ----------------------------------------------------------------
@@ -4524,69 +6524,67 @@ impl Owner {
         freed
     }
 
-    fn delete_job(&mut self, job_id: JobId, delete_files: bool) -> bool {
-        if delete_files {
-            return false;
+    fn delete_job_then(
+        &mut self,
+        job: JobId,
+        delete_files: bool,
+        callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
+    ) {
+        if delete_files
+            || self.state.job(job).is_none()
+            || self.post_admissions.contains_key(&job)
+            || self
+                .verification
+                .get(&job)
+                .is_some_and(|state| state.running)
+        {
+            callback(self, false);
+            return;
         }
-        let Some(idx) = self.state.jobs.iter().position(|j| j.id == job_id) else {
-            return false;
-        };
-        let retiring = match self.artifacts.prepare_forget(job_id.0) {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::error!(job=job_id.0,error=%e,"cannot forget payload ownership");
-                return false;
-            }
-        };
-        let mut stopping = self.retiring_writers.remove(&job_id).unwrap_or_default();
-        self.allocated_jobs.remove(&job_id);
-        let job = self.state.jobs.remove(idx);
-        for f in &job.files {
-            if let Some(writer) = self.writers.remove(&f.id) {
-                writer.stop.cancel();
-                stopping.push(writer);
-            }
-            self.file_sizes.remove(&f.id);
-            self.finalize_sent.remove(&f.id);
+        self.retire_job_writers(job);
+        if self
+            .retiring_writers
+            .get(&job)
+            .is_some_and(|writers| writers.iter().any(|writer| !*writer.stopped.borrow()))
+        {
+            callback(self, false);
+            return;
         }
-        if let Some(artifact) = retiring {
-            let inventory = self.artifacts.clone();
-            self.tracker.spawn(async move {
-                for mut writer in stopping {
-                    if writer.stopped.wait_for(|done| *done).await.is_err() { return; }
+        let epoch = self.job_epochs.get(&job).copied();
+        let inventory = self.artifacts.clone();
+        self.pending_control_commits.insert(job);
+        self.io_then(
+            move || {
+                let retiring = inventory
+                    .prepare_forget(job.0)
+                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                if let Some(artifact) = retiring {
+                    inventory
+                        .finish(job.0, &artifact.path, &artifact.root, "retained")
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
                 }
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Err(e) = inventory.finish(job_id.0, &artifact.path, &artifact.root, "retained") {
-                        tracing::error!(job=job_id.0,error=%e,"retired payload remains on review hold");
+                Ok(())
+            },
+            move |owner, result| {
+                owner.pending_control_commits.remove(&job);
+                if result.is_err() || owner.job_epochs.get(&job).copied() != epoch {
+                    callback(owner, false);
+                    return;
+                }
+                if !owner.remove_job_silent(job) {
+                    callback(owner, false);
+                    return;
+                }
+                owner.persist_then(move |owner, ok| {
+                    if ok {
+                        owner.publish_now();
+                        owner.emit(Event::JobDeleted { job });
+                        owner.bump_epoch();
                     }
-                }).await;
-            });
-        }
-        self.pending_finalize.retain(|(j, _)| *j != job_id);
-        self.attempts.retain(|r, _| r.job != job_id);
-        self.delegated.remove(&job_id);
-        self.mirror.remove(&job_id);
-        self.post_fetch_files.remove(&job_id);
-        if self.persist {
-            // A delete whose journal removal AND snapshot save both fail
-            // is resurrected by the next restart's recovery. The save
-            // failure already logs loudly; this one must too — if a
-            // deleted job "came back", this line is the receipt.
-            if let Err(e) = self.journal.remove_job(job_id) {
-                tracing::error!(
-                    job = job_id.0, error = %e,
-                    "could not remove the deleted job's journal — if the snapshot save also fails, this delete will not survive a restart"
-                );
-            }
-        }
-        // Destructive requests are completed by EngineHandle's inventory
-        // coordinator before this queue retirement command is sent.
-        tracing::info!(job = job_id.0, name = %job.name, delete_files, "job deleted");
-        self.save_snapshot();
-        self.publish_now();
-        self.emit(Event::JobDeleted { job: job_id });
-        self.bump_epoch();
-        true
+                    callback(owner, ok);
+                });
+            },
+        );
     }
 
     // -- tick / snapshot -----------------------------------------------------
@@ -4762,25 +6760,49 @@ impl Owner {
     }
 
     fn update_quota_guard(&mut self) {
-        if self.tuning.daily_quota_bytes > 0 || self.tuning.monthly_quota_bytes > 0 {
-            let (day, month) = self
-                .volumes
-                .cluster_totals(unix_now(), self.tuning.quota_start_day);
-            let was = self.quota_reached;
-            self.quota_reached = (self.tuning.daily_quota_bytes > 0
-                && day >= self.tuning.daily_quota_bytes)
-                || (self.tuning.monthly_quota_bytes > 0
-                    && month >= self.tuning.monthly_quota_bytes);
-            if self.quota_reached != was {
-                tracing::warn!(
-                    day,
-                    month,
-                    reached = self.quota_reached,
-                    "download quota state changed"
-                );
-                self.publish_guard_change(was, self.quota_reached);
-            }
+        if self.quota_probe_pending
+            || (self.tuning.daily_quota_bytes == 0 && self.tuning.monthly_quota_bytes == 0)
+        {
+            return;
         }
+        self.quota_probe_pending = true;
+        let book = self.volumes.clone();
+        let start_day = self.tuning.quota_start_day;
+        self.io_then(
+            move || Ok(book.peer_totals(unix_now(), start_day)),
+            move |owner, result| {
+                owner.quota_probe_pending = false;
+                let Ok((peers_day, peers_month)) = result else {
+                    return;
+                };
+                let day = peers_day.saturating_add(owner.volumes.doc().day_total(unix_now()));
+                let month = peers_month
+                    .saturating_add(owner.volumes.doc().month_total(unix_now(), start_day));
+                let was = owner.quota_reached;
+                owner.quota_reached = (owner.tuning.daily_quota_bytes > 0
+                    && day >= owner.tuning.daily_quota_bytes)
+                    || (owner.tuning.monthly_quota_bytes > 0
+                        && month >= owner.tuning.monthly_quota_bytes);
+                if was != owner.quota_reached {
+                    owner.publish_guard_change(was, owner.quota_reached);
+                }
+            },
+        );
+    }
+
+    fn save_volumes(&mut self) {
+        let book = self.volumes.clone();
+        let revision = book.revision();
+        self.io_then(
+            move || book.save_result(),
+            move |owner, result| {
+                if result.is_ok() {
+                    owner.volumes.acknowledge_save(revision);
+                } else {
+                    tracing::warn!(error=?result.err(),"volume counters save failed");
+                }
+            },
+        );
     }
 
     /// Publish every admission-guard transition. Releasing a hold also
@@ -4795,6 +6817,10 @@ impl Owner {
     }
 
     fn on_tick(&mut self) {
+        self.owner_heartbeat
+            .store(unix_now() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.drain_replacements();
+        self.start_verifications();
         let tick_started = Instant::now();
         self.flush_backend_commands();
         // The adapter publishes its latest-value progress sample before a
@@ -4822,7 +6848,7 @@ impl Owner {
         let mut volumes_ms = 0u64;
         if self.guard_tick.is_multiple_of(30) {
             let t = Instant::now();
-            self.volumes.save_if_dirty();
+            self.save_volumes();
             volumes_ms = t.elapsed().as_millis() as u64;
         }
 
@@ -4863,9 +6889,7 @@ impl Owner {
         let publish_ms = t.elapsed().as_millis() as u64;
 
         let sync_started = Instant::now();
-        if let Err(e) = self.journal.sync() {
-            tracing::error!(error = %e, "journal fsync failed");
-        }
+        self.sync_journal();
         let sync_ms = sync_started.elapsed().as_millis() as u64;
 
         let t = Instant::now();
@@ -5229,17 +7253,15 @@ impl Owner {
             .jobs
             .iter()
             .filter(|job| {
-                job.torrent
-                    .as_ref()
-                    .is_some_and(|torrent| torrent.removal_outcome.is_some())
+                !self.pending_control_commits.contains(&job.id)
+                    && job
+                        .torrent
+                        .as_ref()
+                        .is_some_and(|torrent| torrent.removal_outcome.is_some())
             })
             .cloned()
             .collect::<Vec<_>>();
         if pending.is_empty() {
-            return;
-        }
-
-        if self.persist && !self.save_snapshot() {
             return;
         }
 
@@ -5292,26 +7314,24 @@ impl Owner {
                 seq: 0,
             };
 
-            let recorded = match &self.history {
-                Some(history) => match history.record_seq_durable(&entry) {
-                    Ok(_) => true,
-                    Err(error) => {
-                        tracing::warn!(
-                            job = job.id.0,
-                            error = %error,
-                            "torrent removal confirmed but terminal history is not durable; retaining queue record for retry"
-                        );
-                        false
-                    }
-                },
-                // Embedded engine users may omit history. The daemon always
-                // supplies it; preserving the old behavior here keeps the
-                // engine's standalone test and library surface usable.
-                None => true,
-            };
-            if recorded {
-                self.delete_job(job.id, false);
-            }
+            let job_id = job.id;
+            let epoch = self.job_epochs.get(&job_id).copied();
+            self.pending_control_commits.insert(job_id);
+            self.persist_then(move|owner,committed| {
+                if !committed || owner.job_epochs.get(&job_id).copied()!=epoch {
+                    owner.pending_control_commits.remove(&job_id);return;
+                }
+                let history=owner.history.clone();
+                owner.io_then(move||{
+                    if let Some(history)=history{history.record_seq_durable(&entry).map_err(|error|nzbd_state::StateError::Corrupt(error.to_string()))?;}
+                    Ok(())
+                },move|owner,result|{
+                    owner.pending_control_commits.remove(&job_id);
+                    if owner.job_epochs.get(&job_id).copied()!=epoch{return;}
+                    if result.is_ok(){owner.delete_job_then(job_id,false,|_,_|{});}
+                    else if let Err(error)=result{tracing::warn!(job=job_id.0,%error,"confirmed torrent remains queued until history is durable");}
+                });
+            });
         }
     }
 
@@ -5320,26 +7340,91 @@ impl Owner {
     /// by the caller, so an unrecorded request cannot become idempotently
     /// stuck or reach the engine.
     fn persist_then_command(&mut self, command: BackendCommand) -> bool {
-        // Never let a later request bypass one already retained by a full
-        // adapter FIFO. Refusing at the bound happens before persistence, so
-        // the durable queue remains consistent with the reported result.
-        if !self.pending_backend_commands.is_empty() {
-            if self.pending_backend_commands.len() == MAX_PENDING_BACKEND_COMMANDS {
-                return false;
-            }
-            if self.persist && !self.save_snapshot() {
-                return false;
-            }
-            self.pending_backend_commands.push_back(command);
-            return true;
-        }
-
-        // Worker-mode engines do not own queue persistence. That is an
-        // intentional configuration, not a failed durability barrier.
-        if self.persist && !self.save_snapshot() {
+        if self.pending_backend_commands.len() >= MAX_PENDING_BACKEND_COMMANDS {
             return false;
         }
-        self.enqueue_backend_command(command)
+        let job = match &command {
+            BackendCommand::Start { job }
+            | BackendCommand::Pause { job }
+            | BackendCommand::PauseForSeedPolicy { job }
+            | BackendCommand::PauseForStorage { job }
+            | BackendCommand::PauseForScheduler { job }
+            | BackendCommand::Resume { job }
+            | BackendCommand::Remove { job, .. }
+            | BackendCommand::SetPriority { job, .. } => Some(*job),
+            _ => None,
+        };
+        let epoch = job.and_then(|job| self.job_epochs.get(&job).copied());
+        let control_epoch = job.and_then(|job| self.control_epochs.get(&job).copied());
+        let requested = job
+            .and_then(|job| self.state.job(job))
+            .and_then(|record| record.torrent.as_ref())
+            .cloned();
+        let policy_pause = matches!(command, BackendCommand::PauseForSeedPolicy { .. });
+        self.persist_then(move |owner, ok| {
+            let lifetime_current = job.is_none_or(|job| {
+                owner.state.job(job).is_some() && owner.job_epochs.get(&job).copied() == epoch
+            });
+            let control_current =
+                job.is_none_or(|job| owner.control_epochs.get(&job).copied() == control_epoch);
+            let desired_current = job.is_none_or(|job| {
+                match (
+                    owner
+                        .state
+                        .job(job)
+                        .and_then(|record| record.torrent.as_ref()),
+                    requested.as_ref(),
+                ) {
+                    (Some(current), Some(requested)) => {
+                        current.control_intent == requested.control_intent
+                            && current.stop_reason == requested.stop_reason
+                            && current.removal_intent == requested.removal_intent
+                            && current.seed_policy == requested.seed_policy
+                    }
+                    (None, None) => true,
+                    _ => false,
+                }
+            });
+            if lifetime_current
+                && control_current
+                && desired_current
+                && ok
+                && !owner.cancel.is_cancelled()
+            {
+                if owner.enqueue_backend_command(command) {
+                    return;
+                }
+            }
+            // The only automatic caller is seed policy. A failed/stale barrier
+            // must make that policy eligible for retry, while preserving every
+            // newer user control, byte counter, receipt, category and stage.
+            if policy_pause && lifetime_current && desired_current {
+                if let Some(job) = job {
+                    if let Some(record) = owner.state.job_mut(job) {
+                        if let Some(torrent) = record.torrent.as_mut() {
+                            if torrent.control_intent == TorrentControlIntent::Paused
+                                && torrent.phase == TorrentPhase::Seeding
+                            {
+                                torrent.control_intent = TorrentControlIntent::Running;
+                                torrent.stop_reason = None;
+                                if record.status == JobStatus::Paused {
+                                    record.status = JobStatus::Completed;
+                                }
+                                owner.dirty = true;
+                            }
+                        }
+                    }
+                }
+                owner.publish_now();
+                owner.bump_epoch();
+            }
+            if !ok {
+                tracing::warn!(
+                    "backend policy control remains eligible for retry after persistence recovers"
+                );
+            }
+        });
+        true
     }
 
     /// Preserve the one backend FIFO's ordering even when a previous send had
@@ -5448,6 +7533,10 @@ impl Owner {
                     .map(|s| s.size as u64)
                     .sum();
                 let mut summary = JobSummary {
+                    verification: self
+                        .verification
+                        .get(&j.id)
+                        .map(VerificationState::progress),
                     repair_progress: if !j.held()
                         && !j
                             .params
@@ -5579,6 +7668,15 @@ impl Owner {
                     }
                     if m.done_articles > 0 && summary.status == JobStatus::Queued {
                         summary.status = JobStatus::Downloading;
+                    }
+                }
+                if self.verification.contains_key(&j.id)
+                    || self.retiring_writers.contains_key(&j.id)
+                    || self.pending_control_commits.contains(&j.id)
+                {
+                    summary.ready = false;
+                    if j.status != JobStatus::Paused && !j.held() {
+                        summary.status = JobStatus::Queued;
                     }
                 }
                 summary
@@ -5734,90 +7832,25 @@ impl Owner {
         self.shared.store(Arc::new(snap));
     }
 
-    fn save_snapshot(&mut self) -> bool {
-        match self.save_snapshot_result() {
-            Ok(saved) => saved,
-            Err(error) => {
-                self.on_snapshot_save_error(&error);
-                false
-            }
+    fn save_snapshot(&mut self) {
+        if self.background_save_pending {
+            return;
         }
+        self.background_save_pending = true;
+        let checkpoints = durable_seed_checkpoints(&self.state);
+        self.persist_then(move |owner, ok| {
+            owner.background_save_pending = false;
+            if ok {
+                owner.seed_checkpoints = checkpoints;
+            }
+        });
     }
 
     fn on_snapshot_save_error(&mut self, error: &nzbd_state::StateError) {
-        tracing::error!(
-            error = %error,
-            "snapshot save failed (fenced or io); demoting persistence until re-adopted"
-        );
+        tracing::error!(%error,"persistence failed; durable operations remain blocked");
         if matches!(error, nzbd_state::StateError::Corrupt(_)) {
             self.persist = false;
         }
-    }
-
-    fn save_snapshot_result(&mut self) -> Result<bool, nzbd_state::StateError> {
-        if !self.persist {
-            self.dirty = false;
-            return Ok(false);
-        }
-        self.state.sync_url_admission_receipts();
-        for receipt in &mut self.state.url_admission_receipts {
-            refresh_url_admission_custody(receipt, &self.artifacts);
-        }
-        let doc = self.state.to_doc();
-        let write_started = Instant::now();
-        let bytes = match &self.persist_guard {
-            Some(g) => {
-                let g = g.clone();
-                self.snap_store.save_guarded(&doc, &move || g())
-            }
-            None => self.snap_store.save(&doc),
-        }?;
-        // Duration and throughput, remembered for the adaptive spacing and
-        // said out loud when slow — "how fast is the state volume really?"
-        // must be answerable from the log, with numbers.
-        let ms = write_started.elapsed().as_millis() as u64;
-        self.last_save_ms = ms;
-        let mib_s = (bytes as f64 / (1 << 20) as f64) / (ms.max(1) as f64 / 1000.0);
-        if ms > 1000 {
-            tracing::warn!(
-                bytes,
-                ms,
-                throughput_mib_s = format!("{mib_s:.1}"),
-                "snapshot save is slow — saves are spaced out to compensate (the journal still protects progress)"
-            );
-        } else {
-            tracing::debug!(bytes, ms, "snapshot saved");
-        }
-        // The snapshot now embodies every folded segment: compact journals
-        // of jobs we own outright, plus orphaned job dirs (deleted jobs,
-        // stale zombies). Delegated jobs have live foreign writers — skip.
-        let known: HashSet<JobId> = self.state.jobs.iter().map(|j| j.id).collect();
-        if let Ok(entries) = std::fs::read_dir(self.journal.jobs_dir()) {
-            for entry in entries.flatten() {
-                let Some(id) = entry
-                    .file_name()
-                    .to_string_lossy()
-                    .parse::<u32>()
-                    .ok()
-                    .map(JobId)
-                else {
-                    continue;
-                };
-                // Known & not delegated: folded into the snapshot just
-                // written. Unknown: orphan from a deleted job or a stale
-                // lease. Delegated: live foreign writer — leave alone.
-                let _ = known; // clarity: both known and orphan compact
-                if !self.delegated.contains_key(&id) {
-                    if let Err(e) = self.journal.remove_job(id) {
-                        tracing::debug!(job = id.0, error = %e, "journal compact skip");
-                    }
-                }
-            }
-        }
-        self.dirty = false;
-        self.seed_checkpoints = durable_seed_checkpoints(&self.state);
-        self.last_save = Instant::now();
-        Ok(true)
     }
 
     fn emit(&self, ev: Event) {
@@ -5827,6 +7860,92 @@ impl Owner {
     fn bump_epoch(&self) {
         self.epoch_tx.send_modify(|v| *v += 1);
     }
+}
+
+/// Replay retains unknown evidence; only matching incarnation provenance can
+/// extend a current proof. An older generation can never resurrect retired bits.
+fn merge_replayed_proof(
+    state: &mut QueueState,
+    record: &JournalRecord,
+    raw: Option<&serde_json::Value>,
+    installation: &str,
+) -> bool {
+    let Some(job) = state.job_mut(record.job) else {
+        return false;
+    };
+    let Some(proof) =
+        raw.and_then(|raw| serde_json::from_value::<DurableFileProof>(raw.clone()).ok())
+    else {
+        return true;
+    };
+    let generation_key = format!("*File:generation:{}", record.file.0);
+    if job
+        .params
+        .iter()
+        .find(|(key, _)| key == &generation_key)
+        .is_some_and(|(_, generation)| generation != &proof.generation)
+    {
+        return false;
+    }
+    let range = ProvenRange {
+        seg_number: record.segment_number,
+        offset: record.offset,
+        len: record.len,
+        crc: record.crc32,
+    };
+    if proof.protocol != WRITER_PROTOCOL
+        || proof.installation != installation
+        || !proof.ranges.contains(&range)
+        || proof.generation.is_empty()
+        || proof.allocation_generation.is_empty()
+    {
+        return true;
+    }
+    let proof_key = format!("*File:proof:{}", record.file.0);
+    let existing = job
+        .params
+        .iter()
+        .find(|(key, _)| key == &proof_key)
+        .and_then(|(_, raw)| serde_json::from_str::<DurableFileProof>(raw).ok());
+    let merged = if let Some(mut existing) = existing {
+        if existing.generation != proof.generation
+            || existing.installation != proof.installation
+            || existing.allocation_generation != proof.allocation_generation
+            || !existing.identity.same_object(&proof.identity)
+        {
+            set_owner_param(&mut job.params, &proof_key, None);
+            return true;
+        }
+        for range in &proof.ranges {
+            if existing.ranges.contains(range) {
+                continue;
+            }
+            if existing
+                .ranges
+                .iter()
+                .any(|old| old.seg_number == range.seg_number || old.overlaps(range))
+            {
+                set_owner_param(&mut job.params, &proof_key, None);
+                return true;
+            }
+            existing.ranges.push(range.clone());
+        }
+        existing.identity = proof.identity;
+        existing
+    } else {
+        proof
+    };
+    set_owner_param(
+        &mut job.params,
+        &generation_key,
+        Some(merged.generation.clone()),
+    );
+    set_owner_param(
+        &mut job.params,
+        &proof_key,
+        serde_json::to_string(&merged).ok(),
+    );
+    true
 }
 
 fn refresh_url_admission_custody(
@@ -6179,9 +8298,285 @@ fn read_par2_name(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn guard_test_owner(tuning: Tuning) -> (tempfile::TempDir, Owner, watch::Receiver<u64>) {
-        let (tmp, owner, epoch, _adapter) = guard_test_owner_with_backend(tuning);
-        (tmp, owner, epoch)
+    /// Execute genuine ordered persistence/IO completions before observing a
+    /// direct Owner fixture. The worker remains asynchronous and its bounded
+    /// result channel is drained exactly as the production owner loop does.
+    async fn pump(owner: &mut Owner, messages: &mut mpsc::Receiver<EngineMsg>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                while let Ok(message) = messages.try_recv() { owner.on_msg(message); }
+                if owner.persistence.in_flight() == 0 && owner.persistence_callbacks.is_empty() && owner.io_callbacks.is_empty() {
+                    tokio::task::yield_now().await;
+                    match messages.try_recv() {
+                        Ok(message) => { owner.on_msg(message); continue; },
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => panic!("fixture result channel disconnected before worker completion"),
+                    }
+                }
+                tokio::select! {
+                    message = messages.recv() => owner.on_msg(message.expect("fixture worker result channel")),
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {},
+                }
+            }
+        }).await.expect("real persistence/IO worker did not reach an idle acknowledgement boundary");
+    }
+
+    async fn allocate_for_test(
+        owner: &mut Owner,
+        messages: &mut mpsc::Receiver<EngineMsg>,
+        job: JobId,
+        fresh: bool,
+    ) {
+        let first = if fresh {
+            owner.allocate_new_payload(job)
+        } else {
+            owner.ensure_allocation(job, false)
+        };
+        assert!(
+            first.is_ok() || owner.allocating_jobs.contains(&job),
+            "allocation was refused rather than scheduled: {first:?}"
+        );
+        pump(owner, messages).await;
+        let completed = if fresh {
+            owner.allocate_new_payload(job)
+        } else {
+            owner.ensure_allocation(job, false)
+        };
+        completed
+            .expect("real allocation callback must establish the requested fixture allocation");
+        pump(owner, messages).await;
+    }
+
+    /// Drive prerequisites through real actor completions until a work
+    /// request has a definitive answer; loading is not a successful lease.
+    async fn grant_work_for_test(
+        owner: &mut Owner,
+        messages: &mut mpsc::Receiver<EngineMsg>,
+        server: ServerId,
+        max: usize,
+    ) -> Vec<Lease> {
+        for _ in 0..(owner.state.jobs.len().saturating_mul(3) + 4) {
+            let leases = owner.grant_work(server, max);
+            let pending = owner.persistence.in_flight() != 0
+                || !owner.persistence_callbacks.is_empty()
+                || !owner.io_callbacks.is_empty();
+            pump(owner, messages).await;
+            if !leases.is_empty() || !pending {
+                return leases;
+            }
+        }
+        panic!("work prerequisites did not reach a definitive fixture transition");
+    }
+
+    #[tokio::test]
+    async fn blocked_io_lane_preserves_actor_reads_and_noop_controls_without_faking_durable_pause()
+    {
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        let mut checking = pending_job(1);
+        checking.status = JobStatus::Paused;
+        owner.state.jobs.push(checking);
+        owner.state.jobs.push(pending_job(2));
+        owner.queue_verification(JobId(1));
+        let before = serde_json::to_value(owner.state.to_doc()).unwrap();
+        let verification_before =
+            serde_json::to_value(owner.verification[&JobId(1)].progress()).unwrap();
+        let (started, started_rx) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completion = completed.clone();
+        owner.io_then(
+            move || {
+                let _ = started.send(());
+                held.recv().expect("explicit IO release barrier");
+                Ok(())
+            },
+            move |_, result| {
+                result.expect("real blocked worker result");
+                completion.store(true, std::sync::atomic::Ordering::Release);
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (reply, snapshot) = oneshot::channel();
+        owner.on_command(QueueCommand::RecoveryDocument { reply });
+        let document = tokio::time::timeout(Duration::from_millis(100), snapshot)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_value(document).unwrap(), before);
+        let (reply, noop) = oneshot::channel();
+        owner.on_command(QueueCommand::Pause {
+            job: JobId(1),
+            reply,
+        });
+        assert!(!tokio::time::timeout(Duration::from_millis(100), noop)
+            .await
+            .unwrap()
+            .unwrap());
+        assert_eq!(serde_json::to_value(owner.state.to_doc()).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(owner.verification[&JobId(1)].progress()).unwrap(),
+            verification_before
+        );
+        assert!(!completed.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            owner.persistence.in_flight(),
+            1,
+            "the blocked actual worker retains its slot"
+        );
+
+        let (reply, mut pause) = oneshot::channel();
+        owner.on_command(QueueCommand::Pause {
+            job: JobId(2),
+            reply,
+        });
+        assert!(
+            matches!(pause.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "a valid persistent intent cannot acknowledge through a blocked durability lane"
+        );
+        assert_eq!(owner.state.job(JobId(2)).unwrap().status, JobStatus::Paused);
+        assert_eq!(
+            serde_json::to_value(owner.verification[&JobId(1)].progress()).unwrap(),
+            verification_before
+        );
+        assert!(!completed.load(std::sync::atomic::Ordering::Acquire));
+
+        release.send(()).unwrap();
+        pump(&mut owner, &mut messages).await;
+        assert!(pause.await.unwrap());
+        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+        let saved = SnapshotStore::open(&owner.state_dir)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved
+                .jobs
+                .iter()
+                .find(|job| job.id == JobId(2))
+                .unwrap()
+                .status,
+            JobStatus::Paused
+        );
+        assert_eq!(
+            serde_json::to_value(owner.verification[&JobId(1)].progress()).unwrap(),
+            verification_before
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_shutdown_drains_real_writer_acknowledgement_behind_full_result_channel() {
+        let (tmp, mut owner, adapter, mut messages) = control_test_owner();
+        let mut job = pending_job(1);
+        job.files[0].segments[0].size = 5;
+        recompute_job_totals(&mut job);
+        let file = job.files[0].id;
+        owner.state.jobs.push(job);
+        allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
+        let directory = owner.allocation_cache[&JobId(1)].path.clone();
+        let tracker = owner.tracker.clone();
+        let writer = crate::writer::spawn_writer(
+            &tracker,
+            JobId(1),
+            file,
+            directory.clone(),
+            "payload.bin".into(),
+            owner.engine_tx.clone(),
+        );
+        owner.writers.insert(file, writer.clone());
+        owner.writer_epochs.insert(file, writer.generation);
+        // No owner is receiving yet, so this fills the real one-slot channel.
+        owner
+            .engine_tx
+            .try_send(EngineMsg::ConnectFailed {
+                server: ServerId(99),
+            })
+            .unwrap();
+        assert_eq!(owner.engine_tx.capacity(), 0);
+        writer
+            .tx
+            .send(WriteCmd::Segment {
+                seg_number: 1,
+                offset: 0,
+                data: b"hello".to_vec(),
+                crc: crc32fast::hash(b"hello"),
+                file_size: 5,
+                server: ServerId(1),
+            })
+            .await
+            .unwrap();
+        let partial = directory.join(format!(".runner-file-{}.part", file.0));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while std::fs::read(&partial).ok().as_deref() != Some(b"hello".as_slice()) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("real writer did not reach the acknowledgement barrier");
+        writer.stop.cancel();
+        assert!(
+            !*writer.stopped.borrow(),
+            "cancellation cannot stop a writer whose acknowledgement has no channel room"
+        );
+        assert_eq!(owner.engine_tx.capacity(), 0);
+
+        let handle = crate::EngineHandle {
+            artifacts: owner.artifacts.clone(),
+            cmd_tx: owner.engine_tx.clone(),
+            shared: owner.shared.clone(),
+            events: owner.events.clone(),
+            cancel: owner.cancel.clone(),
+            tracker: tracker.clone(),
+            backend_adapter: Arc::new(std::sync::Mutex::new(Some(adapter))),
+            budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
+            url_fetches: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            post_scope: None,
+            owner_heartbeat: owner.owner_heartbeat.clone(),
+            shutdown_complete: owner.shutdown_complete.clone(),
+        };
+        // Enter the actual owner task already cancelled; its shutdown drain
+        // must create channel room before it can wait for the writer.
+        handle.cancel.cancel();
+        tracker.spawn(owner.run(messages));
+        tracker.close();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+                .await
+                .expect("shutdown deadlocked behind a final writer acknowledgement")
+        );
+        assert!(*writer.stopped.borrow());
+        let saved = SnapshotStore::open(&tmp.path().join("state"))
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(saved.jobs[0].files[0].segments[0].state, SegmentState::Done { offset: 0, len: 5, crc } if crc == crc32fast::hash(b"hello"))
+        );
+        assert_eq!(std::fs::read(partial).unwrap(), b"hello");
+        assert!(
+            !tmp.path()
+                .join("state/unclean.control-test")
+                .try_exists()
+                .unwrap(),
+            "marker clears only after the accepted acknowledgement is durably captured"
+        );
+    }
+
+    fn guard_test_owner(
+        tuning: Tuning,
+    ) -> (
+        tempfile::TempDir,
+        Owner,
+        watch::Receiver<u64>,
+        mpsc::Receiver<EngineMsg>,
+    ) {
+        let (tmp, owner, epoch, _adapter, engine_messages) = guard_test_owner_with_backend(tuning);
+        (tmp, owner, epoch, engine_messages)
     }
 
     fn guard_test_owner_with_backend(
@@ -6191,15 +8586,17 @@ mod tests {
         Owner,
         watch::Receiver<u64>,
         crate::backend::BackendAdapterPort,
+        mpsc::Receiver<EngineMsg>,
     ) {
         let tmp = tempfile::tempdir().unwrap();
         let (budget_tx, _) = watch::channel(crate::pool::BudgetEnvelope::default());
         let (events, _) = broadcast::channel(1);
         let (epoch_tx, epoch_rx) = watch::channel(0);
-        let (engine_tx, _) = mpsc::channel(1);
+        let (engine_tx, engine_messages) = mpsc::channel(1);
         let (backend, adapter) = crate::backend::backend_channel(1, 1);
         let owner = Owner::recover(
             &tmp.path().join("state"),
+            None,
             None,
             tmp.path().join("dest"),
             Vec::new(),
@@ -6222,25 +8619,32 @@ mod tests {
             engine_tx,
             TaskTracker::new(),
             CancellationToken::new(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         )
         .unwrap();
-        (tmp, owner, epoch_rx, adapter)
+        (tmp, owner, epoch_rx, adapter, engine_messages)
     }
 
-    fn control_test_owner() -> (tempfile::TempDir, Owner, crate::backend::BackendAdapterPort) {
+    fn control_test_owner() -> (
+        tempfile::TempDir,
+        Owner,
+        crate::backend::BackendAdapterPort,
+        mpsc::Receiver<EngineMsg>,
+    ) {
         control_test_owner_with_persistence(true, None)
     }
 
-    #[test]
-    fn lifecycle_cohort_is_stamped_at_admission_not_later_url_allocation() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+    #[tokio::test]
+    async fn lifecycle_cohort_is_stamped_at_admission_not_later_url_allocation() {
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         let old = owner.state.admit_url(
             "old-fetching".into(),
             "http://example.test/old.nzb",
             None,
             0,
         );
-        owner.allocate_new_payload(old).unwrap();
+        allocate_for_test(&mut owner, &mut messages, old, true).await;
         let old_row = owner.state.job(old).unwrap();
         assert!(!old_row.lifecycle_eligible());
         assert!(
@@ -6259,7 +8663,7 @@ mod tests {
             0,
         );
         mark_new_lifecycle_cohort(owner.state.job_mut(new).unwrap());
-        owner.allocate_new_payload(new).unwrap();
+        allocate_for_test(&mut owner, &mut messages, new, true).await;
         let new_row = owner.state.job(new).unwrap();
         assert!(new_row.lifecycle_eligible());
         assert!(
@@ -6285,15 +8689,21 @@ mod tests {
     fn control_test_owner_with_persistence(
         persist: bool,
         persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-    ) -> (tempfile::TempDir, Owner, crate::backend::BackendAdapterPort) {
+    ) -> (
+        tempfile::TempDir,
+        Owner,
+        crate::backend::BackendAdapterPort,
+        mpsc::Receiver<EngineMsg>,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let (budget_tx, _) = watch::channel(crate::pool::BudgetEnvelope::default());
         let (events, _) = broadcast::channel(1);
         let (epoch_tx, _) = watch::channel(0);
-        let (engine_tx, _) = mpsc::channel(1);
+        let (engine_tx, engine_messages) = mpsc::channel(1);
         let (backend, adapter) = crate::backend::backend_channel(1, 1);
         let owner = Owner::recover(
             &tmp.path().join("state"),
+            None,
             None,
             tmp.path().join("dest"),
             Vec::new(),
@@ -6316,14 +8726,16 @@ mod tests {
             engine_tx,
             TaskTracker::new(),
             CancellationToken::new(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         )
         .unwrap();
-        (tmp, owner, adapter)
+        (tmp, owner, adapter, engine_messages)
     }
 
     #[tokio::test]
     async fn keep_on_failure_is_opt_in_and_snapshot_committed_before_ack() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(pending_job(1));
         let (reply, result) = oneshot::channel();
         owner.on_command(QueueCommand::SetKeepOnFailure {
@@ -6331,8 +8743,13 @@ mod tests {
             keep: true,
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(result.await.unwrap());
-        let saved = owner.snap_store.load().unwrap().unwrap();
+        let saved = SnapshotStore::open(&owner.state_dir)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
         assert!(saved.jobs[0]
             .params
             .iter()
@@ -6342,7 +8759,7 @@ mod tests {
         // source generation, then consulted by the real failed-payload
         // disposal path. The queue snapshot remains the authority only until
         // that generation exists.
-        owner.allocate_new_payload(JobId(1)).unwrap();
+        allocate_for_test(&mut owner, &mut messages, JobId(1), true).await;
         let source = owner.artifacts.for_job(1).unwrap().unwrap();
         assert!(source.keep_on_failure);
         std::fs::write(source.path.join("partial.bin"), b"failed partial payload").unwrap();
@@ -6363,8 +8780,13 @@ mod tests {
             keep: false,
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(result.await.unwrap());
-        let saved = owner.snap_store.load().unwrap().unwrap();
+        let saved = SnapshotStore::open(&owner.state_dir)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
         assert!(!saved.jobs[0]
             .params
             .iter()
@@ -6377,7 +8799,8 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_failed_job_can_keep_only_its_retained_delivery_source() {
-        let (tmp, mut owner, _adapter) = control_test_owner();
+        let (tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         let mut job = pending_job(57);
         job.status = JobStatus::Failed;
         owner.state.jobs.push(job);
@@ -6465,6 +8888,7 @@ mod tests {
             keep: true,
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(result.await.unwrap());
         assert!(owner.artifacts.get(&source_id).unwrap().keep_on_failure);
         assert!(owner.state.url_admission_receipts[0].keep_source_on_failure);
@@ -6479,6 +8903,7 @@ mod tests {
             keep: false,
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(result.await.unwrap());
         assert!(!owner.artifacts.get(&source_id).unwrap().keep_on_failure);
         assert!(!owner.state.url_admission_receipts[0].keep_source_on_failure);
@@ -6493,6 +8918,7 @@ mod tests {
             request_token: "keep-source-tombstone-57".into(),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(result.await.unwrap().unwrap().keep_source_on_failure);
         owner.artifacts.set_keep_on_failure(57, false).unwrap();
         let (reply, result) = oneshot::channel();
@@ -6500,6 +8926,7 @@ mod tests {
             request_token: "keep-source-tombstone-57".into(),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(!result.await.unwrap().unwrap().keep_source_on_failure);
         assert!(
             !owner
@@ -6513,7 +8940,8 @@ mod tests {
 
     #[tokio::test]
     async fn keep_request_does_not_succeed_after_source_generation_is_deleted() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         let mut job = pending_job(63);
         job.status = JobStatus::Failed;
         owner.state.jobs.push(job);
@@ -6540,6 +8968,7 @@ mod tests {
             keep: true,
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(!result.await.unwrap());
         assert!(!owner.state.jobs[0]
             .params
@@ -6549,7 +8978,8 @@ mod tests {
 
     #[tokio::test]
     async fn intact_publication_clears_previous_private_repair_marker() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         let mut job = pending_job(1);
         let file = job.files[0].id;
         job.params
@@ -6569,9 +8999,11 @@ mod tests {
                 tx,
                 stop: CancellationToken::new(),
                 stopped,
+                generation: 0,
             },
         );
         owner.send_finalize(JobId(1), file);
+        pump(&mut owner, &mut messages).await;
         assert!(!owner.state.job(JobId(1)).unwrap().file_needs_repair(file));
         assert!(matches!(
             rx.try_recv().unwrap(),
@@ -6588,19 +9020,23 @@ mod tests {
 
     #[tokio::test]
     async fn yenc_name_variations_keep_the_first_name_but_size_and_path_conflicts_hold() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         for id in 1..=3 {
             owner.state.jobs.push(pending_job(id));
         }
         let file = owner.state.job(JobId(1)).unwrap().files[0].id;
         owner.accept_file_metadata(JobId(1), file, "first.bin", 100);
+        pump(&mut owner, &mut messages).await;
         owner.accept_file_metadata(JobId(1), file, "different-obfuscated-name", 100);
+        pump(&mut owner, &mut messages).await;
         assert!(!owner.state.job(JobId(1)).unwrap().held());
         assert_eq!(
             owner.state.job(JobId(1)).unwrap().files[0].filename,
             "first.bin"
         );
         owner.accept_file_metadata(JobId(1), file, "third-name", 101);
+        pump(&mut owner, &mut messages).await;
         let control = owner.state.job(JobId(1)).unwrap().control().unwrap();
         assert_eq!(control.cause, "identity_conflict");
         assert_eq!(control.message, "conflicting yEnc declared size");
@@ -6608,18 +9044,20 @@ mod tests {
         for (id, name, size) in [(2, "../unsafe", 100), (3, "empty.bin", 0)] {
             let file = owner.state.job(JobId(id)).unwrap().files[0].id;
             owner.accept_file_metadata(JobId(id), file, name, size);
+            pump(&mut owner, &mut messages).await;
             assert!(owner.state.job(JobId(id)).unwrap().held());
         }
     }
 
     #[tokio::test]
     async fn payload_retirement_retries_keep_original_acknowledgements_and_fence_resume() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         std::fs::create_dir_all(&owner.dest_dir).unwrap();
         let job = pending_job(1);
         let file = job.files[0].id;
         owner.state.jobs.push(job);
-        owner.ensure_allocation(JobId(1), false).unwrap();
+        allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
         let (tx, _rx) = mpsc::channel(1);
         let (done, stopped) = watch::channel(false);
         owner.writers.insert(
@@ -6628,6 +9066,7 @@ mod tests {
                 tx,
                 stop: CancellationToken::new(),
                 stopped,
+                generation: 0,
             },
         );
         let (reply, rx) = oneshot::channel();
@@ -6635,6 +9074,7 @@ mod tests {
             job: JobId(1),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         let first = rx.await.unwrap().unwrap();
         assert_eq!(first.len(), 1);
         assert!(!*first[0].stopped.borrow());
@@ -6644,6 +9084,7 @@ mod tests {
             job: JobId(1),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(!rx.await.unwrap());
         assert!(owner.ensure_allocation(JobId(1), false).is_err());
         let (reply, rx) = oneshot::channel();
@@ -6651,6 +9092,7 @@ mod tests {
             job: JobId(1),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         let mut retry = rx.await.unwrap().unwrap();
         assert_eq!(retry.len(), 1);
         assert!(!*retry[0].stopped.borrow());
@@ -6694,7 +9136,8 @@ mod tests {
 
     #[tokio::test]
     async fn torrent_snapshot_reports_payload_progress_and_live_rates() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         let mut job = control_torrent_job();
         job.status = JobStatus::Downloading;
         let id = job.id;
@@ -6760,7 +9203,8 @@ mod tests {
 
     #[tokio::test]
     async fn seed_policy_stop_survives_restart_and_requires_a_new_policy_to_resume() {
-        let (_tmp, mut owner, mut adapter) = control_test_owner();
+        let (_tmp, mut owner, mut adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         let mut job = control_torrent_job();
         job.status = JobStatus::Downloading;
         let torrent = job.torrent.as_mut().unwrap();
@@ -6777,12 +9221,17 @@ mod tests {
             },
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(rx.await.unwrap());
         assert_eq!(
             adapter.next_command().await,
             Some(BackendCommand::PauseForSeedPolicy { job: JobId(1) })
         );
-        let persisted = owner.snap_store.load().unwrap().unwrap();
+        let persisted = SnapshotStore::open(&owner.state_dir)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
         let saved = persisted.jobs[0].torrent.as_ref().unwrap();
         assert!(saved.seed_policy.stop_on_complete);
         assert_eq!(
@@ -6799,6 +9248,7 @@ mod tests {
             job: JobId(1),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(!rx.await.unwrap());
 
         let (reply, rx) = oneshot::channel();
@@ -6807,6 +9257,7 @@ mod tests {
             policy: Default::default(),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(rx.await.unwrap());
         assert_eq!(
             owner.state.jobs[0].status,
@@ -6818,6 +9269,7 @@ mod tests {
             job: JobId(1),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(rx.await.unwrap());
         assert_eq!(
             owner.state.jobs[0].torrent.as_ref().unwrap().stop_reason,
@@ -6827,7 +9279,8 @@ mod tests {
 
     #[tokio::test]
     async fn torrent_missing_file_recovery_is_not_blocked_by_a_completed_seed_policy() {
-        let (tmp, mut owner, mut adapter) = control_test_owner();
+        let (tmp, mut owner, mut adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         let mut job = control_torrent_job();
         job.status = JobStatus::Paused;
         let torrent = job.torrent.as_mut().unwrap();
@@ -6841,8 +9294,10 @@ mod tests {
             job: JobId(1),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(rx.await.unwrap());
         owner.schedule_torrent_starts();
+        pump(&mut owner, &mut messages).await;
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), adapter.next_command())
                 .await
@@ -6854,7 +9309,11 @@ mod tests {
         assert_eq!(torrent.ready_at_unix, None);
         assert_eq!(torrent.content_path, None);
         assert!(torrent.seed_policy.stop_on_complete);
-        let persisted = owner.snap_store.load().unwrap().unwrap();
+        let persisted = SnapshotStore::open(&owner.state_dir)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
         assert_eq!(
             persisted.jobs[0].torrent.as_ref().unwrap().ready_at_unix,
             None
@@ -6879,8 +9338,11 @@ mod tests {
             .await
             .unwrap();
         owner.fold_backend_progress();
+        pump(&mut owner, &mut messages).await;
         owner.fold_backend_structural();
+        pump(&mut owner, &mut messages).await;
         owner.update_seed_policies(200);
+        pump(&mut owner, &mut messages).await;
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), adapter.next_command())
                 .await
@@ -6897,7 +9359,8 @@ mod tests {
 
     #[tokio::test]
     async fn torrent_storage_recovery_clears_the_stop_reason() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         let mut job = control_torrent_job();
         job.status = JobStatus::Paused;
         let torrent = job.torrent.as_mut().unwrap();
@@ -6906,6 +9369,7 @@ mod tests {
         torrent.stop_reason = Some(nzbd_types::TorrentStopReason::StorageFull);
         owner.state.jobs.push(job);
         owner.release_torrents_after_storage_recovery();
+        pump(&mut owner, &mut messages).await;
         let torrent = owner.state.jobs[0].torrent.as_ref().unwrap();
         assert_eq!(torrent.phase, TorrentPhase::Queued);
         assert_eq!(torrent.stop_reason, None);
@@ -6914,8 +9378,9 @@ mod tests {
 
     #[tokio::test]
     async fn seed_policy_save_failure_rolls_back_without_stopping_the_torrent() {
-        let (_tmp, mut owner, mut adapter) =
+        let (_tmp, mut owner, mut adapter, mut messages) =
             control_test_owner_with_persistence(true, Some(Arc::new(|| false)));
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(control_torrent_job());
         let (reply, rx) = oneshot::channel();
         owner.on_command(QueueCommand::SetTorrentSeedPolicy {
@@ -6926,6 +9391,7 @@ mod tests {
             },
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(!rx.await.unwrap());
         assert_eq!(
             owner.state.jobs[0].torrent.as_ref().unwrap().seed_policy,
@@ -6940,21 +9406,37 @@ mod tests {
 
     #[tokio::test]
     async fn torrent_control_is_persisted_before_fifo_delivery_and_is_idempotent() {
-        let (tmp, mut owner, mut adapter) = control_test_owner();
+        let (tmp, mut owner, mut adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(control_torrent_job());
 
-        let (reply, rx) = oneshot::channel();
+        let (reply, mut rx) = oneshot::channel();
         owner.on_command(QueueCommand::Pause {
             job: JobId(1),
             reply,
         });
+        assert!(
+            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "control acknowledgement must wait for the actual worker completion"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), adapter.next_command())
+                .await
+                .is_err(),
+            "backend delivery must wait for durable owner acceptance"
+        );
+        pump(&mut owner, &mut messages).await;
         assert!(rx.await.unwrap());
         assert_eq!(
             adapter.next_command().await,
             Some(BackendCommand::Pause { job: JobId(1) })
         );
 
-        let persisted = owner.snap_store.load().unwrap().unwrap();
+        let persisted = SnapshotStore::open(&owner.state_dir)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
         let torrent = persisted.jobs[0].torrent.as_ref().unwrap();
         assert_eq!(persisted.jobs[0].status, JobStatus::Paused);
         assert_eq!(torrent.control_intent, TorrentControlIntent::Paused);
@@ -6968,6 +9450,7 @@ mod tests {
             job: JobId(1),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(!rx.await.unwrap());
         assert!(
             tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
@@ -6983,8 +9466,10 @@ mod tests {
             job: JobId(1),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(rx.await.unwrap());
         owner.schedule_torrent_starts();
+        pump(&mut owner, &mut messages).await;
         assert_eq!(
             adapter.next_command().await,
             Some(BackendCommand::Start { job: JobId(1) })
@@ -6994,8 +9479,9 @@ mod tests {
 
     #[tokio::test]
     async fn failed_persistence_never_emits_a_torrent_control() {
-        let (_tmp, mut owner, mut adapter) =
+        let (_tmp, mut owner, mut adapter, mut messages) =
             control_test_owner_with_persistence(true, Some(Arc::new(|| false)));
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(control_torrent_job());
 
         let (reply, rx) = oneshot::channel();
@@ -7003,6 +9489,7 @@ mod tests {
             job: JobId(1),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
 
         assert!(!rx.await.unwrap());
         assert!(
@@ -7021,7 +9508,8 @@ mod tests {
 
     #[tokio::test]
     async fn full_backend_fifo_retries_retained_torrent_commands_in_order() {
-        let (_tmp, mut owner, mut adapter) = control_test_owner();
+        let (_tmp, mut owner, mut adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(control_torrent_job());
 
         let (reply, rx) = oneshot::channel();
@@ -7029,6 +9517,7 @@ mod tests {
             job: JobId(1),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(rx.await.unwrap());
         let (reply, rx) = oneshot::channel();
         owner.on_command(QueueCommand::SetPriority {
@@ -7036,6 +9525,7 @@ mod tests {
             priority: 77,
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(rx.await.unwrap());
         assert_eq!(owner.pending_backend_commands.len(), 1);
 
@@ -7055,7 +9545,8 @@ mod tests {
 
     #[tokio::test]
     async fn retained_backend_commands_precede_later_control_requests() {
-        let (_tmp, mut owner, mut adapter) = control_test_owner();
+        let (_tmp, mut owner, mut adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(control_torrent_job());
 
         for command in [
@@ -7070,6 +9561,7 @@ mod tests {
             },
         ] {
             owner.on_command(command);
+            pump(&mut owner, &mut messages).await;
         }
         assert_eq!(owner.pending_backend_commands.len(), 1);
         assert_eq!(
@@ -7082,8 +9574,10 @@ mod tests {
             job: JobId(1),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(rx.await.unwrap());
         owner.schedule_torrent_starts();
+        pump(&mut owner, &mut messages).await;
         assert_eq!(owner.pending_backend_commands.len(), 2);
 
         owner.flush_backend_commands();
@@ -7103,7 +9597,9 @@ mod tests {
 
     #[tokio::test]
     async fn worker_mode_torrent_controls_do_not_require_queue_persistence() {
-        let (_tmp, mut owner, mut adapter) = control_test_owner_with_persistence(false, None);
+        let (_tmp, mut owner, mut adapter, mut messages) =
+            control_test_owner_with_persistence(false, None);
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(control_torrent_job());
 
         let (reply, rx) = oneshot::channel();
@@ -7111,6 +9607,7 @@ mod tests {
             job: JobId(1),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
 
         assert!(rx.await.unwrap());
         assert_eq!(
@@ -7121,7 +9618,8 @@ mod tests {
 
     #[tokio::test]
     async fn retained_backend_commands_are_bounded_before_persisting_new_intent() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(control_torrent_job());
 
         for priority in 1..=MAX_PENDING_BACKEND_COMMANDS + 1 {
@@ -7131,6 +9629,7 @@ mod tests {
                 priority: priority as i32,
                 reply,
             });
+            pump(&mut owner, &mut messages).await;
             assert!(rx.await.unwrap());
         }
         assert_eq!(
@@ -7144,6 +9643,7 @@ mod tests {
             priority: (MAX_PENDING_BACKEND_COMMANDS + 2) as i32,
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(!rx.await.unwrap());
         assert_eq!(
             owner.pending_backend_commands.len(),
@@ -7155,9 +9655,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn latest_backend_progress_is_folded_without_a_fifo_backlog() {
-        let (_tmp, mut owner, adapter) = control_test_owner();
+    #[tokio::test]
+    async fn latest_backend_progress_is_folded_without_a_fifo_backlog() {
+        let (_tmp, mut owner, adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(control_torrent_job());
         for verified in 0..50_000 {
             adapter.progress(
@@ -7169,6 +9670,7 @@ mod tests {
             );
         }
         owner.fold_backend_progress();
+        pump(&mut owner, &mut messages).await;
         assert_eq!(
             owner
                 .state
@@ -7235,7 +9737,8 @@ mod tests {
 
     #[tokio::test]
     async fn url_download_allocates_fresh_directory_beside_retained_payload() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         let post = nzbd_nserv::build_post("release", &[("payload.bin", vec![7; 100])], 100);
         let parsed = nzbd_nzb::parse(post.nzb.as_bytes()).unwrap();
         let id = owner
@@ -7253,6 +9756,7 @@ mod tests {
             parsed: Box::new(parsed),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(result.await.unwrap());
         let job = owner.state.job(id).unwrap();
         assert_eq!(job.name, "release");
@@ -7270,7 +9774,11 @@ mod tests {
             b"retained bytes"
         );
         assert!(collision.is_dir());
-        let saved = owner.snap_store.load().unwrap().unwrap();
+        let saved = SnapshotStore::open(&owner.state_dir)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
         assert_eq!(
             saved.jobs.iter().find(|j| j.id == id).unwrap().dir_name,
             expected
@@ -7279,7 +9787,8 @@ mod tests {
 
     #[tokio::test]
     async fn allocation_refusal_holds_only_that_job_and_release_retries_it() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         owner.servers = Arc::new(vec![ServerDef {
             id: ServerId(1),
             name: "test".into(),
@@ -7300,11 +9809,16 @@ mod tests {
         owner.state.jobs = (1..=3).map(pending_job).collect();
         let conflict = owner.dest_dir.join("job-1");
         std::fs::create_dir_all(&conflict).unwrap();
-        let leases = owner.grant_work(ServerId(1), 1);
+        let leases = grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1).await;
         assert_eq!(leases.len(), 1, "a hold must not consume the lease budget");
         assert_eq!(leases[0].r.job, JobId(2));
         assert_eq!(owner.state.jobs[0].control().unwrap().cause, "allocation");
-        assert_eq!(owner.grant_work(ServerId(1), 1)[0].r.job, JobId(3));
+        assert_eq!(
+            grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1).await[0]
+                .r
+                .job,
+            JobId(3)
+        );
         let revision = owner.state.jobs[0].control().unwrap().revision;
         let (reply, rx) = oneshot::channel();
         owner.on_command(QueueCommand::ReleaseResourceHold {
@@ -7313,8 +9827,13 @@ mod tests {
             revision: revision.clone(),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(rx.await.unwrap());
-        assert!(owner.grant_work(ServerId(1), 1).is_empty());
+        assert!(
+            grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1)
+                .await
+                .is_empty()
+        );
         let held = owner.state.jobs[0].control().unwrap();
         assert_eq!(held.lifecycle, "held");
         assert!(held.revision.parse::<u64>().unwrap() > revision.parse::<u64>().unwrap());
@@ -7325,6 +9844,7 @@ mod tests {
             revision,
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(!rx.await.unwrap(), "stale release must be rejected");
         std::fs::remove_dir(&conflict).unwrap();
         let mut epoch = owner.epoch_tx.subscribe();
@@ -7336,9 +9856,15 @@ mod tests {
             revision: owner.state.jobs[0].control().unwrap().revision,
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(rx.await.unwrap());
         assert!(epoch.has_changed().unwrap());
-        assert_eq!(owner.grant_work(ServerId(1), 1)[0].r.job, JobId(1));
+        assert_eq!(
+            grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1).await[0]
+                .r
+                .job,
+            JobId(1)
+        );
     }
 
     use nzbd_types::HoldCause;
@@ -7346,35 +9872,46 @@ mod tests {
     /// The release an operator `resume` runs, minus the off-loop part: the
     /// custody check is done here exactly as `EngineHandle::release_hold`
     /// does it in `spawn_blocking`.
-    fn operator_retry(owner: &mut Owner, job: JobId) -> Result<(), String> {
+    async fn operator_retry(
+        owner: &mut Owner,
+        messages: &mut mpsc::Receiver<EngineMsg>,
+        job: JobId,
+    ) -> Result<(), String> {
         let control = owner.state.job(job).unwrap().control().unwrap();
         let custody_checked =
             control.post_side() && owner.artifacts.validate_post_retry(job.0).is_ok();
-        owner.retry_hold(job, &control.revision, RetryBy::Operator, custody_checked)
+        let result = owner.retry_hold(job, &control.revision, RetryBy::Operator, custody_checked);
+        pump(owner, messages).await;
+        result
     }
 
     #[tokio::test]
     async fn post_hold_retry_checks_revision_custody_and_stage_then_persists() {
-        let (tmp, mut owner, _adapter) = control_test_owner();
+        let (tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         let mut job = bare_job();
         job.dir_name = "pp".into();
         owner.state.jobs.push(job);
-        owner.ensure_allocation(JobId(1), false).unwrap();
+        allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
         assert!(owner.hold_job(JobId(1), HoldCause::PostFailure, "unpack", "tool failed"));
+        pump(&mut owner, &mut messages).await;
         let revision = owner.state.jobs[0].control().unwrap().revision;
         assert!(owner
             .retry_hold(JobId(1), "stale", RetryBy::Operator, true)
             .is_err());
+        pump(&mut owner, &mut messages).await;
         assert!(
             owner
                 .retry_hold(JobId(1), &revision, RetryBy::Operator, false)
                 .is_err(),
             "a post-side release needs its custody checked off-loop first"
         );
+        pump(&mut owner, &mut messages).await;
         assert_eq!(
             owner.retry_hold(JobId(1), &revision, RetryBy::Operator, true),
             Ok(())
         );
+        pump(&mut owner, &mut messages).await;
         assert_eq!(owner.state.jobs[0].status, JobStatus::PostQueued);
         let persisted = SnapshotStore::open(&tmp.path().join("state"))
             .unwrap()
@@ -7392,7 +9929,11 @@ mod tests {
             "unrecognised_stage",
             "why"
         ));
-        assert_eq!(operator_retry(&mut owner, JobId(1)), Ok(()));
+        pump(&mut owner, &mut messages).await;
+        assert_eq!(
+            operator_retry(&mut owner, &mut messages, JobId(1)).await,
+            Ok(())
+        );
         assert_eq!(owner.state.jobs[0].status, JobStatus::PostQueued);
     }
 
@@ -7402,7 +9943,8 @@ mod tests {
     /// same save as the hold.
     #[tokio::test]
     async fn storage_errno_writer_error_schedules_itself() {
-        let (tmp, mut owner, _adapter) = control_test_owner();
+        let (tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(pending_job(1));
         let before = unix_now();
         owner.on_msg(EngineMsg::WriterError {
@@ -7410,6 +9952,7 @@ mod tests {
             file: FileId(10),
             error: "write /processing/x/.runner-file-10.part: Transport endpoint is not connected (os error 107)".into(),
         });
+        pump(&mut owner, &mut messages).await;
         let held = owner.state.jobs[0].control().unwrap();
         assert_eq!(held.cause, "storage_unavailable");
         assert_eq!(held.retry_policy, "scheduled_retry");
@@ -7439,6 +9982,7 @@ mod tests {
             owner.retry_hold(JobId(1), &held.revision, RetryBy::Recovery, false),
             Ok(())
         );
+        pump(&mut owner, &mut messages).await;
         let job = &owner.state.jobs[0];
         assert!(!job.held());
         assert_eq!(
@@ -7459,6 +10003,7 @@ mod tests {
             "download_write",
             "still ENOTCONN"
         ));
+        pump(&mut owner, &mut messages).await;
         let again = owner.state.jobs[0].control().unwrap();
         assert_eq!(again.retry_attempt, 2);
         assert!(again.next_retry_at_unix.unwrap() >= unix_now() + 59);
@@ -7493,13 +10038,15 @@ mod tests {
     /// waits for a person instead of re-checking a whole file forever.
     #[tokio::test]
     async fn permanent_writer_error_waits_for_review() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(pending_job(1));
         owner.on_msg(EngineMsg::WriterError {
             job: JobId(1),
             file: FileId(10),
             error: "finalize: complete checkpoint digest differs".into(),
         });
+        pump(&mut owner, &mut messages).await;
         let held = owner.state.jobs[0].control().unwrap();
         assert_eq!(
             (held.cause.as_str(), held.stage.as_str()),
@@ -7513,11 +10060,13 @@ mod tests {
                 .is_ok(),
             "the owner itself does not police policy; the recovery task never asks"
         );
+        pump(&mut owner, &mut messages).await;
     }
 
     #[tokio::test]
     async fn paused_hold_waits_for_the_operator_and_followers_never_auto_release() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(pending_job(1));
         assert!(owner.hold_job(
             JobId(1),
@@ -7525,12 +10074,14 @@ mod tests {
             "download_write",
             "EIO (os error 5)"
         ));
+        pump(&mut owner, &mut messages).await;
         let mut c = owner.state.jobs[0].control().unwrap();
         c.manual_pause = true;
         owner.state.jobs[0].set_control(&c);
         assert!(owner
             .retry_hold(JobId(1), &c.revision, RetryBy::Recovery, false)
             .is_err());
+        pump(&mut owner, &mut messages).await;
         owner.persist = false;
         c.manual_pause = false;
         owner.state.jobs[0].set_control(&c);
@@ -7538,6 +10089,7 @@ mod tests {
             owner.retry_hold(JobId(1), &c.revision, RetryBy::Recovery, false),
             Err("this node is not the queue authority".into())
         );
+        pump(&mut owner, &mut messages).await;
         owner.persist = true;
         c.manual_pause = true;
         c.retry_attempt = 4;
@@ -7546,6 +10098,7 @@ mod tests {
             owner.retry_hold(JobId(1), &c.revision, RetryBy::Operator, false),
             Ok(())
         );
+        pump(&mut owner, &mut messages).await;
         let c = owner.state.jobs[0].control().unwrap();
         assert!(
             !c.manual_pause && c.retry_attempt == 0,
@@ -7566,7 +10119,8 @@ mod tests {
             .chain([HoldCause::Unrecognized("from_a_newer_build".into())]);
         for cause in causes {
             for post in [false, true] {
-                let (_tmp, mut owner, _adapter) = control_test_owner();
+                let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+                pump(&mut owner, &mut messages).await;
                 let mut job = bare_job();
                 job.dir_name = "exit".into();
                 job.status = if post {
@@ -7577,11 +10131,12 @@ mod tests {
                     JobStatus::Downloading
                 };
                 owner.state.jobs.push(job);
-                owner.ensure_allocation(JobId(1), false).unwrap();
+                allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
                 assert!(
                     owner.hold_job(JobId(1), cause.clone(), "stage", "why"),
                     "{cause}"
                 );
+                pump(&mut owner, &mut messages).await;
                 let control = owner.state.jobs[0].control().unwrap();
                 let policy = cause.policy();
                 assert_eq!(control.retry_policy, policy.as_str());
@@ -7598,10 +10153,11 @@ mod tests {
                         revision: control.revision,
                         reply,
                     });
+                    pump(&mut owner, &mut messages).await;
                     assert!(rx.await.unwrap(), "{cause} post={post} has no exit");
                 } else {
                     assert_eq!(
-                        operator_retry(&mut owner, JobId(1)),
+                        operator_retry(&mut owner, &mut messages, JobId(1)).await,
                         Ok(()),
                         "{cause} post={post} has no exit"
                     );
@@ -7625,9 +10181,11 @@ mod tests {
     /// schedule now lives in `hold_job`, and only owner methods change it.
     #[tokio::test]
     async fn held_control_survives_only_owner_writes() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(pending_job(1));
         assert!(owner.hold_job(JobId(1), HoldCause::Io, "download_write", "digest differs"));
+        pump(&mut owner, &mut messages).await;
         let held = owner.state.jobs[0].control().unwrap();
         let mut row = owner.state.jobs[0].clone();
         let mut forged = held.clone();
@@ -7640,6 +10198,7 @@ mod tests {
             require_snapshot: false,
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         let _ = rx.await;
         assert_eq!(
             owner.state.jobs[0].control().unwrap(),
@@ -7660,7 +10219,8 @@ mod tests {
     /// released to the download queue without its custody check.
     #[tokio::test]
     async fn rehold_after_release_routes_by_where_the_job_is_now() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(pending_job(1));
         assert!(owner.hold_job(
             JobId(1),
@@ -7668,11 +10228,13 @@ mod tests {
             "download_write",
             "x (os error 107)"
         ));
+        pump(&mut owner, &mut messages).await;
         let first = owner.state.jobs[0].control().unwrap();
         assert!(!first.post_side());
         owner
             .retry_hold(JobId(1), &first.revision, RetryBy::Recovery, false)
             .unwrap();
+        pump(&mut owner, &mut messages).await;
         // The download finished; post-processing hits the dead mount.
         owner.state.jobs[0].status = JobStatus::Post {
             stage: nzbd_types::PostStage::PostUnpackRename,
@@ -7683,6 +10245,7 @@ mod tests {
             "post_unpack_rename",
             "y (os error 5)"
         ));
+        pump(&mut owner, &mut messages).await;
         let second = owner.state.jobs[0].control().unwrap();
         assert!(second.post_side(), "this hold happened in post-processing");
         assert!(
@@ -7691,6 +10254,7 @@ mod tests {
                 .is_err(),
             "so its release must go through the custody check"
         );
+        pump(&mut owner, &mut messages).await;
         assert_eq!(
             second.retry_attempt, 2,
             "a re-hold right after a release is the same outage"
@@ -7711,6 +10275,7 @@ mod tests {
             "download_write",
             "z (os error 107)"
         ));
+        pump(&mut owner, &mut messages).await;
         let fresh = owner.state.jobs[0].control().unwrap();
         assert_eq!(fresh.retry_attempt, 1, "backoff starts over");
         assert_ne!(
@@ -7725,9 +10290,11 @@ mod tests {
     /// job paused, and the probe's spacing outlived its episode.
     #[tokio::test]
     async fn operator_storage_release_runs_the_job_and_resets_the_probe() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(pending_job(1));
         assert!(owner.hold_job(JobId(1), HoldCause::Capacity, "download_write", "full"));
+        pump(&mut owner, &mut messages).await;
         let mut c = owner.state.jobs[0].control().unwrap();
         c.manual_pause = true;
         owner.state.jobs[0].set_control(&c);
@@ -7747,6 +10314,7 @@ mod tests {
                 by,
                 reply,
             });
+            pump(&mut owner, &mut messages).await;
             assert_eq!(rx.await.unwrap(), expected, "{by:?}");
         }
         let (reply, rx) = oneshot::channel();
@@ -7756,6 +10324,7 @@ mod tests {
             by: RetryBy::Operator,
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(rx.await.unwrap());
         let job = &owner.state.jobs[0];
         assert_eq!(
@@ -7777,7 +10346,8 @@ mod tests {
 
     #[tokio::test]
     async fn reobserve_refusal_records_why_without_moving_its_cadence() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(pending_job(1));
         assert!(owner.hold_job(
             JobId(1),
@@ -7785,6 +10355,7 @@ mod tests {
             "extract",
             "root changed"
         ));
+        pump(&mut owner, &mut messages).await;
         let c = owner.state.jobs[0].control().unwrap();
         assert_eq!(c.next_retry_at_unix, None);
         assert!(owner.reschedule_hold(JobId(1), &c.revision, "wrong root mounted"));
@@ -7877,7 +10448,8 @@ mod tests {
     /// never runs for them; adoption must re-arm too.
     #[tokio::test]
     async fn adopting_authority_rearms_holds() {
-        let (tmp, mut owner, _adapter) = control_test_owner();
+        let (tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         let mut job = pending_job(1);
         job.set_control(&nzbd_types::JobControl {
             version: 1,
@@ -7905,6 +10477,7 @@ mod tests {
         owner.persist = false;
         owner.state.jobs.clear();
         owner.adopt_authority().unwrap();
+        pump(&mut owner, &mut messages).await;
         let c = owner.state.jobs[0].control().unwrap();
         assert_eq!(
             (c.cause.as_str(), c.retry_policy.as_str()),
@@ -7915,25 +10488,29 @@ mod tests {
 
     #[tokio::test]
     async fn mount_unavailable_hold_resumes_only_after_expected_root_returns() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         let mut job = bare_job();
         job.dir_name = "remount".into();
         job.status = JobStatus::Completed;
         job.params.push(("monarr-delivery".into(), "1".into()));
         owner.state.jobs.push(job);
-        owner.ensure_allocation(JobId(1), false).unwrap();
+        allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
         assert!(owner.hold_job(
             JobId(1),
             HoldCause::MountUnavailable,
             "extract",
             "configured root identity changed or volume is unavailable",
         ));
+        pump(&mut owner, &mut messages).await;
         let root = owner.dest_dir.clone();
         let offline = root.with_extension("expected-volume-offline");
         std::fs::rename(&root, &offline).unwrap();
         std::fs::create_dir(&root).unwrap();
         assert!(
-            operator_retry(&mut owner, JobId(1)).is_err(),
+            operator_retry(&mut owner, &mut messages, JobId(1))
+                .await
+                .is_err(),
             "wrong root must stay fenced"
         );
         assert!(owner.state.jobs[0].held());
@@ -7941,7 +10518,7 @@ mod tests {
         std::fs::remove_dir(&root).unwrap();
         std::fs::rename(&offline, &root).unwrap();
         assert_eq!(
-            operator_retry(&mut owner, JobId(1)),
+            operator_retry(&mut owner, &mut messages, JobId(1)).await,
             Ok(()),
             "restored expected root should resume"
         );
@@ -7950,11 +10527,12 @@ mod tests {
 
     #[tokio::test]
     async fn admission_tombstone_refreshes_exact_source_keep_and_delete_evidence() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         let mut job = bare_job();
         job.dir_name = "admission-source".into();
         owner.state.jobs.push(job);
-        owner.ensure_allocation(JobId(1), true).unwrap();
+        allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
         let source = owner.artifacts.for_job(1).unwrap().unwrap();
         owner
             .artifacts
@@ -7992,6 +10570,7 @@ mod tests {
             request_token: "receipt-token".into(),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         let receipt = rx.await.unwrap().unwrap();
         assert_eq!(receipt.custody_state, "kept_by_user");
         assert_eq!(
@@ -8018,6 +10597,7 @@ mod tests {
             request_token: "receipt-token".into(),
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         let receipt = rx.await.unwrap().unwrap();
         assert_eq!(receipt.custody_state, "deleted_by_runner");
         assert_eq!(receipt.source_cleanup_status.as_deref(), Some("removed"));
@@ -8034,7 +10614,8 @@ mod tests {
 
     #[tokio::test]
     async fn writer_retirement_does_not_create_an_allocation_review_hold() {
-        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(pending_job(1));
         owner.retiring_writers.insert(JobId(1), Vec::new());
         assert!(owner.ensure_allocation(JobId(1), false).is_err());
@@ -8057,9 +10638,10 @@ mod tests {
         job
     }
 
-    #[test]
-    fn writer_resource_errors_hold_pending_segments_and_latch_out_of_space() {
-        let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
+    #[tokio::test]
+    async fn writer_resource_errors_hold_pending_segments_and_latch_out_of_space() {
+        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(pending_job(2));
 
         owner.on_msg(EngineMsg::WriterError {
@@ -8067,6 +10649,7 @@ mod tests {
             file: FileId(20),
             error: "write payload.bin: No space left on device (os error 28)".into(),
         });
+        pump(&mut owner, &mut messages).await;
         let job = owner.state.job(JobId(2)).unwrap();
         assert_eq!(job.files[0].segments[0].state, SegmentState::Pending);
         assert!(!job.files[0].finalized);
@@ -8084,11 +10667,13 @@ mod tests {
             file: FileId(20),
             error: "permission denied".into(),
         });
+        pump(&mut owner, &mut messages).await;
         owner.on_msg(EngineMsg::WriterError {
             job: JobId(2),
             file: FileId(999),
             error: "gone".into(),
         });
+        pump(&mut owner, &mut messages).await;
         owner.on_msg(EngineMsg::SegmentWritten {
             job: JobId(999),
             file: FileId(999),
@@ -8099,6 +10684,7 @@ mod tests {
             file_size: 1,
             server: ServerId(1),
         });
+        pump(&mut owner, &mut messages).await;
         owner.on_msg(EngineMsg::WriterFinalized {
             job: JobId(999),
             file: FileId(999),
@@ -8106,6 +10692,7 @@ mod tests {
             final_path: None,
             combined_crc: None,
         });
+        pump(&mut owner, &mut messages).await;
 
         owner.disk_low = false;
         let (reply, received) = oneshot::channel();
@@ -8114,12 +10701,14 @@ mod tests {
             max: 1,
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(received.blocking_recv().unwrap().is_empty());
     }
 
-    #[test]
-    fn failed_fenced_replace_restores_delegation_and_mirror_overlay() {
-        let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
+    #[tokio::test]
+    async fn failed_fenced_replace_restores_delegation_and_mirror_overlay() {
+        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+        pump(&mut owner, &mut messages).await;
         let original = pending_job(3);
         owner.state.jobs.push(original.clone());
         owner.delegated.insert(JobId(3), "worker-a".into());
@@ -8147,6 +10736,7 @@ mod tests {
             require_snapshot: true,
             reply,
         });
+        pump(&mut owner, &mut messages).await;
 
         assert!(!received.try_recv().unwrap());
         assert_eq!(owner.state.job(JobId(3)).unwrap().priority, 0);
@@ -8161,9 +10751,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn legacy_remote_pp_remaining_fallback_stays_paused_aware() {
-        let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
+    #[tokio::test]
+    async fn legacy_remote_pp_remaining_fallback_stays_paused_aware() {
+        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+        pump(&mut owner, &mut messages).await;
         let mut job = pending_job(4);
         job.status = JobStatus::Completed;
         job.files[0].paused = true;
@@ -8265,9 +10856,10 @@ mod tests {
     /// selected fetch returns to the open Post stage when it ends. Only the
     /// verifier-selected PAR may use that lane; generic FileResume and a
     /// PP-only node cannot broaden it to ordinary files.
-    #[test]
-    fn delayed_par_download_keeps_the_open_post_span() {
-        let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
+    #[tokio::test]
+    async fn delayed_par_download_keeps_the_open_post_span() {
+        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+        pump(&mut owner, &mut messages).await;
         let mut job = pending_job(402);
         job.status = JobStatus::Post {
             stage: PostStage::ParVerify,
@@ -8291,6 +10883,7 @@ mod tests {
         owner.state.jobs.push(job);
 
         assert_eq!(owner.unpause_par_blocks(JobId(402), 1, None), 1);
+        pump(&mut owner, &mut messages).await;
         assert_eq!(
             owner.state.job(JobId(402)).unwrap().status,
             JobStatus::Queued
@@ -8308,6 +10901,7 @@ mod tests {
             paused: false,
             reply,
         });
+        pump(&mut owner, &mut messages).await;
         assert!(
             !result.try_recv().unwrap(),
             "FileResume is not recovery authority"
@@ -8367,6 +10961,7 @@ mod tests {
         recompute_job_totals(job);
         let mut events = owner.events.subscribe();
         owner.check_job_complete(JobId(402));
+        pump(&mut owner, &mut messages).await;
         let job = owner.state.job(JobId(402)).unwrap();
         assert_eq!(
             job.status,
@@ -8389,9 +10984,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn restarted_delayed_par_completion_recovers_from_the_persisted_open_span() {
-        let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
+    #[tokio::test]
+    async fn restarted_delayed_par_completion_recovers_from_the_persisted_open_span() {
+        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(restarted_recovery_job(
             403,
             SegmentState::Done {
@@ -8407,6 +11003,7 @@ mod tests {
 
         let mut events = owner.events.subscribe();
         owner.check_job_complete(JobId(403));
+        pump(&mut owner, &mut messages).await;
         assert_eq!(
             owner.state.job(JobId(403)).unwrap().status,
             JobStatus::Post {
@@ -8419,9 +11016,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn restarted_pp_only_node_reauthorizes_only_the_pending_par_file() {
-        let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
+    #[tokio::test]
+    async fn restarted_pp_only_node_reauthorizes_only_the_pending_par_file() {
+        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+        pump(&mut owner, &mut messages).await;
         owner.download_enabled = false;
         let mut job = restarted_recovery_job(406, SegmentState::Pending);
         let recovery_file = job.files[0].id;
@@ -8431,6 +11029,7 @@ mod tests {
         unrelated.is_par2 = false;
         job.files.push(unrelated);
         owner.import_job(job, false, false);
+        pump(&mut owner, &mut messages).await;
 
         assert_eq!(
             owner.post_fetch_files[&JobId(406)],
@@ -8475,9 +11074,10 @@ mod tests {
         assert_eq!(selected.file, recovery_file);
     }
 
-    #[test]
-    fn failed_recovery_articles_return_to_verification_instead_of_disposition() {
-        let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
+    #[tokio::test]
+    async fn failed_recovery_articles_return_to_verification_instead_of_disposition() {
+        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+        pump(&mut owner, &mut messages).await;
         let mut job = restarted_recovery_job(404, SegmentState::Failed);
         let mut failed_payload = job.files[0].clone();
         failed_payload.id = FileId(4041);
@@ -8491,6 +11091,7 @@ mod tests {
 
         let mut events = owner.events.subscribe();
         owner.check_job_complete(JobId(404));
+        pump(&mut owner, &mut messages).await;
         assert_eq!(
             owner.state.job(JobId(404)).unwrap().status,
             JobStatus::Post {
@@ -8503,9 +11104,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn recovery_write_failure_stays_owned_by_the_active_post_task() {
-        let (_tmp, mut owner, _epoch) = guard_test_owner(Tuning::default());
+    #[tokio::test]
+    async fn recovery_write_failure_stays_owned_by_the_active_post_task() {
+        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+        pump(&mut owner, &mut messages).await;
         owner.state.jobs.push(restarted_recovery_job(
             405,
             SegmentState::Done {
@@ -8520,6 +11122,7 @@ mod tests {
 
         let mut events = owner.events.subscribe();
         owner.check_job_complete(JobId(405));
+        pump(&mut owner, &mut messages).await;
         assert_eq!(
             owner.state.job(JobId(405)).unwrap().status,
             JobStatus::Post {
@@ -8696,13 +11299,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn clearing_disk_guard_wakes_parked_connection_tasks() {
+    #[tokio::test]
+    async fn clearing_disk_guard_wakes_parked_connection_tasks() {
         let tuning = Tuning {
             min_free_disk_bytes: 100,
             ..Tuning::default()
         };
-        let (_tmp, mut owner, mut epoch) = guard_test_owner(tuning);
+        let (_tmp, mut owner, mut epoch, mut messages) = guard_test_owner(tuning);
+        pump(&mut owner, &mut messages).await;
         assert!(owner.disk_low, "a configured floor starts fail-safe");
         let _ = epoch.borrow_and_update();
         assert!(!epoch.has_changed().unwrap());
@@ -8721,13 +11325,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn clearing_quota_guard_wakes_parked_connection_tasks() {
+    #[tokio::test]
+    async fn clearing_quota_guard_wakes_parked_connection_tasks() {
         let tuning = Tuning {
             daily_quota_bytes: 1,
             ..Tuning::default()
         };
-        let (_tmp, mut owner, mut epoch) = guard_test_owner(tuning);
+        let (_tmp, mut owner, mut epoch, mut messages) = guard_test_owner(tuning);
+        pump(&mut owner, &mut messages).await;
         owner.quota_reached = true;
         let _ = epoch.borrow_and_update();
         assert!(!epoch.has_changed().unwrap());
@@ -8735,6 +11340,7 @@ mod tests {
         // The empty volume book is deterministically below the configured
         // quota, directly exercising the rollover/recovery transition.
         owner.update_quota_guard();
+        pump(&mut owner, &mut messages).await;
 
         assert!(
             !owner.quota_reached,

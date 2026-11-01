@@ -1,17 +1,13 @@
-//! Per-file disk writer tasks (ARCHITECTURE.md §8.4).
-//!
-//! One task owns each output file; decoded segments arrive over a bounded
-//! channel (backpressure) from whichever connection task decoded them.
-//! DirectWrite semantics: the file is preallocated sparse to its full yEnc
-//! size on first write, each part is written at its yEnc offset
-//! (`begin − 1`), gaps stay zero-filled, and completion is an atomic rename
-//! from `<name>.part` to `<name>`. Resume reopens the `.part` file without
-//! truncation.
-
+//! Per-file serial disk writers. Acknowledgements follow segment data sync;
+//! every generation reserves its extents before any seek or mutation.
 use crate::owner::EngineMsg;
+use crate::recovery::{self, ProvenRange, ValidationOutcome};
+use nzbd_state::artifacts::Identity;
 use nzbd_types::{FileId, JobId, ServerId};
-use std::io::SeekFrom;
-use std::path::PathBuf;
+use std::{
+    io::SeekFrom,
+    path::{Path, PathBuf},
+};
 use tokio::fs::File;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -20,7 +16,6 @@ use tokio_util::task::TaskTracker;
 #[derive(Debug)]
 pub enum WriteCmd {
     PublicationName(String),
-    /// Flush and validate received ranges, retaining the private partial path.
     SealPartial {
         file_size: u64,
         ranges: Vec<(u64, u32, u32)>,
@@ -32,13 +27,9 @@ pub enum WriteCmd {
         offset: u64,
         data: Vec<u8>,
         crc: u32,
-        /// Total output-file size from the yEnc header (0 = unknown).
         file_size: u64,
         server: ServerId,
     },
-    /// All segments accounted for: extend/trim to `file_size`, fsync,
-    /// rename into place. `combined_crc` is the whole-file CRC when every
-    /// segment succeeded contiguously.
     Finalize {
         file_size: u64,
         combined_crc: Option<u32>,
@@ -50,11 +41,47 @@ pub struct WriterHandle {
     pub tx: mpsc::Sender<WriteCmd>,
     pub stop: tokio_util::sync::CancellationToken,
     pub stopped: tokio::sync::watch::Receiver<bool>,
+    pub generation: u64,
 }
 
-/// Bounded queue per file: decoded segments are large, keep few in flight.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WriterScope {
+    pub generation: u64,
+    pub proven: Vec<ProvenRange>,
+    pub expected_identity: Option<Identity>,
+}
+
+#[derive(Debug)]
+pub(crate) enum WriterFact {
+    Written {
+        seg_number: u32,
+        offset: u64,
+        len: u32,
+        crc: u32,
+        file_size: u64,
+        server: ServerId,
+        identity: Identity,
+    },
+    Finalized {
+        ok: bool,
+        final_path: Option<PathBuf>,
+        combined_crc: Option<u32>,
+        identity: Option<Identity>,
+    },
+    Error {
+        error: String,
+    },
+    Rejected {
+        seg_number: u32,
+        server: ServerId,
+        reason: String,
+    },
+}
+
 const WRITER_QUEUE: usize = 8;
 
+/// Compatibility entry point for direct callers without durable scoped evidence.
+#[cfg(test)]
 pub fn spawn_writer(
     tracker: &TaskTracker,
     job: JobId,
@@ -63,15 +90,169 @@ pub fn spawn_writer(
     final_name: String,
     engine_tx: mpsc::Sender<EngineMsg>,
 ) -> WriterHandle {
+    spawn(
+        tracker,
+        job,
+        file,
+        dir,
+        final_name,
+        engine_tx,
+        WriterScope::default(),
+        false,
+    )
+}
+pub(crate) fn spawn_writer_scoped(
+    tracker: &TaskTracker,
+    job: JobId,
+    file: FileId,
+    dir: PathBuf,
+    final_name: String,
+    engine_tx: mpsc::Sender<EngineMsg>,
+    scope: WriterScope,
+) -> WriterHandle {
+    spawn(tracker, job, file, dir, final_name, engine_tx, scope, true)
+}
+fn spawn(
+    tracker: &TaskTracker,
+    job: JobId,
+    file: FileId,
+    dir: PathBuf,
+    final_name: String,
+    engine_tx: mpsc::Sender<EngineMsg>,
+    scope: WriterScope,
+    scoped: bool,
+) -> WriterHandle {
+    let generation = scope.generation;
     let (tx, rx) = mpsc::channel(WRITER_QUEUE);
     let stop = tokio_util::sync::CancellationToken::new();
     let cancellation = stop.clone();
     let (done, stopped) = tokio::sync::watch::channel(false);
     tracker.spawn(async move {
-        writer_task(job, file, dir, final_name, rx, engine_tx, cancellation).await;
+        writer_task(
+            job,
+            file,
+            dir,
+            final_name,
+            rx,
+            engine_tx,
+            cancellation,
+            scope,
+            scoped,
+        )
+        .await;
+        // Cancellation requests are not quiescence. Publish only after actual return.
         let _ = done.send(true);
     });
-    WriterHandle { tx, stop, stopped }
+    WriterHandle {
+        tx,
+        stop,
+        stopped,
+        generation,
+    }
+}
+
+struct Reporter {
+    job: JobId,
+    file: FileId,
+    generation: u64,
+    scoped: bool,
+    tx: mpsc::Sender<EngineMsg>,
+}
+impl Reporter {
+    async fn send(&self, fact: WriterFact) -> bool {
+        let message = if self.scoped {
+            EngineMsg::ScopedWriter {
+                job: self.job,
+                file: self.file,
+                generation: self.generation,
+                fact,
+            }
+        } else {
+            match fact {
+                WriterFact::Written {
+                    seg_number,
+                    offset,
+                    len,
+                    crc,
+                    file_size,
+                    server,
+                    ..
+                } => EngineMsg::SegmentWritten {
+                    job: self.job,
+                    file: self.file,
+                    seg_number,
+                    offset,
+                    len,
+                    crc,
+                    file_size,
+                    server,
+                },
+                WriterFact::Finalized {
+                    ok,
+                    final_path,
+                    combined_crc,
+                    ..
+                } => EngineMsg::WriterFinalized {
+                    job: self.job,
+                    file: self.file,
+                    ok,
+                    final_path,
+                    combined_crc,
+                },
+                WriterFact::Error { error } => EngineMsg::WriterError {
+                    job: self.job,
+                    file: self.file,
+                    error,
+                },
+                WriterFact::Rejected { reason, .. } => EngineMsg::WriterError {
+                    job: self.job,
+                    file: self.file,
+                    error: reason,
+                },
+            }
+        };
+        self.tx.send(message).await.is_ok()
+    }
+    async fn error(&self, error: impl ToString) {
+        self.send(WriterFact::Error {
+            error: error.to_string(),
+        })
+        .await;
+    }
+}
+
+async fn file_identity(file: &File) -> std::io::Result<Identity> {
+    let descriptor = file.try_clone().await?.into_std().await;
+    recovery::capture_identity(&descriptor).map_err(std::io::Error::other)
+}
+fn identity_error() -> std::io::Error {
+    std::io::Error::other("writer identity conflict")
+}
+
+async fn ensure_open(
+    dir: &Path,
+    part: &Path,
+    out: &mut Option<File>,
+    expected: &Option<Identity>,
+) -> std::io::Result<()> {
+    if out.is_none() {
+        if expected.is_none() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        let descriptor =
+            nzbd_state::fileops::writer(part, expected.is_none()).map_err(std::io::Error::other)?;
+        let identity = recovery::capture_identity(&descriptor).map_err(std::io::Error::other)?;
+        if expected.as_ref().is_some_and(|saved| *saved != identity) {
+            return Err(identity_error());
+        }
+        *out = Some(File::from_std(descriptor));
+    }
+    if let Some(expected) = expected {
+        if file_identity(out.as_ref().unwrap()).await? != *expected {
+            return Err(identity_error());
+        }
+    }
+    Ok(())
 }
 
 async fn writer_task(
@@ -82,82 +263,93 @@ async fn writer_task(
     mut rx: mpsc::Receiver<WriteCmd>,
     engine_tx: mpsc::Sender<EngineMsg>,
     stop: tokio_util::sync::CancellationToken,
+    scope: WriterScope,
+    scoped: bool,
 ) {
+    let report = Reporter {
+        job,
+        file: file_id,
+        generation: scope.generation,
+        scoped,
+        tx: engine_tx,
+    };
     let part_path = dir.join(format!(".runner-file-{}.part", file_id.0));
-    let legacy = dir.join(format!("{final_name}.part"));
-    if !part_path.exists() && legacy.exists() {
-        // Exclusive alias migration retains the legacy entry as evidence.
-        if let Err(e) = nzbd_state::fileops::link(&legacy, &part_path) {
-            let _ = engine_tx
-                .send(EngineMsg::WriterError {
-                    job,
-                    file: file_id,
-                    error: format!("legacy partial migration: {e}"),
-                })
+    let mut final_path = dir.join(&final_name);
+    let resolved = match recovery::resolve_payload(&dir, file_id, &final_name) {
+        Ok(payload) => payload,
+        Err(error) => {
+            report
+                .error(format!("write admission / payload resolution: {error:?}"))
                 .await;
             return;
         }
+    };
+    if let Some(payload) = &resolved {
+        if scope
+            .expected_identity
+            .as_ref()
+            .is_some_and(|saved| *saved != payload.identity)
+        {
+            report.error("writer identity conflict at admission").await;
+            return;
+        }
+        if !payload.published && payload.path != part_path {
+            if let Err(error) = nzbd_state::fileops::link(&payload.path, &part_path) {
+                report
+                    .error(format!("legacy partial migration: {error}"))
+                    .await;
+                return;
+            }
+        }
     }
-    let mut final_path = dir.join(&final_name);
-    let mut out: Option<File> = None;
-    let mut preallocated = false;
+    if !scope.proven.is_empty()
+        && (scope.expected_identity.is_none()
+            || !recovery::coherent_ranges(
+                &scope.proven,
+                scope.expected_identity.as_ref().unwrap().bytes,
+            ))
+    {
+        report.error("writer proven range identity conflict").await;
+        return;
+    }
+    // Linking a legacy alias updates ctime. Refresh only the object just established.
+    let mut expected = scope.expected_identity;
+    if expected.is_some() {
+        if let Some(payload) = &resolved {
+            let opened = match nzbd_state::fileops::open(&payload.path) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    report.error(error).await;
+                    return;
+                }
+            };
+            expected = match recovery::capture_identity(&opened) {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    report.error(error).await;
+                    return;
+                }
+            };
+        }
+    }
+    let published_only = resolved.as_ref().is_some_and(|payload| payload.published);
+    let mut ranges = scope.proven;
+    let mut out = None;
     let mut reservation = None;
     #[cfg(test)]
     let mut fault = None;
-
     loop {
-        let cmd = tokio::select! {
-            biased;
-            _ = stop.cancelled() => break,
-            cmd = rx.recv() => match cmd { Some(cmd) => cmd, None => break },
-        };
+        // Never cancel an in-flight seek/write/sync. Stop before the next command.
+        let cmd = tokio::select! { biased; _ = stop.cancelled() => break,
+        command = rx.recv() => match command { Some(command)=>command,None=>break } };
         match cmd {
             #[cfg(test)]
             WriteCmd::InjectFailure(stage, code) => {
                 fault = Some((stage, code));
             }
-            WriteCmd::SealPartial { file_size, ranges } => {
-                let result = async {
-                    if let Some(f) = out.as_mut() {
-                        f.sync_data().await?;
-                    }
-                    drop(out.take());
-                    let metadata = std::fs::symlink_metadata(&part_path)?;
-                    if file_size == 0
-                        || !metadata.is_file()
-                        || metadata.len() != file_size
-                        || ranges.iter().any(|(offset, len, crc)| {
-                            !validate_range(&part_path, *offset, u64::from(*len), *crc)
-                        })
-                    {
-                        return Err(std::io::Error::other("partial checkpoint identity differs"));
-                    }
-                    Ok::<_, std::io::Error>(())
-                }
-                .await;
-                let message = match result {
-                    Ok(()) => EngineMsg::WriterFinalized {
-                        job,
-                        file: file_id,
-                        ok: true,
-                        final_path: Some(part_path.clone()),
-                        combined_crc: None,
-                    },
-                    Err(error) => EngineMsg::WriterError {
-                        job,
-                        file: file_id,
-                        error: format!("seal partial: {error}"),
-                    },
-                };
-                let _ = engine_tx.send(message).await;
-                return;
-            }
             WriteCmd::PublicationName(name) => {
-                if name.is_empty()
-                    || name.contains(['/', '\\', ':', '\0'])
-                    || name == "."
-                    || name == ".."
-                {
+                if !recovery::safe_name(&name) {
+                    report.error("invalid publication name").await;
                     return;
                 }
                 final_path = dir.join(name);
@@ -170,76 +362,156 @@ async fn writer_task(
                 file_size,
                 server,
             } => {
-                if reservation.is_none() && file_size > 0 {
-                    let _ = tokio::fs::create_dir_all(&dir).await;
-                    match nzbd_state::capacity::reserve(&dir, file_size) {
-                        Ok(claim) => reservation = Some(claim),
-                        Err(e) => {
-                            let _ = engine_tx
-                                .send(EngineMsg::WriterError {
-                                    job,
-                                    file: file_id,
-                                    error: format!("write admission {}: {e}", dir.display()),
-                                })
-                                .await;
-                            return;
-                        }
-                    }
-                }
-                #[cfg(test)]
-                let injected = fault.take();
-                #[cfg(test)]
-                if let Some(("write", code)) = injected {
-                    let _ = engine_tx
-                        .send(EngineMsg::WriterError {
-                            job,
-                            file: file_id,
-                            error: format!("write: {}", std::io::Error::from_raw_os_error(code)),
+                let range = ProvenRange {
+                    seg_number,
+                    offset,
+                    len: match u32::try_from(data.len()) {
+                        Ok(len) => len,
+                        Err(_) => 0,
+                    },
+                    crc,
+                };
+                let invalid = published_only
+                    || range.len == 0
+                    || range.end().is_none()
+                    || (file_size > 0 && range.end().is_some_and(|end| end > file_size));
+                let duplicate = ranges.iter().any(|prior| *prior == range);
+                let conflict = ranges.iter().any(|prior| {
+                    (prior.seg_number == seg_number || prior.overlaps(&range)) && *prior != range
+                });
+                if invalid || conflict {
+                    if !report
+                        .send(WriterFact::Rejected {
+                            seg_number,
+                            server,
+                            reason: "segment extent/identity conflicts with reserved ranges".into(),
                         })
+                        .await
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                if let Err(error) = ensure_open(&dir, &part_path, &mut out, &expected).await {
+                    report
+                        .error(format!("write {}: {error}", part_path.display()))
                         .await;
                     return;
                 }
-                let result = write_segment(
-                    &dir,
-                    &part_path,
-                    &mut out,
-                    &mut preallocated,
-                    offset,
-                    &data,
-                    file_size,
-                )
-                .await;
-                #[cfg(test)]
-                let result = if let Some(("sync", code)) = injected {
-                    Err(std::io::Error::from_raw_os_error(code))
-                } else {
-                    result
+                if !duplicate {
+                    if reservation.is_none() && file_size > 0 {
+                        match nzbd_state::capacity::reserve(&dir, file_size) {
+                            Ok(claim) => reservation = Some(claim),
+                            Err(error) => {
+                                report
+                                    .error(format!("write admission {}: {error}", dir.display()))
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                    // Reserve before any mutation, including preallocation. A failed
+                    // or uncertain write terminates this generation rather than releasing it.
+                    ranges.push(range.clone());
+                    #[cfg(test)]
+                    let injected = fault.take();
+                    #[cfg(test)]
+                    if let Some(("write", code)) = injected {
+                        report
+                            .error(format!(
+                                "write: {}",
+                                std::io::Error::from_raw_os_error(code)
+                            ))
+                            .await;
+                        return;
+                    }
+                    let f = out.as_mut().unwrap();
+                    let result = async {
+                        if file_size > 0 && f.metadata().await?.len() < file_size {
+                            f.set_len(file_size).await?;
+                        }
+                        f.seek(SeekFrom::Start(offset)).await?;
+                        f.write_all(&data).await?;
+                        // Segment sync is the durability boundary for every acknowledgement.
+                        f.sync_data().await?;
+                        Ok::<_, std::io::Error>(())
+                    }
+                    .await;
+                    #[cfg(test)]
+                    let result = if let Some(("sync", code)) = injected {
+                        Err(std::io::Error::from_raw_os_error(code))
+                    } else {
+                        result
+                    };
+                    if let Err(error) = result {
+                        report
+                            .error(format!("write {}: {error}", part_path.display()))
+                            .await;
+                        return;
+                    }
+                }
+                let identity = match file_identity(out.as_ref().unwrap()).await {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        report.error(error).await;
+                        return;
+                    }
                 };
-                let msg = match result {
-                    Ok(()) => EngineMsg::SegmentWritten {
-                        job,
-                        file: file_id,
+                expected = Some(identity.clone());
+                if !report
+                    .send(WriterFact::Written {
                         seg_number,
                         offset,
-                        len: data.len() as u32,
+                        len: range.len,
                         crc,
                         file_size,
                         server,
-                    },
-                    Err(e) => {
-                        let _ = engine_tx
-                            .send(EngineMsg::WriterError {
-                                job,
-                                file: file_id,
-                                error: format!("write {}: {e}", part_path.display()),
+                        identity,
+                    })
+                    .await
+                {
+                    return;
+                }
+            }
+            WriteCmd::SealPartial {
+                file_size,
+                ranges: checks,
+            } => {
+                let result = async {
+                    if file_size == 0
+                        || ranges
+                            .iter()
+                            .any(|range| range.end().is_none_or(|end| end > file_size))
+                    {
+                        return Err(identity_error());
+                    }
+                    ensure_open(&dir, &part_path, &mut out, &expected).await?;
+                    let f = out.as_ref().unwrap();
+                    f.sync_data().await?;
+                    let identity = file_identity(f).await?;
+                    if identity.bytes != file_size {
+                        return Err(identity_error());
+                    }
+                    for (offset, len, crc) in checks {
+                        require_valid(&part_path, offset, u64::from(len), crc, Some(&identity))?;
+                    }
+                    Ok::<_, std::io::Error>(identity)
+                }
+                .await;
+                match result {
+                    Ok(identity) => {
+                        report
+                            .send(WriterFact::Finalized {
+                                ok: true,
+                                final_path: Some(part_path.clone()),
+                                combined_crc: None,
+                                identity: Some(identity),
                             })
                             .await;
-                        return; // drop/drain the channel; no more writes after failure
                     }
-                };
-                if engine_tx.send(msg).await.is_err() {
-                    break; // engine gone
+                    Err(error) => report.error(format!("seal partial: {error}")).await,
                 }
+                return;
             }
             WriteCmd::Finalize {
                 file_size,
@@ -247,203 +519,154 @@ async fn writer_task(
             } => {
                 #[cfg(test)]
                 if let Some(("finalize", code)) = fault.take() {
-                    let _ = engine_tx
-                        .send(EngineMsg::WriterError {
-                            job,
-                            file: file_id,
-                            error: format!("finalize: {}", std::io::Error::from_raw_os_error(code)),
-                        })
+                    report
+                        .error(format!(
+                            "finalize: {}",
+                            std::io::Error::from_raw_os_error(code)
+                        ))
                         .await;
                     return;
                 }
-                let result =
-                    finalize(&part_path, &final_path, &mut out, file_size, combined_crc).await;
-                let msg = match result {
-                    Ok(()) => EngineMsg::WriterFinalized {
-                        job,
-                        file: file_id,
-                        ok: true,
-                        final_path: Some(final_path.clone()),
-                        combined_crc,
-                    },
-                    Err(e) => {
-                        tracing::warn!(job = job.0, file = file_id.0, error = %e, "finalize failed");
-                        // Ground truth about the volume, from the one
-                        // place that actually tried to use it.
-                        if crate::is_out_of_space(&e.to_string()) {
-                            let _ = engine_tx
-                                .send(EngineMsg::WriterError {
-                                    job,
-                                    file: file_id,
-                                    error: format!("finalize {}: {e}", final_path.display()),
-                                })
-                                .await;
-                            return;
-                        }
-                        EngineMsg::WriterError {
-                            job,
-                            file: file_id,
-                            error: format!("finalize identity/publication: {e}"),
-                        }
+                if ranges.iter().any(|range| {
+                    range
+                        .end()
+                        .is_none_or(|end| file_size > 0 && end > file_size)
+                }) {
+                    report
+                        .error("finalize identity conflict: would trim a reserved range")
+                        .await;
+                    return;
+                }
+                let result = finalize(
+                    &dir,
+                    &part_path,
+                    &final_path,
+                    &mut out,
+                    &expected,
+                    file_size,
+                    combined_crc,
+                )
+                .await;
+                match result {
+                    Ok(identity) => {
+                        report
+                            .send(WriterFact::Finalized {
+                                ok: true,
+                                final_path: Some(final_path.clone()),
+                                combined_crc,
+                                identity: Some(identity),
+                            })
+                            .await;
                     }
-                };
-                let _ = engine_tx.send(msg).await;
+                    Err(error) => {
+                        report
+                            .error(format!("finalize identity/publication: {error}"))
+                            .await
+                    }
+                }
                 return;
             }
         }
     }
-    // Channel closed without Finalize: job deleted or engine stopping.
-    // Leave the `.part` file for resume / directory cleanup.
 }
 
-async fn write_segment(
-    dir: &PathBuf,
-    part_path: &std::path::Path,
-    out: &mut Option<File>,
-    preallocated: &mut bool,
+fn require_valid(
+    path: &Path,
     offset: u64,
-    data: &[u8],
-    file_size: u64,
-) -> std::io::Result<()> {
-    if out.is_none() {
-        tokio::fs::create_dir_all(dir).await?;
-        // No truncate: resume must keep already-written parts.
-        let f = File::from_std(
-            nzbd_state::fileops::writer(part_path, true).map_err(std::io::Error::other)?,
-        );
-        *out = Some(f);
+    len: u64,
+    crc: u32,
+    expected: Option<&Identity>,
+) -> std::io::Result<Identity> {
+    match recovery::validate_range(path, offset, len, crc, expected) {
+        ValidationOutcome::Valid(identity) => Ok(identity),
+        other => Err(std::io::Error::other(format!(
+            "checkpoint validation: {other:?}"
+        ))),
     }
-    let f = out.as_mut().unwrap();
-    if !*preallocated && file_size > 0 {
-        let current = f.metadata().await?.len();
-        if current < file_size {
-            // Sparse preallocation (POSIX truncate-up), NZBGet DirectWrite.
-            f.set_len(file_size).await?;
-        }
-        *preallocated = true;
-    }
-    f.seek(SeekFrom::Start(offset)).await?;
-    if file_size > 0
-        && offset
-            .checked_add(data.len() as u64)
-            .is_none_or(|end| end > file_size)
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "segment exceeds declared size",
-        ));
-    }
-    f.write_all(data).await?;
-    // Checkpoint boundary: one segment. Durability precedes journal/snapshot proof.
-    f.sync_data().await?;
-    Ok(())
 }
 
 async fn finalize(
-    part_path: &std::path::Path,
-    final_path: &std::path::Path,
+    dir: &Path,
+    part: &Path,
+    final_path: &Path,
     out: &mut Option<File>,
+    expected: &Option<Identity>,
     file_size: u64,
     combined_crc: Option<u32>,
-) -> std::io::Result<()> {
+) -> std::io::Result<Identity> {
     if out.is_none() {
-        match nzbd_state::fileops::writer(part_path, false)
-            .map(File::from_std)
-            .map_err(|e| match e {
-                nzbd_state::artifacts::Error::Io(io) => io,
-                other => std::io::Error::other(other.to_string()),
-            }) {
-            Ok(f) => *out = Some(f),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if file_size > 0
-                    && combined_crc.is_some_and(|crc| validate_range(final_path, 0, file_size, crc))
+        match nzbd_state::fileops::writer(part, false) {
+            Ok(file) => *out = Some(File::from_std(file)),
+            Err(nzbd_state::artifacts::Error::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                let opened =
+                    nzbd_state::fileops::open(final_path).map_err(std::io::Error::other)?;
+                let identity =
+                    recovery::capture_identity(&opened).map_err(std::io::Error::other)?;
+                if file_size == 0
+                    || identity.bytes != file_size
+                    || expected.as_ref().is_some_and(|saved| *saved != identity)
                 {
-                    return Ok(()); // size and complete checkpoint digest establish identity
+                    return Err(identity_error());
                 }
-                return Err(e);
+                if let Some(crc) = combined_crc {
+                    return require_valid(final_path, 0, file_size, crc, Some(&identity));
+                }
+                if expected.is_some() {
+                    return Ok(identity);
+                }
+                return Err(identity_error());
             }
-            Err(e) => return Err(e),
+            Err(error) => return Err(std::io::Error::other(error)),
         }
     }
-    let f = out.as_mut().unwrap();
+    ensure_open(dir, part, out, expected).await?;
+    let f = out.as_ref().unwrap();
     if file_size > 0 {
-        // Zero-fill trailing gap / trim over-preallocation.
         f.set_len(file_size).await?;
     }
-    // Data durability at the completion boundary; per-segment writes stay
-    // relaxed (page cache), matching the configured-default policy.
-    //
-    // This is also the only point at which a deferred writeback failure can
-    // reach us. Per-segment writes land in the page cache and return Ok; on a
-    // network filesystem the ENOSPC/EDQUOT/EIO that killed them surfaces here
-    // or nowhere at all.
+    // Segment acknowledgements already synced. Sync again for completion metadata.
     f.sync_data().await?;
-    drop(out.take()); // close before rename
-
-    // Then check the obvious thing, because the obvious thing turned out not
-    // to be true: is the file the length it is supposed to be?
-    //
-    // Two 40-60 GB remuxes finished as SUCCESS with 500 MiB on disk — stopped
-    // dead on a 500 MiB boundary by a limit outside this process, and reported
-    // complete because nothing ever compared what was written against what was
-    // promised. Every other check in the engine is about the article set:
-    // whether the bytes arrived off the wire. None of them look at the file. A
-    // downloader may report that it failed; it may not report success for a
-    // file it did not write.
-    if file_size > 0 {
-        let on_disk = tokio::fs::metadata(part_path).await?.len();
-        if on_disk != file_size {
-            return Err(std::io::Error::other(format!(
-                "{} is {on_disk} bytes on disk but should be {file_size}: \
-                 {} bytes never reached the filesystem",
-                part_path.display(),
-                file_size.saturating_sub(on_disk),
-            )));
-        }
+    let identity = file_identity(f).await?;
+    if file_size > 0 && identity.bytes != file_size {
+        return Err(identity_error());
     }
-
     if let Some(crc) = combined_crc {
-        if !validate_range(part_path, 0, file_size, crc) {
-            return Err(std::io::Error::other("complete checkpoint digest differs"));
-        }
+        require_valid(part, 0, file_size, crc, Some(&identity))?;
     }
-    nzbd_state::fileops::link(part_path, final_path).map_err(std::io::Error::other)?;
+    // Keep the writer descriptor alive while checking path and publishing.
+    let source = nzbd_state::fileops::open(part).map_err(std::io::Error::other)?;
+    if recovery::capture_identity(&source).map_err(std::io::Error::other)? != identity {
+        return Err(identity_error());
+    }
+    match nzbd_state::fileops::link(part, final_path) {
+        Ok(()) => {}
+        Err(nzbd_state::artifacts::Error::Io(error))
+            if error.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            let target = nzbd_state::fileops::open(final_path).map_err(std::io::Error::other)?;
+            let target_identity =
+                recovery::capture_identity(&target).map_err(std::io::Error::other)?;
+            if !target_identity.same_object(&identity)
+                || target_identity.bytes != identity.bytes
+                || target_identity.modified != identity.modified
+            {
+                return Err(identity_error());
+            }
+        }
+        Err(error) => return Err(std::io::Error::other(error)),
+    }
     if let Some(parent) = final_path.parent() {
         File::open(parent).await?.sync_all().await?;
     }
-    tokio::fs::remove_file(part_path).await?;
-    Ok(())
-}
-
-pub(crate) fn validate_range(path: &std::path::Path, offset: u64, len: u64, crc: u32) -> bool {
-    use std::io::{Read, Seek};
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    if !meta.is_file()
-        || meta.file_type().is_symlink()
-        || offset.checked_add(len).is_none_or(|end| end > meta.len())
-    {
-        return false;
+    tokio::fs::remove_file(part).await?;
+    if let Some(parent) = part.parent() {
+        File::open(parent).await?.sync_all().await?;
     }
-    let Ok(mut file) = nzbd_state::fileops::open(path) else {
-        return false;
-    };
-    if file.seek(SeekFrom::Start(offset)).is_err() {
-        return false;
-    }
-    let mut digest = crc32fast::Hasher::new();
-    let mut remaining = len;
-    let mut data = [0; 65536];
-    while remaining > 0 {
-        let amount = remaining.min(data.len() as u64) as usize;
-        if file.read_exact(&mut data[..amount]).is_err() {
-            return false;
-        }
-        digest.update(&data[..amount]);
-        remaining -= amount as u64;
-    }
-    digest.finalize() == crc
+    let identity = file_identity(out.as_ref().unwrap()).await?;
+    drop(out.take());
+    Ok(identity)
 }
 
 #[cfg(test)]
@@ -523,12 +746,9 @@ mod tests {
     /// A finalize that cannot complete must report failure, not success.
     ///
     /// Regression test for the worst bug this engine has had: two 40-60 GB
-    /// remuxes reported SUCCESS with 500 MiB on disk. `sync_data` is the only
-    /// point at which a deferred writeback error can reach us — per-segment
-    /// writes land in the page cache and return Ok, so on a network
-    /// filesystem the ENOSPC/EDQUOT/EIO that killed them surfaces here or
-    /// nowhere. Losing it means calling a download that never reached the
-    /// disk finished.
+    /// remuxes reported SUCCESS with 500 MiB on disk. Segment writes already
+    /// sync before acknowledgement; the completion sync must also propagate
+    /// any later metadata or deferred writeback failure.
     ///
     /// The failure is simulated the only way it can be from a unit test:
     /// the `.part` file is removed while the destination directory is gone
@@ -889,5 +1109,138 @@ mod tests {
                 );
             }
         }
+    }
+    #[tokio::test]
+    async fn scoped_writer_reserves_before_owner_ack_and_duplicate_does_not_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracker = TaskTracker::new();
+        // Capacity one keeps the first acknowledgement outstanding while queued
+        // conflicting and replay commands reach the serial writer.
+        let (tx, mut rx) = channel(1);
+        let writer = spawn_writer_scoped(
+            &tracker,
+            JobId(1),
+            FileId(2),
+            dir.path().to_path_buf(),
+            "out".into(),
+            tx,
+            WriterScope {
+                generation: 9,
+                ..WriterScope::default()
+            },
+        );
+        for (seg_number, offset, data, crc) in [
+            (1, 0, vec![1, 2, 3], 42),
+            (2, 2, vec![9, 9, 9], 43),
+            (1, 0, vec![8, 8, 8], 42),
+        ] {
+            writer
+                .tx
+                .send(WriteCmd::Segment {
+                    seg_number,
+                    offset,
+                    data,
+                    crc,
+                    file_size: 5,
+                    server: ServerId(1),
+                })
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            rx.recv().await,
+            Some(EngineMsg::ScopedWriter {
+                generation: 9,
+                fact: WriterFact::Written { seg_number: 1, .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(EngineMsg::ScopedWriter {
+                fact: WriterFact::Rejected { seg_number: 2, .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(EngineMsg::ScopedWriter {
+                fact: WriterFact::Written { seg_number: 1, .. },
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::read(dir.path().join(".runner-file-2.part")).unwrap(),
+            [1, 2, 3, 0, 0]
+        );
+        writer.stop.cancel();
+        let mut stopped = writer.stopped.clone();
+        stopped.wait_for(|done| *done).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn seeded_writer_rejects_overlap_different_crc_and_trimming() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".runner-file-2.part");
+        std::fs::write(&path, b"abcd").unwrap();
+        let opened = nzbd_state::fileops::open(&path).unwrap();
+        let identity = recovery::capture_identity(&opened).unwrap();
+        let tracker = TaskTracker::new();
+        let (tx, mut rx) = channel(8);
+        let writer = spawn_writer_scoped(
+            &tracker,
+            JobId(1),
+            FileId(2),
+            dir.path().to_path_buf(),
+            "out".into(),
+            tx,
+            WriterScope {
+                generation: 4,
+                proven: vec![ProvenRange {
+                    seg_number: 1,
+                    offset: 0,
+                    len: 4,
+                    crc: 42,
+                }],
+                expected_identity: Some(identity),
+            },
+        );
+        for (seg_number, crc) in [(2, 42), (1, 43)] {
+            writer
+                .tx
+                .send(WriteCmd::Segment {
+                    seg_number,
+                    offset: 0,
+                    data: b"zzzz".to_vec(),
+                    crc,
+                    file_size: 4,
+                    server: ServerId(1),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                rx.recv().await,
+                Some(EngineMsg::ScopedWriter {
+                    fact: WriterFact::Rejected { .. },
+                    ..
+                })
+            ));
+        }
+        writer
+            .tx
+            .send(WriteCmd::Finalize {
+                file_size: 3,
+                combined_crc: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.recv().await,
+            Some(EngineMsg::ScopedWriter {
+                fact: WriterFact::Error { .. },
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), b"abcd");
     }
 }

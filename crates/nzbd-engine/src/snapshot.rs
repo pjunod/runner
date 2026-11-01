@@ -33,7 +33,17 @@ pub struct RepairProgress {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct VerificationProgress {
+    pub state: String,
+    pub reason: Option<String>,
+    pub checked_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct JobSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification: Option<VerificationProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repair_progress: Option<RepairProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -326,6 +336,7 @@ mod mobile_queue_contract_tests {
             let input = &fixture["job"];
             // Construct the actual engine DTO, rather than adding Deserialize to it.
             let summary = JobSummary {
+                verification: None,
                 repair_progress: None,
                 control: None,
                 lifecycle_eligible: false,

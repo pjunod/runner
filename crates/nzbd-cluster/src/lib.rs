@@ -118,8 +118,40 @@ impl ClusterRuntime {
         dest_dir: PathBuf,
         speed_limit_bps: Option<u64>,
         max_active_downloads: Option<u32>,
-        mut pp: Option<PpSetup>,
+        pp: Option<PpSetup>,
     ) -> Result<ClusterRuntime, ClusterError> {
+        Self::start_expected(
+            cfg,
+            servers,
+            tuning,
+            dest_dir,
+            speed_limit_bps,
+            max_active_downloads,
+            pp,
+            None,
+        )
+        .await
+    }
+
+    /// Start with an independently enrolled lifecycle inventory identity.
+    /// The original constructor remains suitable for first-time enrollment.
+    pub async fn start_expected(
+        cfg: ClusterConfig,
+        servers: Vec<ServerDef>,
+        tuning: Tuning,
+        dest_dir: PathBuf,
+        speed_limit_bps: Option<u64>,
+        max_active_downloads: Option<u32>,
+        mut pp: Option<PpSetup>,
+        expected_installation_id: Option<String>,
+    ) -> Result<ClusterRuntime, ClusterError> {
+        nzbd_state::artifacts::Inventory::validate_expected(
+            &cfg.control_dir.join("file-lifecycle"),
+            expected_installation_id.as_deref(),
+        )
+        .map_err(|error| {
+            ClusterError::Control(format!("installation identity preflight: {error}"))
+        })?;
         let layout = SharedLayout::new(&cfg.shared_dir, &cfg.node_name)?;
         if let Some(setup) = pp.as_mut() {
             if setup.post.failure_action == nzbd_post::manager::FailureAction::Park {
@@ -183,6 +215,7 @@ impl ClusterRuntime {
             download_enabled: false,
             state_dir: layout.state_dir(),
             artifact_dir: Some(cfg.control_dir.join("file-lifecycle")),
+            expected_installation_id,
             dest_dir: dest_dir.clone(),
             torrent_payload_roots: cfg.torrent_payload_roots.clone(),
             history: pp.as_ref().map(|setup| setup.history.clone()),
@@ -495,18 +528,20 @@ impl ClusterRuntime {
     }
 
     /// Stop cluster tasks, then flush the engine.
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self) -> bool {
         if let Some(worker) = &self.history_worker {
             worker.stop();
         }
         self.cancel.cancel();
         self.tracker.wait().await;
-        self.engine.shutdown().await;
+        let mut complete = self.engine.shutdown().await;
         if let Some(control) = &self.control {
             if let Err(error) = control.shutdown().await {
                 tracing::warn!(%error, "replicated control shutdown did not complete cleanly");
+                complete = false;
             }
         }
+        complete
     }
 }
 
