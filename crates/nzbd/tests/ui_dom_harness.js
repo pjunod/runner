@@ -393,11 +393,31 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(heldRow.st, "HELD", "a hold is distinct from a manual pause");
   eq(heldRow.stHidden, false, "the hold remains visible in a single-state section");
   ok(heldRow.dRest.includes("conflicting yEnc declared size"), "the hold reason appears in the row");
-  eq(heldRow.pauseHidden, true, "review holds do not offer a resume that cannot work");
+  // Field report 2026-11-01: two HELD jobs with only "delete" to click.
+  // Every hold now offers exactly one of: pause (Runner is retrying it)
+  // or retry (a person decides, or the retries were paused).
+  eq(heldRow.pauseHidden, false, "every hold, review included, offers an exit");
+  eq(heldRow.pauseLabel, "retry", "a review hold offers retry");
+  eq(heldRow.pauseAction, "resume", "retry rides the resume action the engine accepts for holds");
+  ok(heldRow.pauseTip.includes("held again"), "the tip says a persisting cause re-holds");
+  ok(heldRow.pauseTip.includes("retained evidence"), "an identity-conflict retry says it overwrites evidence");
+  const storageHold = { ...held.control, cause: "storage_unavailable", stage: "download_write",
+    retry_policy: "scheduled_retry", message: "write /processing/x.part: Transport endpoint is not connected (os error 107)",
+    blocked_since_unix: 0, next_retry_at_unix: 3600 + 90 };
+  const retrying = T.rowModel({ ...held, control: storageHold }, { nowMs: 3600 * 1000 });
+  eq(retrying.pauseLabel, "pause", "a hold Runner is retrying offers pause");
+  eq(retrying.pauseAction, "pause", "…which stops the retries");
+  ok(retrying.dRest.includes("next retry in"), "a scheduled retry shows when it fires");
+  ok(retrying.dRest.includes("still blocked after 30 minutes"), "…alongside the long-wait warning");
+  ok(!retrying.dRest.includes("needs review"), "an automatically retried hold is not a review item");
+  const paused = T.rowModel({ ...held, control: { ...storageHold, manual_pause: true } }, { nowMs: 3600 * 1000 });
+  eq(paused.pauseLabel, "retry", "a paused automatic hold offers retry");
+  ok(paused.dRest.includes("retries paused") && !paused.dRest.includes("next retry in"),
+    "a paused hold says its retries are paused, not when the next one fires");
   const capacityRow = T.rowModel({ ...held, control: { ...held.control,
     cause: "capacity", retry_policy: "resume_same_job", message: "storage full" } });
-  eq(capacityRow.pauseHidden, false, "resource holds retain the resume probe");
-  eq(capacityRow.pauseAction, "resume", "resource holds can request recovery");
+  eq(capacityRow.pauseHidden, false, "resource holds keep a control");
+  eq(capacityRow.pauseAction, "pause", "Runner releases a resource hold when space returns; the row can stop that");
 }
 
 // --- 8b. storage paths: capacity, warning levels, stable rows ------------

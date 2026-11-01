@@ -15,7 +15,7 @@ use nzbd_state::artifacts::{Artifact, DeliveryFileOutcome, FileEntry};
 use nzbd_state::history::HistoryDb;
 use nzbd_state::HistoryEntry;
 use nzbd_types::metrics::PpStageStats;
-use nzbd_types::{Health, Job, JobId, JobStatus, PostStage};
+use nzbd_types::{Health, HoldCause, Job, JobId, JobStatus, PostStage};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -255,7 +255,6 @@ impl Default for PpCtx {
 /// (covers leadership takeover, lagged event streams, crashed PP attempts
 /// on a prior run — the `*PP:done` stamp keeps it idempotent).
 const RESCAN_INTERVAL: Duration = Duration::from_secs(30);
-const POST_RETRY_DELAYS_SECONDS: [i64; 4] = [30, 60, 120, 300];
 const PP_FAILURE_AT_PARAM: &str = "*PP:failure-at";
 const PP_SELECTED_OUTCOME_PARAM: &str = "*PP:selected-publication-outcome";
 const PP_SELECTED_FAILURE_CAUSE_PARAM: &str = "*PP:selected-publication-failure-cause";
@@ -550,21 +549,19 @@ async fn manager_task(
                             }
                         }
                         Ok(Some(row)) => {
-                            let control = row.control().filter(|control| {
-                                control.lifecycle == "held"
-                                    && !control.manual_pause
-                                    && matches!(
-                                        control.retry_policy.as_str(),
-                                        "scheduled_retry" | "resume_same_job" | "reobserve_mount"
-                                    )
-                            });
+                            // Retry is an operator request: every hold answers it.
+                            let control = row.control().filter(|control| control.lifecycle == "held");
                             if active.contains_key(&job) {
                                 Err(RestartPostError::UnsafePoint)
                             } else if let Some(control) = control {
                                 if !claim(&gate, job) {
                                     Err(RestartPostError::NotOwned)
-                                } else if !engine.retry_post_hold(job, control.revision).await.unwrap_or(false) {
+                                } else if !matches!(engine.release_hold(job, control.revision.clone(), nzbd_engine::RetryBy::Operator).await, Ok(Ok(()))) {
                                     Err(RestartPostError::NotReady)
+                                } else if !control.post_side() {
+                                    // A download-side hold went back to the
+                                    // download queue; nothing to spawn here.
+                                    Ok(())
                                 } else {
                                     let ready = engine.snapshot().jobs.iter().any(|summary| {
                                         summary.id == job
@@ -601,6 +598,12 @@ async fn manager_task(
                         }
                         if !claim(&gate, job) {
                             let _ = reply.send(Err(RestartPostError::NotOwned));
+                            continue;
+                        }
+                        // A post-processing restart cannot release a hold
+                        // that stopped the download; `resume` is its exit.
+                        if !control.post_side() {
+                            let _ = reply.send(Err(RestartPostError::NotReady));
                             continue;
                         }
                         if !engine.retry_post_hold(job, control.revision).await.unwrap_or(false) {
@@ -2031,48 +2034,9 @@ async fn scan_queue(
 ) {
     let claim = |job: JobId| gate.as_ref().map(|f| f(job)).unwrap_or(true);
     for j in engine.snapshot().jobs.iter() {
-        // A temporarily absent configured volume may expose the underlying
-        // directory at the same path. Keep all writes blocked while its mount
-        // tuple differs, but revalidate periodically so restoring the expected
-        // mount resumes the same attempt without a manual Retry click.
-        let delivery_lifecycle = j.lifecycle_eligible;
-        if delivery_lifecycle
-            && !j.pp_done
-            && !active.contains_key(&j.id)
-            && j.control.as_ref().is_some_and(|control| {
-                control.lifecycle == "held"
-                    && control.cause == "mount_unavailable"
-                    && !control.manual_pause
-            })
-        {
-            if let Some(control) = &j.control {
-                let _ = engine.retry_post_hold(j.id, control.revision.clone()).await;
-            }
-            continue;
-        }
-        if delivery_lifecycle
-            && !j.pp_done
-            && !active.contains_key(&j.id)
-            && j.control.as_ref().is_some_and(|control| {
-                control.lifecycle == "held"
-                    && control.retry_policy == "scheduled_retry"
-                    && !control.manual_pause
-                    && control.next_retry_at_unix.is_some_and(|at| at <= now())
-            })
-        {
-            if let Some(control) = &j.control {
-                if !engine
-                    .retry_post_hold(j.id, control.revision.clone())
-                    .await
-                    .unwrap_or(false)
-                {
-                    // Failed storage rebinding is still retryable. Move the
-                    // next attempt out using the same durable backoff state.
-                    schedule_recoverable_post_retry(engine, j.id).await;
-                }
-            }
-            continue;
-        }
+        // Holds are released by the engine's recovery task (mount
+        // re-observation, scheduled retries, storage) and by operator
+        // retries; post-processing only runs what that leaves PostQueued.
         // NZBGet parity: finished-and-processed jobs live in history, not
         // the queue. Single-node the manager IS the authority; in cluster
         // mode the leader sweep retires (the gate stays out of hygiene).
@@ -2142,15 +2106,17 @@ async fn schedule_recoverable_post_retry(engine: &EngineHandle, job: JobId) {
     }
     let Some(mut control) = row.control().filter(|control| {
         control.lifecycle == "held"
-            && matches!(
-                control.cause.as_str(),
-                "io" | "missing_tool" | "capacity" | "quota"
-            )
+            && control.hold_cause().policy().timed()
             && !control.manual_pause
     }) else {
         return;
     };
 
+    if control.next_retry_at_unix.is_some()
+        && control.retry_policy == control.hold_cause().policy().as_str()
+    {
+        return;
+    }
     let delay = retry_delay_with_jitter(
         post_retry_delay_seconds(control.retry_attempt),
         job,
@@ -2233,7 +2199,8 @@ pub async fn retain_worker_post_retry(
         .and_then(|job| job.control())
         .is_some_and(|control| {
             control.lifecycle == "held"
-                && control.retry_policy == "scheduled_retry"
+                && control.hold_cause().policy().automatic()
+                && control.next_retry_at_unix.is_some()
                 && !control.manual_pause
         })
 }
@@ -2245,6 +2212,7 @@ fn retry_delay_with_jitter(base: i64, job: JobId, attempt: u32) -> i64 {
     base.saturating_add((seed % (base.max(1) as u64 / 10 + 1)) as i64)
 }
 
+const POST_RETRY_DELAYS_SECONDS: [i64; 4] = [30, 60, 120, 300];
 fn post_retry_delay_seconds(retry_attempt: u8) -> i64 {
     POST_RETRY_DELAYS_SECONDS[usize::from(retry_attempt).min(POST_RETRY_DELAYS_SECONDS.len() - 1)]
 }
@@ -2391,10 +2359,8 @@ fn spawn_job(
                     }
                 }
                 Some(Err(PostError::Held)) => {
-                    // The stage owns the persisted cause and revision. I/O or
-                    // missing-tool holds get a durable capped-backoff retry;
-                    // capacity/quota holds use the owner's resource recovery.
-                    schedule_recoverable_post_retry(&engine, job).await;
+                    // The stage owns the persisted cause and revision; the
+                    // hold carries its own retry schedule (owner policy table).
                 }
                 Some(Err(e)) => {
                     let detail = e.to_string();
@@ -2407,10 +2373,9 @@ fn spawn_job(
                         .and_then(|j| j.stages.last())
                         .map(|s| s.stage.as_str().to_string())
                         .unwrap_or_else(|| "extract".into());
+                    // The hold is written with its retry schedule in the
+                    // same commit; nothing to follow up here.
                     let _ = engine.hold_job(job, cause, &stage, &detail).await;
-                    if matches!(cause, "io" | "missing_tool" | "capacity" | "quota") {
-                        schedule_recoverable_post_retry(&engine, job).await;
-                    }
                     // PP writes as much as the downloader does — unpack,
                     // move, script output. An ENOSPC here is the same ground
                     // truth about the volume and must stop intake too, not
@@ -2556,8 +2521,8 @@ fn set_param(params: &mut Vec<(String, String)>, key: &str, value: String) {
 fn failed_cleanup_retry_delay(attempt: u32) -> i64 {
     let index = attempt
         .saturating_sub(1)
-        .min((POST_RETRY_DELAYS_SECONDS.len() - 1) as u32);
-    POST_RETRY_DELAYS_SECONDS[index as usize]
+        .min((nzbd_types::HOLD_RETRY_DELAYS_SECONDS.len() - 1) as u32);
+    nzbd_types::HOLD_RETRY_DELAYS_SECONDS[index as usize]
 }
 
 async fn record_failed_cleanup_retry(engine: &EngineHandle, id: JobId, error: String) {
@@ -3323,7 +3288,11 @@ async fn process_job_ctx_from_inner(
                 let mut r = ex.extract(archive, *kind, &staging, password).await?;
                 staging = r.output_dir.clone();
                 if r.disk_space_error {
-                    let cause = if r.quota_error { "quota" } else { "capacity" };
+                    let cause = if r.quota_error {
+                        HoldCause::Quota
+                    } else {
+                        HoldCause::Capacity
+                    };
                     let detail = r
                         .attempts
                         .iter()
@@ -3344,7 +3313,15 @@ async fn process_job_ctx_from_inner(
                         .artifacts()
                         .abandon_workspace(&workspace)
                         .map_err(PostError::from)?;
-                    let _ = engine.hold_job(job_id, "io", "extract", &detail).await;
+                    // A retryable extractor failure retries on its own only
+                    // when the volume stopped answering; re-running an
+                    // extractor on the same bytes forever is not recovery.
+                    let cause = if nzbd_engine::is_storage_unavailable(&detail) {
+                        HoldCause::StorageUnavailable
+                    } else {
+                        HoldCause::Io
+                    };
+                    let _ = engine.hold_job(job_id, cause, "extract", &detail).await;
                     return Err(PostError::Held);
                 }
                 if !r.success && !par_did_repair && par_ok {
@@ -3382,7 +3359,11 @@ async fn process_job_ctx_from_inner(
                     }
                 }
                 if r.disk_space_error {
-                    let cause = if r.quota_error { "quota" } else { "capacity" };
+                    let cause = if r.quota_error {
+                        HoldCause::Quota
+                    } else {
+                        HoldCause::Capacity
+                    };
                     let _ = engine
                         .hold_job(
                             job_id,
@@ -3404,7 +3385,15 @@ async fn process_job_ctx_from_inner(
                         .artifacts()
                         .abandon_workspace(&workspace)
                         .map_err(PostError::from)?;
-                    let _ = engine.hold_job(job_id, "io", "extract", &detail).await;
+                    // A retryable extractor failure retries on its own only
+                    // when the volume stopped answering; re-running an
+                    // extractor on the same bytes forever is not recovery.
+                    let cause = if nzbd_engine::is_storage_unavailable(&detail) {
+                        HoldCause::StorageUnavailable
+                    } else {
+                        HoldCause::Io
+                    };
+                    let _ = engine.hold_job(job_id, cause, "extract", &detail).await;
                     return Err(PostError::Held);
                 }
                 if r.password_error {
@@ -3415,7 +3404,7 @@ async fn process_job_ctx_from_inner(
                     let _ = engine
                         .hold_job(
                             job_id,
-                            "password_required",
+                            HoldCause::PasswordRequired,
                             "unpack",
                             "encrypted archive needs a corrected password; source files are retained",
                         )
@@ -3695,7 +3684,7 @@ async fn process_job_ctx_from_inner(
                         tracing::error!(job = job_id.0, error = %e, "script failed to run");
                         if job.lifecycle_eligible() && matches!(&e, PostError::ToolMissing(_)) {
                             engine
-                                .hold_job(job_id, "missing_tool", "script", &e.to_string())
+                                .hold_job(job_id, HoldCause::MissingTool, "script", &e.to_string())
                                 .await
                                 .map_err(|hold_error| {
                                     PostError::Subprocess(format!(
@@ -4696,22 +4685,35 @@ fn select_delivery_payload(
     (selected, outcomes)
 }
 
-/// The control cause recorded when post-processing stops with `error`.
-fn post_hold_cause(error: &PostError) -> &'static str {
+/// The hold cause when post-processing stops with `error`: whether retrying
+/// can help, decided by the errno where there is one.
+fn post_hold_cause(error: &PostError) -> HoldCause {
     // Its detail names payload files; a release title must never steer the
     // cause through the substring checks below.
     if matches!(error, PostError::NothingPublishable(_)) {
-        return "post_failure";
+        return HoldCause::PostFailure;
     }
     let detail = error.to_string();
     if nzbd_engine::is_out_of_space(&detail) {
         if detail.to_lowercase().contains("quota") {
-            "quota"
+            HoldCause::Quota
         } else {
-            "capacity"
+            HoldCause::Capacity
         }
+    } else if nzbd_engine::is_storage_unavailable(&detail)
+        // SQLite reports a failing volume as SQLITE_IOERR, whose message has
+        // no errno suffix; matched only on the inventory's SQL variant.
+        || (matches!(
+            error,
+            PostError::Artifact(nzbd_state::artifacts::Error::Sql(_))
+        ) && detail.contains("disk I/O error"))
+    {
+        // Whatever wrapper the error crossed (inventory, subprocess, a
+        // rename), a volume that stopped answering is not a verdict on the
+        // job's content: it retries on its own.
+        HoldCause::StorageUnavailable
     } else if matches!(error, PostError::ToolMissing(_)) {
-        "missing_tool"
+        HoldCause::MissingTool
     } else if matches!(
         error,
         PostError::Io(_)
@@ -4719,18 +4721,18 @@ fn post_hold_cause(error: &PostError) -> &'static str {
                 nzbd_state::artifacts::Error::Io(_) | nzbd_state::artifacts::Error::Sql(_)
             )
     ) {
-        "io"
+        HoldCause::Io
     } else if detail.contains("identity")
         || detail.contains("collision")
         || detail.contains("unsafe")
     {
         if detail.contains("configured root identity changed or volume is unavailable") {
-            "mount_unavailable"
+            HoldCause::MountUnavailable
         } else {
-            "identity_conflict"
+            HoldCause::IdentityConflict
         }
     } else {
-        "post_failure"
+        HoldCause::PostFailure
     }
 }
 
@@ -7776,6 +7778,42 @@ mod decision_tests {
         }
     }
 
+    fn rusqlite_disk_io_error() -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+            Some("disk I/O error".into()),
+        )
+    }
+
+    #[test]
+    fn dropped_volume_errors_hold_as_storage_unavailable_through_any_wrapper() {
+        for error in [
+            PostError::Subprocess(
+                "restore /processing/x -> /processing/y: Transport endpoint is not connected (os error 107)".into(),
+            ),
+            PostError::Io(std::io::Error::other(
+                "read /processing/x: Input/output error (os error 5)",
+            )),
+        ] {
+            assert_eq!(post_hold_cause(&error), HoldCause::StorageUnavailable, "{error}");
+        }
+        let sqlite_ioerr = rusqlite_disk_io_error();
+        assert_eq!(
+            post_hold_cause(&PostError::Artifact(nzbd_state::artifacts::Error::Sql(
+                sqlite_ioerr
+            ))),
+            HoldCause::StorageUnavailable,
+            "SQLITE_IOERR on the state volume carries no errno suffix"
+        );
+        assert_eq!(
+            post_hold_cause(&PostError::Io(std::io::Error::other(
+                "No such file or directory (os error 2)"
+            ))),
+            HoldCause::Io,
+            "a missing file is not a dropped volume"
+        );
+    }
+
     #[test]
     fn nothing_publishable_is_a_retryable_post_failure_whatever_the_title() {
         for title in [
@@ -7785,14 +7823,14 @@ mod decision_tests {
         ] {
             assert_eq!(
                 post_hold_cause(&PostError::NothingPublishable(title.into())),
-                "post_failure"
+                HoldCause::PostFailure
             );
         }
         assert_eq!(
             post_hold_cause(&PostError::Subprocess(
                 "restore source changed identity".into()
             )),
-            "identity_conflict"
+            HoldCause::IdentityConflict
         );
     }
 
@@ -8206,12 +8244,12 @@ mod decision_tests {
 
     #[test]
     fn recoverable_post_retry_backoff_caps_at_five_minutes_without_expiring() {
-        assert_eq!(post_retry_delay_seconds(0), 30);
-        assert_eq!(post_retry_delay_seconds(1), 60);
-        assert_eq!(post_retry_delay_seconds(2), 120);
-        assert_eq!(post_retry_delay_seconds(3), 300);
-        assert_eq!(post_retry_delay_seconds(4), 300);
-        assert_eq!(post_retry_delay_seconds(u8::MAX), 300);
+        assert_eq!(nzbd_types::hold_retry_delay_seconds(0), 30);
+        assert_eq!(nzbd_types::hold_retry_delay_seconds(1), 60);
+        assert_eq!(nzbd_types::hold_retry_delay_seconds(2), 120);
+        assert_eq!(nzbd_types::hold_retry_delay_seconds(3), 300);
+        assert_eq!(nzbd_types::hold_retry_delay_seconds(4), 300);
+        assert_eq!(nzbd_types::hold_retry_delay_seconds(u8::MAX), 300);
     }
 
     #[test]
@@ -9238,7 +9276,7 @@ mod decision_tests {
         let engine = nzbd_engine::Engine::spawn(config()).await.unwrap();
         let first_block = now() - 1801;
         let deadline = now() + 900;
-        for (index, cause) in ["io", "missing_tool", "capacity", "quota"]
+        for (index, cause) in ["storage_unavailable", "missing_tool", "capacity", "quota"]
             .iter()
             .enumerate()
         {
@@ -9260,6 +9298,7 @@ mod decision_tests {
                 retry_attempt: 0,
                 next_retry_at_unix: Some(deadline),
                 blocked_since_unix: Some(first_block),
+                released_at_unix: None,
             });
             engine
                 .import_job(request.clone(), false, false)

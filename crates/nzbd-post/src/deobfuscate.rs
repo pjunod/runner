@@ -261,7 +261,9 @@ pub fn restore_media_extensions_owned(
         None
     }
     let mut plan = Vec::new();
-    for path in crate::namespace::files(dir)? {
+    let listed = crate::namespace::files(dir)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("list {}: {e}", dir.display())))?;
+    for path in listed {
         if path.extension().is_some()
             || protected.contains(
                 &path
@@ -274,10 +276,13 @@ pub fn restore_media_extensions_owned(
             continue;
         }
         let mut bytes = Vec::new();
+        // Name the file: on a dropped mount this is the first read of the
+        // stage, and a bare errno says nothing about where.
         nzbd_state::fileops::open(&path)
             .map_err(|e| crate::PostError::Subprocess(e.to_string()))?
             .take(4096)
-            .read_to_end(&mut bytes)?;
+            .read_to_end(&mut bytes)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("read {}: {e}", path.display())))?;
         if let Some(ext) = kind(&bytes) {
             plan.push((path.clone(), path.with_extension(ext)));
         }

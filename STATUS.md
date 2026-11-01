@@ -1,5 +1,32 @@
 # nzbd — Project Status
 
+## Held jobs with no way out — 2026-11-01
+
+**Status:** fixed on `fix/held-jobs-always-have-an-exit`; plan and root cause
+in [docs/HELD_JOBS_PLAN.md](docs/HELD_JOBS_PLAN.md). Field report: #2181 and
+#2183 on nuc3 sat `HELD` with only *delete* after a sub-six-minute
+`/processing` outage (ENOTCONN, EIO) — "this keeps happening".
+
+- Root cause, post side: the scheduled retry for I/O holds was written by
+  re-importing the row, and `import_job` deliberately keeps a held job's
+  local control — so since it shipped (`f53cdcb`, 2026-10-22) it wrote
+  `review` back every time. Download side: write errors never got a retry
+  at all. Every surface then treated `review` as "no exit".
+- `HoldCause` (nzbd-types) is the closed set; `policy()` is the one table,
+  and a new cause does not compile without one. Causes encode whether
+  retrying helps: a storage errno (`(os error 5|107|116|…)`) is
+  `storage_unavailable` and retries on 30/60/120/300 s backoff; a digest or
+  size mismatch stays `io` for a person.
+- The retry time is stamped by `hold_job` in the same save as the hold. One
+  recovery task (off the owner loop, authority only) releases due holds,
+  including capacity/quota once space returns — which had no automatic exit
+  either. The custody check and capacity probe run in `spawn_blocking`.
+- Every hold answers `resume` (409 with the reason when refused). Web row
+  and mobile card: *pause* while Runner is retrying, *retry* otherwise.
+- Boot and cluster adoption re-arm stored holds, reclassifying `io` holds
+  whose own message carries a storage errno — #2181 and #2183 recover on
+  deploy with no click.
+
 ## Deobfuscated extractions held as unpublishable — 2026-11-01
 
 **Status:** fixed; state and end-to-end PP regressions added. Field report

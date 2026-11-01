@@ -411,6 +411,7 @@ impl Inventory {
                             retry_attempt: 0,
                             next_retry_at_unix: None,
                             blocked_since_unix: None,
+                            released_at_unix: None,
                         });
                         return Ok(Some(WorkerRetryAdoption {
                             source,
@@ -701,6 +702,7 @@ mod tests {
             retry_attempt: 9,
             next_retry_at_unix: Some(999999),
             blocked_since_unix: Some(123),
+            released_at_unix: None,
         };
         job.set_control(&control);
         inventory.checkpoint_worker_control(&job, "1").unwrap();

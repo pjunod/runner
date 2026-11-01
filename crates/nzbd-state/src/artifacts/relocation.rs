@@ -58,7 +58,55 @@ type CopyGate = Option<(
 )>;
 #[cfg(test)]
 pub(super) static COPY_GATE: std::sync::Mutex<CopyGate> = std::sync::Mutex::new(None);
+#[cfg(feature = "test-support")]
+static SHARED_TEST_FAULTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(String, String), i32>>,
+> = std::sync::LazyLock::new(Default::default);
+#[cfg(feature = "test-support")]
+pub struct RelocationTestFault {
+    key: (String, String),
+}
+#[cfg(feature = "test-support")]
+impl Drop for RelocationTestFault {
+    fn drop(&mut self) {
+        SHARED_TEST_FAULTS.lock().unwrap().remove(&self.key);
+    }
+}
+#[cfg(feature = "test-support")]
+impl Inventory {
+    pub fn inject_relocation_test_fault(
+        &self,
+        job: u32,
+        stage: &str,
+        errno: i32,
+    ) -> Result<RelocationTestFault> {
+        if !matches!(stage, "copy_chunk" | "before_commit") {
+            return Err(Error::Conflict(
+                "unsupported relocation test boundary".into(),
+            ));
+        }
+        let source = self.for_job(job)?.ok_or(Error::NotFound)?;
+        let identity = source.identity.ok_or(Error::NotFound)?;
+        let key = (serde_json::to_string(&identity)?, stage.into());
+        SHARED_TEST_FAULTS
+            .lock()
+            .unwrap()
+            .insert(key.clone(), errno);
+        Ok(RelocationTestFault { key })
+    }
+}
 fn boundary(stage: &'static str, scope: Option<&Identity>) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if let Some(identity) = scope {
+        if let Some(errno) = SHARED_TEST_FAULTS
+            .lock()
+            .unwrap()
+            .remove(&(serde_json::to_string(identity)?, stage.into()))
+        {
+            return Err(std::io::Error::from_raw_os_error(errno).into());
+        }
+    }
+
     #[cfg(test)]
     if let Some(code) = FAULTS.with(|f| f.borrow_mut().remove(stage)) {
         return Err(std::io::Error::from_raw_os_error(code).into());
@@ -99,6 +147,70 @@ impl Drop for RelocationLease<'_> {
     }
 }
 impl Inventory {
+    pub(super) fn resume_post_relocation(&self, job: u32) -> Result<()> {
+        let (artifact, key) = {
+            let _guard = self.mutation_guard()?;
+            let Some(source) = self.for_job(job)? else {
+                return Ok(());
+            };
+            let pending = self.pending_relocations(&source.id)?;
+            if pending.is_empty() {
+                return Ok(());
+            }
+            let deletion:bool=self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state IN ('queued','running','review','retry') AND json_extract(data,'$.kind')='delete')",[&source.id],|row|row.get(0))?;
+            if deletion
+                || !source.owned
+                || pending.len() != 1
+                || pending[0].state != "retry"
+                || !self.recoverable_post_relocation(&source)?
+                || source
+                    .hold
+                    .as_ref()
+                    .is_some_and(|hold| hold != "review: interrupted move")
+                || self.source_in_use(&SourceGeneration {
+                    artifact: source.id.clone(),
+                    generation: source.generation.clone(),
+                })
+            {
+                return Err(Error::Conflict(
+                    "resolve pending relocation or deletion before retrying post-processing".into(),
+                ));
+            }
+            let mut operation = pending.into_iter().next().unwrap();
+            operation.next_retry = 0;
+            save_operation(&self.db.lock().unwrap(), &operation)?;
+            (source.id, operation.id)
+        };
+        self.reconcile_relocations_filtered(false, Some(&artifact))?;
+        let current = self.operation(&key)?;
+        if current.state != "succeeded" {
+            return Err(Error::Conflict(current.error.unwrap_or_else(|| {
+                "the exact relocation is still pending; source retained".into()
+            })));
+        }
+        Ok(())
+    }
+    pub(super) fn recoverable_post_relocation(&self, source: &Artifact) -> Result<bool> {
+        let rows = {
+            let db = self.db.lock().unwrap();
+            let mut statement=db.prepare("SELECT data FROM operations WHERE artifact=?1 AND state='retry' AND json_extract(data,'$.kind')='relocate'")?;
+            let rows = statement.query_map([&source.id], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in rows {
+            let op: Operation = serde_json::from_str(&raw)?;
+            let movement: Relocation = serde_json::from_str(&op.request)?;
+            if !movement.registry
+                && movement.source.id == source.id
+                && movement.source.generation == source.generation
+                && movement.source.path == source.path
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Return the durable target of a successful selected-file publication
     /// for this job, if one has already committed. Used when finalization
     /// restarts after the publication journal completed but before History.
@@ -951,6 +1063,7 @@ impl Inventory {
                 Err(e) => return Err(e),
             }
             let _guard = self.mutation_guard()?;
+            boundary("before_commit", source.identity.as_ref())?;
             self.commit_relocation(&mut op, &mut relocation)
         })();
         let guard = self.mutation_guard()?;

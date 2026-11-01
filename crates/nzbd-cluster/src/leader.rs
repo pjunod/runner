@@ -586,7 +586,12 @@ impl LeaderShared {
             let message = format!("job descriptor exceeds the {} MiB cluster limit; split the NZB or reduce its metadata before retrying", MAX_DESCRIPTOR_BYTES / 1024 / 1024);
             if self
                 .engine
-                .hold_job(job.id, "descriptor_oversize", "cluster", &message)
+                .hold_job(
+                    job.id,
+                    nzbd_types::HoldCause::parse("descriptor_oversize"),
+                    "cluster",
+                    &message,
+                )
                 .await
                 .is_ok_and(|held| held)
             {

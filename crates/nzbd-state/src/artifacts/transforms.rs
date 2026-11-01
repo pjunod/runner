@@ -1347,28 +1347,24 @@ impl Inventory {
 impl Inventory {
     /// Validate custody before an operator retries a held PP job. This does not
     /// release an identity or relocation hold, adopt bytes, or delete an attempt.
+    /// Whether post-processing may be retried from the beginning. The
+    /// filesystem proof (root identity, every payload file's identity) runs
+    /// WITHOUT the mutation guard: it is called against volumes that just
+    /// failed, and a wedged NFS/FUSE mount must stall only this caller — not
+    /// every allocation, attempt lease and inventory write queued behind the
+    /// guard. The guarded re-check afterwards proves the row it verified is
+    /// still the row (same id, generation and revision).
     pub fn validate_post_retry(&self, job: u32) -> Result<()> {
-        let _guard = self.mutation_guard()?;
-        let source = self.for_job(job)?.ok_or(Error::NotFound)?;
-        if self.source_in_use(&SourceGeneration {
-            artifact: source.id.clone(),
-            generation: source.generation.clone(),
-        }) {
-            return Err(Error::Conflict(
-                "previous processing workers have not quiesced".into(),
-            ));
-        }
-        if !source.owned
-            || source.hold.is_some()
-            || !matches!(
-                source.state.as_str(),
-                "active" | "transitioning" | "retained"
-            )
-        {
-            return Err(Error::Conflict(
-                "payload custody must be resolved before retrying post-processing".into(),
-            ));
-        }
+        // A journaled rename may already have moved the old source path.
+        // Resume only its exact retryable operation before checking the new
+        // committed source; review and deletion operations remain fenced.
+        self.resume_post_relocation(job)?;
+        let source = {
+            let _guard = self.mutation_guard()?;
+            let source = self.for_job(job)?.ok_or(Error::NotFound)?;
+            self.post_retry_custody(&source)?;
+            source
+        };
         let root = self.verify(&source)?;
         for entry in source.files.iter().filter(|e| !e.identity.directory) {
             let file = fs::open_relative(&root, &entry.path)?;
@@ -1378,13 +1374,51 @@ impl Inventory {
                 ));
             }
         }
+        let _guard = self.mutation_guard()?;
+        let current = self.for_job(job)?.ok_or(Error::NotFound)?;
+        if (&current.id, &current.generation, current.revision)
+            != (&source.id, &source.generation, source.revision)
+        {
+            return Err(Error::Conflict(
+                "payload custody changed during the retry check; check again".into(),
+            ));
+        }
+        self.post_retry_custody(&current)?;
         let pending: i64 = self.db.lock().unwrap().query_row(
-            "SELECT COUNT(*) FROM operations WHERE artifact=?1 AND state IN ('running','review','queued','retry') AND json_extract(data,'$.kind') IN ('relocate','delete')",
-            [&source.id], |r| r.get(0),
+            "SELECT COUNT(*) FROM operations WHERE artifact=?1 AND state IN ('running','review','queued','retry') AND (json_extract(data,'$.kind')='delete' OR (json_extract(data,'$.kind')='relocate' AND state!='retry'))",
+            [&current.id], |r| r.get(0),
         )?;
-        if pending != 0 {
+        let retry_relocations:bool=self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state='retry' AND json_extract(data,'$.kind')='relocate')",[&current.id],|row|row.get(0))?;
+        if pending != 0 || (retry_relocations && !self.recoverable_post_relocation(&current)?) {
             return Err(Error::Conflict(
                 "resolve pending relocation or deletion before retrying post-processing".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The custody facts a post retry needs, read from the row alone.
+    fn post_retry_custody(&self, source: &Artifact) -> Result<()> {
+        if self.source_in_use(&SourceGeneration {
+            artifact: source.id.clone(),
+            generation: source.generation.clone(),
+        }) {
+            return Err(Error::Conflict(
+                "previous processing workers have not quiesced".into(),
+            ));
+        }
+        if !source.owned
+            || (source.hold.is_some()
+                && !(source.hold.as_deref() == Some("review: interrupted move")
+                    && self.recoverable_post_relocation(source)?))
+            || !matches!(
+                source.state.as_str(),
+                "active" | "transitioning" | "retained"
+            )
+        {
+            return Err(Error::Conflict(
+                "payload custody must be resolved before retrying post-processing".into(),
             ));
         }
         Ok(())

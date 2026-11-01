@@ -2303,3 +2303,6 @@ mod tests;
 
 #[cfg(test)]
 mod relocation_failure_tests;
+
+#[cfg(feature = "test-support")]
+pub use relocation::RelocationTestFault;

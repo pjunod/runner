@@ -15,6 +15,7 @@ pub mod backend;
 pub mod events;
 pub mod failover;
 pub mod fetch;
+mod hold_recovery;
 pub mod queue;
 pub mod rate;
 pub mod snapshot;
@@ -29,7 +30,7 @@ mod pool;
 mod writer;
 
 pub use events::Event;
-pub use owner::{MirrorStats, MoveOp};
+pub use owner::{MirrorStats, MoveOp, RetryBy};
 pub use queue::clean_job_name;
 pub use snapshot::{
     new_shared_snapshot, JobSummary, QueueSnapshot, RepairPhase, RepairProgress, ServerVolume,
@@ -113,6 +114,96 @@ fn url_storage_error(error: nzbd_state::artifacts::Error) -> EngineError {
         }
         nzbd_state::artifacts::Error::NotFound => EngineError::OwnershipLost,
         other => EngineError::Lifecycle(other.to_string()),
+    }
+}
+
+/// The storage under a path stopped answering: a network or FUSE mount lost
+/// its transport, a stale handle after a server-side remount, a device that
+/// went away, a remote that timed out or reset, or the generic EIO such
+/// mounts report meanwhile. Nothing about the job is wrong; the same
+/// operation succeeds once the volume is back, so these holds retry on
+/// their own ([`nzbd_types::HoldCause::StorageUnavailable`]).
+///
+/// Matched only on the std `(os error N)` suffix every `io::Error` Display
+/// ends with — the error has usually crossed a `to_string()` by the time a
+/// hold is classified, and free text (payload names, extractor output) must
+/// not steer the cause.
+pub fn is_storage_unavailable(msg: &str) -> bool {
+    // EIO ENXIO EAGAIN ENODEV ENOLINK ECONNABORTED ECONNRESET ENOTCONN
+    // ETIMEDOUT ECONNREFUSED EHOSTDOWN EHOSTUNREACH ESTALE EREMOTEIO
+    const ERRNOS: [u16; 14] = [
+        5, 6, 11, 19, 67, 103, 104, 107, 110, 111, 112, 113, 116, 121,
+    ];
+    ERRNOS
+        .iter()
+        .any(|n| msg.contains(&format!("(os error {n})")))
+}
+
+/// How long a hold release waits on a filesystem probe (custody check,
+/// capacity probe) against the volume that failed. A hung NFS/FUSE mount
+/// blocks the probe's thread in the kernel; the release gives up on it and
+/// treats that as a refusal, so one wedged job cannot stall the recovery of
+/// every other job or the daemon's shutdown.
+const HOLD_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Run a blocking filesystem probe off the runtime with a deadline. The
+/// error says why there is no answer.
+struct HoldProbeLease {
+    probes: Arc<Mutex<HashSet<JobId>>>,
+    job: JobId,
+}
+impl Drop for HoldProbeLease {
+    fn drop(&mut self) {
+        self.probes.lock().unwrap().remove(&self.job);
+    }
+}
+async fn bounded_probe<T: Send + 'static>(
+    probes: Arc<Mutex<HashSet<JobId>>>,
+    job: JobId,
+    probe: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    bounded_probe_deadline(probes, job, HOLD_PROBE_TIMEOUT, probe).await
+}
+async fn bounded_probe_deadline<T: Send + 'static>(
+    probes: Arc<Mutex<HashSet<JobId>>>,
+    job: JobId,
+    deadline: Duration,
+    probe: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    if !probes.lock().unwrap().insert(job) {
+        return Err("a previous probe for this job is still waiting on its volume".into());
+    }
+    let lease = HoldProbeLease { probes, job };
+    match tokio::time::timeout(
+        deadline,
+        tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            probe()
+        }),
+    )
+    .await
+    {
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(error)) => Err(format!("did not finish: {error}")),
+        Err(_) => Err(format!(
+            "got no answer from the volume within {} s",
+            HOLD_PROBE_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// The hold cause for a failed write or filesystem step, by errno.
+pub fn io_hold_cause(msg: &str) -> nzbd_types::HoldCause {
+    if is_out_of_space(msg) {
+        if msg.to_lowercase().contains("quota") {
+            nzbd_types::HoldCause::Quota
+        } else {
+            nzbd_types::HoldCause::Capacity
+        }
+    } else if is_storage_unavailable(msg) {
+        nzbd_types::HoldCause::StorageUnavailable
+    } else {
+        nzbd_types::HoldCause::Io
     }
 }
 
@@ -489,71 +580,15 @@ impl Engine {
             backend_adapter: Arc::new(std::sync::Mutex::new(Some(backend_adapter))),
             budget_tracker,
             url_fetches: Arc::new(Mutex::new(HashSet::new())),
+            hold_probes: Arc::new(Mutex::new(HashSet::new())),
+            recovery_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
-        // Probe retained resource holds independently of download admission.
-        // Bound each sweep and rotate it so an unavailable volume cannot starve
-        // later jobs. The owner durably schedules unlimited per-job backoff.
-        {
-            let retries = handle.clone();
-            handle.tracker.spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                let mut cursor = 0usize;
-                loop {
-                    tokio::select! {
-                        _ = retries.cancel.cancelled() => break,
-                        _ = tick.tick() => {}
-                    }
-                    let snapshot = retries.snapshot();
-                    let jobs = snapshot
-                        .jobs
-                        .iter()
-                        .filter(|job| job.kind == nzbd_types::JobKind::Nzb)
-                        .map(|job| job.id)
-                        .collect::<Vec<_>>();
-                    if jobs.is_empty() {
-                        continue;
-                    }
-                    let mut probes = tokio::task::JoinSet::new();
-                    for offset in 0..jobs.len().min(8) {
-                        let job = jobs[(cursor + offset) % jobs.len()];
-                        let retries = retries.clone();
-                        probes.spawn(async move {
-                            let Some(record) = retries.export_job(job).await.ok().flatten() else {
-                                return;
-                            };
-                            if !record.control().is_some_and(|control| {
-                                control.lifecycle == "held"
-                                    && matches!(control.cause.as_str(), "capacity" | "quota")
-                                    && !matches!(
-                                        control.previous_status,
-                                        Some(
-                                            nzbd_types::JobStatus::Post { .. }
-                                                | nzbd_types::JobStatus::PostQueued
-                                                | nzbd_types::JobStatus::Completed
-                                        )
-                                    )
-                            }) {
-                                return;
-                            }
-                            let _ = tokio::time::timeout(
-                                std::time::Duration::from_secs(8),
-                                retries.resume_resource_job(job, false),
-                            )
-                            .await;
-                        });
-                    }
-                    cursor = (cursor + jobs.len().min(8)) % jobs.len();
-                    while !probes.is_empty() {
-                        tokio::select! {
-                            _ = retries.cancel.cancelled() => return,
-                            _ = probes.join_next() => {}
-                        }
-                    }
-                }
-            });
-        }
+        // Automatic hold recovery: one task, off the owner loop, for every
+        // policy that releases without a person (docs/HELD_JOBS_PLAN.md §4.5).
+        handle
+            .tracker
+            .spawn(hold_recovery::run(handle.clone(), handle.cancel.clone()));
 
         for (job, url) in refetch {
             tracing::info!(job = job.0, %url, "re-spawning NZB fetch for job recovered mid-fetch");
@@ -656,6 +691,8 @@ pub struct EngineHandle {
     backend_adapter: Arc<std::sync::Mutex<Option<backend::BackendAdapterPort>>>,
     budget_tracker: Arc<pool::BudgetTracker>,
     url_fetches: Arc<Mutex<HashSet<JobId>>>,
+    hold_probes: Arc<Mutex<HashSet<JobId>>>,
+    recovery_cursor: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct UrlFetchGuard {
@@ -965,7 +1002,7 @@ impl EngineHandle {
                         // Size/identity/parse constraints are permanent for this
                         // input. Persist an actionable failed disposition once.
                         if failure.as_deref() == Some(&message) {
-                            let _ = handle.hold_job(id, "identity_conflict", "url_fetch", &message).await;
+                            let _ = handle.hold_job(id, nzbd_types::HoldCause::IdentityConflict, "url_fetch", &message).await;
                             tracing::error!(job=id.0, %message, "URL source retained for review"); return;
                         }
                         failure = Some(message); continue;
@@ -1292,92 +1329,180 @@ impl EngineHandle {
     async fn resume_resource_job(&self, job: JobId, force: bool) -> Result<bool, EngineError> {
         if let Some(record) = self.export_job(job).await? {
             if let Some(control) = record.control().filter(|c| c.lifecycle == "held") {
-                // Allocation may have no owned payload yet: do not run the
-                // capacity probe, which requires one. The queue owner persists
-                // release and wakes normal allocation admission for this job.
-                if control.cause == "allocation" {
-                    return self
-                        .roundtrip_bool(|reply| QueueCommand::ReleaseResourceHold {
-                            job,
-                            revision: control.revision.clone(),
-                            reply,
-                        })
-                        .await;
-                }
-                if !matches!(control.cause.as_str(), "capacity" | "quota") {
-                    return Ok(false);
-                }
-                if matches!(
-                    control.previous_status,
-                    Some(
-                        nzbd_types::JobStatus::Post { .. }
-                            | nzbd_types::JobStatus::PostQueued
-                            | nzbd_types::JobStatus::Completed
-                    )
-                ) {
-                    // Publication capacity belongs to its destination journal.
-                    // Explicit retry re-enters that operation; background source
-                    // probes must never release a post-processing hold.
-                    return if force {
-                        self.retry_post_hold(job, control.revision).await
-                    } else {
-                        Ok(false)
-                    };
-                }
-                let revision = control.revision.clone();
-                if !self
-                    .roundtrip_bool(|reply| QueueCommand::BeginResourceProbe {
+                // Every hold answers an operator resume: the same release the
+                // recovery task would run, without its due-time or pause
+                // checks. A refusal carries its reason to the caller.
+                return match self
+                    .release_hold(
                         job,
-                        revision: revision.clone(),
-                        force,
-                        reply,
-                    })
+                        control.revision,
+                        if force {
+                            RetryBy::Operator
+                        } else {
+                            RetryBy::Recovery
+                        },
+                    )
                     .await?
                 {
-                    return Ok(false);
-                }
-                let inventory = self.artifacts();
-                let path = inventory
-                    .for_job(job.0)
-                    .map_err(|e| EngineError::Lifecycle(e.to_string()))?
-                    .ok_or_else(|| {
-                        EngineError::Lifecycle("held payload identity unavailable".into())
-                    })?
-                    .path;
-                let bytes = record
-                    .files
-                    .iter()
-                    .map(|f| {
-                        let key = format!("*File:size:{}", f.id.0);
-                        record
-                            .params
-                            .iter()
-                            .find(|(k, _)| k == &key)
-                            .and_then(|(_, v)| v.parse::<u64>().ok())
-                            .unwrap_or_else(|| f.segments.iter().map(|s| s.size as u64).sum())
-                    })
-                    .sum();
-                let token = format!("{}-{}", job.0, revision);
-                // Explicit resume is the operator release for unavailable quota
-                // telemetry. Admission and a write/flush probe still must pass.
-                let health = tokio::task::spawn_blocking(move || {
-                    nzbd_state::capacity::health(&path, bytes, &token)
-                })
-                .await;
-                let Ok(Ok(_reservation)) = health else {
-                    return Ok(false);
+                    Ok(()) => Ok(true),
+                    Err(reason) => Err(EngineError::Lifecycle(reason)),
                 };
-                return self
-                    .roundtrip_bool(|reply| QueueCommand::ReleaseResourceHold {
-                        job,
-                        revision,
-                        reply,
-                    })
-                    .await;
             }
         }
         self.roundtrip_bool(|reply| QueueCommand::Resume { job, reply })
             .await
+    }
+
+    /// End the hold at `revision`, by whichever release its cause takes.
+    /// Everything that touches the payload mount (the custody check, the
+    /// capacity probe) runs in `spawn_blocking` here, never on the owner
+    /// loop, so a wedged FUSE/NFS mount cannot stall the queue. The inner
+    /// error is the refusal reason.
+    pub async fn release_hold(
+        &self,
+        job: JobId,
+        revision: String,
+        by: RetryBy,
+    ) -> Result<Result<(), String>, EngineError> {
+        let Some(record) = self.export_job(job).await? else {
+            return Ok(Err("job not found".into()));
+        };
+        let Some(control) = record
+            .control()
+            .filter(|c| c.lifecycle == "held" && c.revision == revision)
+        else {
+            return Ok(Err(
+                "the hold changed since it was read; reload and retry".into()
+            ));
+        };
+        let cause = control.hold_cause();
+        if cause == nzbd_types::HoldCause::Allocation {
+            // Allocation may have no owned payload yet: no capacity probe,
+            // which requires one. The next lease re-allocates.
+            return Ok(self
+                .roundtrip_bool(|reply| QueueCommand::ReleaseResourceHold {
+                    job,
+                    revision,
+                    by,
+                    reply,
+                })
+                .await?
+                .then_some(())
+                .ok_or_else(|| "the allocation hold could not be released".to_string()));
+        }
+        if cause.is_storage() && !control.post_side() {
+            if by == RetryBy::Recovery && self.snapshot().disk_low {
+                return Ok(Err("waiting for free space".into()));
+            }
+            return self.release_capacity_hold(&record, revision, by).await;
+        }
+        let custody_checked = if control.post_side() {
+            let inventory = self.artifacts();
+            match bounded_probe(self.hold_probes.clone(), job, move || {
+                inventory.validate_post_retry(job.0)
+            })
+            .await
+            {
+                Ok(Ok(())) => true,
+                Ok(Err(e)) => return Ok(Err(format!("post-processing retry refused: {e}"))),
+                Err(why) => return Ok(Err(format!("custody check {why}"))),
+            }
+        } else {
+            false
+        };
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::RetryHold {
+            job,
+            revision,
+            by,
+            custody_checked,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| EngineError::Closed)
+    }
+
+    /// Capacity/quota release: the owner's probe backoff, then an admission
+    /// and write/flush probe on the payload path, then the owner release.
+    async fn release_capacity_hold(
+        &self,
+        record: &Job,
+        revision: String,
+        by: RetryBy,
+    ) -> Result<Result<(), String>, EngineError> {
+        let job = record.id;
+        if !self
+            .roundtrip_bool(|reply| QueueCommand::BeginResourceProbe {
+                job,
+                revision: revision.clone(),
+                by,
+                reply,
+            })
+            .await?
+        {
+            return Ok(Err("the storage probe is backing off; retry shortly".into()));
+        }
+        let path = match self.artifacts().for_job(job.0) {
+            Ok(Some(artifact)) => artifact.path,
+            Ok(None) => return Ok(Err("held payload identity unavailable".into())),
+            Err(e) => return Ok(Err(e.to_string())),
+        };
+        let bytes = record
+            .files
+            .iter()
+            .map(|f| {
+                let key = format!("*File:size:{}", f.id.0);
+                record
+                    .params
+                    .iter()
+                    .find(|(k, _)| k == &key)
+                    .and_then(|(_, v)| v.parse::<u64>().ok())
+                    .unwrap_or_else(|| f.segments.iter().map(|s| s.size as u64).sum())
+            })
+            .sum();
+        let token = format!("{}-{}", job.0, revision);
+        // Admission and a write/flush probe must pass before writes resume.
+        let health = bounded_probe(self.hold_probes.clone(), job, move || {
+            nzbd_state::capacity::health(&path, bytes, &token)
+        })
+        .await;
+        match health {
+            Ok(Ok(_reservation)) => {}
+            Ok(Err(e)) => return Ok(Err(format!("storage is still not admitting writes: {e}"))),
+            Err(why) => return Ok(Err(format!("storage probe {why}"))),
+        }
+        Ok(self
+            .roundtrip_bool(|reply| QueueCommand::ReleaseResourceHold {
+                job,
+                revision,
+                by,
+                reply,
+            })
+            .await?
+            .then_some(())
+            .ok_or_else(|| "the storage hold could not be released".to_string()))
+    }
+
+    /// Run one automatic hold-recovery pass now (the background task runs
+    /// one every few seconds). Returns how many holds it released.
+    pub async fn run_hold_recovery_pass(&self) -> Result<usize, EngineError> {
+        hold_recovery::pass(self, true).await
+    }
+
+    /// Move an automatic hold's next attempt out, recording why.
+    pub async fn reschedule_hold(
+        &self,
+        job: JobId,
+        revision: String,
+        reason: String,
+    ) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::RescheduleHold {
+            job,
+            revision,
+            reason,
+            reply,
+        })
+        .await
     }
 
     pub async fn delete_job(&self, job: JobId, delete_files: bool) -> Result<bool, EngineError> {
@@ -1908,26 +2033,26 @@ impl EngineHandle {
         .await
     }
 
+    /// Operator retry from post-processing's own surfaces (restart, Retry):
+    /// the same release as `resume` on a held job.
     pub async fn retry_post_hold(&self, job: JobId, revision: String) -> Result<bool, EngineError> {
-        self.roundtrip_bool(|reply| QueueCommand::RetryPostHold {
-            job,
-            revision,
-            reply,
-        })
-        .await
+        Ok(self
+            .release_hold(job, revision, RetryBy::Operator)
+            .await?
+            .is_ok())
     }
 
     /// Persist a nonterminal fence before exposing it to consumers.
     pub async fn hold_job(
         &self,
         job: JobId,
-        cause: &str,
+        cause: nzbd_types::HoldCause,
         stage: &str,
         message: &str,
     ) -> Result<bool, EngineError> {
         self.roundtrip_bool(|reply| QueueCommand::HoldJob {
             job,
-            cause: cause.into(),
+            cause,
             stage: stage.into(),
             message: message.into(),
             reply,
@@ -2101,7 +2226,88 @@ fn validate_torrent_tags(tags: &[String]) -> Result<(), EngineError> {
 }
 
 #[cfg(test)]
+mod hold_probe_tests {
+    use super::*;
+    #[tokio::test]
+    async fn timed_out_probe_keeps_singleflight_until_blocked_thread_finishes() {
+        let probes = Arc::new(Mutex::new(HashSet::new()));
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let blocked = gate.clone();
+        let owned = probes.clone();
+        let (entered, started) = oneshot::channel();
+        let first = tokio::spawn(async move {
+            bounded_probe_deadline(owned, JobId(901), Duration::from_millis(25), move || {
+                let _ = entered.send(());
+                blocked.wait();
+                true
+            })
+            .await
+        });
+        started.await.unwrap();
+        let timeout = first.await.unwrap();
+        let second = bounded_probe_deadline(
+            probes.clone(),
+            JobId(901),
+            Duration::from_millis(25),
+            || true,
+        )
+        .await;
+        tokio::task::spawn_blocking(move || gate.wait())
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if probes.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(timeout.is_err());
+        assert!(second.unwrap_err().contains("previous probe"));
+        assert!(probes.lock().unwrap().is_empty());
+        assert!(
+            bounded_probe_deadline(probes, JobId(901), Duration::from_secs(2), || true)
+                .await
+                .unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
 mod out_of_space_tests {
+    use super::*;
+
+    #[test]
+    fn storage_unavailable_matches_dropped_volumes_by_errno_only() {
+        for n in [
+            5, 6, 11, 19, 67, 103, 104, 107, 110, 111, 112, 113, 116, 121,
+        ] {
+            let msg = format!("write /processing/x.part: whatever (os error {n})");
+            assert!(is_storage_unavailable(&msg), "{msg}");
+            assert_eq!(
+                io_hold_cause(&msg),
+                nzbd_types::HoldCause::StorageUnavailable
+            );
+        }
+        for no in [
+            "Permission denied (os error 13)",
+            "os error 57",
+            "(os error 50)",
+            "(os error 1107)",
+            "a release named Transport endpoint is not connected",
+            "finalize: complete checkpoint digest differs",
+        ] {
+            assert!(!is_storage_unavailable(no), "{no}");
+            assert_eq!(io_hold_cause(no), nzbd_types::HoldCause::Io, "{no}");
+        }
+        assert_eq!(
+            io_hold_cause("No space left on device (os error 28)"),
+            nzbd_types::HoldCause::Capacity
+        );
+        assert_eq!(
+            io_hold_cause("Disk quota exceeded (os error 122)"),
+            nzbd_types::HoldCause::Quota
+        );
+    }
     use super::is_out_of_space;
 
     /// Every shape this string arrives in — the writer's stringified
