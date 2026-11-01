@@ -57,7 +57,7 @@ export function FailureKeepControl({ client, jobId }: { client: NzbdClient; jobI
       accessibilityState={{ disabled: busy, busy }} onPress={() => { if (!busy) void toggle(); }} style={styles.button}>
       <Text style={styles.buttonText}>{busy ? 'Saving source retention…' : label}</Text>
     </Pressable> : <Text style={styles.note}>{error ? `Could not check source retention: ${error}` : preference ? 'No retained source is available for this preference.' : 'Checking current source retention…'}</Text>}
-    {pending ? <Text accessibilityLiveRegion="polite" style={styles.note}>{`Waiting for source owners${ownerCount ? ` (${ownerCount})` : ''} to apply this retention change. Protection is not confirmed yet.`}</Text> : null}
+    {pending ? <Text accessibilityLiveRegion="polite" style={styles.note}>{`Waiting for source owners${ownerCount ? ` (${ownerCount})` : ''} to apply this retention change. The change is not confirmed on every source owner yet.`}</Text> : null}
     {actionError ? <Text accessibilityRole="alert" style={styles.error}>{actionError}</Text> : null}
     {notice ? <Text accessibilityLiveRegion="polite" style={styles.note}>{notice}</Text> : null}
     {!preference || error ? <Pressable accessibilityRole="button" onPress={() => void refresh()}><Text style={styles.buttonText}>Refresh source retention</Text></Pressable> : null}

@@ -2362,7 +2362,7 @@ function failureKeepModel(id, hidden = false) {
     failureKeepNote: hidden ? "" : state?.error
       ? "Could not check source retention: " + state.error
       : state?.available === false ? "No retained source is available for this preference."
-      : state?.applied === false ? "Waiting for source owners" + (state.pendingOwners?.length ? " (" + Math.min(64, state.pendingOwners.length) + ")" : "") + " to apply this retention change. Protection is not confirmed yet."
+      : state?.applied === false ? "Waiting for source owners" + (state.pendingOwners?.length ? " (" + Math.min(64, state.pendingOwners.length) + ")" : "") + " to apply this retention change. The change is not confirmed on every source owner yet."
       : !state || state.loading ? "Checking current source retention…" : "" };
 }
 async function refreshFailureKeep(id) {
