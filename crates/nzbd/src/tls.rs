@@ -15,8 +15,21 @@ use std::sync::Arc;
 
 pub struct TlsSetup {
     pub config: Arc<rustls::ServerConfig>,
+    /// Exact known certificate for the private responsiveness check.
+    pub certificate: Vec<u8>,
     /// Human-readable note for the startup log (cert origin/fingerprint).
     pub note: String,
+}
+
+fn storage_error(op: &str, path: &Path, error: std::io::Error) -> anyhow_lite::Error {
+    // Missing explicit material and malformed material are invalid startup
+    // configuration; uncertain storage never authorizes identity generation.
+    let prefix = if error.kind() == std::io::ErrorKind::NotFound {
+        ""
+    } else {
+        "storage unavailable: "
+    };
+    err(format!("{prefix}{op} {}: {error}", path.display()))
 }
 
 fn err(msg: String) -> anyhow_lite::Error {
@@ -44,9 +57,22 @@ pub fn install_process_crypto_provider() -> anyhow_lite::Result<()> {
 
 /// Build the server TLS config, generating a persistent self-signed cert
 /// when none is configured. Returns None when `[api] tls` is off.
+#[cfg(test)]
 pub fn server_config(
     cfg: &nzbd_config::Config,
     state_dir: &Path,
+) -> anyhow_lite::Result<Option<TlsSetup>> {
+    server_config_checked(cfg, state_dir, || Ok(()))
+}
+
+/// Existing security material is read without requiring backend ownership.
+/// The caller's nonmutating installation preflight runs only immediately
+/// before proven first initialization could create material on the data root.
+/// This keeps a conflicting inventory owner from withdrawing safe controls.
+pub fn server_config_checked(
+    cfg: &nzbd_config::Config,
+    state_dir: &Path,
+    before_initialization: impl FnOnce() -> anyhow_lite::Result<()>,
 ) -> anyhow_lite::Result<Option<TlsSetup>> {
     install_process_crypto_provider()?;
     if !cfg.api.tls {
@@ -70,13 +96,43 @@ pub fn server_config(
         }
     };
 
-    if generated && !cert_path.exists() {
-        generate_self_signed(&cert_path, &key_path, &cfg.api.tls_sans)?;
+    if generated {
+        let cert_exists = cert_path
+            .try_exists()
+            .map_err(|error| storage_error("inspect", &cert_path, error))?;
+        let key_exists = key_path
+            .try_exists()
+            .map_err(|error| storage_error("inspect", &key_path, error))?;
+        match (cert_exists, key_exists) {
+            (true, true) => {}
+            (false, false) => {
+                let directory = cert_path.parent().expect("generated TLS directory");
+                match std::fs::metadata(directory) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        before_initialization()?;
+                        generate_self_signed(&cert_path, &key_path, &cfg.api.tls_sans)?
+                    }
+                    Err(error) => return Err(storage_error("inspect", directory, error)),
+                    Ok(_) => {
+                        return Err(err(format!(
+                            "incomplete TLS identity in {}; refusing to replace existing material",
+                            directory.display()
+                        )))
+                    }
+                }
+            }
+            _ => {
+                return Err(err(format!(
+                    "incomplete TLS certificate/key pair in {}; refusing to regenerate identity",
+                    cert_path.parent().unwrap().display()
+                )))
+            }
+        }
     }
 
     let certs: Vec<CertificateDer<'static>> = {
-        let pem = std::fs::read(&cert_path)
-            .map_err(|e| err(format!("read {}: {e}", cert_path.display())))?;
+        let pem =
+            std::fs::read(&cert_path).map_err(|error| storage_error("read", &cert_path, error))?;
         CertificateDer::pem_slice_iter(&pem)
             .collect::<Result<_, _>>()
             .map_err(|e| err(format!("parse {}: {e}", cert_path.display())))?
@@ -88,8 +144,8 @@ pub fn server_config(
         )));
     }
     let key = {
-        let pem = std::fs::read(&key_path)
-            .map_err(|e| err(format!("read {}: {e}", key_path.display())))?;
+        let pem =
+            std::fs::read(&key_path).map_err(|error| storage_error("read", &key_path, error))?;
         PrivateKeyDer::pem_slice_iter(&pem)
             .next()
             .transpose()
@@ -97,7 +153,8 @@ pub fn server_config(
             .ok_or_else(|| err(format!("{}: no private key found", key_path.display())))?
     };
 
-    let fingerprint = sha256_hex(certs[0].as_ref());
+    let certificate = certs[0].as_ref().to_vec();
+    let fingerprint = sha256_hex(&certificate);
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
@@ -112,6 +169,7 @@ pub fn server_config(
     };
     Ok(Some(TlsSetup {
         config: Arc::new(config),
+        certificate,
         note,
     }))
 }
@@ -131,13 +189,61 @@ fn generate_self_signed(
     sans.dedup();
     let cert = rcgen::generate_simple_self_signed(sans.clone())
         .map_err(|e| err(format!("generate self-signed cert: {e}")))?;
-    if let Some(parent) = cert_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| err(format!("create {}: {e}", parent.display())))?;
+    // Publish the complete identity with one directory rename. The final
+    // directory must be absent; rename cannot replace another complete pair
+    // because a complete TLS directory is nonempty. An interrupted staging
+    // directory is never treated as authority to rotate a persisted identity.
+    let directory = cert_path.parent().expect("TLS certificate directory");
+    let parent = directory
+        .parent()
+        .ok_or_else(|| err("TLS directory has no parent".into()))?;
+    std::fs::create_dir_all(parent).map_err(|error| storage_error("create", parent, error))?;
+    // Serialize cooperating initializers outside the yet-unpublished TLS
+    // directory. A stale lock records interrupted initialization and must
+    // never be interpreted as permission to create another identity.
+    let initialization_lock = parent.join(".nzbd-tls-initialization.lock");
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&initialization_lock)
+        .map_err(|error| {
+            storage_error(
+                "claim first TLS initialization",
+                &initialization_lock,
+                error,
+            )
+        })?;
+    if directory
+        .try_exists()
+        .map_err(|error| storage_error("inspect", directory, error))?
+    {
+        return Err(err(format!(
+            "TLS identity appeared during initialization in {}; refusing replacement",
+            directory.display()
+        )));
     }
-    std::fs::write(cert_path, cert.cert.pem())
-        .map_err(|e| err(format!("write {}: {e}", cert_path.display())))?;
-    write_private(key_path, cert.key_pair.serialize_pem().as_bytes())?;
+
+    let staging = parent.join(format!(
+        ".tls-initializing-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&staging).map_err(|error| storage_error("create", &staging, error))?;
+    let staged_cert = staging.join(cert_path.file_name().unwrap());
+    let staged_key = staging.join(key_path.file_name().unwrap());
+    write_exclusive(&staged_cert, cert.cert.pem().as_bytes(), false)?;
+    write_exclusive(&staged_key, cert.key_pair.serialize_pem().as_bytes(), true)?;
+    sync_directory(&staging)?;
+    std::fs::rename(&staging, directory)
+        .map_err(|error| storage_error("publish TLS identity", directory, error))?;
+    sync_directory(parent)?;
+    drop(lock);
+    std::fs::remove_file(&initialization_lock)
+        .map_err(|error| storage_error("finish TLS initialization", &initialization_lock, error))?;
+    sync_directory(parent)?;
     tracing::info!(
         cert = %cert_path.display(),
         sans = %sans.join(", "),
@@ -146,14 +252,32 @@ fn generate_self_signed(
     Ok(())
 }
 
-/// 0600 on unix; plain write elsewhere.
-fn write_private(path: &PathBuf, bytes: &[u8]) -> anyhow_lite::Result<()> {
-    std::fs::write(path, bytes).map_err(|e| err(format!("write {}: {e}", path.display())))?;
+/// Exclusive creation with key permissions set before any secret bytes exist.
+fn write_exclusive(path: &Path, bytes: &[u8], private: bool) -> anyhow_lite::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(if private { 0o600 } else { 0o644 });
     }
+    #[cfg(not(unix))]
+    let _ = private;
+    let mut file = options
+        .open(path)
+        .map_err(|error| storage_error("create", path, error))?;
+    file.write_all(bytes)
+        .map_err(|error| storage_error("write", path, error))?;
+    file.sync_all()
+        .map_err(|error| storage_error("sync", path, error))?;
+    Ok(())
+}
+fn sync_directory(path: &Path) -> anyhow_lite::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| storage_error("sync directory", path, error))?;
     Ok(())
 }
 
@@ -261,6 +385,20 @@ mod tests {
         .unwrap();
         std::fs::remove_file(tmp.path().join("tls/key.pem")).unwrap();
         assert!(server_config(&cfg, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn incomplete_identity_never_regenerates_or_overwrites_surviving_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = base_cfg(tmp.path());
+        cfg.api.tls = true;
+        server_config(&cfg, tmp.path()).unwrap();
+        let key_path = tmp.path().join("tls/key.pem");
+        let key = std::fs::read(&key_path).unwrap();
+        std::fs::remove_file(tmp.path().join("tls/cert.pem")).unwrap();
+        assert!(server_config(&cfg, tmp.path()).is_err());
+        assert_eq!(std::fs::read(key_path).unwrap(), key);
+        assert!(!tmp.path().join("tls/cert.pem").try_exists().unwrap());
     }
 
     #[test]

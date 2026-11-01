@@ -39,6 +39,15 @@ fn http_nzb(addr: &str, path: &str, body: &[u8]) -> (u16, String) {
 /// fails here immediately: waiting out the budget to report "did not become
 /// healthy" names the symptom and discards the cause.
 fn wait_healthy(daemon: &KillOnDrop, addr: &str, deadline: Duration) -> Result<(), String> {
+    wait_healthy_authenticated(daemon, addr, deadline, None)
+}
+
+fn wait_healthy_authenticated(
+    daemon: &KillOnDrop,
+    addr: &str,
+    deadline: Duration,
+    auth: Option<&str>,
+) -> Result<(), String> {
     let start = Instant::now();
     loop {
         if let Some(cause) = daemon.died() {
@@ -49,7 +58,23 @@ fn wait_healthy(daemon: &KillOnDrop, addr: &str, deadline: Duration) -> Result<(
         let budget = PROBE_TIMEOUT.min(deadline.saturating_sub(start.elapsed()));
         if let Some((200, body)) = probe_within(addr, "/healthz", budget) {
             if body == "ok" {
-                return Ok(());
+                let remaining = PROBE_TIMEOUT.min(deadline.saturating_sub(start.elapsed()));
+                if let Some((200, service)) = request(
+                    addr,
+                    "GET",
+                    "/api/v1/service",
+                    b"",
+                    "application/json",
+                    auth,
+                    remaining,
+                ) {
+                    if serde_json::from_str::<serde_json::Value>(&service)
+                        .ok()
+                        .is_some_and(|value| value["components"]["backend"] == "ready")
+                    {
+                        return Ok(());
+                    }
+                }
             }
         }
         if start.elapsed() > deadline {
@@ -766,7 +791,7 @@ fn https_selfsigned_serves_healthz_and_pwa_assets() {
     let (stderr, stderr_path) = daemon_stderr(tmp.path());
     let child = spawn_child(
         Command::new(bin)
-            .args(["run", "--config"])
+            .args(["run", "--monitor-bind", "127.0.0.1:0", "--config"])
             .arg(&cfg_path)
             .stdout(Stdio::null())
             .stderr(stderr),
@@ -854,7 +879,13 @@ fn https_selfsigned_serves_healthz_and_pwa_assets() {
         }
         if let Some((200, body)) = https_get("/healthz") {
             assert!(body.ends_with(b"ok"), "healthz over https");
-            break;
+            if let Some((200, service)) = https_get("/api/v1/service") {
+                let service: serde_json::Value =
+                    serde_json::from_slice(&strip_chunking(&service)).unwrap();
+                if service["components"]["backend"] == "ready" {
+                    break;
+                }
+            }
         }
         assert!(
             Instant::now() < deadline,
@@ -966,7 +997,7 @@ fn pending_magnet_does_not_block_api_startup() {
     let (stderr, stderr_path) = daemon_stderr(tmp.path());
     let child = spawn_child(
         Command::new(env!("CARGO_BIN_EXE_nzbd"))
-            .args(["run", "--config"])
+            .args(["run", "--monitor-bind", "127.0.0.1:0", "--config"])
             .arg(&cfg_path)
             .stdout(Stdio::null())
             .stderr(stderr),
@@ -1008,7 +1039,7 @@ fn restart_completes_with_an_open_sse_stream() {
     let (stderr, stderr_path) = daemon_stderr(tmp.path());
     let child = spawn_child(
         Command::new(bin)
-            .args(["run", "--config"])
+            .args(["run", "--monitor-bind", "127.0.0.1:0", "--config"])
             .arg(&cfg_path)
             .stdout(Stdio::null())
             .stderr(stderr),
@@ -1134,7 +1165,7 @@ scripts_dir = "{scripts}"
     let stderr_path = daemon_log_path.clone();
     let child = spawn_child(
         Command::new(bin)
-            .args(["run", "--config"])
+            .args(["run", "--monitor-bind", "127.0.0.1:0", "--config"])
             .arg(&cfg_path)
             .stdout(daemon_log.try_clone().unwrap())
             .stderr(daemon_log),
@@ -1203,14 +1234,15 @@ fn settings_live_apply_restart_flow_keeps_secrets() {
     let (stderr, stderr_path) = daemon_stderr(tmp.path());
     let child = spawn_child(
         Command::new(bin)
-            .args(["run", "--config"])
+            .args(["run", "--monitor-bind", "127.0.0.1:0", "--config"])
             .arg(&cfg_path)
             .stdout(Stdio::null())
             .stderr(stderr),
     )
     .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
-    wait_healthy(&daemon, &addr, Duration::from_secs(15)).unwrap_or_else(|cause| panic!("{cause}"));
+    wait_healthy_authenticated(&daemon, &addr, Duration::from_secs(15), Some("nzbd:pw1"))
+        .unwrap_or_else(|cause| panic!("{cause}"));
 
     let auth = Some("nzbd:pw1");
     let json = |s: &str| -> serde_json::Value {
@@ -1367,7 +1399,7 @@ fn setup_unwritable_config_offers_copyable_toml() {
     let (stderr, stderr_path) = daemon_stderr(tmp.path());
     let child = spawn_child(
         Command::new(bin)
-            .args(["run", "--config"])
+            .args(["run", "--monitor-bind", "127.0.0.1:0", "--config"])
             .arg(&cfg_path)
             .args(["--bind", &addr])
             // First-run mode boots with Config::default() until setup writes the
@@ -1474,7 +1506,7 @@ fn a_missing_config_is_recovered_from_the_data_volume_not_replaced_by_the_wizard
     let (stderr, stderr_path) = daemon_stderr(tmp.path());
     let child = spawn_child(
         Command::new(bin)
-            .args(["run", "--config"])
+            .args(["run", "--monitor-bind", "127.0.0.1:0", "--config"])
             .arg(&cfg_path)
             .args(["--bind", &api_addr])
             // How recovery finds the data volume with no config to read it from
@@ -1486,8 +1518,13 @@ fn a_missing_config_is_recovered_from_the_data_volume_not_replaced_by_the_wizard
     )
     .expect("spawn nzbd");
     let daemon = KillOnDrop::new(child, stderr_path);
-    wait_healthy(&daemon, &api_addr, Duration::from_secs(15))
-        .unwrap_or_else(|cause| panic!("{cause}"));
+    wait_healthy_authenticated(
+        &daemon,
+        &api_addr,
+        Duration::from_secs(15),
+        Some("nzbd:recovered-pw"),
+    )
+    .unwrap_or_else(|cause| panic!("{cause}"));
 
     // Auth is on, which can only come from the recovered config.
     let (code, _) = try_http(&api_addr, "GET", "/api/v1/status", b"", None).unwrap();
@@ -1551,7 +1588,7 @@ fn first_run_setup_wizard_writes_config_and_reloads() {
     let (stderr, stderr_path) = daemon_stderr(tmp.path());
     let child = spawn_child(
         Command::new(bin)
-            .args(["run", "--config"])
+            .args(["run", "--monitor-bind", "127.0.0.1:0", "--config"])
             .arg(&cfg_path)
             .args(["--bind", &api_addr])
             // First-run mode boots with Config::default() until setup writes the
@@ -1716,7 +1753,7 @@ bind = "{api_addr}"
     let stderr_path = daemon_log_path.clone();
     let child = spawn_child(
         Command::new(bin)
-            .args(["run", "--config"])
+            .args(["run", "--monitor-bind", "127.0.0.1:0", "--config"])
             .arg(&cfg_path)
             .stdout(daemon_log.try_clone().unwrap())
             .stderr(daemon_log),
@@ -1903,7 +1940,7 @@ bind = "{api_addr}"
     let (stderr, stderr_path) = daemon_stderr(tmp.path());
     let child = spawn_child(
         Command::new(bin)
-            .args(["run", "--config"])
+            .args(["run", "--monitor-bind", "127.0.0.1:0", "--config"])
             .arg(&cfg_path)
             .stdout(Stdio::null())
             .stderr(stderr),
@@ -2062,7 +2099,7 @@ bind = "{api_addr}"
     let stderr_path = daemon_log_path.clone();
     let child = spawn_child(
         Command::new(bin)
-            .args(["run", "--config"])
+            .args(["run", "--monitor-bind", "127.0.0.1:0", "--config"])
             .arg(&cfg_path)
             .stdout(daemon_log.try_clone().unwrap())
             .stderr(daemon_log),
@@ -2184,7 +2221,7 @@ fn unwritable_state_dir_names_the_path_at_startup() {
 
     let out = child_output(
         Command::new(env!("CARGO_BIN_EXE_nzbd"))
-            .args(["run", "--config"])
+            .args(["run", "--monitor-bind", "127.0.0.1:0", "--config"])
             .arg(&cfg_path)
             .args(["--bind", &format!("127.0.0.1:{}", free_port())])
             .env("RUST_LOG", "info"),
@@ -2245,7 +2282,7 @@ fn permission_denied_state_dir_suggests_the_fix() {
 
     let out = child_output(
         Command::new(env!("CARGO_BIN_EXE_nzbd"))
-            .args(["run", "--config"])
+            .args(["run", "--monitor-bind", "127.0.0.1:0", "--config"])
             .arg(&cfg_path)
             .args(["--bind", &format!("127.0.0.1:{}", free_port())]),
     )
@@ -2268,4 +2305,350 @@ fn permission_denied_state_dir_suggests_the_fix() {
         stderr.contains("hint:") && stderr.contains("paths.queue_dir"),
         "must tell the operator how to fix it:\n{stderr}"
     );
+}
+
+/// A real blocked config read cannot prevent local health, imply public
+/// readiness, or cause a permissive public setup listener to appear.
+#[test]
+fn bootstrap_monitor_precedes_blocked_security_and_shares_probe_environment() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fifo = tmp.path().join("blocked-config.toml");
+    assert!(child_status(Command::new("mkfifo").arg(&fifo))
+        .unwrap()
+        .success());
+    let monitor = format!("127.0.0.1:{}", free_port());
+    let public = format!("127.0.0.1:{}", free_port());
+    let (stderr, path) = daemon_stderr(tmp.path());
+    let child = spawn_child(
+        Command::new(env!("CARGO_BIN_EXE_nzbd"))
+            .args(["run", "--config"])
+            .arg(&fifo)
+            .args(["--bind", &public])
+            .env("NZBD_MONITOR_BIND", &monitor)
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .unwrap();
+    let daemon = KillOnDrop::new(child, path);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while probe(&monitor, "/healthz").map(|response| response.0) != Some(200) {
+        assert!(daemon.died().is_none(), "{}", daemon.stderr_tail());
+        assert!(Instant::now() < deadline, "bootstrap monitor did not start");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(probe(&monitor, "/readyz").unwrap().0, 503);
+    assert!(
+        probe(&public, "/healthz").is_none(),
+        "unknown security must not expose a public listener"
+    );
+    assert!(child_output(
+        Command::new(env!("CARGO_BIN_EXE_nzbd"))
+            .arg("health")
+            .env("NZBD_MONITOR_BIND", &monitor)
+    )
+    .unwrap()
+    .status
+    .success());
+    assert!(!child_output(
+        Command::new(env!("CARGO_BIN_EXE_nzbd"))
+            .args(["health", "--ready"])
+            .env("NZBD_MONITOR_BIND", &monitor)
+    )
+    .unwrap()
+    .status
+    .success());
+    // Explicit CLI selection wins over the environment in the probe as well.
+    assert!(child_output(
+        Command::new(env!("CARGO_BIN_EXE_nzbd"))
+            .args(["health", "--monitor-bind", &monitor])
+            .env("NZBD_MONITOR_BIND", "not-an-address")
+    )
+    .unwrap()
+    .status
+    .success());
+    // The FIFO stays closed throughout all assertions.
+    drop(daemon);
+}
+
+#[test]
+fn monitor_conflict_exits_before_attempting_blocked_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fifo = tmp.path().join("unreadable-until-writer.toml");
+    assert!(child_status(Command::new("mkfifo").arg(&fifo))
+        .unwrap()
+        .success());
+    let listener = bind_listener("127.0.0.1:0").unwrap();
+    let monitor = listener.local_addr().unwrap().to_string();
+    let (stderr, path) = daemon_stderr(tmp.path());
+    let child = spawn_child(
+        Command::new(env!("CARGO_BIN_EXE_nzbd"))
+            .args(["run", "--monitor-bind", &monitor, "--config"])
+            .arg(&fifo)
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .unwrap();
+    let daemon = KillOnDrop::new(child, path);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = daemon.child.borrow_mut().try_wait().unwrap() {
+            assert!(!status.success());
+            assert!(
+                daemon.stderr_tail().contains("bootstrap monitor"),
+                "{}",
+                daemon.stderr_tail()
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "monitor bind conflict was hidden by config loading"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Holding the real inventory process lock keeps the backend unavailable.
+/// The secure public control service must still become traffic-ready.
+#[test]
+fn secure_control_is_ready_while_inventory_ownership_is_unavailable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("data");
+    let inventory = nzbd_state::artifacts::Inventory::open(&main.join("queue")).unwrap();
+    let monitor = format!("127.0.0.1:{}", free_port());
+    let public = format!("127.0.0.1:{}", free_port());
+    let config = tmp.path().join("nzbd.toml");
+    std::fs::write(&config, format!("[paths]\nmain_dir = {:?}\ndest_dir = {:?}\n[post]\nenabled = false\n[api]\nbind = {public:?}\npassword = \"control-secret\"\ndiscovery = false\n", main, main.join("complete"))).unwrap();
+    let (stderr, path) = daemon_stderr(tmp.path());
+    let child = spawn_child(
+        Command::new(env!("CARGO_BIN_EXE_nzbd"))
+            .args(["run", "--config"])
+            .arg(&config)
+            .env("NZBD_MONITOR_BIND", &monitor)
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .unwrap();
+    let daemon = KillOnDrop::new(child, path);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while probe(&monitor, "/readyz").map(|response| response.0) != Some(200) {
+        assert!(daemon.died().is_none(), "{}", daemon.stderr_tail());
+        assert!(
+            Instant::now() < deadline,
+            "secure control did not become ready while owner lock remained held: {}",
+            daemon.stderr_tail()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let auth = Some("nzbd:control-secret");
+    assert_eq!(
+        try_http(&public, "GET", "/api/v1/service", b"", None)
+            .unwrap()
+            .0,
+        401
+    );
+    let (code, body) = try_http(&public, "GET", "/api/v1/service", b"", auth).unwrap();
+    assert_eq!(code, 200);
+    let service: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(service["components"]["backend"], "loading");
+    assert_eq!(try_http(&public, "GET", "/", b"", auth).unwrap().0, 200);
+    let (code, body) = try_http(&public, "GET", "/api/v1/jobs", b"", auth).unwrap();
+    assert_eq!(
+        code, 503,
+        "queue loading must never look like an empty successful queue"
+    );
+    assert!(body.contains("backend_loading"));
+    assert!(child_output(
+        Command::new(env!("CARGO_BIN_EXE_nzbd"))
+            .args(["health", "--ready"])
+            .env("NZBD_MONITOR_BIND", &monitor)
+    )
+    .unwrap()
+    .status
+    .success());
+    assert_eq!(
+        try_http(&public, "POST", "/api/v1/service/shutdown", b"", auth)
+            .unwrap()
+            .0,
+        202
+    );
+    // The ownership barrier is never released to make readiness succeed.
+    drop(daemon);
+    drop(inventory);
+}
+
+#[test]
+fn health_transition_rejects_dns_credentials_nonloopback_and_nonhealth_routes() {
+    for target in [
+        "http://localhost:6789",
+        "http://127.1:6789",
+        "http://192.0.2.1:6789",
+        "http://u:p@127.0.0.1:6789",
+        "http://127.0.0.1:6789/api/v1/status",
+        "http://127.0.0.1:6789/healthz?token=secret",
+    ] {
+        let result = child_output(
+            Command::new(env!("CARGO_BIN_EXE_nzbd")).args(["health", "--url", target]),
+        )
+        .unwrap();
+        assert!(
+            !result.status.success(),
+            "accepted unsafe health target {target}"
+        );
+    }
+}
+
+#[test]
+fn health_transition_bounds_silent_http_and_tls_handshakes() {
+    for scheme in ["http", "https"] {
+        let listener = bind_listener("127.0.0.1:0").unwrap();
+        let url = format!("{scheme}://{}", listener.local_addr().unwrap());
+        let held = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+            drop(stream);
+        });
+        let start = Instant::now();
+        let result =
+            child_output(Command::new(env!("CARGO_BIN_EXE_nzbd")).args(["health", "--url", &url]))
+                .unwrap();
+        assert!(!result.status.success());
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{scheme} probe exceeded total budget: {:?}",
+            start.elapsed()
+        );
+        held.join().unwrap();
+    }
+}
+
+/// An ordinary settings restart keeps the known secure listener alive even
+/// when the next configuration read never returns. Neither readiness nor the
+/// test releases the new config barrier to make the assertions pass.
+#[test]
+fn reload_keeps_secure_control_listener_while_next_config_read_is_blocked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let public = format!("127.0.0.1:{}", free_port());
+    let monitor = format!("127.0.0.1:{}", free_port());
+    let config = tmp.path().join("nzbd.toml");
+    std::fs::write(&config, format!("[paths]\nmain_dir = {:?}\ndest_dir = {:?}\n[post]\nenabled = false\n[api]\nbind = {public:?}\npassword = \"persistent-secret\"\ndiscovery = false\n", tmp.path().join("data"), tmp.path().join("data/complete"))).unwrap();
+    let (stderr, path) = daemon_stderr(tmp.path());
+    let child = spawn_child(
+        Command::new(env!("CARGO_BIN_EXE_nzbd"))
+            .args(["run", "--config"])
+            .arg(&config)
+            .env("NZBD_MONITOR_BIND", &monitor)
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .unwrap();
+    let daemon = KillOnDrop::new(child, path);
+    let auth = Some("nzbd:persistent-secret");
+    wait_healthy_authenticated(&daemon, &public, Duration::from_secs(15), auth).unwrap();
+    std::fs::remove_file(&config).unwrap();
+    assert!(child_status(Command::new("mkfifo").arg(&config))
+        .unwrap()
+        .success());
+    assert_eq!(
+        try_http(&public, "POST", "/api/v1/restart", b"", auth)
+            .unwrap()
+            .0,
+        200
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(daemon.died().is_none(), "{}", daemon.stderr_tail());
+        assert_eq!(
+            try_http(&public, "GET", "/", b"", auth).unwrap().0,
+            200,
+            "UI listener closed across backend reload"
+        );
+        assert_eq!(
+            try_http(&public, "GET", "/api/v1/service", b"", None)
+                .unwrap()
+                .0,
+            401,
+            "reload must retain known authentication"
+        );
+        let (code, body) = try_http(&public, "GET", "/api/v1/service", b"", auth).unwrap();
+        assert_eq!(code, 200);
+        let service: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if service["components"]["backend"] == "loading" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "backend reload did not enter loading"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(probe(&monitor, "/readyz").unwrap().0, 200);
+    assert_eq!(
+        try_http(&public, "GET", "/api/v1/jobs", b"", auth)
+            .unwrap()
+            .0,
+        503
+    );
+    assert_eq!(
+        try_http(&public, "POST", "/api/v1/service/shutdown", b"", auth)
+            .unwrap()
+            .0,
+        202
+    );
+}
+
+#[test]
+fn wrong_enrolled_mount_stays_unmodified_before_history_and_tls_initialization() {
+    for auto_tls in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let wrong_mount = tmp.path().join("unmounted-data");
+        let public = format!("127.0.0.1:{}", free_port());
+        let monitor = format!("127.0.0.1:{}", free_port());
+        let config = tmp.path().join("nzbd.toml");
+        std::fs::write(&config, format!("[paths]\nmain_dir = {wrong_mount:?}\ndest_dir = {:?}\n[api]\nbind = {public:?}\ntls = {auto_tls}\ndiscovery = false\n", wrong_mount.join("complete"))).unwrap();
+        let (stderr, path) = daemon_stderr(tmp.path());
+        let child = spawn_child(
+            Command::new(env!("CARGO_BIN_EXE_nzbd"))
+                .args(["run", "--config"])
+                .arg(&config)
+                .env("NZBD_MONITOR_BIND", &monitor)
+                .env(
+                    "NZBD_EXPECTED_INSTALLATION_ID",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+                .stdout(Stdio::null())
+                .stderr(stderr),
+        )
+        .unwrap();
+        let daemon = KillOnDrop::new(child, path);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(daemon.died().is_none(), "{}", daemon.stderr_tail());
+            let monitor_alive = probe(&monitor, "/healthz").map(|response| response.0) == Some(200);
+            let expected_surface = if auto_tls {
+                daemon
+                    .stderr_tail()
+                    .contains("installation identity preflight")
+            } else {
+                probe(&monitor, "/readyz").map(|response| response.0) == Some(200)
+            };
+            if monitor_alive && expected_surface {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "wrong-root startup did not expose its bounded control state: {}",
+                daemon.stderr_tail()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!wrong_mount.try_exists().unwrap(), "no history, inventory, destination, TLS, or volume bookkeeping may initialize an absent enrolled mount");
+        if auto_tls {
+            assert_eq!(probe(&monitor, "/readyz").unwrap().0, 503);
+            assert!(probe(&public, "/healthz").is_none());
+        } else {
+            assert_eq!(http(&public, "GET", "/", b"").0, 200);
+            assert_eq!(http(&public, "GET", "/api/v1/jobs", b"").0, 503);
+        }
+    }
 }
