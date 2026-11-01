@@ -25,6 +25,7 @@ pub struct WorkerControlCheckpoint {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerCompletionProof {
+    pub accepted: bool,
     pub job: nzbd_types::JobId,
     pub context: WorkerControlContext,
     pub source: SourceGeneration,
@@ -154,6 +155,7 @@ impl Inventory {
                 ));
             }
             return Ok(WorkerCompletionProof {
+                accepted: true,
                 job: job.id,
                 context,
                 source: accepted_source,
@@ -187,6 +189,7 @@ impl Inventory {
         tx.execute("INSERT INTO worker_completions(job,data) VALUES(?1,?2) ON CONFLICT(job) DO UPDATE SET data=excluded.data", params![job.id.0, encoded])?;
         tx.commit()?;
         Ok(WorkerCompletionProof {
+            accepted: false,
             job: job.id,
             context,
             source: SourceGeneration {

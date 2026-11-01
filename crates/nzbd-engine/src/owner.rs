@@ -3066,6 +3066,11 @@ impl Owner {
             if proof.job != job.id || !exact_context || !exact_source {
                 return false;
             }
+            // Acceptance is terminal. Late selected-outcome preparations may
+            // acknowledge it but must never regress PP_DONE or queue state.
+            if proof.accepted {
+                return true;
+            }
             true
         } else {
             false
@@ -7728,6 +7733,110 @@ mod tests {
         );
         assert_eq!(receipt.source_cleanup_status.as_deref(), Some("removed"));
         assert!(receipt.keep_source_on_failure);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_worker_api_import_is_noop_for_late_preterminal_descriptor() {
+        use nzbd_state::artifacts::{
+            DeliveryFileOutcome, FinalizationProof, WorkerControlContext,
+            WORKER_CONTROL_CONTEXT_PARAM,
+        };
+        let temporary = tempfile::tempdir().unwrap();
+        let state = temporary.path().join("state");
+        let root = temporary.path().join("private");
+        let mut config = crate::EngineConfig::single_node(
+            Vec::new(),
+            state,
+            root.clone(),
+            Tuning::default(),
+            None,
+        );
+        config.persist_queue = false;
+        let engine = crate::Engine::spawn(config).await.unwrap();
+        let mut marker = pending_job(85);
+        marker.status = JobStatus::PostQueued;
+        marker.dir_name = "input".into();
+        mark_new_lifecycle_cohort(&mut marker);
+        marker.delivery_lifecycle = true;
+        let context = WorkerControlContext {
+            lease_id: "lease-85".into(),
+            job_incarnation: "incarnation-85".into(),
+            job_revision: 1,
+            control_revision: 1,
+            epoch: 1,
+        };
+        marker.params.push((
+            WORKER_CONTROL_CONTEXT_PARAM.into(),
+            serde_json::to_string(&context).unwrap(),
+        ));
+        let inventory = engine.artifacts();
+        let original = root.join("input");
+        inventory
+            .allocate_for_delivery(85, &root, &original, true, true)
+            .unwrap();
+        std::fs::write(original.join("episode.mkv"), b"verified").unwrap();
+        inventory.finish(85, &original, &root, "active").unwrap();
+        engine
+            .import_job(marker.clone(), false, false)
+            .await
+            .unwrap();
+        let target = temporary.path().join("publication/85");
+        let selected = inventory.for_job(85).unwrap().unwrap().files;
+        inventory
+            .publish_selected_for_delivery_checked(
+                85,
+                &target,
+                selected,
+                vec![DeliveryFileOutcome {
+                    source_path: "episode.mkv".into(),
+                    publication_path: Some("episode.mkv".into()),
+                    classification: "video".into(),
+                    outcome: "published".into(),
+                    reason: None,
+                    repair_dependency: false,
+                    source_cleanup_status: "pending".into(),
+                }],
+                &|| Ok(()),
+            )
+            .unwrap();
+        marker
+            .params
+            .push(("*PP:selected-publication-outcome".into(), "SUCCESS".into()));
+        assert!(engine
+            .import_worker_job_if_present(marker.clone())
+            .await
+            .unwrap());
+        let mut terminal = marker.clone();
+        terminal.status = JobStatus::Completed;
+        terminal
+            .params
+            .push((nzbd_types::PP_DONE_PARAM.into(), "SUCCESS".into()));
+        assert!(engine.import_worker_job_if_present(terminal).await.unwrap());
+        let publication = inventory.for_job(85).unwrap().unwrap();
+        let source = nzbd_state::artifacts::SourceGeneration {
+            artifact: publication.id,
+            generation: publication.generation,
+        };
+        inventory
+            .acknowledge_worker_completion(
+                85,
+                &context,
+                &source,
+                &FinalizationProof::Cluster {
+                    receipt: "durable-cluster-receipt".into(),
+                    accepted_at_ms: 1000,
+                },
+            )
+            .unwrap();
+        assert!(engine.import_worker_job_if_present(marker).await.unwrap());
+        let job = engine.export_job(JobId(85)).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Completed);
+        assert!(job
+            .params
+            .iter()
+            .any(|(key, value)| key == nzbd_types::PP_DONE_PARAM && value == "SUCCESS"));
+        assert_eq!(inventory.for_job(85).unwrap().unwrap().path, target);
+        engine.shutdown().await;
     }
 
     #[tokio::test]
