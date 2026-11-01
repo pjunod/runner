@@ -542,8 +542,188 @@ pub struct JobControl {
     /// long-wait warning even after the bounded retry schedule is exhausted.
     #[serde(default)]
     pub blocked_since_unix: Option<i64>,
+    /// When the last hold in this control's history was released. A new
+    /// hold within [`HOLD_EPISODE_SECONDS`] of it is the same outage coming
+    /// back (backoff and `blocked_since_unix` carry on); a later one is a
+    /// new episode and starts fresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at_unix: Option<i64>,
+}
+impl JobControl {
+    pub fn hold_cause(&self) -> HoldCause {
+        HoldCause::parse(&self.cause)
+    }
+    /// The job stopped during post-processing (or right before it), so a
+    /// retry re-queues post-processing rather than the download.
+    pub fn post_side(&self) -> bool {
+        matches!(
+            self.previous_status,
+            Some(JobStatus::Post { .. } | JobStatus::PostQueued | JobStatus::Completed)
+        )
+    }
 }
 pub const CONTROL_PARAM: &str = "*Control:v1";
+
+/// Why a job is held. The set is closed: every cause the daemon writes is a
+/// variant here, and [`HoldCause::policy`] is an exhaustive match, so a new
+/// cause cannot compile without saying how a hold for it ends. The wire
+/// form stays the string in `JobControl::cause`.
+///
+/// A cause states whether retrying can help, not merely where it failed: a
+/// volume that stopped answering is [`HoldCause::StorageUnavailable`] and
+/// heals by itself; a checksum that disagrees is [`HoldCause::Io`] and fails
+/// the same way every time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HoldCause {
+    /// The storage under the job stopped answering (ENOTCONN, EIO, ESTALE…):
+    /// a dropped network/FUSE mount, or the state volume refusing a save.
+    StorageUnavailable,
+    /// A write ran out of space.
+    Capacity,
+    /// A write ran out of quota.
+    Quota,
+    /// The payload directory could not be allocated.
+    Allocation,
+    /// The configured root's identity changed (a mount came back as the
+    /// empty directory underneath it).
+    MountUnavailable,
+    /// An extractor or script binary is missing.
+    MissingTool,
+    /// An encrypted archive needs a password a person has to supply.
+    PasswordRequired,
+    /// An I/O failure retrying will not fix (a digest or size mismatch,
+    /// a missing file, a refused permission).
+    Io,
+    /// The evidence disagrees with itself (foreign journal bytes, unsafe or
+    /// conflicting yEnc metadata, unverified coverage).
+    IdentityConflict,
+    /// Post-processing failed on its input.
+    PostFailure,
+    /// A cause written by another build. Never produced here.
+    Unrecognized(String),
+}
+
+/// How a hold ends without an operator. Every policy also answers an
+/// operator retry, so `Review` means "nothing retries this by itself",
+/// never "stuck".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldPolicy {
+    /// Retried on [`HOLD_RETRY_DELAYS_SECONDS`] for as long as it is held.
+    ScheduledRetry,
+    /// Released when the resource the owner watches comes back.
+    ResumeSameJob,
+    /// The configured volume's identity is re-checked every recovery pass.
+    ReobserveMount,
+    /// A person decides.
+    Review,
+}
+
+impl HoldPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HoldPolicy::ScheduledRetry => "scheduled_retry",
+            HoldPolicy::ResumeSameJob => "resume_same_job",
+            HoldPolicy::ReobserveMount => "reobserve_mount",
+            HoldPolicy::Review => "review",
+        }
+    }
+    /// Whether the recovery task releases this hold without a person.
+    pub fn automatic(self) -> bool {
+        self != HoldPolicy::Review
+    }
+    /// Whether the hold waits for a time (`next_retry_at_unix`) rather than
+    /// being re-checked every pass.
+    pub fn timed(self) -> bool {
+        matches!(self, HoldPolicy::ScheduledRetry | HoldPolicy::ResumeSameJob)
+    }
+}
+
+impl HoldCause {
+    /// Every cause this build writes, for tests that must cover the set.
+    pub const ALL: [HoldCause; 10] = [
+        HoldCause::StorageUnavailable,
+        HoldCause::Capacity,
+        HoldCause::Quota,
+        HoldCause::Allocation,
+        HoldCause::MountUnavailable,
+        HoldCause::MissingTool,
+        HoldCause::PasswordRequired,
+        HoldCause::Io,
+        HoldCause::IdentityConflict,
+        HoldCause::PostFailure,
+    ];
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            HoldCause::StorageUnavailable => "storage_unavailable",
+            HoldCause::Capacity => "capacity",
+            HoldCause::Quota => "quota",
+            HoldCause::Allocation => "allocation",
+            HoldCause::MountUnavailable => "mount_unavailable",
+            HoldCause::MissingTool => "missing_tool",
+            HoldCause::PasswordRequired => "password_required",
+            HoldCause::Io => "io",
+            HoldCause::IdentityConflict => "identity_conflict",
+            HoldCause::PostFailure => "post_failure",
+            HoldCause::Unrecognized(s) => s,
+        }
+    }
+
+    pub fn parse(s: &str) -> HoldCause {
+        HoldCause::ALL
+            .iter()
+            .find(|c| c.as_str() == s)
+            .cloned()
+            .unwrap_or_else(|| HoldCause::Unrecognized(s.to_string()))
+    }
+
+    /// The one table.
+    pub fn policy(&self) -> HoldPolicy {
+        match self {
+            HoldCause::StorageUnavailable | HoldCause::MissingTool => HoldPolicy::ScheduledRetry,
+            HoldCause::Capacity | HoldCause::Quota | HoldCause::Allocation => {
+                HoldPolicy::ResumeSameJob
+            }
+            HoldCause::MountUnavailable => HoldPolicy::ReobserveMount,
+            // A password has to come from a person; until it does a retry
+            // fails the same way.
+            HoldCause::PasswordRequired
+            | HoldCause::Io
+            | HoldCause::IdentityConflict
+            | HoldCause::PostFailure
+            | HoldCause::Unrecognized(_) => HoldPolicy::Review,
+        }
+    }
+
+    /// Storage causes are released through the capacity probe, which does
+    /// admission work a plain retry must not skip.
+    pub fn is_storage(&self) -> bool {
+        matches!(
+            self,
+            HoldCause::Capacity | HoldCause::Quota | HoldCause::Allocation
+        )
+    }
+}
+
+impl std::fmt::Display for HoldCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Backoff for automatic holds, indexed by attempts already scheduled and
+/// capped at the last entry: a dead mount is re-tried every five minutes for
+/// as long as it stays held, and every attempt is visible on the job.
+pub const HOLD_RETRY_DELAYS_SECONDS: [i64; 4] = [30, 60, 120, 300];
+
+/// How long after a release a new hold still counts as the same episode:
+/// well past the longest backoff step, so a mount that flaps keeps backing
+/// off, while a job that ran fine for an hour starts its next blip at 30 s.
+pub const HOLD_EPISODE_SECONDS: i64 = 3600;
+
+pub fn hold_retry_delay_seconds(attempts_made: u8) -> i64 {
+    HOLD_RETRY_DELAYS_SECONDS[usize::from(attempts_made).min(HOLD_RETRY_DELAYS_SECONDS.len() - 1)]
+}
 /// Explicit request to hand a successful publication to Curator.
 pub const DELIVERY_INTENT_PARAM: &str = "monarr-delivery";
 

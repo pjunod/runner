@@ -1980,7 +1980,10 @@ function rowModel(j, ctx) {
   const active = !["waiting", "completed", "attention", "paused"].includes(section);
   const torrent = j.kind === "torrent";
   const hold = j.control && j.control.lifecycle === "held" ? j.control : null;
-  const reviewHold = hold && !["resume_same_job", "reobserve_mount"].includes(hold.retry_policy);
+  const reviewHold = hold && !["resume_same_job", "reobserve_mount", "scheduled_retry"].includes(hold.retry_policy);
+  // An automatic hold Runner is still retrying offers "pause"; a review hold
+  // or one the operator paused offers "retry". Every hold has one of the two.
+  const holdRetrying = !!hold && !reviewHold && !hold.manual_pause;
   const phase = torrentPhase(j);
   const seed = phase === "seeding" || phase === "paused_seed";
   const seedPaused = phase === "paused_seed";
@@ -2037,14 +2040,14 @@ function rowModel(j, ctx) {
   }
 
   if (hold) {
-    rest.push(" · " + (hold.message || "job on hold") + (reviewHold ? " · needs review" : ""));
+    rest.push(" · " + (hold.message || "job on hold") + (reviewHold ? " · needs review" : hold.manual_pause ? " · retries paused" : ""));
     if (hold.retry_policy === "reobserve_mount")
       rest.push(" · waiting for the configured storage source; Runner will resume when it returns");
-    if (["scheduled_retry", "resume_same_job"].includes(hold.retry_policy) && hold.blocked_since_unix != null) {
+    if (!hold.manual_pause && ["scheduled_retry", "resume_same_job"].includes(hold.retry_policy) && hold.blocked_since_unix != null) {
       const blockedForMs = Math.max(0, (ctx.nowMs || Date.now()) - hold.blocked_since_unix * 1000);
       if (blockedForMs >= 30 * 60 * 1000)
         rest.push(" · still blocked after 30 minutes; source remains in Runner for recovery");
-      else if (hold.retry_policy === "scheduled_retry" && hold.next_retry_at_unix != null)
+      if (hold.next_retry_at_unix != null)
         rest.push(" · next retry in " + fmtDur(Math.max(0, hold.next_retry_at_unix * 1000 - (ctx.nowMs || Date.now()))));
     }
   }
@@ -2102,9 +2105,15 @@ function rowModel(j, ctx) {
     // the sectioned queue (the DOM harness, a future flat view) keeps the
     // controls it always had.
     moveHidden: seed || phase === "failed" || ctx.movable === false,
-    pauseHidden: reviewHold || (torrent ? !torrentAction : fetching),
-    pauseLabel: torrent ? (torrentAction ? torrentAction.label : "") : ((over || st) === "paused" ? "resume" : "pause"),
-    pauseAction: torrent ? (torrentAction ? torrentAction.action : "") : ((over || st) === "paused" ? "resume" : "pause"),
+    // Every hold has an exit: resume on a held job asks the engine to send it
+    // back to the step it stopped in, and a refusal comes back with its reason.
+    pauseHidden: torrent ? !torrentAction : fetching,
+    pauseLabel: torrent ? (torrentAction ? torrentAction.label : "") : holdRetrying ? "pause" : hold ? "retry" : ((over || st) === "paused" ? "resume" : "pause"),
+    pauseAction: torrent ? (torrentAction ? torrentAction.action : "") : holdRetrying ? "pause" : ((over || st) === "paused" || hold ? "resume" : "pause"),
+    pauseTip: torrent || !hold ? ""
+      : holdRetrying ? "Runner is retrying this on its own. Pause stops the retries until you retry it yourself."
+      : "Retry now: the job goes back to the step it stopped in. If the cause is still there it is held again, with the reason."
+        + (hold.cause === "identity_conflict" ? " Retrying re-downloads the conflicting data over the retained evidence." : ""),
     deleteLabel: torrent ? "remove torrent" : "delete",
     deleteTip: torrent ? "Remove this torrent from the queue, keeping its downloaded files." :
       "Remove this job from the queue. One click — no dialog; you get 8 seconds to undo it.",
@@ -2216,6 +2225,7 @@ function applyRow(tr, m, d) {
   w("pauseHidden", m.pauseHidden, v => d.prop(c.pause, "hidden", v));
   w("pauseLabel", m.pauseLabel, v => d.text(c.pause, v));
   w("pauseAction", m.pauseAction, v => d.data(c.pause, "action", v));
+  w("pauseTip", m.pauseTip, v => d.prop(c.pause, "title", v));
   w("deleteLabel", m.deleteLabel, v => d.text(c.del, v));
   w("deleteTip", m.deleteTip, v => d.prop(c.del, "title", v));
   w("deleteDataHidden", m.deleteDataHidden, v => d.prop(c.delData, "hidden", v));
@@ -2645,7 +2655,8 @@ function detailModel(j, nowMs) {
     recoverMax,
     lifecycleHidden: torrent || (!lifecycleStatus && !(j.lifecycleEligible && j.status === "failed")),
     lifecycleStatus: lifecycleStatus || (j.lifecycleEligible && j.status === "failed" ? "Failed source cleanup is ready for an immediate retry." : ""),
-    lifecycleRetryHidden: torrent || !(j.lifecycleEligible && (cleanupRetry || (j.control && ["scheduled_retry", "resume_same_job", "reobserve_mount"].includes(j.control.retry_policy)))) ,
+    // Every hold answers "retry now"; cleanup retries stay lifecycle-only.
+    lifecycleRetryHidden: torrent || !(heldControl || (j.lifecycleEligible && cleanupRetry)),
     lifecycleRetryDisabled: !!(j.urlFetch && j.urlFetch.nextRetryAtUnix && j.status === "fetching"),
     meta: bits.join("  ·  "),
     metaHidden: false,
@@ -4230,7 +4241,14 @@ document.addEventListener("click", (ev) => {
   const id = Number(el.dataset.job || (row && row.dataset.jobId));
   const scope = row ? row.dataset.scope : "queue";
   if (action === "lifecycle-retry-now") {
-    const name = store.jobs.find(j => j.id === id)?.name || ("job #" + id);
+    const job = store.jobs.find(j => j.id === id);
+    const name = job?.name || ("job #" + id);
+    // A held job retries through resume, which every hold answers; the
+    // lifecycle endpoint is for failed-source cleanup.
+    if (job && job.control && job.control.lifecycle === "held") {
+      jobAction(id, "resume").then(() => refreshAll(true));
+      return;
+    }
     post("/api/v1/jobs/" + id + "/retry").then(result => {
       if (!result.ok) toast({ text: "Retry failed — " + result.error, kind: "error" });
       else toast({ text: "Retrying lifecycle work for “" + name + "”" });
