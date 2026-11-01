@@ -2652,3 +2652,136 @@ fn wrong_enrolled_mount_stays_unmodified_before_history_and_tls_initialization()
         }
     }
 }
+
+#[test]
+fn missing_config_with_retained_enrollment_never_exposes_setup_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let public = format!("127.0.0.1:{}", free_port());
+    let monitor = format!("127.0.0.1:{}", free_port());
+    let config = tmp.path().join("missing.toml");
+    std::fs::write(
+        tmp.path().join(".nzbd-installation-id"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+    )
+    .unwrap();
+    let (stderr, path) = daemon_stderr(tmp.path());
+    let child = spawn_child(
+        Command::new(env!("CARGO_BIN_EXE_nzbd"))
+            .args(["run", "--config"])
+            .arg(&config)
+            .args(["--bind", &public])
+            .env("NZBD_MONITOR_BIND", &monitor)
+            .env("NZBD_MAIN_DIR", tmp.path().join("absent-data"))
+            .env_remove("NZBD_EXPECTED_INSTALLATION_ID")
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .unwrap();
+    let daemon = KillOnDrop::new(child, path);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(daemon.died().is_none(), "{}", daemon.stderr_tail());
+        if probe(&monitor, "/healthz").map(|response| response.0) == Some(200)
+            && daemon.stderr_tail().contains("enrolled installation")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "missing enrolled config was not visibly blocked: {}",
+            daemon.stderr_tail()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(probe(&monitor, "/readyz").unwrap().0, 503);
+    assert!(probe(&public, "/healthz").is_none());
+    assert!(!config.try_exists().unwrap());
+    assert!(!tmp.path().join("absent-data").try_exists().unwrap());
+}
+
+#[test]
+fn reload_missing_primary_and_mirror_preserves_known_authentication_with_cli_bind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let public = format!("127.0.0.1:{}", free_port());
+    let monitor = format!("127.0.0.1:{}", free_port());
+    let main = tmp.path().join("data");
+    let config = tmp.path().join("nzbd.toml");
+    std::fs::write(&config, format!("[paths]\nmain_dir = {main:?}\ndest_dir = {:?}\n[api]\npassword = \"retained-secret\"\ndiscovery = false\n[post]\nenabled = false\n", main.join("complete"))).unwrap();
+    let (stderr, path) = daemon_stderr(tmp.path());
+    let child = spawn_child(
+        Command::new(env!("CARGO_BIN_EXE_nzbd"))
+            .args(["run", "--config"])
+            .arg(&config)
+            .args(["--bind", &public])
+            .env("NZBD_MONITOR_BIND", &monitor)
+            .env("NZBD_MAIN_DIR", &main)
+            .env_remove("NZBD_EXPECTED_INSTALLATION_ID")
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .unwrap();
+    let daemon = KillOnDrop::new(child, path);
+    let auth = Some("nzbd:retained-secret");
+    wait_healthy_authenticated(&daemon, &public, Duration::from_secs(15), auth).unwrap();
+    assert!(tmp
+        .path()
+        .join(".nzbd-security-established")
+        .try_exists()
+        .unwrap());
+    std::fs::remove_file(&config).unwrap();
+    let mirror = main.join("queue/nzbd.toml.saved");
+    if mirror.try_exists().unwrap() {
+        std::fs::remove_file(mirror).unwrap();
+    }
+    assert_eq!(
+        try_http(&public, "POST", "/api/v1/restart", b"", auth)
+            .unwrap()
+            .0,
+        200
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(daemon.died().is_none(), "{}", daemon.stderr_tail());
+        assert_eq!(
+            try_http(&public, "GET", "/api/v1/service", b"", None)
+                .unwrap()
+                .0,
+            401,
+            "missing reload config must not replace authentication with defaults"
+        );
+        let (code, body) = try_http(&public, "GET", "/api/v1/service", b"", auth).unwrap();
+        assert_eq!(code, 200);
+        if body.contains("last trusted security") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "missing config recovery did not retain trusted security: {}",
+            daemon.stderr_tail()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(probe(&monitor, "/readyz").unwrap().0, 200);
+    assert_eq!(
+        try_http(&public, "POST", "/api/v1/service/shutdown", b"", None)
+            .unwrap()
+            .0,
+        401
+    );
+    assert_eq!(
+        try_http(&public, "GET", "/api/v1/jobs", b"", auth)
+            .unwrap()
+            .0,
+        503
+    );
+    assert!(
+        !config.try_exists().unwrap(),
+        "missing config must never be rewritten from permissive defaults"
+    );
+    assert_eq!(
+        try_http(&public, "POST", "/api/v1/service/shutdown", b"", auth)
+            .unwrap()
+            .0,
+        202
+    );
+}

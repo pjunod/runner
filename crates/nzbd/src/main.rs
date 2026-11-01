@@ -737,12 +737,13 @@ fn load_bootstrap(
 )> {
     loop {
         let worker_path = path.clone();
+        let trusted_configuration = control.trusted_configuration();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let started = std::time::Instant::now();
         let worker = std::thread::Builder::new()
             .name("nzbd-bootstrap-security".into())
             .spawn(move || {
-                let result = read_bootstrap(worker_path);
+                let result = read_bootstrap(worker_path, trusted_configuration);
                 let _ = tx.send(result);
             })?;
         let result = loop {
@@ -815,8 +816,102 @@ fn validate_installation_before_mutation(
     Ok(expected)
 }
 
+const SECURITY_RECEIPT: &str = ".nzbd-security-established";
+
+fn security_receipt(config: &std::path::Path) -> PathBuf {
+    config
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(SECURITY_RECEIPT)
+}
+
+/// Missing configuration is not positive evidence of a new installation.
+/// Any enrolled identity, historical state, security material, or uncertain
+/// probe keeps bootstrap nonpermissive until trusted settings are recovered.
+fn prove_first_installation(config: Option<&std::path::Path>) -> Result<(), String> {
+    if expected_installation_id(config)
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err("configuration and mirrors are missing for an enrolled installation; refusing unauthenticated first-run defaults".into());
+    }
+    if let Some(config) = config {
+        let receipt = security_receipt(config);
+        match std::fs::symlink_metadata(&receipt) {
+            Ok(_) => return Err(format!("configuration is missing but established security was recorded in {}; refusing first-run defaults", receipt.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(format!("cannot inspect established security {}: {error}", receipt.display())),
+        }
+    }
+    for directory in nzbd_config::durable::candidate_state_dirs() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot establish first installation from {}: {error}",
+                    directory.display()
+                ))
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "cannot inspect prior installation in {}: {error}",
+                    directory.display()
+                )
+            })?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(
+                name.as_ref(),
+                "artifacts.sqlite"
+                    | "artifacts.lock"
+                    | "queue.json"
+                    | "queue.json.bak"
+                    | "tls"
+                    | "jobs"
+                    | "workers"
+                    | "history"
+                    | "nzbd.toml.saved"
+                    | SECURITY_RECEIPT
+            ) || name.starts_with("unclean.")
+                || name.ends_with(".journal")
+            {
+                return Err(format!("configuration is missing but prior installation evidence exists at {}; refusing first-run defaults", entry.path().display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remember_established_security(config: &std::path::Path) {
+    use std::io::Write;
+    let receipt = security_receipt(config);
+    let result = (|| -> std::io::Result<()> {
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&receipt)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        file.write_all(b"nzbd established security v1\n")?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        std::fs::File::open(receipt.parent().unwrap())?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        tracing::warn!(path = %receipt.display(), %error, "cannot retain independent security history; keep the configuration or expected installation identity on durable storage");
+    }
+}
+
 fn read_bootstrap(
     path: Option<PathBuf>,
+    trusted_configuration: Option<nzbd_config::Config>,
 ) -> Result<
     (
         nzbd_config::Config,
@@ -833,7 +928,10 @@ fn read_bootstrap(
     let mut recovered_from = None;
     let mut recovered_text = None;
     let cfg = match path {
-        None => nzbd_config::Config::default(),
+        None => {
+            prove_first_installation(None).map_err(Unavailable)?;
+            nzbd_config::Config::default()
+        }
         Some(path) => {
             match std::fs::metadata(&path) {
                 Ok(metadata) if metadata.is_dir() => return Err(Invalid(format!("config path {} is a DIRECTORY, not a file — check the Docker bind mount and create the host config file", path.display()))),
@@ -845,6 +943,9 @@ fn read_bootstrap(
                 Ok(text) => nzbd_config::Config::from_toml(&text)
                     .map_err(|error| Invalid(format!("{}: {error}", path.display())))?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if trusted_configuration.is_some() {
+                        return Err(Unavailable(format!("configuration {} disappeared; retaining the process's last trusted security and public listener until an explicit configuration returns", path.display())));
+                    }
                     let mut recovered = None;
                     // Do not use find_mirror(): its historical Option API hides
                     // unreadable mirrors and could expose a permissive wizard.
@@ -876,6 +977,7 @@ fn read_bootstrap(
                     match recovered {
                         Some(cfg) => cfg,
                         None => {
+                            prove_first_installation(Some(&path)).map_err(Unavailable)?;
                             setup_path = Some(path);
                             nzbd_config::Config::default()
                         }
@@ -909,6 +1011,11 @@ fn read_bootstrap(
             Invalid(message)
         }
     })?;
+    if setup_path.is_none() {
+        if let Some(path) = config_path.as_deref() {
+            remember_established_security(path);
+        }
+    }
     Ok((cfg, setup_path, recovered_from, tls, recovered_text))
 }
 
@@ -1777,6 +1884,30 @@ mod anyhow_lite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_primary_after_known_security_never_selects_default_or_stale_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("lost.toml");
+        let mut trusted = nzbd_config::Config::default();
+        trusted.api.password = Some("known-secret".into());
+        trusted.api.tls = true;
+        match read_bootstrap(Some(missing), Some(trusted)) {
+            Err(BootstrapError::Unavailable(message)) => {
+                assert!(message.contains("last trusted security"))
+            }
+            _ => panic!(
+                "lost primary configuration must retain established security and remain retryable"
+            ),
+        }
+        assert!(
+            !tmp.path()
+                .join(".nzbd-security-established")
+                .try_exists()
+                .unwrap(),
+            "a missing primary must not manufacture a new security receipt or TLS identity"
+        );
+    }
 
     fn cfg_with(extra: &str) -> nzbd_config::Config {
         let toml = format!("[paths]\nmain_dir = \"/data\"\ndest_dir = \"/data/complete\"\n{extra}");

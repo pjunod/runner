@@ -151,6 +151,7 @@ impl OwnerObservation {
 
 struct Status {
     configuration: &'static str,
+    trusted_configuration: Option<nzbd_config::Config>,
     backend: &'static str,
     identity: &'static str,
     owner: Option<OwnerObservation>,
@@ -199,6 +200,7 @@ impl Controller {
         let shared = Arc::new(Shared {
             status: Mutex::new(Status {
                 configuration: "loading",
+                trusted_configuration: None,
                 backend: "loading",
                 identity: "unknown",
                 owner: None,
@@ -286,6 +288,14 @@ impl Controller {
         }
         state.reason = Some(reason.into());
     }
+    pub fn trusted_configuration(&self) -> Option<nzbd_config::Config> {
+        self.shared
+            .status
+            .lock()
+            .unwrap()
+            .trusted_configuration
+            .clone()
+    }
     pub fn security_known(&self) -> bool {
         {
             let status = self.shared.status.lock().unwrap();
@@ -353,6 +363,7 @@ impl Controller {
         {
             let mut state = self.shared.status.lock().unwrap();
             state.configuration = "ready";
+            state.trusted_configuration = Some(cfg.clone());
             if state.signature.as_ref() == Some(&signature) {
                 return Ok(());
             }
