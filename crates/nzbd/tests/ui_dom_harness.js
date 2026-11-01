@@ -1699,6 +1699,25 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     eq(T.queueModels().filter(m => m.kind === "job").length, 20, "reopening seeds restores pagination");
     T.collapsedSections.clear();
 
+    const child = { ...seed, id: 900, torrent_role: "acquisition", seed_donor_job_id: seed.id,
+      status: { post: { stage: "unpack" } }, ready: false, stages: [{ stage: "unpack", since: 1 }] };
+    eq(T.torrentPhase(child), null, "managed child never derives a seed phase from donor counters");
+    const childRow = T.rowModel(child);
+    ok(childRow.sub.includes("TORRENT ACQUISITION") && childRow.sub.includes("#" + seed.id), "child identifies its separate seed source");
+    ok(!childRow.sub.includes("USENET"), "child is never labeled Usenet");
+    eq(childRow.deleteDataHidden, true, "child offers no donor data deletion control");
+    eq(childRow.pauseLabel, "pause", "child retains ordinary processing control");
+    eq(childRow.health, "—", "child invents neither article health nor seed ratio");
+    T.failureKeepState.set(child.id, { available: true, keep: false });
+    const childDetail = T.detailModel(child);
+    eq(childDetail.torrent, false, "child has no seed editor or peer counters");
+    eq(childDetail.failureKeepHidden, false, "child has scoped processing source Keep");
+    eq(childDetail.nzbHidden, true, "child does not issue NZB or donor metainfo requests");
+    ok(childDetail.meta.includes("separate seed source"), "child inspector explains source separation");
+    const heldChild = { ...child, control: { lifecycle: "held", retry_policy: "review", manual_pause: true, message: "Review payload" } };
+    eq(T.rowModel(heldChild).pauseLabel, "retry", "child preserves main held-job Retry");
+    eq(T.rowModel({ ...heldChild, control: { ...heldChild.control, retry_policy: "scheduled_retry", manual_pause: false } }).pauseLabel, "pause", "child preserves pause of automatic retries");
+
     const detail = T.detailModel(seed);
     eq(detail.torPeers, "3", "inspector exposes peer count");
     eq(detail.torRatio, "0.64", "inspector exposes share ratio");

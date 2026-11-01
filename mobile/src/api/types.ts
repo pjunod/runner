@@ -54,6 +54,8 @@ export interface JobSummary {
   control?: JobControl | null;
   id: number;
   kind?: 'nzb' | 'torrent';
+  torrent_role?: 'acquisition' | 'seed' | null;
+  seed_donor_job_id?: number | null;
   torrent_phase?: TorrentPhase | null;
   torrent_control_intent?: 'running' | 'paused' | null;
   seed_policy?: SeedPolicy | null;

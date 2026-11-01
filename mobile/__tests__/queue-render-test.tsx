@@ -141,3 +141,32 @@ test('a parked NZB fetch says why it waits, with no byte counters or bar, and th
     jest.useRealTimers();
   }
 });
+
+test('managed child shows POST and scoped Keep without donor seed controls', async () => {
+  const donor = fixtures.find((f) => f.name === 'stopped seed')!.job as JobSummary;
+  const child = { ...donor, id: 990, torrent_role: 'acquisition', seed_donor_job_id: donor.id, ready: false,
+    status: { post: { stage: 'unpack' } }, stages: [] } as JobSummary;
+  const getFailureKeep = jest.fn(async () => ({ available: true, keep: false }));
+  const client = { getFailureKeep, setFailureKeep: jest.fn(async () => {}) } as any;
+  const action = jest.fn();
+  const card = (job: JobSummary) => <JobCard client={client} job={job} index={0} total={1} expanded busy={false}
+    onToggle={jest.fn()} onAction={action} onDelete={jest.fn()} onPriorityChange={jest.fn()} onSeedOptions={jest.fn()}
+    movable={false} sectionKey={queueSectionKey(job)} sectionLabel="Unpacking" styles={styles} tone={{ accent: theme.accent, background: theme.panel }} />;
+  await act(async () => { tree = create(card(child)); });
+  expect(text()).toContain('TORRENT ACQUISITION');
+  expect(text()).toContain(`seed source`);
+  expect(text()).toContain('unpacking');
+  expect(text()).not.toContain('Ratio');
+  expect(text()).not.toContain('Peers');
+  expect(button('Seeding options')).toBeUndefined();
+  expect(button('Keep on failure: off')).toBeDefined();
+  expect(getFailureKeep).toHaveBeenCalledWith(child.id);
+  const held = { ...child, control: { lifecycle: 'held', retry_policy: 'review', manual_pause: true, message: 'Review payload' } } as unknown as JobSummary;
+  await act(async () => tree.update(card(held)));
+  await act(async () => button('Retry').props.onPress());
+  expect(action).toHaveBeenCalledWith('resume');
+  const retrying = { ...held, control: { ...held.control!, retry_policy: 'scheduled_retry', manual_pause: false } };
+  await act(async () => tree.update(card(retrying)));
+  await act(async () => button('Pause retries').props.onPress());
+  expect(action).toHaveBeenCalledWith('pause');
+});

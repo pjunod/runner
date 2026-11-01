@@ -37,8 +37,7 @@ opening History does not claim that the app imported a job or replace its
 ## Queue activity and torrent seeding
 
 The native queue uses the same lifecycle rules as the web: Downloading,
-Fetching NZB, Fetching torrent metadata, Checking torrent files, the NZB
-post-processing stages, Seeding, Completed, and Waiting. Completed means a
+Fetching NZB, Fetching torrent metadata, Checking torrent files, post-processing stages, Seeding, Completed, and Waiting. Completed means a
 verified torrent is retained with seeding stopped; it does not mean an import
 into a library or a move to History. Checking, missing files, and failures take
 precedence over stale readiness.
@@ -64,6 +63,13 @@ The new sections do not expose NZB stage timers or health for torrents, nor
 queue-move and priority controls for seeds. Older daemons can omit lifecycle
 fields; the app falls back to generic status. Unknown states remain visible,
 and an unsupported policy endpoint reports an error without breaking the queue.
+
+A managed torrent acquisition is labeled **Torrent acquisition** and names its
+separate seed source. It uses ordinary post-processing, scoped **Keep on
+failure**, pause, retry and removal controls. It has no seed options, upload or
+peer counters, donor-file deletion choice, or seed-resume fallback. Removing
+the child leaves the seed source and its seeding policy unchanged. A held child
+keeps the same **Retry** or **Pause retries** action as any other processing job.
 
 [The parity status page](MOBILE_QUEUE_PARITY_STATUS.md) separates implementation
 and test evidence from iOS/Android distribution evidence.

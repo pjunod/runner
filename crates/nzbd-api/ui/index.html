@@ -1831,8 +1831,10 @@ function toggleSection(key) {
   page = 0;
   renderQueue();
 }
+function isTorrentAcquisition(j) { return j.kind === "torrent" && j.torrent_role === "acquisition"; }
+function isSeedTorrent(j) { return j.kind === "torrent" && !isTorrentAcquisition(j); }
 function torrentPhase(j) {
-  if (j.kind !== "torrent") return null;
+  if (!isSeedTorrent(j)) return null;
   const phase = j.torrent_phase;
   if (j.status === "failed") return "failed";
   if (["missing_files", "failed", "checking"].includes(phase)) return phase;
@@ -1981,7 +1983,8 @@ function rowModel(j, ctx) {
   const busy = pend ? pend.busy(j.id) : false;   // an action is in flight
   const section = ctx.section || sectionOf(j);
   const active = !["waiting", "completed", "attention", "paused"].includes(section);
-  const torrent = j.kind === "torrent";
+  const torrent = isSeedTorrent(j);
+  const acquisition = isTorrentAcquisition(j);
   const hold = j.control && j.control.lifecycle === "held" ? j.control : null;
   const reviewHold = hold && !["resume_same_job", "reobserve_mount", "scheduled_retry"].includes(hold.retry_policy);
   // An automatic hold Runner is still retrying offers "pause"; a review hold
@@ -2064,7 +2067,7 @@ function rowModel(j, ctx) {
             "job-" + section + (busy ? " pending" : ""),
     name: j.name,
     nameTip: j.name + " — click for details",
-    sub: "#" + j.id + (torrent ? " · BITTORRENT" : " · USENET") +
+    sub: "#" + j.id + (acquisition ? " · TORRENT ACQUISITION · separate seed source" + (j.seed_donor_job_id != null ? " #" + j.seed_donor_job_id : "") : torrent ? " · BITTORRENT" : " · USENET") +
          (j.category ? " · " + j.category : "") +
          (j.assigned_node ? " · on " + j.assigned_node : "") + " ",
     st: torrent ? torrentStatus(j).toUpperCase() : (shownSt === "completed" && j.ready
@@ -2089,19 +2092,19 @@ function rowModel(j, ctx) {
     dRest: seed ? " · " + (seedPaused ? seedStopText(j) : "↑ " + fmtRate(j.upload_rate_bps || 0)) +
       " · " + fmtBytes(j.uploaded_bytes || 0) + " uploaded · " + (j.useful_peers || 0) + " peers"
       : torrent && ["failed", "missing_files", "storage_hold"].includes(phase) ? " · " + (phase === "storage_hold" ? "storage full · waiting for disk space · downloads recover automatically when space is available" : j.torrent_error || torrentStatus(j))
-      : fetching ? "fetching the NZB from the indexer…" : rest.join(""),
+      : fetching ? (acquisition ? "waiting for the acquisition payload…" : "fetching the NZB from the indexer…") : rest.join(""),
     dRetry: j.retried_articles > 0
       ? " · " + j.retried_articles + " retries" : "",
     dRetryTip: j.retried_articles > 0
       ? "Articles that failed and were re-downloaded — this is bandwidth the header rate spends that never lands in the file. A high count means a flaky server or an aging post."
       : "",
     size: fetching ? "—" : fmtBytes(total),
-    health: fetching ? "—" : (torrent ? Number(j.ratio || 0).toFixed(2) + "×" : (j.health / 10).toFixed(1) + "%"),
-    healthColor: fetching || torrent ? "" : healthColor(j.health, j.critical_health),
-    healthTip: fetching ? "" : (torrent ? "uploaded / selected payload bytes" : healthTip(j.health, j.critical_health, j.critical_health_estimated)),
-    hNote: fetching ? "" : (torrent ? fmtDur((j.seeding_seconds || 0) * 1000) + " seeded" : hNote),
+    health: fetching || acquisition ? "—" : (torrent ? Number(j.ratio || 0).toFixed(2) + "×" : (j.health / 10).toFixed(1) + "%"),
+    healthColor: fetching || torrent || acquisition ? "" : healthColor(j.health, j.critical_health),
+    healthTip: fetching || acquisition ? "" : (torrent ? "uploaded / selected payload bytes" : healthTip(j.health, j.critical_health, j.critical_health_estimated)),
+    hNote: fetching || acquisition ? "" : (torrent ? fmtDur((j.seeding_seconds || 0) * 1000) + " seeded" : hNote),
     hNoteCls: fetching ? "hnote" : hNoteCls,
-    hNoteTip: torrent ? seedPolicyText(j.seed_policy) : hNoteTip,
+    hNoteTip: acquisition ? "Private processing acquisition; seeding belongs to the separate source job." : torrent ? seedPolicyText(j.seed_policy) : hNoteTip,
     upDisabled: ctx.idx === 0,
     downDisabled: ctx.idx === (ctx.count || 0) - 1,
     // `movable` defaults to true so a caller that renders a row outside
@@ -2118,14 +2121,14 @@ function rowModel(j, ctx) {
       : "Retry now: the job goes back to the step it stopped in. If the cause is still there it is held again, with the reason."
         + (hold.cause === "identity_conflict" ? " Retrying re-downloads the conflicting data over the retained evidence." : ""),
     deleteLabel: torrent ? "remove torrent" : "delete",
-    deleteTip: torrent ? "Remove this torrent from the queue, keeping its downloaded files." :
+    deleteTip: acquisition ? "Remove this acquisition only; the separate seed source is unchanged." : torrent ? "Remove this torrent from the queue, keeping its downloaded files." :
       "Remove this job from the queue. One click — no dialog; you get 8 seconds to undo it.",
     seedRule: seed ? seedPolicyText(j.seed_policy) : "",
     deleteDataHidden: !torrent,
     deleteDataLabel: armIsSet("q" + j.id) ? "sure?" : "delete data",
     // `detail` is the joined line the row shows; kept as one string for
     // readability and for the DOM test's assertions.
-    detail: (fetching ? "fetching the NZB from the indexer…"
+    detail: (fetching ? (acquisition ? "waiting for the acquisition payload…" : "fetching the NZB from the indexer…")
                       : fmtBytes(done) + rest.join("")),
   };
 }
@@ -2329,7 +2332,7 @@ function seedBody(draft) {
 }
 async function saveSeedPolicy(id) {
   const j = store.jobs.find(j => j.id === id);
-  if (!j || j.kind !== "torrent" || seedSaving.has(id)) return;
+  if (!j || !isSeedTorrent(j) || seedSaving.has(id)) return;
   let body;
   try { body = seedBody(seedDraft(j)); }
   catch (e) { toast({ text: e.message, kind: "error" }); return; }
@@ -2626,7 +2629,8 @@ function recoveryMax(j) {
 }
 
 function detailModel(j, nowMs) {
-  const torrent = j.kind === "torrent";
+  const torrent = isSeedTorrent(j);
+  const acquisition = isTorrentAcquisition(j);
   const postStage = currentPostStage(j);
   const st = statusName(j.status, postStage);
   const cls = postStage != null || typeof j.status !== "string"
@@ -2639,6 +2643,7 @@ function detailModel(j, nowMs) {
   const bits = (j.params || [])
     .filter(([k]) => k && k[0] !== "*")
     .map(([k, v]) => k + " = " + v);
+  if (acquisition) bits.unshift("Torrent acquisition · separate seed source" + (j.seed_donor_job_id != null ? " #" + j.seed_donor_job_id : ""));
   const recoverMax = recoveryMax(j);
   const postTiming = j.postTiming;
   const cleanupRetry = j.failedCleanup;
@@ -2671,10 +2676,10 @@ function detailModel(j, nowMs) {
       : draft.mode === "stop" ? "Pieces may upload during downloading. Seeding stops once the download is verified complete."
       : draft.mode === "defaults" ? "Copies the active category / global defaults to this torrent. Later default changes do not alter it."
       : "Continue seeding until manually stopped.",
-    articles: torrent ? "" : "articles " + j.done_articles + "/" + j.total_articles +
+    articles: torrent || acquisition ? "" : "articles " + j.done_articles + "/" + j.total_articles +
       (j.failed_articles ? " · " + j.failed_articles + " failed" : "") +
       (j.retried_articles ? " · " + j.retried_articles + " retried" : ""),
-    health: torrent ? "ratio " + Number(j.ratio || 0).toFixed(2) + "×" :
+    health: acquisition ? "Private processing copy · seed source unchanged" : torrent ? "ratio " + Number(j.ratio || 0).toFixed(2) + "×" :
       "download health " + (j.health / 10).toFixed(1) + "%",
     repair: torrent ? "" : repairProgressText(j.repair_progress, nowMs),
     dupe: j.dupe_key ? "dupe: " + j.dupe_key : "",
@@ -2686,7 +2691,7 @@ function detailModel(j, nowMs) {
     ...failureKeepModel(j.id, torrent),
     jobDeliveryTrace: jobDeliveryHtml(j.id, j.params),
     jobDeliveryId: receiptIdOf(j.params),
-    nzbHidden: false,
+    nzbHidden: acquisition,
     closeHidden: false,
     recoverHidden: torrent || !recoverMax,
     recoverMax,
@@ -4150,7 +4155,7 @@ async function jobAction(id, action, op) {
   const res = await post("/api/v1/jobs/" + id + "/actions/" + action);
   if (op) op.inflight = false;
   if (!res.ok) {
-    if (action === "resume" && res.status === 404 && original && original.kind === "torrent" && original.ready) {
+    if (action === "resume" && res.status === 404 && original && isSeedTorrent(original) && original.ready) {
       if (op) pending.revert(op.key);
       const fresh = await post("/api/v1/jobs", { method: "GET" });
       if (!fresh.ok || !Array.isArray(fresh.body.jobs)) {
