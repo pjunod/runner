@@ -133,6 +133,26 @@ impl Inventory {
         let Some(artifact) = self.for_job(job)? else {
             return Ok(None);
         };
+        self.selected_publication_for_generation(
+            &SourceGeneration {
+                artifact: artifact.id,
+                generation: artifact.generation,
+            },
+            source_path,
+        )
+    }
+
+    pub fn selected_publication_for_generation(
+        &self,
+        source: &SourceGeneration,
+        source_path: &Path,
+    ) -> Result<Option<SelectedPublication>> {
+        let artifact = self.get(&source.artifact)?;
+        if artifact.generation != source.generation {
+            return Err(Error::Conflict(
+                "selected publication source generation changed".into(),
+            ));
+        }
         let raw_operations = {
             let db = self.db.lock().unwrap();
             let mut statement = db.prepare(

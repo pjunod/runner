@@ -30,6 +30,28 @@ impl Inventory {
         let Some(artifact) = self.for_job(job)? else {
             return Ok(None);
         };
+        self.cluster_artifact_copy_for_generation(
+            job,
+            selected,
+            &SourceGeneration {
+                artifact: artifact.id,
+                generation: artifact.generation,
+            },
+        )
+    }
+
+    pub fn cluster_artifact_copy_for_generation(
+        &self,
+        job: u32,
+        selected: bool,
+        source: &SourceGeneration,
+    ) -> Result<Option<ClusterArtifactCopy>> {
+        let artifact = self.get(&source.artifact)?;
+        if artifact.generation != source.generation || artifact.job != Some(job) {
+            return Err(Error::Conflict(
+                "cluster copy belongs to another job generation".into(),
+            ));
+        }
         if !artifact.owned || !artifact.automatic_cleanup_eligible || !artifact.delivery_lifecycle {
             return Ok(None);
         }
@@ -105,6 +127,12 @@ impl Inventory {
         if !copy.selected && outcome != "SUCCESS" && !artifact.terminal() {
             return Ok(ClusterCopyCleanup { status: "retained".into(), error: Some(
                 "partial failure publication does not prove every raw source dependency redundant; retain this exact source until recovery is resolved".into()) });
+        }
+        // A delegated download writes into the admission owner's allocation.
+        // READY is reached only after that writer's durable completion, so seal
+        // its final manifest now; imported/legacy paths never reach this branch.
+        if !copy.selected && artifact.state == "active" {
+            self.finish(copy.job_id, &artifact.path, &artifact.root, "completed")?;
         }
         self.accept_cluster_completion(&copy.publication, outcome, proof.clone())?;
         let retained = if copy.selected {
@@ -321,9 +349,10 @@ pub fn remove_cluster_generation_copy(
     }
     let mut observed = fs::manifest(&directory, 100_000)?;
     for entry in observed.iter().filter(|entry| entry.identity.directory) {
-        if !files
-            .iter()
-            .any(|file| file.path.starts_with(&format!("{}/", entry.path)))
+        if entry.path != "files"
+            && !files
+                .iter()
+                .any(|file| file.path.starts_with(&format!("{}/", entry.path)))
         {
             return Err(Error::Conflict(format!(
                 "unexpected generation directory: {}",
@@ -420,5 +449,30 @@ mod generation_tests {
         )
         .is_err());
         assert!(path.join("replacement.mkv").exists());
+    }
+
+    #[test]
+    fn empty_sealed_payload_retirement_replays_after_metadata_unlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("generations");
+        let path = root.join("job/fence-1");
+        std::fs::create_dir_all(path.join("files")).unwrap();
+        let bytes = b"empty generation descriptor";
+        std::fs::write(path.join("manifest.json"), bytes).unwrap();
+        let files = vec![DeliveryFile {
+            path: "manifest.json".into(),
+            size_bytes: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        }];
+        let identity = fs::identity_for_file(&fs::open_dir(&path).unwrap()).unwrap();
+        std::fs::remove_file(path.join("manifest.json")).unwrap();
+        remove_cluster_generation_copy(
+            &root,
+            Path::new("job/fence-1"),
+            (identity.device, identity.inode),
+            &files,
+        )
+        .unwrap();
+        assert!(!path.exists());
     }
 }

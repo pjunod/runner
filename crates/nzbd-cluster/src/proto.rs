@@ -13,9 +13,12 @@ pub const SECRET_HEADER: &str = "x-nzbd-cluster-secret";
 /// Poll emits one grant so a maximum-size descriptor fits the RPC envelope.
 pub const MAX_DESCRIPTOR_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_RPC_BYTES: usize = 32 * 1024 * 1024;
+pub const LIFECYCLE_PROTOCOL: u8 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PollRequest {
+    #[serde(default)]
+    pub lifecycle_protocol: u8,
     pub node: String,
     pub owner_incarnation: String,
     pub free_download_slots: u32,
@@ -41,6 +44,8 @@ pub enum LeaseKind {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Grant {
+    #[serde(default)]
+    pub lifecycle_protocol: u8,
     pub lease_id: String,
     pub token: LeaseToken,
     pub job_incarnation: String,
@@ -118,8 +123,10 @@ pub struct HeartbeatResponse {
     pub post_fetch_budgeted: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompleteRequest {
+    #[serde(default)]
+    pub lifecycle_protocol: u8,
     pub node: String,
     pub lease_id: String,
     pub token: LeaseToken,
@@ -177,6 +184,8 @@ pub struct ScriptReceiptResponse {
 /// Node presence record (registry file on the shared volume).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRecord {
+    #[serde(default)]
+    pub lifecycle_protocol: u8,
     pub name: String,
     pub api_url: String,
     pub download: bool,

@@ -8,6 +8,7 @@
 //! protocol when phase 2 lands.
 
 pub mod control;
+mod delivery;
 pub mod election;
 pub mod http;
 pub mod layout;
@@ -219,6 +220,21 @@ impl ClusterRuntime {
             .with_post(pp.as_ref().map(|setup| setup.post.clone())),
         );
         spawn_leader_task(leader_shared.clone(), cancel.clone(), &tracker);
+        {
+            let shared = leader_shared.clone();
+            let cancel = cancel.clone();
+            tracker.spawn(async move {
+                let mut cleanup_cursor=0;
+                loop {
+                    if cancel.is_cancelled(){break;}
+                    if shared.view.borrow().is_me && shared.authority_ready() {
+                        if let Err(error)=delivery::migrate_local_deliveries(&shared).await {tracing::warn!(%error,"cluster Delivery catalog adoption remains pending");}
+                        if let Err(error)=delivery::cleanup_one_copy(&shared,&mut cleanup_cursor).await {tracing::warn!(%error,"cluster source-copy cleanup remains pending");}
+                    }
+                    tokio::select!{_=cancel.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_secs(1))=>{}}
+                }
+            });
+        }
         registry::spawn_registry(
             layout.clone(),
             cfg.clone(),
@@ -465,7 +481,11 @@ impl ClusterRuntime {
                 pp_manager: self.pp_manager.clone(),
                 events: None, // router_with starts the hub
             })
-            .merge(nzbd_compat::router(compat_state)),
+            .merge(nzbd_compat::router(compat_state))
+            .layer(middleware::from_fn_with_state(
+                self.leader_shared.clone(),
+                delivery::serve_cluster_delivery,
+            )),
             auth.clone(),
         )
         .layer(middleware::from_fn_with_state(

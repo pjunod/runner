@@ -15,6 +15,9 @@ use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CONTROL_SCHEMA: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS cluster_delivery_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL) STRICT",
+    "CREATE TABLE IF NOT EXISTS cluster_deliveries(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,data TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,discovery_error TEXT,public_data TEXT,accepted_at INTEGER) STRICT",
+
     "CREATE TABLE IF NOT EXISTS cluster_meta (
         cluster_id TEXT PRIMARY KEY,
         source_fingerprint TEXT NOT NULL,
@@ -159,7 +162,7 @@ const CONTROL_SCHEMA: &[&str] = &[
 
 #[derive(Clone)]
 pub struct ControlStore {
-    client: Client,
+    pub(crate) client: Client,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,7 +270,10 @@ impl ControlStore {
             secret_raft: format!("raft-{secret}"),
             secret_api: format!("api-{secret}"),
             health_check_delay_secs: 0,
-            wal_size: 8 * 1024 * 1024,
+            // One bounded 32 MiB private copy record plus its bounded public
+            // projection/transaction overhead must fit a Raft entry. The WAL
+            // writer cannot split an entry across segments.
+            wal_size: (crate::proto::MAX_RPC_BYTES * 4) as u32,
             raft_config,
             ..NodeConfig::default()
         };
@@ -1490,4 +1496,8 @@ fn expiry(now: i64, ttl: Duration) -> Result<i64, String> {
     let ttl = ttl.clamp(Duration::from_secs(1), Duration::from_secs(300));
     now.checked_add(i64::try_from(ttl.as_millis()).map_err(|error| error.to_string())?)
         .ok_or_else(|| "lease expiry overflow".to_owned())
+}
+
+pub(crate) fn unix_ms_public() -> i64 {
+    unix_ms().unwrap_or(0)
 }

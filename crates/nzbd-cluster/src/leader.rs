@@ -68,7 +68,11 @@ pub struct LeaderShared {
     /// commits. The engine is speculative until replicated control accepts
     /// the exact request-local delta.
     pub(crate) mutation_serial: tokio::sync::Mutex<()>,
+    pub(crate) delivery_serial: tokio::sync::Mutex<()>,
     authority_ready: AtomicBool,
+    /// With one descriptor per poll, alternate the first lane so a stream of
+    /// downloads cannot starve a worker's free post-processing capacity.
+    post_poll_turn: Mutex<HashSet<String>>,
 }
 
 pub(crate) struct LeaderDurability {
@@ -122,7 +126,9 @@ impl LeaderShared {
             node_seen: Mutex::new(HashMap::new()),
             budgets: Mutex::new(BudgetHandoff::default()),
             mutation_serial: tokio::sync::Mutex::new(()),
+            delivery_serial: tokio::sync::Mutex::new(()),
             authority_ready: AtomicBool::new(false),
+            post_poll_turn: Mutex::new(HashSet::new()),
         })
     }
 
@@ -469,13 +475,34 @@ impl LeaderShared {
         scope: serde_json::Value,
     ) -> Option<Grant> {
         let control = self.control.as_ref()?;
+        if kind == LeaseKind::Download
+            && job.delivery_lifecycle
+            && !job
+                .params
+                .iter()
+                .any(|(key, _)| key == crate::delivery::AUTHORITY_COPY_PARAM)
+        {
+            if let Ok(Some(copy)) = self
+                .engine
+                .artifacts()
+                .cluster_artifact_copy(job.id.0, false)
+            {
+                let value = serde_json::to_string(&crate::delivery::AuthoritySourceCopy {
+                    owner_node: self.cfg.node_name.clone(),
+                    copy,
+                })
+                .ok()?;
+                job.params
+                    .push((crate::delivery::AUTHORITY_COPY_PARAM.into(), value));
+            }
+        }
         if serde_json::to_vec(&(&job, &scope)).ok()?.len() > MAX_DESCRIPTOR_BYTES {
             let message = format!("job descriptor exceeds the {} MiB cluster limit; split the NZB or reduce its metadata before retrying", MAX_DESCRIPTOR_BYTES / 1024 / 1024);
             if self
                 .engine
                 .hold_job(job.id, "descriptor_oversize", "cluster", &message)
                 .await
-                .is_ok()
+                .is_ok_and(|held| held)
             {
                 if let Ok(Some(held)) = self.engine.export_job(job.id).await {
                     let _ = control
@@ -551,6 +578,7 @@ impl LeaderShared {
         let (budget_generation, server_budgets) = self.budget_command(node, None);
         self.persist_budget_state().await;
         Some(Grant {
+            lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
             lease_id,
             token,
             job_incarnation,
@@ -599,6 +627,18 @@ pub fn router(shared: Arc<LeaderShared>) -> Router {
         .route("/cluster/v1/work/heartbeat", post(work_heartbeat))
         .route("/cluster/v1/work/complete", post(work_complete))
         .route("/cluster/v1/work/reject", post(work_reject))
+        .route(
+            "/cluster/v1/deliveries/migrate-page",
+            post(crate::delivery::local_delivery_page),
+        )
+        .route(
+            "/cluster/v1/deliveries/copy-authority",
+            post(crate::delivery::copy_authority),
+        )
+        .route(
+            "/cluster/v1/deliveries/cleanup-copy",
+            post(crate::delivery::cleanup_copy),
+        )
         .route("/cluster/v1/work/script-receipt", post(work_script_receipt))
         // Authenticate the peer namespace before extractors parse a request
         // body. Otherwise an unauthenticated malformed request can reveal
@@ -747,6 +787,9 @@ async fn work_poll(
     if !s.authority_ready() {
         return authority_not_ready();
     }
+    if req.lifecycle_protocol < LIFECYCLE_PROTOCOL {
+        return (StatusCode::UPGRADE_REQUIRED,Json(serde_json::json!({"error":"worker requires cluster lifecycle protocol 2 (durable completion outbox and exact copy cleanup); upgrade this worker"}))).into_response();
+    }
     // The registry is the leader's independent admission fact. Do not trust
     // slot counts from a poll whose node is already known to be held.
     if read_nodes(&s.layout)
@@ -762,6 +805,15 @@ async fn work_poll(
     // only one bounded article view.
     let snap = s.engine.snapshot();
     let mut grants = Vec::new();
+    let post_first =
+        req.free_pp_slots > 0 && post_lane_first(&mut s.post_poll_turn.lock().unwrap(), &req.node);
+    if post_first {
+        if let Some(grant) = grant_post_candidate(&s, &req, &snap).await {
+            grants.push(grant);
+            s.apply_local_budgets().await;
+            return Json(PollResponse { grants }).into_response();
+        }
+    }
     if req.free_download_slots > 0 {
         let range_jobs: Vec<JobId> = snap
             .jobs
@@ -914,6 +966,21 @@ async fn work_poll(
         }
     }
 
+    if let Some(grant) = grant_post_candidate(&s, &req, &snap).await {
+        grants.push(grant);
+    }
+
+    if !grants.is_empty() {
+        s.apply_local_budgets().await;
+    }
+    Json(PollResponse { grants }).into_response()
+}
+
+async fn grant_post_candidate(
+    s: &LeaderShared,
+    req: &PollRequest,
+    snap: &nzbd_engine::QueueSnapshot,
+) -> Option<Grant> {
     // PP grants (C2): completed jobs the scheduler assigned to this node
     // for post-processing, not yet leased, PP not yet done.
     let pp_candidates: Vec<JobId> = snap
@@ -947,17 +1014,19 @@ async fn work_poll(
             )
             .await
         {
-            tracing::info!(job = job_id.0, node = %req.node, lease = %grant.lease_id, "pp lease granted");
-            grants.push(grant);
-            s.apply_local_budgets().await;
-            return Json(PollResponse { grants }).into_response();
+            return Some(grant);
         }
     }
+    None
+}
 
-    if !grants.is_empty() {
-        s.apply_local_budgets().await;
+fn post_lane_first(turns: &mut HashSet<String>, node: &str) -> bool {
+    if turns.remove(node) {
+        false
+    } else {
+        turns.insert(node.to_owned());
+        true
     }
-    Json(PollResponse { grants }).into_response()
 }
 
 fn range_owner(workers: &[NodeRecord], index: u32) -> Option<&str> {
@@ -1197,8 +1266,10 @@ async fn work_complete(
     if !s.authority_ready() {
         return authority_not_ready();
     }
-    let _serial = s.mutation_serial.lock().await;
     let job_id = req.job.id;
+    if req.job.delivery_lifecycle && req.lifecycle_protocol < LIFECYCLE_PROTOCOL {
+        return (StatusCode::UPGRADE_REQUIRED,Json(serde_json::json!({"error":"lifecycle completion requires protocol 2 copy custody/outbox metadata"}))).into_response();
+    }
     if serde_json::to_vec(&req.job).map_or(true, |bytes| bytes.len() > MAX_DESCRIPTOR_BYTES) {
         return (StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({"error": "completed job descriptor exceeds 16 MiB; reduce metadata before retrying"}))).into_response();
@@ -1271,6 +1342,20 @@ async fn work_complete(
         )
             .into_response();
     }
+    let ready_delivery_id = cluster_delivery_id(&req.result_id);
+    let already_ready = match &s.control {
+        Some(control) => match control.cluster_delivery(&ready_delivery_id).await {
+            Ok(record) => record,
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error":error})),
+                )
+                    .into_response()
+            }
+        },
+        None => None,
+    };
     let verify_root = s.cfg.shared_dir.clone();
     let verify_ref = req.result_ref.clone();
     let verify_id = req.result_id.clone();
@@ -1287,20 +1372,24 @@ async fn work_complete(
     };
     let verify_job = req.job.clone();
     let verify_fence = req.token.fence;
-    let verified = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        tokio::task::spawn_blocking(move || {
-            verify_generation(
-                &verify_root,
-                &verify_ref,
-                &verify_id,
-                verify_job_incarnation.as_deref(),
-                verify_fence,
-                &verify_job,
-            )
-        }),
-    )
-    .await;
+    let verified = if already_ready.is_some() {
+        Ok(Ok(Ok(())))
+    } else {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tokio::task::spawn_blocking(move || {
+                verify_generation(
+                    &verify_root,
+                    &verify_ref,
+                    &verify_id,
+                    verify_job_incarnation.as_deref(),
+                    verify_fence,
+                    &verify_job,
+                )
+            }),
+        )
+        .await
+    };
     if !matches!(verified, Ok(Ok(Ok(())))) {
         tracing::warn!(job = job_id.0, owner_incarnation = %verify_incarnation, "completion generation validation failed or timed out");
         return (
@@ -1412,18 +1501,28 @@ async fn work_complete(
             )
                 .into_response();
         };
-        let final_path = dest_dir.join(&original_dir);
-        let publish_dir = original_dir.clone();
-        let publish = tokio::task::spawn_blocking(move || {
-            publish_generation(
-                &dest_dir,
-                &result_ref,
-                &publish_dir,
-                fence,
-                &publish_result_id,
-            )
-        })
-        .await;
+        let publish_dir = cluster_publication_name(
+            &original_dir,
+            &req.result_id,
+            info.kind == LeaseKind::Post && published_job.delivery_lifecycle,
+        );
+        let final_path = dest_dir.join(&publish_dir);
+        let exclusive = info.kind == LeaseKind::Post && published_job.delivery_lifecycle;
+        let publish = if already_ready.is_some() {
+            Ok(Ok(()))
+        } else {
+            tokio::task::spawn_blocking(move || {
+                publish_generation_checked(
+                    &dest_dir,
+                    &result_ref,
+                    &publish_dir,
+                    fence,
+                    &publish_result_id,
+                    exclusive,
+                )
+            })
+            .await
+        };
         if !matches!(publish, Ok(Ok(()))) {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1440,6 +1539,14 @@ async fn work_complete(
             final_path.to_string_lossy().into_owned(),
         ));
         final_publication = Some(final_path);
+    }
+    if info.kind == LeaseKind::Post && published_job.delivery_lifecycle {
+        match ensure_cluster_delivery(&s, &published_job, &req.result_id, &req.result_ref, &req.receipt_id,
+            accepted_at_ms, final_publication.as_deref().expect("post path")).await {
+            Ok(Some(delivery))=>attach_delivery_params(&mut published_job,&delivery),
+            Ok(None)=>{},
+            Err(error)=>return (StatusCode::SERVICE_UNAVAILABLE,Json(serde_json::json!({"error":format!("published result awaits durable Delivery: {error}")}))).into_response(),
+        }
     }
     let history_recorded_by_authority = info.kind == LeaseKind::Post && s.history.is_some();
     if info.kind == LeaseKind::Post {
@@ -1544,23 +1651,6 @@ fn segment_completion_is_exact(job: &nzbd_types::Job, resource: &str) -> bool {
             .all(|segment| matches!(segment.state, nzbd_types::SegmentState::Done { .. }))
 }
 
-#[derive(serde::Deserialize)]
-struct VerifyGenerationManifest {
-    job_incarnation: String,
-    fence: u64,
-    result_id: String,
-    job_sha256: String,
-    files: Vec<VerifyGenerationFile>,
-    total_bytes: u64,
-}
-
-#[derive(serde::Deserialize)]
-struct VerifyGenerationFile {
-    path: String,
-    bytes: u64,
-    sha256: String,
-}
-
 fn verify_generation(
     shared_dir: &Path,
     result_ref: &str,
@@ -1576,19 +1666,19 @@ fn verify_generation(
     if !selected.starts_with(&allowed) {
         return Err("generation escaped shared namespace".into());
     }
-    let manifest: VerifyGenerationManifest = serde_json::from_slice(
-        &std::fs::read(selected.join("manifest.json"))
-            .map_err(|error| format!("read generation manifest: {error}"))?,
+    let manifest: crate::worker::GenerationManifest = serde_json::from_slice(
+        &crate::worker::read_bounded_file(&selected.join("manifest.json"), MAX_DESCRIPTOR_BYTES)?,
     )
     .map_err(|error| format!("decode generation manifest: {error}"))?;
     if manifest.result_id != result_id
+        || !manifest.identity_matches()
         || manifest.fence != fence
         || job_incarnation.is_some_and(|expected| expected != manifest.job_incarnation)
     {
         return Err("generation identity mismatch".into());
     }
-    let job_bytes = std::fs::read(selected.join("job.json"))
-        .map_err(|error| format!("read generation job: {error}"))?;
+    let job_bytes =
+        crate::worker::read_bounded_file(&selected.join("job.json"), MAX_DESCRIPTOR_BYTES)?;
     use sha2::Digest;
     if format!("{:x}", sha2::Sha256::digest(&job_bytes)) != manifest.job_sha256 {
         return Err("generation job hash mismatch".into());
@@ -1658,12 +1748,35 @@ fn verify_generation(
 /// Materialize a selected immutable generation. Existing output is moved to
 /// a uniquely named recoverable sibling and is never deleted here. A marker
 /// makes retries idempotent without repeatedly moving the selected output.
+#[cfg(test)]
 fn publish_generation(
     dest_dir: &Path,
     result_ref: &str,
     original_dir: &str,
     fence: u64,
     result_id: &str,
+) -> Result<(), String> {
+    publish_generation_checked(dest_dir, result_ref, original_dir, fence, result_id, false)
+}
+
+fn cluster_publication_name(original: &str, result_id: &str, lifecycle: bool) -> String {
+    if lifecycle {
+        format!(
+            "{original}.runner-{}",
+            result_id.strip_prefix("sha256:").unwrap_or(result_id)
+        )
+    } else {
+        original.to_owned()
+    }
+}
+
+fn publish_generation_checked(
+    dest_dir: &Path,
+    result_ref: &str,
+    original_dir: &str,
+    fence: u64,
+    result_id: &str,
+    exclusive: bool,
 ) -> Result<(), String> {
     let relative = PathBuf::from(original_dir);
     if relative.is_absolute()
@@ -1681,6 +1794,9 @@ fn publish_generation(
         .is_some_and(|selected| selected == result_id)
     {
         return Ok(());
+    }
+    if exclusive && target.try_exists().map_err(|error| error.to_string())? {
+        return Err("lifecycle publication target exists without its exact generation marker; source retained for review".into());
     }
     let parent = target
         .parent()
@@ -1848,6 +1964,13 @@ async fn recover_selected_publications(s: &LeaderShared) -> Result<(), String> {
     let Some(control) = &s.control else {
         return Ok(());
     };
+    control
+        .initialize_delivery_identity(&s.engine.artifacts().installation, &s.cfg.node_name)
+        .await?;
+    // A single bounded page per pass; interrupted adoption resumes its trusted cursor.
+    if let Err(error) = crate::delivery::migrate_local_deliveries(s).await {
+        tracing::warn!(%error,"legacy Delivery catalog adoption awaits original owner");
+    }
     for (result_id, result_ref, job, fence, accepted_at_ms, kind) in
         control.published_results().await?
     {
@@ -1859,18 +1982,313 @@ async fn recover_selected_publications(s: &LeaderShared) -> Result<(), String> {
             continue;
         };
         let dest_dir = s.publication_root(&job, kind == "post");
-        let original_dir = original_dir.clone();
+        let original_dir = cluster_publication_name(
+            original_dir,
+            &result_id,
+            kind == "post" && job.delivery_lifecycle,
+        );
         let final_path = dest_dir.join(&original_dir);
-        tokio::task::spawn_blocking(move || {
-            publish_generation(&dest_dir, &result_ref, &original_dir, fence, &result_id)
-        })
-        .await
-        .map_err(|error| format!("publication recovery task failed: {error}"))??;
+        let exclusive = kind == "post" && job.delivery_lifecycle;
+        let ready = control
+            .cluster_delivery(&cluster_delivery_id(&result_id))
+            .await?;
+        if ready.is_none() {
+            let publish_ref = result_ref.clone();
+            let publish_id = result_id.clone();
+            tokio::task::spawn_blocking(move || {
+                publish_generation_checked(
+                    &dest_dir,
+                    &publish_ref,
+                    &original_dir,
+                    fence,
+                    &publish_id,
+                    exclusive,
+                )
+            })
+            .await
+            .map_err(|error| format!("publication recovery task failed: {error}"))??;
+        }
         if kind == "post" {
+            let mut job = job;
+            let receipt_id = format!(
+                "complete:{}:{}:{}",
+                format!("work/job/{}/post", job.id.0),
+                fence,
+                result_id
+            );
+            if let Some(delivery) = ensure_cluster_delivery(
+                s,
+                &job,
+                &result_id,
+                &result_ref,
+                &receipt_id,
+                accepted_at_ms,
+                &final_path,
+            )
+            .await?
+            {
+                attach_delivery_params(&mut job, &delivery);
+            }
             record_pp_history(s, &job, accepted_at_ms, &final_path).await?;
         }
     }
     Ok(())
+}
+
+fn cluster_delivery_id(result_id: &str) -> String {
+    format!("cluster-delivery:{result_id}")
+}
+
+fn attach_delivery_params(job: &mut nzbd_types::Job, delivery: &nzbd_state::artifacts::Delivery) {
+    for (key, value) in [
+        ("Delivery:Id", delivery.delivery_id.clone()),
+        ("Delivery:Path", delivery.publication_path.clone()),
+        (
+            "Delivery:Generation",
+            delivery.publication_generation.clone(),
+        ),
+        ("Delivery:ManifestDigest", delivery.manifest_digest.clone()),
+        ("Delivery:Custody", "curator".into()),
+        (
+            "Delivery:SourceArtifactId",
+            delivery.source_artifact_id.clone(),
+        ),
+        (
+            "Delivery:SourceGeneration",
+            delivery.source_generation.clone(),
+        ),
+        (
+            "Delivery:SourceCleanup",
+            delivery.source_cleanup.status.clone(),
+        ),
+    ] {
+        job.params.retain(|(existing, _)| existing != key);
+        job.params.push((key.into(), value));
+    }
+}
+
+async fn ensure_cluster_delivery(
+    s: &LeaderShared,
+    job: &nzbd_types::Job,
+    result_id: &str,
+    result_ref: &str,
+    receipt_id: &str,
+    accepted_at_ms: i64,
+    final_path: &Path,
+) -> Result<Option<nzbd_state::artifacts::Delivery>, String> {
+    if !job.delivery_lifecycle {
+        return Ok(None);
+    }
+    let control = s.control.as_ref().ok_or("replicated control unavailable")?;
+    let _serial = s.delivery_serial.lock().await;
+    let id = cluster_delivery_id(result_id);
+    if let Some(record) = control.cluster_delivery(&id).await? {
+        return Ok(Some(record.delivery));
+    }
+    if control.delivery_meta("local_imported").await?.is_none() {
+        return Err("legacy Delivery cursor adoption is still pending; retry publication after catalog recovery".into());
+    }
+    let manifest: crate::worker::GenerationManifest =
+        serde_json::from_slice(&crate::worker::read_bounded_file(
+            &Path::new(result_ref).join("manifest.json"),
+            MAX_DESCRIPTOR_BYTES,
+        )?)
+        .map_err(|e| e.to_string())?;
+    if manifest.result_id != result_id || !manifest.identity_matches() {
+        return Err("sealed copy metadata changed after selection".into());
+    }
+    if manifest.files.is_empty() {
+        return Ok(None);
+    }
+    // Receipt selection alone is not READY: final bytes and the publication
+    // marker must have reached the durable materialization boundary first.
+    if std::fs::read_to_string(final_path.join(".nzbd-generation"))
+        .ok()
+        .as_deref()
+        != Some(result_id)
+    {
+        return Err("materialized publication marker is not durable".into());
+    }
+    let mut copies = Vec::new();
+    for (copy_result, copy_ref, copy_job, _, _, _) in control.published_results().await? {
+        if copy_job.id != job.id {
+            continue;
+        }
+        let copy_manifest_bytes = crate::worker::read_bounded_file(
+            &Path::new(&copy_ref).join("manifest.json"),
+            MAX_DESCRIPTOR_BYTES,
+        )?;
+        let copy_manifest: crate::worker::GenerationManifest =
+            serde_json::from_slice(&copy_manifest_bytes).map_err(|error| error.to_string())?;
+        if copy_manifest.result_id != copy_result || !copy_manifest.identity_matches() {
+            return Err("accepted copy metadata changed".into());
+        }
+        if copy_manifest.job_incarnation != manifest.job_incarnation {
+            continue;
+        }
+        if let Some(copy) = copy_manifest.artifact_copy {
+            let copy_key = format!(
+                "artifact:{}:{}:{}",
+                copy.storage_instance_id, copy.publication.artifact, copy.publication.generation
+            );
+            if !copies
+                .iter()
+                .any(|existing: &crate::delivery::CopyObligation| existing.id == copy_key)
+            {
+                copies.push(crate::delivery::CopyObligation {
+                    id: copy_key,
+                    owner_node: copy_manifest.owner_node_id.clone(),
+                    artifact: Some(copy),
+                    local_delivery_id: None,
+                    result_ref: None,
+                    result_id: None,
+                    directory_identity: None,
+                    deletion_files: None,
+                    claim_id: None,
+                    attempts: 0,
+                    next_retry_at: None,
+                    status: "pending".into(),
+                    error: None,
+                });
+            }
+        }
+        let mut deletion_files = copy_manifest
+            .files
+            .iter()
+            .map(|file| nzbd_state::artifacts::DeliveryFile {
+                path: format!("files/{}", file.path),
+                size_bytes: file.bytes,
+                sha256: file.sha256.clone(),
+            })
+            .collect::<Vec<_>>();
+        use sha2::{Digest, Sha256};
+        deletion_files.push(nzbd_state::artifacts::DeliveryFile {
+            path: "manifest.json".into(),
+            size_bytes: copy_manifest_bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&copy_manifest_bytes)),
+        });
+        let copy_job_bytes = crate::worker::read_bounded_file(
+            &Path::new(&copy_ref).join("job.json"),
+            MAX_DESCRIPTOR_BYTES,
+        )?;
+        if format!("{:x}", Sha256::digest(&copy_job_bytes)) != copy_manifest.job_sha256 {
+            return Err("accepted copy job changed before Delivery".into());
+        }
+        let sealed_job: nzbd_types::Job =
+            serde_json::from_slice(&copy_job_bytes).map_err(|error| error.to_string())?;
+        if let Some((_, value)) = sealed_job
+            .params
+            .iter()
+            .find(|(key, _)| key == crate::delivery::AUTHORITY_COPY_PARAM)
+        {
+            let authority: crate::delivery::AuthoritySourceCopy =
+                serde_json::from_str(value).map_err(|error| error.to_string())?;
+            if authority.copy.job_id != job.id.0
+                || authority.copy.selected
+                || authority.owner_node.is_empty()
+            {
+                return Err("sealed admission copy identity is invalid".into());
+            }
+            let key = format!(
+                "artifact:{}:{}:{}",
+                authority.copy.storage_instance_id,
+                authority.copy.publication.artifact,
+                authority.copy.publication.generation
+            );
+            if !copies.iter().any(|copy| copy.id == key) {
+                copies.push(crate::delivery::CopyObligation {
+                    id: key,
+                    owner_node: authority.owner_node,
+                    artifact: Some(authority.copy),
+                    local_delivery_id: None,
+                    result_ref: None,
+                    result_id: None,
+                    directory_identity: None,
+                    deletion_files: None,
+                    claim_id: None,
+                    attempts: 0,
+                    next_retry_at: None,
+                    status: "pending".into(),
+                    error: None,
+                });
+            }
+        }
+        deletion_files.push(nzbd_state::artifacts::DeliveryFile {
+            path: "job.json".into(),
+            size_bytes: copy_job_bytes.len() as u64,
+            sha256: copy_manifest.job_sha256.clone(),
+        });
+        copies.push(crate::delivery::CopyObligation {
+            id:format!("generation:{copy_result}"),owner_node:copy_manifest.owner_node_id,
+            artifact:None,local_delivery_id:None,result_ref:Some(copy_ref),result_id:Some(copy_result),directory_identity:copy_manifest.directory_identity,deletion_files:Some(deletion_files),claim_id:None,attempts:0,next_retry_at:None,
+            status:if copy_manifest.directory_identity.is_some(){"pending"}else{"review_required"}.into(),
+            error:copy_manifest.directory_identity.is_none().then(||"legacy generation lacks owned directory identity; inspect this exact copy before cleanup".into()),
+        });
+    }
+    copies.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut files = manifest
+        .files
+        .iter()
+        .map(|file| nzbd_state::artifacts::DeliveryFile {
+            path: file.path.clone(),
+            size_bytes: file.bytes,
+            sha256: file.sha256.clone(),
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    use sha2::{Digest, Sha256};
+    let mut canonical = b"runner-manifest-v1\n".to_vec();
+    for file in &files {
+        canonical.extend_from_slice(
+            format!(
+                "{}:{}\n{}\n{}\n",
+                file.path.len(),
+                file.path,
+                file.size_bytes,
+                file.sha256
+            )
+            .as_bytes(),
+        );
+    }
+    let outcome = job
+        .params
+        .iter()
+        .find(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+        .map(|(_, value)| value.as_str())
+        .unwrap_or("SUCCESS");
+    let source = manifest
+        .artifact_copy
+        .as_ref()
+        .map(|copy| copy.source.clone());
+    let keep = job
+        .params
+        .iter()
+        .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
+    let delivery:nzbd_state::artifacts::Delivery=serde_json::from_value(serde_json::json!({
+        "protocolVersion":1,"sequence":0,"status":"ready","deliveryId":id,"publicationGeneration":result_id,
+        "artifactId":format!("cluster-publication:{result_id}"),"sourceArtifactId":source.as_ref().map(|source|source.artifact.as_str()).unwrap_or(""),
+        "sourceGeneration":source.as_ref().map(|source|source.generation.as_str()).unwrap_or(""),"jobId":job.id.0,
+        "runnerInstanceId":control.delivery_instance().await?,
+        "requestToken":job.params.iter().find(|(key,_)|key=="monarr-transfer").map(|(_,value)|value),
+        "keepSourceOnFailure":keep,"terminalOutcome":outcome,
+        "failureStage":job.params.iter().find(|(key,_)|key=="Failure:Stage").map(|(_,value)|value),
+        "failureCause":job.params.iter().find(|(key,_)|key=="Failure:Reason"||key=="Failure:Files").map(|(_,value)|value),
+        "publicationPath":final_path.to_string_lossy(),"manifestDigest":format!("{:x}",Sha256::digest(canonical)),
+        "files":files,"fileOutcomes":manifest.file_outcomes,"readyAt":accepted_at_ms/1000,
+        "acceptedAt":null,"consumerReceiptId":null,
+        "runnerStages":{"nodeId":manifest.owner_node_id,"clockDomain":format!("node:{}:unix-ms",manifest.owner_node_id),"spans":job.stages.iter().take(128).collect::<Vec<_>>()},
+        "sourceCleanup":{"status":"pending","error":null,"attempts":0,"nextRetryAt":null,"blockedSince":null,"warning":null}
+    })).map_err(|e|e.to_string())?;
+    let record = control
+        .commit_delivery(&crate::delivery::ClusterDelivery {
+            revision: 0,
+            delivery,
+            receipt_id: receipt_id.into(),
+            result_id: result_id.into(),
+            copies,
+        })
+        .await?;
+    Ok(Some(record.delivery))
 }
 
 async fn record_pp_history(
@@ -2237,6 +2655,7 @@ mod tests {
     fn lost_completion_response_replays_only_the_exact_durable_receipt() {
         let token = test_token("work/job/7/download");
         let request = CompleteRequest {
+            lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
             node: "worker".into(),
             lease_id: "work/job/7/download@1".into(),
             token: token.clone(),
@@ -2419,6 +2838,41 @@ mod tests {
         let entries = hist.list(10).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].final_dir.as_deref(), category.to_str());
+        shared.authority_ready.store(true, Ordering::Release);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = router(shared);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut large_job = test_job(7);
+        large_job
+            .params
+            .push(("large-metadata".into(), "x".repeat(2 * 1024 * 1024)));
+        let request = CompleteRequest {
+            lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
+            node: "worker".into(),
+            lease_id: "unknown".into(),
+            token: test_token("work/job/7/post"),
+            expected_job_revision: 1,
+            result_id: "result".into(),
+            result_ref: "/missing".into(),
+            receipt_id: "receipt".into(),
+            job: large_job,
+        };
+        let error = crate::http::ClusterClient::new("secret".into())
+            .post_json::<_, serde_json::Value>(
+                &format!("http://{address}"),
+                "/cluster/v1/work/complete",
+                &request,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("409") && error.contains("unknown lease"),
+            "real cluster completion route must parse >1MiB before checking lease: {error}"
+        );
+        server.abort();
         engine.shutdown().await;
     }
 
@@ -2648,5 +3102,17 @@ mod tests {
             None
         );
         engine.shutdown().await;
+    }
+    #[test]
+    fn bounded_poll_alternates_download_and_post_backlogs() {
+        let mut turns = HashSet::new();
+        let lanes = (0..10)
+            .map(|_| post_lane_first(&mut turns, "busy-worker"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lanes,
+            vec![true, false, true, false, true, false, true, false, true, false]
+        );
+        assert!(post_lane_first(&mut turns, "independent-worker"));
     }
 }

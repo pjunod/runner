@@ -2196,6 +2196,46 @@ async fn schedule_recoverable_post_retry(engine: &EngineHandle, job: JobId) {
     }
 }
 
+/// Retain the exact leased worker attempt through recoverable post failures.
+/// Scheduling itself is an owner CAS and, on cluster workers, a durable local
+/// inventory checkpoint rather than a volatile queue import.
+pub async fn retain_worker_post_retry(
+    engine: &EngineHandle,
+    job: JobId,
+    error: &PostError,
+) -> bool {
+    if !matches!(error, PostError::Held) {
+        let cause = post_hold_cause(error);
+        let stage = engine
+            .snapshot()
+            .jobs
+            .iter()
+            .find(|row| row.id == job)
+            .and_then(|row| row.stages.last())
+            .map(|span| span.stage.as_str().to_owned())
+            .unwrap_or_else(|| "extract".into());
+        if !engine
+            .hold_job(job, cause, &stage, &error.to_string())
+            .await
+            .unwrap_or(false)
+        {
+            return false;
+        }
+    }
+    schedule_recoverable_post_retry(engine, job).await;
+    engine
+        .export_job(job)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|job| job.control())
+        .is_some_and(|control| {
+            control.lifecycle == "held"
+                && control.retry_policy == "scheduled_retry"
+                && !control.manual_pause
+        })
+}
+
 fn retry_delay_with_jitter(base: i64, job: JobId, attempt: u32) -> i64 {
     let seed = u64::from(job.0).wrapping_mul(0x9e3779b97f4a7c15)
         ^ u64::from(attempt).wrapping_mul(0xbf58476d1ce4e5b9)
@@ -2366,7 +2406,7 @@ fn spawn_job(
                         .map(|s| s.stage.as_str().to_string())
                         .unwrap_or_else(|| "extract".into());
                     let _ = engine.hold_job(job, cause, &stage, &detail).await;
-                    if matches!(cause, "io" | "missing_tool") {
+                    if matches!(cause, "io" | "missing_tool" | "capacity" | "quota") {
                         schedule_recoverable_post_retry(&engine, job).await;
                     }
                     // PP writes as much as the downloader does — unpack,
@@ -3455,7 +3495,10 @@ async fn process_job_ctx_from_inner(
         )?;
         deobfuscated.extend(crate::deobfuscate::deobfuscate_dir_owned(
             &dir,
-            &sanitized,
+            job.params
+                .iter()
+                .find(|(key, _)| key == "*Cluster:original-dir")
+                .map_or(sanitized.as_str(), |(_, name)| name.as_str()),
             &par2_names,
             Some((&engine.artifacts(), job_id.0)),
         )?);
@@ -3984,7 +4027,13 @@ async fn process_job_ctx_from_inner(
                 let target_root = configured_root
                     .cloned()
                     .unwrap_or_else(|| source.path.parent().unwrap_or(dest_dir).to_path_buf());
-                let target = target_root.join(format!("{sanitized}.runner-{}", source.generation));
+                let publication_name = if ctx.publish_history {
+                    sanitized.as_str()
+                } else {
+                    "private-payload"
+                };
+                let target =
+                    target_root.join(format!("{publication_name}.runner-{}", source.generation));
                 stages.enter(PostStage::Move).await;
                 if !(ctx.commit_ok)() {
                     return Err(PostError::Subprocess(
@@ -4006,11 +4055,12 @@ async fn process_job_ctx_from_inner(
                         PP_SELECTED_OUTCOME_PARAM,
                         outcome.as_str().into(),
                     );
-                    if !engine
-                        .import_job_if_present(marker)
-                        .await
-                        .map_err(|error| PostError::Subprocess(error.to_string()))?
-                    {
+                    let marker_commit = if ctx.publish_history {
+                        engine.import_job_if_present(marker).await
+                    } else {
+                        engine.import_worker_job_if_present(marker).await
+                    };
+                    if !marker_commit.map_err(|error| PostError::Subprocess(error.to_string()))? {
                         return Err(PostError::Subprocess(
                             "publication outcome was not committed".into(),
                         ));
