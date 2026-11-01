@@ -26,11 +26,11 @@ outside compiler caches in the task's durable evidence directory.
 
 | Slice | State | Evidence |
 |---|---|---|
-| Runner publication retries, resource holds, custody, Keep and durable queue mutations | Core checkpoints integrated; URL and broader timing still active | State 3f47dce, d70609c9 and 2ecfc5c integrated; focused failure/race regressions pass |
+| Runner publication retries, resource holds, custody, Keep and durable queue mutations | Core checkpoints integrated; URL and broader timing still active | State 3f47dce, d70609c9, 2ecfc5c and ce4cdd3 integrated; focused failure/race and actual writer recovery regressions pass |
 | Runner real partial repair, native books, safe sidecars and classification | Integrated; focused regressions pass | POST a2aa622 and bf4c21ca; integration 78555830 and 8727681a |
-| Curator discovery, atomic import ledger, replacement ownership and manual intent | Core checkpoint integrated; service fault tests active | Curator 2665a8b |
-| Curator upgrade distinction, stale batches, storage explanation and reviewed acceptance | Upgrade distinction and cancellation committed; storage acceptance active | Curator 2665a8b; narrow migration/service tests underway |
-| Cluster durable Delivery, copy retirement, URL replay and RPC bounds | RPC bounds integrated; Delivery/copy implementation active | Runner 2e36b491; stable replicated consumer identity, separate node storage identities |
+| Curator discovery, atomic import ledger, replacement ownership and manual intent | Core and follow-up integrated; focused service fault tests pass | Curator 2665a8b and 21a9bec |
+| Curator upgrade distinction, stale batches, storage explanation and reviewed acceptance | Committed; focused migration/service/storage tests pass | Curator 2665a8b, 21a9bec and 176fd58; rendered UI acceptance remains pending |
+| Cluster durable Delivery, copy retirement, URL replay and RPC bounds | RPC bounds and exact local copy helper integrated; Delivery/copy implementation active | Runner 2e36b491 and bf539031; actual authority-change and complete-copy-drain evidence pending |
 | Native torrent independent publication and seeding custody | Pending | None yet |
 | Joined timing, usable controls and desktop/mobile acceptance | Pending | None yet |
 | Real Runner–Curator/cluster/torrent integration evidence | Pending | None yet |
@@ -45,8 +45,8 @@ outside compiler caches in the task's durable evidence directory.
 Focused POST regressions pass for native book publication, failed-health repair,
 retained dependencies, deletion replay, exact repair IDs, title classification,
 junk-only completion and persistent retry scheduling against the integrated
-state checkpoint. State compilation passed; additional fault regressions remain
-active. These checks establish specific fixes and do not replace final gates. Final reports must
+state checkpoint. State compilation and focused owner/custody/resource fault regressions passed.
+Cluster, URL, torrent and full lifecycle integration remain active. These checks establish specific fixes and do not replace final gates. Final reports must
 name exact tested commits, toolchains, commands, limitations and review outcome.
 
 Curator gates include lint, Go tests, coverage, web tests/build, mobile checks,
