@@ -55,6 +55,7 @@ pub struct WriterHandle {
 /// Bounded queue per file: decoded segments are large, keep few in flight.
 const WRITER_QUEUE: usize = 8;
 
+#[cfg(test)]
 pub fn spawn_writer(
     tracker: &TaskTracker,
     job: JobId,
@@ -63,17 +64,40 @@ pub fn spawn_writer(
     final_name: String,
     engine_tx: mpsc::Sender<EngineMsg>,
 ) -> WriterHandle {
+    spawn_writer_with_checkpoint(tracker, job, file, dir, final_name, engine_tx, (0, 0))
+}
+
+pub(crate) fn spawn_writer_with_checkpoint(
+    tracker: &TaskTracker,
+    job: JobId,
+    file: FileId,
+    dir: PathBuf,
+    final_name: String,
+    engine_tx: mpsc::Sender<EngineMsg>,
+    checkpoint: (u64, u64),
+) -> WriterHandle {
     let (tx, rx) = mpsc::channel(WRITER_QUEUE);
     let stop = tokio_util::sync::CancellationToken::new();
     let cancellation = stop.clone();
     let (done, stopped) = tokio::sync::watch::channel(false);
     tracker.spawn(async move {
-        writer_task(job, file, dir, final_name, rx, engine_tx, cancellation).await;
+        writer_task(
+            job,
+            file,
+            dir,
+            final_name,
+            rx,
+            engine_tx,
+            cancellation,
+            checkpoint,
+        )
+        .await;
         let _ = done.send(true);
     });
     WriterHandle { tx, stop, stopped }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn writer_task(
     job: JobId,
     file_id: FileId,
@@ -82,6 +106,7 @@ async fn writer_task(
     mut rx: mpsc::Receiver<WriteCmd>,
     engine_tx: mpsc::Sender<EngineMsg>,
     stop: tokio_util::sync::CancellationToken,
+    checkpoint: (u64, u64),
 ) {
     let part_path = dir.join(format!(".runner-file-{}.part", file_id.0));
     let legacy = dir.join(format!("{final_name}.part"));
@@ -172,7 +197,16 @@ async fn writer_task(
             } => {
                 if reservation.is_none() && file_size > 0 {
                     let _ = tokio::fs::create_dir_all(&dir).await;
-                    match nzbd_state::capacity::reserve(&dir, file_size) {
+                    let credit = if checkpoint.1 <= file_size {
+                        crate::download_capacity::allocated_credit(
+                            &part_path,
+                            checkpoint.0.min(file_size),
+                            checkpoint.1,
+                        )
+                    } else {
+                        0
+                    };
+                    match nzbd_state::capacity::reserve(&dir, file_size.saturating_sub(credit)) {
                         Ok(claim) => reservation = Some(claim),
                         Err(e) => {
                             let _ = engine_tx

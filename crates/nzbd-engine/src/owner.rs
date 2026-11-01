@@ -18,7 +18,7 @@ use crate::queue::{
 use crate::rate::{RateLimiter, SpeedMeter};
 use crate::snapshot::{JobSummary, QueueSnapshot, SharedSnapshot, StorageVolumeSnapshot};
 use crate::volumes::DiskGuardReading;
-use crate::writer::{spawn_writer, WriteCmd, WriterHandle};
+use crate::writer::{spawn_writer_with_checkpoint, WriteCmd, WriterHandle};
 use crate::{AddOpts, Tuning};
 use arc_swap::ArcSwap;
 use nzbd_nzb::ParsedNzb;
@@ -5285,13 +5285,25 @@ impl Owner {
             let (tx, _) = mpsc::channel(1);
             return tx;
         }
-        let h = spawn_writer(
+        let checkpoint = self
+            .state
+            .job(job)
+            .and_then(|job| job.files.iter().find(|candidate| candidate.id == file))
+            .map(|file| {
+                crate::download_capacity::done_coverage(
+                    file,
+                    self.file_sizes.get(&file.id).copied().unwrap_or(u64::MAX),
+                )
+            })
+            .unwrap_or_default();
+        let h = spawn_writer_with_checkpoint(
             &self.tracker,
             job,
             file,
             dir,
             filename,
             self.engine_tx.clone(),
+            checkpoint,
         );
         let tx = h.tx.clone();
         self.writers.insert(file, h);
@@ -10786,6 +10798,169 @@ mod tests {
         });
         assert!(result.await.unwrap().is_err());
         assert_eq!(owner.state.jobs[0].priority, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capacity_forecast_selects_finalized_and_repair_staging_paths() {
+        use std::io::Write;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let mut row = pending_job(76);
+        let file = row.files[0].id;
+        row.params
+            .push((format!("*File:size:{}", file.0), (128 * 1024).to_string()));
+        row.files[0].segments[0].state = SegmentState::Done {
+            offset: 0,
+            len: 65536,
+            crc: crc32fast::hash(&[3; 65536]),
+        };
+        let legacy = root.join("payload.bin.part");
+        let stable = root.join(format!(".runner-file-{}.part", file.0));
+        let mut output = std::fs::File::create(&legacy).unwrap();
+        output.write_all(&[3; 65536]).unwrap();
+        output.sync_all().unwrap();
+        let legacy_remaining = crate::download_capacity::remaining(&row, root);
+        assert!(legacy_remaining < 128 * 1024);
+        let output = std::fs::File::create(&stable).unwrap();
+        output.set_len(128 * 1024).unwrap();
+        output.sync_all().unwrap();
+        assert_eq!(
+            crate::download_capacity::remaining(&row, root),
+            128 * 1024,
+            "existing sparse stable path cannot borrow legacy allocation credit"
+        );
+        std::fs::remove_file(&stable).unwrap();
+        std::fs::rename(&legacy, &stable).unwrap();
+        assert_eq!(
+            crate::download_capacity::remaining(&row, root),
+            legacy_remaining
+        );
+        row.files[0].finalized = true;
+        row.files[0].segments[0].state = SegmentState::Done {
+            offset: 0,
+            len: 128 * 1024,
+            crc: crc32fast::hash(&vec![3; 128 * 1024]),
+        };
+        let mut final_file = std::fs::File::create(root.join("payload.bin")).unwrap();
+        final_file.write_all(&vec![3; 128 * 1024]).unwrap();
+        final_file.sync_all().unwrap();
+        assert_eq!(
+            crate::download_capacity::remaining(&row, root),
+            0,
+            "full finalized checkpoint is already allocated"
+        );
+        row.params
+            .push((format!("*File:repair:{}", file.0), "true".into()));
+        assert_eq!(
+            crate::download_capacity::remaining(&row, root),
+            128 * 1024,
+            "repair uses its shorter staging checkpoint, not a different final file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn partial_download_capacity_and_restarted_writer_reserve_only_unwritten_bytes() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let (engine_tx, mut messages) = mpsc::channel(16);
+        owner.engine_tx = engine_tx;
+        let mut row = pending_job(78);
+        mark_new_lifecycle_cohort(&mut row);
+        let file = row.files[0].id;
+        let mut next = row.files[0].segments[0].clone();
+        next.number = 2;
+        next.size = 65536;
+        let mut last = next.clone();
+        last.number = 3;
+        row.files[0].segments.push(next);
+        row.files[0].segments.push(last);
+        owner.state.jobs.push(row);
+        owner.allocate_new_payload(JobId(78)).unwrap();
+        let source = owner.artifacts.for_job(78).unwrap().unwrap();
+        let partial = source.path.join(format!(".runner-file-{}.part", file.0));
+        let checkpoint = vec![7u8; 16 * 1024 * 1024];
+        let legacy = source.path.join("payload.bin.part");
+        let mut output = std::fs::File::create(&legacy).unwrap();
+        output.write_all(&checkpoint).unwrap();
+        output.sync_all().unwrap();
+        drop(output);
+        let free = nzbd_state::capacity::available(&source.path).unwrap();
+        let reserve_margin = 1024 * 1024 * 1024;
+        assert!(free > reserve_margin + 32 * 1024 * 1024);
+        let declared = free - reserve_margin + 8 * 1024 * 1024;
+        owner.on_msg(EngineMsg::SegmentWritten {
+            job: JobId(78),
+            file,
+            seg_number: 1,
+            offset: 0,
+            len: checkpoint.len() as u32,
+            crc: crc32fast::hash(&checkpoint),
+            file_size: declared,
+            server: ServerId(1),
+        });
+        assert!(owner.hold_job(
+            JobId(78),
+            nzbd_types::HoldCause::Capacity,
+            "download_write",
+            "disk full"
+        ));
+        let row = owner.state.job(JobId(78)).unwrap().clone();
+        let remaining = crate::download_capacity::remaining(&row, &source.path);
+        assert!(remaining < declared);
+        assert!(
+            nzbd_state::capacity::reserve(&source.path, declared).is_err(),
+            "full-size readmission would strand this partially completed job"
+        );
+        let reservation =
+            nzbd_state::capacity::health(&source.path, remaining, "partial-download-capacity")
+                .unwrap();
+        drop(reservation);
+        let guard = crate::hold_release::HoldReleaseGuard::prepare(&row, Some(&source), None);
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::ReleaseResourceHold {
+            job: JobId(78),
+            revision: row.control().unwrap().revision,
+            by: RetryBy::Operator,
+            guard,
+            reply,
+        });
+        assert!(result.await.unwrap());
+        assert!(
+            !partial.exists(),
+            "health credited only the validated legacy staging path"
+        );
+        let writer = owner.writer_for(JobId(78), file);
+        let resumed = vec![13u8; 65536];
+        writer
+            .send(WriteCmd::Segment {
+                seg_number: 2,
+                offset: checkpoint.len() as u64,
+                data: resumed.clone(),
+                crc: crc32fast::hash(&resumed),
+                file_size: declared,
+                server: ServerId(1),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5),async {
+            loop { let message=messages.recv().await.unwrap();
+                if let EngineMsg::WriterError { error,.. }=&message { panic!("resumed writer must use remaining-byte reservation: {error}"); }
+                let written=matches!(&message,EngineMsg::SegmentWritten { job,file:observed,seg_number:2,.. } if *job==JobId(78)&&*observed==file);
+                owner.on_msg(message); if written { break; }
+            }
+        }).await.unwrap();
+        let mut input = std::fs::File::open(&partial).unwrap();
+        input
+            .seek(SeekFrom::Start(checkpoint.len() as u64))
+            .unwrap();
+        let mut actual = vec![0; 65536];
+        input.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, resumed);
+        owner.writers[&file].stop.cancel();
+        let mut stopped = owner.writers[&file].stopped.clone();
+        stopped.wait_for(|done| *done).await.unwrap();
     }
 
     #[tokio::test]

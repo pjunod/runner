@@ -13,6 +13,7 @@
 
 mod admissions;
 pub mod backend;
+mod download_capacity;
 pub mod events;
 pub mod failover;
 pub mod fetch;
@@ -1515,19 +1516,7 @@ impl EngineHandle {
             Ok(None) => return Ok(Err("held payload identity unavailable".into())),
             Err(e) => return Ok(Err(e.to_string())),
         };
-        let bytes = record
-            .files
-            .iter()
-            .map(|f| {
-                let key = format!("*File:size:{}", f.id.0);
-                record
-                    .params
-                    .iter()
-                    .find(|(k, _)| k == &key)
-                    .and_then(|(_, v)| v.parse::<u64>().ok())
-                    .unwrap_or_else(|| f.segments.iter().map(|s| s.size as u64).sum())
-            })
-            .sum();
+        let record = record.clone();
         let token = format!("{}-{}", job.0, revision);
         // Admission and a write/flush probe must pass before writes resume.
         let inventory = self.artifacts();
@@ -1541,6 +1530,7 @@ impl EngineHandle {
             inventory
                 .validate_download_retry(job.0)
                 .map_err(std::io::Error::other)?;
+            let bytes = download_capacity::remaining(&record, &path);
             nzbd_state::capacity::health(&path, bytes, &token)
         })
         .await;
