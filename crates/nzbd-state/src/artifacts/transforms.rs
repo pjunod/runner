@@ -64,6 +64,27 @@ fn digest_file_with_checkpoint(
     Ok(format!("{:x}", digest.finalize()))
 }
 
+/// See [`Inventory::verified_custody_evidence`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CustodyEvidence {
+    /// Former source-relative path -> current path, for every owned rename
+    /// whose current bytes still match the rename journal's digest.
+    pub restored: std::collections::HashMap<String, String>,
+    /// Archive inputs a successful extraction consumed, at former and current
+    /// paths.
+    pub consumed_inputs: std::collections::HashSet<String>,
+    /// Extraction and PAR-repair outputs proven intact, at current paths.
+    pub verified_outputs: std::collections::HashSet<String>,
+}
+
+/// One former path of a renamed file, with the file's complete identity at
+/// the moment it left that path.
+struct VerifiedRename {
+    current: String,
+    before: Identity,
+    digest: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Workspace {
     #[serde(default)]
@@ -602,7 +623,8 @@ impl Inventory {
     /// Return only extraction outputs whose successful transform journal and
     /// current source identities still prove them. This is used by delivery
     /// salvage after a later archive or script failed; an extension alone is
-    /// never integrity evidence.
+    /// never integrity evidence. Owned renames journaled after the transform
+    /// are followed; see [`Inventory::verified_custody_evidence`].
     pub fn verified_transform_evidence(
         &self,
         job: u32,
@@ -610,9 +632,35 @@ impl Inventory {
         std::collections::HashSet<String>,
         std::collections::HashSet<String>,
     )> {
+        let evidence = self.verified_custody_evidence(job, || Ok(()))?;
+        Ok((evidence.consumed_inputs, evidence.verified_outputs))
+    }
+
+    /// Integrity evidence for one source generation, from all three custody
+    /// journals in a single hashing pass: owned renames (`par_restore`),
+    /// successful extractions, and PAR-validated repairs.
+    ///
+    /// The journals are judged together because they compose. Post-processing
+    /// extracts first and renames afterwards (the final deobfuscation pass
+    /// gives an obfuscated `<hash>.mkv` and its `<hash>.partNN.rar` volumes
+    /// the release name). A rename changes inode ctime, so an extraction
+    /// output no longer matches the complete identity its journal recorded.
+    /// The rename journal is what proves that transition: it recorded the
+    /// file's complete identity immediately before the rename and a digest of
+    /// its bytes, and the current file must still be the same object with the
+    /// same bytes. An output is followed through a rename only when the
+    /// journaled pre-rename identity is exactly the identity the transform
+    /// recorded, so the chain transform → rename → current file is unbroken.
+    pub fn verified_custody_evidence(
+        &self,
+        job: u32,
+        mut checkpoint: impl FnMut() -> std::io::Result<()>,
+    ) -> Result<CustodyEvidence> {
         let Some(source) = self.for_job(job)? else {
             return Ok(Default::default());
         };
+        let root = self.verify(&source)?;
+        let renamed = self.verified_renames(&source, &root, &mut checkpoint)?;
         let raws = {
             let db = self.db.lock().unwrap();
             let mut statement = db.prepare(
@@ -623,7 +671,6 @@ impl Inventory {
         };
         let mut inputs = std::collections::HashSet::new();
         let mut outputs = std::collections::HashSet::new();
-        let root = self.verify(&source)?;
         let observed = fs::manifest(&root, 100_000)?;
         for raw in raws {
             let operation: Operation = serde_json::from_str(&raw)?;
@@ -635,12 +682,34 @@ impl Inventory {
                 continue;
             }
             if operation.kind == "extract" {
-                inputs.extend(workspace.input_paths.iter().cloned());
-                if let Some(path) = &workspace.input_path {
-                    inputs.insert(path.clone());
+                let consumed = workspace
+                    .input_paths
+                    .iter()
+                    .chain(workspace.input_path.as_ref())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for path in consumed {
+                    // An input renamed after extraction is still the consumed
+                    // input when the rename journal left from the same object
+                    // the extraction bound. Its ctime may legitimately differ:
+                    // the extraction's own journaled renames touch it too.
+                    let bound = workspace
+                        .source
+                        .files
+                        .iter()
+                        .find(|entry| entry.path == path && !entry.identity.directory);
+                    if let (Some(bound), Some(rename)) = (bound, renamed.get(&path)) {
+                        if rename_transition_matches(&bound.identity, &rename.before) {
+                            inputs.insert(rename.current.clone());
+                        }
+                    }
+                    inputs.insert(path);
                 }
             }
             for output in workspace.published_files.as_deref().unwrap_or_default() {
+                if output.identity.directory {
+                    continue;
+                }
                 if let Some(current) = observed
                     .iter()
                     .find(|entry| entry.identity == output.identity && !entry.identity.directory)
@@ -650,6 +719,15 @@ impl Inventory {
                         .is_ok_and(|identity| identity == output.identity)
                     {
                         outputs.insert(current.path.clone());
+                    }
+                    continue;
+                }
+                // Repair outputs are proven by path and digest below.
+                if operation.kind == "extract" {
+                    if let Some(rename) = renamed.get(&output.path) {
+                        if rename.before == output.identity {
+                            outputs.insert(rename.current.clone());
+                        }
                     }
                 }
             }
@@ -672,17 +750,43 @@ impl Inventory {
                         .iter()
                         .find(|entry| entry.path == path && !entry.identity.directory)
                         .is_some_and(|current| current.identity == proof.identity);
-                    let matches_digest = proof.digest.as_deref().is_some_and(|expected| {
-                        digest_file(&root, &path, &proof.identity)
+                    if matches_identity {
+                        checkpoint()?;
+                        let matches_digest = proof.digest.as_deref().is_some_and(|expected| {
+                            digest_file_with_checkpoint(
+                                &root,
+                                &path,
+                                &proof.identity,
+                                &mut checkpoint,
+                            )
                             .is_ok_and(|actual| actual == expected)
-                    });
-                    if matches_identity && matches_digest {
-                        outputs.insert(path.clone());
+                        });
+                        if matches_digest {
+                            outputs.insert(path.clone());
+                        }
+                        continue;
+                    }
+                    // Renamed after repair: the rename journal hashed the
+                    // current bytes already, so the same digest and the exact
+                    // pre-rename identity complete the proof.
+                    if let Some(rename) = renamed.get(&path) {
+                        if rename.before == proof.identity
+                            && proof.digest.as_deref() == Some(rename.digest.as_str())
+                        {
+                            outputs.insert(rename.current.clone());
+                        }
                     }
                 }
             }
         }
-        Ok((inputs, outputs))
+        Ok(CustodyEvidence {
+            restored: renamed
+                .into_iter()
+                .map(|(old, rename)| (old, rename.current))
+                .collect(),
+            consumed_inputs: inputs,
+            verified_outputs: outputs,
+        })
     }
 
     /// Return journaled filename restorations that still match the same
@@ -705,6 +809,22 @@ impl Inventory {
         let Some(source) = self.for_job(job)? else {
             return Ok(Default::default());
         };
+        let root = self.verify(&source)?;
+        Ok(self
+            .verified_renames(&source, &root, &mut checkpoint)?
+            .into_iter()
+            .map(|(old, rename)| (old, rename.current))
+            .collect())
+    }
+
+    /// Every former path of a file whose owned-rename chain still verifies,
+    /// keyed by that former path.
+    fn verified_renames(
+        &self,
+        source: &Artifact,
+        root: &File,
+        mut checkpoint: impl FnMut() -> std::io::Result<()>,
+    ) -> Result<std::collections::HashMap<String, VerifiedRename>> {
         let raws = {
             let db = self.db.lock().unwrap();
             let mut statement = db.prepare(
@@ -713,7 +833,6 @@ impl Inventory {
             let rows = statement.query_map([&source.id], |row| row.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        let root = self.verify(&source)?;
         let mut proofs = Vec::new();
         for raw in raws {
             let operation: Operation = serde_json::from_str(&raw)?;
@@ -765,7 +884,7 @@ impl Inventory {
             };
             if current.identity.directory
                 || !rename_transition_matches(original, &current.identity)
-                || digest_file_with_checkpoint(&root, new, &current.identity, &mut checkpoint)?
+                || digest_file_with_checkpoint(root, new, &current.identity, &mut checkpoint)?
                     != *expected_digest
             {
                 continue;
@@ -777,7 +896,14 @@ impl Inventory {
             let mut child_identity = original;
             let mut seen = std::collections::HashSet::new();
             loop {
-                restored.insert(oldest.to_string(), new.clone());
+                restored.insert(
+                    oldest.to_string(),
+                    VerifiedRename {
+                        current: new.clone(),
+                        before: child_identity.clone(),
+                        digest: expected_digest.clone(),
+                    },
+                );
                 let predecessor =
                     proofs
                         .iter()
@@ -1453,5 +1579,123 @@ mod tests {
         let inventory = Inventory::open(&state).unwrap();
         let (_, verified) = inventory.verified_transform_evidence(5).unwrap();
         assert!(!verified.contains("episode.mkv"));
+    }
+
+    /// Obfuscated release shape: `<hash>.partNN.rar` holding `<hash>.mkv`.
+    /// Extraction publishes the hash-named media, then the final
+    /// deobfuscation pass renames media and volumes to the release name.
+    fn extracted_then_renamed(
+        tamper_before_rename: bool,
+    ) -> (tempfile::TempDir, Inventory, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("downloads");
+        std::fs::create_dir(&root).unwrap();
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        let source = root.join("job");
+        inventory
+            .allocate_for_delivery(5, &root, &source, true, true)
+            .unwrap();
+        for part in ["part1", "part2"] {
+            std::fs::write(
+                source.join(format!("9f8e7d6c5b4a.{part}.rar")),
+                format!("volume {part}"),
+            )
+            .unwrap();
+        }
+        inventory.finish(5, &source, &root, "active").unwrap();
+        let mut workspace = inventory.workspace(5, "extract", "5e7").unwrap();
+        inventory
+            .bind_extraction_inputs(
+                &mut workspace,
+                &[
+                    source.join("9f8e7d6c5b4a.part1.rar"),
+                    source.join("9f8e7d6c5b4a.part2.rar"),
+                ],
+            )
+            .unwrap();
+        let attempt = inventory.begin_workspace_attempt(&mut workspace).unwrap();
+        let output = attempt.join("output");
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(output.join("9f8e7d6c5b4a.mkv"), b"extracted episode").unwrap();
+        crate::fileops::copy_publish(
+            &output.join("9f8e7d6c5b4a.mkv"),
+            &source.join("9f8e7d6c5b4a.mkv"),
+        )
+        .unwrap();
+        inventory.finish_extraction(&workspace, &output).unwrap();
+        if tamper_before_rename {
+            let path = source.join("9f8e7d6c5b4a.mkv");
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            std::fs::write(&path, b"EXTRACTED EPISODE").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        }
+        for (from, to) in [
+            ("9f8e7d6c5b4a.mkv", "Show.S01E01.mkv"),
+            ("9f8e7d6c5b4a.part1.rar", "Show.S01E01.part1.rar"),
+            ("9f8e7d6c5b4a.part2.rar", "Show.S01E01.part2.rar"),
+        ] {
+            inventory
+                .restore_file(5, &source.join(from), &source.join(to))
+                .unwrap();
+        }
+        (temp, inventory, source)
+    }
+
+    #[test]
+    fn extraction_proof_follows_owned_rename_of_outputs_and_inputs() {
+        let (_temp, inventory, _source) = extracted_then_renamed(false);
+        let evidence = inventory.verified_custody_evidence(5, || Ok(())).unwrap();
+        assert!(
+            evidence.verified_outputs.contains("Show.S01E01.mkv"),
+            "renamed extraction output keeps its proof: {evidence:?}"
+        );
+        assert!(evidence.consumed_inputs.contains("Show.S01E01.part1.rar"));
+        assert!(evidence.consumed_inputs.contains("Show.S01E01.part2.rar"));
+        assert_eq!(
+            evidence
+                .restored
+                .get("9f8e7d6c5b4a.mkv")
+                .map(String::as_str),
+            Some("Show.S01E01.mkv")
+        );
+        // The pair API used by older callers sees the same proof.
+        let (consumed, verified) = inventory.verified_transform_evidence(5).unwrap();
+        assert_eq!(consumed, evidence.consumed_inputs);
+        assert_eq!(verified, evidence.verified_outputs);
+    }
+
+    #[test]
+    fn renamed_output_rewritten_in_place_after_rename_is_not_trusted() {
+        let (_temp, inventory, source) = extracted_then_renamed(false);
+        let path = source.join("Show.S01E01.mkv");
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // Same inode, size and mtime: only the bytes can tell.
+        std::fs::write(&path, b"EXTRACTED EPISODE").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        inventory.refresh_for_delivery(5).unwrap();
+        let evidence = inventory.verified_custody_evidence(5, || Ok(())).unwrap();
+        assert!(!evidence.verified_outputs.contains("Show.S01E01.mkv"));
+    }
+
+    #[test]
+    fn output_changed_between_extraction_and_rename_is_not_trusted() {
+        let (_temp, inventory, _source) = extracted_then_renamed(true);
+        let evidence = inventory.verified_custody_evidence(5, || Ok(())).unwrap();
+        assert!(
+            !evidence.verified_outputs.contains("Show.S01E01.mkv"),
+            "the rename journal proves only bytes at rename time"
+        );
+        // The untouched volumes are still the consumed inputs.
+        assert!(evidence.consumed_inputs.contains("Show.S01E01.part1.rar"));
     }
 }

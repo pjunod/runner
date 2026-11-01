@@ -24,7 +24,7 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-pub use transforms::Workspace;
+pub use transforms::{CustodyEvidence, Workspace};
 pub use workspace_lifecycle::{
     AttemptUse, FinalizationProof, SourceGeneration, StagedCompletion, WorkspaceAssessment,
 };
