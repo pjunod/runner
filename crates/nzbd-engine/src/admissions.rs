@@ -299,6 +299,45 @@ mod tests {
         ));
     }
     #[tokio::test]
+    async fn standalone_url_history_never_accumulates_a_cluster_pending_index() {
+        let temporary = tempfile::tempdir().unwrap();
+        let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
+            Vec::new(),
+            temporary.path().join("state"),
+            temporary.path().join("working"),
+            crate::Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        for id in 1..=2 {
+            let token = format!("standalone-{id}");
+            engine
+                .add_url(
+                    &format!("standalone-{id}"),
+                    &format!("http://127.0.0.1:9/{id}.nzb"),
+                    crate::AddOpts {
+                        params: vec![
+                            ("monarr-transfer".into(), token.clone()),
+                            ("monarr-delivery".into(), "1".into()),
+                        ],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(engine.url_admission(&token).await.unwrap().is_some());
+        }
+        assert_eq!(engine.url_admissions_page("", 100).await.unwrap().len(), 2);
+        assert!(engine
+            .url_unaccepted_admissions(100)
+            .await
+            .unwrap()
+            .is_empty());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn public_consumer_identity_and_tombstone_highwater_survive_projection_replacement() {
         let temporary = tempfile::tempdir().unwrap();
         let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
@@ -317,6 +356,8 @@ mod tests {
             .unwrap());
         assert!(engine.adopt_replicated_highwater(900, 700).await.unwrap());
         engine.adopt_replicated_authority(Vec::new()).await.unwrap();
+        assert!(engine.begin_url_admission_adoption().await.unwrap());
+        assert!(engine.finish_url_admission_adoption().await.unwrap());
         let id = engine
             .add_url(
                 "original",

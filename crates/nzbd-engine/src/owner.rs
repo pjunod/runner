@@ -1674,8 +1674,10 @@ impl Owner {
                             source_artifact_id: None,
                             source_generation: None,
                         };
-                        self.unaccepted_admissions
-                            .insert(receipt.request_token.clone(), receipt.clone());
+                        if self.admission_catalog_adopted {
+                            self.unaccepted_admissions
+                                .insert(receipt.request_token.clone(), receipt.clone());
+                        }
                         self.state.url_admission_receipts.push(receipt);
                         if !self.save_snapshot() {
                             self.unaccepted_admissions.remove(token);
@@ -1773,8 +1775,10 @@ impl Owner {
                         source_generation: None,
                     });
                     let receipt = self.state.url_admission_receipts.last().unwrap();
-                    self.unaccepted_admissions
-                        .insert(receipt.request_token.clone(), receipt.clone());
+                    if self.admission_catalog_adopted {
+                        self.unaccepted_admissions
+                            .insert(receipt.request_token.clone(), receipt.clone());
+                    }
                     if !self.save_snapshot() {
                         self.unaccepted_admissions.remove(token);
                         self.state.jobs.retain(|job| job.id != id);
