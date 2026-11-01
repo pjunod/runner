@@ -2,6 +2,7 @@ import {
   criticalStorage,
   diskGuardMessage,
   formatBytes,
+  formatDuration,
   jobProgress,
   jobStatusKey,
   jobStatusLabel,
@@ -172,4 +173,11 @@ describe('API presentation helpers', () => {
       usedPercent: 95,
     });
   });
+});
+
+test('durations round once, on the total, never to a 60-minute remainder', () => {
+  expect(formatDuration(9 * 3600 + 59 * 60 + 30)).toBe('10h');
+  expect(formatDuration(3599.5)).toBe('1h');
+  expect(formatDuration(3540)).toBe('59m');
+  expect(formatDuration(3600 + 61)).toBe('1h 2m');
 });

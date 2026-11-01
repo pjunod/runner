@@ -47,6 +47,7 @@ import { Theme, useDisplayPreferences, useTheme } from '../theme';
 import { useCollapsedSections } from '../storage/queuePreferences';
 import { SeedPolicyEditor } from '../components/SeedPolicyEditor';
 import { torrentDisplayPhase, torrentStatus, torrentPrimaryAction, seedPolicyText, seedStopText } from '../torrentPresentation';
+import { urlFetchDetail } from '../urlFetchPresentation';
 import { HistoryView } from './HistoryView';
 import { LogsView } from './LogsView';
 
@@ -659,9 +660,11 @@ export function JobCard({
             </Text>
           ) : null}
           {hold ? <Text style={styles.statusFailed}>{hold.message}</Text> : null}
-          <Text style={styles.metaText}>
-            {seed ? 'Files ready' : `${formatBytes(job.downloaded_bytes)} / ${formatBytes(job.size_bytes)}`}
-          </Text>
+          {statusKey === 'fetching' && !phase ? null : (
+            <Text style={styles.metaText}>
+              {seed ? 'Files ready' : `${formatBytes(job.downloaded_bytes)} / ${formatBytes(job.size_bytes)}`}
+            </Text>
+          )}
           {phase ? (
             <>
               {phase === 'downloading' ? <Text style={styles.metaText}>{formatBytes(job.rate_bps, '/s')} · ETA {jobEta(job)}</Text> : null}
@@ -675,6 +678,10 @@ export function JobCard({
           ) : postProcessing ? (
             <Text style={[styles.metaText, { color: tone.accent }]}>
               {postProcessingDetail(job, sectionKey, sectionLabel)}
+            </Text>
+          ) : statusKey === 'fetching' ? (
+            <Text style={[styles.metaText, job.url_fetch?.attempts ? styles.statusFailed : null]}>
+              {urlFetchDetail(job, Date.now())}
             </Text>
           ) : (
             <>
