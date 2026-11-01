@@ -577,6 +577,7 @@ fn validate_external_params(params: &[(String, String)]) -> Result<(), EngineErr
 pub struct PostAdmission {
     pub job: JobId,
     pub generation: u64,
+    pub cancellation: CancellationToken,
 }
 
 /// Cloneable handle to a running engine.
@@ -1382,48 +1383,70 @@ impl EngineHandle {
         fold_journals: bool,
         emit_finished: bool,
     ) -> Result<(), EngineError> {
-        let (tx, rx) = oneshot::channel();
+        if self.post_scope.is_some() {
+            return self
+                .apply_post_record(job, true)
+                .await?
+                .then_some(())
+                .ok_or_else(|| EngineError::Lifecycle("post-processing scope changed".into()));
+        }
+        let (reply, rx) = oneshot::channel();
         self.send(QueueCommand::ImportJob {
             job: Box::new(job),
             fold_journals,
             emit_finished,
-            reply: tx,
+            reply,
         })
         .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await?.map_err(EngineError::State)
     }
-
-    /// Atomically replace an existing authority copy without ever inserting a
-    /// missing job, returning true only after its queue snapshot commits.
-    /// Used before and after awaited terminal side effects so demotion or an
-    /// ordinary snapshot I/O failure cannot leave an in-memory-only finalizer
-    /// key or resurrect a job the node just lost.
+    async fn apply_post_record(
+        &self,
+        job: nzbd_types::Job,
+        require_snapshot: bool,
+    ) -> Result<bool, EngineError> {
+        let admission = self
+            .post_scope
+            .clone()
+            .ok_or_else(|| EngineError::Lifecycle("post-processing scope is absent".into()))?;
+        let (reply, rx) = oneshot::channel();
+        self.send(QueueCommand::ApplyPostRecord {
+            admission,
+            job: Box::new(job),
+            require_snapshot,
+            reply,
+        })
+        .await?;
+        owner_reply(rx).await
+    }
     pub async fn import_job_if_present(&self, job: nzbd_types::Job) -> Result<bool, EngineError> {
-        let (tx, rx) = oneshot::channel();
+        if self.post_scope.is_some() {
+            return self.apply_post_record(job, true).await;
+        }
+        let (reply, rx) = oneshot::channel();
         self.send(QueueCommand::ImportJobIfPresent {
             job: Box::new(job),
             require_snapshot: true,
-            reply: tx,
+            reply,
         })
         .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
-
-    /// Stamp an existing executor copy. Worker queues are intentionally
-    /// ephemeral; the authority accepts the fenced result before retirement.
-    /// An authority engine still requires its snapshot commit.
     pub async fn import_worker_job_if_present(
         &self,
         job: nzbd_types::Job,
     ) -> Result<bool, EngineError> {
-        let (tx, rx) = oneshot::channel();
+        if self.post_scope.is_some() {
+            return self.apply_post_record(job, false).await;
+        }
+        let (reply, rx) = oneshot::channel();
         self.send(QueueCommand::ImportJobIfPresent {
             job: Box::new(job),
             require_snapshot: false,
-            reply: tx,
+            reply,
         })
         .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
 
     pub async fn export_job(&self, job: JobId) -> Result<Option<nzbd_types::Job>, EngineError> {
@@ -1493,6 +1516,17 @@ impl EngineHandle {
     }
 
     pub async fn remove_job_silent(&self, job: JobId) -> Result<bool, EngineError> {
+        if let Some(admission) = &self.post_scope {
+            if admission.job != job {
+                return Ok(false);
+            }
+            return self
+                .roundtrip_bool(|reply| QueueCommand::FinishPostAdmission {
+                    admission: admission.clone(),
+                    reply,
+                })
+                .await;
+        }
         self.roundtrip_bool(|reply| QueueCommand::RemoveJobSilent { job, reply })
             .await
     }
@@ -1586,8 +1620,10 @@ impl EngineHandle {
         &self,
         jobs: Vec<nzbd_types::Job>,
     ) -> Result<(), EngineError> {
-        self.roundtrip_unit(|reply| QueueCommand::AdoptReplicatedAuthority { jobs, reply })
-            .await
+        let (reply, rx) = oneshot::channel();
+        self.send(QueueCommand::AdoptReplicatedAuthority { jobs, reply })
+            .await?;
+        owner_reply(rx).await?.map_err(EngineError::State)
     }
 
     /// Crash-only demotion: keep only `keep` (leases still executing),

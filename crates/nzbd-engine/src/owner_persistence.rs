@@ -96,7 +96,7 @@ impl Persistence {
                             // Only this lane appends local records. Foreign live
                             // journals remain untouched, including unknown jobs.
                             for job in doc.jobs.iter().filter(|_|authoritative) {
-                                if !delegated.contains(&job.id) { if let Err(error)=journal.remove_job(job.id) {tracing::warn!(job=job.id.0,%error,"snapshot durable; journal compaction deferred");} }
+                                if !delegated.contains(&job.id) { if let Err(error)=journal.compact_local(job.id) {tracing::warn!(job=job.id.0,%error,"snapshot durable; journal compaction deferred");} }
                             }
                             Ok(())
                         })();
@@ -104,7 +104,7 @@ impl Persistence {
                         (revision,result)
                     }
                     Request::Sync {revision} => (revision, journal.sync()),
-                    Request::Remove {revision,job} => (revision,journal.remove_job(job)),
+                    Request::Remove {revision,job} => (revision,journal.compact_local(job)),
                     Request::Shutdown {doc,authoritative,guard,marker,volumes,reply} => {
                         let result = (|| {
                             journal.sync()?;
@@ -395,6 +395,43 @@ mod tests {
         let remaining = JobJournals::replay_job(dir.path(), job).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].segment_number, 2);
+        stop(&mut lane, dir.path()).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_never_unlinks_a_foreign_incarnation_append_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = QueueState::default();
+        let job = state.admit_url("test".into(), "http://example.invalid/test", None, 0);
+        // Even the same logical node suffix gets a distinct exclusive inode.
+        let mut foreign = JobJournals::open(dir.path(), "test").unwrap();
+        foreign.append(&record(job, 10)).unwrap();
+        foreign.sync().unwrap();
+        let (mut lane, mut rx) = lane(dir.path());
+        assert!(lane.send(Request::Append {
+            revision: 1,
+            record: record(job, 1),
+            provenance: None
+        }));
+        assert!(lane.send(Request::Snapshot {
+            revision: 2,
+            doc: state.to_doc(),
+            delegated: HashSet::new(),
+            authoritative: true,
+            guard: None
+        }));
+        assert!(completion(&mut rx).await.result.is_ok());
+        assert!(completion(&mut rx).await.result.is_ok());
+        foreign.append(&record(job, 11)).unwrap();
+        foreign.sync().unwrap();
+        let records = JobJournals::replay_job(dir.path(), job).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.segment_number)
+                .collect::<HashSet<_>>(),
+            HashSet::from([10, 11])
+        );
         stop(&mut lane, dir.path()).await;
     }
 

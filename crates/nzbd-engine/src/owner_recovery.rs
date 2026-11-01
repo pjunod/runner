@@ -5,6 +5,8 @@ use nzbd_state::artifacts::{Artifact, Identity, Inventory};
 use serde::{Deserialize, Serialize};
 
 const MAX_VERIFICATION_WORKERS: usize = 2;
+const BATCH_BYTES: u64 = 32 * 1024 * 1024;
+const BATCH_RANGES: usize = 64;
 const PENDING: &str = "*Recovery:pending";
 const REASON: &str = "*Recovery:reason";
 
@@ -20,6 +22,8 @@ pub(super) struct VerificationState {
     pub cancel: CancellationToken,
     pub running: bool,
     pub review_required: bool,
+    partial: Option<VerifiedJob>,
+    turn: u64,
 }
 impl VerificationState {
     pub(super) fn progress(&self) -> crate::snapshot::VerificationProgress {
@@ -41,6 +45,10 @@ pub(crate) struct VerificationResult {
 }
 #[derive(Debug)]
 struct VerifiedJob {
+    complete: bool,
+    completed_files: HashSet<FileId>,
+    observations: HashMap<FileId, (String, Option<Identity>)>,
+    partial_range: Option<PartialRange>,
     allocation: Artifact,
     proofs: Vec<(FileId, DurableFileProof)>,
     invalid: Vec<(FileId, u32)>,
@@ -52,6 +60,71 @@ struct VerifiedJob {
     publication_repair: bool,
     repair_files: Vec<PublicationRepairFile>,
 }
+struct PartialRange {
+    file: FileId,
+    range: ProvenRange,
+    read: u64,
+    digest: crc32fast::Hasher,
+}
+impl std::fmt::Debug for PartialRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartialRange")
+            .field("file", &self.file)
+            .field("range", &self.range)
+            .field("read", &self.read)
+            .finish()
+    }
+}
+fn read_piece(
+    file: &mut std::fs::File,
+    identity: &Identity,
+    cursor: &mut PartialRange,
+    budget: u64,
+) -> (ValidationOutcome, u64, bool) {
+    use std::io::{Read, Seek, SeekFrom};
+    if !cursor.range.end().is_some_and(|end| end <= identity.bytes) {
+        return (ValidationOutcome::Mismatch, 0, true);
+    }
+    match recovery::capture_identity(file) {
+        Ok(observed) if observed == *identity => {}
+        Ok(_) => return (ValidationOutcome::IdentityConflict, 0, true),
+        Err(error) => return (ValidationOutcome::Unavailable(error), 0, true),
+    }
+    if let Err(error) = file.seek(SeekFrom::Start(cursor.range.offset + cursor.read)) {
+        return (ValidationOutcome::Unavailable(error.to_string()), 0, true);
+    }
+    let mut bytes = 0;
+    let mut buffer = [0u8; 65536];
+    while cursor.read < u64::from(cursor.range.len) && bytes < budget {
+        let amount = (u64::from(cursor.range.len) - cursor.read)
+            .min(budget - bytes)
+            .min(buffer.len() as u64) as usize;
+        if let Err(error) = file.read_exact(&mut buffer[..amount]) {
+            return (
+                ValidationOutcome::Unavailable(error.to_string()),
+                bytes,
+                true,
+            );
+        }
+        cursor.digest.update(&buffer[..amount]);
+        cursor.read += amount as u64;
+        bytes += amount as u64;
+    }
+    match recovery::capture_identity(file) {
+        Ok(observed) if observed == *identity => {
+            let complete = cursor.read == u64::from(cursor.range.len);
+            let outcome = if complete && cursor.digest.clone().finalize() != cursor.range.crc {
+                ValidationOutcome::Mismatch
+            } else {
+                ValidationOutcome::Valid(observed)
+            };
+            (outcome, bytes, complete)
+        }
+        Ok(_) => (ValidationOutcome::IdentityConflict, bytes, true),
+        Err(error) => (ValidationOutcome::Unavailable(error), bytes, true),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PublicationRepairFile {
     file: FileId,
@@ -260,9 +333,9 @@ impl Owner {
             if !committed {owner.pending_control_commits.remove(&job);owner.block_verification(job,VerificationFailure::conflict("file generation retirement is not durable; publication retained",0));callback(owner,Err("file generation retirement is not durable; publication retained".into()));return;}
             if let Some(state)=owner.verification.get_mut(&job){state.phase="repairing".into();state.running=true;}
             let inventory=owner.artifacts.clone();let files_for_worker=files.clone();
-            owner.io_then(move||stage_publication_repair(job,&allocation,&inventory,&files_for_worker)
+            owner.payload_then(allocation.root.clone(),move||stage_publication_repair(job,&allocation,&inventory,&files_for_worker)
                 .map_err(nzbd_state::StateError::Corrupt),move|owner,result| {
-                // io_then returns only after its Inventory guard and descriptors
+                // payload_then returns only after its Inventory guard and descriptors
                 // have been dropped, including when a rename or sync failed.
                 if let Some(state)=owner.verification.get_mut(&job){state.running=false;}
                 owner.pending_control_commits.remove(&job);
@@ -339,6 +412,8 @@ impl Owner {
                 cancel: self.cancel.child_token(),
                 running: false,
                 review_required: false,
+                partial: None,
+                turn: 0,
             },
         );
         if let Some(current) = self.state.job_mut(job) {
@@ -368,6 +443,8 @@ impl Owner {
                     && !state.review_required
                     && state.retry_at <= now
                     && !self.delegated.contains_key(&job.id)
+                    && !self.pending_control_commits.contains(&job.id)
+                    && !self.pending_control_revisions.contains_key(&job.id)
                     && !self.post_admissions.contains_key(&job.id)
                     && !self.retiring_writers.contains_key(&job.id)
                     && !job
@@ -376,14 +453,18 @@ impl Owner {
                         .any(|file| self.writers.contains_key(&file.id)))
                 .then_some((
                     job.status == JobStatus::Paused || job.held(),
+                    std::cmp::Reverse(job.priority),
+                    state.turn,
                     position,
                     job.id,
                 ))
             })
             .collect::<Vec<_>>();
-        candidates.sort_by_key(|(paused, position, _)| (*paused, *position));
+        candidates.sort_by_key(|(paused, priority, turn, position, _)| {
+            (*paused, *priority, *turn, *position)
+        });
         let mut changed = false;
-        for (_, _, job) in candidates {
+        for (_, _, _, _, job) in candidates {
             if self.verification_roots.len() >= MAX_VERIFICATION_WORKERS {
                 break;
             }
@@ -409,6 +490,8 @@ impl Owner {
                 continue;
             }
             state.running = true;
+            state.turn = fresh_epoch();
+            let partial = state.partial.take();
             state.phase = "checking".into();
             state.reason = None;
             let cancellation = state.cancel.clone();
@@ -422,7 +505,15 @@ impl Owner {
                     // The custody guard and every descriptor live inside this call
                     // and are dropped before the completion signal is sent.
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        verify_job(&snapshot, allocation, &inventory, &cancellation, generation)
+                        verify_job_batch(
+                            &snapshot,
+                            allocation,
+                            &inventory,
+                            &cancellation,
+                            generation,
+                            partial,
+                            true,
+                        )
                     }))
                     .unwrap_or_else(|_| {
                         Err(VerificationFailure::unavailable(
@@ -585,6 +676,18 @@ impl Owner {
                 ),
             );
             self.dirty = true;
+            self.publish_now();
+            self.bump_epoch();
+            return;
+        }
+        if !verified.complete {
+            if let Some(state) = self.verification.get_mut(&job) {
+                state.running = false;
+                state.phase = "pending".into();
+                state.checked_bytes = verified.checked_bytes;
+                state.partial = Some(verified);
+                state.retry_at = Instant::now();
+            }
             self.publish_now();
             self.bump_epoch();
             return;
@@ -880,6 +983,7 @@ fn checkpoint(cancel: &CancellationToken) -> std::io::Result<()> {
     }
 }
 
+#[cfg(test)]
 fn verify_job(
     job: &Job,
     allocation: Artifact,
@@ -887,7 +991,22 @@ fn verify_job(
     cancel: &CancellationToken,
     ticket: u64,
 ) -> Result<VerifiedJob, VerificationFailure> {
-    let mut checked = 0;
+    verify_job_batch(job, allocation, inventory, cancel, ticket, None, false)
+}
+
+fn verify_job_batch(
+    job: &Job,
+    allocation: Artifact,
+    inventory: &Arc<Inventory>,
+    cancel: &CancellationToken,
+    ticket: u64,
+    partial: Option<VerifiedJob>,
+    bounded: bool,
+) -> Result<VerifiedJob, VerificationFailure> {
+    let mut checked = partial.as_ref().map_or(0, |partial| partial.checked_bytes);
+    let batch_started = std::time::Instant::now();
+    let mut batch_bytes = 0u64;
+    let mut batch_ranges = 0usize;
     if job
         .params
         .iter()
@@ -943,7 +1062,19 @@ fn verify_job(
             checked,
         ));
     }
-    let mut verified = VerifiedJob {
+    if partial.as_ref().is_some_and(|prior| {
+        prior.transformed != transformed || prior.post_retry_validated != post_retry_validated
+    }) {
+        return Err(VerificationFailure::conflict(
+            "payload custody changed between verification batches",
+            checked,
+        ));
+    }
+    let mut verified = partial.unwrap_or_else(|| VerifiedJob {
+        complete: false,
+        completed_files: HashSet::new(),
+        observations: HashMap::new(),
+        partial_range: None,
         allocation: current,
         proofs: vec![],
         invalid: vec![],
@@ -954,7 +1085,7 @@ fn verify_job(
         checked_bytes: 0,
         publication_repair: false,
         repair_files: vec![],
-    };
+    });
     if transformed {
         // Existing PP operation journals own transformed inputs. Never compare
         // those paths to obsolete pre-transform download CRCs or reset Done.
@@ -962,12 +1093,32 @@ fn verify_job(
             .verified_custody_evidence(job.id.0, check)
             .map_err(|error| VerificationFailure::conflict(error, checked))?;
         verified.checked_bytes = done_bytes(job);
+        verified.complete = true;
         return Ok(verified);
     }
+    for (file, (publication, identity)) in &verified.observations {
+        let current = recovery::resolve_payload(&verified.allocation.path, *file, publication)
+            .map_err(|error| {
+                VerificationFailure::conflict(
+                    format!("batch identity reconciliation: {error:?}"),
+                    checked,
+                )
+            })?;
+        if current.as_ref().map(|resolved| &resolved.identity) != identity.as_ref() {
+            return Err(VerificationFailure::conflict(
+                "file identity changed between verification batches",
+                checked,
+            ));
+        }
+    }
     for file in &job.files {
+        if verified.completed_files.contains(&file.id) {
+            continue;
+        }
         check().map_err(|error| VerificationFailure::unavailable(error, checked))?;
         let done = ranges(file);
         if done.is_empty() {
+            verified.completed_files.insert(file.id);
             continue;
         }
         let file_generation = parameter(job, &format!("*File:generation:{}", file.id.0))
@@ -1016,6 +1167,10 @@ fn verify_job(
             verified
                 .invalid
                 .extend(done.iter().map(|range| (file.id, range.seg_number)));
+            verified
+                .observations
+                .insert(file.id, (publication.to_owned(), None));
+            verified.completed_files.insert(file.id);
             continue;
         };
         let bound_proof = proof.as_ref().filter(|proof| {
@@ -1056,52 +1211,102 @@ fn verify_job(
                     &[],
                 )
             });
-        let mut valid = Vec::new();
+        let mut valid = verified
+            .proofs
+            .iter()
+            .find(|(id, _)| *id == file.id)
+            .map(|(_, proof)| proof.ranges.clone())
+            .unwrap_or_default();
+        let mut accepted: HashSet<u32> = valid
+            .iter()
+            .map(|range| range.seg_number)
+            .chain(
+                verified
+                    .invalid
+                    .iter()
+                    .filter(|(id, _)| *id == file.id)
+                    .map(|(_, number)| *number),
+            )
+            .collect();
         let mut read_payload = false;
+        let mut descriptor = nzbd_state::fileops::open(&resolved.path)
+            .map_err(|error| VerificationFailure::unavailable(error, checked))?;
         for range in &done {
-            check().map_err(|error| VerificationFailure::unavailable(error, checked))?;
-            let current_proof = trust_metadata && claimed.contains(range);
-            if current_proof {
-                valid.push(range.clone());
+            if accepted.contains(&range.seg_number) {
                 continue;
             }
-            // A covered range outside the new observed size contradicts current
-            // durable proof and must never silently turn into a redownload.
-            let claimed_current = claimed.contains(range);
+            check().map_err(|error| VerificationFailure::unavailable(error, checked))?;
+            if bounded
+                && (batch_ranges >= BATCH_RANGES
+                    || batch_bytes >= BATCH_BYTES
+                    || ((batch_ranges > 0 || batch_bytes > 0)
+                        && batch_started.elapsed() >= std::time::Duration::from_millis(250)))
+            {
+                break;
+            }
+            if trust_metadata && claimed.contains(range) {
+                valid.push(range.clone());
+                accepted.insert(range.seg_number);
+                batch_ranges += 1;
+                continue;
+            }
             read_payload = true;
-            match recovery::validate_range(
-                &resolved.path,
-                range.offset,
-                u64::from(range.len),
-                range.crc,
-                Some(&resolved.identity),
-            ) {
+            let cursor = verified.partial_range.get_or_insert_with(|| PartialRange {
+                file: file.id,
+                range: range.clone(),
+                read: 0,
+                digest: crc32fast::Hasher::new(),
+            });
+            if cursor.file != file.id || cursor.range != *range {
+                return Err(VerificationFailure::conflict(
+                    "range changed between verification batches",
+                    checked,
+                ));
+            }
+            let budget = if bounded {
+                BATCH_BYTES.saturating_sub(batch_bytes)
+            } else {
+                u64::MAX
+            };
+            let (outcome, bytes, complete) =
+                read_piece(&mut descriptor, &resolved.identity, cursor, budget);
+            checked = checked.saturating_add(bytes);
+            batch_bytes = batch_bytes.saturating_add(bytes);
+            if !complete {
+                break;
+            }
+            verified.partial_range = None;
+            batch_ranges += 1;
+            match outcome {
                 ValidationOutcome::Valid(_) => valid.push(range.clone()),
-                ValidationOutcome::Mismatch | ValidationOutcome::Missing if claimed_current => {
+                ValidationOutcome::Mismatch | ValidationOutcome::Missing
+                    if claimed.contains(range) =>
+                {
                     return Err(VerificationFailure::conflict(
                         format!("file {} contradicts current durable range proof", file.id.0),
                         checked,
-                    ));
+                    ))
                 }
                 ValidationOutcome::Mismatch | ValidationOutcome::Missing => {
                     verified.invalid.push((file.id, range.seg_number))
                 }
                 ValidationOutcome::Unavailable(reason) => {
-                    return Err(VerificationFailure::unavailable(reason, checked));
+                    return Err(VerificationFailure::unavailable(reason, checked))
                 }
                 ValidationOutcome::IdentityConflict => {
                     return Err(VerificationFailure::conflict(
-                        format!("file {} changed identity during validation", file.id.0),
+                        "file changed during verification batch",
                         checked,
-                    ));
+                    ))
                 }
             }
-            checked = checked.saturating_add(u64::from(range.len));
+            accepted.insert(range.seg_number);
         }
+        let file_complete = done
+            .iter()
+            .all(|range| accepted.contains(&range.seg_number));
         // Stamp legacy verification only after a sync of the same opened object;
         // validate current identity both before and after that sync.
-        let descriptor = nzbd_state::fileops::open(&resolved.path)
-            .map_err(|error| VerificationFailure::unavailable(error, checked))?;
         let before = recovery::capture_identity(&descriptor)
             .map_err(|error| VerificationFailure::unavailable(error, checked))?;
         if before != resolved.identity {
@@ -1147,7 +1352,7 @@ fn verify_job(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(VerificationFailure::unavailable(error, checked)),
         };
-        if published && valid.len() != done.len() {
+        if file_complete && published && valid.len() != done.len() {
             verified.publication_repair = true;
             verified.repair_files.push(PublicationRepairFile {
                 file: file.id,
@@ -1156,7 +1361,7 @@ fn verify_job(
                 generation: file_generation.clone(),
             });
         }
-        if published && valid.len() == done.len() {
+        if file_complete && published && valid.len() == done.len() {
             let size = expected_size.ok_or_else(|| {
                 VerificationFailure::unavailable(
                     "expected publication size is not recorded",
@@ -1176,9 +1381,13 @@ fn verify_job(
             {
                 verified.published.insert(file.id);
             }
-        } else if file.finalized {
+        } else if file_complete && file.finalized {
             verified.reopen_finalize.insert(file.id);
         }
+        verified
+            .observations
+            .insert(file.id, (publication.to_owned(), Some(identity.clone())));
+        verified.proofs.retain(|(id, _)| *id != file.id);
         if !valid.is_empty() {
             verified.proofs.push((
                 file.id,
@@ -1193,7 +1402,24 @@ fn verify_job(
                 },
             ));
         }
+        if file_complete {
+            verified.completed_files.insert(file.id);
+        } else {
+            break;
+        }
+        if bounded
+            && (batch_ranges >= BATCH_RANGES
+                || batch_bytes >= BATCH_BYTES
+                || ((batch_ranges > 0 || batch_bytes > 0)
+                    && batch_started.elapsed() >= std::time::Duration::from_millis(250)))
+        {
+            break;
+        }
     }
+    verified.complete = job
+        .files
+        .iter()
+        .all(|file| verified.completed_files.contains(&file.id));
     check().map_err(|error| VerificationFailure::unavailable(error, checked))?;
     let final_allocation = inventory
         .for_job(job.id.0)
@@ -1340,6 +1566,134 @@ mod tests {
         let inventory = Arc::new(Inventory::open(&temp.path().join("state")).unwrap());
         let allocation = inventory.allocate(7, &root, &root.join("fixture")).unwrap();
         (inventory, allocation)
+    }
+
+    #[test]
+    fn bounded_batches_keep_progress_and_same_object_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let (inventory, allocation) = fixture_inventory(&temp);
+        let mut job = fixture_job();
+        let bytes: Vec<u8> = (0..128).map(|n| n as u8).collect();
+        std::fs::write(allocation.path.join(".runner-file-1.part"), &bytes).unwrap();
+        job.files[0].segments = bytes
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| nzbd_types::Segment {
+                message_id: index.to_string().into(),
+                number: index as u32 + 1,
+                size: 1,
+                state: SegmentState::Done {
+                    offset: index as u64,
+                    len: 1,
+                    crc: crc32fast::hash(&[*byte]),
+                },
+            })
+            .collect();
+        let cancel = CancellationToken::new();
+        let first = verify_job_batch(
+            &job,
+            allocation.clone(),
+            &inventory,
+            &cancel,
+            11,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(!first.complete);
+        assert!(first.checked_bytes > 0 && first.checked_bytes <= 64);
+        assert_eq!(first.proofs[0].1.ranges.len() as u64, first.checked_bytes);
+        let mut result = first;
+        for _ in 0..128 {
+            if result.complete {
+                break;
+            }
+            result = verify_job_batch(
+                &job,
+                allocation.clone(),
+                &inventory,
+                &cancel,
+                11,
+                Some(result),
+                true,
+            )
+            .unwrap();
+        }
+        assert!(result.complete);
+        assert_eq!(
+            result.checked_bytes, 128,
+            "previous batch must not reread payload"
+        );
+        assert_eq!(result.proofs[0].1.ranges.len(), 128);
+    }
+
+    #[test]
+    fn one_large_range_yields_and_resumes_crc_without_rereading() {
+        let temp = tempfile::tempdir().unwrap();
+        let (inventory, allocation) = fixture_inventory(&temp);
+        let bytes = vec![0x5au8; BATCH_BYTES as usize + 4096];
+        std::fs::write(allocation.path.join(".runner-file-1.part"), &bytes).unwrap();
+        let mut job = fixture_job();
+        job.files[0].segments.truncate(1);
+        job.files[0].segments[0].size = bytes.len() as u32;
+        job.files[0].segments[0].state = SegmentState::Done {
+            offset: 0,
+            len: bytes.len() as u32,
+            crc: crc32fast::hash(&bytes),
+        };
+        let cancel = CancellationToken::new();
+        let first = verify_job_batch(
+            &job,
+            allocation.clone(),
+            &inventory,
+            &cancel,
+            11,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(!first.complete);
+        assert_eq!(first.checked_bytes, BATCH_BYTES);
+        assert_eq!(first.partial_range.as_ref().unwrap().read, BATCH_BYTES);
+        let second =
+            verify_job_batch(&job, allocation, &inventory, &cancel, 11, Some(first), true).unwrap();
+        assert!(second.complete);
+        assert_eq!(second.checked_bytes, bytes.len() as u64);
+        assert!(second.invalid.is_empty());
+    }
+
+    #[test]
+    fn identity_change_between_batches_never_reuses_prior_crc() {
+        let temp = tempfile::tempdir().unwrap();
+        let (inventory, allocation) = fixture_inventory(&temp);
+        let bytes = vec![0x5au8; BATCH_BYTES as usize + 4096];
+        let path = allocation.path.join(".runner-file-1.part");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut job = fixture_job();
+        job.files[0].segments.truncate(1);
+        job.files[0].segments[0].state = SegmentState::Done {
+            offset: 0,
+            len: bytes.len() as u32,
+            crc: crc32fast::hash(&bytes),
+        };
+        let cancel = CancellationToken::new();
+        let first = verify_job_batch(
+            &job,
+            allocation.clone(),
+            &inventory,
+            &cancel,
+            11,
+            None,
+            true,
+        )
+        .unwrap();
+        std::fs::rename(&path, path.with_extension("old")).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let failure =
+            verify_job_batch(&job, allocation, &inventory, &cancel, 11, Some(first), true)
+                .unwrap_err();
+        assert!(failure.review_required);
+        assert!(failure.reason.contains("identity"));
     }
 
     #[test]

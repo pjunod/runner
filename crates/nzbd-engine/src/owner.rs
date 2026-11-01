@@ -8,6 +8,9 @@
 //! about state. Sends toward writer tasks use `try_send` with a
 //! retry-on-tick fallback so owner ⇄ writer backpressure can never deadlock.
 
+#[path = "owner_transitions.rs"]
+mod transitions;
+
 use crate::backend::{BackendCommand, BackendFact, BackendOwnerPort, RemovalOutcome};
 use crate::events::Event;
 use crate::failover::{AttemptOutcome, Ladder, SegmentAttempt, Verdict};
@@ -36,6 +39,12 @@ use nzbd_types::{
     StageSpan, TorrentControlIntent, TorrentPayloadDisposition, TorrentPhase, TorrentRemovalIntent,
 };
 use persistence_worker::{IoResult, PersistResult, Persistence};
+#[cfg(test)]
+#[path = "owner_batch_tests.rs"]
+mod batch_tests;
+#[path = "owner_payload.rs"]
+mod payload_worker;
+use payload_worker::PayloadWork;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -109,6 +118,16 @@ fn fresh_epoch() -> u64 {
 /// External commands (wrapped by `EngineHandle` methods).
 #[derive(Debug)]
 pub(crate) enum QueueCommand {
+    ApplyPostRecord {
+        admission: crate::PostAdmission,
+        job: Box<Job>,
+        require_snapshot: bool,
+        reply: oneshot::Sender<bool>,
+    },
+    FinishPostAdmission {
+        admission: crate::PostAdmission,
+        reply: oneshot::Sender<bool>,
+    },
     BeginPostAdmission {
         job: JobId,
         reply: oneshot::Sender<Option<crate::PostAdmission>>,
@@ -276,7 +295,7 @@ pub(crate) enum QueueCommand {
         job: Box<Job>,
         fold_journals: bool,
         emit_finished: bool,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), nzbd_state::StateError>>,
     },
     /// Replace only an authority copy that still exists. This is the fenced
     /// terminal-update path: a demoted worker must never resurrect a job that
@@ -342,7 +361,7 @@ pub(crate) enum QueueCommand {
     /// must not survive takeover or rollback after a failed quorum commit.
     AdoptReplicatedAuthority {
         jobs: Vec<Job>,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), nzbd_state::StateError>>,
     },
     /// Crash-only demotion: drop authority persistence and every job not
     /// in `keep` (the leases this node still executes).
@@ -536,6 +555,11 @@ pub(crate) struct Lease {
 /// Everything that reaches the owner task.
 #[derive(Debug)]
 pub(crate) enum EngineMsg {
+    PayloadFinished {
+        root: PathBuf,
+        revision: u64,
+        result: IoResult,
+    },
     WritersStopped {
         job: JobId,
         generation: u64,
@@ -643,6 +667,13 @@ pub(crate) struct Owner {
     job_epochs: HashMap<JobId, u64>,
     control_epochs: HashMap<JobId, u64>,
     post_admissions: HashMap<JobId, u64>,
+    post_cancellations: HashMap<JobId, CancellationToken>,
+    record_transitions: HashSet<JobId>,
+    projection_transition: bool,
+    startup_reconciliation: HashMap<PathBuf, transitions::StartupRoot>,
+    startup_roots_loading: bool,
+    startup_roots_ready: bool,
+    startup_roots_retry_at: Instant,
     verification: HashMap<JobId, VerificationState>,
     verification_roots: HashSet<PathBuf>,
     allocation_cache: HashMap<JobId, nzbd_state::artifacts::Artifact>,
@@ -654,6 +685,10 @@ pub(crate) struct Owner {
     pending_writer_birth: HashMap<FileId, u64>,
     allocating_jobs: HashSet<JobId>,
     pending_control_commits: HashSet<JobId>,
+    /// Exact queue control revision currently awaiting its durable snapshot.
+    /// Unlike the unrelated set of commit barriers, this protects overlapping
+    /// Pause/Resume intents from releasing one another's operational fence.
+    pending_control_revisions: HashMap<JobId, u64>,
     allocated_jobs: HashSet<JobId>,
     finalize_sent: HashSet<FileId>,
     pending_finalize: Vec<(JobId, FileId)>,
@@ -731,6 +766,8 @@ pub(crate) struct Owner {
     persistence: Persistence,
     persistence_callbacks: HashMap<u64, Box<dyn FnOnce(&mut Owner, bool) + Send>>,
     journal_suffix: String,
+    payload_waiting: VecDeque<PayloadWork>,
+    payload_active: HashSet<PathBuf>,
     io_callbacks: HashMap<u64, Box<dyn FnOnce(&mut Owner, IoResult) + Send>>,
     pending_sources: nzbd_state::torrent_sources::PendingSourceStore,
     /// How long the last snapshot write took — feeds [`save_spacing`], so a
@@ -923,11 +960,6 @@ impl Owner {
             )
             .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?,
         );
-        std::fs::create_dir_all(&dest_dir).map_err(|source| nzbd_state::StateError::Io {
-            op: "create download root",
-            path: dest_dir.clone(),
-            source,
-        })?;
         let marker = UncleanMarker::new(state_dir, journal_suffix);
         let was_unclean = marker.check_and_arm()?;
         let snap_store = SnapshotStore::open(state_dir)?;
@@ -946,20 +978,8 @@ impl Owner {
                 state = QueueState::from_doc(doc);
             }
 
-            artifacts
-                .reconcile_startup(&state.jobs.iter().map(|job| job.id.0).collect::<Vec<_>>())
-                .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?;
-            for job in &state.jobs {
-                if job.torrent.is_none() && artifacts.for_job(job.id.0).ok().flatten().is_none() {
-                    artifacts
-                        .register_legacy_active(
-                            job.id.0,
-                            &dest_dir,
-                            &dest_dir.join(job_dir_name(job)),
-                        )
-                        .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?;
-                }
-            }
+            // Payload roots and lifecycle reconciliation are runtime work.
+            // Only state-volume metadata is touched before the owner exists.
             // Legacy phase-1 global journal: fold once, then retire it.
             let legacy = FsJournal::open(state_dir)?;
             let mut replayed = legacy
@@ -1060,29 +1080,19 @@ impl Owner {
             );
         }
 
-        let mut allocated_jobs = HashSet::new();
+        let allocated_jobs = HashSet::new();
         let retiring_writers = HashMap::new();
         let mut allocation_cache = HashMap::new();
-        // Validate recovered allocations before the actor starts. Segment
-        // scheduling subsequently consults only actor-owned admission state.
-        for job in &mut state.jobs {
-            if job.torrent.is_some() {
-                continue;
-            }
-            if let Some(a) = artifacts
-                .for_job(job.id.0)
-                .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?
-            {
-                allocation_cache.insert(job.id, a.clone());
-                if a.state == "active" {
-                    artifacts
-                        .allocate(job.id.0, &a.root, &a.path)
-                        .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?;
-                    allocated_jobs.insert(job.id);
-                } else if a.state == "retained" {
-                    job.status = JobStatus::Paused;
-                    // Retained custody is verified asynchronously. There is no
-                    // live writer from the previous process to wait for.
+        // Cache authoritative metadata without treating it as a capability.
+        // Active root/path identity and legacy registration are established
+        // asynchronously, independently for each payload root after spawn.
+        for job in &state.jobs {
+            if job.torrent.is_none() {
+                if let Some(allocation) = artifacts
+                    .for_job(job.id.0)
+                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
+                {
+                    allocation_cache.insert(job.id, allocation);
                 }
             }
         }
@@ -1097,6 +1107,13 @@ impl Owner {
             job_epochs: HashMap::new(),
             control_epochs: HashMap::new(),
             post_admissions: HashMap::new(),
+            post_cancellations: HashMap::new(),
+            record_transitions: HashSet::new(),
+            projection_transition: false,
+            startup_reconciliation: HashMap::new(),
+            startup_roots_loading: false,
+            startup_roots_ready: false,
+            startup_roots_retry_at: Instant::now(),
             verification: HashMap::new(),
             verification_roots: HashSet::new(),
             allocation_cache,
@@ -1108,6 +1125,7 @@ impl Owner {
             pending_writer_birth: HashMap::new(),
             allocating_jobs: HashSet::new(),
             pending_control_commits: HashSet::new(),
+            pending_control_revisions: HashMap::new(),
             allocated_jobs,
             finalize_sent: HashSet::new(),
             pending_finalize: Vec::new(),
@@ -1153,6 +1171,8 @@ impl Owner {
             ),
             persistence_callbacks: HashMap::new(),
             io_callbacks: HashMap::new(),
+            payload_waiting: VecDeque::new(),
+            payload_active: HashSet::new(),
             journal_suffix: journal_suffix.to_owned(),
             pending_sources,
             persist,
@@ -1196,21 +1216,7 @@ impl Owner {
             rotate: 0,
             guard_tick: 0,
         };
-        let pending = owner
-            .state
-            .jobs
-            .iter()
-            .filter(|j| {
-                j.torrent.is_none()
-                    && !j.params.iter().any(|(k, _)| k == nzbd_types::PP_DONE_PARAM)
-                    && (j.files.iter().any(|f| f.has_any_done())
-                        || j.params.iter().any(|(k, _)| k == "*Recovery:pending"))
-            })
-            .map(|j| j.id)
-            .collect::<Vec<_>>();
-        for job in pending {
-            owner.queue_verification(job);
-        }
+        owner.schedule_startup_reconciliation();
         Ok(owner)
     }
 
@@ -1262,6 +1268,7 @@ impl Owner {
     async fn drain_shutdown_results(&mut self, rx: &mut mpsc::Receiver<EngineMsg>) {
         self.cancel.cancel();
         self.download_enabled = false;
+        self.cancel_payload_work();
         self.post_admissions.clear();
         for verification in self.verification.values() {
             verification.cancel.cancel();
@@ -1291,6 +1298,8 @@ impl Owner {
             let workers_stopped = self.tracker.len() <= 1;
             let callbacks_drained = self.persistence_callbacks.is_empty()
                 && self.io_callbacks.is_empty()
+                && self.payload_active.is_empty()
+                && self.payload_waiting.is_empty()
                 && self.persistence.in_flight() == 0;
             if writers_stopped
                 && workers_stopped
@@ -1435,6 +1444,11 @@ impl Owner {
         self.owner_heartbeat
             .store(unix_now() as u64, std::sync::atomic::Ordering::Relaxed);
         match msg {
+            EngineMsg::PayloadFinished {
+                root,
+                revision,
+                result,
+            } => self.payload_finished(root, revision, result),
             EngineMsg::ScopedNameInspected {
                 job,
                 generation,
@@ -1479,19 +1493,50 @@ impl Owner {
                 result,
             } => self.on_verification_result(job, generation, result),
             EngineMsg::ScopedCommand { admission, command } => {
-                if self.post_admissions.get(&admission.job) == Some(&admission.generation)
-                    && self.job_epochs.get(&admission.job) == Some(&admission.generation)
-                {
-                    if matches!(&*command, QueueCommand::RemoveJobSilent { .. }) {
-                        self.post_admissions.remove(&admission.job);
+                if self.post_scope_current(&admission) {
+                    match *command {
+                        QueueCommand::ImportJobIfPresent {
+                            job,
+                            require_snapshot,
+                            reply,
+                        } => self.apply_post_record(
+                            admission,
+                            *job,
+                            require_snapshot,
+                            move |_, ok| {
+                                let _ = reply.send(ok);
+                            },
+                        ),
+                        QueueCommand::RemoveJobSilent { reply, .. } => {
+                            self.finish_post_admission(admission, move |_, ok| {
+                                let _ = reply.send(ok);
+                            })
+                        }
+                        QueueCommand::ApplyPostRecord {
+                            admission: scope,
+                            job,
+                            require_snapshot,
+                            reply,
+                        } => self.apply_post_record(scope, *job, require_snapshot, move |_, ok| {
+                            let _ = reply.send(ok);
+                        }),
+                        QueueCommand::FinishPostAdmission {
+                            admission: scope,
+                            reply,
+                        } => self.finish_post_admission(scope, move |_, ok| {
+                            let _ = reply.send(ok);
+                        }),
+                        // Replacing an allocation is never an admitted PP update.
+                        QueueCommand::ImportJob { .. }
+                        | QueueCommand::AdoptAuthority { .. }
+                        | QueueCommand::AdoptReplicatedAuthority { .. }
+                        | QueueCommand::Delete { .. } => {}
+                        command => self.on_command(command),
                     }
-                    self.on_command(*command);
                 }
             }
             EngineMsg::ScopedEvent { admission, event } => {
-                if self.post_admissions.get(&admission.job) == Some(&admission.generation)
-                    && self.job_epochs.get(&admission.job) == Some(&admission.generation)
-                {
+                if self.post_scope_current(&admission) {
                     self.emit(event);
                 }
             }
@@ -1598,6 +1643,17 @@ impl Owner {
             }
             _ => None,
         };
+        if self.projection_transition
+            && (replacement.is_some()
+                || matches!(
+                    &cmd,
+                    QueueCommand::AdoptReplicatedAuthority { .. }
+                        | QueueCommand::AdoptAuthority { .. }
+                ))
+        {
+            self.deferred_replacements.push_back(cmd);
+            return;
+        }
         if let Some(job) = replacement {
             let busy = self
                 .pending_name_inspections
@@ -1605,6 +1661,9 @@ impl Owner {
                 .is_some_and(|count| *count > 0)
                 || self.retiring_writers.contains_key(&job)
                 || self.post_admissions.contains_key(&job)
+                || self.allocating_jobs.contains(&job)
+                || self.record_transitions.contains(&job)
+                || self.pending_control_revisions.contains_key(&job)
                 || self
                     .verification
                     .get(&job)
@@ -1617,18 +1676,26 @@ impl Owner {
                     })
                 });
             if busy {
+                if let Some(cancel) = self.post_cancellations.get(&job) {
+                    cancel.cancel();
+                }
                 if let Some(state) = self.verification.get(&job) {
                     state.cancel.cancel();
                 }
                 self.retire_job_writers(job);
-                self.control_epochs.insert(job, fresh_epoch());
+                if !self.pending_control_revisions.contains_key(&job) {
+                    self.control_epochs.insert(job, fresh_epoch());
+                }
                 self.deferred_replacements.push_back(cmd);
                 self.publish_now();
                 self.bump_epoch();
                 return;
             }
         }
-        if matches!(cmd, QueueCommand::AdoptReplicatedAuthority { .. }) {
+        if matches!(
+            cmd,
+            QueueCommand::AdoptReplicatedAuthority { .. } | QueueCommand::AdoptAuthority { .. }
+        ) {
             let busy_jobs = self
                 .state
                 .jobs
@@ -1637,6 +1704,9 @@ impl Owner {
                     let id = job.id;
                     let busy = self.retiring_writers.contains_key(&id)
                         || self.post_admissions.contains_key(&id)
+                        || self.allocating_jobs.contains(&id)
+                        || self.record_transitions.contains(&id)
+                        || self.pending_control_revisions.contains_key(&id)
                         || self
                             .verification
                             .get(&id)
@@ -1651,11 +1721,16 @@ impl Owner {
                 .collect::<Vec<_>>();
             if !busy_jobs.is_empty() {
                 for job in busy_jobs {
+                    if let Some(cancel) = self.post_cancellations.get(&job) {
+                        cancel.cancel();
+                    }
                     if let Some(state) = self.verification.get(&job) {
                         state.cancel.cancel();
                     }
                     self.retire_job_writers(job);
-                    self.job_epochs.insert(job, fresh_epoch());
+                    if !self.pending_control_revisions.contains_key(&job) {
+                        self.job_epochs.insert(job, fresh_epoch());
+                    }
                 }
                 self.deferred_replacements.push_back(cmd);
                 self.publish_now();
@@ -1664,6 +1739,19 @@ impl Owner {
             }
         }
         match cmd {
+            QueueCommand::ApplyPostRecord {
+                admission,
+                job,
+                require_snapshot,
+                reply,
+            } => self.apply_post_record(admission, *job, require_snapshot, move |_, ok| {
+                let _ = reply.send(ok);
+            }),
+            QueueCommand::FinishPostAdmission { admission, reply } => {
+                self.finish_post_admission(admission, move |_, ok| {
+                    let _ = reply.send(ok);
+                })
+            }
             QueueCommand::BeginPostAdmission { job, reply } => {
                 let allowed = !self.cancel.is_cancelled()
                     && self.state.job(job).is_some_and(|j| {
@@ -1671,6 +1759,7 @@ impl Owner {
                             && matches!(
                                 j.status,
                                 JobStatus::Completed
+                                    | JobStatus::Failed
                                     | JobStatus::PostQueued
                                     | JobStatus::Post { .. }
                             )
@@ -1709,6 +1798,8 @@ impl Owner {
                     self.writers.remove(&file);
                 }
                 self.post_admissions.insert(job, generation);
+                let cancellation = self.cancel.child_token();
+                self.post_cancellations.insert(job, cancellation.clone());
                 if let Some(record) = self.state.job_mut(job) {
                     let proofs = record
                         .params
@@ -1735,20 +1826,30 @@ impl Owner {
                 }
                 self.dirty = true;
                 self.persist_then(move |owner, ok| {
-                    let current = owner.post_admissions.get(&job) == Some(&generation)
+                    let current = owner
+                        .post_cancellations
+                        .get(&job)
+                        .is_some_and(|cancel| !cancel.is_cancelled())
+                        && owner.post_admissions.get(&job) == Some(&generation)
                         && owner.job_epochs.get(&job) == Some(&generation)
                         && !owner.verification.contains_key(&job)
                         && owner.state.job(job).is_some()
                         && !owner.cancel.is_cancelled();
                     if ok && current {
                         if reply
-                            .send(Some(crate::PostAdmission { job, generation }))
+                            .send(Some(crate::PostAdmission {
+                                job,
+                                generation,
+                                cancellation,
+                            }))
                             .is_err()
                         {
                             owner.post_admissions.remove(&job);
+                            owner.post_cancellations.remove(&job);
                         }
                     } else {
                         owner.post_admissions.remove(&job);
+                        owner.post_cancellations.remove(&job);
                         let _ = reply.send(None);
                     }
                 });
@@ -1756,6 +1857,9 @@ impl Owner {
             QueueCommand::EndPostAdmission { admission, reply } => {
                 if self.post_admissions.get(&admission.job) == Some(&admission.generation) {
                     self.post_admissions.remove(&admission.job);
+                    if let Some(cancel) = self.post_cancellations.remove(&admission.job) {
+                        cancel.cancel();
+                    }
                 }
                 self.drain_replacements();
                 let _ = reply.send(());
@@ -2632,16 +2736,23 @@ impl Owner {
                     self.dirty = true;
                     let generation = fresh_epoch();
                     self.control_epochs.insert(job, generation);
+                    self.pending_control_revisions.insert(job, generation);
                     let persistent = self.persist;
                     self.persist_then(move |owner, committed| {
-                        let current = owner.control_epochs.get(&job) == Some(&generation)
+                        let lifecycle_current = owner.control_epochs.get(&job) == Some(&generation)
                             && owner.job_epochs.get(&job) == Some(&scope_generation);
+                        let current = lifecycle_current
+                            && owner.pending_control_revisions.get(&job) == Some(&generation);
                         let ok = (!persistent || committed) && current;
                         if ok {
+                            owner.pending_control_revisions.remove(&job);
                             owner.publish_now();
                             owner.emit(Event::JobControlChanged { job, control });
-                        } else if current {
-                            owner.dirty = true;
+                        } else if owner.pending_control_revisions.get(&job) == Some(&generation) {
+                            owner.pending_control_revisions.remove(&job);
+                            if lifecycle_current {
+                                owner.dirty = true;
+                            }
                         }
                         let _ = reply.send(ok);
                     });
@@ -2680,14 +2791,18 @@ impl Owner {
                 self.dirty = true;
                 let generation = fresh_epoch();
                 self.control_epochs.insert(job, generation);
+                self.pending_control_revisions.insert(job, generation);
                 let persistent = self.persist;
                 self.persist_then(move |owner, committed| {
-                    let current = owner.control_epochs.get(&job) == Some(&generation)
+                    let lifecycle_current = owner.control_epochs.get(&job) == Some(&generation)
                         && owner.job_epochs.get(&job) == Some(&scope_generation);
+                    let current = lifecycle_current
+                        && owner.pending_control_revisions.get(&job) == Some(&generation);
                     let ok = (!persistent || committed) && current;
                     if ok {
                         if torrent && !owner.enqueue_backend_command(BackendCommand::Pause { job })
                         {
+                            owner.pending_control_revisions.remove(&job);
                             owner.hold_job(
                                 job,
                                 nzbd_types::HoldCause::StorageUnavailable,
@@ -2697,16 +2812,20 @@ impl Owner {
                             let _ = reply.send(false);
                             return;
                         }
+                        owner.pending_control_revisions.remove(&job);
                         owner.bump_epoch();
                         owner.publish_now();
-                    } else if current {
-                        owner.dirty = true;
-                        owner.hold_job(
-                            job,
-                            nzbd_types::HoldCause::StorageUnavailable,
-                            "snapshot",
-                            "Pause intent could not be persisted",
-                        );
+                    } else if owner.pending_control_revisions.get(&job) == Some(&generation) {
+                        owner.pending_control_revisions.remove(&job);
+                        if lifecycle_current {
+                            owner.dirty = true;
+                            owner.hold_job(
+                                job,
+                                nzbd_types::HoldCause::StorageUnavailable,
+                                "snapshot",
+                                "Pause intent could not be persisted",
+                            );
+                        }
                     }
                     let _ = reply.send(ok);
                 });
@@ -2779,22 +2898,29 @@ impl Owner {
                 self.dirty = true;
                 let generation = fresh_epoch();
                 self.control_epochs.insert(job, generation);
+                self.pending_control_revisions.insert(job, generation);
                 let persistent = self.persist;
                 self.persist_then(move |owner, committed| {
-                    let current = owner.control_epochs.get(&job) == Some(&generation)
+                    let lifecycle_current = owner.control_epochs.get(&job) == Some(&generation)
                         && owner.job_epochs.get(&job) == Some(&scope_generation);
+                    let current = lifecycle_current
+                        && owner.pending_control_revisions.get(&job) == Some(&generation);
                     let ok = (!persistent || committed) && current;
                     if ok {
+                        owner.pending_control_revisions.remove(&job);
                         owner.bump_epoch();
                         owner.publish_now();
-                    } else if current {
-                        owner.dirty = true;
-                        owner.hold_job(
-                            job,
-                            nzbd_types::HoldCause::StorageUnavailable,
-                            "snapshot",
-                            "Resume intent could not be persisted",
-                        );
+                    } else if owner.pending_control_revisions.get(&job) == Some(&generation) {
+                        owner.pending_control_revisions.remove(&job);
+                        if lifecycle_current {
+                            owner.dirty = true;
+                            owner.hold_job(
+                                job,
+                                nzbd_types::HoldCause::StorageUnavailable,
+                                "snapshot",
+                                "Resume intent could not be persisted",
+                            );
+                        }
                     }
                     let _ = reply.send(ok);
                 });
@@ -3296,58 +3422,32 @@ impl Owner {
                 emit_finished,
                 reply,
             } => {
-                let _ = self.import_job(*job, fold_journals, emit_finished);
-                let _ = reply.send(());
+                self.replace_job_then(
+                    *job,
+                    fold_journals,
+                    emit_finished,
+                    false,
+                    false,
+                    move |_, result| {
+                        let _ = reply.send(result);
+                    },
+                );
             }
             QueueCommand::ImportJobIfPresent {
                 job,
                 require_snapshot,
                 reply,
             } => {
-                let id = job.id;
-                let previous = self.state.job(id).cloned();
-                let previous_delegated = self.delegated.get(&id).cloned();
-                let previous_mirror = self.mirror.get(&id).cloned();
-                let previous_post_fetch = self.post_fetch_files.get(&id).cloned();
-                let committed = previous.is_some()
-                    && (!require_snapshot || self.persist)
-                    && self.import_job(*job, false, false);
-                if !committed {
-                    // Atomic means memory and disk agree. A failed snapshot
-                    // commit must not leave an in-memory-only PP_DONE or
-                    // finalization key that later scans mistake for durable.
-                    let _ = self.remove_job_silent(id);
-                    if let Some(previous) = previous {
-                        self.state.jobs.push(previous);
-                    }
-                    match previous_delegated {
-                        Some(node) => {
-                            self.delegated.insert(id, node);
-                        }
-                        None => {
-                            self.delegated.remove(&id);
-                        }
-                    }
-                    match previous_mirror {
-                        Some(stats) => {
-                            self.mirror.insert(id, stats);
-                        }
-                        None => {
-                            self.mirror.remove(&id);
-                        }
-                    }
-                    match previous_post_fetch {
-                        Some(files) => {
-                            self.post_fetch_files.insert(id, files);
-                        }
-                        None => {
-                            self.post_fetch_files.remove(&id);
-                        }
-                    }
-                    self.publish_now();
-                    self.bump_epoch();
-                }
-                let _ = reply.send(committed);
+                self.replace_job_then(
+                    *job,
+                    false,
+                    false,
+                    true,
+                    require_snapshot,
+                    move |_, result| {
+                        let _ = reply.send(result.is_ok());
+                    },
+                );
             }
             QueueCommand::ExportJob { job, reply } => {
                 let replacement_pending =
@@ -3364,6 +3464,7 @@ impl Owner {
                         });
                 let exportable = !self.verification.contains_key(&job)
                     && !self.retiring_writers.contains_key(&job)
+                    && !self.pending_control_revisions.contains_key(&job)
                     && !replacement_pending;
                 let result = if exportable {
                     self.state.job(job).cloned().map(Box::new)
@@ -3392,6 +3493,7 @@ impl Owner {
                     && (node.is_none()
                         || (!self.verification.contains_key(&job)
                             && !self.retiring_writers.contains_key(&job)
+                            && !self.pending_control_revisions.contains_key(&job)
                             && !replacement_pending));
                 if ok {
                     match &node {
@@ -3477,63 +3579,8 @@ impl Owner {
                 });
             }
             QueueCommand::AdoptReplicatedAuthority { jobs, reply } => {
-                for old in &self.state.jobs {
-                    if let Some(state) = self.verification.get(&old.id) {
-                        state.cancel.cancel();
-                    }
-                    self.job_epochs.insert(old.id, fresh_epoch());
-                }
-                self.verification.clear();
-                self.writer_epochs.clear();
-                self.pending_writer_birth.clear();
-                for job in &jobs {
-                    self.job_epochs.insert(job.id, fresh_epoch());
-                }
-                self.state.jobs = jobs;
-                self.state.pending_admissions.clear();
-                self.state.next_job_id = self
-                    .state
-                    .jobs
-                    .iter()
-                    .map(|job| job.id.0)
-                    .max()
-                    .unwrap_or(0);
-                self.state.next_file_id = self
-                    .state
-                    .jobs
-                    .iter()
-                    .flat_map(|job| job.files.iter().map(|file| file.id.0))
-                    .max()
-                    .unwrap_or(0);
-                self.state.recompute_all_totals();
-                self.dirty = true;
-                let verify =
-                    self.state
-                        .jobs
-                        .iter()
-                        .filter_map(|job| {
-                            (!matches!(
-                                job.status,
-                                JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
-                            ) && job.torrent.is_none()
-                                && job.files.iter().flat_map(|file| &file.segments).any(
-                                    |segment| matches!(segment.state, SegmentState::Done { .. }),
-                                ))
-                            .then_some(job.id)
-                        })
-                        .collect::<Vec<_>>();
-                for job in verify {
-                    self.queue_verification(job);
-                }
-                self.bump_epoch();
-                self.persist_then(move |owner, committed| {
-                    if !committed {
-                        owner.dirty = true;
-                        tracing::error!("replicated authority replacement is not durable");
-                    } else {
-                        owner.publish_now();
-                    }
-                    let _ = reply.send(());
+                self.replace_projection_then(jobs, move |_, result| {
+                    let _ = reply.send(result);
                 });
             }
             QueueCommand::AbandonRelocation {
@@ -3566,8 +3613,20 @@ impl Owner {
                         )
                     })
                     .collect::<HashMap<_, _>>();
-                self.io_then(
-                    move || {
+                let lookup = artifacts.clone();
+                let lookup_operation = operation.clone();
+                self.io_then(move || {
+                    let operation = lookup.operation(&lookup_operation)
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    lookup.get(&operation.artifact)
+                        .map(|artifact| artifact.root)
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))
+                }, move |owner, root| {
+                    let root = match root {
+                        Ok(root) => root,
+                        Err(error) => {let _ = reply.send(Err(error.to_string())); return;}
+                    };
+                    owner.payload_then(root, move || {
                         let result = (|| {
                             let op = artifacts
                                 .operation(&operation)
@@ -3599,7 +3658,8 @@ impl Owner {
                         let result = result.map_err(|error| error.to_string());
                         let _ = reply.send(result);
                     },
-                );
+                    );
+                });
             }
             QueueCommand::RetryHold {
                 job,
@@ -3968,7 +4028,8 @@ impl Owner {
                     .filter(|id| !keep.contains(id))
                     .collect();
                 for id in drop_ids {
-                    self.remove_job_silent(id);
+                    let (reply, _) = oneshot::channel();
+                    self.on_command(QueueCommand::RemoveJobSilent { job: id, reply });
                 }
                 self.delegated.clear();
                 self.mirror.clear();
@@ -3982,151 +4043,20 @@ impl Owner {
 
     // -- cluster: import / export / delegation / adoption --------------------
 
-    fn import_job(&mut self, mut job: Job, fold_journals: bool, emit_finished: bool) -> bool {
-        let job_id = job.id;
-        if self.retiring_writers.contains_key(&job_id)
-            || self.post_admissions.contains_key(&job_id)
-            || self
-                .verification
-                .get(&job_id)
-                .is_some_and(|state| state.running)
-        {
-            return false;
-        }
-        if let Some(control) = self
-            .state
-            .job(job_id)
-            .and_then(Job::control)
-            .filter(|control| control.lifecycle == "held")
-        {
-            job.set_control(&control);
-            job.status = JobStatus::Paused;
-            job.params
-                .retain(|(key, _)| key != nzbd_types::PP_DONE_PARAM);
-        }
-        let relative = PathBuf::from(job_dir_name(&job));
-        if relative
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        {
-            return false;
-        }
-        for file in &mut job.files {
-            for segment in &mut file.segments {
-                if matches!(segment.state, SegmentState::Leased { .. }) {
-                    segment.state = SegmentState::Pending;
+    #[cfg(test)]
+    fn import_job(&mut self, job: Job, fold_journals: bool, emit_finished: bool) -> bool {
+        self.replace_job_then(
+            job,
+            fold_journals,
+            emit_finished,
+            false,
+            false,
+            |_, result| {
+                if let Err(error) = result {
+                    tracing::warn!(%error,"job replacement was not committed");
                 }
-            }
-        }
-        if job.status == JobStatus::Downloading {
-            job.status = JobStatus::Queued;
-        }
-        if self.state.job(job_id).is_some() {
-            self.remove_job_silent(job_id);
-        }
-        let epoch = fresh_epoch();
-        self.job_epochs.insert(job_id, epoch);
-        self.state.next_job_id = self.state.next_job_id.max(job_id.0);
-        self.state.next_file_id = self
-            .state
-            .next_file_id
-            .max(job.files.iter().map(|file| file.id.0).max().unwrap_or(0));
-        let needs_verification = job.torrent.is_none()
-            && !job
-                .params
-                .iter()
-                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM);
-        recompute_job_totals(&mut job);
-        self.state.jobs.push(job.clone());
-        self.delegated.remove(&job_id);
-        self.mirror.remove(&job_id);
-        if let Some(files) = recovered_post_fetch_files(&job) {
-            self.post_fetch_files.insert(job_id, files);
-        } else {
-            self.post_fetch_files.remove(&job_id);
-        }
-        if needs_verification {
-            self.queue_verification(job_id);
-        }
-        if job.torrent.is_none() {
-            let inventory = self.artifacts.clone();
-            let path = self.dest_dir.join(relative);
-            self.io_then(
-                move || {
-                    if let Some(allocation) = inventory
-                        .for_job(job_id.0)
-                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
-                    {
-                        return Ok(Some(allocation));
-                    }
-                    std::fs::create_dir_all(&path)
-                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
-                    inventory
-                        .register_legacy_active(job_id.0, path.parent().unwrap(), &path)
-                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
-                    inventory
-                        .for_job(job_id.0)
-                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))
-                },
-                move |owner, result| {
-                    if owner.job_epochs.get(&job_id) != Some(&epoch) {
-                        return;
-                    }
-                    match result {
-                        Ok(Some(allocation)) => {
-                            owner.allocation_cache.insert(job_id, allocation);
-                            if let Some(state) = owner.verification.get_mut(&job_id) {
-                                state.retry_at = Instant::now();
-                            }
-                        }
-                        Ok(None) => {
-                            owner.hold_job(
-                                job_id,
-                                nzbd_types::HoldCause::Allocation,
-                                "recovery",
-                                "import allocation metadata is unavailable",
-                            );
-                        }
-                        Err(error) => {
-                            owner.hold_job(
-                                job_id,
-                                allocation_hold_cause(&error.to_string()),
-                                "recovery",
-                                &error.to_string(),
-                            );
-                        }
-                    }
-                    owner.start_verifications();
-                    owner.publish_now();
-                    owner.bump_epoch();
-                },
-            );
-        }
-        if fold_journals {
-            self.fold_job_journals(job_id);
-        }
-        self.dirty = true;
-        if emit_finished
-            && !needs_verification
-            && matches!(
-                job.status,
-                JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
-            )
-        {
-            self.persist_then(move |owner, ok| {
-                if ok && owner.job_epochs.get(&job_id) == Some(&epoch) {
-                    owner.publish_now();
-                    owner.emit(Event::JobFinished {
-                        job: job_id,
-                        name: job.name,
-                        status: job.status,
-                        health: Health::calc(&job.totals).0,
-                    });
-                }
-            });
-        }
-        self.publish_now();
-        self.bump_epoch();
+            },
+        );
         true
     }
 
@@ -4342,15 +4272,9 @@ impl Owner {
         self.io_then(
             move || SnapshotStore::open(&state_dir)?.load(),
             move |owner, result| {
-                let doc = match result {
-                    Ok(doc) => doc,
-                    Err(error) => {
-                        owner.persist = false;
-                        callback(owner, Err(error));
-                        return;
-                    }
-                };
-                let recovered = match doc.map(QueueState::from_runtime_doc).transpose() {
+                let recovered = match result
+                    .and_then(|doc| doc.map(QueueState::from_runtime_doc).transpose())
+                {
                     Ok(state) => state,
                     Err(error) => {
                         owner.persist = false;
@@ -4358,80 +4282,19 @@ impl Owner {
                         return;
                     }
                 };
+                let mut jobs = owner.state.jobs.clone();
                 if let Some(state) = recovered {
                     owner.state.next_job_id = owner.state.next_job_id.max(state.next_job_id);
                     owner.state.next_file_id = owner.state.next_file_id.max(state.next_file_id);
                     owner.state.download_paused = state.download_paused;
                     for job in state.jobs {
-                        if owner.state.job(job.id).is_none() {
-                            owner.import_job(job, false, false);
+                        if !jobs.iter().any(|current| current.id == job.id) {
+                            jobs.push(job);
                         }
                     }
                 }
                 owner.persist = true;
-                let jobs = owner
-                    .state
-                    .jobs
-                    .iter()
-                    .filter(|job| job.torrent.is_none())
-                    .map(|job| job.id)
-                    .collect::<Vec<_>>();
-                if jobs.is_empty() {
-                    owner.persist_then(move |owner, ok| {
-                        callback(
-                            owner,
-                            if ok {
-                                Ok(())
-                            } else {
-                                Err(nzbd_state::StateError::Corrupt(
-                                    "authority adoption is not durable".into(),
-                                ))
-                            },
-                        )
-                    });
-                    return;
-                }
-                type Done = Box<dyn FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send>;
-                let pending = Arc::new(std::sync::Mutex::new((
-                    jobs.len(),
-                    Some(Box::new(callback) as Done),
-                    None::<nzbd_state::StateError>,
-                )));
-                for job in jobs {
-                    let pending = pending.clone();
-                    owner.fold_job_journals_then(job, move |owner, result| {
-                        let completed = {
-                            let mut pending = pending.lock().unwrap();
-                            pending.0 -= 1;
-                            if let Err(error) = result {
-                                pending.2 = Some(error);
-                            }
-                            if pending.0 == 0 {
-                                Some((pending.1.take().unwrap(), pending.2.take()))
-                            } else {
-                                None
-                            }
-                        };
-                        if let Some((done, error)) = completed {
-                            if let Some(error) = error {
-                                done(owner, Err(error));
-                            } else {
-                                owner.persist_then(move |owner, ok| {
-                                    done(
-                                        owner,
-                                        if ok {
-                                            Ok(())
-                                        } else {
-                                            Err(nzbd_state::StateError::Corrupt(
-                                                "authority adoption is not durable".into(),
-                                            ))
-                                        },
-                                    )
-                                });
-                            }
-                        }
-                    });
-                }
+                owner.replace_projection_then(jobs, callback);
             },
         );
     }
@@ -4461,6 +4324,8 @@ impl Owner {
             .keys()
             .chain(self.retiring_writers.keys())
             .chain(self.pending_control_commits.iter())
+            .chain(self.pending_control_revisions.keys())
+            .chain(self.allocating_jobs.iter())
         {
             excluded.insert(*job, "verification/replacement".into());
         }
@@ -4471,6 +4336,8 @@ impl Owner {
                 !self.verification.contains_key(job)
                     && !self.retiring_writers.contains_key(job)
                     && !self.pending_control_commits.contains(job)
+                    && !self.pending_control_revisions.contains_key(job)
+                    && !self.allocating_jobs.contains(job)
             })
             .map(|(job, files)| (*job, files.clone()))
             .collect::<HashMap<_, _>>();
@@ -4501,6 +4368,7 @@ impl Owner {
                 rotate: self.rotate,
             };
             let result = next_for_server(&self.state, server, &mut ctx);
+            drop(ctx);
             let exhausted = result.exhausted;
             let lease = result.lease;
             for r in exhausted {
@@ -4514,7 +4382,9 @@ impl Owner {
                 {
                     // Writer retirement owns its own completion/wake-up. It is
                     // transient, not an allocation needing operator review.
-                    break;
+                    // Exclude just this job for the rest of this bounded pass.
+                    excluded.insert(r.job, "allocation/retirement pending".into());
+                    continue;
                 }
                 let message = format!("payload allocation: {e}");
                 self.hold_job(
@@ -5367,6 +5237,8 @@ impl Owner {
 
     fn after_file_change(&mut self, job: JobId, file: FileId) {
         if self.pending_control_commits.contains(&job)
+            || self.pending_control_revisions.contains_key(&job)
+            || self.allocating_jobs.contains(&job)
             || self.cancel.is_cancelled()
             || self.verification.contains_key(&job)
             || self.retiring_writers.contains_key(&job)
@@ -5981,7 +5853,8 @@ impl Owner {
             .collect::<HashSet<_>>();
         let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
         self.allocating_jobs.insert(job);
-        self.io_then(
+        self.payload_then(
+            root.clone(),
             move || {
                 let base = job_dir_name(&record);
                 let mut suffix = 0_u32;
@@ -6089,7 +5962,13 @@ impl Owner {
         let root = self.dest_dir.clone();
         let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
         self.allocating_jobs.insert(job);
-        self.io_then(
+        let lane_root = self
+            .allocation_cache
+            .get(&job)
+            .map(|allocation| allocation.root.clone())
+            .unwrap_or_else(|| root.clone());
+        self.payload_then(
+            lane_root,
             move || {
                 let result = if let Some(existing) = inventory
                     .for_job(job.0)
@@ -6355,7 +6234,7 @@ impl Owner {
     }
 
     fn drain_replacements(&mut self) {
-        if self.cancel.is_cancelled() {
+        if self.cancel.is_cancelled() || self.projection_transition {
             return;
         }
         let count = self.deferred_replacements.len();
@@ -6363,13 +6242,19 @@ impl Owner {
             let Some(command) = self.deferred_replacements.pop_front() else {
                 break;
             };
-            if matches!(&command, QueueCommand::AdoptReplicatedAuthority { .. }) {
+            if matches!(
+                &command,
+                QueueCommand::AdoptReplicatedAuthority { .. } | QueueCommand::AdoptAuthority { .. }
+            ) {
                 let busy = self.state.jobs.iter().any(|job| {
                     self.pending_name_inspections
                         .get(&job.id)
                         .is_some_and(|count| *count > 0)
                         || self.retiring_writers.contains_key(&job.id)
                         || self.post_admissions.contains_key(&job.id)
+                        || self.allocating_jobs.contains(&job.id)
+                        || self.record_transitions.contains(&job.id)
+                        || self.pending_control_revisions.contains_key(&job.id)
                         || self
                             .verification
                             .get(&job.id)
@@ -6401,6 +6286,9 @@ impl Owner {
                 .is_some_and(|count| *count > 0)
                 || self.retiring_writers.contains_key(&job)
                 || self.post_admissions.contains_key(&job)
+                || self.allocating_jobs.contains(&job)
+                || self.record_transitions.contains(&job)
+                || self.pending_control_revisions.contains_key(&job)
                 || self
                     .verification
                     .get(&job)
@@ -6553,7 +6441,13 @@ impl Owner {
         let epoch = self.job_epochs.get(&job).copied();
         let inventory = self.artifacts.clone();
         self.pending_control_commits.insert(job);
-        self.io_then(
+        let lane_root = self
+            .allocation_cache
+            .get(&job)
+            .map(|allocation| allocation.root.clone())
+            .unwrap_or_else(|| self.dest_dir.clone());
+        self.payload_then(
+            lane_root,
             move || {
                 let retiring = inventory
                     .prepare_forget(job.0)
@@ -6820,6 +6714,7 @@ impl Owner {
         self.owner_heartbeat
             .store(unix_now() as u64, std::sync::atomic::Ordering::Relaxed);
         self.drain_replacements();
+        self.retry_payload_recoveries();
         self.start_verifications();
         let tick_started = Instant::now();
         self.flush_backend_commands();
@@ -6986,9 +6881,13 @@ impl Owner {
     }
 
     fn schedule_torrent_starts(&mut self) {
+        let mut unavailable = self.delegated.clone();
+        for job in self.pending_control_revisions.keys() {
+            unavailable.insert(*job, "control persistence pending".into());
+        }
         let mut desired = active_set(
             &self.state,
-            &self.delegated,
+            &unavailable,
             self.quota_reached || self.disk_low,
             unix_now(),
         )
@@ -7000,6 +6899,7 @@ impl Owner {
         desired.extend(self.state.jobs.iter().filter_map(|job| {
             let torrent = job.torrent.as_ref()?;
             (torrent.ready_at_unix.is_some()
+                && !self.pending_control_revisions.contains_key(&job.id)
                 && torrent.control_intent == TorrentControlIntent::Running
                 && torrent.removal_intent.is_none())
             .then_some(job.id)
@@ -7008,6 +6908,8 @@ impl Owner {
         for job_id in desired.iter().copied() {
             let runnable = self.state.job(job_id).is_some_and(|job| {
                 job.kind == JobKind::Torrent
+                    && !self.pending_control_revisions.contains_key(&job_id)
+                    && !self.pending_control_commits.contains(&job_id)
                     && job.status != JobStatus::Paused
                     && job.torrent.as_ref().is_some_and(|torrent| {
                         torrent.control_intent == TorrentControlIntent::Running
@@ -8567,6 +8469,141 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_boot_and_other_root_controls_do_not_wait_for_blocked_active_allocation() {
+        use std::io::Write;
+        let (tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        let state_dir = owner.state_dir.clone();
+        let root_a = owner.dest_dir.clone();
+        let root_b = tmp.path().join("healthy-payload");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let mut first = pending_job(1);
+        first.status = JobStatus::Paused;
+        owner.state.jobs = vec![first, pending_job(2)];
+        let first = owner
+            .artifacts
+            .allocate_for_delivery(1, &root_a, &root_a.join("job-1"), false, false)
+            .unwrap();
+        owner
+            .artifacts
+            .allocate_for_delivery(2, &root_b, &root_b.join("job-2"), false, false)
+            .unwrap();
+        owner.save_snapshot();
+        pump(&mut owner, &mut messages).await;
+        let marker = state_dir
+            .join("artifact-identities")
+            .join(&first.id)
+            .join(format!("{}.json", first.generation));
+        let original = std::fs::read(&marker).unwrap();
+        owner.artifacts.close().unwrap();
+        drop(owner);
+        drop(messages);
+        std::fs::remove_file(&marker).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&marker)
+            .status()
+            .unwrap()
+            .success());
+        let (opened, reader_started) = oneshot::channel();
+        let opening_path = marker.clone();
+        let writer = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(opening_path)
+                .unwrap();
+            let _ = opened.send(file);
+        });
+        let config = crate::EngineConfig::single_node(
+            Vec::new(),
+            state_dir.clone(),
+            root_a.clone(),
+            Tuning::default(),
+            None,
+        );
+        let starting = tokio::spawn(crate::Engine::spawn(config));
+        let engine = tokio::time::timeout(Duration::from_secs(2), starting)
+            .await
+            .expect("payload I/O blocked healthy queue metadata construction")
+            .unwrap()
+            .unwrap();
+        let blocked = tokio::time::timeout(Duration::from_secs(2), reader_started).await
+            .expect("active-allocation capability worker did not reach the explicit sidecar read barrier").unwrap();
+        writer.join().unwrap();
+        // Restore the pathname before releasing the existing descriptor, so
+        // later verification observes ordinary identity material rather than
+        // accidentally creating a second FIFO barrier.
+        struct Release {
+            path: PathBuf,
+            bytes: Vec<u8>,
+            writer: Option<std::fs::File>,
+        }
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.path);
+                let _ = std::fs::write(&self.path, &self.bytes);
+                if let Some(mut writer) = self.writer.take() {
+                    let _ = writer.write_all(&self.bytes);
+                }
+            }
+        }
+        let release = Release {
+            path: marker,
+            bytes: original,
+            writer: Some(blocked),
+        };
+        assert_eq!(
+            engine.snapshot().jobs.len(),
+            2,
+            "metadata must retain both jobs while root A is blocked"
+        );
+        let document = tokio::time::timeout(Duration::from_secs(1), engine.recovery_document())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(document.jobs.len(), 2);
+        let first = document.jobs.iter().find(|job| job.id == JobId(1)).unwrap();
+        assert_eq!(first.status, JobStatus::Paused);
+        assert!(matches!(
+            first.files[0].segments[0].state,
+            SegmentState::Pending
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if engine
+                    .snapshot()
+                    .jobs
+                    .iter()
+                    .find(|job| job.id == JobId(2))
+                    .is_some_and(|job| job.verification.is_none())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("root B capability was held behind unrelated root A");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), engine.pause_job(JobId(2)))
+                .await
+                .unwrap()
+                .unwrap(),
+            "healthy-state durable metadata control cannot wait for root A"
+        );
+        assert!(
+            release.writer.is_some(),
+            "the barrier remains closed through every metadata/control assertion"
+        );
+        drop(release);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+                .await
+                .unwrap()
+        );
+    }
+
     fn guard_test_owner(
         tuning: Tuning,
     ) -> (
@@ -9733,6 +9770,178 @@ mod tests {
         }];
         recompute_job_totals(&mut job);
         job
+    }
+
+    fn install_control_test_server(owner: &mut Owner) {
+        owner.servers = Arc::new(vec![ServerDef {
+            id: ServerId(1),
+            name: "test".into(),
+            host: "localhost".into(),
+            port: 119,
+            tls: nzbd_types::TlsMode::None,
+            username: None,
+            password: None,
+            active: true,
+            tier: 0,
+            group: 0,
+            fill: false,
+            max_connections: 2,
+            pipeline_depth: 1,
+            retention_days: 0,
+            cert_verification: nzbd_types::CertLevel::Strict,
+        }]);
+    }
+
+    async fn block_control_test_io(owner: &mut Owner) -> std::sync::mpsc::Sender<()> {
+        let (started, started_rx) = oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        owner.io_then(
+            move || {
+                let _ = started.send(());
+                wait.recv().expect("release blocked control test IO");
+                Ok(())
+            },
+            |_, result| result.expect("blocked control test IO completes"),
+        );
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("IO worker started")
+            .expect("worker start signal");
+        release
+    }
+
+    #[tokio::test]
+    async fn pending_payload_allocation_does_not_starve_an_allocated_job() {
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
+        install_control_test_server(&mut owner);
+        owner.state.jobs = vec![pending_job(1), pending_job(2)];
+        allocate_for_test(&mut owner, &mut messages, JobId(2), false).await;
+        owner.allocating_jobs.insert(JobId(1));
+
+        let leases = owner.grant_work(ServerId(1), 1);
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].r.job, JobId(2));
+        assert!(matches!(
+            &owner
+                .state
+                .segment_mut(SegRef {
+                    job: JobId(1),
+                    file: FileId(10),
+                    seg_number: 1,
+                })
+                .unwrap()
+                .state,
+            SegmentState::Pending
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_waits_for_durable_revision_and_failure_keeps_both_schedulers_fenced() {
+        // NZB lease path: a queued in-memory Resume stays ineligible while its
+        // exact control revision is waiting on the ordered IO/snapshot lane.
+        let (_tmp, mut owner, _adapter, mut messages) =
+            control_test_owner_with_persistence(true, Some(Arc::new(|| false)));
+        pump(&mut owner, &mut messages).await;
+        install_control_test_server(&mut owner);
+        let mut job = pending_job(1);
+        job.status = JobStatus::Paused;
+        owner.state.jobs.push(job);
+        allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
+        let release = block_control_test_io(&mut owner).await;
+        let (reply, resumed) = oneshot::channel();
+        owner.on_command(QueueCommand::Resume {
+            job: JobId(1),
+            reply,
+        });
+        assert!(owner.pending_control_revisions.contains_key(&JobId(1)));
+        assert!(owner.grant_work(ServerId(1), 1).is_empty());
+        release.send(()).unwrap();
+        pump(&mut owner, &mut messages).await;
+        assert!(!resumed.await.unwrap());
+        assert!(owner.state.job(JobId(1)).unwrap().held());
+        assert!(owner.pending_control_revisions.get(&JobId(1)).is_none());
+        assert!(owner.grant_work(ServerId(1), 1).is_empty());
+
+        // Torrent Start follows the same fence and remains stopped on failed
+        // persistence, even though the in-memory control intent is Running.
+        let (_tmp, mut owner, mut adapter, mut messages) =
+            control_test_owner_with_persistence(true, Some(Arc::new(|| false)));
+        pump(&mut owner, &mut messages).await;
+        let mut torrent = control_torrent_job();
+        torrent.status = JobStatus::Paused;
+        let control = torrent.torrent.as_mut().unwrap();
+        control.phase = TorrentPhase::PausedDownload;
+        control.control_intent = TorrentControlIntent::Paused;
+        owner.state.jobs.push(torrent);
+        let release = block_control_test_io(&mut owner).await;
+        let (reply, resumed) = oneshot::channel();
+        owner.on_command(QueueCommand::Resume {
+            job: JobId(1),
+            reply,
+        });
+        owner.schedule_torrent_starts();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        pump(&mut owner, &mut messages).await;
+        assert!(!resumed.await.unwrap());
+        assert!(owner.state.job(JobId(1)).unwrap().held());
+        owner.schedule_torrent_starts();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn obsolete_resume_callback_cannot_release_newer_pause_revision() {
+        let (_tmp, mut owner, mut adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
+        let mut torrent = control_torrent_job();
+        torrent.status = JobStatus::Paused;
+        let control = torrent.torrent.as_mut().unwrap();
+        control.phase = TorrentPhase::PausedDownload;
+        control.control_intent = TorrentControlIntent::Paused;
+        owner.state.jobs.push(torrent);
+        let release = block_control_test_io(&mut owner).await;
+
+        let (resume_reply, resumed) = oneshot::channel();
+        owner.on_command(QueueCommand::Resume {
+            job: JobId(1),
+            reply: resume_reply,
+        });
+        let resume_revision = *owner.pending_control_revisions.get(&JobId(1)).unwrap();
+        let (pause_reply, paused) = oneshot::channel();
+        owner.on_command(QueueCommand::Pause {
+            job: JobId(1),
+            reply: pause_reply,
+        });
+        let pause_revision = *owner.pending_control_revisions.get(&JobId(1)).unwrap();
+        assert_ne!(resume_revision, pause_revision);
+        owner.schedule_torrent_starts();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
+                .await
+                .is_err()
+        );
+
+        release.send(()).unwrap();
+        pump(&mut owner, &mut messages).await;
+        assert!(!resumed.await.unwrap());
+        assert!(paused.await.unwrap());
+        assert!(!owner.pending_control_revisions.contains_key(&JobId(1)));
+        assert_eq!(owner.state.job(JobId(1)).unwrap().status, JobStatus::Paused);
+        owner.schedule_torrent_starts();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

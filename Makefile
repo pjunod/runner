@@ -215,7 +215,7 @@ fast-check-startup: ## Startup recovery writer, admission, enrollment, and daemo
 	$(CARGO) test --locked -p nzbd-engine --lib writer::tests
 	$(CARGO) test --locked -p nzbd-engine --lib recovery::
 	$(CARGO) test --locked -p nzbd-engine --lib owner:: -- --skip torrent_ --skip seed_policy_
-	$(CARGO) test --locked -p nzbd-post --lib refused_owner_admission_finishes_without_pipeline_or_history
+	$(CARGO) test --locked -p nzbd-post --lib admission_tests
 	$(CARGO) test --locked -p nzbd-state --test enrollment
 	$(CARGO) test --locked -p nzbd --bin nzbd
 	$(CARGO) test --locked -p nzbd --test daemon -- --test-threads=1

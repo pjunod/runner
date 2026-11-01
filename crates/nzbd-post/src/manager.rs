@@ -669,6 +669,51 @@ async fn handle_failed_job(
     health: u16,
     last_disposition: &mut HashMap<JobId, tokio::time::Instant>,
 ) {
+    let admission = match engine.begin_post_admission(job).await {
+        Ok(Some(admission)) => admission,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(job=job.0,%error,"failed-job cleanup awaits owner admission");
+            return;
+        }
+    };
+    let scoped = engine.for_post_admission(&admission);
+    let cancellation = admission.cancellation.clone();
+    let upstream = gate.clone();
+    let admitted_gate: PpGate = Some(Arc::new(move |job| {
+        !cancellation.is_cancelled() && upstream.as_ref().is_none_or(|claim| claim(job))
+    }));
+    // Do not cancel/drop this future while its blocking workers are alive.
+    // The revocable gate stops the next step; existing workers are awaited.
+    handle_failed_job_admitted(
+        &scoped,
+        cfg,
+        history,
+        dest_dir,
+        &admitted_gate,
+        job,
+        name,
+        health,
+        last_disposition,
+    )
+    .await;
+    if let Err(error) = engine.end_post_admission(admission).await {
+        tracing::warn!(job=job.0,%error,"failed-job cleanup custody release remains pending");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_failed_job_admitted(
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    history: &Arc<HistoryDb>,
+    dest_dir: &Path,
+    gate: &PpGate,
+    job: JobId,
+    name: String,
+    health: u16,
+    last_disposition: &mut HashMap<JobId, tokio::time::Instant>,
+) {
     // Below critical health: no PP; record history and stamp so the retire
     // sweep moves the job out. Cluster disk admission gates this whole
     // operation because FailureAction::Park can copy across filesystems.
@@ -2179,14 +2224,8 @@ fn spawn_job(
     let task_cancel = attempt_cancel.clone();
     let finished = finished.clone();
     tracker.spawn(async move {
-        // Cancel-aware at both await points. Without this, one PP job —
-        // a par2 repair, an unpack, an extension script — kept the PP
-        // tracker's shutdown wait (and with it the whole daemon restart)
-        // hostage until it finished: "clicked restart, page never came
-        // back" (field report 2026-07-25, second of the day). Aborting is
-        // safe by the pipeline's own crash model: no `*PP:done` stamp has
-        // been written, subprocesses are kill-on-drop, and the next pass's
-        // rescan re-runs the job from scratch.
+        // Cancellation revokes further side effects. Once admitted, retain
+        // custody until the processing future and every blocking worker drain.
         let permit =
             acquire_admitted_permit(sem, global_cancel.clone(), task_cancel.clone(), gate, job)
                 .await;
@@ -2211,17 +2250,30 @@ fn spawn_job(
                 }
             };
             let engine = base_engine.for_post_admission(&admission);
+            let admission_cancel=admission.cancellation.clone();
             let ctx = PpCtx {
                 cancel: task_cancel.child_token(),
-                commit_ok: Arc::new({ let global = global_cancel.clone(); let task = task_cancel.clone(); move || !global.is_cancelled() && !task.is_cancelled() }),
+                commit_ok: Arc::new({ let global = global_cancel.clone(); let task = task_cancel.clone(); let admission=admission_cancel.clone(); move || !global.is_cancelled() && !task.is_cancelled() && !admission.is_cancelled() }),
                 ..PpCtx::default()
             };
+            let processing = process_job_ctx_from(&engine, &cfg, &history, &dest, job, &ctx, from);
+            tokio::pin!(processing);
             let outcome = tokio::select! {
                 _ = global_cancel.cancelled() => None,
                 _ = task_cancel.cancelled() => None,
-                r = process_job_ctx_from(&engine, &cfg, &history, &dest, job, &ctx, from) => Some(r),
+                _ = admission_cancel.cancelled() => None,
+                result = &mut processing => Some(result),
             };
-            ctx.cancel.cancel(); ctx.workers.close(); ctx.workers.wait().await;
+            ctx.cancel.cancel();
+            if outcome.is_none() {
+                // Some recovery/finalization steps await blocking work outside
+                // the attempt tracker. Drive the entire future to completion
+                // before releasing custody, including those already-started
+                // steps; dropping it would detach their blocking workers.
+                let _ = processing.await;
+            }
+            ctx.workers.close();
+            ctx.workers.wait().await;
             match outcome {
                 None => {
                     tracing::info!(
@@ -2377,6 +2429,125 @@ mod admission_tests {
         assert_eq!(sem.available_permits(), 1);
         assert!(history.get(job).unwrap().is_none());
         assert!(!dest.exists());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn common_spawn_success_durably_stamps_before_releasing_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("downloads");
+        let dir = root.join("job");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = b"complete media fixture";
+        std::fs::write(dir.join("episode.mkv"), bytes).unwrap();
+        let history = Arc::new(
+            HistoryDb::open(&temp.path().join("history.sqlite"), Some(temp.path())).unwrap(),
+        );
+        let engine = nzbd_engine::Engine::spawn(nzbd_engine::EngineConfig::single_node(
+            vec![],
+            temp.path().join("state"),
+            root.clone(),
+            nzbd_engine::Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let job = Job {
+            id: JobId(41),
+            kind: nzbd_types::JobKind::Nzb,
+            name: "job".into(),
+            dir_name: "job".into(),
+            name_provisional: false,
+            delivery_lifecycle: false,
+            queued_at_unix: 0,
+            original_name: String::new(),
+            category: None,
+            priority: 0,
+            dupe: Default::default(),
+            params: vec![("*File:size:1".into(), bytes.len().to_string())],
+            files: vec![nzbd_types::FileEntry {
+                id: nzbd_types::FileId(1),
+                subject: "episode.mkv".into(),
+                filename: "episode.mkv".into(),
+                filename_confirmed: true,
+                is_par2: false,
+                paused: false,
+                groups: vec![],
+                date: None,
+                crc32: Some(crc32fast::hash(bytes)),
+                finalized: true,
+                segments: vec![nzbd_types::Segment {
+                    message_id: "fixture".into(),
+                    number: 1,
+                    size: bytes.len() as u32,
+                    state: nzbd_types::SegmentState::Done {
+                        offset: 0,
+                        len: bytes.len() as u32,
+                        crc: crc32fast::hash(bytes),
+                    },
+                }],
+            }],
+            totals: Default::default(),
+            status: JobStatus::Completed,
+            torrent: None,
+            stages: vec![],
+        };
+        engine.import_job(job, false, false).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while engine.export_job(JobId(41)).await.unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("legacy inputs should verify before the common spawn entry");
+        let tracker = TaskTracker::new();
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let cancel = CancellationToken::new();
+        let (finished, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = PostConfig {
+            unpack: false,
+            cleanup: false,
+            deobfuscate_final: false,
+            failure_action: FailureAction::None,
+            ..Default::default()
+        };
+        let _attempt = spawn_job(
+            &tracker,
+            &engine,
+            &cfg,
+            &history,
+            &root,
+            &sem,
+            &cancel,
+            &finished,
+            JobId(41),
+            None,
+            false,
+            RestartPoint::Beginning,
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .expect("common spawn must not await its own admission release"),
+            Some(JobId(41))
+        );
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(sem.available_permits(), 1);
+        let row = engine.export_job(JobId(41)).await.unwrap().unwrap();
+        assert!(row
+            .params
+            .iter()
+            .any(|(key, value)| key == PP_DONE_PARAM && value == "SUCCESS/ALL"));
+        assert_eq!(
+            history.get(JobId(41)).unwrap().unwrap().status,
+            "SUCCESS/ALL"
+        );
+        let durable = engine.recovery_document().await.unwrap();
+        assert!(durable.jobs[0]
+            .params
+            .iter()
+            .any(|(key, _)| key == PP_DONE_PARAM));
         engine.shutdown().await;
     }
 
