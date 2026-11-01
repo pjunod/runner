@@ -5382,6 +5382,11 @@ function renderRecoveries() {
 }
 // Optional timings are measured within one machine/session. Publication and
 // cleanup observations stay separate; no wall timestamp invents missing time.
+function deliveryMeasuredMs(i) {
+  const measured = value => Number.isSafeInteger(value) && value >= 0;
+  return i.state === "completed" && measured(i.startMonotonicMs) && measured(i.endMonotonicMs) && measured(i.durationMs)
+    && i.endMonotonicMs >= i.startMonotonicMs && i.durationMs === i.endMonotonicMs - i.startMonotonicMs ? i.durationMs : undefined;
+}
 function measuredDeliveryLanes(delivery) {
   const groups = new Map();
   for (const interval of (delivery.lifecycleTiming?.version === 1 && Array.isArray(delivery.lifecycleTiming.intervals) ? delivery.lifecycleTiming.intervals : []).slice(0, 128)) {
@@ -5390,10 +5395,8 @@ function measuredDeliveryLanes(delivery) {
     if (!groups.has(key)) groups.set(key, { node: interval.nodeId, clock: interval.clockDomain, intervals: [] });
     groups.get(key).intervals.push(interval);
   }
-  const measured = value => Number.isSafeInteger(value) && value >= 0;
   return [...groups.values()].map(group => {
-    const valid = group.intervals.filter(i => i.state === "completed" && measured(i.startMonotonicMs) && measured(i.endMonotonicMs)
-      && measured(i.durationMs) && i.endMonotonicMs >= i.startMonotonicMs && i.durationMs === i.endMonotonicMs - i.startMonotonicMs);
+    const valid = group.intervals.filter(i => deliveryMeasuredMs(i) !== undefined);
     const ranges = valid.map(i => [i.startMonotonicMs, i.endMonotonicMs]).sort((a, b) => a[0] - b[0]);
     let total = 0, end;
     for (const [start, finish] of ranges) { total += end == null ? finish - start : Math.max(0, finish - Math.max(start, end)); end = Math.max(end ?? finish, finish); }
@@ -5452,7 +5455,7 @@ function deliveryTraceHtml(delivery) {
   const lanes = measuredDeliveryLanes(delivery);
   const timing = lanes.length ? lanes.map(lane => `<section><b>Runner · ${esc(lane.node || "node unknown")}</b>` +
     `<p>${lane.measuredMs == null ? "Measured time unavailable" : "Measured time (overlapping steps counted once): " + esc(fmtDur(lane.measuredMs))}${lane.unknown ? " · Some steps have no complete timing" : ""}</p>` +
-    `<ol>${lane.intervals.map(i => `<li><b>${esc(String(i.stage || "unknown").replaceAll("_", " "))}</b> · ${esc(i.state || "unknown")} · ${esc(duration(i.state === "completed" ? i.durationMs : undefined))}</li>`).join("")}</ol>` +
+    `<ol>${lane.intervals.map(i => `<li><b>${esc(String(i.stage || "unknown").replaceAll("_", " "))}</b> · ${esc(i.state || "unknown")} · ${esc(duration(deliveryMeasuredMs(i)))}</li>`).join("")}</ol>` +
     `<details><summary>Timing reference</summary><code>${esc(lane.clock)}</code></details></section>`).join("") : `<p>Earlier step timings were not recorded.</p>`;
   const stages = delivery.runnerStages;
   const post = stages && Array.isArray(stages.spans) ? `<details><summary>Processing details · ${esc(stages.nodeId || "node unknown")}</summary><p>These details expand processing steps above and are not added again.</p><ol>${stages.spans.slice(0, 128).map(span => `<li>${esc(String(span.stage || "unknown").replaceAll("_", " "))} · ${esc(duration(span.ms))}</li>`).join("")}</ol></details>` : "";

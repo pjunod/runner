@@ -24,6 +24,7 @@ test('expanded exact receipt shows timings/copies and real retry request feedbac
   await act(async () => { tree = create(<DeliveryLifecyclePanel client={client} receiptId="receipt-a" />); });
   expect(client.getDelivery).toHaveBeenCalledWith('receipt-a'); expect(text()).toContain('overlapping steps counted once'); expect(text()).toContain('Mount unavailable'); expect(text()).toContain('Consumer acceptance recorded');
   expect(text()).not.toContain('long-copy-identity');
+  expect(text().replace(/\s+/g, ' ')).toContain('queue · completed · duration unknown');
   await act(async () => button('Retry source cleanup').props.onPress());
   expect(client.retryDeliveryCleanup).toHaveBeenCalledWith('receipt-a'); expect(text()).toContain('Source cleanup retry requested');
   (client.retryDeliveryCleanup as jest.Mock).mockRejectedValueOnce(new Error('Mount still unavailable'));

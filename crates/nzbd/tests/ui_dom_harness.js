@@ -1224,6 +1224,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(lanes[0].measuredMs, 3000, "overlap counted once");
   eq(lanes[0].unknown, 1, "interrupted timing excluded");
   eq(lanes[2].measuredMs, null, "legacy wall timestamps cannot invent measured total");
+  ok(T.deliveryTraceHtml({ ...timed, lifecycleTiming: { version: 1, intervals: [timed.lifecycleTiming.intervals[4]] } }).includes("completed · duration unknown"), "legacy row duration is unknown without measured endpoints");
   ok(T.deliveryTraceHtml(timed).includes("Mount unavailable"), "per-copy reason visible");
   ok(T.deliveryTraceHtml(timed).includes("Timing reference"), "raw session identity secondary");
   reset(); T.setDeliveriesForTest([timed], 0, 4); T.renderDeliveries();

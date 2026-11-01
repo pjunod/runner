@@ -1,6 +1,9 @@
 import { DeliveryInterval, DeliveryTrace } from './api/types';
 export function deliveryReference(params?: [string, string][]) { return params?.find(([key, value]) => key === 'Delivery:Id' && value)?.[1]; }
 const measured = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+export function measuredIntervalDuration(i: DeliveryInterval): number | undefined {
+  return i.state === 'completed' && measured(i.startMonotonicMs) && measured(i.endMonotonicMs) && measured(i.durationMs) && i.endMonotonicMs >= i.startMonotonicMs && i.durationMs === i.endMonotonicMs - i.startMonotonicMs ? i.durationMs : undefined;
+}
 export function deliveryLanes(delivery: DeliveryTrace) {
   const groups = new Map<string, { node: string; clock: string; intervals: DeliveryInterval[] }>();
   for (const interval of (delivery.lifecycleTiming?.version === 1 && Array.isArray(delivery.lifecycleTiming.intervals) ? delivery.lifecycleTiming.intervals : []).slice(0, 128)) {
@@ -10,7 +13,7 @@ export function deliveryLanes(delivery: DeliveryTrace) {
     groups.get(key)!.intervals.push(interval);
   }
   return [...groups.values()].map(group => {
-    const valid = group.intervals.filter(i => i.state === 'completed' && measured(i.startMonotonicMs) && measured(i.endMonotonicMs) && measured(i.durationMs) && i.endMonotonicMs >= i.startMonotonicMs && i.durationMs === i.endMonotonicMs - i.startMonotonicMs);
+    const valid = group.intervals.filter(i => measuredIntervalDuration(i) !== undefined);
     const ranges = valid.map(i => [i.startMonotonicMs!, i.endMonotonicMs!]).sort((a, b) => a[0] - b[0]);
     let total = 0, end: number | undefined;
     for (const [start, finish] of ranges) { total += end == null ? finish - start : Math.max(0, finish - Math.max(start, end)); end = Math.max(end ?? finish, finish); }

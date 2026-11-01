@@ -3,7 +3,7 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { NzbdClient } from '../api/client';
 import { DeliveryTrace } from '../api/types';
 import { formatDuration } from '../api/format';
-import { deliveryLanes } from '../deliveryTiming';
+import { deliveryLanes, measuredIntervalDuration } from '../deliveryTiming';
 import { Theme, useTheme } from '../theme';
 export function DeliveryLifecyclePanel({ client, receiptId }: { client: NzbdClient; receiptId: string }) {
   const theme = useTheme(), styles = useMemo(() => makeStyles(theme), [theme]);
@@ -45,7 +45,7 @@ export function DeliveryLifecyclePanel({ client, receiptId }: { client: NzbdClie
         <Text style={styles.title}>Runner · {lane.node || 'node unknown'}</Text>
         <Text style={styles.note}>Measured time (overlapping steps counted once): {duration(lane.measuredMs)}</Text>
         {lane.unknown ? <Text style={styles.note}>Some steps have no complete timing.</Text> : null}
-        {lane.intervals.map((interval, index) => <Text key={index} style={styles.text}>{interval.stage.replaceAll('_', ' ')} · {interval.state} · {duration(interval.state === 'completed' ? interval.durationMs : undefined)} measured time</Text>)}
+        {lane.intervals.map((interval, index) => <Text key={index} style={styles.text}>{interval.stage.replaceAll('_', ' ')} · {interval.state} · {measuredIntervalDuration(interval) === undefined ? 'duration unknown' : `${duration(measuredIntervalDuration(interval))} measured time`}</Text>)}
         {references ? <Text selectable style={styles.note}>{lane.clock}</Text> : null}
       </View>) : <Text style={styles.note}>Earlier step timings were not recorded.</Text>}
       {delivery.runnerStages ? <View style={styles.lane}><Text style={styles.title}>Processing details · {delivery.runnerStages.nodeId}</Text><Text style={styles.note}>These details expand the processing steps above and are not added again.</Text>{delivery.runnerStages.spans.slice(0, 128).map((span, index) => <Text key={index} style={styles.text}>{span.stage.replaceAll('_', ' ')} · {duration(span.ms)} measured time</Text>)}</View> : null}
