@@ -74,6 +74,18 @@ the pinned toolchain's formatting, linting, complete workspace tests with
 required archive tools, native/mobile UI checks, coverage, and relevant cluster
 and torrent integration tests. Repository-defined required checks remain binding.
 
+Latest main refresh also preserves Curator PR #78 shutdown ownership. Its
+focused shutdown and lifecycle checks pass. Runner Apple CI and release builds
+now select the Xcode 27.2 fleet and verify that version before building, as
+required by the current runner fleet. Final CI has not been dispatched.
+
+Cluster partial-unlink replay now resumes its exact journal while preserving
+selected-copy original-source obligations. Actual mixed-worker fairness passes
+with real NNTP activity. Authority upgrade receipts and live-lease relocation
+checks are integrated; cluster admission failover and native acquisition remain
+under construction. Cancellation disposition must still prove physical cleanup
+for explicit file deletion while preserving remove-job-and-keep-files behavior.
+
 ## 4. Durable work and recovery
 
 Source and evidence live in a task-owned persistent directory, not /tmp:
