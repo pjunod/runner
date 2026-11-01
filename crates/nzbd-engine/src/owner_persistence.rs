@@ -3,8 +3,6 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-type Continuation = Box<dyn FnOnce(&mut Owner, bool) + Send>;
-
 #[derive(Debug)]
 pub(crate) struct PersistResult {
     pub result: Result<(), nzbd_state::StateError>,
@@ -159,15 +157,14 @@ impl Owner {
     ) {
         let revision = fresh_epoch();
         let operation = Box::new(move || action().map(|value| Box::new(value) as IoValue));
-        let callback: Box<dyn FnOnce(&mut Owner, IoResult) + Send> =
-            Box::new(move |owner: &mut Owner, result: IoResult| {
-                let typed = result.and_then(|value| {
-                    value.downcast::<T>().map(|v| *v).map_err(|_| {
-                        nzbd_state::StateError::Corrupt("persistence response type mismatch".into())
-                    })
-                });
-                continuation(owner, typed);
+        let callback: IoContinuation = Box::new(move |owner: &mut Owner, result: IoResult| {
+            let typed = result.and_then(|value| {
+                value.downcast::<T>().map(|v| *v).map_err(|_| {
+                    nzbd_state::StateError::Corrupt("persistence response type mismatch".into())
+                })
             });
+            continuation(owner, typed);
+        });
         if self.persistence.send(Request::Io {
             revision,
             action: operation,

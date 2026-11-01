@@ -112,6 +112,9 @@ pub(crate) fn spawn_writer_scoped(
 ) -> WriterHandle {
     spawn(tracker, job, file, dir, final_name, engine_tx, scope, true)
 }
+// This boundary keeps the writer's actor identity, channels, and admission
+// evidence explicit instead of hiding lifecycle state in a new container.
+#[allow(clippy::too_many_arguments)]
 fn spawn(
     tracker: &TaskTracker,
     job: JobId,
@@ -255,6 +258,8 @@ async fn ensure_open(
     Ok(())
 }
 
+// The task owns one writer actor; keep its bounded plumbing explicit here.
+#[allow(clippy::too_many_arguments)]
 async fn writer_task(
     job: JobId,
     file_id: FileId,
@@ -365,17 +370,14 @@ async fn writer_task(
                 let range = ProvenRange {
                     seg_number,
                     offset,
-                    len: match u32::try_from(data.len()) {
-                        Ok(len) => len,
-                        Err(_) => 0,
-                    },
+                    len: u32::try_from(data.len()).unwrap_or_default(),
                     crc,
                 };
                 let invalid = published_only
                     || range.len == 0
                     || range.end().is_none()
                     || (file_size > 0 && range.end().is_some_and(|end| end > file_size));
-                let duplicate = ranges.iter().any(|prior| *prior == range);
+                let duplicate = ranges.contains(&range);
                 let conflict = ranges.iter().any(|prior| {
                     (prior.seg_number == seg_number || prior.overlaps(&range)) && *prior != range
                 });

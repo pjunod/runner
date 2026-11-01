@@ -135,6 +135,7 @@ impl ClusterRuntime {
 
     /// Start with an independently enrolled lifecycle inventory identity.
     /// The original constructor remains suitable for first-time enrollment.
+    #[allow(clippy::too_many_arguments)] // Preserve the existing constructor plus its enrollment identity.
     pub async fn start_expected(
         cfg: ClusterConfig,
         servers: Vec<ServerDef>,

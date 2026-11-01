@@ -547,7 +547,7 @@ impl Owner {
                             .send(EngineMsg::VerificationFinished {
                                 job,
                                 generation,
-                                result: VerificationResult { root, outcome },
+                                result: Box::new(VerificationResult { root, outcome }),
                             })
                             .await;
                     });

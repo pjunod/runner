@@ -553,6 +553,9 @@ pub(crate) struct Lease {
 }
 
 /// Everything that reaches the owner task.
+type Continuation = Box<dyn FnOnce(&mut Owner, bool) + Send>;
+type IoContinuation = Box<dyn FnOnce(&mut Owner, IoResult) + Send>;
+
 #[derive(Debug)]
 pub(crate) enum EngineMsg {
     PayloadFinished {
@@ -600,7 +603,7 @@ pub(crate) enum EngineMsg {
     VerificationFinished {
         job: JobId,
         generation: u64,
-        result: VerificationResult,
+        result: Box<VerificationResult>,
     },
     Command(QueueCommand),
     WorkRequest {
@@ -764,11 +767,11 @@ pub(crate) struct Owner {
 
     state_dir: PathBuf,
     persistence: Persistence,
-    persistence_callbacks: HashMap<u64, Box<dyn FnOnce(&mut Owner, bool) + Send>>,
+    persistence_callbacks: HashMap<u64, Continuation>,
     journal_suffix: String,
     payload_waiting: VecDeque<PayloadWork>,
     payload_active: HashSet<PathBuf>,
-    io_callbacks: HashMap<u64, Box<dyn FnOnce(&mut Owner, IoResult) + Send>>,
+    io_callbacks: HashMap<u64, IoContinuation>,
     pending_sources: nzbd_state::torrent_sources::PendingSourceStore,
     /// How long the last snapshot write took — feeds [`save_spacing`], so a
     /// slow state volume stretches the save cadence instead of consuming
@@ -1491,7 +1494,7 @@ impl Owner {
                 job,
                 generation,
                 result,
-            } => self.on_verification_result(job, generation, result),
+            } => self.on_verification_result(job, generation, *result),
             EngineMsg::ScopedCommand { admission, command } => {
                 if self.post_scope_current(&admission) {
                     match *command {
@@ -2551,7 +2554,7 @@ impl Owner {
             }
             QueueCommand::FailUrlFetch { job, error, reply } => {
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
-                let before_status = self.state.job(job).map(|record| record.status.clone());
+                let before_status = self.state.job(job).map(|record| record.status);
                 let name = match self.state.job_mut(job) {
                     Some(j) if matches!(j.status, JobStatus::Fetching) => {
                         j.status = JobStatus::Failed;
@@ -3013,7 +3016,7 @@ impl Owner {
                     .state
                     .job(job)
                     .and_then(|record| record.torrent.as_ref())
-                    .and_then(|torrent| torrent.removal_intent.clone());
+                    .and_then(|torrent| torrent.removal_intent);
                 let torrent_command = self.state.job_mut(job).and_then(|record| {
                     let torrent = record.torrent.as_mut()?;
                     torrent.removal_intent = Some(TorrentRemovalIntent {
@@ -3043,7 +3046,7 @@ impl Owner {
                                     .job_mut(job)
                                     .and_then(|record| record.torrent.as_mut())
                                 {
-                                    torrent.removal_intent = previous_removal_intent.clone();
+                                    torrent.removal_intent = previous_removal_intent;
                                 }
                                 let _ = reply.send(false);
                                 return;
@@ -3300,7 +3303,7 @@ impl Owner {
                     .state
                     .job(job)
                     .and_then(|record| record.torrent.as_ref())
-                    .map(|torrent| torrent.seed_policy.clone());
+                    .map(|torrent| torrent.seed_policy);
                 let ok = self.state.job_mut(job).is_some_and(|record| {
                     let Some(torrent) = record.torrent.as_mut() else {
                         return false;
@@ -3887,7 +3890,7 @@ impl Owner {
                     let _ = reply.send(false);
                     return;
                 }
-                let before_status = self.state.job(job).map(|record| record.status.clone());
+                let before_status = self.state.job(job).map(|record| record.status);
                 let ok = match self.state.job_mut(job) {
                     Some(j) => {
                         j.status = status;
@@ -4368,7 +4371,6 @@ impl Owner {
                 rotate: self.rotate,
             };
             let result = next_for_server(&self.state, server, &mut ctx);
-            drop(ctx);
             let exhausted = result.exhausted;
             let lease = result.lease;
             for r in exhausted {
@@ -7292,10 +7294,9 @@ impl Owner {
                 && desired_current
                 && ok
                 && !owner.cancel.is_cancelled()
+                && owner.enqueue_backend_command(command)
             {
-                if owner.enqueue_backend_command(command) {
-                    return;
-                }
+                return;
             }
             // The only automatic caller is seed policy. A failed/stale barrier
             // must make that policy eligible for retry, while preserving every
@@ -9860,7 +9861,7 @@ mod tests {
         pump(&mut owner, &mut messages).await;
         assert!(!resumed.await.unwrap());
         assert!(owner.state.job(JobId(1)).unwrap().held());
-        assert!(owner.pending_control_revisions.get(&JobId(1)).is_none());
+        assert!(!owner.pending_control_revisions.contains_key(&JobId(1)));
         assert!(owner.grant_work(ServerId(1), 1).is_empty());
 
         // Torrent Start follows the same fence and remains stopped on failed

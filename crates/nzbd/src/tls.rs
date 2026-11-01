@@ -10,7 +10,7 @@
 
 use crate::anyhow_lite;
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 pub struct TlsSetup {
@@ -175,8 +175,8 @@ pub fn server_config_checked(
 }
 
 fn generate_self_signed(
-    cert_path: &PathBuf,
-    key_path: &PathBuf,
+    cert_path: &Path,
+    key_path: &Path,
     extra_sans: &[String],
 ) -> anyhow_lite::Result<()> {
     let mut sans: Vec<String> = vec!["localhost".into(), "nzbd".into()];

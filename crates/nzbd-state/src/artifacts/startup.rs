@@ -10,13 +10,12 @@ struct OrphanReceipt {
 }
 
 #[cfg(test)]
-pub(super) static ROOT_OPEN_GATE: Mutex<
-    Option<(
-        PathBuf,
-        std::sync::mpsc::Sender<()>,
-        std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>,
-    )>,
-> = Mutex::new(None);
+type RootOpenRelease = std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>;
+#[cfg(test)]
+type RootOpenGate = Option<(PathBuf, std::sync::mpsc::Sender<()>, RootOpenRelease)>;
+
+#[cfg(test)]
+pub(super) static ROOT_OPEN_GATE: Mutex<RootOpenGate> = Mutex::new(None);
 
 #[cfg(test)]
 pub(super) fn before_root_open(root: &Path) {

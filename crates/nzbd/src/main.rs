@@ -725,16 +725,18 @@ enum BootstrapError {
     Invalid(String),
 }
 
-fn load_bootstrap(
-    path: Option<PathBuf>,
-    control: &control::Controller,
-) -> anyhow_lite::Result<(
+type BootstrapSecurity = (
     nzbd_config::Config,
     Option<PathBuf>,
     Option<PathBuf>,
     Option<tls::TlsSetup>,
     Option<String>,
-)> {
+);
+
+fn load_bootstrap(
+    path: Option<PathBuf>,
+    control: &control::Controller,
+) -> anyhow_lite::Result<BootstrapSecurity> {
     loop {
         let worker_path = path.clone();
         let trusted_configuration = control.trusted_configuration();
@@ -912,16 +914,7 @@ fn remember_established_security(config: &std::path::Path) {
 fn read_bootstrap(
     path: Option<PathBuf>,
     trusted_configuration: Option<nzbd_config::Config>,
-) -> Result<
-    (
-        nzbd_config::Config,
-        Option<PathBuf>,
-        Option<PathBuf>,
-        Option<tls::TlsSetup>,
-        Option<String>,
-    ),
-    BootstrapError,
-> {
+) -> Result<BootstrapSecurity, BootstrapError> {
     use BootstrapError::{Invalid, Unavailable};
     let config_path = path.clone();
     let mut setup_path = None;
