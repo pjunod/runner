@@ -1,7 +1,7 @@
 # Startup runtime recovery — implementation and merge status
 
 **Owner:** Codex (`codex/startup-runtime-recovery`) · **Updated:** 2026-11-01
-**State:** implementation complete; independent review next · draft PR · **PR:** [#262](https://github.com/pjunod/runner/pull/262)
+**State:** independent Astra review running · draft PR · **PR:** [#262](https://github.com/pjunod/runner/pull/262)
 **Base:** `368b500` (fresh remote clone; includes held-job recovery updates)
 
 Companion to [STARTUP_VERIFICATION_PLAN.md](STARTUP_VERIFICATION_PLAN.md)
@@ -15,7 +15,7 @@ Companion to [STARTUP_VERIFICATION_PLAN.md](STARTUP_VERIFICATION_PLAN.md)
 | Persistent control availability and shutdown | Sol | Written, unvalidated | Independent review and final affected checks |
 | Deployment templates/operator docs; web/mobile 503 retention | Luna | Written, unvalidated | Integrate with final runtime interfaces |
 | Enrollment regressions and startup fast-lane wiring | Luna | Written, unvalidated | Run in the final affected lane after review |
-| Combined adversarial implementation review | Independent reviewer | Not started | One review after integration is complete |
+| Combined adversarial implementation review | Astra | Running | Review candidate `5c7b80b`; Hermes card `t_6c60a23f` |
 | Fast lane | Codex | Wired, not run | Run once after review fixes; rerun failed checks only |
 | Merge and cleanup | Codex | Pending | Merge after required checks pass; finish owned clone |
 
