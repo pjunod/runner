@@ -155,7 +155,7 @@ impl Inventory {
                 })),
             });
         }
-        if let Some(operation) = existing.as_ref() {
+        if let Some(operation) = existing.as_ref().filter(|_| !copy.selected) {
             let request: DeleteRequest = serde_json::from_str(&operation.request)?;
             if operation.kind != "delete"
                 || operation.artifact != artifact.id
@@ -283,7 +283,14 @@ impl Inventory {
             ) {
                 Ok(true) => None,
                 Ok(false) => Some("source retirement remains pending".to_string()),
-                Err(Error::Conflict(reason)) if reason.starts_with("blocked:") => Some(reason),
+                Err(Error::Conflict(reason))
+                    if reason.starts_with("blocked:")
+                        || reason.starts_with(
+                            "source retirement is blocked by ownership/hold state",
+                        ) =>
+                {
+                    Some(reason)
+                }
                 Err(error) => return Err(error),
             }
         } else {
@@ -407,6 +414,35 @@ mod tests {
             .publish_selected_for_delivery_checked(7, &target, selected, outcomes, &|| Ok(()))
             .unwrap();
         let copy = inventory.cluster_artifact_copy(7, true).unwrap().unwrap();
+        let original = inventory.get(&copy.source.artifact).unwrap();
+        assert_eq!(original.path, source);
+        inventory
+            .retention(&original.id, original.revision, true, None)
+            .unwrap();
+        assert_eq!(
+            inventory
+                .retire_cluster_artifact_copy(&copy, "SUCCESS", proof())
+                .unwrap()
+                .status,
+            "retained"
+        );
+        assert!(source.exists());
+        assert!(
+            !target.exists(),
+            "selected duplicate can drain while original source is blocked"
+        );
+        assert_eq!(
+            inventory
+                .retire_cluster_artifact_copy(&copy, "SUCCESS", proof())
+                .unwrap()
+                .status,
+            "retained",
+            "succeeded selected journal cannot hide blocked original source"
+        );
+        let original = inventory.get(&copy.source.artifact).unwrap();
+        inventory
+            .retention(&original.id, original.revision, false, None)
+            .unwrap();
         assert_eq!(
             inventory
                 .retire_cluster_artifact_copy(&copy, "SUCCESS", proof())
