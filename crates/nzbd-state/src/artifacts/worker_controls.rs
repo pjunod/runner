@@ -131,6 +131,34 @@ impl Inventory {
                 "worker completion lease authority changed".into(),
             ));
         }
+        let receipt_id = format!("{}:{}", source.id, source.generation);
+        let accepted: Option<String> = tx
+            .query_row(
+                "SELECT data FROM worker_completion_receipts WHERE id=?1",
+                [&receipt_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(accepted) = accepted {
+            let (accepted_context, accepted_source, _): (
+                WorkerControlContext,
+                SourceGeneration,
+                FinalizationProof,
+            ) = serde_json::from_str(&accepted)?;
+            if accepted_context != context
+                || accepted_source.artifact != source.id
+                || accepted_source.generation != source.generation
+            {
+                return Err(Error::Conflict(
+                    "accepted worker completion identity changed".into(),
+                ));
+            }
+            return Ok(WorkerCompletionProof {
+                job: job.id,
+                context,
+                source: accepted_source,
+            });
+        }
         let previous: Option<String> = tx
             .query_row(
                 "SELECT data FROM worker_completions WHERE job=?1",
@@ -662,6 +690,7 @@ mod tests {
             adopted.completed_job.as_ref().unwrap().status,
             nzbd_types::JobStatus::Paused
         );
+        let late = adopted.completed_job.as_ref().unwrap().clone();
         let source = SourceGeneration {
             artifact: adopted.source.id,
             generation: adopted.source.generation,
@@ -676,6 +705,7 @@ mod tests {
         assert!(inventory
             .acknowledge_worker_completion(42, &next, &source, &proof)
             .unwrap());
+        inventory.prepare_worker_completion(&late).unwrap();
         let count: i64 = inventory
             .db
             .lock()
