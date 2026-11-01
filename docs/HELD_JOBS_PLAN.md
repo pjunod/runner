@@ -1,6 +1,7 @@
 # Held jobs — why a hold can strand a job, and the fix
 
-**Status:** proposed · revised after adversarial review (rev 2) · **Base:**
+**Status:** built on `fix/held-jobs-always-have-an-exit` (rev 2, after
+adversarial review; §8 lists where the build differs) · **Base:**
 `a253562` (main, 2026-11-01) · **Written:** 2026-11-01 · **Field report:**
 jobs #2181 and #2183 on nuc3
 
@@ -326,8 +327,8 @@ pub(crate) fn retry_hold(&mut self, job: JobId, revision: &str,
 
 New `QueueCommand::RescheduleHold { job, revision, reason }` moves the
 next attempt out on the same backoff, with the refusal appended to the
-message. `RetryPostHold` becomes `retry_hold(…, custody_checked: true)` and
-loses its cause and stage allow-lists. The stage list already named every
+message. `RetryPostHold` is removed: `EngineHandle::retry_post_hold` is now
+`release_hold(…, Operator)`, and its cause and stage allow-lists go with it. The stage list already named every
 `PostStage`, so it guarded nothing, and an unrecognised cause must not
 strand a job. `ReleaseResourceHold` and `BeginResourceProbe` keep their
 jobs for storage holds.
@@ -481,3 +482,19 @@ classification is unaffected. #2181's message would have read `io: read
   or `review` hold. `/api/v1/logs` shows `hold released` lines for both.
 - Next real mount blip: held rows read `next retry in 30s`, a `pause`
   button is present, and they clear without a click.
+
+## 8. Where the build differs from this plan
+
+- **The two message-matched boot releases stay** (§3.5, §4.7). They still
+  release two legacy holds automatically; with an operator exit on every
+  hold they are redundant, not harmful, and deleting them is a separate
+  change with its own e2e test (`legacy_coverage_hold_recovers_…`).
+- **`ManagerCommand::RetryNow`** (the detail panel's *Retry now* for
+  lifecycle work) accepts any hold and calls `release_hold(Operator)`; the
+  web detail panel sends held jobs through `resume` instead, so the button
+  works for legacy rows too.
+- **Mobile** gets `src/holdAction.ts` (pure, jest-tested) for the card's
+  *Pause retries* / *Retry* control.
+- **`EngineHandle::run_hold_recovery_pass`** exposes one pass for tests and
+  future tooling; the e2e `stranded_storage_hold_recovers_after_restart_…`
+  drives #2183's exact stored state through a restart and a pass.
