@@ -15,6 +15,7 @@ use std::{path::PathBuf, sync::Arc};
 pub fn router() -> Router<ApiState> {
     Router::new()
         .route("/api/v1/deliveries", get(deliveries))
+        .route("/api/v1/url-resolution-faults", get(url_resolution_faults))
         .route("/api/v1/deliveries/{id}", get(delivery))
         .route("/api/v1/deliveries/{id}/accept", post(accept_delivery))
         .route(
@@ -87,6 +88,13 @@ mod delivery_query_tests {
         assert_eq!(page.after, 41);
         assert_eq!(page.limit, Some(100));
         assert!(page.include_accepted);
+    }
+}
+
+async fn url_resolution_faults(State(st): State<ApiState>) -> Response {
+    match st.engine.url_resolution_faults(100).await {
+        Ok(faults) => Json(json!({"faults": faults})).into_response(),
+        Err(failure) => error(StatusCode::SERVICE_UNAVAILABLE, &failure.to_string()),
     }
 }
 

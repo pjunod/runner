@@ -63,6 +63,56 @@ pub fn is_out_of_space(msg: &str) -> bool {
         || lower.contains("no storage space")
 }
 
+#[cfg(test)]
+pub(crate) static URL_PREPARATION_GATE: std::sync::Mutex<
+    Option<(
+        String,
+        std::sync::Arc<(std::sync::Barrier, std::sync::Barrier)>,
+    )>,
+> = std::sync::Mutex::new(None);
+fn url_preparation_checkpoint(identity: &str) {
+    #[cfg(test)]
+    {
+        let gate = {
+            let mut configured = URL_PREPARATION_GATE.lock().unwrap();
+            if configured
+                .as_ref()
+                .is_some_and(|(expected, _)| expected == identity)
+            {
+                configured.take().map(|(_, gate)| gate)
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.0.wait();
+            gate.1.wait();
+        }
+    }
+    let _ = identity;
+}
+
+fn url_retry_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn url_storage_error(error: nzbd_state::artifacts::Error) -> EngineError {
+    match error {
+        nzbd_state::artifacts::Error::Io(source) => {
+            EngineError::State(nzbd_state::StateError::Io {
+                op: "persist URL source",
+                path: PathBuf::from("url-resolutions"),
+                source,
+            })
+        }
+        nzbd_state::artifacts::Error::NotFound => EngineError::OwnershipLost,
+        other => EngineError::Lifecycle(other.to_string()),
+    }
+}
+
 fn fetch_retry_state(job: &Job) -> crate::fetch::FetchRetryState {
     let value = |key: &str| {
         job.params
@@ -95,6 +145,8 @@ pub enum EngineError {
     RequestConflict(String),
     #[error("request-token admission could not be durably saved")]
     AdmissionNotDurable,
+    #[error("queue authority was lost; durable URL work is retained for its owner")]
+    OwnershipLost,
     #[error("engine is shutting down")]
     Closed,
 }
@@ -306,6 +358,24 @@ impl Engine {
         let mut owner = owner;
         owner.seed_snapshot();
         let artifacts = owner.artifacts.clone();
+        let url_resolutions = owner.url_resolutions.clone();
+        {
+            let store = url_resolutions.clone();
+            let stop = cancel.clone();
+            tracker.spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                loop {
+                    tokio::select! { _ = stop.cancelled() => break, _ = interval.tick() => {} }
+                    let store = store.clone();
+                    match tokio::task::spawn_blocking(move || store.maintenance(25)).await {
+                        Ok(Ok(_)) => {}
+                        outcome => {
+                            tracing::warn!(?outcome, "URL cache maintenance requires review")
+                        }
+                    }
+                }
+            });
+        }
         {
             let inventory = artifacts.clone();
             let stop = cancel.clone();
@@ -401,6 +471,10 @@ impl Engine {
 
         let handle = EngineHandle {
             artifacts,
+            url_resolutions,
+            url_dest_dir: cfg.dest_dir.clone(),
+            url_history: cfg.history.clone(),
+            url_outbox_external: cfg.persist_guard.is_some(),
             cmd_tx: engine_tx,
             shared,
             events,
@@ -563,6 +637,10 @@ fn validate_external_params(params: &[(String, String)]) -> Result<(), EngineErr
 #[derive(Clone)]
 pub struct EngineHandle {
     artifacts: Arc<nzbd_state::artifacts::Inventory>,
+    url_resolutions: Arc<nzbd_state::artifacts::UrlResolutionStore>,
+    url_dest_dir: PathBuf,
+    url_history: Option<Arc<nzbd_state::history::HistoryDb>>,
+    url_outbox_external: bool,
     cmd_tx: mpsc::Sender<EngineMsg>,
     shared: SharedSnapshot,
     events: broadcast::Sender<Event>,
@@ -785,76 +863,334 @@ impl EngineHandle {
     /// fetch aborts on cancel instead of holding graceful shutdown open for
     /// up to the 60 s hop timeout.
     fn spawn_url_fetch(&self, id: JobId, url: String, retry_state: crate::fetch::FetchRetryState) {
-        if let Ok(mut jobs) = self.url_fetches.lock() {
-            if !jobs.insert(id) {
-                return;
-            }
-        } else {
+        if !self
+            .url_fetches
+            .lock()
+            .is_ok_and(|mut jobs| jobs.insert(id))
+        {
             return;
         }
         let handle = self.clone();
         self.tracker.spawn(async move {
             let _fetch_guard = UrlFetchGuard { jobs: handle.url_fetches.clone(), job: id };
-            let mut events = handle.subscribe();
-            let fetched = tokio::select! {
-                _ = handle.cancel.cancelled() => return, // shutting down
-                _ = async {
-                    loop {
-                        match events.recv().await {
+            let Some(origin) = handle.export_job(id).await.ok().flatten() else { return; };
+            let identity = match nzbd_state::artifacts::url_source_identity(&origin) { Ok(identity) => identity, Err(_) => return };
+            let mut storage_retry = nzbd_state::artifacts::UrlStorageRetry::default();
+            let retry_store = handle.url_resolutions.clone(); let retry_id = identity.clone();
+            if let Ok(Ok(Some(retry))) = tokio::task::spawn_blocking(move || retry_store.retry(&retry_id)).await {
+                let seconds = retry.next_retry_at.saturating_sub(url_retry_now()).max(0) as u64;
+                storage_retry = retry;
+                tokio::select! { _ = handle.cancel.cancelled() => return, _ = tokio::time::sleep(Duration::from_secs(seconds)) => {} }
+            }
+            let mut failure = None;
+            let mut received = loop {
+                let store = handle.url_resolutions.clone(); let cached_origin = origin.clone();
+                match tokio::task::spawn_blocking(move || store.source(&cached_origin)).await {
+                    Ok(Ok(bytes)) => break bytes,
+                    Ok(Err(nzbd_state::artifacts::Error::NotFound)) => return,
+                    Ok(Err(nzbd_state::artifacts::Error::Io(error))) => {
+                        if !handle.wait_url_storage_retry(&origin, &identity, &format!("cached NZB source read: {error}"), &mut storage_retry).await { return; }
+                    }
+                    error => { failure = Some(format!("durable URL source requires review: {error:?}")); break None; }
+                }
+            };
+            if received.is_none() && failure.is_none() {
+                let mut events = handle.subscribe();
+                let fetched = tokio::select! {
+                    _ = handle.cancel.cancelled() => return,
+                    _ = async {
+                        loop { match events.recv().await {
                             Ok(Event::JobDeleted { job }) if job == id => break,
                             Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
                             Err(broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                } => return,
-                r = crate::fetch::http_get_observed(&url, retry_state, {
-                    let progress_handle = handle.clone();
-                    move |progress| {
-                        let progress_handle = progress_handle.clone();
-                        async move {
-                            loop {
-                                if progress_handle.cancel.is_cancelled() {
-                                    return false;
-                                }
-                                match progress_handle.record_url_fetch_progress(id, progress.clone()).await {
-                                    Ok(active) => return active,
-                                    Err(error) => {
-                                        tracing::warn!(job = id.0, %error, "could not persist URL fetch retry progress; waiting before retrying persistence");
-                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        }}
+                    } => return,
+                    result = crate::fetch::http_get_observed(&url, retry_state, {
+                        let progress_handle = handle.clone();
+                        let progress_origin = origin.clone();
+                        let progress_identity = identity.clone();
+                        move |progress| {
+                            let handle = progress_handle.clone(); let origin = progress_origin.clone(); let identity = progress_identity.clone();
+                            async move {
+                                let mut retry = nzbd_state::artifacts::UrlStorageRetry::default();
+                                loop {
+                                    if handle.cancel.is_cancelled() { return false; }
+                                    match handle.record_url_fetch_progress(id, progress.clone()).await {
+                                        Ok(active) => return active,
+                                        Err(EngineError::OwnershipLost | EngineError::Closed) => return false,
+                                        Err(error) => if !handle.wait_url_storage_retry_after(&origin, &identity, &error.to_string(), &mut retry, progress.next_retry_at).await { return false; },
                                     }
                                 }
                             }
                         }
-                    }
-                }) => r,
-            };
-            if matches!(fetched, Err(crate::fetch::FetchError::Cancelled)) {
-                return;
-            }
-            let outcome = match fetched {
-                Ok(bytes) => match nzbd_nzb::parse(&bytes) {
-                    Ok(parsed) => Ok(parsed),
-                    Err(e) => Err(format!("nzb parse: {e}")),
-                },
-                Err(e) => Err(e.to_string()),
-            };
-            match outcome {
-                Ok(parsed) => {
-                    let (tx, rx) = oneshot::channel();
-                    let _ = handle
-                        .send(QueueCommand::CompleteUrlFetch {
-                            job: id,
-                            parsed: Box::new(parsed),
-                            reply: tx,
-                        })
-                        .await;
-                    let _ = rx.await;
+                    }) => result,
+                };
+                match fetched {
+                    Ok(bytes) => received = Some(bytes),
+                    Err(crate::fetch::FetchError::Cancelled) => return,
+                    Err(error) => failure = Some(error.to_string()),
                 }
-                Err(error) => {
-                    let _ = handle.fail_url_fetch(id, error).await;
+            }
+            if let Some(mut bytes) = received {
+                loop {
+                    let store = handle.url_resolutions.clone(); let source_origin = origin.clone();
+                    // Move the one received buffer through storage retries;
+                    // no per-second cloning or parsing on the queue actor.
+                    let candidate = bytes;
+                    match tokio::task::spawn_blocking(move || { let result = store.cache_source(&source_origin, &candidate); (result, candidate) }).await {
+                        Ok((Ok(_), _)) => break,
+                        Ok((Err(nzbd_state::artifacts::Error::NotFound), _)) => return,
+                        Ok((Err(nzbd_state::artifacts::Error::Conflict(message)), _)) => { failure = Some(message); break; }
+                        Ok((Err(error), retained)) => {
+                            bytes = retained;
+                            if !handle.wait_url_storage_retry(&origin, &identity, &error.to_string(), &mut storage_retry).await { return; }
+                        }
+                        Err(_) => return,
+                    }
+                }
+            }
+            loop {
+                if handle.cancel.is_cancelled() { return; }
+                let prepared = match handle.prepare_url_resolution(&origin, failure.clone()).await {
+                    Ok(prepared) => prepared,
+                    Err(EngineError::OwnershipLost | EngineError::Closed) => return,
+                    Err(EngineError::Lifecycle(message)) => {
+                        // Size/identity/parse constraints are permanent for this
+                        // input. Persist an actionable failed disposition once.
+                        if failure.as_deref() == Some(&message) {
+                            let _ = handle.hold_job(id, "identity_conflict", "url_fetch", &message).await;
+                            tracing::error!(job=id.0, %message, "URL source retained for review"); return;
+                        }
+                        failure = Some(message); continue;
+                    }
+                    Err(error) => {
+                        if !handle.wait_url_storage_retry(&origin, &identity, &error.to_string(), &mut storage_retry).await { return; }
+                        continue;
+                    }
+                };
+                let (tx, rx) = oneshot::channel();
+                if handle.send(QueueCommand::CompleteUrlFetch { job: id, source_identity: identity.clone(), prepared: Box::new(prepared), reply: tx }).await.is_err() { return; }
+                match rx.await {
+                    Ok(Ok(true)) => {
+                        if !handle.url_outbox_external {
+                            loop {
+                                let store = handle.url_resolutions.clone(); let acknowledgement = identity.clone();
+                                match tokio::task::spawn_blocking(move || store.acknowledge(&acknowledgement)).await {
+                                    Ok(Ok(_)) => break,
+                                    error => if !handle.wait_url_storage_retry(&origin, &identity, &format!("URL queue commit is durable; outbox compaction pending: {error:?}"), &mut storage_retry).await { return; },
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    Ok(Ok(false)) | Ok(Err(EngineError::OwnershipLost)) | Err(_) => return,
+                    Ok(Err(error)) => if !handle.wait_url_storage_retry(&origin, &identity, &error.to_string(), &mut storage_retry).await { return; },
                 }
             }
         });
+    }
+
+    async fn wait_url_storage_retry(
+        &self,
+        origin: &Job,
+        identity: &str,
+        message: &str,
+        fallback: &mut nzbd_state::artifacts::UrlStorageRetry,
+    ) -> bool {
+        self.wait_url_storage_retry_after(origin, identity, message, fallback, None)
+            .await
+    }
+    async fn wait_url_storage_retry_after(
+        &self,
+        origin: &Job,
+        identity: &str,
+        message: &str,
+        fallback: &mut nzbd_state::artifacts::UrlStorageRetry,
+        not_before: Option<i64>,
+    ) -> bool {
+        let store = self.url_resolutions.clone();
+        let id = identity.to_owned();
+        let error = message.to_owned();
+        let retry = match tokio::task::spawn_blocking(move || {
+            store.schedule_storage_retry_not_before(&id, &error, not_before)
+        })
+        .await
+        {
+            Ok(Ok(retry)) => retry,
+            _ => {
+                let now = url_retry_now();
+                nzbd_state::artifacts::UrlStorageRetry {
+                    attempts: fallback.attempts.saturating_add(1),
+                    next_retry_at: nzbd_state::artifacts::url_storage_retry_deadline(
+                        identity,
+                        fallback.attempts,
+                        now,
+                        fallback.next_retry_at,
+                        not_before,
+                    ),
+                    blocked_since: if fallback.blocked_since == 0 {
+                        now
+                    } else {
+                        fallback.blocked_since
+                    },
+                    error: message.chars().take(4096).collect(),
+                }
+            }
+        };
+        *fallback = retry.clone();
+        let warning = url_retry_now().saturating_sub(retry.blocked_since) >= 1800;
+        tracing::warn!(job=origin.id.0, attempts=retry.attempts, next_retry=retry.next_retry_at, warning, error=%retry.error, "URL storage commit pending; durable source retained");
+        let progress = crate::fetch::FetchRetryState {
+            attempts: retry.attempts,
+            next_retry_at: Some(retry.next_retry_at),
+            blocked_since: Some(retry.blocked_since),
+            last_error: Some(format!(
+                "storage: {}{}",
+                retry.error,
+                if warning {
+                    "; warning: blocked for at least 30 minutes"
+                } else {
+                    ""
+                }
+            )),
+        };
+        if matches!(
+            self.record_url_fetch_progress(origin.id, progress).await,
+            Err(EngineError::OwnershipLost | EngineError::Closed)
+        ) {
+            return false;
+        }
+        let seconds = retry.next_retry_at.saturating_sub(url_retry_now()).max(0) as u64;
+        tokio::select! { _ = self.cancel.cancelled() => false, _ = tokio::time::sleep(Duration::from_secs(seconds)) => true }
+    }
+
+    async fn prepare_url_resolution(
+        &self,
+        origin: &Job,
+        failure: Option<String>,
+    ) -> Result<nzbd_state::artifacts::UrlResolutionRecord, EngineError> {
+        let store = self.url_resolutions.clone();
+        let source_origin = origin.clone();
+        let identity = nzbd_state::artifacts::url_source_identity(origin)
+            .map_err(|error| EngineError::Lifecycle(error.to_string()))?;
+        let record_id = identity.clone();
+        let history = self.url_history.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            if store.is_cancelled(&source_origin)? {
+                return Err(nzbd_state::artifacts::Error::NotFound);
+            }
+            if let Some(record) = store.record(&record_id)? {
+                return Ok(Err(record));
+            }
+            let parsed = match failure {
+                Some(error) => Err(error),
+                None => {
+                    let bytes = store.source(&source_origin)?.ok_or_else(|| {
+                        nzbd_state::artifacts::Error::Conflict(
+                            "durable NZB source unavailable".into(),
+                        )
+                    })?;
+                    if let Some(history) = history {
+                        history
+                            .spool_nzb(source_origin.id, &bytes)
+                            .map_err(|error| {
+                                nzbd_state::artifacts::Error::Io(std::io::Error::other(
+                                    error.to_string(),
+                                ))
+                            })?;
+                    }
+                    url_preparation_checkpoint(&record_id);
+                    nzbd_nzb::parse(&bytes).map_err(|error| format!("nzb parse: {error}"))
+                }
+            };
+            Ok(Ok(parsed))
+        })
+        .await
+        .map_err(|_| EngineError::Closed)?
+        .map_err(url_storage_error)?;
+        let parsed = match outcome {
+            Err(record) => return Ok(record),
+            Ok(parsed) => parsed,
+        };
+        let count = parsed
+            .as_ref()
+            .map(|parsed| parsed.files.len())
+            .unwrap_or(0);
+        let count = u32::try_from(count)
+            .map_err(|_| EngineError::Lifecycle("NZB contains too many files".into()))?;
+        let first = if count == 0 {
+            0
+        } else {
+            let (tx, rx) = oneshot::channel();
+            self.send(QueueCommand::ReserveUrlFiles {
+                job: origin.id,
+                source_identity: identity.clone(),
+                count,
+                reply: tx,
+            })
+            .await?;
+            rx.await.map_err(|_| EngineError::Closed)??
+        };
+        let store = self.url_resolutions.clone();
+        let origin = origin.clone();
+        let root = self.url_dest_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut staging = queue::QueueState::default(); staging.jobs.push(origin.clone());
+            match parsed {
+                Ok(parsed) => {
+                    let reservation = store.reserve_files(&origin, first, count)?;
+                    staging.next_file_id = reservation.first_file_id.saturating_sub(1);
+                    staging.complete_url_fetch(origin.id, &parsed, true);
+                    let base = queue::job_dir_name(&staging.jobs[0]);
+                    // A stable admission suffix prevents concurrently prepared
+                    // URLs from claiming the same uncreated directory.
+                    staging.jobs[0].dir_name = format!("{base}.job-{}-url-{}", origin.id.0, &identity[..12]);
+                    if root.join(&staging.jobs[0].dir_name).symlink_metadata().is_ok() {
+                        // Existing bytes require the same durable preparation;
+                        // only stage() replay may authorize reuse of that path.
+                        return Err(nzbd_state::artifacts::Error::Conflict("URL publication directory already exists; retained bytes require review".into()));
+                    }
+                }
+                Err(error) => {
+                    staging.jobs[0].status = nzbd_types::JobStatus::Failed;
+                    staging.jobs[0].params.extend([("Failure:Stage".into(), "url_fetch".into()), ("Failure:Reason".into(), error.chars().take(2048).collect())]);
+                }
+            }
+            store.stage(&origin, &staging.jobs[0])
+        }).await.map_err(|_| EngineError::Closed)?.map_err(url_storage_error)
+    }
+
+    /// Read durable, unacknowledged URL resolutions. Events are only hints;
+    /// cluster consumers drain this at startup and periodically after failures.
+    pub async fn url_resolution_outbox(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<nzbd_state::artifacts::UrlResolutionRecord>, EngineError> {
+        let store = self.url_resolutions.clone();
+        tokio::task::spawn_blocking(move || store.pending(limit))
+            .await
+            .map_err(|_| EngineError::Closed)?
+            .map_err(|error| EngineError::Lifecycle(error.to_string()))
+    }
+
+    pub async fn url_resolution_faults(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<nzbd_state::artifacts::UrlResolutionFault>, EngineError> {
+        let store = self.url_resolutions.clone();
+        tokio::task::spawn_blocking(move || store.faults(limit))
+            .await
+            .map_err(|_| EngineError::Closed)?
+            .map_err(url_storage_error)
+    }
+
+    pub async fn ack_url_resolution(&self, resolution_id: &str) -> Result<bool, EngineError> {
+        let store = self.url_resolutions.clone();
+        let identity = resolution_id.to_owned();
+        tokio::task::spawn_blocking(move || store.acknowledge(&identity))
+            .await
+            .map_err(|_| EngineError::Closed)?
+            .map_err(|error| EngineError::Lifecycle(error.to_string()))
     }
 
     /// Restart durable URL placeholders after cluster authority takeover.
@@ -876,14 +1212,22 @@ impl EngineHandle {
     }
 
     async fn fail_url_fetch(&self, job: JobId, error: String) -> Result<(), EngineError> {
+        let Some(origin) = self.export_job(job).await? else {
+            return Ok(());
+        };
+        let source_identity = nzbd_state::artifacts::url_source_identity(&origin)
+            .map_err(|error| EngineError::Lifecycle(error.to_string()))?;
+        let prepared = self.prepare_url_resolution(&origin, Some(error)).await?;
         let (tx, rx) = oneshot::channel();
-        self.send(QueueCommand::FailUrlFetch {
+        self.send(QueueCommand::CompleteUrlFetch {
             job,
-            error,
+            source_identity,
+            prepared: Box::new(prepared),
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        rx.await.map_err(|_| EngineError::Closed)??;
+        Ok(())
     }
 
     async fn record_url_fetch_progress(
@@ -898,7 +1242,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        rx.await.map_err(|_| EngineError::Closed)?
     }
 
     /// [`EngineHandle::add_nzb`] with the full option set (dupe metadata,

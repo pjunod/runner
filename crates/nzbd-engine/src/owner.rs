@@ -139,20 +139,22 @@ pub(crate) enum QueueCommand {
         request_token: String,
         reply: oneshot::Sender<Option<UrlAdmissionReceipt>>,
     },
+    ReserveUrlFiles {
+        job: JobId,
+        source_identity: String,
+        count: u32,
+        reply: oneshot::Sender<Result<u32, crate::EngineError>>,
+    },
     CompleteUrlFetch {
         job: JobId,
-        parsed: Box<ParsedNzb>,
-        reply: oneshot::Sender<bool>,
-    },
-    FailUrlFetch {
-        job: JobId,
-        error: String,
-        reply: oneshot::Sender<()>,
+        source_identity: String,
+        prepared: Box<nzbd_state::artifacts::UrlResolutionRecord>,
+        reply: oneshot::Sender<Result<bool, crate::EngineError>>,
     },
     UpdateUrlFetchProgress {
         job: JobId,
         progress: crate::fetch::FetchRetryState,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<Result<bool, crate::EngineError>>,
     },
     SetFilePaused {
         job: JobId,
@@ -650,6 +652,7 @@ pub(crate) struct Owner {
     journal: JobJournals,
     snap_store: SnapshotStore,
     pending_sources: nzbd_state::torrent_sources::PendingSourceStore,
+    pub(crate) url_resolutions: Arc<nzbd_state::artifacts::UrlResolutionStore>,
     /// How long the last snapshot write took — feeds [`save_spacing`], so a
     /// slow state volume stretches the save cadence instead of consuming
     /// the owner loop.
@@ -843,6 +846,10 @@ impl Owner {
         let was_unclean = marker.check_and_arm()?;
         let snap_store = SnapshotStore::open(state_dir)?;
         let pending_sources = nzbd_state::torrent_sources::PendingSourceStore::open(state_dir)?;
+        let url_resolutions = Arc::new(
+            nzbd_state::artifacts::UrlResolutionStore::open(state_dir)
+                .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?,
+        );
         let journal = JobJournals::open(state_dir, journal_suffix)?;
 
         let mut state = QueueState::default();
@@ -855,6 +862,21 @@ impl Owner {
                 // daemon associates their paused backend handles. Cluster
                 // takeover retains its separate unsupported-protocol guard.
                 state = QueueState::from_doc(doc);
+            }
+            let mut retired = HashSet::new();
+            for job in &state.jobs {
+                if url_resolutions
+                    .is_retired(job)
+                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
+                {
+                    retired.insert(job.id);
+                }
+            }
+            state.jobs.retain(|job| !retired.contains(&job.id));
+            for receipt in &mut state.url_admission_receipts {
+                if retired.contains(&JobId(receipt.job_id)) && receipt.custody_state != "curator" {
+                    receipt.outcome = "deleted".into();
+                }
             }
 
             artifacts
@@ -1039,6 +1061,11 @@ impl Owner {
                 }
             }
         }
+        state.next_file_id = state.next_file_id.max(
+            url_resolutions
+                .reserved_file_id()
+                .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?,
+        );
         let initial_disk_hold = tuning.min_free_disk_bytes > 0;
         Ok(Owner {
             state,
@@ -1073,6 +1100,7 @@ impl Owner {
             journal,
             snap_store,
             pending_sources,
+            url_resolutions,
             marker,
             persist,
             persistence_fenced: false,
@@ -1620,6 +1648,18 @@ impl Owner {
                 let id = self.state.admit_url(name.clone(), &url, category, priority);
                 if let Some(j) = self.state.job_mut(id) {
                     mark_new_lifecycle_cohort(j);
+                    j.params.push((
+                        "*URL:AdmissionGeneration".into(),
+                        format!(
+                            "{}-{}-{}",
+                            self.artifacts.installation,
+                            id.0,
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos()
+                        ),
+                    ));
                     if let Some(dupe) = dupe {
                         j.dupe = dupe;
                     }
@@ -1703,69 +1743,55 @@ impl Owner {
                 let receipt = self.state.url_admission_receipts[index].clone();
                 let _ = reply.send(Some(receipt));
             }
-            QueueCommand::CompleteUrlFetch { job, parsed, reply } => {
-                let ok = self
+            QueueCommand::ReserveUrlFiles {
+                job,
+                source_identity,
+                count,
+                reply,
+            } => {
+                let result = if self.persistence_fenced || !self.persist {
+                    Err(crate::EngineError::OwnershipLost)
+                } else if self
                     .state
-                    .complete_url_fetch(job, &parsed, self.tuning.pause_extra_pars);
-                if ok {
-                    if let Some(j) = self.state.job_mut(job) {
-                        if let Some(pos) = j.params.iter().position(|(k, _)| k == "*AddPaused") {
-                            j.params.remove(pos);
-                            j.status = JobStatus::Paused;
-                        }
-                    }
-                    // `complete_url_fetch` has just re-run the evidence
-                    // pass against the fetched NZB. If that still came up
-                    // with nothing, fall back to who asked. Still no files
-                    // on disk, so the directory follows the name.
-                    self.name_from_requestor(job, true);
-                    // URL admissions need the same fresh allocation as direct
-                    // uploads. A retained release directory belongs to the old
-                    // job, even when the newly fetched NZB has the same name.
-                    if let Err(error) = self.allocate_new_payload(job) {
-                        self.hold_job(
-                            job,
-                            "allocation",
-                            "download_write",
-                            &format!("payload allocation: {error}"),
-                        );
-                    }
-                    tracing::info!(job = job.0, "url fetch complete");
-                    self.save_snapshot();
-                    self.publish_now();
-                    self.emit(Event::UrlFetchResolved { job });
-                    self.bump_epoch();
-                }
-                let _ = reply.send(ok);
-            }
-            QueueCommand::FailUrlFetch { job, error, reply } => {
-                let name = match self.state.job_mut(job) {
-                    Some(j) if matches!(j.status, JobStatus::Fetching) => {
-                        j.status = JobStatus::Failed;
-                        Some(j.name.clone())
-                    }
-                    _ => None,
+                    .job(job)
+                    .filter(|row| row.status == JobStatus::Fetching)
+                    .and_then(|row| nzbd_state::artifacts::url_source_identity(row).ok())
+                    .as_deref()
+                    != Some(&source_identity)
+                {
+                    Err(crate::EngineError::OwnershipLost)
+                } else if let Some(maximum) = self.state.next_file_id.checked_add(count) {
+                    let first = self.state.next_file_id.saturating_add(1);
+                    self.state.next_file_id = maximum;
+                    self.dirty = true;
+                    Ok(first)
+                } else {
+                    Err(crate::EngineError::Lifecycle(
+                        "NZB file IDs exhausted".into(),
+                    ))
                 };
-                if let Some(name) = name {
-                    tracing::warn!(job = job.0, %error, "url fetch failed");
-                    self.save_snapshot();
-                    self.publish_now();
-                    self.emit(Event::JobFinished {
-                        job,
-                        name,
-                        status: JobStatus::Failed,
-                        health: 0,
-                    });
-                    self.emit(Event::UrlFetchResolved { job });
-                    self.bump_epoch();
-                }
-                let _ = reply.send(());
+                let _ = reply.send(result);
+            }
+            QueueCommand::CompleteUrlFetch {
+                job,
+                source_identity,
+                prepared,
+                reply,
+            } => {
+                let result = self.apply_url_resolution(job, &source_identity, *prepared);
+                let _ = reply.send(result);
             }
             QueueCommand::UpdateUrlFetchProgress {
                 job,
                 progress,
                 reply,
             } => {
+                let before = self.state.job(job).cloned();
+                let receipts = self.state.url_admission_receipts.clone();
+                if self.persistence_fenced || !self.persist {
+                    let _ = reply.send(Err(crate::EngineError::OwnershipLost));
+                    return;
+                }
                 let changed = if let Some(record) = self
                     .state
                     .job_mut(job)
@@ -1795,13 +1821,19 @@ impl Owner {
                 } else {
                     false
                 };
-                let durable = if changed {
+                let result = if !changed {
+                    Ok(false)
+                } else if self.persist && self.save_snapshot() {
                     self.publish_now();
-                    self.save_snapshot()
+                    Ok(true)
                 } else {
-                    false
+                    if let Some(before) = before {
+                        *self.state.job_mut(job).unwrap() = before;
+                    }
+                    self.state.url_admission_receipts = receipts;
+                    Err(crate::EngineError::AdmissionNotDurable)
                 };
-                let _ = reply.send(durable);
+                let _ = reply.send(result);
             }
             QueueCommand::SetFilePaused {
                 job,
@@ -1866,6 +1898,27 @@ impl Owner {
                 let _ = reply.send(ok);
             }
             QueueCommand::Pause { job, reply } => {
+                if self
+                    .state
+                    .job(job)
+                    .is_some_and(|row| row.status == JobStatus::Fetching)
+                {
+                    let before = self.state.job(job).unwrap().clone();
+                    set_owner_param(
+                        &mut self.state.job_mut(job).unwrap().params,
+                        "*AddPaused",
+                        Some("yes".into()),
+                    );
+                    let ok = self.persist && !self.persistence_fenced && self.save_snapshot();
+                    if ok {
+                        self.publish_now();
+                    } else {
+                        *self.state.job_mut(job).unwrap() = before;
+                    }
+                    let _ = reply.send(ok);
+                    return;
+                }
+
                 if let Some(mut control) = self
                     .state
                     .job(job)
@@ -1937,6 +1990,27 @@ impl Owner {
                 let _ = reply.send(ok);
             }
             QueueCommand::Resume { job, reply } => {
+                if self
+                    .state
+                    .job(job)
+                    .is_some_and(|row| row.status == JobStatus::Fetching)
+                {
+                    let before = self.state.job(job).unwrap().clone();
+                    self.state
+                        .job_mut(job)
+                        .unwrap()
+                        .params
+                        .retain(|(key, _)| key != "*AddPaused");
+                    let ok = self.persist && !self.persistence_fenced && self.save_snapshot();
+                    if ok {
+                        self.publish_now();
+                    } else {
+                        *self.state.job_mut(job).unwrap() = before;
+                    }
+                    let _ = reply.send(ok);
+                    return;
+                }
+
                 // Resource/custody release has its own admission protocol. Manual
                 // resume cannot erase a hold merely because statvfs looks healthy.
                 if self.state.job(job).is_some_and(|j| j.held()) {
@@ -3005,6 +3079,105 @@ impl Owner {
     }
 
     // -- cluster: import / export / delegation / adoption --------------------
+
+    fn apply_url_resolution(
+        &mut self,
+        job: JobId,
+        identity: &str,
+        prepared: nzbd_state::artifacts::UrlResolutionRecord,
+    ) -> Result<bool, crate::EngineError> {
+        if self.persistence_fenced || !self.persist {
+            return Err(crate::EngineError::OwnershipLost);
+        }
+        let Some(before) = self
+            .state
+            .job(job)
+            .filter(|row| row.status == JobStatus::Fetching)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        let source_identity = nzbd_state::artifacts::url_source_identity(&before)
+            .map_err(|error| crate::EngineError::Lifecycle(error.to_string()))?;
+        if identity != source_identity
+            || prepared.resolution_id != identity
+            || prepared.source_identity != identity
+            || prepared.origin.id != job
+            || prepared.resolved.id != job
+        {
+            return Ok(false);
+        }
+        let receipts = self.state.url_admission_receipts.clone();
+        let prior_allocated = self.allocated_jobs.clone();
+        let failed = prepared.resolved.status == JobStatus::Failed;
+        let row = self.state.job_mut(job).unwrap();
+        // Bulk parsing, hashes and outbox fsync completed off the actor. Only
+        // immutable file facts are applied here; current user intent wins.
+        if row.name == prepared.origin.name
+            && row.name_provisional == prepared.origin.name_provisional
+        {
+            row.name = prepared.resolved.name;
+            row.name_provisional = prepared.resolved.name_provisional;
+        }
+        if row.category.is_none() && prepared.origin.category.is_none() {
+            row.category = prepared.resolved.category;
+        }
+        if row.dir_name == prepared.origin.dir_name {
+            row.dir_name = prepared.resolved.dir_name;
+        }
+        row.files = prepared.resolved.files;
+        row.totals = prepared.resolved.totals;
+        row.status = if failed {
+            JobStatus::Failed
+        } else if row.params.iter().any(|(key, _)| key == "*AddPaused") {
+            JobStatus::Paused
+        } else {
+            JobStatus::Queued
+        };
+        row.params.retain(|(key, _)| key != "*AddPaused");
+        for (key, value) in prepared
+            .resolved
+            .params
+            .into_iter()
+            .filter(|(key, _)| matches!(key.as_str(), "Failure:Stage" | "Failure:Reason"))
+        {
+            set_owner_param(&mut row.params, &key, Some(value));
+        }
+        let maximum_file_id = row.files.iter().map(|file| file.id.0).max().unwrap_or(0);
+        self.state.next_file_id = self.state.next_file_id.max(maximum_file_id);
+        if !failed {
+            if let Err(error) = self.ensure_allocation(job, true) {
+                self.hold_job(
+                    job,
+                    "allocation",
+                    "download_write",
+                    &format!("payload allocation: {error}"),
+                );
+            }
+        }
+        if !self.save_snapshot() {
+            *self.state.job_mut(job).unwrap() = before;
+            self.state.url_admission_receipts = receipts;
+            self.allocated_jobs = prior_allocated;
+            return Err(if self.persistence_fenced {
+                crate::EngineError::OwnershipLost
+            } else {
+                crate::EngineError::AdmissionNotDurable
+            });
+        }
+        self.publish_now();
+        self.emit(Event::UrlFetchResolved { job });
+        if failed {
+            self.emit(Event::JobFinished {
+                job,
+                name: self.state.job(job).unwrap().name.clone(),
+                status: JobStatus::Failed,
+                health: 0,
+            });
+        }
+        self.bump_epoch();
+        Ok(true)
+    }
 
     /// A worker owns no shared queue snapshot. Its retry intent commits to
     /// the local inventory under the exact lease/source tuple instead.
@@ -4450,6 +4623,11 @@ impl Owner {
     /// jobs must retain their committed allocation and go through ownership
     /// review if it becomes unavailable.
     fn allocate_new_payload(&mut self, job: JobId) -> Result<(), nzbd_state::artifacts::Error> {
+        self.choose_new_payload_name(job)?;
+        self.ensure_allocation(job, true)
+    }
+
+    fn choose_new_payload_name(&mut self, job: JobId) -> Result<(), nzbd_state::artifacts::Error> {
         let record = self
             .state
             .job(job)
@@ -4476,7 +4654,7 @@ impl Owner {
                 })?;
             }
         }
-        self.ensure_allocation(job, true)
+        Ok(())
     }
 
     fn ensure_allocation(
@@ -4687,6 +4865,9 @@ impl Owner {
         let Some(idx) = self.state.jobs.iter().position(|j| j.id == job_id) else {
             return false;
         };
+        if self.persistence_fenced || !self.persist {
+            return false;
+        }
         let retiring = match self.artifacts.prepare_forget(job_id.0) {
             Ok(a) => a,
             Err(e) => {
@@ -4694,11 +4875,15 @@ impl Owner {
                 return false;
             }
         };
+        if let Err(error) = self.url_resolutions.retire_job(&self.state.jobs[idx]) {
+            tracing::error!(job=job_id.0, %error, "queue retirement is not durable; source retained");
+            return false;
+        }
         let mut stopping = self.retiring_writers.remove(&job_id).unwrap_or_default();
         self.allocated_jobs.remove(&job_id);
         let job = self.state.jobs.remove(idx);
         for receipt in &mut self.state.url_admission_receipts {
-            if receipt.job_id == job_id.0 {
+            if receipt.job_id == job_id.0 && receipt.custody_state != "curator" {
                 receipt.outcome = "deleted".into();
             }
         }
@@ -4743,7 +4928,12 @@ impl Owner {
         // Destructive requests are completed by EngineHandle's inventory
         // coordinator before this queue retirement command is sent.
         tracing::info!(job = job_id.0, name = %job.name, delete_files, "job deleted");
-        self.save_snapshot();
+        if !self.save_snapshot() {
+            tracing::warn!(
+                job = job_id.0,
+                "queue snapshot retirement pending; exact admission tombstone is durable"
+            );
+        }
         self.publish_now();
         self.emit(Event::JobDeleted { job: job_id });
         self.bump_epoch();
@@ -7348,6 +7538,453 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn url_bulk_preparation_does_not_block_live_controls() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let post = nzbd_nserv::build_post("bulk", &[("payload.bin", vec![7; 100])], 100);
+        let id = owner.state.admit_url(
+            "bulk".into(),
+            "http://127.0.0.1:9/source.nzb",
+            Some("before".into()),
+            0,
+        );
+        let origin = owner.state.job(id).unwrap().clone();
+        let identity = nzbd_state::artifacts::url_source_identity(&origin).unwrap();
+        assert!(owner.save_snapshot());
+        owner
+            .url_resolutions
+            .cache_source(&origin, post.nzb.as_bytes())
+            .unwrap();
+        let gate = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        *crate::URL_PREPARATION_GATE.lock().unwrap() = Some((identity, gate.clone()));
+        let state = owner.state_dir.clone();
+        let dest = owner.dest_dir.clone();
+        drop(owner);
+        let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
+            Vec::new(),
+            state,
+            dest,
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let entered = gate.clone();
+        tokio::task::spawn_blocking(move || entered.0.wait())
+            .await
+            .unwrap();
+        let changed = tokio::time::timeout(Duration::from_secs(2), async {
+            assert!(engine.set_priority(id, 99).await.unwrap());
+            assert!(engine.set_category(id, None).await.unwrap());
+            assert!(engine.set_keep_on_failure(id, true).await.unwrap());
+            assert!(engine.pause_job(id).await.unwrap());
+        })
+        .await;
+        let release = gate.clone();
+        tokio::task::spawn_blocking(move || release.1.wait())
+            .await
+            .unwrap();
+        changed.expect("bulk preparation must leave the queue actor responsive");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if engine
+                    .export_job(id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|job| job.status == JobStatus::Paused && !job.files.is_empty())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let job = engine.export_job(id).await.unwrap().unwrap();
+        assert_eq!(job.priority, 99);
+        assert!(job.category.is_none());
+        assert!(job
+            .params
+            .iter()
+            .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1"));
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn normal_delete_tombstone_survives_snapshot_failure_without_reclaiming_consumer_custody()
+    {
+        for transferred in [false, true] {
+            let (_tmp, mut owner, _adapter) = control_test_owner();
+            let token = if transferred {
+                "consumer-owned"
+            } else {
+                "pending-request"
+            };
+            let (reply, result) = oneshot::channel();
+            owner.on_command(QueueCommand::AddUrl {
+                name: "request".into(),
+                url: "http://127.0.0.1:9/source.nzb".into(),
+                category: None,
+                priority: 0,
+                dupe: None,
+                paused: false,
+                params: vec![("monarr-transfer".into(), token.into())],
+                reply,
+            });
+            let (id, _) = result.await.unwrap().unwrap();
+            if transferred {
+                owner.state.job_mut(id).unwrap().status = JobStatus::Completed;
+                let receipt = &mut owner.state.url_admission_receipts[0];
+                receipt.custody_state = "curator".into();
+                receipt.outcome = "completed".into();
+                receipt.terminal_outcome = Some("SUCCESS".into());
+                receipt.publication_path = Some("/verified/publication".into());
+                assert!(owner.save_snapshot());
+            }
+            std::fs::create_dir(owner.state_dir.join("queue.json.tmp")).unwrap();
+            assert!(owner.delete_job(id, false), "exact retirement tombstone makes cancellation durable despite snapshot I/O failure");
+            assert!(owner.state.jobs.is_empty());
+            let receipt = &owner.state.url_admission_receipts[0];
+            assert_eq!(
+                receipt.outcome,
+                if transferred { "completed" } else { "deleted" }
+            );
+            std::fs::remove_dir(owner.state_dir.join("queue.json.tmp")).unwrap();
+            let state = owner.state_dir.clone();
+            let dest = owner.dest_dir.clone();
+            drop(owner);
+            let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
+                Vec::new(),
+                state,
+                dest,
+                Tuning::default(),
+                None,
+            ))
+            .await
+            .unwrap();
+            assert!(
+                engine.snapshot().jobs.is_empty(),
+                "old queue snapshot cannot resurrect the retired admission"
+            );
+            let receipt = engine.url_admission(token).await.unwrap().unwrap();
+            assert_eq!(
+                receipt.outcome,
+                if transferred { "completed" } else { "deleted" }
+            );
+            if transferred {
+                assert_eq!(receipt.custody_state, "curator");
+                assert_eq!(
+                    receipt.publication_path.as_deref(),
+                    Some("/verified/publication")
+                );
+                assert_eq!(receipt.terminal_outcome.as_deref(), Some("SUCCESS"));
+            }
+            engine.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_url_resolution_preserves_later_clear_rename_pause_priority_and_keep() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let post = nzbd_nserv::build_post("resolved", &[("payload.bin", vec![7; 100])], 100);
+        let parsed = nzbd_nzb::parse(post.nzb.as_bytes()).unwrap();
+        let id = owner.state.admit_url(
+            "original".into(),
+            "http://example.test/source.nzb",
+            Some("old-category".into()),
+            0,
+        );
+        let origin = owner.state.job(id).unwrap().clone();
+        let identity = nzbd_state::artifacts::url_source_identity(&origin).unwrap();
+        owner
+            .url_resolutions
+            .cache_source(&origin, post.nzb.as_bytes())
+            .unwrap();
+        owner
+            .url_resolutions
+            .reserve_files(&origin, 1, parsed.files.len() as u32)
+            .unwrap();
+        let mut staging = QueueState::default();
+        staging.jobs.push(origin.clone());
+        staging.complete_url_fetch(id, &parsed, true);
+        let prepared = owner
+            .url_resolutions
+            .stage(&origin, &staging.jobs[0])
+            .unwrap();
+        let current = owner.state.job_mut(id).unwrap();
+        current.category = None;
+        current.priority = 99;
+        current.name = "user rename".into();
+        current.dir_name = "user-private-name".into();
+        current.params.extend([
+            ("*AddPaused".into(), "yes".into()),
+            ("*Runner:KeepOnFailure".into(), "1".into()),
+        ]);
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::CompleteUrlFetch {
+            job: id,
+            source_identity: identity,
+            prepared: Box::new(prepared),
+            reply,
+        });
+        assert!(result.await.unwrap().unwrap());
+        let job = owner.state.job(id).unwrap();
+        assert!(job.category.is_none());
+        assert_eq!(job.priority, 99);
+        assert_eq!(job.name, "user rename");
+        assert_eq!(job.dir_name, "user-private-name");
+        assert_eq!(job.status, JobStatus::Paused);
+        assert!(job
+            .params
+            .iter()
+            .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1"));
+    }
+
+    #[tokio::test]
+    async fn storage_retry_record_failure_keeps_provider_floor_in_live_fallback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = temporary.path().join("state");
+        let dest = temporary.path().join("dest");
+        let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
+            Vec::new(),
+            state.clone(),
+            dest,
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let mut job = pending_job(87);
+        job.kind = JobKind::Url;
+        job.status = JobStatus::Fetching;
+        job.files.clear();
+        job.params
+            .push(("*URL".into(), "http://example.test/source.nzb".into()));
+        engine.import_job(job.clone(), false, false).await.unwrap();
+        let identity = nzbd_state::artifacts::url_source_identity(&job).unwrap();
+        std::fs::create_dir(state.join("url-resolutions/retries").join(&identity)).unwrap();
+        let floor = unix_now() + 600;
+        let caller = engine.clone();
+        let retrying = tokio::spawn(async move {
+            let mut fallback = nzbd_state::artifacts::UrlStorageRetry::default();
+            caller
+                .wait_url_storage_retry_after(
+                    &job,
+                    &identity,
+                    "storage retry record cannot be written",
+                    &mut fallback,
+                    Some(floor),
+                )
+                .await;
+            fallback
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop { let job = engine.export_job(JobId(87)).await.unwrap().unwrap(); if job.params.iter().any(|(key,value)| key == crate::fetch::NEXT_RETRY_PARAM && value.parse::<i64>().ok().is_some_and(|deadline| deadline >= floor)) { break; } tokio::task::yield_now().await; }
+        }).await.expect("failed retry-record persistence must still honor the provider floor in the live scheduled progress");
+        engine.cancel.cancel();
+        let fallback = retrying.await.unwrap();
+        assert_eq!(fallback.attempts, 1);
+        assert!(fallback.next_retry_at >= floor);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn transient_cached_nzb_read_recovers_in_process_without_becoming_failed() {
+        let (temporary, mut owner, _adapter) = control_test_owner();
+        let post = nzbd_nserv::build_post("read-recovery", &[("payload.bin", vec![7; 100])], 100);
+        let id = owner.state.admit_url(
+            "read-recovery".into(),
+            "http://127.0.0.1:9/source.nzb",
+            None,
+            0,
+        );
+        let origin = owner.state.job(id).unwrap().clone();
+        let identity = nzbd_state::artifacts::url_source_identity(&origin).unwrap();
+        assert!(owner.save_snapshot());
+        owner
+            .url_resolutions
+            .cache_source(&origin, post.nzb.as_bytes())
+            .unwrap();
+        let source = owner
+            .state_dir
+            .join("url-resolutions/sources")
+            .join(&identity);
+        let saved = temporary.path().join("saved-source");
+        std::fs::rename(&source, &saved).unwrap();
+        std::fs::create_dir(&source).unwrap();
+        let state = owner.state_dir.clone();
+        let dest = owner.dest_dir.clone();
+        drop(owner);
+        let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
+            Vec::new(),
+            state,
+            dest,
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let job = engine.export_job(id).await.unwrap().unwrap();
+                if job.params.iter().any(|(key, value)| {
+                    key == crate::fetch::LAST_ERROR_PARAM
+                        && value.contains("cached NZB source read")
+                }) {
+                    assert_eq!(job.status, JobStatus::Fetching);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir(&source).unwrap();
+        std::fs::rename(saved, source).unwrap();
+        tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                let job = engine.export_job(id).await.unwrap().unwrap();
+                assert_ne!(
+                    job.status,
+                    JobStatus::Failed,
+                    "transient read I/O must not be converted into permanent fetch failure"
+                );
+                if job.status == JobStatus::Queued && !job.files.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("cached source must resume after its real persisted 30-second storage backoff");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cached_url_resolution_survives_failed_snapshot_and_offline_restart() {
+        let (tmp, mut owner, _adapter) = control_test_owner();
+        let post = nzbd_nserv::build_post("offline", &[("payload.bin", vec![7; 100])], 100);
+        let parsed = nzbd_nzb::parse(post.nzb.as_bytes()).unwrap();
+        let id = owner
+            .state
+            .admit_url("offline".into(), "http://127.0.0.1:9/expired.nzb", None, 0);
+        let origin = owner.state.job(id).unwrap().clone();
+        let identity = nzbd_state::artifacts::url_source_identity(&origin).unwrap();
+        assert!(owner.save_snapshot());
+        owner
+            .url_resolutions
+            .cache_source(&origin, post.nzb.as_bytes())
+            .unwrap();
+        owner
+            .url_resolutions
+            .reserve_files(&origin, 1, parsed.files.len() as u32)
+            .unwrap();
+        let mut staging = QueueState::default();
+        staging.jobs.push(origin.clone());
+        staging.complete_url_fetch(id, &parsed, true);
+        let prepared = owner
+            .url_resolutions
+            .stage(&origin, &staging.jobs[0])
+            .unwrap();
+        let blocked = owner.state_dir.join("queue.json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::CompleteUrlFetch {
+            job: id,
+            source_identity: identity.clone(),
+            prepared: Box::new(prepared),
+            reply,
+        });
+        assert!(matches!(
+            result.await.unwrap(),
+            Err(crate::EngineError::AdmissionNotDurable)
+        ));
+        assert_eq!(owner.state.job(id).unwrap().status, JobStatus::Fetching);
+        assert_eq!(owner.url_resolutions.pending(100).unwrap().len(), 1);
+        std::fs::remove_dir(blocked).unwrap();
+        let state_dir = owner.state_dir.clone();
+        let dest_dir = owner.dest_dir.clone();
+        drop(owner);
+        let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
+            Vec::new(),
+            state_dir,
+            dest_dir,
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if engine
+                    .export_job(id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|job| job.status == JobStatus::Queued && !job.files.is_empty())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("restart must use the durable NZB even while the original URL is offline");
+        let files = engine.export_job(id).await.unwrap().unwrap().files;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id, FileId(1));
+        engine.shutdown().await;
+        assert!(tmp
+            .path()
+            .join("state/url-resolutions/acknowledged")
+            .is_dir());
+    }
+
+    #[tokio::test]
+    async fn url_progress_storage_failure_is_error_and_preserves_fetching_for_retry() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        let id = owner.state.admit_url(
+            "progress".into(),
+            "http://example.test/progress.nzb",
+            None,
+            0,
+        );
+        assert!(owner.save_snapshot());
+        let before = owner.state.job(id).unwrap().clone();
+        let blocked = owner.state_dir.join("queue.json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        let progress = crate::fetch::FetchRetryState {
+            attempts: 1,
+            next_retry_at: Some(999),
+            blocked_since: Some(1),
+            last_error: Some("retryable server error".into()),
+        };
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::UpdateUrlFetchProgress {
+            job: id,
+            progress: progress.clone(),
+            reply,
+        });
+        assert!(
+            matches!(
+                result.await.unwrap(),
+                Err(crate::EngineError::AdmissionNotDurable)
+            ),
+            "storage failure must never look like user cancellation"
+        );
+        assert_eq!(
+            serde_json::to_value(owner.state.job(id)).unwrap(),
+            serde_json::to_value(Some(&before)).unwrap()
+        );
+        std::fs::remove_dir(blocked).unwrap();
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::UpdateUrlFetchProgress {
+            job: id,
+            progress,
+            reply,
+        });
+        assert!(result.await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
     async fn url_download_allocates_fresh_directory_beside_retained_payload() {
         let (_tmp, mut owner, _adapter) = control_test_owner();
         let post = nzbd_nserv::build_post("release", &[("payload.bin", vec![7; 100])], 100);
@@ -7362,12 +7999,32 @@ mod tests {
         std::fs::create_dir(&collision).unwrap();
 
         let (reply, result) = oneshot::channel();
+        let source_identity =
+            nzbd_state::artifacts::url_source_identity(owner.state.job(id).unwrap()).unwrap();
+        owner
+            .url_resolutions
+            .cache_source(owner.state.job(id).unwrap(), post.nzb.as_bytes())
+            .unwrap();
+        let origin = owner.state.job(id).unwrap().clone();
+        let mut staging = QueueState::default();
+        staging.jobs.push(origin.clone());
+        staging.complete_url_fetch(id, &parsed, true);
+        staging.jobs[0].dir_name = format!("release.job-{}-1", id.0);
+        owner
+            .url_resolutions
+            .reserve_files(&origin, 1, parsed.files.len() as u32)
+            .unwrap();
+        let prepared = owner
+            .url_resolutions
+            .stage(&origin, &staging.jobs[0])
+            .unwrap();
         owner.on_command(QueueCommand::CompleteUrlFetch {
             job: id,
-            parsed: Box::new(parsed),
+            source_identity,
+            prepared: Box::new(prepared),
             reply,
         });
-        assert!(result.await.unwrap());
+        assert!(result.await.unwrap().unwrap());
         let job = owner.state.job(id).unwrap();
         assert_eq!(job.name, "release");
         assert_eq!(job.status, JobStatus::Queued);

@@ -15,7 +15,12 @@ pub use delivery::{Delivery, DeliveryFile, DeliveryFileOutcome, DeliveryRunnerSt
 pub use relocation::{RelocationResult, SelectedPublication};
 mod tasks;
 mod transforms;
+mod url_resolutions;
 mod worker_controls;
+pub use url_resolutions::{
+    url_source_identity, url_storage_retry_deadline, UrlFileReservation, UrlResolutionFault,
+    UrlResolutionRecord, UrlResolutionStore, UrlStorageRetry,
+};
 mod workspace_lifecycle;
 pub use recovery::{Receipt, ReceiptFile, Recovery, RecoveryFile};
 use rusqlite::{params, Connection, OptionalExtension};
