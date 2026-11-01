@@ -1309,6 +1309,8 @@ async fn job_action(
             Ok(None) => not_found(),
             Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
         },
+        // The job's own state refused the action, with the reason.
+        Err(nzbd_engine::EngineError::Lifecycle(reason)) => error(StatusCode::CONFLICT, &reason),
         Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
     }
 }
@@ -3419,38 +3421,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_reports_a_hold_as_conflict_and_missing_job_as_not_found() {
+    async fn resume_retries_any_hold_and_a_refusal_is_a_conflict_with_its_reason() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = test_engine(&tmp).await;
         let id = engine
             .add_nzb("held", NZB.as_bytes(), None, 0)
             .await
             .unwrap();
+        // A review hold used to answer 409 to every action but delete.
         engine
             .hold_job(
                 id,
-                "identity_conflict",
+                nzbd_types::HoldCause::IdentityConflict,
                 "download_write",
                 "conflicting yEnc declared size",
             )
             .await
             .unwrap();
         let app = router(engine.clone());
-        let response = app
-            .clone()
-            .oneshot(
+        let resume = |app: axum::Router| async move {
+            app.oneshot(
                 axum::http::Request::post(format!("/api/v1/jobs/{}/actions/resume", id.0))
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
             .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = body_json(response).await;
-        assert!(body["error"]
-            .as_str()
             .unwrap()
-            .contains("conflicting yEnc declared size"));
+        };
+        let response = resume(app.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!engine.export_job(id).await.unwrap().unwrap().held());
+
+        // A refused release says why, as a conflict, not as the service
+        // being down: the second capacity probe inside its backoff window.
+        for expected in [StatusCode::OK, StatusCode::CONFLICT] {
+            engine
+                .hold_job(
+                    id,
+                    nzbd_types::HoldCause::Capacity,
+                    "download_write",
+                    "storage full",
+                )
+                .await
+                .unwrap();
+            let response = resume(app.clone()).await;
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::CONFLICT {
+                let body = body_json(response).await;
+                assert!(
+                    body["error"].as_str().unwrap().contains("backing off"),
+                    "{body}"
+                );
+            }
+        }
         assert!(engine.export_job(id).await.unwrap().unwrap().held());
         let response = app
             .oneshot(

@@ -241,6 +241,10 @@ pub struct StorageVolumeSnapshot {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct QueueSnapshot {
     pub up_since_unix: i64,
+    /// This engine owns the queue (single node, or the cluster leader after
+    /// adopting authority). Automatic hold recovery runs only here.
+    #[serde(skip)]
+    pub queue_authority: bool,
     pub download_paused: bool,
     /// Daily/monthly quota exhausted (force-priority jobs still run).
     pub quota_reached: bool,

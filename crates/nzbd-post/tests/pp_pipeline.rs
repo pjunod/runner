@@ -3004,7 +3004,12 @@ async fn manager_operator_retry_of_held_unpack_uses_existing_restart_action() {
         .await
         .unwrap();
     assert!(engine
-        .hold_job(JobId(812), "post_failure", "unpack", "extraction failed")
+        .hold_job(
+            JobId(812),
+            nzbd_types::HoldCause::PostFailure,
+            "unpack",
+            "extraction failed"
+        )
         .await
         .unwrap());
     let hist = history(tmp.path());
@@ -3086,7 +3091,12 @@ async fn held_move_retry_reuses_a_verified_successful_extraction() {
     );
     assert_eq!(std::fs::read(dir.join("Movie.S01E01.mkv")).unwrap(), bytes);
     assert!(engine
-        .hold_job(JobId(813), "post_failure", "move", "destination conflict")
+        .hold_job(
+            JobId(813),
+            nzbd_types::HoldCause::PostFailure,
+            "move",
+            "destination conflict"
+        )
         .await
         .unwrap());
     std::fs::remove_dir(&occupied).unwrap();
