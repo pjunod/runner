@@ -326,6 +326,10 @@ pub(crate) enum QueueCommand {
     AdoptAuthority {
         reply: oneshot::Sender<Result<(), nzbd_state::StateError>>,
     },
+    UnacceptedUrlAdmissions {
+        limit: usize,
+        reply: oneshot::Sender<Result<Vec<UrlAdmissionReceipt>, String>>,
+    },
     UrlAdmissionsPage {
         after: String,
         limit: usize,
@@ -633,7 +637,9 @@ pub(crate) enum EngineMsg {
 pub(crate) struct Owner {
     state: QueueState,
     admission_adoption: Option<HashSet<String>>,
+    admission_catalog_adopted: bool,
     authoritative_admissions: HashMap<String, String>,
+    unaccepted_admissions: HashMap<String, UrlAdmissionReceipt>,
     consumer_instance_id: String,
     timing_cache: crate::lifecycle::TimingCache,
     attempts: HashMap<SegRef, SegmentAttempt>,
@@ -1141,7 +1147,9 @@ impl Owner {
         Ok(Owner {
             state,
             admission_adoption: None,
+            admission_catalog_adopted: false,
             authoritative_admissions: HashMap::new(),
+            unaccepted_admissions: HashMap::new(),
             consumer_instance_id: artifacts.installation.clone(),
             attempts: HashMap::new(),
             blocked: HashMap::new(),
@@ -1666,8 +1674,11 @@ impl Owner {
                             source_artifact_id: None,
                             source_generation: None,
                         };
+                        self.unaccepted_admissions
+                            .insert(receipt.request_token.clone(), receipt.clone());
                         self.state.url_admission_receipts.push(receipt);
                         if !self.save_snapshot() {
+                            self.unaccepted_admissions.remove(token);
                             self.state
                                 .url_admission_receipts
                                 .retain(|receipt| receipt.request_token != *token);
@@ -1761,7 +1772,11 @@ impl Owner {
                         source_artifact_id: None,
                         source_generation: None,
                     });
+                    let receipt = self.state.url_admission_receipts.last().unwrap();
+                    self.unaccepted_admissions
+                        .insert(receipt.request_token.clone(), receipt.clone());
                     if !self.save_snapshot() {
+                        self.unaccepted_admissions.remove(token);
                         self.state.jobs.retain(|job| job.id != id);
                         self.state
                             .url_admission_receipts
@@ -2671,6 +2686,28 @@ impl Owner {
                 self.publish_conn_budgets();
                 let _ = reply.send(applied);
             }
+            QueueCommand::UnacceptedUrlAdmissions { limit, reply } => {
+                let result = if !(1..=100).contains(&limit)
+                    || self.unaccepted_admissions.len() > limit
+                {
+                    Err("unaccepted admission index exceeds supported page bound; reconcile before accepting more requests".into())
+                } else {
+                    let mut rows = self
+                        .unaccepted_admissions
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    rows.sort_unstable_by(|left, right| {
+                        left.request_token.cmp(&right.request_token)
+                    });
+                    if crate::admissions::valid_page(&rows) {
+                        Ok(rows)
+                    } else {
+                        Err("unaccepted admission index exceeds supported 1MiB bound".into())
+                    }
+                };
+                let _ = reply.send(result);
+            }
             QueueCommand::UrlAdmissionsPage {
                 after,
                 limit,
@@ -2720,7 +2757,10 @@ impl Owner {
                 if !committed {
                     self.state.url_admission_receipts = before;
                     self.state.pending_admissions = pending_before;
-                } else if removed_pending {
+                } else {
+                    self.unaccepted_admissions.remove(&expected.request_token);
+                }
+                if committed && removed_pending {
                     // The exact pending descriptor can no longer be recovered
                     // after its durable reservation has been removed.
                     if let Err(error) = self.pending_sources.remove(JobId(expected.job_id)) {
@@ -3387,6 +3427,7 @@ impl Owner {
         let before = self.state.url_admission_receipts.clone();
         let next_id = self.state.next_job_id;
         let accepted = self.authoritative_admissions.clone();
+        let pending = self.unaccepted_admissions.clone();
         let seen = self.admission_adoption.clone();
         for row in rows {
             self.state.next_job_id = self.state.next_job_id.max(row.job_id);
@@ -3402,6 +3443,7 @@ impl Owner {
             }
             self.authoritative_admissions
                 .insert(row.request_token.clone(), crate::admissions::identity(&row));
+            self.unaccepted_admissions.remove(&row.request_token);
             if let Some(seen) = self.admission_adoption.as_mut() {
                 seen.insert(row.request_token);
             }
@@ -3410,6 +3452,7 @@ impl Owner {
             self.state.url_admission_receipts = before;
             self.state.next_job_id = next_id;
             self.authoritative_admissions = accepted;
+            self.unaccepted_admissions = pending;
             self.admission_adoption = seen;
             return false;
         }
@@ -3433,6 +3476,8 @@ impl Owner {
         self.authoritative_admissions
             .retain(|token, _| seen.contains(token));
         self.admission_adoption = None;
+        self.admission_catalog_adopted = true;
+        self.unaccepted_admissions.clear();
         true
     }
     fn can_discard_url_admission(&self, expected: &UrlAdmissionReceipt) -> bool {
@@ -3860,6 +3905,39 @@ impl Owner {
                         return Err(error);
                     }
                 };
+                // Upgrade boot may start a cluster executor without loading
+                // queue.json. Preserve its retired admissions before this
+                // first authority save, so the cluster can migrate them into
+                // its catalog. A completed catalog prune must never be undone
+                // by a later stale shared snapshot in the same process.
+                if !self.admission_catalog_adopted {
+                    let mut receipts = self.state.url_admission_receipts.clone();
+                    for incoming in snapshot_state.url_admission_receipts {
+                        if self
+                            .authoritative_admissions
+                            .get(&incoming.request_token)
+                            .is_some_and(|identity| {
+                                identity != &crate::admissions::identity(&incoming)
+                            })
+                        {
+                            return Err(nzbd_state::StateError::Corrupt("shared snapshot admission conflicts with accepted authority catalog".into()));
+                        }
+                        if let Some(current) = receipts
+                            .iter_mut()
+                            .find(|row| row.request_token == incoming.request_token)
+                        {
+                            *current = crate::admissions::merge_current(current, &incoming);
+                        } else {
+                            receipts.push(incoming);
+                        }
+                    }
+                    self.state.next_job_id = receipts
+                        .iter()
+                        .fold(self.state.next_job_id, |next, receipt| {
+                            next.max(receipt.job_id)
+                        });
+                    self.state.url_admission_receipts = receipts;
+                }
                 self.state.next_job_id = self.state.next_job_id.max(snapshot_state.next_job_id);
                 self.state.next_file_id = self.state.next_file_id.max(snapshot_state.next_file_id);
                 self.state.download_paused = snapshot_state.download_paused;
@@ -9548,6 +9626,96 @@ mod tests {
     fn catalog_receipt(token: &str, id: u32) -> UrlAdmissionReceipt {
         serde_json::from_value(serde_json::json!({"protocolVersion":1,"requestToken":token,"submissionSha256":"catalog-fingerprint","jobId":id,"generation":format!("generation-{id}"),"runnerInstanceId":"cluster-consumer"})).unwrap()
     }
+    #[tokio::test]
+    async fn unaccepted_admission_read_uses_only_pending_index_and_refuses_overflow() {
+        let (_temporary, mut owner, _adapter) = control_test_owner();
+        owner.state.url_admission_receipts = (1..=1000)
+            .map(|id| catalog_receipt(&format!("accepted-history-{id}"), id))
+            .collect();
+        let pending = catalog_receipt("new-pending", 1001);
+        owner.state.url_admission_receipts.push(pending.clone());
+        owner
+            .unaccepted_admissions
+            .insert(pending.request_token.clone(), pending.clone());
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::UnacceptedUrlAdmissions { limit: 100, reply });
+        let rows = result.await.unwrap().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_token, "new-pending");
+        assert!(owner.adopt_url_admissions(vec![pending]));
+        assert!(owner.unaccepted_admissions.is_empty());
+        for id in 1002..1103 {
+            let row = catalog_receipt(&format!("pending-{id}"), id);
+            owner
+                .unaccepted_admissions
+                .insert(row.request_token.clone(), row);
+        }
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::UnacceptedUrlAdmissions { limit: 100, reply });
+        assert!(
+            result.await.unwrap().is_err(),
+            "overflow cannot silently omit pending admissions"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_authority_upgrade_preserves_retired_snapshot_receipts_without_resurrection() {
+        let (_temporary, mut owner, _adapter) = control_test_owner_with_persistence(false, None);
+        assert!(owner.state.jobs.is_empty());
+        assert!(owner.state.url_admission_receipts.is_empty());
+        let mut receipt = catalog_receipt("retired-before-catalog-upgrade", 88);
+        receipt.custody_state = "curator".into();
+        receipt.publication_path = Some("/publication/already-imported".into());
+        receipt.terminal_outcome = Some("SUCCESS".into());
+        receipt.outcome = "completed".into();
+        let mut old = owner.state.to_doc();
+        old.url_admission_receipts.push(receipt.clone());
+        owner.snap_store.save(&old).unwrap();
+        owner.adopt_authority().unwrap();
+        assert!(owner.state.jobs.is_empty());
+        assert_eq!(owner.state.url_admission_receipts.len(), 1);
+        assert_eq!(
+            crate::admissions::identity(&owner.state.url_admission_receipts[0]),
+            crate::admissions::identity(&receipt)
+        );
+        assert_eq!(
+            owner.state.url_admission_receipts[0].publication_path,
+            receipt.publication_path
+        );
+        assert!(owner.state.next_job_id >= 88);
+        assert_eq!(
+            owner
+                .snap_store
+                .load()
+                .unwrap()
+                .unwrap()
+                .url_admission_receipts
+                .len(),
+            1
+        );
+        assert!(
+            owner.authoritative_admissions.is_empty(),
+            "legacy snapshot projection is not yet a replicated catalog acceptance"
+        );
+        owner.admission_adoption = Some(HashSet::new());
+        assert!(owner.finish_url_admission_adoption());
+        assert!(owner.state.url_admission_receipts.is_empty());
+        // Even if an old shared projection reappears, the completed catalog
+        // has proved this token absent and is authoritative for this owner.
+        owner.snap_store.save(&old).unwrap();
+        owner.persist = false;
+        owner.adopt_authority().unwrap();
+        assert!(owner.state.url_admission_receipts.is_empty());
+        assert!(owner
+            .snap_store
+            .load()
+            .unwrap()
+            .unwrap()
+            .url_admission_receipts
+            .is_empty());
+        assert!(owner.state.next_job_id >= 88);
+    }
+
     #[tokio::test]
     async fn catalog_adoption_replaces_only_unaccepted_identity_and_rolls_back_on_fence() {
         let (temporary, mut owner, _adapter) = control_test_owner();

@@ -103,6 +103,26 @@ pub(crate) fn merge_current(
 }
 
 impl EngineHandle {
+    /// Newly local receipts awaiting an authoritative catalog decision.
+    /// This reads the bounded pending index, never the settled history.
+    pub async fn url_unaccepted_admissions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<UrlAdmissionReceipt>, EngineError> {
+        if !(1..=100).contains(&limit) {
+            return Err(EngineError::RequestConflict(
+                "unaccepted admission limit must be 1..100".into(),
+            ));
+        }
+        let (reply, result) = oneshot::channel();
+        self.send(QueueCommand::UnacceptedUrlAdmissions { limit, reply })
+            .await?;
+        result
+            .await
+            .map_err(|_| EngineError::Closed)?
+            .map_err(EngineError::RequestConflict)
+    }
+
     /// Read a token-ordered catalog page, including retired admissions.
     /// Advance with the last returned token; an empty page ends the scan.
     pub async fn url_admissions_page(
@@ -317,6 +337,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(
+            engine.url_unaccepted_admissions(100).await.unwrap().len(),
+            1
+        );
         assert_eq!(admission.runner_instance_id, "stable-cluster-consumer");
         assert!(admission
             .generation
@@ -335,6 +359,11 @@ mod tests {
             .await
             .unwrap());
         assert!(engine.finish_url_admission_adoption().await.unwrap());
+        assert!(engine
+            .url_unaccepted_admissions(100)
+            .await
+            .unwrap()
+            .is_empty());
         let next = engine
             .reserve_torrent_admission(
                 nzbd_types::TorrentSource::Metainfo,
