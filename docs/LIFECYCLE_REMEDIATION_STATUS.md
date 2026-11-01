@@ -11,8 +11,10 @@ outside compiler caches in the task's durable evidence directory.
 
 ## 1. Baseline and constraints
 
-- Runner baseline: a2535623af1a7a5623677350895b49e8c2a840ab.
-- Curator baseline: dae74249195b97f7af0f0b649b3ea79109e8aae7; independent PR #76 (990e768) preserved via merge225cfd6.
+- Runner initially audited at a2535623; later PR #261 (368b5001) is preserved
+  through merge 1bac4dd7, with typed hold policy and one authority recovery loop.
+- Curator initially audited at dae7424; PR #76 (990e768) and PR #77 (17eb0f6)
+  are preserved through merges 225cfd6 and 4935fab. Mobile build 31 is retained.
 - Lower-model agents implement isolated slices; primary reviews integration.
 - Final Astra adversarial review precedes the full required test gates.
 - Merge only after findings are resolved and required tests/checks pass.
@@ -26,14 +28,14 @@ outside compiler caches in the task's durable evidence directory.
 
 | Slice | State | Evidence |
 |---|---|---|
-| Runner publication retries, resource holds, custody, Keep and durable queue mutations | Core and URL checkpoints integrated; journal preparation and broader timing still active | State through8ad43dc integrated; focused custody/retry, actual writer recovery, cached URL restart and storage-retry regressions pass |
+| Runner publication retries, resource holds, custody, Keep and durable queue mutations | Core, URL and off-actor journal preparation integrated; later main policy reconciled | State through 1530967 and merge 1bac4dd7; focused custody/retry, actual writer recovery, cached URL restart and moved-source recovery regressions pass |
 | Runner real partial repair, native books, safe sidecars and classification | Integrated; focused regressions pass | POST a2aa622 and bf4c21ca; integration 78555830 and 8727681a |
 | Curator discovery, atomic import ledger, replacement ownership and manual intent | Core and follow-up integrated; focused service fault tests pass | Curator 2665a8b and 21a9bec |
 | Curator upgrade distinction, stale batches, storage explanation and reviewed acceptance | Committed; focused migration/service/storage tests pass | Curator 2665a8b, 21a9bec and 176fd58; desktop/iPhone action and geometry regressions pass |
 | Cluster durable Delivery, copy retirement, URL replay and RPC bounds | Durable receipt/copy cleanup and failover checkpoints integrated; partial recovery and worker regrant remain active | Runner0ae1fb85/a70b552; actual three-node source drain, different-authority receipt survival and WAL upgrade regressions pass |
-| Native torrent independent publication and seeding custody | Pending | None yet |
-| Joined timing, usable controls and desktop/mobile acceptance | Curator timing and phone workflows committed; Runner controls integrated, major-stage capture active | Curator9b091fd/f23a76c/f0b4510; Runner current-source controls33db58ca/2f6021c8/94bc3648; focused UI checks pass |
-| Real Runner–Curator/cluster/torrent integration evidence | Focused paired Usenet and cluster cases pass; final candidate and torrent pending | Runner978bfb3e + Curatorc24ad27 actual NNTP/import/permission failure/restart/retry; final physical-drain assertions being strengthened |
+| Native torrent independent publication and seeding custody | Runner draft active; Curator native client mode committed | Curator 4da2cef/6b93d5a: explicit mode, capability checks, pending admission and two-mode isolation tests pass; real native backend integration remains pending |
+| Joined timing, usable controls and desktop/mobile acceptance | Major-stage capture and immutable publication timing integrated | Runner c4111ddc and Curator 76fc7e9; actual pair proves measured download/POST intervals survive restart; omitted history is explicit |
+| Real Runner–Curator/cluster/torrent integration evidence | Strengthened Usenet pair passes; final candidate and torrent pending | Runner 38d43723 + Curator c24ad27 prove both exact processing sources and publications physically disappear, both library files remain intact, and permission-failure cleanup resumes after restart |
 | Primary integration review | Active | Review found retry scheduling CAS, intact partial dependency, probe routing and discovery bounds gaps; fixes underway |
 | Final Astra review | Pending | None yet |
 | Full tests, coverage and required CI | Pending | None yet |
@@ -41,6 +43,13 @@ outside compiler caches in the task's durable evidence directory.
 | Workspace archival and retained receipts | Pending | Work remains active |
 
 ## 3. Validation and claims
+
+The PR #261 merge passes affected crate checks and focused tests for repeated
+ENOSPC, a source already renamed before move commit, review/deletion refusal,
+probe singleflight and worker control persistence. Worker lease-driven recovery
+still needs integration with that unified policy. Cluster partial-copy claims,
+terminal-empty retirement, cross-node Keep and replicated admission identity are
+still active work; these are not covered by the earlier success-path receipt.
 
 Focused POST regressions pass for native book publication, failed-health repair,
 retained dependencies, deletion replay, exact repair IDs, title classification,
