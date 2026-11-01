@@ -832,6 +832,47 @@ mod tests {
         );
     }
     #[test]
+    fn staging_retirement_hash_yields_mutation_lock_and_rechecks_journal() {
+        use std::sync::{Arc, Barrier};
+        let (_temp, inventory, source, target) = fixture();
+        fs::RENAME_FAILURE.with(|failure| failure.set(Some(libc::EINVAL)));
+        publish(&inventory, &source, &target).unwrap();
+        let inventory = Arc::new(inventory);
+        let gate = Arc::new((Barrier::new(2), Barrier::new(2)));
+        arm_digest_gate(&source, "nested/media.mkv", gate.clone());
+        let worker_inventory = inventory.clone();
+        let worker = std::thread::spawn(move || {
+            let mut guard = Some(worker_inventory.mutation_guard().unwrap());
+            worker_inventory.retire_publication_source_unlocked(&mut guard, "one")
+        });
+        gate.0.wait();
+        // A mutation can complete while staging cleanup is hashing. Revoke
+        // its journal authority to prove that yielding cannot unlink stale work.
+        let mutation_inventory = inventory.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let mutation = std::thread::spawn(move || {
+            let _guard = mutation_inventory.mutation_guard().unwrap();
+            let mut operation = mutation_inventory.operation("publish-one").unwrap();
+            operation.state = "cancelled".into();
+            save_operation(&mutation_inventory.db.lock().unwrap(), &operation).unwrap();
+            sent.send(()).unwrap();
+        });
+        let completed = received.recv_timeout(std::time::Duration::from_secs(2));
+        gate.1.wait();
+        mutation.join().unwrap();
+        assert!(
+            completed.is_ok(),
+            "hash must not hold the global mutation coordinator"
+        );
+        assert!(worker.join().unwrap().is_err());
+        assert!(source.join("nested/media.mkv").exists());
+        assert_eq!(
+            inventory.operation("publish-one").unwrap().state,
+            "cancelled"
+        );
+    }
+
+    #[test]
     fn nested_hardlinks_verify_and_target_eio_remains_retryable() {
         let (_temp, inventory, source, target) = fixture();
         fs::RENAME_FAILURE.with(|f| f.set(Some(libc::EINVAL)));

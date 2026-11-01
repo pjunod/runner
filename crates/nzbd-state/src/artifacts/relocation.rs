@@ -679,7 +679,8 @@ impl Inventory {
                 }
             }
         }
-        self.reconcile_relocations()?;
+        let requested_artifact = self.for_job(job)?.map(|source| source.id);
+        self.reconcile_relocations_filtered(true, requested_artifact.as_deref())?;
         let guard = self.mutation_guard()?;
         checkpoint()?;
         let mut source = self.for_job(job)?.ok_or(Error::NotFound)?;
@@ -974,6 +975,11 @@ impl Inventory {
         let mut current = self.relocation_source(op, movement)?.ok_or_else(|| {
             Error::Conflict("relocation no longer owns the source generation".into())
         })?;
+        if op.state == "retry" && current.hold.as_deref() == Some("review: interrupted move") {
+            // Recover the exact operation-generated hold persisted by older
+            // releases. Explicit user holds and Keep remain authoritative.
+            current.hold = None;
+        }
         let root = movement.destination.parent().unwrap();
         let root_dir = fs::open_dir(root)?;
         if !movement
@@ -1894,11 +1900,23 @@ impl Inventory {
         self.retire_delivery_source(delivery_id)
     }
     pub fn reconcile_relocations(&self) -> Result<()> {
+        self.reconcile_relocations_filtered(true, None)
+    }
+    pub(super) fn reconcile_due_relocations(&self) -> Result<()> {
+        self.reconcile_relocations_filtered(false, None)
+    }
+    fn reconcile_relocations_filtered(
+        &self,
+        include_review: bool,
+        artifact: Option<&str>,
+    ) -> Result<()> {
         let mut guard = Some(self.mutation_guard()?);
         let raws = {
             let db = self.db.lock().unwrap();
-            let mut stmt = db.prepare("SELECT data FROM operations WHERE (state IN ('running','review') OR (state='retry' AND COALESCE(json_extract(data,'$.next_retry'),0)<=?1)) AND json_extract(data,'$.kind')='relocate' LIMIT 25")?;
-            let rows = stmt.query_map([now()], |r| r.get::<_, String>(0))?;
+            let mut stmt = db.prepare("SELECT data FROM operations WHERE (state='running' OR (?2 AND state='review') OR (state='retry' AND COALESCE(json_extract(data,'$.next_retry'),0)<=?1)) AND json_extract(data,'$.kind')='relocate' AND (?3 IS NULL OR artifact=?3) ORDER BY CASE state WHEN 'review' THEN 1 ELSE 0 END, COALESCE(json_extract(data,'$.next_retry'),0), json_extract(data,'$.created_at'), id LIMIT 25")?;
+            let rows = stmt.query_map(params![now(), include_review, artifact], |r| {
+                r.get::<_, String>(0)
+            })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         let mut retired = Vec::new();
@@ -2263,8 +2281,15 @@ impl Inventory {
                 }
                 save_operation(&self.db.lock().unwrap(), &op)?;
                 let mut a = self.get(&op.artifact)?;
-                a.hold = Some("review: interrupted move".into());
-                a.state = "retained".into();
+                if matches!(e, Error::Io(_)) {
+                    // A recoverable storage error must not invent a permanent
+                    // review hold that poisons a later successful READY commit.
+                    a.state = "active".into();
+                    a.error = Some(e.to_string());
+                } else {
+                    a.hold = Some("review: interrupted move".into());
+                    a.state = "retained".into();
+                }
                 a.revision += 1;
                 save_artifact(&self.db.lock().unwrap(), &a)?;
             } else if movement.source.automatic_cleanup_eligible

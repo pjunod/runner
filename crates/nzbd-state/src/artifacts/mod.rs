@@ -9,7 +9,7 @@ pub use policy::{RetentionChange, RetentionPreview};
 mod delivery;
 mod recovery;
 mod relocation;
-pub use delivery::{Delivery, DeliveryFile, DeliveryFileOutcome};
+pub use delivery::{Delivery, DeliveryFile, DeliveryFileOutcome, DeliveryRunnerStages};
 pub use relocation::{RelocationResult, SelectedPublication};
 mod tasks;
 mod transforms;
@@ -2098,7 +2098,7 @@ impl Inventory {
             }
         }
         self.run_due_deletes()?;
-        self.reconcile_relocations()?;
+        self.reconcile_due_relocations()?;
         self.reconcile_workspace_retirements()?;
         self.run_workspace_retirements()?;
         self.reconcile_recoveries()?;

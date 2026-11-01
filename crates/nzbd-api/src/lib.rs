@@ -3550,6 +3550,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivery_router_advances_past_huge_row_and_rejects_bad_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let inventory = engine.artifacts();
+        let root = tmp.path().join("source");
+        std::fs::create_dir(&root).unwrap();
+        let mut deliveries = Vec::new();
+        for (job, huge) in [(91u32, true), (92u32, false)] {
+            let source = root.join(format!("job-{job}"));
+            inventory
+                .allocate_for_delivery(job, &root, &source, true, true)
+                .unwrap();
+            std::fs::write(source.join("episode.mkv"), b"verified payload").unwrap();
+            inventory.finish(job, &source, &root, "active").unwrap();
+            let selected = inventory.for_job(job).unwrap().unwrap().files;
+            let outcomes = vec![nzbd_state::artifacts::DeliveryFileOutcome {
+                source_path: "episode.mkv".into(),
+                publication_path: Some("episode.mkv".into()),
+                classification: "video".into(),
+                outcome: "published".into(),
+                reason: Some(if huge {
+                    "x".repeat(8 * 1024 * 1024 + 1)
+                } else {
+                    "verified".into()
+                }),
+                repair_dependency: false,
+                source_cleanup_status: "pending".into(),
+            }];
+            let target = tmp.path().join("completed").join(format!("job-{job}"));
+            inventory
+                .publish_selected_for_delivery_checked(job, &target, selected, outcomes, &|| Ok(()))
+                .unwrap();
+            deliveries.push(
+                inventory
+                    .create_delivery(job, true, Some(&format!("request-{job}")))
+                    .unwrap(),
+            );
+        }
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: None,
+            torrent: None,
+            log: None,
+            setup: None,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/deliveries")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = body_json(response).await;
+        let rows = page["deliveries"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["deliveryId"], deliveries[0].delivery_id);
+        assert!(rows[0]["discoveryError"]
+            .as_str()
+            .unwrap()
+            .contains("exceeds"));
+        assert_eq!(rows[1]["deliveryId"], deliveries[1].delivery_id);
+        assert_eq!(page["nextCursor"], deliveries[1].sequence);
+        assert!(serde_json::to_vec(&page).unwrap().len() <= 16 * 1024 * 1024);
+        for query in ["after=-1", "limit=0", "limit=101"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(format!("/api/v1/deliveries?{query}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn consumer_history_requeue_refuses_both_sources_without_retiring_history() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = test_engine(&tmp).await;

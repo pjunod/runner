@@ -446,6 +446,14 @@ impl Engine {
                             if !record.control().is_some_and(|control| {
                                 control.lifecycle == "held"
                                     && matches!(control.cause.as_str(), "capacity" | "quota")
+                                    && !matches!(
+                                        control.previous_status,
+                                        Some(
+                                            nzbd_types::JobStatus::Post { .. }
+                                                | nzbd_types::JobStatus::PostQueued
+                                                | nzbd_types::JobStatus::Completed
+                                        )
+                                    )
                             }) {
                                 return;
                             }
@@ -947,6 +955,23 @@ impl EngineHandle {
                 }
                 if !matches!(control.cause.as_str(), "capacity" | "quota") {
                     return Ok(false);
+                }
+                if matches!(
+                    control.previous_status,
+                    Some(
+                        nzbd_types::JobStatus::Post { .. }
+                            | nzbd_types::JobStatus::PostQueued
+                            | nzbd_types::JobStatus::Completed
+                    )
+                ) {
+                    // Publication capacity belongs to its destination journal.
+                    // Explicit retry re-enters that operation; background source
+                    // probes must never release a post-processing hold.
+                    return if force {
+                        self.retry_post_hold(job, control.revision).await
+                    } else {
+                        Ok(false)
+                    };
                 }
                 let revision = control.revision.clone();
                 if !self

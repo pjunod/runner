@@ -266,7 +266,9 @@ impl QueueState {
                 if let Some(custody) =
                     param("Delivery:Custody").or_else(|| param("Artifact:Custody"))
                 {
-                    receipt.custody_state = custody;
+                    if receipt.custody_state != "curator" {
+                        receipt.custody_state = custody;
+                    }
                 }
                 receipt.publication_path =
                     param("Delivery:Path").or_else(|| param("*Cluster:final-dir"));

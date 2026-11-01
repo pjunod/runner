@@ -2553,6 +2553,10 @@ impl Owner {
                 revision,
                 reply,
             } => {
+                if self.persistence_fenced {
+                    let _ = reply.send(false);
+                    return;
+                }
                 let before = self.state.job(job).cloned();
                 let control = before.as_ref().and_then(|j| j.control()).filter(|c| {
                     c.lifecycle == "held"
@@ -2704,6 +2708,10 @@ impl Owner {
                 force,
                 reply,
             } => {
+                if self.persistence_fenced {
+                    let _ = reply.send(false);
+                    return;
+                }
                 let before = self.state.job(job).cloned();
                 let quiescent = self.state.job(job).is_some_and(|j| {
                     j.files
@@ -2767,6 +2775,10 @@ impl Owner {
                 revision,
                 reply,
             } => {
+                if self.persistence_fenced {
+                    let _ = reply.send(false);
+                    return;
+                }
                 let before = self.state.job(job).cloned();
                 let mut changed = None;
                 if let Some(j) = self.state.job_mut(job) {
@@ -6418,14 +6430,26 @@ mod tests {
         // generation still refreshes the receipt, and stale queue params no
         // longer overwrite its live Keep preference.
         owner.state.jobs.clear();
-        owner.artifacts.set_keep_on_failure(57, true).unwrap();
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::SetKeepOnFailure {
+            job: JobId(57),
+            keep: true,
+            reply,
+        });
+        assert!(result.await.unwrap());
         let (reply, result) = oneshot::channel();
         owner.on_command(QueueCommand::GetUrlAdmission {
             request_token: "keep-source-tombstone-57".into(),
             reply,
         });
         assert!(result.await.unwrap().unwrap().keep_source_on_failure);
-        owner.artifacts.set_keep_on_failure(57, false).unwrap();
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::SetKeepOnFailure {
+            job: JobId(57),
+            keep: false,
+            reply,
+        });
+        assert!(result.await.unwrap());
         let (reply, result) = oneshot::channel();
         owner.on_command(QueueCommand::GetUrlAdmission {
             request_token: "keep-source-tombstone-57".into(),
@@ -7435,6 +7459,16 @@ mod tests {
         let unchanged = refresh_url_admission_custody(&mut receipt, &owner.artifacts);
         assert!(!unchanged);
         assert_eq!(receipt.custody_state, "runner_owned");
+        receipt.source_generation = Some(source.generation.clone());
+        receipt.custody_state = "curator".into();
+        assert!(!refresh_url_admission_custody(
+            &mut receipt,
+            &owner.artifacts
+        ));
+        assert_eq!(
+            receipt.custody_state, "curator",
+            "Runner source deletion cannot reclaim consumer custody"
+        );
     }
 
     #[tokio::test]
@@ -7520,6 +7554,122 @@ mod tests {
             reply,
         });
         assert!(received.blocking_recv().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replacement_commit_is_single_and_fencing_cannot_degrade_to_volatile_success() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let allowed = Arc::new(AtomicBool::new(true));
+        let observed = allowed.clone();
+        let (tmp, mut owner, _adapter) = control_test_owner_with_persistence(
+            true,
+            Some(Arc::new(move || observed.load(Ordering::SeqCst))),
+        );
+        let original = pending_job(3);
+        let file = original.files[0].id;
+        owner.state.jobs.push(original.clone());
+        owner.state.next_job_id = 3;
+        owner.state.next_file_id = file.0;
+        owner.file_sizes.insert(file, 42);
+        owner.allocated_jobs.insert(JobId(3));
+        owner
+            .post_fetch_files
+            .insert(JobId(3), HashSet::from([file]));
+        assert!(owner.save_snapshot());
+        let before = serde_json::to_value(owner.state.to_doc()).unwrap();
+        allowed.store(false, Ordering::SeqCst);
+        for (round, require_snapshot) in [(1, true), (2, false)] {
+            let mut replacement = original.clone();
+            replacement.priority = 99;
+            replacement.files[0].id = FileId(999);
+            let (reply, result) = oneshot::channel();
+            owner.on_command(QueueCommand::ImportJobIfPresent {
+                job: Box::new(replacement),
+                require_snapshot,
+                reply,
+            });
+            assert!(
+                !result.await.unwrap(),
+                "fenced replacement round {round} must refuse"
+            );
+            assert_eq!(serde_json::to_value(owner.state.to_doc()).unwrap(), before);
+            assert_eq!(owner.file_sizes.get(&file), Some(&42));
+            assert!(owner.allocated_jobs.contains(&JobId(3)));
+            assert!(owner.post_fetch_files[&JobId(3)].contains(&file));
+            let persisted = SnapshotStore::open(&tmp.path().join("state"))
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap();
+            assert_eq!(serde_json::to_value(persisted).unwrap(), before);
+        }
+        // The remote import command must return the same definite failure.
+        let mut replacement = original;
+        replacement.priority = 101;
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::ImportJob {
+            job: Box::new(replacement),
+            fold_journals: false,
+            emit_finished: true,
+            reply,
+        });
+        assert!(!result.await.unwrap());
+        assert_eq!(owner.state.jobs[0].priority, 0);
+    }
+
+    #[tokio::test]
+    async fn resource_probes_continue_after_eight_failures_and_explicit_retry_bypasses_deadline() {
+        let (_tmp, mut owner, _adapter) = control_test_owner();
+        owner.state.jobs.push(pending_job(1));
+        assert!(owner.hold_job(JobId(1), "capacity", "download_write", "disk full"));
+        let revision = owner.state.jobs[0].control().unwrap().revision;
+        for attempt in 1..=12 {
+            owner.state.jobs[0]
+                .params
+                .retain(|(key, _)| key != "*Control:probe_after");
+            let (reply, result) = oneshot::channel();
+            owner.on_command(QueueCommand::BeginResourceProbe {
+                job: JobId(1),
+                revision: revision.clone(),
+                force: false,
+                reply,
+            });
+            assert!(
+                result.await.unwrap(),
+                "resource retry {attempt} must remain admitted"
+            );
+        }
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::BeginResourceProbe {
+            job: JobId(1),
+            revision: revision.clone(),
+            force: false,
+            reply,
+        });
+        assert!(
+            !result.await.unwrap(),
+            "automatic retry honors persisted backoff"
+        );
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::BeginResourceProbe {
+            job: JobId(1),
+            revision,
+            force: true,
+            reply,
+        });
+        assert!(
+            result.await.unwrap(),
+            "explicit retry can probe immediately"
+        );
+        let count = owner.state.jobs[0]
+            .params
+            .iter()
+            .find(|(key, _)| key == "*Control:attempts")
+            .unwrap()
+            .1
+            .parse::<u32>()
+            .unwrap();
+        assert_eq!(count, 13);
     }
 
     #[test]

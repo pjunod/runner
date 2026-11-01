@@ -33,6 +33,15 @@ pub struct DeliveryFileOutcome {
     pub source_cleanup_status: String,
 }
 
+/// Immutable stage evidence captured in the Runner node's own clock domain.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryRunnerStages {
+    pub node_id: String,
+    pub clock_domain: String,
+    pub spans: Vec<nzbd_types::StageSpan>,
+}
+
 /// Immutable description of one published generation plus its independent
 /// consumer-acceptance receipt. The payload bytes never contain this record.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +78,8 @@ pub struct Delivery {
     pub files: Vec<DeliveryFile>,
     #[serde(default)]
     pub file_outcomes: Vec<DeliveryFileOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_stages: Option<DeliveryRunnerStages>,
     pub ready_at: i64,
     pub accepted_at: Option<i64>,
     pub consumer_receipt_id: Option<String>,
@@ -298,6 +309,39 @@ impl Inventory {
         failure_cause: Option<&str>,
         keep_source_on_failure: bool,
     ) -> Result<Delivery> {
+        self.create_delivery_with_outcome_keep_and_stages(
+            job,
+            admitted_for_delivery,
+            request_token,
+            terminal_outcome,
+            failure_stage,
+            failure_cause,
+            keep_source_on_failure,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_delivery_with_outcome_keep_and_stages(
+        &self,
+        job: u32,
+        admitted_for_delivery: bool,
+        request_token: Option<&str>,
+        terminal_outcome: &str,
+        failure_stage: Option<&str>,
+        failure_cause: Option<&str>,
+        keep_source_on_failure: bool,
+        runner_stages: Option<DeliveryRunnerStages>,
+    ) -> Result<Delivery> {
+        if runner_stages.as_ref().is_some_and(|snapshot| {
+            snapshot.spans.len() > 128
+                || snapshot.node_id.is_empty()
+                || snapshot.node_id.len() > 256
+                || snapshot.clock_domain.is_empty()
+                || snapshot.clock_domain.len() > 256
+        }) {
+            return Err(Error::Conflict("invalid Runner stage snapshot".into()));
+        }
         if !admitted_for_delivery {
             return Err(Error::Conflict(
                 "pre-existing job is exempt from automatic delivery lifecycle".into(),
@@ -418,6 +462,7 @@ impl Inventory {
             manifest_digest,
             files,
             file_outcomes,
+            runner_stages,
             ready_at: now(),
             accepted_at: None,
             consumer_receipt_id: None,
@@ -487,6 +532,67 @@ impl Inventory {
             }
         }
         Ok((deliveries, cursor))
+    }
+
+    /// Bounded discovery advances past unsupported rows using only the
+    /// trusted SQLite identity/cursor. Detail remains available for review.
+    pub fn deliveries_discovery_page(
+        &self,
+        after: i64,
+        limit: u32,
+        include_accepted: bool,
+    ) -> Result<(Vec<serde_json::Value>, i64)> {
+        if after < 0 || !(1..=100).contains(&limit) {
+            return Err(Error::Conflict("invalid delivery cursor or limit".into()));
+        }
+        const ROW_LIMIT: usize = 8 * 1024 * 1024;
+        const PAGE_LIMIT: usize = 16 * 1024 * 1024;
+        let db = self.db.lock().unwrap();
+        let identities = {
+            let mut statement = db.prepare("SELECT id,sequence,length(CAST(data AS BLOB)),accepted_at FROM deliveries WHERE sequence>?1 ORDER BY sequence LIMIT ?2")?;
+            let rows = statement.query_map(params![after, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut page = Vec::new();
+        let mut cursor = after;
+        let mut bytes = 1024usize;
+        for (id, sequence, size, accepted_at) in identities {
+            if !include_accepted && accepted_at.is_some() {
+                cursor = sequence;
+                continue;
+            }
+            let stub = |reason: &str| serde_json::json!({"protocolVersion":1,"sequence":sequence,"deliveryId":id,"discoveryError":reason});
+            let row = if size > ROW_LIMIT as i64 {
+                stub("publication manifest exceeds supported discovery size; source retained for review")
+            } else {
+                match read_delivery(&db, &id) {
+                    Ok(delivery) if delivery.delivery_id == id && delivery.sequence == sequence => {
+                        serde_json::to_value(delivery)?
+                    }
+                    _ => stub("publication manifest is invalid; source retained for review"),
+                }
+            };
+            let mut row = row;
+            let mut row_bytes = serde_json::to_vec(&row)?.len();
+            if row_bytes > ROW_LIMIT {
+                row = stub("publication manifest exceeds supported discovery size; source retained for review");
+                row_bytes = serde_json::to_vec(&row)?.len();
+            }
+            if bytes.saturating_add(row_bytes + 1) > PAGE_LIMIT {
+                break;
+            }
+            bytes += row_bytes + 1;
+            page.push(row);
+            cursor = sequence;
+        }
+        Ok((page, cursor))
     }
 
     /// Persist Curator's durable mapping receipt. Repeating the exact tuple is

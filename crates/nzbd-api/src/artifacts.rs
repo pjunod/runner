@@ -99,7 +99,7 @@ async fn deliveries(State(st): State<ApiState>, Query(page): Query<DeliveryPage>
     let include_accepted = page.include_accepted;
     work(move || {
         let (deliveries, next_cursor) =
-            db.deliveries_page(page.after, limit, include_accepted)?;
+            db.deliveries_discovery_page(page.after, limit, include_accepted)?;
         Ok(json!({
             "protocolVersion": 1,
             "deliveries": deliveries,
