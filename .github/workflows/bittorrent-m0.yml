@@ -71,7 +71,7 @@ jobs:
             runner: ${{ (vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]' }}
             target: x86_64-unknown-linux-gnu
           - name: macos-aarch64
-            runner: '["macos-latest"]'
+            runner: ${{ (vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["macos-latest"]' || '["self-hosted","macOS","ARM64","lab","apple","xcode-27.2"]' }}
             target: aarch64-apple-darwin
           - name: windows-x86_64-msvc
             runner: '["windows-latest"]'
@@ -80,6 +80,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      - name: Verify Xcode 27.2
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          xcodebuild -version | awk '{ print } NR == 1 { valid = ($0 == "Xcode 27.2") } END { exit !valid }'
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.85"

@@ -10,25 +10,30 @@ permissions:
 jobs:
   build:
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ fromJSON(matrix.runner) }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: linux-x86_64-musl
-            os: ubuntu-latest
+            runner: '["ubuntu-latest"]'
             target: x86_64-unknown-linux-musl
             setup: sudo apt-get update && sudo apt-get install -y musl-tools
           - name: linux-aarch64-musl
-            os: ubuntu-24.04-arm
+            runner: '["ubuntu-24.04-arm"]'
             target: aarch64-unknown-linux-musl
             setup: sudo apt-get update && sudo apt-get install -y musl-tools
           - name: macos-aarch64
-            os: macos-latest
+            runner: ${{ (vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["macos-latest"]' || '["self-hosted","macOS","ARM64","lab","apple","xcode-27.2"]' }}
             target: aarch64-apple-darwin
             setup: ""
     steps:
       - uses: actions/checkout@v5
+      - name: Verify Xcode 27.2
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          xcodebuild -version | awk '{ print } NR == 1 { valid = ($0 == "Xcode 27.2") } END { exit !valid }'
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
