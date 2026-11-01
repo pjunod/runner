@@ -2356,11 +2356,13 @@ function renderRetention() { renderQueue(); renderHistory(); }
 function failureKeepModel(id, hidden = false) {
   const state = failureKeepState.get(id);
   return { failureKeep: !!state?.keep,
+    failureKeepPending: state?.applied === false,
     failureKeepHidden: hidden || state?.available !== true,
     failureKeepBusy: !!state?.saving,
     failureKeepNote: hidden ? "" : state?.error
       ? "Could not check source retention: " + state.error
       : state?.available === false ? "No retained source is available for this preference."
+      : state?.applied === false ? "Waiting for source owners" + (state.pendingOwners?.length ? " (" + Math.min(64, state.pendingOwners.length) + ")" : "") + " to apply this retention change. Protection is not confirmed yet."
       : !state || state.loading ? "Checking current source retention…" : "" };
 }
 async function refreshFailureKeep(id) {
@@ -2368,8 +2370,8 @@ async function refreshFailureKeep(id) {
   if (previous?.loading || previous?.saving) return;
   failureKeepState.set(id, { ...previous, loading: true });
   const result = await post("/api/v1/jobs/" + id + "/failure-keep", { method: "GET" });
-  failureKeepState.set(id, result.ok && typeof result.body?.available === "boolean" && typeof result.body?.keep === "boolean"
-    ? { available: result.body.available, keep: result.body.keep }
+  failureKeepState.set(id, result.ok && typeof result.body?.available === "boolean" && typeof result.body?.keep === "boolean" && (result.body.applied === undefined || typeof result.body.applied === "boolean")
+    ? { available: result.body.available, keep: result.body.keep, applied: result.body.applied !== false, pendingOwners: Array.isArray(result.body.pendingOwners) ? result.body.pendingOwners.slice(0,64) : [] }
     : { available: false, error: result.error || "Runner did not provide a current preference." });
   renderRetention();
 }
@@ -2382,9 +2384,10 @@ async function toggleFailureKeep(id) {
     method: "PUT", headers: { ...CLIENT_HDRS, "content-type": "application/json" },
     body: JSON.stringify({ keep }),
   });
-  failureKeepState.set(id, { ...state, keep: response.ok ? keep : state.keep });
+  const pending = response.status === 202 || response.body?.applied === false;
+  failureKeepState.set(id, { ...state, keep: response.ok ? keep : state.keep, applied: response.ok ? !pending : state.applied });
   if (response.ok) {
-    toast({ text: keep ? "Keep on failure is on for this retained source." : "Keep on failure is off. Runner's configured failure policy applies." });
+    toast({ text: pending ? "Keep on failure requested. Waiting for source owners to apply the change." : keep ? "Keep on failure is on for this retained source." : "Keep on failure is off. Runner's configured failure policy applies." });
     await refreshFailureKeep(id);
   } else {
     toast({ text: "Couldn't save failure retention — " + response.error, kind: "error" });
@@ -2816,10 +2819,11 @@ function applyDetail(tr, m, d) {
   w("nzbHref", m.nzbHref || "", v => d.attr(c.nzb, "href", v));
   w("sourceLabel", m.sourceLabel || "download source", v => d.text(c.nzb, v));
   w("sourceTitle", m.sourceTitle || "", v => d.prop(c.nzb, "title", v));
-  w("failureKeep", !!m.failureKeep, v => {
-    d.text(c.keepFailure, "Keep on failure: " + (v ? "on" : "off"));
-    d.prop(c.keepFailure, "title", v
-      ? "Retain this Runner source if the download fails. Change applies to the current retained source."
+  w("failureKeepDisplay", !!m.failureKeep + ":" + !!m.failureKeepPending, () => {
+    d.text(c.keepFailure, (m.failureKeepPending ? "Requested Keep" : "Keep") + " on failure: " + (m.failureKeep ? "on" : "off"));
+    d.prop(c.keepFailure, "title", m.failureKeepPending
+      ? "Requested preference; waiting for exact source owners to apply the change."
+      : m.failureKeep ? "Retain this Runner source if the download fails. Change applies to the current retained source."
       : "Default: failed source files follow Runner's configured failure policy.");
   });
   w("requeueNote", m.requeueNote || "", v => { d.text(c.requeueNote, v); d.prop(c.requeueNote, "hidden", !v); });

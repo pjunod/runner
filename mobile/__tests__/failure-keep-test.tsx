@@ -60,3 +60,23 @@ test('changing identity during PUT resets pending state and ignores old completi
   expect(button('Keep on failure: on').props.accessibilityState.busy).toBe(false);
   expect(current.getFailureKeep).toHaveBeenCalledTimes(2);
 });
+
+test('pending owner application survives GET/remount and never confirms restored protection', async () => {
+  let keep = false;
+  const client = { getFailureKeep: jest.fn(async () => ({ available: true, keep, applied: !keep, pendingOwners: keep ? ['worker-a'] : [] })),
+    setFailureKeep: jest.fn(async (_id, desired) => { keep = desired; return { applied: false }; }) } as unknown as NzbdClient;
+  await act(async () => { tree = create(<FailureKeepControl client={client} jobId={42} />); });
+  await act(async () => button('Keep on failure: off').props.onPress());
+  expect(button('Requested Keep on failure: on')).toBeDefined();
+  expect(text()).toContain('Waiting for source owners (1)');
+  expect(text()).not.toContain('on for this retained source');
+  await act(async () => tree.unmount()); tree = undefined;
+  await act(async () => { tree = create(<FailureKeepControl client={client} jobId={42} />); });
+  expect(button('Requested Keep on failure: on')).toBeDefined();
+  expect(text()).toContain('Protection is not confirmed yet');
+  (client.getFailureKeep as jest.Mock).mockResolvedValue({ available: false, keep: true, applied: false });
+  await act(async () => tree.update(<FailureKeepControl client={client} jobId={43} />));
+  expect(text()).toContain('No retained source');
+  expect(text()).not.toContain('Protection is not confirmed yet');
+  expect(button('Requested Keep on failure: on')).toBeUndefined();
+});

@@ -81,3 +81,9 @@ test('exact lifecycle lookup bounds the body and refuses mismatched receipt', as
   mockedFetch.mockResolvedValueOnce(streamed(new Uint8Array(8 * 1024 * 1024 + 1)) as any);
   await expect(client.getDelivery('receipt-a')).rejects.toThrow('exceeds supported display size');
 });
+
+test('202 Keep response remains pending even if an optional body omits application state', async () => {
+  mockedFetch.mockReset(); mockedFetch.mockResolvedValue(Object.assign(okResponse(), { status: 202 }));
+  const client = new NzbdClient({ baseUrl: 'https://nzbd.example.test', username: '', password: '', token: '' });
+  expect((await client.setFailureKeep(42, true)).applied).toBe(false);
+});

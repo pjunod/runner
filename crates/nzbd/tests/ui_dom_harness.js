@@ -1427,6 +1427,22 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   routes.set("/jobs/22/failure-keep", { status: 200, body: { available: false, keep: false } });
   await T.refreshFailureKeep(22);
   ok(T.histDetailModel({ job: 22, stages: [] }).failureKeepNote.includes("No retained source"), "unavailable source is explained");
+  let keepPending = false;
+  routes.set("/jobs/23/failure-keep", (_url, init) => {
+    if (init.method === "PUT") keepPending = true;
+    return { status: init.method === "PUT" ? 202 : 200, body: { available: true, keep: keepPending, applied: !keepPending, pendingOwners: keepPending ? ["worker-a"] : [] } };
+  });
+  await T.refreshFailureKeep(23); await T.toggleFailureKeep(23);
+  const pendingKeep = T.histDetailModel({ job: 23, stages: [] });
+  eq(pendingKeep.failureKeep, true, "pending Keep retains desired preference");
+  eq(pendingKeep.failureKeepPending, true, "202 desired preference is not owner-applied");
+  ok(pendingKeep.failureKeepNote.includes("Waiting for source owners (1)"), "pending owner application is explicit");
+  ok(stack.children.at(-1).children[0].textContent.includes("requested. Waiting"), "pending request never confirms applied protection");
+  T.failureKeepState.clear(); await T.refreshFailureKeep(23);
+  eq(T.histDetailModel({ job: 23, stages: [] }).failureKeepPending, true, "GET after reload restores pending owner state");
+  routes.set("/jobs/23/failure-keep", { status: 200, body: { available: false, keep: true, applied: false, pendingOwners: [] } });
+  await T.refreshFailureKeep(23);
+  ok(T.histDetailModel({ job: 23, stages: [] }).failureKeepNote.includes("No retained source"), "desired Keep cannot restore an absent source");
   T.failureKeepState.clear();
 
   // (d) a failed delete reverts the row and quotes the daemon

@@ -22,8 +22,8 @@ export function FailureKeepControl({ client, jobId }: { client: NzbdClient; jobI
     const request = ++sequence.current;
     try {
       const current = await client.getFailureKeep(jobId);
-      if (typeof current.available !== 'boolean' || typeof current.keep !== 'boolean') throw new Error('Runner did not provide a current preference.');
-      if (active.current && request === sequence.current) { setPreference(current); setError(null); }
+      if (typeof current.available !== 'boolean' || typeof current.keep !== 'boolean' || current.applied !== undefined && typeof current.applied !== 'boolean') throw new Error('Runner did not provide a current preference.');
+      if (active.current && request === sequence.current) { setPreference(current); setError(null); if (!current.available || current.applied === false) setNotice(null); }
     } catch (cause) {
       if (active.current && request === sequence.current) { setPreference(null); setError(cause instanceof Error ? cause.message : 'Could not check source retention.'); }
     }
@@ -38,8 +38,8 @@ export function FailureKeepControl({ client, jobId }: { client: NzbdClient; jobI
     const epoch = identity.current;
     saving.current = true; const request = ++sequence.current; setBusy(true); setNotice(null); setActionError(null);
     try {
-      await client.setFailureKeep(jobId, !preference.keep);
-      if (active.current && request === sequence.current) { setNotice(`Keep on failure is ${preference.keep ? 'off. Runner’s configured failure policy applies.' : 'on for this retained source.'}`); setError(null); }
+      const result = await client.setFailureKeep(jobId, !preference.keep);
+      if (active.current && request === sequence.current) { setNotice(result?.applied === false ? 'Keep on failure requested. Waiting for source owners to apply the change.' : `Keep on failure is ${preference.keep ? 'off. Runner’s configured failure policy applies.' : 'on for this retained source.'}`); setError(null); }
     } catch (cause) {
       if (active.current && request === sequence.current) setActionError(cause instanceof Error ? cause.message : 'Could not save source retention.');
     } finally {
@@ -49,11 +49,15 @@ export function FailureKeepControl({ client, jobId }: { client: NzbdClient; jobI
       }
     }
   };
+  const pending = preference?.available && preference.applied === false;
+  const label = `${pending ? 'Requested Keep' : 'Keep'} on failure: ${preference?.keep ? 'on' : 'off'}`;
+  const ownerCount = Array.isArray(preference?.pendingOwners) ? Math.min(64, preference.pendingOwners.length) : 0;
   return <View style={styles.wrap}>
-    {preference?.available ? <Pressable accessibilityRole="button" accessibilityLabel={`Keep on failure: ${preference.keep ? 'on' : 'off'}`}
+    {preference?.available ? <Pressable accessibilityRole="button" accessibilityLabel={label}
       accessibilityState={{ disabled: busy, busy }} onPress={() => { if (!busy) void toggle(); }} style={styles.button}>
-      <Text style={styles.buttonText}>{busy ? 'Saving source retention…' : `Keep on failure: ${preference.keep ? 'on' : 'off'}`}</Text>
+      <Text style={styles.buttonText}>{busy ? 'Saving source retention…' : label}</Text>
     </Pressable> : <Text style={styles.note}>{error ? `Could not check source retention: ${error}` : preference ? 'No retained source is available for this preference.' : 'Checking current source retention…'}</Text>}
+    {pending ? <Text accessibilityLiveRegion="polite" style={styles.note}>{`Waiting for source owners${ownerCount ? ` (${ownerCount})` : ''} to apply this retention change. Protection is not confirmed yet.`}</Text> : null}
     {actionError ? <Text accessibilityRole="alert" style={styles.error}>{actionError}</Text> : null}
     {notice ? <Text accessibilityLiveRegion="polite" style={styles.note}>{notice}</Text> : null}
     {!preference || error ? <Pressable accessibilityRole="button" onPress={() => void refresh()}><Text style={styles.buttonText}>Refresh source retention</Text></Pressable> : null}

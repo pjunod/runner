@@ -73,6 +73,12 @@ peer counters, donor-file deletion choice, or seed-resume fallback. Removing
 the child leaves the seed source and its seeding policy unchanged. A held child
 keeps the same **Retry** or **Pause retries** action as any other processing job.
 
+When a cross-node Keep change is durably requested but an exact source owner
+has not acknowledged it, the control says **Requested Keep** and **Waiting for
+source owners**. Desired Keep is not confirmation that protection was applied;
+this pending state survives refresh and reconnect. An already absent source
+remains unavailable: requesting Keep cannot restore deleted bytes.
+
 [The parity status page](MOBILE_QUEUE_PARITY_STATUS.md) separates implementation
 and test evidence from iOS/Android distribution evidence.
 

@@ -211,6 +211,9 @@ export interface HistoryJobRecord {
 export interface FailureKeepPreference {
   available: boolean;
   keep: boolean;
+  applied?: boolean;
+  pendingOwners?: string[];
+  message?: string;
 }
 
 export interface HistoryEntry {

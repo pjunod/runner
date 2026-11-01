@@ -103,10 +103,12 @@ export class NzbdClient {
     return this.json<FailureKeepPreference>(`/api/v1/jobs/${id}/failure-keep`);
   }
 
-  async setFailureKeep(id: number, keep: boolean): Promise<void> {
-    await this.json(`/api/v1/jobs/${id}/failure-keep`, {
+  async setFailureKeep(id: number, keep: boolean): Promise<Partial<FailureKeepPreference>> {
+    const response = await this.request(`/api/v1/jobs/${id}/failure-keep`, {
       method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ keep }),
     });
+    const result = await this.readJson<Partial<FailureKeepPreference>>(response);
+    return response.status === 202 ? { ...result, applied: false } : result;
   }
 
   async getLogs(includeFiles = false, limit = 1000): Promise<LogsPage> {
