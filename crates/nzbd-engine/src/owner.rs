@@ -326,6 +326,11 @@ pub(crate) enum QueueCommand {
     AdoptAuthority {
         reply: oneshot::Sender<Result<(), nzbd_state::StateError>>,
     },
+    UrlAdmissionsPage {
+        after: String,
+        limit: usize,
+        reply: oneshot::Sender<Result<Vec<UrlAdmissionReceipt>, String>>,
+    },
     BeginUrlAdmissionAdoption {
         reply: oneshot::Sender<bool>,
     },
@@ -2662,6 +2667,17 @@ impl Owner {
                 self.user_conn_caps = applied.clone();
                 self.publish_conn_budgets();
                 let _ = reply.send(applied);
+            }
+            QueueCommand::UrlAdmissionsPage {
+                after,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(crate::admissions::page(
+                    &self.state.url_admission_receipts,
+                    &after,
+                    limit,
+                ));
             }
             QueueCommand::BeginUrlAdmissionAdoption { reply } => {
                 let ok = !self.persistence_fenced;

@@ -37,6 +37,38 @@ pub(crate) fn valid_page(rows: &[UrlAdmissionReceipt]) -> bool {
             && tokens.insert(&row.request_token)
     })
 }
+pub(crate) fn page(
+    rows: &[UrlAdmissionReceipt],
+    after: &str,
+    limit: usize,
+) -> Result<Vec<UrlAdmissionReceipt>, String> {
+    if !(1..=100).contains(&limit) || after.len() > 1024 * 1024 {
+        return Err("admission catalog page requires limit 1..100 and bounded cursor".into());
+    }
+    let mut candidates = rows
+        .iter()
+        .filter(|row| row.request_token.as_str() > after)
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by(|a, b| a.request_token.cmp(&b.request_token));
+    let mut result = Vec::new();
+    let mut bytes = 2usize; // JSON array brackets, plus commas below.
+    for row in candidates.into_iter().take(limit) {
+        let encoded = serde_json::to_vec(row).map_err(|error| error.to_string())?;
+        let next = bytes
+            .saturating_add(encoded.len())
+            .saturating_add(usize::from(!result.is_empty()));
+        if next > 1024 * 1024 {
+            if result.is_empty() {
+                return Err("admission receipt exceeds supported 1MiB catalog page; admission requires review".into());
+            }
+            break;
+        }
+        bytes = next;
+        result.push(row.clone());
+    }
+    Ok(result)
+}
+
 pub(crate) fn merge_current(
     local: &UrlAdmissionReceipt,
     incoming: &UrlAdmissionReceipt,
@@ -71,6 +103,31 @@ pub(crate) fn merge_current(
 }
 
 impl EngineHandle {
+    /// Read a token-ordered catalog page, including retired admissions.
+    /// Advance with the last returned token; an empty page ends the scan.
+    pub async fn url_admissions_page(
+        &self,
+        after_token: &str,
+        limit: usize,
+    ) -> Result<Vec<UrlAdmissionReceipt>, EngineError> {
+        if !(1..=100).contains(&limit) || after_token.len() > 1024 * 1024 {
+            return Err(EngineError::RequestConflict(
+                "invalid admission page limit/cursor".into(),
+            ));
+        }
+        let (reply, result) = oneshot::channel();
+        self.send(QueueCommand::UrlAdmissionsPage {
+            after: after_token.into(),
+            limit,
+            reply,
+        })
+        .await?;
+        result
+            .await
+            .map_err(|_| EngineError::Closed)?
+            .map_err(EngineError::RequestConflict)
+    }
+
     /// Call while the cluster API is fenced, before paging its durable catalog.
     pub async fn begin_url_admission_adoption(&self) -> Result<bool, EngineError> {
         self.roundtrip_bool(|reply| QueueCommand::BeginUrlAdmissionAdoption { reply })
@@ -191,6 +248,30 @@ mod tests {
         let mut oversized = receipt("large", 2);
         oversized.publication_path = Some("x".repeat(1024 * 1024));
         assert!(!valid_page(&[oversized]));
+        let rows = vec![
+            receipt("z-retired", 3),
+            receipt("a-retired", 1),
+            receipt("m-retired", 2),
+        ];
+        let first = page(&rows, "", 2).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|row| row.request_token.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-retired", "m-retired"]
+        );
+        assert_eq!(
+            page(&rows, &first.last().unwrap().request_token, 2).unwrap()[0].request_token,
+            "z-retired"
+        );
+        assert!(page(&rows, "z-retired", 2).unwrap().is_empty());
+        assert!(page(&rows, "", 101).is_err());
+        let mut large = receipt("a", 1);
+        large.publication_path = Some("x".repeat(700 * 1024));
+        let mut second = large.clone();
+        second.request_token = "b".into();
+        assert_eq!(page(&[large, second], "", 100).unwrap().len(), 1);
         assert!(valid_page(
             &(1..=100)
                 .map(|id| receipt(&format!("token-{id}"), id))
