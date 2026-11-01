@@ -42,6 +42,10 @@ pub enum PostError {
     ToolMissing(String),
     #[error("subprocess failed: {0}")]
     Subprocess(String),
+    /// Post-processing finished, but no payload file has the integrity
+    /// evidence publication requires. Nothing failed to run.
+    #[error("nothing publishable: {0}")]
+    NothingPublishable(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("artifact inventory: {0}")]

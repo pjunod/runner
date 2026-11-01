@@ -1613,15 +1613,13 @@ async fn extract_complete_failed_archives(
         .for_job(job.id.0)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "failed job has no source artifact".to_string())?;
-    let restored_paths = inventory
-        .verified_restore_paths(job.id.0)
+    let evidence = inventory
+        .verified_custody_evidence(job.id.0, || Ok(()))
         .map_err(|error| error.to_string())?;
-    let mut complete = verified_direct_payload_paths(job, &source, &restored_paths, || Ok(()))
+    let mut complete = verified_direct_payload_paths(job, &source, &evidence.restored, || Ok(()))
         .map_err(|error| error.to_string())?;
-    let (_, repaired_or_extracted) = inventory
-        .verified_transform_evidence(job.id.0)
-        .map_err(|error| error.to_string())?;
-    complete.extend(repaired_or_extracted);
+    let already_consumed = evidence.consumed_inputs;
+    complete.extend(evidence.verified_outputs);
     let extractors = Extractors {
         unrar_cmd: cfg.unrar_cmd.clone(),
         sevenzip_cmd: cfg.sevenzip_cmd.clone(),
@@ -1646,7 +1644,10 @@ async fn extract_complete_failed_archives(
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
-        if paths.is_empty() || !paths.iter().all(|path| complete.contains(path)) {
+        if paths.is_empty()
+            || !paths.iter().all(|path| complete.contains(path))
+            || paths.iter().all(|path| already_consumed.contains(path))
+        {
             continue;
         }
         let token = format!("{:x}", Sha256::digest(archive.to_string_lossy().as_bytes()));
@@ -1752,14 +1753,13 @@ fn salvage_failed_delivery(
                 .into(),
         );
     }
-    let restored_paths = inventory
-        .verified_restore_paths(job.id.0)
+    let evidence = inventory
+        .verified_custody_evidence(job.id.0, || Ok(()))
         .map_err(|error| error.to_string())?;
-    let verified_direct = verified_direct_payload_paths(job, &source, &restored_paths, || Ok(()))
-        .map_err(|error| error.to_string())?;
-    let (consumed, extracted) = inventory
-        .verified_transform_evidence(job.id.0)
-        .map_err(|error| error.to_string())?;
+    let verified_direct =
+        verified_direct_payload_paths(job, &source, &evidence.restored, || Ok(()))
+            .map_err(|error| error.to_string())?;
+    let (consumed, extracted) = (evidence.consumed_inputs, evidence.verified_outputs);
     let verified = verified_direct.into_iter().chain(extracted).collect();
     let mut diagnostics = assess_file_inputs(job, &source, &verified)
         .map_err(|error| format!("source diagnostic read requires retry: {error}"))?;
@@ -1853,14 +1853,13 @@ fn failed_source_recovery(
             "bounded failed-source assessment requires the exact owned eligible generation".into(),
         );
     }
-    let restored_paths = inventory
-        .verified_restore_paths(job.id.0)
+    let evidence = inventory
+        .verified_custody_evidence(job.id.0, || Ok(()))
         .map_err(|error| error.to_string())?;
-    let verified_direct = verified_direct_payload_paths(job, &source, &restored_paths, || Ok(()))
-        .map_err(|error| error.to_string())?;
-    let (consumed, extracted) = inventory
-        .verified_transform_evidence(job.id.0)
-        .map_err(|error| error.to_string())?;
+    let verified_direct =
+        verified_direct_payload_paths(job, &source, &evidence.restored, || Ok(()))
+            .map_err(|error| error.to_string())?;
+    let (consumed, extracted) = (evidence.consumed_inputs, evidence.verified_outputs);
     let verified = verified_direct.into_iter().chain(extracted).collect();
     let mut diagnostics =
         assess_file_inputs(job, &source, &verified).map_err(|error| error.to_string())?;
@@ -2309,35 +2308,7 @@ fn spawn_job(
                 }
                 Some(Err(e)) => {
                     let detail = e.to_string();
-                    let cause = if nzbd_engine::is_out_of_space(&detail) {
-                        if detail.to_lowercase().contains("quota") {
-                            "quota"
-                        } else {
-                            "capacity"
-                        }
-                    } else if matches!(&e, PostError::ToolMissing(_)) {
-                        "missing_tool"
-                    } else if matches!(
-                        &e,
-                        PostError::Io(_)
-                            | PostError::Artifact(
-                                nzbd_state::artifacts::Error::Io(_)
-                                    | nzbd_state::artifacts::Error::Sql(_)
-                            )
-                    ) {
-                        "io"
-                    } else if detail.contains("identity")
-                        || detail.contains("collision")
-                        || detail.contains("unsafe")
-                    {
-                        if detail.contains("configured root identity changed or volume is unavailable") {
-                            "mount_unavailable"
-                        } else {
-                            "identity_conflict"
-                        }
-                    } else {
-                        "post_failure"
-                    };
+                    let cause = post_hold_cause(&e);
                     let stage = engine
                         .snapshot()
                         .jobs
@@ -3181,10 +3152,38 @@ async fn process_job_ctx_from_inner(
                 .find(|(k, _)| k == "*Unpack:Password")
                 .map(|(_, v)| v.as_str());
             let _capacity = nzbd_state::capacity::reserve(&dir, job.totals.size)?;
+            // A retry that restarts before unpack meets volumes the final
+            // deobfuscation pass already renamed. The extraction workspace is
+            // keyed by archive path, so the renamed set would look new and be
+            // extracted a second time. The custody journals say which exact
+            // files a successful extraction already consumed.
+            let already_consumed = {
+                let inventory = engine.artifacts();
+                crate::attempt::current()
+                    .expect("processing control")
+                    .blocking(move |control| {
+                        inventory
+                            .verified_custody_evidence(job_id.0, || control.checkpoint())
+                            .map(|evidence| evidence.consumed_inputs)
+                            .map_err(PostError::from)
+                    })
+                    .await?
+            };
             for (archive, kind) in &archives {
                 use sha2::{Digest, Sha256};
                 let token = format!("{:x}", Sha256::digest(archive.to_string_lossy().as_bytes()));
                 let archive_inputs = archive_input_set(&dir, archive, *kind);
+                let relative_inputs = source_relative(&dir, &archive_inputs);
+                if !relative_inputs.is_empty()
+                    && relative_inputs.len() == archive_inputs.len()
+                    && relative_inputs
+                        .iter()
+                        .all(|path| already_consumed.contains(path))
+                {
+                    unpacked_any = true;
+                    consumed_archive_paths.extend(relative_inputs);
+                    continue;
+                }
                 let mut workspace = engine
                     .artifacts()
                     .workspace(job_id.0, "extract", &token)
@@ -3645,29 +3644,30 @@ async fn process_job_ctx_from_inner(
     // post-script source bytes.
     let (journal_inputs, extraction_outputs, verified_direct) = if job.lifecycle_eligible() {
         let inventory = engine.artifacts();
-        let (inputs, outputs) = inventory
-            .verified_transform_evidence(job_id.0)
-            .map_err(PostError::from)?;
         // The active artifact is intentionally only an allocation record
         // until this quiescence boundary. Refresh its file identities now so
         // direct-media CRC proof is bound to the files actually on disk.
         let source = inventory
             .refresh_for_delivery(job_id.0)
             .map_err(PostError::from)?;
-        let restore_inventory = inventory.clone();
+        let evidence_inventory = inventory.clone();
         let job = job.clone();
-        let direct = crate::attempt::current()
+        crate::attempt::current()
             .expect("processing control")
             .blocking(move |control| {
-                let restored_paths = restore_inventory
-                    .verified_restore_paths_with_checkpoint(job_id.0, || control.checkpoint())
+                // One pass over all custody journals: the final deobfuscation
+                // pass above renames extraction outputs, and only the rename
+                // journal can carry their extraction proof to the new name.
+                let evidence = evidence_inventory
+                    .verified_custody_evidence(job_id.0, || control.checkpoint())
                     .map_err(PostError::from)?;
-                verified_direct_payload_paths(&job, &source, &restored_paths, || {
-                    control.checkpoint()
-                })
+                let direct =
+                    verified_direct_payload_paths(&job, &source, &evidence.restored, || {
+                        control.checkpoint()
+                    })?;
+                Ok::<_, PostError>((evidence.consumed_inputs, evidence.verified_outputs, direct))
             })
-            .await?;
-        (inputs, outputs, direct)
+            .await?
     } else {
         (Default::default(), Default::default(), Default::default())
     };
@@ -3881,9 +3881,9 @@ async fn process_job_ctx_from_inner(
                     &diagnostics,
                 );
                 if selected_files.is_empty() {
-                    return Err(PostError::Subprocess(
-                        "no verified media, native book, or paired sidecar is eligible for publication; source retained".into(),
-                    ));
+                    return Err(PostError::NothingPublishable(unpublishable_summary(
+                        &file_outcomes,
+                    )));
                 }
                 let configured_root = rule
                     .as_ref()
@@ -4467,6 +4467,90 @@ fn select_delivery_payload(
         )
         .collect();
     (selected, outcomes)
+}
+
+/// The control cause recorded when post-processing stops with `error`.
+fn post_hold_cause(error: &PostError) -> &'static str {
+    // Its detail names payload files; a release title must never steer the
+    // cause through the substring checks below.
+    if matches!(error, PostError::NothingPublishable(_)) {
+        return "post_failure";
+    }
+    let detail = error.to_string();
+    if nzbd_engine::is_out_of_space(&detail) {
+        if detail.to_lowercase().contains("quota") {
+            "quota"
+        } else {
+            "capacity"
+        }
+    } else if matches!(error, PostError::ToolMissing(_)) {
+        "missing_tool"
+    } else if matches!(
+        error,
+        PostError::Io(_)
+            | PostError::Artifact(
+                nzbd_state::artifacts::Error::Io(_) | nzbd_state::artifacts::Error::Sql(_)
+            )
+    ) {
+        "io"
+    } else if detail.contains("identity")
+        || detail.contains("collision")
+        || detail.contains("unsafe")
+    {
+        if detail.contains("configured root identity changed or volume is unavailable") {
+            "mount_unavailable"
+        } else {
+            "identity_conflict"
+        }
+    } else {
+        "post_failure"
+    }
+}
+
+/// Source-relative spellings of `paths`, dropping any outside `dir`.
+fn source_relative(dir: &Path, paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .filter_map(|path| path.strip_prefix(dir).ok())
+        .map(|relative| relative.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Why nothing in the source could be published, in the operator's terms:
+/// the payload files that exist and what each one lacks.
+fn unpublishable_summary(outcomes: &[DeliveryFileOutcome]) -> String {
+    const SHOWN: usize = 3;
+    let payloads: Vec<_> = outcomes
+        .iter()
+        .filter(|file| {
+            matches!(
+                file.classification.as_str(),
+                "video" | "native_book" | "audio"
+            )
+        })
+        .collect();
+    if payloads.is_empty() {
+        return "no media, book, or audio file was found in the download; source retained".into();
+    }
+    let mut detail = payloads
+        .iter()
+        .take(SHOWN)
+        .map(|file| {
+            let name = Path::new(&file.source_path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| file.source_path.clone());
+            match &file.reason {
+                Some(reason) => format!("{name}: {reason}"),
+                None => name,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if payloads.len() > SHOWN {
+        detail.push_str(&format!("; and {} more", payloads.len() - SHOWN));
+    }
+    format!("no file has integrity evidence for publication; source retained ({detail})")
 }
 
 fn recovery_reason(outcomes: &[DeliveryFileOutcome]) -> Option<String> {
@@ -7000,6 +7084,305 @@ mod decision_tests {
         );
         assert!(!published.exists());
         engine.shutdown().await;
+    }
+
+    struct ObfuscatedRelease {
+        _temp: tempfile::TempDir,
+        engine: EngineHandle,
+        history: Arc<HistoryDb>,
+        downloads: PathBuf,
+        completed: PathBuf,
+        source: PathBuf,
+        hash: &'static str,
+        media: Vec<u8>,
+    }
+
+    /// The field shape: an obfuscated archive (`<hash>.zip`, standing in for
+    /// `<hash>.partNN.rar`) holding obfuscated media (`<hash>.mkv`), on a
+    /// Curator-lifecycle job, optionally with a PAR2 set whose catalog names
+    /// the obfuscated archive.
+    async fn obfuscated_release(with_par2: bool) -> ObfuscatedRelease {
+        let temp = tempfile::tempdir().unwrap();
+        let downloads = temp.path().join("downloads");
+        let completed = temp.path().join("completed");
+        let history = Arc::new(
+            HistoryDb::open(&temp.path().join("history.sqlite"), Some(temp.path())).unwrap(),
+        );
+        let mut config = nzbd_engine::EngineConfig::single_node(
+            Vec::new(),
+            temp.path().join("queue"),
+            downloads.clone(),
+            nzbd_engine::Tuning::default(),
+            None,
+        );
+        config.artifact_dir = Some(temp.path().join("artifacts"));
+        config.history = Some(history.clone());
+        let engine = nzbd_engine::Engine::spawn(config).await.unwrap();
+        let inventory = engine.artifacts();
+        let hash = "9abad49b5b2859fa648bbb2a5286671e";
+        let media = vec![b'M'; 64 * 1024];
+        let staging = temp.path().join("posted");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join(format!("{hash}.mkv")), &media).unwrap();
+        assert!(std::process::Command::new("7z")
+            .args(["a", "-tzip", "-y"])
+            .arg(format!("{hash}.zip"))
+            .arg(format!("{hash}.mkv"))
+            .current_dir(&staging)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::remove_file(staging.join(format!("{hash}.mkv"))).unwrap();
+        if with_par2 {
+            assert!(std::process::Command::new("par2")
+                .args(["create", "-q", "-q", "-s8192", "-c4"])
+                .arg(format!("{hash}.par2"))
+                .arg(format!("{hash}.zip"))
+                .current_dir(&staging)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let mut files = Vec::new();
+        let mut names = std::fs::read_dir(&staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        for (index, name) in names.iter().enumerate() {
+            let bytes = std::fs::read(staging.join(name)).unwrap();
+            let mut entry = file(index as u32 + 1, name, Some(crc32fast::hash(&bytes)));
+            entry.is_par2 = name.ends_with(".par2");
+            entry.segments = vec![Segment {
+                message_id: format!("posted-{index}").into(),
+                number: 1,
+                size: bytes.len() as u32,
+                state: SegmentState::Done {
+                    offset: 0,
+                    len: bytes.len() as u32,
+                    crc: crc32fast::hash(&bytes),
+                },
+            }];
+            files.push(entry);
+        }
+        let mut request = job(
+            files,
+            vec![
+                ("monarr-transfer".into(), "obfuscated-token".into()),
+                ("monarr-delivery".into(), "1".into()),
+            ],
+        );
+        request.delivery_lifecycle = true;
+        request.status = JobStatus::PostQueued;
+        let source_path = downloads.join(nzbd_engine::queue::job_dir_name(&request));
+        inventory
+            .allocate_for_delivery(41, &downloads, &source_path, true, true)
+            .unwrap();
+        engine
+            .import_job(request.clone(), false, false)
+            .await
+            .unwrap();
+        let source = inventory.for_job(41).unwrap().unwrap().path;
+        for name in &names {
+            std::fs::copy(staging.join(name), source.join(name)).unwrap();
+        }
+        inventory.finish(41, &source, &downloads, "active").unwrap();
+        ObfuscatedRelease {
+            _temp: temp,
+            engine,
+            history,
+            downloads,
+            completed,
+            source,
+            hash,
+            media,
+        }
+    }
+
+    impl ObfuscatedRelease {
+        fn cfg(&self) -> PostConfig {
+            PostConfig {
+                completed_dir: Some(self.completed.clone()),
+                ..PostConfig::default()
+            }
+        }
+
+        async fn process(&self) -> Result<PpFinal, PostError> {
+            process_job_ctx(
+                &self.engine,
+                &self.cfg(),
+                &self.history,
+                &self.downloads,
+                JobId(41),
+                &PpCtx::default(),
+            )
+            .await
+        }
+
+        fn publication(&self) -> PathBuf {
+            let generation = self
+                .engine
+                .artifacts()
+                .for_job(41)
+                .unwrap()
+                .unwrap()
+                .generation;
+            self.completed
+                .join(format!("Some.Release.runner-{generation}"))
+        }
+
+        /// The publication holds exactly the release-named media.
+        fn assert_published_once(&self) {
+            let published = self.publication();
+            assert_eq!(
+                std::fs::read(published.join("Some.Release.mkv")).unwrap(),
+                self.media
+            );
+            let media = std::fs::read_dir(&published)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".mkv"))
+                .collect::<Vec<_>>();
+            assert_eq!(media, vec!["Some.Release.mkv".to_string()]);
+            assert_eq!(
+                self.history.get(JobId(41)).unwrap().unwrap().status,
+                "SUCCESS"
+            );
+        }
+    }
+
+    /// Field report 2026-10-27: obfuscated releases (`<hash>.partNN.rar`
+    /// holding `<hash>.mkv`) extracted cleanly, then the final deobfuscation
+    /// pass renamed the media to the release name. The rename changed the
+    /// file's ctime, the extraction proof stopped matching, and every such
+    /// download was held with nothing publishable.
+    #[tokio::test]
+    async fn deobfuscated_extraction_output_is_published_under_its_release_name() {
+        if !crate::tools::require_tool("7z") {
+            return;
+        }
+        let release = obfuscated_release(false).await;
+        let outcome = release.process().await;
+        assert!(
+            matches!(outcome, Ok(PpFinal::Success)),
+            "deobfuscated extraction must publish: {outcome:?}"
+        );
+        release.assert_published_once();
+        assert!(!release
+            .publication()
+            .join(format!("{}.mkv", release.hash))
+            .exists());
+        let inventory = release.engine.artifacts();
+        let delivery = inventory
+            .delivery_for_job(41)
+            .unwrap()
+            .expect("Curator delivery");
+        let outcomes = inventory
+            .delivery_file_outcomes(&delivery.artifact_id, &delivery.publication_generation)
+            .unwrap();
+        let archive_row = outcomes
+            .iter()
+            .find(|row| row.source_path == "Some.Release.zip")
+            .expect("renamed archive input is classified");
+        assert_eq!(archive_row.outcome, "consumed");
+        release.engine.shutdown().await;
+    }
+
+    /// The held field jobs are retried with the operator's Retry, which
+    /// restarts post-processing from the beginning. By then the volumes carry
+    /// the release name (and a PAR2 catalog may rename them back to the
+    /// obfuscated name). Neither spelling may cause a second extraction.
+    #[tokio::test]
+    async fn retry_from_beginning_after_deobfuscation_does_not_extract_twice() {
+        if !crate::tools::require_tool("7z") || !crate::tools::require_tool("par2") {
+            return;
+        }
+        for with_par2 in [false, true] {
+            let release = obfuscated_release(with_par2).await;
+            // Hold the first attempt after deobfuscation and before
+            // publication, as the field jobs were.
+            let blocker = release.publication();
+            std::fs::create_dir_all(&blocker).unwrap();
+            std::fs::write(blocker.join("occupied"), b"x").unwrap();
+            assert!(
+                release.process().await.is_err(),
+                "occupied publication target must stop the first attempt"
+            );
+            assert!(release.source.join("Some.Release.mkv").exists());
+            std::fs::remove_dir_all(&blocker).unwrap();
+            // Re-extraction would fail: the consumed set must be recognized.
+            let outcome = process_job_ctx(
+                &release.engine,
+                &PostConfig {
+                    sevenzip_cmd: "/no-such-extractor".into(),
+                    ..release.cfg()
+                },
+                &release.history,
+                &release.downloads,
+                JobId(41),
+                &PpCtx::default(),
+            )
+            .await;
+            assert!(
+                matches!(outcome, Ok(PpFinal::Success)),
+                "retry (par2={with_par2}) must publish without re-extracting: {outcome:?}"
+            );
+            release.assert_published_once();
+            release.engine.shutdown().await;
+        }
+    }
+
+    #[test]
+    fn nothing_publishable_is_a_retryable_post_failure_whatever_the_title() {
+        for title in [
+            "The.Bourne.Identity.2002.mkv: no integrity evidence",
+            "Unsafe.2026.mkv: collision",
+            "No space left on device.mkv: missing",
+        ] {
+            assert_eq!(
+                post_hold_cause(&PostError::NothingPublishable(title.into())),
+                "post_failure"
+            );
+        }
+        assert_eq!(
+            post_hold_cause(&PostError::Subprocess(
+                "restore source changed identity".into()
+            )),
+            "identity_conflict"
+        );
+    }
+
+    #[test]
+    fn nothing_publishable_names_the_payload_and_what_it_lacks() {
+        let row = |path: &str, classification: &str, reason: Option<&str>| DeliveryFileOutcome {
+            source_path: path.into(),
+            publication_path: None,
+            classification: classification.into(),
+            outcome: "unverified_review".into(),
+            reason: reason.map(str::to_owned),
+            repair_dependency: false,
+            source_cleanup_status: String::new(),
+        };
+        let summary = unpublishable_summary(&[
+            row("Show.S01E01.part01.rar", "archive_input", Some("archive")),
+            row(
+                "sub/Show.S01E01.mkv",
+                "video",
+                Some("no integrity evidence"),
+            ),
+        ]);
+        assert_eq!(
+            summary,
+            "no file has integrity evidence for publication; source retained (Show.S01E01.mkv: no integrity evidence)"
+        );
+        assert_eq!(
+            unpublishable_summary(&[row("x.rar", "archive_input", None)]),
+            "no media, book, or audio file was found in the download; source retained"
+        );
+        assert_eq!(
+            PostError::NothingPublishable(summary).to_string(),
+            "nothing publishable: no file has integrity evidence for publication; source retained (Show.S01E01.mkv: no integrity evidence)"
+        );
     }
 
     #[tokio::test]

@@ -1,5 +1,39 @@
 # nzbd — Project Status
 
+## Deobfuscated extractions held as unpublishable — 2026-11-01
+
+**Status:** fixed; state and end-to-end PP regressions added. Field report
+(2026-10-27, 17 held jobs, 15 of them Good Trouble episodes): "I frequently
+have downloads that end up 'held' for the same reason with some message about a
+subprocess failed … The message makes no sense to me and it's annoying that
+they keep getting hung up." Every one was an obfuscated release
+(`<hash>.partNN.rar` holding `<hash>.mkv`) that extracted cleanly; the final
+deobfuscation pass then renamed the media and volumes to the release name. The
+rename changed the media's ctime, the extraction journal's complete-identity
+proof stopped matching, nothing was eligible for publication, and the job was
+held with `subprocess failed: no verified media, native book, or paired sidecar
+is eligible for publication`. Retries reached the same verdict. The rename
+journal already carried the proof for exactly this transition (pre-rename
+identity + digest); publication never consulted it for transform outputs.
+
+- `Inventory::verified_custody_evidence` judges the rename, extraction and
+  PAR-repair journals in one hashing pass. An output is followed through a
+  rename only when the journaled pre-rename identity equals the identity the
+  transform recorded and the current bytes match the rename digest; consumed
+  archive inputs follow their renames the same way. All four PP/salvage
+  callers use it.
+- A retry restarts PP from the beginning, after the volumes were renamed (and
+  a PAR2 catalog may rename them back). The extraction workspace is keyed by
+  archive path, so that either re-extracted the set (two copies published) or
+  failed `published extraction output changed`. Unpack now skips an archive
+  whose every volume the custody journals prove a successful extraction
+  already consumed.
+- "Consumed" authorizes deletion, so it now requires the exact identity the
+  extraction bound, at the bound path or carried by the rename journal.
+- The held message is now `nothing publishable:` (its own `PostError` variant;
+  nothing failed to run, always cause `post_failure` so Retry stays available)
+  and names each payload file and what it lacks.
+
 ## Stuck "Fetching NZB" jobs — 2026-11-01
 
 **Status:** root cause fixed in Curator (monarr v0.38.3); Runner app shows the

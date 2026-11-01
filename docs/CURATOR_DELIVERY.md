@@ -208,6 +208,18 @@ plus paired subtitle, NFO, and established cover art sidecars. Explicit
 `Sample/` or `Proof/` directories are excluded; ordinary titles containing
 “Sample” remain eligible. Samples and repair/temp inputs are excluded. An archive is marked
 consumed only when the transform journal proves its extraction was published.
+Extraction and repair outputs keep their proof across Runner's own later
+renames (PAR naming restoration and the final deobfuscation pass, which gives
+an obfuscated `<hash>.mkv` and its `<hash>.partNN.rar` volumes the release
+name): the rename journal records each file's complete identity immediately
+before the rename and a digest of its bytes, and an output is followed to its
+new name only when that pre-rename identity is exactly the one the transform
+journal recorded and the current bytes still match the digest. Consumed archive
+inputs need the exact identity the extraction bound, at the bound path or
+carried by the rename journal, and an archive whose every volume is already
+proven consumed is not extracted again on retry. When nothing is
+publishable, the held job says `nothing publishable:` and names the payload
+files found and what each one lacks.
 Nested or unconsumed archives and unknown files stay in Runner's source tree
 when they remain unresolved after a partial publication. A failed job is
 retained for recovery only when Runner has a concrete retry or repair reason;
