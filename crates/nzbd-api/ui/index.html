@@ -2334,19 +2334,48 @@ async function saveSeedPolicy(id) {
   } else toast({ text: "Couldn't save seeding policy — " + result.error, kind: "error" });
   renderQueue();
 }
+// Current retention is mutable source custody, separate from the admission snapshot.
+const failureKeepState = new Map();
+function renderRetention() { renderQueue(); renderHistory(); }
+function failureKeepModel(id, hidden = false) {
+  const state = failureKeepState.get(id);
+  return { failureKeep: !!state?.keep,
+    failureKeepHidden: hidden || state?.available !== true,
+    failureKeepBusy: !!state?.saving,
+    failureKeepNote: hidden ? "" : state?.error
+      ? "Could not check source retention: " + state.error
+      : state?.available === false ? "No retained source is available for this preference."
+      : !state || state.loading ? "Checking current source retention…" : "" };
+}
+async function refreshFailureKeep(id) {
+  const previous = failureKeepState.get(id);
+  if (previous?.loading || previous?.saving) return;
+  failureKeepState.set(id, { ...previous, loading: true });
+  const result = await post("/api/v1/jobs/" + id + "/failure-keep", { method: "GET" });
+  failureKeepState.set(id, result.ok && typeof result.body?.available === "boolean" && typeof result.body?.keep === "boolean"
+    ? { available: result.body.available, keep: result.body.keep }
+    : { available: false, error: result.error || "Runner did not provide a current preference." });
+  renderRetention();
+}
 async function toggleFailureKeep(id) {
-  const job = store.jobs.find(item => item.id === id);
-  if (!job) return;
-  const keep = !(job.params || []).some(([key, value]) => key === "*Runner:KeepOnFailure" && value === "1");
+  const state = failureKeepState.get(id);
+  if (!state?.available || state.loading || state.saving) return;
+  const keep = !state.keep;
+  failureKeepState.set(id, { ...state, saving: true }); renderRetention();
   const response = await post("/api/v1/jobs/" + id + "/failure-keep", {
     method: "PUT", headers: { ...CLIENT_HDRS, "content-type": "application/json" },
     body: JSON.stringify({ keep }),
   });
+  failureKeepState.set(id, { ...state, keep: response.ok ? keep : state.keep });
   if (response.ok) {
-    toast({ text: keep ? "Runner will retain this download's source if it fails" : "This download will follow Runner's configured failure policy" });
-    refreshAll();
-  } else toast({ text: "Couldn't save failure retention — " + response.error, kind: "error" });
+    toast({ text: keep ? "Keep on failure is on for this retained source." : "Keep on failure is off. Runner's configured failure policy applies." });
+    await refreshFailureKeep(id);
+  } else {
+    toast({ text: "Couldn't save failure retention — " + response.error, kind: "error" });
+    renderRetention();
+  }
 }
+
 function editSeedPolicy(ev) {
   const el = ev.target;
   const field = el && el.dataset && el.dataset.seedField;
@@ -2398,6 +2427,7 @@ function buildDetailRow(d) {
   d.data(c.close, "action", "detail-close");
   d.text(c.close, "close");
 
+  c.failureKeepNote = d.append(wrap, d.create("div", "jd-metric"));
   c.repair = d.append(wrap, d.create("div", "jd-metric"));
   c.torrent = d.append(wrap, d.create("section", "jd-torrent"));
   const facts = d.append(c.torrent, d.create("dl", "torrent-facts"));
@@ -2592,7 +2622,6 @@ function detailModel(j, nowMs) {
   const bits = (j.params || [])
     .filter(([k]) => k && k[0] !== "*")
     .map(([k, v]) => k + " = " + v);
-  const keepOnFailure = (j.params || []).some(([key, value]) => key === "*Runner:KeepOnFailure" && value === "1");
   const recoverMax = recoveryMax(j);
   const postTiming = j.postTiming;
   const cleanupRetry = j.failedCleanup;
@@ -2637,8 +2666,7 @@ function detailModel(j, nowMs) {
     sourceTitle: torrent
       ? "Download this job's retained .torrent metainfo."
       : "Download this job's NZB regenerated from queue state.",
-    failureKeep: keepOnFailure,
-    failureKeepHidden: torrent || j.status === "completed" || j.status === "failed" || j.status === "deleted",
+    ...failureKeepModel(j.id, torrent),
     nzbHidden: false,
     closeHidden: false,
     recoverHidden: torrent || !recoverMax,
@@ -2766,10 +2794,12 @@ function applyDetail(tr, m, d) {
   w("failureKeep", !!m.failureKeep, v => {
     d.text(c.keepFailure, "Keep on failure: " + (v ? "on" : "off"));
     d.prop(c.keepFailure, "title", v
-      ? "Retain this Runner source if the download fails. Change is saved to the durable queue record."
+      ? "Retain this Runner source if the download fails. Change applies to the current retained source."
       : "Default: failed source files follow Runner's configured failure policy.");
   });
   w("failureKeepHidden", !!m.failureKeepHidden, v => d.prop(c.keepFailure, "hidden", v));
+  w("failureKeepBusy", !!m.failureKeepBusy, v => d.attr(c.keepFailure, "aria-disabled", String(v)));
+  w("failureKeepNote", m.failureKeepNote || "", v => { d.text(c.failureKeepNote, v); d.prop(c.failureKeepNote, "hidden", !v); });
   // History has no NZB endpoint of its own — a parked NZB is reachable
   // only through requeue — so the button is absent rather than broken.
   w("nzbHidden", !!m.nzbHidden, v => d.prop(c.nzb, "hidden", v));
@@ -3385,6 +3415,7 @@ function histModel(e) {
     // A parked delete can go straight back to the queue, long after the
     // Undo toast has faded.
     requeueHidden: !e.can_requeue,
+    requeueReason: e.can_requeue ? "" : e.requeue_reason || "",
     detailsLabel: e.job === openHist ? "close" : "details",
     detailsCls: e.job === openHist ? "details-open" : "",
     // The only destructive action on the page arms first (§ two-step).
@@ -3455,6 +3486,7 @@ function histDetailModel(e) {
     // No history NZB endpoint: the parked NZB is reachable through
     // requeue, and a link that 404s is worse than no link.
     nzbHref: "", nzbHidden: true, closeHidden: true,
+    ...failureKeepModel(e.job),
     recoverHidden: true, recoverMax: "",
     // Keep the joined string in the model for compatibility/searchability,
     // but records render through labeled facts below. Only the explanatory
@@ -3511,6 +3543,7 @@ function buildHistRow(d) {
   c.forget = mk("", "h-delete", "forget", "remove the history record, keep files");
   c.delFiles = mk("del", "h-delete-files", "delete files",
     "remove the record AND delete the downloaded files");
+  c.requeueReason = d.append(td6, d.create("div", "jd-metric"));
   tr.__c = c;
   return tr;
 }
@@ -3537,6 +3570,7 @@ function applyHistRow(tr, m, d) {
   w("visLabel", m.visLabel, v => d.text(c.vis, v));
   w("visTip", m.visTip, v => d.prop(c.vis, "title", v));
   w("requeueHidden", m.requeueHidden, v => d.prop(c.requeue, "hidden", v));
+  w("requeueReason", m.requeueReason || "", v => { d.text(c.requeueReason, v); d.prop(c.requeueReason, "hidden", !v); });
   w("detailsLabel", m.detailsLabel, v => d.text(c.details, v));
   w("detailsCls", m.detailsCls || "", v => d.cls(c.details, v));
   w("delLabel", m.delLabel, v => d.text(c.delFiles, v));
@@ -4035,6 +4069,7 @@ async function refreshLogs() {
 async function refreshJobDetail() {
   if (openJob == null) return;
   const id = openJob;
+  refreshFailureKeep(id);
   try {
     const [fr, lr] = await Promise.all([
       jfetch("/api/v1/jobs/" + id + "/files"),
@@ -4138,13 +4173,12 @@ function toggleJob(id) {
   refreshJobDetail();
 }
 
-/// Open/close a history entry's detail panel. No fetch: everything it
-/// shows was captured into the entry when the job left the queue, which is
-/// the point — a record you have to go and ask the queue for is a record
-/// that stops existing when the queue forgets the job.
+/// Historical facts are self-contained. Current retained-source preference
+/// is fetched independently and remains available after queue retirement.
 function toggleHist(id) {
   openHist = openHist === id ? null : id;
   renderHistory();
+  if (openHist != null) refreshFailureKeep(id);
 }
 
 // ---- one delegated click listener ---------------------------------------
@@ -4165,13 +4199,18 @@ const HIST_ACTIONS = {
 // case (you didn't) cost one more. The server parks the job's regenerated
 // NZB, so Undo is a real requeue and not a re-download.
 const UNDO_MS = 8000;
+const CONSUMER_REQUEUE_REASON = "This download belongs to a Curator request. Use a fresh Grab in Curator to acquire it again, or retry its retained source.";
+function consumerRequest(job) { return (job?.params || []).some(([key, value]) => key === "monarr-transfer" && value); }
 async function deleteJob(id, name) {
+  const consumerOwned = consumerRequest(store.jobs.find(job => job.id === id));
   const res = await jobAction(id, "delete", {
     key: pending.key(id, "delete"), kind: "delete", jobId: id,
     label: "Deleting “" + name + "”",
   });
   if (!res) return; // jobAction already reverted the row and said why
-  if (res.parked) {
+  if (consumerOwned || res.can_requeue === false && res.requeue_reason) {
+    toast({ text: "Deleted “" + name + "” — " + (res.requeue_reason || CONSUMER_REQUEUE_REASON), ttlMs: 12000 });
+  } else if (res.parked) {
     toast({
       text: "Deleted “" + name + "”",
       ttlMs: UNDO_MS,
@@ -4249,6 +4288,7 @@ document.addEventListener("click", (ev) => {
     return;
   }
   const name = row && row.__prev ? row.__prev.name : "this job";
+  if (action === "failure-keep") { toggleFailureKeep(id); return; }
   if (scope === "history") {
     if (action === "h-details") { toggleHist(id); return; }
     if (action === "h-requeue") { requeueJob(id, name); return; }
@@ -4273,7 +4313,6 @@ document.addEventListener("click", (ev) => {
   }
   if (action === "seed-options") { if (openJob !== id) toggleJob(id); return; }
   if (action === "seed-save") { saveSeedPolicy(id); return; }
-  if (action === "failure-keep") { toggleFailureKeep(id); return; }
   if (action === "delete") {
     deleteJob(id, name);
     return;
@@ -6449,6 +6488,7 @@ function pollPass() {
     else if (activeTab !== "queue") refreshTab();
   } else if (activeTab !== "queue") refreshTab();
   if (openJob != null) refreshJobDetail();
+  if (activeTab === "history" && openHist != null) refreshFailureKeep(openHist);
 }
 (async () => {
   if (await checkSetup()) return;
@@ -6497,6 +6537,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     PENDING_TTL_MS, PENDING_HARD_MS, UNDO_MS, ARM_MS, refreshTab,
     armButton, armIsSet, disarmButton, histKey, renderHistory, renderStatus,
     deleteJob, requeueJob, jobAction, histAction, post,
+    failureKeepModel, refreshFailureKeep, toggleFailureKeep, failureKeepState,
     pushRate, pushRateSampled, rateSeries, spark, SPARK_N, titleFor,
     appendLogs, logMatches, renderLogs, serverChipModels, renderStorage, LOG_RING_MAX,
     trimLogRing, logClass, logLineText, scheduleLogRender, refreshLogs,

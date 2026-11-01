@@ -584,12 +584,13 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   ok(old.meta.includes("predates"), `pre-upgrade entries say so (got ${old.meta})`);
   eq(old.files.length, 0);
 
-  // The panel is a toggle, and opening one does not fetch anything.
+  // Historical facts remain local; only current retained-source custody is fetched.
   routes.clear(); seen.length = 0;
   T.store.history = [withRecord];
   T.toggleHist(182);
   eq(T.getOpenHist(), 182, "details open");
-  eq(seen.length, 0, "no request — the record is already in hand");
+  eq(seen.length, 1, "one current source preference lookup, no historical record fetch");
+  ok(seen[0].url.endsWith("/jobs/182/failure-keep"), "history does not depend on live queue membership");
   const body = sandbox.document.getElementById("history-body");
   eq(body.children.length, 2, "the detail row renders under its own row");
   const dc = body.children[1].__c;
@@ -1341,6 +1342,42 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(stack.children[0].children.length, 2, "but with no action button — just the dismiss ×");
   ok(stack.children[0].children[0].textContent.includes("can't be undone"),
     "…and it says why");
+
+  // Consumer-owned parked jobs need fresh Curator authority, never a fake Undo.
+  reset();
+  T.store.jobs = [job(22, { name: "Curator movie", params: [["monarr-transfer", "transfer-22"]] })];
+  routes.set("/actions/delete", { status: 200, body: { ok: true, parked: true } });
+  await T.deleteJob(22, "Curator movie");
+  eq(stack.children[0].children.length, 2, "consumer parked deletion has no Undo");
+  ok(stack.children[0].children[0].textContent.includes("fresh Grab in Curator"), "consumer delete explains fresh request authority");
+  const refused = T.histModel({ job: 22, name: "Curator movie", status: "DELETED", can_requeue: false,
+    requeue_reason: "Use a fresh Grab in Curator", stages: [] });
+  eq(refused.requeueHidden, true, "consumer history cannot offer requeue");
+  eq(refused.requeueReason, "Use a fresh Grab in Curator", "history renders the server refusal reason");
+
+  // Queue retirement does not remove a durable source's current Keep control.
+  reset(); T.store.jobs = []; T.failureKeepState.clear();
+  let retainedKeep = false;
+  routes.set("/jobs/22/failure-keep", (_url, init) => {
+    if (init.method === "PUT") retainedKeep = JSON.parse(init.body).keep;
+    return { status: 200, body: { available: true, keep: retainedKeep } };
+  });
+  await T.refreshFailureKeep(22);
+  eq(T.histDetailModel({ job: 22, stages: [] }).failureKeepHidden, false, "retired history exposes proven source preference");
+  await T.toggleFailureKeep(22);
+  eq(retainedKeep, true, "history toggle writes current retained-source preference");
+  eq(T.histDetailModel({ job: 22, stages: [] }).failureKeep, true, "GET refresh confirms the changed current value");
+  routes.set("/jobs/22/failure-keep", { status: 409, body: { error: "source changed; review current source" } });
+  await T.toggleFailureKeep(22);
+  eq(T.histDetailModel({ job: 22, stages: [] }).failureKeep, true, "failed toggle preserves confirmed preference");
+  ok(stack.children.some(n => n.children[0].textContent.includes("source changed")), "retention failure is visible");
+  await T.refreshFailureKeep(22);
+  eq(T.histDetailModel({ job: 22, stages: [] }).failureKeepHidden, true, "unconfirmed current custody cannot toggle");
+  ok(T.histDetailModel({ job: 22, stages: [] }).failureKeepNote.includes("source changed"), "failed current lookup has actionable feedback");
+  routes.set("/jobs/22/failure-keep", { status: 200, body: { available: false, keep: false } });
+  await T.refreshFailureKeep(22);
+  ok(T.histDetailModel({ job: 22, stages: [] }).failureKeepNote.includes("No retained source"), "unavailable source is explained");
+  T.failureKeepState.clear();
 
   // (d) a failed delete reverts the row and quotes the daemon
   reset();

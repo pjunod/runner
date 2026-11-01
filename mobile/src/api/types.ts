@@ -206,6 +206,11 @@ export interface HistoryJobRecord {
   dir_name: string | null;
 }
 
+export interface FailureKeepPreference {
+  available: boolean;
+  keep: boolean;
+}
+
 export interface HistoryEntry {
   job: number;
   name: string;
@@ -218,6 +223,7 @@ export interface HistoryEntry {
   picked_up_by: string | null;
   removed_at_unix: number | null;
   can_requeue: boolean;
+  requeue_reason?: string | null;
   record: HistoryJobRecord | null;
   stages: StageSpan[];
 }

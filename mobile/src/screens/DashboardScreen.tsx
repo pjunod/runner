@@ -38,6 +38,8 @@ import {
   StoragePath,
   StatusDto,
 } from '../api/types';
+import { NzbdClient } from '../api/client';
+import { FailureKeepControl } from '../components/FailureKeepControl';
 import { ActionButton } from '../components/ActionButton';
 import { ThemeSwitcher } from '../components/ThemeSwitcher';
 import { useNzbd } from '../hooks/useNzbd';
@@ -69,6 +71,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
   const [seedEditor, setSeedEditor] = useState<number | null>(null);
   const [seedExplanation, setSeedExplanation] = useState<string | null>(null);
   const { collapsed, toggle: toggleCollapsed } = useCollapsedSections();
+  const lifecycleClient = useMemo(() => new NzbdClient(config), [config]);
   const activeConfig = useRef<Props['config'] | null>(config);
   activeConfig.current = config;
   useEffect(() => { activeConfig.current = config; return () => { activeConfig.current = null; }; }, [config]);
@@ -356,6 +359,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
                         {!hidden ? <View style={styles.queueGroupJobs}>
                           {sectionJobs.map(({ job, index }) => (
                             <JobCard
+                              client={lifecycleClient}
                               busy={busyKey !== null}
                               expanded={expanded === job.id}
                               index={index}
@@ -579,6 +583,7 @@ function StorageVolume({
 }
 
 export function JobCard({
+  client,
   job,
   index,
   total,
@@ -595,6 +600,7 @@ export function JobCard({
   styles,
   tone,
 }: {
+  client?: NzbdClient;
   job: JobSummary;
   index: number;
   total: number;
@@ -700,6 +706,7 @@ export function JobCard({
 
       {expanded ? (
         <View style={styles.jobActions}>
+          {client && job.kind !== 'torrent' ? <FailureKeepControl client={client} jobId={job.id} /> : null}
           <View style={styles.jobFacts}>
             {!phase ? <Fact label="Health" styles={styles} value={`${(job.health / 10).toFixed(1)}%`} /> : null}
             <Fact label="Files" styles={styles} value={`${job.files_done}/${job.files_total}`} />

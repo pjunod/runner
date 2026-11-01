@@ -8,6 +8,7 @@ import {
   AddTorrentResult,
   ConnectionConfig,
   HistoryPage,
+  FailureKeepPreference,
   JobSummary,
   LogsPage,
   QueueSnapshot,
@@ -54,6 +55,16 @@ export class NzbdClient {
   async getHistory(limit = 200, offset = 0): Promise<HistoryPage> {
     const query = new URLSearchParams({ limit: String(limit), offset: String(offset) });
     return this.json<HistoryPage>(`/api/v1/history?${query.toString()}`);
+  }
+
+  async getFailureKeep(id: number): Promise<FailureKeepPreference> {
+    return this.json<FailureKeepPreference>(`/api/v1/jobs/${id}/failure-keep`);
+  }
+
+  async setFailureKeep(id: number, keep: boolean): Promise<void> {
+    await this.json(`/api/v1/jobs/${id}/failure-keep`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ keep }),
+    });
   }
 
   async getLogs(includeFiles = false, limit = 1000): Promise<LogsPage> {

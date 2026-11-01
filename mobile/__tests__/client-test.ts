@@ -59,3 +59,11 @@ test('seed policy uses the existing authenticated PUT endpoint with only accepte
   expect(mockedFetch.mock.calls[0][0]).toBe('https://nzbd.example.test/api/v1/jobs/7/torrent/seed-policy');
   expect(mockedFetch.mock.calls[0][1]).toMatchObject({ method: 'PUT', body: JSON.stringify(policy) });
 });
+
+test('current retained-source preference uses GET and authenticated PUT after queue retirement', async () => {
+  mockedFetch.mockReset(); mockedFetch.mockResolvedValue(okResponse());
+  const client = new NzbdClient({ baseUrl: 'https://nzbd.example.test', username: '', password: '', token: 'operator-token' });
+  await client.getFailureKeep(42); await client.setFailureKeep(42, true);
+  expect(mockedFetch.mock.calls[0][0]).toBe('https://nzbd.example.test/api/v1/jobs/42/failure-keep');
+  expect(mockedFetch.mock.calls[1][1]).toMatchObject({ method: 'PUT', body: JSON.stringify({ keep: true }) });
+});

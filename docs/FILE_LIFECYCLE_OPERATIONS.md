@@ -1,6 +1,6 @@
 # File lifecycle operations
 
-**Status:** implementation under final preparation · **Updated:** 2026-09-25
+**Status:** implementation under final preparation · **Updated:** 2026-11-01
 
 Runner records payload ownership separately from History. Removing a History
 row does not abandon its files. Unknown folders are retained for review, and
@@ -14,6 +14,18 @@ payload expiry. Enablement always accepts the operator's choice; readiness
 information is advisory. Manual inspection, Keep and recovery remain available.
 A specific destructive action still requires verified ownership and no active
 writer, recovery claim or Keep hold.
+
+Expanded queue and History details show **Keep on failure** when Runner can
+identify the current retained source. This reads and changes the live preference;
+the choice recorded when a Delivery was admitted remains historical evidence.
+The preference remains available after the queue entry retires. An unavailable
+source or failed lookup explains why the toggle cannot be used. Save failures
+remain visible and do not claim a changed preference.
+
+Curator-owned history explains why requeue is unavailable: acquire again with a
+fresh **Grab** in Curator, or retry the retained source. Removing such a queue
+entry does not offer an Undo that would reuse its consumer request token.
+Ordinary parked jobs retain their existing Undo/requeue behavior.
 
 New owned failures use seven days by default. Expiry requires both its wall
 clock deadline and seven days of observed eligible daemon uptime. Downtime and
