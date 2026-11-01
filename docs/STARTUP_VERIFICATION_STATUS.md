@@ -1,49 +1,46 @@
 # Startup runtime recovery — implementation and merge status
 
 **Owner:** Codex (`codex/startup-runtime-recovery`) · **Updated:** 2026-11-01
-**State:** Astra implementation review complete; changes required · fixes in progress · draft PR · **PR:** [#262](https://github.com/pjunod/runner/pull/262)
+**State:** implementation and Astra corrections complete · **Live validation/merge status and owner:** [PR #262](https://github.com/pjunod/runner/pull/262)
 **Base:** `368b500` (fresh remote clone; includes held-job recovery updates)
 
 Companion to [STARTUP_VERIFICATION_PLAN.md](STARTUP_VERIFICATION_PLAN.md)
 (reviewed design) and [STARTUP_VERIFICATION_REVIEW.md](STARTUP_VERIFICATION_REVIEW.md)
-(review history). This is the canonical status page for the combined PR.
+(review history). This is the implementation ledger. The linked PR body is the live status page: Codex updates its check results, remaining work and merge state without creating source-only commits that restart passing CI lanes.
 
-| Workstream | Owner | State | Remaining |
+| Workstream | Owner | Implementation | Validation/merge state |
 |---|---|---|---|
-| Owner, provenance, verification and async persistence integration | Codex / Sol / Luna | Written; compile checked | Independent review, then affected tests |
-| Writer/recovery helper and PP/torrent admission call sites | Sol | Written; compile checked | Independent review, then affected tests |
-| Persistent control availability and shutdown | Sol | Written, unvalidated | Independent review and final affected checks |
-| Deployment templates/operator docs; web/mobile 503 retention | Luna | Written, unvalidated | Integrate with final runtime interfaces |
-| Enrollment regressions and startup fast-lane wiring | Luna | Written, unvalidated | Run in the final affected lane after review |
-| Combined adversarial implementation review | Astra | Complete; changes required | Findings R1–R10 below; fixes in progress |
-| Fast lane | Codex | Wired, not run | Run once after review fixes; rerun failed checks only |
-| Merge and cleanup | Codex | Pending | Merge after required checks pass; finish owned clone |
+| Owner, provenance, bounded verification and persistence | Codex / Sol / Luna | Complete | Live PR checks |
+| Writer safety and PP/torrent admission | Sol | Complete | Live PR checks |
+| Persistent secure control and shutdown | Sol | Complete | Live PR checks |
+| Deployment templates, operator docs and UI 503 retention | Luna | Complete | Live PR checks |
+| Enrollment and startup fast-lane wiring | Luna / Codex | Complete | Live PR checks |
+| Combined adversarial implementation review | Astra | Complete; R1–R10 corrected | Original report linked below |
+| Fast lane, merge and owned-clone cleanup | Codex | Authorized after corrections | Live PR body and checks |
 
 ## Validation policy
 
-The independent Astra implementation review of candidate `5c7b80b` against
-base `368b500` is complete and requires changes. The earlier
-`cargo check --workspace --all-targets --locked` pass predates the review fixes;
-it does not validate the current work. No tests have run. Fixes are in progress,
-and every review item remains open until its correction and evidence are
-recorded below. Run each affected fast-lane check once on the merge candidate;
-rerun failed checks only. Do not mark modules validated or the draft PR ready
-before that point.
+Astra reviewed candidate `5c7b80b` against base `368b500` and required changes.
+The integrated corrections pass `cargo check --workspace --all-targets --locked`.
+No tests ran before the review corrections were complete. The affected fast lane
+runs on the corrected merge candidate; passing checks are not repeated unless
+later changes invalidate them. Failed checks are corrected and rerun. The PR's
+Checks tab and owner-maintained body record actual results and merge status.
 
-## Astra findings — all corrections remain in progress
+## Astra findings — correction and validation disposition
 
-| Finding | Required correction | State |
+| Finding | Correction | Disposition |
 |---|---|---|
-| R1 · Secure startup fallback | Preserve established secure identity when configuration or mirrors are missing; distinguish proven first install. | In progress |
-| R2 · Deferred PP admission | Keep admitted same-lifetime updates scoped; cancel external replacement before waiting for custody. | In progress |
-| R3 · Durable PP replacement | Persist replacement as one acknowledged document instead of remove-then-insert. | In progress |
-| R4 · Delegated journal ownership | Fence delegation transitions and compact only the journal generation covered by the snapshot. | In progress |
-| R5 · Recovery startup latency | Move payload checks out of synchronous owner recovery into per-root workers. | In progress |
-| R6 · Inventory lock scope | Keep root and payload I/O outside the global inventory mutation lock; separate bounded payload work from ordered commits. | In progress |
-| R7 · Writer fairness | Exclude jobs with pending allocation and continue selection past ineligible candidates. | In progress |
-| R8 · Replicated authority adoption | Reclassify recovered metadata, rebuild allocation caches, and report durable adoption failures. | In progress |
-| R9 · Resume persistence fence | Block operational dispatch until the exact Resume revision is durably saved. | In progress |
-| R10 · Bounded verification | Verify identity-bound batches with scheduler yields and visible intermediate progress. | In progress |
+| R1 · Secure startup fallback | Retain established secure identity across missing config/mirror cases; disable TLS/auth only for proven first install. | Implemented; covered by affected lane |
+| R2 · Deferred PP admission | Scope admitted updates to their lifetime and cancel external replacements before awaiting custody. | Implemented; covered by affected lane |
+| R3 · Durable PP replacement | Replace a job with one acknowledged document, avoiding a durable remove/insert gap. | Implemented; covered by affected lane |
+| R4 · Delegated journal ownership | Fence delegation and compact only the exact journal incarnation/cutoff covered by its snapshot. | Implemented; covered by affected lane |
+| R5 · Recovery startup latency | Load metadata first, then reconcile lifecycle state in bounded root-scoped workers. | Implemented; covered by affected lane |
+| R6 · Inventory lock scope | Separate bounded payload I/O from metadata commits and reserve exact artifact generations during inspection. | Implemented; root isolation regressions in affected lane |
+| R7 · Writer fairness | Skip pending allocations and keep selecting other eligible writers. | Implemented; covered by affected lane |
+| R8 · Replicated authority adoption | Reclassify recovered metadata, rebuild allocation caches, and return durable adoption failures. | Implemented; covered by affected lane |
+| R9 · Resume persistence fence | Fence dispatch by the exact pending control revision until durable save acknowledgement. | Implemented; covered by affected lane |
+| R10 · Bounded verification | Preserve identity-bound batch cursors, publish intermediate progress, and reschedule newly eligible higher-priority work. | Implemented; regression in affected lane |
 
 ## Decisions and operating limits
 
@@ -55,10 +52,18 @@ before that point.
 - Feature behavior is enabled normally; no feature flags are introduced.
 - Correctness admission based on evidence is intrinsic runtime behavior,
   not a feature-enable gate.
-- A bounded ordered persistence lane now acknowledges actual durable writes.
-  Periodic saves coalesce while a prior save is pending. Cluster workers
-  checkpoint generations privately without replacing the shared queue or
-  compacting foreign journals.
+- A bounded ordered persistence lane acknowledges actual durable writes and
+  compacts only the exact captured journal incarnation and cutoff. Periodic
+  saves coalesce while a prior save is pending. Cluster workers checkpoint
+  generations privately without replacing the shared queue or compacting
+  foreign journals.
+- Payload syscalls use a separate bounded lane from ordered metadata commits.
+  Startup recovery and runtime inventory/transform/relocation operations keep
+  payload probes outside the inventory-wide mutation coordinator. Exact
+  generation reservations survive until the blocking worker actually exits.
+- Post-processing updates carry their admission scope through deferred owner
+  work. Durable imports replace a job in one acknowledged snapshot. Resume and
+  Start remain fenced until the exact pending control revision is saved.
 - Explicit operator Retry safely stages corrupt legacy download-owned final
   publications back to partial files after durable generation retirement;
   current-proof integrity contradictions remain review holds.
@@ -73,9 +78,9 @@ before that point.
   production performance without it.
 - The supplied Forgejo credential is not written into source, receipts, or logs.
 
-## Next steps
+## Live progress
 
-Complete review fixes → affected fast lane → rerun failed checks only → merge.
-Root owns fixes, integration, PR and status updates, and merge. PR ownership
-remains Codex; Sol's runtime and Luna's UI/deployment work remain unvalidated
-until the affected checks pass.
+[PR #262](https://github.com/pjunod/runner/pull/262) is the live status page for
+check results, outstanding failures, merge and cleanup. Codex owns integration,
+fixes, test receipts, PR updates and merge. The original independent report is
+[STARTUP_IMPLEMENTATION_REVIEW.md](STARTUP_IMPLEMENTATION_REVIEW.md).

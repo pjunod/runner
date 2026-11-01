@@ -245,11 +245,56 @@ A global token-bucket rate limiter (replacing the C++ sleep-loop): connection ta
 
 The queue snapshot contains jobs, segment outcomes, unresolved recovery evidence and durable file proofs. The append-only per-job journal retains segment ranges and optional provenance; older records remain readable and require verification. A clean-shutdown marker is diagnostic, never proof that payload data is intact. History uses SQLite WAL and its append-only JSONL source of truth.
 
-The process starts a local monitor before reading configuration or storage. Once authentication and TLS are known, a persistent public control listener serves the UI, logs, shutdown and component status while backend metadata loads. Metadata-dependent routes return retryable 503 responses during that interval. Readiness means the secure control listener responds; it does not require every download to be runnable. See [deployment probes](DEPLOY.md#container-health-and-discovery-startup) and the [reviewed recovery plan](STARTUP_VERIFICATION_PLAN.md).
+The process starts a local monitor before reading configuration or storage. Once
+authentication and TLS are known, a persistent public control listener serves
+the UI, logs, shutdown and component status while backend metadata loads.
+Metadata-dependent routes return retryable 503 responses during that interval.
+Missing configuration or mirrors preserve an established secure identity;
+default no-TLS/no-auth startup is allowed only when first install is proven.
+Readiness means the secure control listener responds; it does not require every
+download to be runnable. See [deployment probes](DEPLOY.md#container-health-and-discovery-startup)
+and the [reviewed recovery plan](STARTUP_VERIFICATION_PLAN.md).
 
-Recovery folds metadata first, then checks recovered jobs on bounded workers, with one verifier per allocation root. Each job has a separate verification state, so unrelated work can run and manual pauses survive verification. Current writer proofs bind installation, allocation and file generation, descriptor identity, and exact immutable ranges. Legacy ranges require CRC reads and a successful descriptor sync before receiving such a proof. Protocol 1 permits metadata-only recovery on recognized local filesystem identities; unqualified network/FUSE mounts, including GlusterFS, continue background range verification because deployment-specific identity and flush guarantees have not been established. Missing data, mismatches, identity conflicts and unavailable storage remain distinct outcomes; unavailable I/O never erases Done evidence.
+Recovery loads queue metadata before touching payload roots. Root-scoped workers
+then reconcile lifecycle state and establish allocation capabilities
+independently, so a blocked mount does not hold engine construction or another
+root's metadata progress. Verification uses bounded batches (up to 64 ranges,
+32 MiB, or 250 ms), retaining a cursor bound to the observed file identity
+between batches. The owner publishes checked-byte progress and can admit newly
+eligible higher-priority work before a yielded job resumes; manual pauses
+remain effective. Current writer proofs bind installation, allocation and file
+generation, descriptor identity, and exact immutable ranges. Legacy ranges
+require CRC reads and a successful descriptor sync before receiving such a
+proof. Protocol 1 permits metadata-only recovery on recognized local filesystem
+identities; unqualified network/FUSE mounts, including GlusterFS, continue
+background range verification because deployment-specific identity and flush
+guarantees have not been established. Missing data, mismatches, identity
+conflicts and unavailable storage remain distinct outcomes; unavailable I/O
+never erases Done evidence.
 
-The queue owner captures immutable documents and sends persistence requests to one bounded, ordered filesystem lane. It continues processing controls while storage runs. Durability-sensitive transitions resume only after a completion acknowledgement; enqueueing a request is not a successful save. Snapshot commit and journal compaction execute in the same lane before later appends, preserving the captured cutoff. Non-authority cluster workers write a private node checkpoint for generation admission; they never overwrite the shared queue or compact foreign journals. A fenced or failed save retains journals. Late writer, verifier and post-processing results are checked against current owner generations before they can change state.
+The queue owner captures immutable documents and sends persistence requests to
+one bounded, ordered filesystem lane, independent from bounded payload-I/O
+workers. Durability-sensitive transitions resume only after a completion
+acknowledgement; enqueueing a request is not a successful save. Snapshot commit
+compacts only the exact journal incarnation and cutoff captured by that
+document, before later appends. Non-authority cluster workers write a private
+node checkpoint for generation admission; they never overwrite the shared
+queue or compact foreign journals. A fenced or failed save retains journals.
+Late writer, verifier and post-processing results are checked against current
+owner generations before they can change state.
+
+Post-processing updates retain their `PostAdmission` scope while deferred and
+apply only to the matching job lifetime. Replacement imports persist as one
+acknowledged document, without a durable remove/insert gap. Resume and torrent
+Start set an exact pending control-revision fence; lease and backend scheduling
+wait for the matching durable save acknowledgement, so an older completion
+cannot release a newer Pause or Resume. Inventory discovery and review actions
+reserve the exact artifact generation, perform payload probes outside the
+global mutation coordinator, then recheck revision before committing.
+Runtime transforms, relocation, deletion and interrupted-operation replay use
+this same boundary. Their generation reservations retain namespace custody
+until actual worker completion; new scratch joins that reservation in the
+transaction that records it. See [startup verification status](STARTUP_VERIFICATION_STATUS.md).
 
 Shutdown stops intake, cancels workers, consumes their remaining results, and waits for actual worker termination before saving the final document and clearing the diagnostic marker. A failed drain or final save prevents a replacement backend from being started in the same process.
 
