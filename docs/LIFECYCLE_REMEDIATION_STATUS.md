@@ -51,6 +51,16 @@ still needs integration with that unified policy. Cluster partial-copy claims,
 terminal-empty retirement, cross-node Keep and replicated admission identity are
 still active work; these are not covered by the earlier success-path receipt.
 
+The later cluster checkpoint e570dc5 (integration bc12c425) proves terminal
+unusable copy disposal, exact raw-copy seal refusal, newer-Delete protection,
+renewed completion and encoded-ID routes. Admission catalog engine contracts
+cdd4a3e (integration 6d39a3a4) pass bounded-page, accepted-identity, rollback
+and retired-ID checks; Raft migration/failover wiring is still pending. Native
+and phone controls distinguish acquisition children from seed sources and show
+pending owner application of Keep. Curator 6fd9d1e corrects the torrent_url wire
+literal found by the actual local-swarm fixture. Ordinary seed download passes;
+managed same-item repeated manual acquisition remains to be proven.
+
 Focused POST regressions pass for native book publication, failed-health repair,
 retained dependencies, deletion replay, exact repair IDs, title classification,
 junk-only completion and persistent retry scheduling against the integrated
