@@ -12,6 +12,7 @@ export function FailureKeepControl({ client, jobId }: { client: NzbdClient; jobI
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const sequence = useRef(0);
+  const identity = useRef(0);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const saving = useRef(false);
@@ -28,12 +29,13 @@ export function FailureKeepControl({ client, jobId }: { client: NzbdClient; jobI
     }
   }, [client, jobId]);
   useEffect(() => {
-    active.current = true; setPreference(null); setNotice(null); setActionError(null); void refresh();
+    active.current = true; identity.current++; saving.current = false; setBusy(false); setError(null); setPreference(null); setNotice(null); setActionError(null); void refresh();
     const timer = setInterval(() => void refresh(), 5000);
-    return () => { active.current = false; sequence.current++; clearInterval(timer); };
+    return () => { active.current = false; identity.current++; sequence.current++; clearInterval(timer); };
   }, [refresh]);
   const toggle = async () => {
     if (!preference?.available || saving.current) return;
+    const epoch = identity.current;
     saving.current = true; const request = ++sequence.current; setBusy(true); setNotice(null); setActionError(null);
     try {
       await client.setFailureKeep(jobId, !preference.keep);
@@ -41,8 +43,10 @@ export function FailureKeepControl({ client, jobId }: { client: NzbdClient; jobI
     } catch (cause) {
       if (active.current && request === sequence.current) setActionError(cause instanceof Error ? cause.message : 'Could not save source retention.');
     } finally {
-      saving.current = false;
-      if (active.current && request === sequence.current) { setBusy(false); await refresh(); }
+      if (epoch === identity.current) {
+        saving.current = false;
+        if (active.current && request === sequence.current) { setBusy(false); await refresh(); }
+      }
     }
   };
   return <View style={styles.wrap}>

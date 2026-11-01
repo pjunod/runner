@@ -38,3 +38,25 @@ test('missing or unconfirmed source cannot offer a toggle', async () => {
   expect(text()).toContain('Refresh source retention');
   expect(button('Keep on failure: off')).toBeUndefined();
 });
+
+test('changing identity during PUT resets pending state and ignores old completion', async () => {
+  let finishOld!: () => void;
+  const old = { getFailureKeep: jest.fn(async () => ({ available: true, keep: false })),
+    setFailureKeep: jest.fn(() => new Promise<void>(resolve => { finishOld = resolve; })) } as unknown as NzbdClient;
+  let finishNew!: () => void;
+  const current = { getFailureKeep: jest.fn(async () => ({ available: true, keep: true })),
+    setFailureKeep: jest.fn(() => new Promise<void>(resolve => { finishNew = resolve; })) } as unknown as NzbdClient;
+  await act(async () => { tree = create(<FailureKeepControl client={old} jobId={42} />); });
+  await act(async () => button('Keep on failure: off').props.onPress());
+  await act(async () => tree.update(<FailureKeepControl client={current} jobId={43} />));
+  expect(button('Keep on failure: on').props.accessibilityState.busy).toBe(false);
+  await act(async () => button('Keep on failure: on').props.onPress());
+  expect(current.setFailureKeep).toHaveBeenCalledWith(43, false);
+  expect(button('Keep on failure: on').props.accessibilityState.busy).toBe(true);
+  await act(async () => finishOld());
+  expect(button('Keep on failure: on').props.accessibilityState.busy).toBe(true);
+  expect(text()).not.toContain('on for this retained source');
+  await act(async () => finishNew());
+  expect(button('Keep on failure: on').props.accessibilityState.busy).toBe(false);
+  expect(current.getFailureKeep).toHaveBeenCalledTimes(2);
+});
