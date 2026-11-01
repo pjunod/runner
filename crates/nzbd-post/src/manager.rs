@@ -2132,7 +2132,7 @@ async fn scan_queue(
 }
 
 async fn schedule_recoverable_post_retry(engine: &EngineHandle, job: JobId) {
-    let Ok(Some(mut row)) = engine.export_job(job).await else {
+    let Ok(Some(row)) = engine.export_job(job).await else {
         return;
     };
     if !row.lifecycle_eligible() {
@@ -2180,8 +2180,18 @@ async fn schedule_recoverable_post_retry(engine: &EngineHandle, job: JobId) {
             ""
         },
     );
-    row.set_control(&control);
-    if !engine.import_job_if_present(row).await.unwrap_or(false) {
+    if !engine
+        .schedule_post_retry(
+            job,
+            control.revision,
+            control.retry_attempt,
+            control.next_retry_at_unix.expect("scheduled deadline"),
+            control.blocked_since_unix.expect("blocked time"),
+            control.message,
+        )
+        .await
+        .unwrap_or(false)
+    {
         tracing::warn!(job = job.0, "recoverable retry schedule was not committed");
     }
 }
@@ -9120,38 +9130,49 @@ mod decision_tests {
             )
         };
         let engine = nzbd_engine::Engine::spawn(config()).await.unwrap();
-        let mut request = job(vec![], vec![]);
-        request.delivery_lifecycle = true;
-        request.status = JobStatus::PostQueued;
-        engine.import_job(request, false, false).await.unwrap();
-        engine
-            .hold_job(JobId(41), "io", "move", "temporarily blocked")
-            .await
-            .unwrap();
         let first_block = now() - 1801;
         let deadline = now() + 900;
-        for cause in ["io", "missing_tool", "capacity", "quota"] {
-            let mut row = engine.export_job(JobId(41)).await.unwrap().unwrap();
-            let mut control = row.control().unwrap();
-            control.cause = cause.into();
-            control.blocked_since_unix = Some(first_block);
-            control.next_retry_at_unix = Some(deadline);
-            control.manual_pause = false;
-            row.set_control(&control);
-            engine.import_job_if_present(row).await.unwrap();
-            schedule_recoverable_post_retry(&engine, JobId(41)).await;
+        for (index, cause) in ["io", "missing_tool", "capacity", "quota"]
+            .iter()
+            .enumerate()
+        {
+            let mut request = job(vec![], vec![]);
+            request.id = JobId(41 + index as u32);
+            request.delivery_lifecycle = true;
+            request.status = JobStatus::Paused;
+            request.set_control(&nzbd_types::JobControl {
+                version: 1,
+                revision: "1".into(),
+                lifecycle: "held".into(),
+                cause: (*cause).into(),
+                stage: "move".into(),
+                retry_policy: "review".into(),
+                message: "temporarily blocked".into(),
+                instance: "retry-test".into(),
+                previous_status: Some(JobStatus::PostQueued),
+                manual_pause: false,
+                retry_attempt: 0,
+                next_retry_at_unix: Some(deadline),
+                blocked_since_unix: Some(first_block),
+            });
+            engine
+                .import_job(request.clone(), false, false)
+                .await
+                .unwrap();
+            schedule_recoverable_post_retry(&engine, request.id).await;
             let scheduled = engine
-                .export_job(JobId(41))
+                .export_job(request.id)
                 .await
                 .unwrap()
                 .unwrap()
                 .control()
                 .unwrap();
-            assert_eq!(scheduled.cause, cause);
+            assert_eq!(scheduled.cause, *cause);
+            assert_eq!(scheduled.revision, "2");
             assert_eq!(
                 scheduled.next_retry_at_unix,
                 Some(deadline),
-                "a provider deadline cannot be shortened"
+                "an existing deadline cannot be shortened"
             );
             assert_eq!(scheduled.blocked_since_unix, Some(first_block));
             assert_eq!(scheduled.retry_policy, "scheduled_retry");
@@ -9160,33 +9181,43 @@ mod decision_tests {
                 .contains("warning: blocked for at least 30 minutes"));
         }
         let expected = engine
-            .export_job(JobId(41))
+            .export_job(JobId(44))
             .await
             .unwrap()
             .unwrap()
             .control()
             .unwrap();
-        engine.shutdown().await;
-        let reopened = nzbd_engine::Engine::spawn(config()).await.unwrap();
-        let mut row = reopened.export_job(JobId(41)).await.unwrap().unwrap();
-        let mut control = row.control().unwrap();
-        assert_eq!(control.next_retry_at_unix, expected.next_retry_at_unix);
-        assert_eq!(control.blocked_since_unix, expected.blocked_since_unix);
-        control.manual_pause = true;
-        row.set_control(&control);
-        reopened.import_job_if_present(row).await.unwrap();
-        schedule_recoverable_post_retry(&reopened, JobId(41)).await;
+        let mut paused = job(vec![], vec![]);
+        paused.id = JobId(45);
+        paused.delivery_lifecycle = true;
+        paused.status = JobStatus::Paused;
+        let mut manual = expected.clone();
+        manual.manual_pause = true;
+        paused.set_control(&manual);
+        engine.import_job(paused, false, false).await.unwrap();
+        schedule_recoverable_post_retry(&engine, JobId(45)).await;
         assert_eq!(
-            reopened
-                .export_job(JobId(41))
+            engine
+                .export_job(JobId(45))
                 .await
                 .unwrap()
                 .unwrap()
                 .control()
-                .unwrap()
-                .retry_attempt,
-            control.retry_attempt
+                .unwrap(),
+            manual
         );
+        engine.shutdown().await;
+        let reopened = nzbd_engine::Engine::spawn(config()).await.unwrap();
+        let control = reopened
+            .export_job(JobId(44))
+            .await
+            .unwrap()
+            .unwrap()
+            .control()
+            .unwrap();
+        assert_eq!(control.next_retry_at_unix, expected.next_retry_at_unix);
+        assert_eq!(control.blocked_since_unix, expected.blocked_since_unix);
+        assert_eq!(control.retry_attempt, expected.retry_attempt);
         reopened.shutdown().await;
         for base in [30, 60, 120, 300] {
             for attempt in 0..100 {
