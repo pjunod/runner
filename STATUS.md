@@ -22,8 +22,17 @@ identity + digest); publication never consulted it for transform outputs.
   transform recorded and the current bytes match the rename digest; consumed
   archive inputs follow their renames the same way. All four PP/salvage
   callers use it.
+- A retry restarts PP from the beginning, after the volumes were renamed (and
+  a PAR2 catalog may rename them back). The extraction workspace is keyed by
+  archive path, so that either re-extracted the set (two copies published) or
+  failed `published extraction output changed`. Unpack now skips an archive
+  whose every volume the custody journals prove a successful extraction
+  already consumed.
+- "Consumed" authorizes deletion, so it now requires the exact identity the
+  extraction bound, at the bound path or carried by the rename journal.
 - The held message is now `nothing publishable:` (its own `PostError` variant;
-  nothing failed to run) and names each payload file and what it lacks.
+  nothing failed to run, always cause `post_failure` so Retry stays available)
+  and names each payload file and what it lacks.
 
 ## Download incident recovery — 2026-10-01
 

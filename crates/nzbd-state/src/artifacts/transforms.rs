@@ -689,21 +689,30 @@ impl Inventory {
                     .cloned()
                     .collect::<Vec<_>>();
                 for path in consumed {
-                    // An input renamed after extraction is still the consumed
-                    // input when the rename journal left from the same object
-                    // the extraction bound. Its ctime may legitimately differ:
-                    // the extraction's own journaled renames touch it too.
-                    let bound = workspace
+                    // "Consumed" authorizes source cleanup to delete the file,
+                    // so it needs the same proof as a published output: the
+                    // exact identity the successful extraction bound (and
+                    // rechecked when it finished), either still at its bound
+                    // path or carried to a new name by the rename journal.
+                    let Some(bound) = workspace
                         .source
                         .files
                         .iter()
-                        .find(|entry| entry.path == path && !entry.identity.directory);
-                    if let (Some(bound), Some(rename)) = (bound, renamed.get(&path)) {
-                        if rename_transition_matches(&bound.identity, &rename.before) {
+                        .find(|entry| entry.path == path && !entry.identity.directory)
+                    else {
+                        continue;
+                    };
+                    if observed
+                        .iter()
+                        .any(|entry| entry.path == path && entry.identity == bound.identity)
+                    {
+                        inputs.insert(path.clone());
+                    }
+                    if let Some(rename) = renamed.get(&path) {
+                        if rename.before == bound.identity {
                             inputs.insert(rename.current.clone());
                         }
                     }
-                    inputs.insert(path);
                 }
             }
             for output in workspace.published_files.as_deref().unwrap_or_default() {
@@ -1581,11 +1590,40 @@ mod tests {
         assert!(!verified.contains("episode.mkv"));
     }
 
+    /// Rewrite `path` in place with same-length bytes and its original mtime,
+    /// so only ctime and content differ. Waits for ctime to advance so a
+    /// coarse-timestamp filesystem cannot make the change invisible.
+    fn rewrite_preserving_mtime(path: &Path, bytes: &[u8]) {
+        let before = std::fs::metadata(path).unwrap();
+        assert_eq!(before.len(), bytes.len() as u64);
+        let modified = before.modified().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::fs::write(path, bytes).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            let after = std::fs::metadata(path).unwrap();
+            if fs::identity(&after) != fs::identity(&before) {
+                assert_eq!(after.modified().unwrap(), modified);
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "filesystem never advanced ctime"
+            );
+        }
+    }
+
     /// Obfuscated release shape: `<hash>.partNN.rar` holding `<hash>.mkv`.
     /// Extraction publishes the hash-named media, then the final
     /// deobfuscation pass renames media and volumes to the release name.
     fn extracted_then_renamed(
-        tamper_before_rename: bool,
+        tamper_before_rename: Option<&str>,
     ) -> (tempfile::TempDir, Inventory, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("downloads");
@@ -1623,16 +1661,11 @@ mod tests {
         )
         .unwrap();
         inventory.finish_extraction(&workspace, &output).unwrap();
-        if tamper_before_rename {
-            let path = source.join("9f8e7d6c5b4a.mkv");
-            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-            std::fs::write(&path, b"EXTRACTED EPISODE").unwrap();
-            std::fs::File::options()
-                .write(true)
-                .open(&path)
-                .unwrap()
-                .set_modified(modified)
-                .unwrap();
+        if let Some(name) = tamper_before_rename {
+            let path = source.join(name);
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes.make_ascii_uppercase();
+            rewrite_preserving_mtime(&path, &bytes);
         }
         for (from, to) in [
             ("9f8e7d6c5b4a.mkv", "Show.S01E01.mkv"),
@@ -1648,7 +1681,7 @@ mod tests {
 
     #[test]
     fn extraction_proof_follows_owned_rename_of_outputs_and_inputs() {
-        let (_temp, inventory, _source) = extracted_then_renamed(false);
+        let (_temp, inventory, _source) = extracted_then_renamed(None);
         let evidence = inventory.verified_custody_evidence(5, || Ok(())).unwrap();
         assert!(
             evidence.verified_outputs.contains("Show.S01E01.mkv"),
@@ -1671,17 +1704,9 @@ mod tests {
 
     #[test]
     fn renamed_output_rewritten_in_place_after_rename_is_not_trusted() {
-        let (_temp, inventory, source) = extracted_then_renamed(false);
-        let path = source.join("Show.S01E01.mkv");
-        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let (_temp, inventory, source) = extracted_then_renamed(None);
         // Same inode, size and mtime: only the bytes can tell.
-        std::fs::write(&path, b"EXTRACTED EPISODE").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(modified)
-            .unwrap();
+        rewrite_preserving_mtime(&source.join("Show.S01E01.mkv"), b"EXTRACTED EPISODE");
         inventory.refresh_for_delivery(5).unwrap();
         let evidence = inventory.verified_custody_evidence(5, || Ok(())).unwrap();
         assert!(!evidence.verified_outputs.contains("Show.S01E01.mkv"));
@@ -1689,13 +1714,36 @@ mod tests {
 
     #[test]
     fn output_changed_between_extraction_and_rename_is_not_trusted() {
-        let (_temp, inventory, _source) = extracted_then_renamed(true);
+        let (_temp, inventory, _source) = extracted_then_renamed(Some("9f8e7d6c5b4a.mkv"));
         let evidence = inventory.verified_custody_evidence(5, || Ok(())).unwrap();
         assert!(
             !evidence.verified_outputs.contains("Show.S01E01.mkv"),
             "the rename journal proves only bytes at rename time"
         );
         // The untouched volumes are still the consumed inputs.
+        assert!(evidence.consumed_inputs.contains("Show.S01E01.part1.rar"));
+    }
+
+    #[test]
+    fn input_changed_between_extraction_and_rename_is_not_consumed() {
+        let (_temp, inventory, _source) = extracted_then_renamed(Some("9f8e7d6c5b4a.part1.rar"));
+        let evidence = inventory.verified_custody_evidence(5, || Ok(())).unwrap();
+        assert!(
+            !evidence.consumed_inputs.contains("Show.S01E01.part1.rar"),
+            "consumed authorizes deletion; it needs the exact bound identity"
+        );
+        assert!(!evidence.consumed_inputs.contains("9f8e7d6c5b4a.part1.rar"));
+        assert!(evidence.consumed_inputs.contains("Show.S01E01.part2.rar"));
+        assert!(evidence.verified_outputs.contains("Show.S01E01.mkv"));
+    }
+
+    #[test]
+    fn a_new_file_at_a_consumed_inputs_former_path_is_not_consumed() {
+        let (_temp, inventory, source) = extracted_then_renamed(None);
+        std::fs::write(source.join("9f8e7d6c5b4a.part1.rar"), b"volume part1").unwrap();
+        inventory.refresh_for_delivery(5).unwrap();
+        let evidence = inventory.verified_custody_evidence(5, || Ok(())).unwrap();
+        assert!(!evidence.consumed_inputs.contains("9f8e7d6c5b4a.part1.rar"));
         assert!(evidence.consumed_inputs.contains("Show.S01E01.part1.rar"));
     }
 }

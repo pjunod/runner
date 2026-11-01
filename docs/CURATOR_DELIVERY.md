@@ -214,7 +214,10 @@ an obfuscated `<hash>.mkv` and its `<hash>.partNN.rar` volumes the release
 name): the rename journal records each file's complete identity immediately
 before the rename and a digest of its bytes, and an output is followed to its
 new name only when that pre-rename identity is exactly the one the transform
-journal recorded and the current bytes still match the digest. When nothing is
+journal recorded and the current bytes still match the digest. Consumed archive
+inputs need the exact identity the extraction bound, at the bound path or
+carried by the rename journal, and an archive whose every volume is already
+proven consumed is not extracted again on retry. When nothing is
 publishable, the held job says `nothing publishable:` and names the payload
 files found and what each one lacks.
 Nested or unconsumed archives and unknown files stay in Runner's source tree
