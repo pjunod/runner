@@ -14,6 +14,8 @@ import { formatBytes } from '../api/format';
 import { ConnectionConfig, HistoryEntry, HistoryPage } from '../api/types';
 import { Theme, useTheme } from '../theme';
 import { FailureKeepControl } from '../components/FailureKeepControl';
+import { DeliveryLifecyclePanel } from '../components/DeliveryLifecyclePanel';
+import { deliveryReference } from '../deliveryTiming';
 
 export function HistoryView({ config }: { config: ConnectionConfig }) {
   const theme = useTheme();
@@ -163,6 +165,7 @@ function HistoryCard({
       {expanded ? (
         <View style={styles.details}>
           {entry.requeue_reason ? <Text style={styles.metaText}>{entry.requeue_reason}</Text> : null}
+          {deliveryReference(entry.params) ? <DeliveryLifecyclePanel client={client} receiptId={deliveryReference(entry.params)!} /> : null}
           <FailureKeepControl client={client} jobId={entry.job} />
           <Detail label="Job" value={`#${entry.job}`} styles={styles} />
           <Detail label="Folder" value={entry.final_dir || record?.dir_name || '—'} styles={styles} />

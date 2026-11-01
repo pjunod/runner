@@ -60,6 +60,21 @@ Undo window is preserved. A pending operation is never reported as HTTP success;
 retry the same request. Transient deletion failures retry after 1 minute,
 5 minutes, 30 minutes and then 6 hours. Identity conflicts require review.
 
+Expanded queue and History details read the exact `Delivery:Id` reference stored
+with the job. Files → **Published deliveries** loads timing and cleanup details
+on demand. Oversized publication responses are refused with a review reason;
+opening a job never scans the Delivery collection to guess its receipt.
+
+Measured queue, fetch, download and processing steps remain separate for each
+machine and process session. A subtotal counts overlapping completed steps once,
+using recorded monotonic endpoints. Missing or interrupted measurements stay
+unknown. Processing details expand the major steps and are not added again.
+Publication/consumer acceptance and source-copy cleanup follow separately. Copy
+status, retry attempts and errors lead; exact references can be expanded. Retry
+source cleanup uses its existing independent action, and polling preserves its
+button and focus. Phone queue and History details show the same receipt and
+provide visible retry results.
+
 ## 2. Recover media into Curator
 
 1. Inspect and, if needed, adopt the source. Select regular media files.

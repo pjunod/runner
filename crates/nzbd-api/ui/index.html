@@ -671,6 +671,9 @@ try {
   .files-recoveries .sub { color: var(--muted); font-size: 12px; margin: 6px 0 8px; }
   .rec-row { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; padding: 6px 0;
     border-bottom: 1px solid var(--line); font-size: 12.5px; }
+  .delivery-trace { flex-basis: 100%; min-width: 0; overflow-wrap: anywhere; }
+  .delivery-trace section { margin: 12px 0; padding-left: 12px; border-left: 2px solid var(--line); }
+  .delivery-trace p { margin: 6px 0; }
   .rec-row code { font-family: var(--font-mono); font-size: 11.5px; color: var(--ink2); }
   @media (max-width: 640px) {
     .files-table th:nth-child(5), .files-table td:nth-child(5) { display: none; }
@@ -1433,7 +1436,7 @@ function initDisplay() {
   } catch {}
 }
 function fmtTime(unix) {
-  if (!unix) return "—";
+  if (typeof unix !== "number" || unix <= 0 || !Number.isFinite(new Date(unix * 1000).getTime())) return "—";
   return new Date(unix * 1000).toLocaleString();
 }
 function esc(s) {
@@ -2427,6 +2430,10 @@ function buildDetailRow(d) {
   d.data(c.close, "action", "detail-close");
   d.text(c.close, "close");
 
+  c.requeueNote = d.append(wrap, d.create("div", "jd-metric"));
+  c.jobDeliveryRetry = d.append(wrap, d.create("button", "small"));
+  d.data(c.jobDeliveryRetry, "action", "f-delivery-retry"); d.text(c.jobDeliveryRetry, "retry source cleanup");
+  c.jobDeliveryTrace = d.append(wrap, d.create("div", "delivery-trace"));
   c.failureKeepNote = d.append(wrap, d.create("div", "jd-metric"));
   c.repair = d.append(wrap, d.create("div", "jd-metric"));
   c.torrent = d.append(wrap, d.create("section", "jd-torrent"));
@@ -2667,6 +2674,8 @@ function detailModel(j, nowMs) {
       ? "Download this job's retained .torrent metainfo."
       : "Download this job's NZB regenerated from queue state.",
     ...failureKeepModel(j.id, torrent),
+    jobDeliveryTrace: jobDeliveryHtml(j.id, j.params),
+    jobDeliveryId: receiptIdOf(j.params),
     nzbHidden: false,
     closeHidden: false,
     recoverHidden: torrent || !recoverMax,
@@ -2797,6 +2806,9 @@ function applyDetail(tr, m, d) {
       ? "Retain this Runner source if the download fails. Change applies to the current retained source."
       : "Default: failed source files follow Runner's configured failure policy.");
   });
+  w("requeueNote", m.requeueNote || "", v => { d.text(c.requeueNote, v); d.prop(c.requeueNote, "hidden", !v); });
+  w("jobDeliveryId", m.jobDeliveryId || "", v => { d.data(c.jobDeliveryRetry, "delivery", v); d.prop(c.jobDeliveryRetry, "hidden", !v); });
+  w("jobDeliveryTrace", m.jobDeliveryTrace || "", v => { d.prop(c.jobDeliveryTrace, "innerHTML", v); d.prop(c.jobDeliveryTrace, "hidden", !v); });
   w("failureKeepHidden", !!m.failureKeepHidden, v => d.prop(c.keepFailure, "hidden", v));
   w("failureKeepBusy", !!m.failureKeepBusy, v => d.attr(c.keepFailure, "aria-disabled", String(v)));
   w("failureKeepNote", m.failureKeepNote || "", v => { d.text(c.failureKeepNote, v); d.prop(c.failureKeepNote, "hidden", !v); });
@@ -3415,7 +3427,7 @@ function histModel(e) {
     // A parked delete can go straight back to the queue, long after the
     // Undo toast has faded.
     requeueHidden: !e.can_requeue,
-    requeueReason: e.can_requeue ? "" : e.requeue_reason || "",
+    requeueReason: !e.can_requeue && e.requeue_reason ? "Requeue unavailable — see details" : "",
     detailsLabel: e.job === openHist ? "close" : "details",
     detailsCls: e.job === openHist ? "details-open" : "",
     // The only destructive action on the page arms first (§ two-step).
@@ -3487,6 +3499,9 @@ function histDetailModel(e) {
     // requeue, and a link that 404s is worse than no link.
     nzbHref: "", nzbHidden: true, closeHidden: true,
     ...failureKeepModel(e.job),
+    jobDeliveryTrace: jobDeliveryHtml(e.job, e.params),
+    jobDeliveryId: receiptIdOf(e.params),
+    requeueNote: !e.can_requeue ? e.requeue_reason || "" : "",
     recoverHidden: true, recoverMax: "",
     // Keep the joined string in the model for compatibility/searchability,
     // but records render through labeled facts below. Only the explanatory
@@ -4070,6 +4085,7 @@ async function refreshJobDetail() {
   if (openJob == null) return;
   const id = openJob;
   refreshFailureKeep(id);
+  refreshJobDelivery(id, store.jobs.find(job => job.id === id)?.params);
   try {
     const [fr, lr] = await Promise.all([
       jfetch("/api/v1/jobs/" + id + "/files"),
@@ -4178,7 +4194,7 @@ function toggleJob(id) {
 function toggleHist(id) {
   openHist = openHist === id ? null : id;
   renderHistory();
-  if (openHist != null) refreshFailureKeep(id);
+  if (openHist != null) { refreshFailureKeep(id); refreshJobDelivery(id, store.history?.find(entry => entry.job === id)?.params); }
 }
 
 // ---- one delegated click listener ---------------------------------------
@@ -5364,51 +5380,158 @@ function renderRecoveries() {
     setText($("files-recoveries-info"), (filesRecoveryOffset + 1) + "–" + (filesRecoveryOffset + r.length));
   }
 }
+// Optional timings are measured within one machine/session. Publication and
+// cleanup observations stay separate; no wall timestamp invents missing time.
+function measuredDeliveryLanes(delivery) {
+  const groups = new Map();
+  for (const interval of (delivery.lifecycleTiming?.version === 1 && Array.isArray(delivery.lifecycleTiming.intervals) ? delivery.lifecycleTiming.intervals : []).slice(0, 128)) {
+    if (!interval || typeof interval.nodeId !== "string" || typeof interval.clockDomain !== "string") continue;
+    const key = JSON.stringify([interval.nodeId, interval.clockDomain]);
+    if (!groups.has(key)) groups.set(key, { node: interval.nodeId, clock: interval.clockDomain, intervals: [] });
+    groups.get(key).intervals.push(interval);
+  }
+  const measured = value => Number.isSafeInteger(value) && value >= 0;
+  return [...groups.values()].map(group => {
+    const valid = group.intervals.filter(i => i.state === "completed" && measured(i.startMonotonicMs) && measured(i.endMonotonicMs)
+      && measured(i.durationMs) && i.endMonotonicMs >= i.startMonotonicMs && i.durationMs === i.endMonotonicMs - i.startMonotonicMs);
+    const ranges = valid.map(i => [i.startMonotonicMs, i.endMonotonicMs]).sort((a, b) => a[0] - b[0]);
+    let total = 0, end;
+    for (const [start, finish] of ranges) { total += end == null ? finish - start : Math.max(0, finish - Math.max(start, end)); end = Math.max(end ?? finish, finish); }
+    return { ...group, measuredMs: valid.length ? total : null, unknown: group.intervals.length - valid.length };
+  });
+}
+async function boundedDeliveryDetail(id) {
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 20000);
+  try {
+  const response = await jfetch("/api/v1/deliveries/" + encodeURIComponent(id), { signal: controller.signal });
+  if (!response.ok) { let error; try { error = (await response.json()).error; } catch {} throw new Error(error || "Could not load lifecycle details: " + response.status); }
+  let value;
+  if (response.body?.getReader) {
+    const reader = response.body.getReader(), chunks = []; let size = 0;
+    try {
+      while (true) {
+        const chunk = await reader.read(); if (chunk.done) break;
+        size += chunk.value.byteLength;
+        if (size > 8 * 1024 * 1024) { await reader.cancel(); throw new Error("Publication manifest exceeds supported display size; review it in Curator."); }
+        chunks.push(chunk.value);
+      }
+    } finally { reader.releaseLock(); }
+    const bytes = new Uint8Array(size); let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    value = JSON.parse(new TextDecoder().decode(bytes));
+  } else value = await response.json();
+  if (!value || value.deliveryId !== id) throw new Error("Runner returned a different publication; refresh and review.");
+  if (value.discoveryError) throw new Error(value.discoveryError);
+  if (value.lifecycleTiming?.version === 1 && (!Array.isArray(value.lifecycleTiming.intervals) || value.lifecycleTiming.intervals.length > 128 || value.lifecycleTiming.intervals.some(i => !i || ![i.stage, i.nodeId, i.clockDomain, i.state].every(v => typeof v === "string")))
+    || value.runnerStages && (!Array.isArray(value.runnerStages.spans) || value.runnerStages.spans.length > 128 || value.runnerStages.spans.some(span => typeof span?.stage !== "string"))
+    || value.sourceCopies && (!Array.isArray(value.sourceCopies) || value.sourceCopies.length > 64 || value.sourceCopies.some(copy => !copy || ![copy.id, copy.ownerNode, copy.status].every(v => typeof v === "string")))) throw new Error("Runner returned malformed lifecycle details; refresh and review.");
+  return value;
+  } finally { clearTimeout(timer); }
+}
+const jobDeliveries = new Map();
+function receiptIdOf(params) { return (params || []).find(([key, value]) => key === "Delivery:Id" && value)?.[1]; }
+async function refreshJobDelivery(id, params) {
+  const receiptId = receiptIdOf(params); if (!receiptId) return;
+  const old = jobDeliveries.get(id); if (old?.loading && old.id === receiptId) return;
+  const state = { id: receiptId, loading: true, value: old?.id === receiptId ? old.value : null, error: "" };
+  jobDeliveries.set(id, state);
+  try { state.value = await boundedDeliveryDetail(receiptId); }
+  catch (error) { state.error = error.message; }
+  state.loading = false;
+  if (jobDeliveries.get(id) !== state) return;
+  renderRetention();
+}
+function jobDeliveryHtml(id, params) {
+  const receiptId = receiptIdOf(params); if (!receiptId) return "";
+  const state = jobDeliveries.get(id);
+  if (state?.id !== receiptId) return "<p>Loading publication lifecycle…</p>";
+  return (state.error ? `<p class="err">${esc(state.error)}</p>` : "") + (state.value ? deliveryTraceHtml(state.value) : state.loading ? "<p>Loading publication lifecycle…</p>" : "");
+}
+function deliveryTraceHtml(delivery) {
+  const duration = value => Number.isSafeInteger(value) && value >= 0 ? fmtDur(value) + " measured time" : "duration unknown";
+  const lanes = measuredDeliveryLanes(delivery);
+  const timing = lanes.length ? lanes.map(lane => `<section><b>Runner · ${esc(lane.node || "node unknown")}</b>` +
+    `<p>${lane.measuredMs == null ? "Measured time unavailable" : "Measured time (overlapping steps counted once): " + esc(fmtDur(lane.measuredMs))}${lane.unknown ? " · Some steps have no complete timing" : ""}</p>` +
+    `<ol>${lane.intervals.map(i => `<li><b>${esc(String(i.stage || "unknown").replaceAll("_", " "))}</b> · ${esc(i.state || "unknown")} · ${esc(duration(i.state === "completed" ? i.durationMs : undefined))}</li>`).join("")}</ol>` +
+    `<details><summary>Timing reference</summary><code>${esc(lane.clock)}</code></details></section>`).join("") : `<p>Earlier step timings were not recorded.</p>`;
+  const stages = delivery.runnerStages;
+  const post = stages && Array.isArray(stages.spans) ? `<details><summary>Processing details · ${esc(stages.nodeId || "node unknown")}</summary><p>These details expand processing steps above and are not added again.</p><ol>${stages.spans.slice(0, 128).map(span => `<li>${esc(String(span.stage || "unknown").replaceAll("_", " "))} · ${esc(duration(span.ms))}</li>`).join("")}</ol></details>` : "";
+  const copies = Array.isArray(delivery.sourceCopies) ? delivery.sourceCopies.slice(0, 64) : [];
+  return `<p>Times from different machines or restarts stay separate.</p>${timing}${post}` +
+    `<section><b>Publication and handoff</b><p>Ready ${esc(fmtTime(delivery.readyAt))} · ${delivery.acceptedAt ? "Consumer acceptance recorded " + esc(fmtTime(delivery.acceptedAt)) : "Awaiting consumer acceptance"}</p></section>` +
+    (copies.length ? `<section><b>Processing source copies</b><ul>${copies.map(copy => `<li><b>${esc(copy.ownerNode || "node unknown")}</b> · ${esc(String(copy.status || "unknown").replaceAll("_", " "))}<p>${esc(copy.attempts ?? 0)} cleanup attempts${copy.nextRetryAt ? " · next " + esc(fmtTime(copy.nextRetryAt)) : ""}</p>${copy.error ? `<p class="err">${esc(copy.error)}</p>` : ""}<details><summary>Copy reference</summary><code>${esc(copy.id)}</code></details></li>`).join("")}</ul></section>` : `<p>Separate source-copy details were not reported.</p>`);
+}
+let openDelivery = null;
+let deliveryDetail = { id: null, loading: false, value: null, error: "" };
+let deliveryDetailRequest = 0;
+const deliveryRetrying = new Set();
+async function refreshDeliveryDetail(id) {
+  if (openDelivery !== id || deliveryDetail.loading) return;
+  const request = ++deliveryDetailRequest;
+  deliveryDetail = { ...deliveryDetail, id, loading: true }; renderDeliveries();
+  try {
+    const value = await boundedDeliveryDetail(id);
+    if (openDelivery !== id || request !== deliveryDetailRequest) return;
+    deliveryDetail = { id, value, loading: false, error: "" };
+  } catch (error) {
+    if (openDelivery !== id || request !== deliveryDetailRequest) return;
+    deliveryDetail = { ...deliveryDetail, loading: false, error: error.message };
+  }
+  renderDeliveries();
+}
+function toggleDeliveryDetail(id) {
+  openDelivery = openDelivery === id ? null : id; deliveryDetailRequest++;
+  deliveryDetail = { id: openDelivery, loading: false, value: null, error: "" };
+  renderDeliveries(); if (openDelivery) refreshDeliveryDetail(openDelivery);
+}
+function buildDeliveryRow(d) {
+  const row = d.create("div", "rec-row"), c = {};
+  for (const [key, tag, cls] of [["id", "code", ""], ["status", "span", "st"], ["summary", "span", ""], ["timeline", "span", "rec-folder"], ["retained", "span", ""], ["warning", "span", "warn"], ["error", "span", "err"]]) c[key] = d.append(row, d.create(tag, cls));
+  for (const [key, action, label] of [["retry", "f-delivery-retry", "retry source cleanup"], ["remove", "f-delivery-source-delete", "remove retained source"], ["details", "f-delivery-details", "timing and cleanup details"]]) {
+    c[key] = d.append(row, d.create("button", key === "remove" ? "small del" : "small")); d.data(c[key], "action", action); d.text(c[key], label);
+  }
+  c.trace = d.append(row, d.create("div", "delivery-trace"));
+  row.__c = c; return row;
+}
+function applyDeliveryRow(row, m, d) {
+  const c = row.__c, w = differ(row);
+  w("id", m.id, value => { d.text(c.id, value); for (const key of ["retry", "remove", "details"]) d.data(c[key], "delivery", value); });
+  for (const key of ["status", "summary", "timeline", "retained", "warning", "error"]) w(key, m[key] || "", value => { d.text(c[key], value); d.prop(c[key], "hidden", !value); if (key === "timeline") d.prop(c[key], "title", value); });
+  w("statusCls", m.status === "accepted" ? "st ok" : "st warn", value => d.cls(c.status, value));
+  for (const key of ["retry", "remove", "details"]) w(key + "Hidden", m[key + "Hidden"], value => d.prop(c[key], "hidden", value));
+  w("removeLabel", m.removeLabel, value => d.text(c.remove, value));
+  w("open", m.open, value => { d.attr(c.details, "aria-expanded", String(value)); d.prop(c.trace, "hidden", !value); d.text(c.details, value ? "close timing and cleanup details" : "timing and cleanup details"); });
+  w("retryBusy", m.retryBusy, value => { d.attr(c.retry, "aria-disabled", String(value)); d.text(c.retry, value ? "retrying source cleanup…" : "retry source cleanup"); });
+  // Action nodes stay mounted when asynchronous lifecycle observations change.
+  w("trace", m.trace || "", value => d.prop(c.trace, "innerHTML", value));
+}
+KINDS.delivery = { build: buildDeliveryRow, apply: applyDeliveryRow };
+KINDS.deliveryEmpty = { build: d => d.create("div", "sub"), apply: (row, _m, d) => d.text(row, "no published deliveries") };
 function renderDeliveries() {
   const box = $("files-deliveries"), count = $("files-deliveries-count"), rows = store.deliveries;
   if (!box) return;
-  if (armed.key && armed.key.startsWith("ds:") &&
-      !(rows || []).some(d => deliverySourceArmKey(d) === armed.key)) disarmButton();
+  if (armed.key && armed.key.startsWith("ds:") && !(rows || []).some(d => deliverySourceArmKey(d) === armed.key)) disarmButton();
   if (count) setText(count, rows ? String(rows.length) : "");
-  const sig = rows ? rows.map(d => deliverySourceArmKey(d) + ":" + d.status + ":" + d.sourceCleanup.status + ":" + (d.sourceCleanup.error || "") + ":" + (d.sourceCleanup.warning || "") + ":" + d.sourceCleanup.lastAttemptAt + ":" + d.sourceCleanup.completedAt + ":" + JSON.stringify(d.sourceCleanup.attemptHistory || [])).join("|") + ":" + (armed.key || "") : "";
-  const more = $("files-deliveries-more");
-  if (more) more.hidden = !(filesDeliveryNext > filesDeliveryAfter);
-  if (box.__sig === sig) return;
-  box.__sig = sig;
-  if (!rows || !rows.length) { box.innerHTML = `<div class="sub">no published deliveries</div>`; return; }
-  box.innerHTML = rows.slice().reverse().map(d => {
-    const cleanup = d.sourceCleanup || {};
-    const retryable = ["blocked", "retry", "pending"].includes(cleanup.status);
-    const retained = (d.fileOutcomes || []).filter(f => f.outcome === "retained_processing").length;
-    const repairDependencies = (d.fileOutcomes || []).filter(f => f.repairDependency).length;
-    const hasSeparateSource = d.sourceArtifactId && d.sourceArtifactId !== d.artifactId;
-    const timeline = ["ready " + fmtTime(d.readyAt)];
-    if (d.acceptedAt) timeline.push("accepted " + fmtTime(d.acceptedAt));
-    if (cleanup.startedAt) timeline.push("cleanup started " + fmtTime(cleanup.startedAt));
-    if (cleanup.lastAttemptAt && cleanup.lastAttemptAt !== cleanup.startedAt)
-      timeline.push("last cleanup attempt " + fmtTime(cleanup.lastAttemptAt));
-    if (cleanup.completedAt) {
-      const elapsed = cleanup.startedAt ? " in " + fmtDur((cleanup.completedAt - cleanup.startedAt) * 1000) : "";
-      timeline.push("source retired " + fmtTime(cleanup.completedAt) + elapsed);
-    }
-    const attempts = (cleanup.attemptHistory || []).map(a => {
-      const work = a.workMs == null ? "running" : fmtDur(a.workMs);
-      return "attempt " + a.attempt + ": " + a.outcome + " · work " + work + " · wait " + fmtDur(a.waitMs) + (a.error ? " · " + a.error : "");
-    });
-    return `<div class="rec-row"><code>${esc(d.deliveryId)}</code>` +
-      `<span class="st ${d.status === "accepted" ? "ok" : "warn"}">${esc(d.status)}</span>` +
-      `<span>${(d.files || []).length} payload files</span><span>source cleanup: ${esc(cleanup.status || "unknown")}</span>` +
-      `<span class="rec-folder">${esc(timeline.join(" · "))}</span>` +
-      (attempts.length ? `<span class="rec-folder" title="${esc(attempts.join("\n"))}">${esc(attempts.slice(-3).join(" · "))}</span>` : "") +
-      (retained ? `<span>${retained} retained source files</span>` : "") +
-      (repairDependencies ? `<span>${repairDependencies} PAR repair inputs retained</span>` : "") +
-      (cleanup.warning ? `<span class="warn">${esc(cleanup.warning)}</span>` : "") +
-      (cleanup.error ? `<span class="err">${esc(cleanup.error)}</span>` : "") +
-      (retryable ? `<button class="small" data-action="f-delivery-retry" data-delivery="${esc(d.deliveryId)}">retry source cleanup</button>` : "") +
-      `<span class="rec-folder" title="${esc(d.sourceArtifactId || "")}">Runner source ${esc(d.sourceArtifactId || "unknown")}</span>` +
-      (hasSeparateSource ? `<button class="small del" data-action="f-delivery-source-delete" data-delivery="${esc(d.deliveryId)}">${armIsSet(deliverySourceArmKey(d)) ? "click again to remove" : "remove retained source"}</button>` : "") + `</div>`;
-  }).join("");
+  const more = $("files-deliveries-more"); if (more) more.hidden = !(filesDeliveryNext > filesDeliveryAfter);
+  reconcileRows(box, (rows || []).length ? rows.slice().reverse().map(delivery => {
+    const cleanup = delivery.sourceCleanup || {}, retained = (delivery.fileOutcomes || []).filter(f => f.outcome === "retained_processing").length,
+      repair = (delivery.fileOutcomes || []).filter(f => f.repairDependency).length, open = openDelivery === delivery.deliveryId;
+    const timeline = ["ready " + fmtTime(delivery.readyAt)];
+    if (delivery.acceptedAt) timeline.push("accepted " + fmtTime(delivery.acceptedAt));
+    if (cleanup.lastAttemptAt) timeline.push("last cleanup attempt " + fmtTime(cleanup.lastAttemptAt));
+    if (cleanup.completedAt) timeline.push("source retired " + fmtTime(cleanup.completedAt));
+    const detail = deliveryDetail.id === delivery.deliveryId ? deliveryDetail : null;
+    return { key: delivery.deliveryId, kind: "delivery", id: delivery.deliveryId, status: delivery.status || "review required",
+      summary: (delivery.files || []).length + " payload files · source cleanup: " + (cleanup.status || "unknown") + " · " + (cleanup.attempts || 0) + " attempts",
+      timeline: timeline.join(" · "), retained: [retained ? retained + " retained source files" : "", repair ? repair + " PAR repair inputs retained" : ""].filter(Boolean).join(" · "),
+      warning: cleanup.warning, error: delivery.discoveryError || cleanup.error,
+      retryHidden: !["blocked", "retry", "pending"].includes(cleanup.status) && !(delivery.sourceCopies || []).some(copy => ["pending", "retry", "blocked"].includes(copy.status)),
+      removeHidden: !delivery.sourceArtifactId || delivery.sourceArtifactId === delivery.artifactId, detailsHidden: !!delivery.discoveryError,
+      removeLabel: armIsSet(deliverySourceArmKey(delivery)) ? "click again to remove" : "remove retained source", open, retryBusy: deliveryRetrying.has(delivery.deliveryId),
+      trace: open ? (detail?.error ? `<p class="err">${esc(detail.error)}</p>` : "") + (detail?.value ? deliveryTraceHtml(detail.value) : "<p>Loading lifecycle details…</p>") : "" };
+  }) : [{ key: "empty", kind: "deliveryEmpty" }]);
 }
+
 function deliverySourceArmKey(delivery) {
   return "ds:" + [delivery.deliveryId, delivery.artifactId, delivery.publicationGeneration || delivery.generation,
     delivery.sourceArtifactId, delivery.sourceGeneration].join(":");
@@ -5459,6 +5582,7 @@ async function refreshFiles(force = false) {
         filesDeliveryNext = priorNext;
       }
       store.deliveries = filesDeliveryRows;
+      if (openDelivery) refreshDeliveryDetail(openDelivery);
     } catch { store.deliveries = store.deliveries || []; }
     renderFiles();
   } catch (e) {
@@ -5639,12 +5763,18 @@ async function pruneRecovery(rid) {
   } catch (e) { filesError(e); }
 }
 async function retryDeliveryCleanup(id) {
+  if (deliveryRetrying.has(id)) return;
+  deliveryRetrying.add(id); renderDeliveries();
   try {
     const delivery = await fileRequest("deliveries/" + encodeURIComponent(id) + "/source-cleanup/retry", {});
     const cleanup = delivery.sourceCleanup || {};
     toast({ text: "Source cleanup is " + (cleanup.status || "unknown") + (cleanup.error ? " — " + cleanup.error : "") });
     await refreshFiles(true);
+    if (openDelivery === id) await refreshDeliveryDetail(id);
+    if (openJob != null) await refreshJobDelivery(openJob, store.jobs.find(job => job.id === openJob)?.params);
+    if (openHist != null) await refreshJobDelivery(openHist, store.history?.find(entry => entry.job === openHist)?.params);
   } catch (e) { filesError(e); }
+  finally { deliveryRetrying.delete(id); renderDeliveries(); }
 }
 async function deleteDeliverySource(id) {
   const delivery = (store.deliveries || []).find(d => d.deliveryId === id);
@@ -5687,6 +5817,7 @@ function filesClick(action, el) {
   if (action === "f-rec-prune") return pruneRecovery(el.dataset.recovery);
   if (action === "f-rec-cancel") return cancelRecovery(el.dataset.recovery);
   if (action === "f-delivery-retry") return retryDeliveryCleanup(el.dataset.delivery);
+  if (action === "f-delivery-details") return toggleDeliveryDetail(el.dataset.delivery);
   if (action === "f-deliveries-next") return loadOlderDeliveries();
   if (action === "f-delivery-source-delete") {
     const delivery = (store.deliveries || []).find(d => d.deliveryId === el.dataset.delivery);
@@ -6488,7 +6619,7 @@ function pollPass() {
     else if (activeTab !== "queue") refreshTab();
   } else if (activeTab !== "queue") refreshTab();
   if (openJob != null) refreshJobDetail();
-  if (activeTab === "history" && openHist != null) refreshFailureKeep(openHist);
+  if (activeTab === "history" && openHist != null) { refreshFailureKeep(openHist); refreshJobDelivery(openHist, store.history?.find(entry => entry.job === openHist)?.params); }
 }
 (async () => {
   if (await checkSetup()) return;
@@ -6550,6 +6681,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     },
     clientLabel, clientChipModels, UA_MAX,
     fileRowModel, fileDetailModel, fileDetailHtml, filesStateModel, fileRetentionText, filesScanModel,
+    measuredDeliveryLanes, deliveryTraceHtml, receiptIdOf, jobDeliveryHtml, refreshJobDelivery, boundedDeliveryDetail, toggleDeliveryDetail, refreshDeliveryDetail,
     fileBaseName, fileParent, renderFiles, renderDeliveries, refreshFiles, loadOlderDeliveries, retryDeliveryCleanup, filesClick, toggleFile, watchOperation, selectAllFiles, filesSelectionChange,
     setFilesPage, setFilesPageSize, setFilesFilter, setFilesSort, setFilesQuery, filesPages,
     filesView, filesWatch, filesSelections, FILES_PAGE_SIZES, FILES_PAGE_SIZE_DEFAULT,

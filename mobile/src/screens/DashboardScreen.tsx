@@ -40,6 +40,8 @@ import {
 } from '../api/types';
 import { NzbdClient } from '../api/client';
 import { FailureKeepControl } from '../components/FailureKeepControl';
+import { DeliveryLifecyclePanel } from '../components/DeliveryLifecyclePanel';
+import { deliveryReference } from '../deliveryTiming';
 import { ActionButton } from '../components/ActionButton';
 import { ThemeSwitcher } from '../components/ThemeSwitcher';
 import { useNzbd } from '../hooks/useNzbd';
@@ -706,6 +708,7 @@ export function JobCard({
 
       {expanded ? (
         <View style={styles.jobActions}>
+          {client && deliveryReference(job.params) ? <DeliveryLifecyclePanel client={client} receiptId={deliveryReference(job.params)!} /> : null}
           {client && job.kind !== 'torrent' ? <FailureKeepControl client={client} jobId={job.id} /> : null}
           <View style={styles.jobFacts}>
             {!phase ? <Fact label="Health" styles={styles} value={`${(job.health / 10).toFixed(1)}%`} /> : null}

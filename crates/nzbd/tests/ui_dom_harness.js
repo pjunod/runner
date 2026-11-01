@@ -1187,6 +1187,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   // exposes a bounded next-page action so an early accepted window cannot
   // hide later publications, and cleanup retry remains independent of ack.
   reset();
+  const deliveryText = () => { const visit = n => [n.textContent || "", n.innerHTML || "", ...(n.children || []).map(visit)].join(" "); return visit(sandbox.document.getElementById("files-deliveries")); };
   const delivery = (id, status, sequence) => ({ deliveryId: id, status, sequence, artifactId: "published-" + id,
     sourceArtifactId: "source-" + id, sourceGeneration: "source-generation", fileOutcomes: [], files: [],
     readyAt: 1, sourceCleanup: { status: "retry", attempts: 1, attemptHistory: [] } });
@@ -1194,9 +1195,9 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   repairDelivery.fileOutcomes = [{ repairDependency: true, outcome: "published" }];
   T.setDeliveriesForTest([repairDelivery], 0, 100);
   T.renderDeliveries();
-  ok(sandbox.document.getElementById("files-deliveries").innerHTML.includes("accepted"),
+  ok(deliveryText().includes("accepted"),
     "accepted deliveries remain visible in the durable listing");
-  ok(sandbox.document.getElementById("files-deliveries").innerHTML.includes("1 PAR repair inputs retained"),
+  ok(deliveryText().includes("1 PAR repair inputs retained"),
     "a published sibling can visibly remain a required PAR repair input");
   routes.set("/api/v1/deliveries?after=100", { status: 200, body: { deliveries: [delivery("d2", "pending", 101)], nextCursor: 200 } });
   await T.loadOlderDeliveries();
@@ -1210,6 +1211,31 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   await T.retryDeliveryCleanup("d2");
   ok(seen.some(r => r.url.endsWith("/api/v1/deliveries/d2/source-cleanup/retry") && r.method === "POST"),
     "source cleanup retry calls its independent Runner endpoint");
+
+  // One machine/session subtotal counts overlap once, no wall-time guesses.
+  const timed = delivery("timed", "accepted", 4);
+  const span = (stage, start, end, nodeId = "worker-a", clockDomain = "boot-a") => ({ stage, nodeId, clockDomain, state: "completed", startUnixMs: 100000,
+    startMonotonicMs: start, endMonotonicMs: end, durationMs: end - start });
+  timed.lifecycleTiming = { version: 1, intervals: [span("download", 0, 2000), span("post_processing", 1000, 3000), span("queue", 0, 1000, "worker-b"),
+    { ...span("url_fetch", 0, 9999), state: "interrupted" }, { stage: "queue", nodeId: "worker-a", clockDomain: "legacy", state: "completed", startUnixMs: 1, endUnixMs: 99999, durationMs: 99998 }] };
+  timed.sourceCopies = [{ id: "copy-long-reference", ownerNode: "worker-a", status: "retry", attempts: 2, error: "Mount unavailable" }];
+  const lanes = T.measuredDeliveryLanes(timed);
+  eq(lanes.length, 3, "node and session identities keep separate subtotals");
+  eq(lanes[0].measuredMs, 3000, "overlap counted once");
+  eq(lanes[0].unknown, 1, "interrupted timing excluded");
+  eq(lanes[2].measuredMs, null, "legacy wall timestamps cannot invent measured total");
+  ok(T.deliveryTraceHtml(timed).includes("Mount unavailable"), "per-copy reason visible");
+  ok(T.deliveryTraceHtml(timed).includes("Timing reference"), "raw session identity secondary");
+  reset(); T.setDeliveriesForTest([timed], 0, 4); T.renderDeliveries();
+  const timedRow = sandbox.document.getElementById("files-deliveries").__rows.get("timed");
+  const retryNode = timedRow.__c.retry;
+  timed.sourceCleanup.attempts = 3; T.renderDeliveries();
+  ok(sandbox.document.getElementById("files-deliveries").__rows.get("timed").__c.retry === retryNode, "polling preserves actual retry button identity");
+  routes.set("/api/v1/deliveries/timed", { status: 200, body: timed });
+  await T.refreshJobDelivery(22, [["Delivery:Id", "timed"]]);
+  ok(seen.some(r => r.url === "/api/v1/deliveries/timed" && r.method === "GET"), "expanded detail uses exact receipt reference");
+  ok(!seen.some(r => r.url.includes("deliveries?")), "expanded detail never fans out through collection");
+  ok(T.jobDeliveryHtml(22, [["Delivery:Id", "timed"]]).includes("Mount unavailable"), "retired job can show exact receipt lifecycle");
 
   // Source removal requires two clicks bound to the exact delivery and
   // source generation. The first click cannot issue a destructive request;
@@ -1228,7 +1254,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   const changedSourceDelivery = { ...sourceDelivery, sourceGeneration: "replacement-generation" };
   T.setDeliveriesForTest([changedSourceDelivery], 100, 200);
   T.renderDeliveries();
-  ok(!sandbox.document.getElementById("files-deliveries").innerHTML.includes("click again to remove"),
+  ok(!deliveryText().includes("click again to remove"),
     "a changed source generation clears the old armed control");
   routes.set("/api/v1/artifacts/source-d2", { status: 200, body: {
     id: "source-d2", generation: "replacement-generation", owned: true, revision: 7,
@@ -1353,7 +1379,8 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   const refused = T.histModel({ job: 22, name: "Curator movie", status: "DELETED", can_requeue: false,
     requeue_reason: "Use a fresh Grab in Curator", stages: [] });
   eq(refused.requeueHidden, true, "consumer history cannot offer requeue");
-  eq(refused.requeueReason, "Use a fresh Grab in Curator", "history renders the server refusal reason");
+  eq(refused.requeueReason, "Requeue unavailable — see details", "history points to its refusal explanation");
+  eq(T.histDetailModel({ job: 22, can_requeue: false, requeue_reason: "Use a fresh Grab in Curator" }).requeueNote, "Use a fresh Grab in Curator", "expanded history renders full server explanation");
 
   // Queue retirement does not remove a durable source's current Keep control.
   reset(); T.store.jobs = []; T.failureKeepState.clear();
