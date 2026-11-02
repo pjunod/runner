@@ -2,7 +2,7 @@
 
 **Status:** active single-node BitTorrent engine · **Upstream base:**
 rqbit v8.1.1, commit `00b97485160ff5b5aa2b379ea0815d568ec665f0` ·
-**Stable patch delta:** exactly twelve ordered patches ·
+**Stable patch delta:** exactly thirteen ordered patches ·
 **Production daemon:** starts it only when `[torrent].enabled = true`
 
 Companion to
@@ -44,6 +44,8 @@ The maintained series is:
 | 10 | `0019-disable-peer-exchange.patch` | Make the daemon's PEX setting authoritative for inbound messages and outgoing advertisement. |
 | 11 | `0020-expose-test-only-dht-bootstrap.patch` | Expose a feature-gated constructor for deterministic loopback DHT tests and a typed invalid-resolved-metadata marker without adding an nzbd runtime bootstrap setting. |
 | 12 | `0021-configurable-client-identity-and-announce-lifecycle.patch` | Let the embedder set the tracker HTTP `User-Agent` and BEP 10 `v`, and make announces tracker-compliant: keep the tracker URL's own query (passkeys), send a stable `key`, echo `tracker id`, report session-relative `downloaded`, send `completed` once and promptly, back off failed announces, and send a bounded `stopped` when the torrent's tracker session ends (ordered before a restart's `started`; awaited by `Session::stop`). Peer lookups send no events. |
+
+| 13 | `0022-read-only-piece-verifier.patch` | Reuse the existing piece verifier against an FD-bound read-only snapshot before native processing copies; verify boundary bytes and avoid rescanning preceding files for every piece. |
 
 The checked-in [`vendor/`](vendor/) tree is generated from those inputs. It
 contains the derived upstream `LICENSE`, `README.md`, and `crates/` tree needed

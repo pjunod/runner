@@ -15,6 +15,10 @@ use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CONTROL_SCHEMA: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS cluster_delivery_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL) STRICT",
+    "CREATE TABLE IF NOT EXISTS cluster_deliveries(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,data TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,discovery_error TEXT,public_data TEXT,accepted_at INTEGER,cleanup_only INTEGER NOT NULL DEFAULT 0,request_token TEXT) STRICT",
+    "CREATE INDEX IF NOT EXISTS cluster_deliveries_request_token ON cluster_deliveries(request_token)",
+
     "CREATE TABLE IF NOT EXISTS cluster_meta (
         cluster_id TEXT PRIMARY KEY,
         source_fingerprint TEXT NOT NULL,
@@ -40,6 +44,15 @@ const CONTROL_SCHEMA: &[&str] = &[
         deleted INTEGER NOT NULL DEFAULT 0,
         updated_at_ms INTEGER NOT NULL
     ) STRICT",
+    "CREATE TABLE IF NOT EXISTS request_admissions(token TEXT PRIMARY KEY,identity TEXT NOT NULL,job_id INTEGER NOT NULL,data TEXT NOT NULL CHECK(length(CAST(data AS BLOB))<=8192)) STRICT",
+    "CREATE TRIGGER IF NOT EXISTS admission_identity BEFORE INSERT ON request_admissions BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM request_admissions WHERE token=NEW.token AND identity<>NEW.identity) THEN RAISE(ABORT,'admission identity conflict') END; END",
+    "CREATE TRIGGER IF NOT EXISTS admission_job_binding BEFORE INSERT ON request_admissions BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM control_jobs j,json_each(j.intent_json,'$.params') p WHERE j.job_id=NEW.job_id AND json_extract(p.value,'$[0]')='monarr-transfer' AND json_extract(p.value,'$[1]')=NEW.token) THEN RAISE(ABORT,'admission job binding conflict') END; END",
+    "CREATE TRIGGER IF NOT EXISTS control_job_highwater_insert AFTER INSERT ON control_jobs BEGIN
+       INSERT INTO control_counters(name,value) VALUES('next_job_id',NEW.job_id) ON CONFLICT(name) DO UPDATE SET value=max(value,excluded.value);
+       INSERT INTO control_counters(name,value) VALUES('next_file_id',coalesce((SELECT max(CAST(json_extract(value,'$.id') AS INTEGER)) FROM json_each(NEW.intent_json,'$.files')),0)) ON CONFLICT(name) DO UPDATE SET value=max(value,excluded.value); END",
+    "CREATE TRIGGER IF NOT EXISTS control_job_highwater_update AFTER UPDATE OF intent_json ON control_jobs BEGIN
+       INSERT INTO control_counters(name,value) VALUES('next_file_id',coalesce((SELECT max(CAST(json_extract(value,'$.id') AS INTEGER)) FROM json_each(NEW.intent_json,'$.files')),0)) ON CONFLICT(name) DO UPDATE SET value=max(value,excluded.value); END",
+    "CREATE TRIGGER IF NOT EXISTS admission_highwater AFTER INSERT ON request_admissions BEGIN INSERT INTO control_counters(name,value) VALUES('next_job_id',NEW.job_id) ON CONFLICT(name) DO UPDATE SET value=max(value,excluded.value); END",
     "CREATE TABLE IF NOT EXISTS work_leases (
         resource TEXT PRIMARY KEY,
         cluster_id TEXT NOT NULL,
@@ -56,6 +69,12 @@ const CONTROL_SCHEMA: &[&str] = &[
         terminal INTEGER NOT NULL DEFAULT 0,
         updated_at_ms INTEGER NOT NULL
     ) STRICT",
+    "CREATE INDEX IF NOT EXISTS work_leases_job ON work_leases(job_id)",
+    "CREATE TRIGGER IF NOT EXISTS work_job_intent_validate BEFORE INSERT ON work_leases WHEN NEW.resource<>'cluster/leader' BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM control_jobs WHERE job_id=NEW.job_id AND incarnation=NEW.job_incarnation AND revision=NEW.job_revision AND deleted=0) THEN RAISE(ABORT,'stale job intent at lease claim') END; SELECT CASE WHEN json_type(NEW.scope_json,'$._authority') IS NOT NULL AND NOT EXISTS(SELECT 1 FROM work_leases WHERE resource='cluster/leader' AND terminal=0 AND owner_node_id=json_extract(NEW.scope_json,'$._authority.node') AND owner_incarnation=json_extract(NEW.scope_json,'$._authority.incarnation') AND fence=json_extract(NEW.scope_json,'$._authority.fence') AND expires_at_ms>NEW.updated_at_ms) THEN RAISE(ABORT,'stale grant issuer authority') END; END",
+    "CREATE TRIGGER IF NOT EXISTS coordinator_protocol_insert BEFORE INSERT ON work_leases WHEN NEW.resource='cluster/leader' AND (json_type(NEW.scope_json,'$.lifecycleProtocol') IS NOT 'integer' OR coalesce(json_extract(NEW.scope_json,'$.lifecycleProtocol'),0)<2) BEGIN SELECT RAISE(ABORT,'coordinator requires lifecycleProtocol 2; upgrade this node before claiming authority'); END",
+    "CREATE TRIGGER IF NOT EXISTS coordinator_protocol_update BEFORE UPDATE ON work_leases WHEN NEW.resource='cluster/leader' AND NEW.terminal=0 AND (json_type(NEW.scope_json,'$.lifecycleProtocol') IS NOT 'integer' OR coalesce(json_extract(NEW.scope_json,'$.lifecycleProtocol'),0)<2) BEGIN SELECT RAISE(ABORT,'coordinator requires lifecycleProtocol 2; upgrade this node before renewing authority'); END",
+    "CREATE TABLE IF NOT EXISTS request_authority(id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL,incarnation TEXT NOT NULL,fence INTEGER NOT NULL,checked_at_ms INTEGER NOT NULL) STRICT",
+    "CREATE TRIGGER IF NOT EXISTS request_authority_validate BEFORE INSERT ON request_authority BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM work_leases WHERE resource='cluster/leader' AND owner_node_id=NEW.owner AND owner_incarnation=NEW.incarnation AND fence=NEW.fence AND expires_at_ms>NEW.checked_at_ms AND terminal=0) THEN RAISE(ABORT,'stale request authority') END; END",
     "CREATE TABLE IF NOT EXISTS command_receipts (
         command_id TEXT PRIMARY KEY,
         job_id INTEGER NOT NULL,
@@ -159,7 +178,7 @@ const CONTROL_SCHEMA: &[&str] = &[
 
 #[derive(Clone)]
 pub struct ControlStore {
-    client: Client,
+    pub(crate) client: Client,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,8 +243,20 @@ pub struct PublicationReceipt {
     pub kind: String,
 }
 
+pub(crate) fn authority_statement(
+    (owner, incarnation, fence): (&str, &str, u64),
+) -> Result<(String, hiqlite::Params), String> {
+    Ok(("INSERT INTO request_authority(id,owner,incarnation,fence,checked_at_ms) VALUES(1,?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET owner=excluded.owner,incarnation=excluded.incarnation,fence=excluded.fence,checked_at_ms=excluded.checked_at_ms".into(),params!(owner,incarnation,i64_value("authority fence",fence)?,unix_ms()?)))
+}
+
 impl ControlStore {
     pub async fn start(cfg: &ClusterConfig) -> Result<Self, String> {
+        Self::start_with_wal_size(cfg, (crate::proto::MAX_RPC_BYTES * 4) as u32).await
+    }
+    pub(crate) async fn start_with_wal_size(
+        cfg: &ClusterConfig,
+        wal_size: u32,
+    ) -> Result<Self, String> {
         std::fs::create_dir_all(&cfg.control_dir)
             .map_err(|error| format!("create control directory: {error}"))?;
         let local_raft: SocketAddr = cfg
@@ -267,7 +298,10 @@ impl ControlStore {
             secret_raft: format!("raft-{secret}"),
             secret_api: format!("api-{secret}"),
             health_check_delay_secs: 0,
-            wal_size: 8 * 1024 * 1024,
+            // One bounded 32 MiB private copy record plus its bounded public
+            // projection/transaction overhead must fit a Raft entry. The WAL
+            // writer cannot split an entry across segments.
+            wal_size,
             raft_config,
             ..NodeConfig::default()
         };
@@ -282,6 +316,7 @@ impl ControlStore {
             .txn(
                 CONTROL_SCHEMA
                     .iter()
+                    .chain(crate::grant_receipts::SCHEMA.iter())
                     .map(|statement| ((*statement).to_owned(), params!()))
                     .collect::<Vec<(String, hiqlite::Params)>>(),
             )
@@ -290,7 +325,10 @@ impl ControlStore {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("install control schema statement: {error}"))?;
-        Ok(Self { client })
+        let store = Self { client };
+        crate::cancellation::install_schema(&store).await?;
+        crate::cluster_keep::install_schema(&store).await?;
+        Ok(store)
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {
@@ -366,18 +404,24 @@ impl ControlStore {
             let incarnation = format!("legacy-{:x}", Sha256::digest(intent_json.as_bytes()));
             statements.push((
                 "INSERT INTO control_jobs
-                 (job_id,incarnation,revision,intent_json,updated_at_ms)
-                 VALUES($1,$2,1,$3,$4)"
+                 (job_id,incarnation,revision,intent_json,updated_at_ms,deleted)
+                 VALUES($1,$2,1,$3,$4,$5)"
                     .into(),
-                params!(i64::from(job.id.0), incarnation, intent_json, now),
+                params!(
+                    i64::from(job.id.0),
+                    incarnation,
+                    intent_json,
+                    now,
+                    job.status == nzbd_types::JobStatus::Deleted
+                ),
             ));
         }
         statements.push((
-            "INSERT INTO control_counters(name,value) VALUES('next_job_id',$1)".into(),
+            "INSERT INTO control_counters(name,value) VALUES('next_job_id',$1) ON CONFLICT(name) DO UPDATE SET value=max(value,excluded.value)".into(),
             params!(i64::from(snapshot.next_job_id)),
         ));
         statements.push((
-            "INSERT INTO control_counters(name,value) VALUES('next_file_id',$1)".into(),
+            "INSERT INTO control_counters(name,value) VALUES('next_file_id',$1) ON CONFLICT(name) DO UPDATE SET value=max(value,excluded.value)".into(),
             params!(i64::from(snapshot.next_file_id)),
         ));
         statements.push((
@@ -479,7 +523,26 @@ impl ControlStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("decode acquired lease: {error}"))?;
         if let Some(row) = rows.into_iter().next() {
-            return Ok(LeaseClaim::Acquired(row.try_into()?));
+            let token: LeaseToken = row.try_into()?;
+            if resource != "cluster/leader" {
+                let receipt = self.historical_grant(resource, token.fence).await?.ok_or(
+                    "new lease lacks immutable grant provenance; do not execute this attempt",
+                )?;
+                if receipt.initial_token != token
+                    || u64::from(receipt.job_id) != job_id
+                    || receipt.job_incarnation != job_incarnation
+                    || receipt.job_revision != job_revision
+                    || receipt.kind != kind
+                    || receipt.issued_at_unix_ms != now
+                    || receipt.source_binding_json.as_ref().is_some_and(|value| {
+                        value.len() > 8192
+                            || serde_json::from_str::<serde_json::Value>(value).is_err()
+                    })
+                {
+                    return Err("committed grant provenance differs from its claimed operation; retain and review".into());
+                }
+            }
+            return Ok(LeaseClaim::Acquired(token));
         }
         let held = self.current_lease(resource).await?.ok_or_else(|| {
             "lease acquire changed no row and the resource disappeared".to_owned()
@@ -625,6 +688,21 @@ impl ControlStore {
             .transpose()
     }
 
+    pub(crate) async fn selected_publication_job(
+        &self,
+        job: u32,
+        result: &str,
+    ) -> Result<Option<(nzbd_types::Job, u64)>, String> {
+        let row=self.client.query_consistent_map::<ControlJobRow,_>("SELECT intent_json,revision,incarnation FROM control_jobs WHERE job_id=?1 AND result_id=?2 AND deleted=0",params!(i64::from(job),result)).await.map_err(|error|error.to_string())?.into_iter().next();
+        row.map(|row| {
+            Ok((
+                serde_json::from_str(&row.intent_json).map_err(|error| error.to_string())?,
+                u64::try_from(row.revision).map_err(|error| error.to_string())?,
+            ))
+        })
+        .transpose()
+    }
+
     pub async fn load_jobs(&self) -> Result<Vec<(nzbd_types::Job, u64, String)>, String> {
         let rows = self
             .client
@@ -719,11 +797,42 @@ impl ControlStore {
         &self,
         changes: &[(u64, Option<nzbd_types::Job>)],
     ) -> Result<(), String> {
-        if changes.is_empty() {
-            return Ok(());
-        }
+        let expected = self
+            .job_revision_fences_for(&changes.iter().map(|(id, _)| *id).collect::<Vec<_>>())
+            .await?;
+        self.commit_job_delta_guarded(changes, &expected, &[], None)
+            .await
+    }
+
+    pub(crate) async fn commit_job_delta_guarded(
+        &self,
+        changes: &[(u64, Option<nzbd_types::Job>)],
+        expected_rows: &std::collections::HashMap<u64, u64>,
+        admissions: &[nzbd_state::UrlAdmissionReceipt],
+        authority: Option<(&str, &str, u64)>,
+    ) -> Result<(), String> {
+        self.commit_job_delta_guarded_with_removals(
+            changes,
+            expected_rows,
+            admissions,
+            authority,
+            &Default::default(),
+        )
+        .await
+    }
+    pub(crate) async fn commit_job_delta_guarded_with_removals(
+        &self,
+        changes: &[(u64, Option<nzbd_types::Job>)],
+        expected_rows: &std::collections::HashMap<u64, u64>,
+        admissions: &[nzbd_state::UrlAdmissionReceipt],
+        authority: Option<(&str, &str, u64)>,
+        removals: &std::collections::BTreeMap<u32, crate::cancellation::RemovalMode>,
+    ) -> Result<(), String> {
         let now = unix_ms()?;
         let mut statements: Vec<(String, hiqlite::Params)> = Vec::new();
+        if let Some(authority) = authority {
+            statements.push(authority_statement(authority)?);
+        }
         for (job_id, desired_job) in changes {
             let rows = self
                 .client
@@ -738,7 +847,14 @@ impl ControlStore {
                 .map(serde_json::to_string)
                 .transpose()
                 .map_err(|error| format!("encode replicated request row: {error}"))?;
-            match rows.into_iter().next() {
+            let row = rows.into_iter().next();
+            let actual = row.as_ref().map(|row| row.revision as u64);
+            if actual != expected_rows.get(job_id).copied() {
+                return Err(format!(
+                    "job {job_id} changed during request; retry against current authority"
+                ));
+            }
+            match row {
                 None => {
                     let intent = desired.as_deref().ok_or_else(|| {
                         format!("request attempted to delete unknown job {job_id}")
@@ -787,11 +903,32 @@ impl ControlStore {
                             now
                         ),
                     ));
+                    if deleted {
+                        let job = u32::try_from(*job_id).map_err(|e| e.to_string())?;
+                        statements.extend(crate::cancellation::tombstone_statements(
+                            job,
+                            &row.incarnation,
+                            expected,
+                            next_revision,
+                            removals
+                                .get(&job)
+                                .copied()
+                                .unwrap_or(crate::cancellation::RemovalMode::KeepFiles),
+                            now,
+                        ));
+                    }
                 }
             }
         }
+        statements.extend(crate::admissions::admission_statements(admissions)?);
         if statements.is_empty() {
             return Ok(());
+        }
+        crate::delivery::bounded_transaction(&statements)?;
+        // Per-job reads and bounded encoding can be slow. Refresh only this
+        // deterministic proposal timestamp immediately before submission.
+        if let Some(authority) = authority {
+            statements[0] = authority_statement(authority)?;
         }
         self.client
             .txn(statements)
@@ -851,6 +988,122 @@ impl ControlStore {
         {
             MutationOutcome::Applied { .. } | MutationOutcome::Duplicate { .. } => Ok(()),
             MutationOutcome::Conflict => Err("URL resolution lost a revision race".into()),
+        }
+    }
+
+    /// Drain the durable URL outbox against current replicated intent. Events
+    /// are wake hints only; the immutable resolution ID is the command key.
+    /// True means durable acceptance/replay or a definite durable cancellation.
+    #[cfg(test)]
+    pub(crate) async fn commit_url_outbox(
+        &self,
+        record: &nzbd_state::artifacts::UrlResolutionRecord,
+    ) -> Result<bool, String> {
+        self.commit_url_outbox_with_source(record, None).await
+    }
+    pub(crate) async fn commit_url_outbox_with_source(
+        &self,
+        record: &nzbd_state::artifacts::UrlResolutionRecord,
+        source: Option<&crate::source_facts::OwnedSourceFact>,
+    ) -> Result<bool, String> {
+        use nzbd_state::artifacts::url_source_identity;
+        if record.resolution_id != record.source_identity
+            || url_source_identity(&record.origin).map_err(|error| error.to_string())?
+                != record.source_identity
+            || record.origin.id != record.resolved.id
+        {
+            return Err("URL outbox identity is invalid; retain record for review".into());
+        }
+        let command_id = format!("url-resolution-outbox:{}", record.resolution_id);
+        if self.command_receipt(&command_id).await?.is_some() {
+            return Ok(true);
+        }
+        let row = self
+            .client
+            .query_consistent_map::<ControlJobStateRow, _>(
+                "SELECT incarnation,revision,intent_json,deleted FROM control_jobs WHERE job_id=?1",
+                params!(i64::from(record.origin.id.0)),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next();
+        let Some(row) = row else { return Ok(false) }; // Admission may still be committing.
+        if row.deleted {
+            return Ok(true);
+        }
+        let prior: nzbd_types::Job =
+            serde_json::from_str(&row.intent_json).map_err(|error| error.to_string())?;
+        if url_source_identity(&prior).ok().as_deref() != Some(record.source_identity.as_str()) {
+            return Ok(true); // The durable row names another request/incarnation.
+        }
+        if !matches!(
+            prior.status,
+            nzbd_types::JobStatus::Fetching | nzbd_types::JobStatus::Paused
+        ) || !prior.files.is_empty()
+        {
+            // A previous authority already resolved this exact admission (or
+            // durable user intent superseded it). Never overwrite later work.
+            return Ok(true);
+        }
+        let mut next = prior.clone();
+        if prior.name == record.origin.name
+            && prior.name_provisional == record.origin.name_provisional
+        {
+            next.name = record.resolved.name.clone();
+            next.name_provisional = record.resolved.name_provisional;
+        }
+        if prior.category.is_none() && record.origin.category.is_none() {
+            next.category = record.resolved.category.clone();
+        }
+        if prior.dir_name == record.origin.dir_name {
+            next.dir_name = record.resolved.dir_name.clone();
+        }
+        next.files = record.resolved.files.clone();
+        next.totals = record.resolved.totals;
+        next.status = if record.resolved.status == nzbd_types::JobStatus::Failed {
+            nzbd_types::JobStatus::Failed
+        } else if prior.status == nzbd_types::JobStatus::Paused
+            || prior.params.iter().any(|(key, _)| key == "*AddPaused")
+            || prior
+                .control()
+                .is_some_and(|control| control.manual_pause || control.lifecycle == "held")
+        {
+            nzbd_types::JobStatus::Paused
+        } else {
+            nzbd_types::JobStatus::Queued
+        };
+        next.params.retain(|(key, _)| key != "*AddPaused");
+        for (key, value) in record
+            .resolved
+            .params
+            .iter()
+            .filter(|(key, _)| matches!(key.as_str(), "Failure:Stage" | "Failure:Reason"))
+        {
+            next.params.retain(|(existing, _)| existing != key);
+            next.params.push((key.clone(), value.clone()));
+        }
+        if let Some(source) = source {
+            if source.dirname == nzbd_engine::queue::job_dir_name(&next)
+                && !next
+                    .params
+                    .iter()
+                    .any(|(key, _)| key == crate::delivery::AUTHORITY_COPY_PARAM)
+            {
+                next.params.push((
+                    crate::delivery::AUTHORITY_COPY_PARAM.into(),
+                    source.value.clone(),
+                ));
+            }
+        }
+        let next = serde_json::to_string(&next).map_err(|error| error.to_string())?;
+        if next.len() > crate::proto::MAX_DESCRIPTOR_BYTES {
+            return Err("resolved URL descriptor exceeds 16 MiB; retain source for review".into());
+        }
+        let expected = u64::try_from(row.revision).map_err(|error| error.to_string())?;
+        match self.apply_command(&command_id,u64::from(prior.id.0),expected,&serde_json::json!({"op":"url_resolution_outbox","resolutionId":record.resolution_id,"sourceIdentity":record.source_identity}).to_string(),&next,false).await? {
+            MutationOutcome::Applied{..}|MutationOutcome::Duplicate{..}=>Ok(true),
+            MutationOutcome::Conflict=>Ok(false),
         }
     }
 
@@ -947,6 +1200,96 @@ impl ControlStore {
             Ok(_) => Ok(MutationOutcome::Conflict),
             Err(error) if error.to_string().contains("stale") => Ok(MutationOutcome::Conflict),
             Err(error) => Err(format!("publish result: {error}")),
+        }
+    }
+
+    /// Bulk verification may span heartbeat renewals. The short receipt
+    /// transaction selects the latest exact same operation token, while the
+    /// existing trigger still fences job intent, owner/incarnation and expiry.
+    pub async fn publish_result_renewable(
+        &self,
+        receipt_id: &str,
+        token: &LeaseToken,
+        expected_job_revision: u64,
+        result_id: &str,
+        result_ref: &str,
+        result_job_json: &str,
+    ) -> Result<MutationOutcome, String> {
+        if let Some(receipt) = self.publication_record(receipt_id).await? {
+            return Ok(
+                if renewable_receipt_matches(
+                    &receipt,
+                    token,
+                    expected_job_revision,
+                    result_id,
+                    result_ref,
+                    result_job_json,
+                ) {
+                    MutationOutcome::Duplicate {
+                        revision: expected_job_revision.saturating_add(1),
+                    }
+                } else {
+                    MutationOutcome::Conflict
+                },
+            );
+        }
+        let now = unix_ms()?;
+        let sql="INSERT INTO publication_receipts(receipt_id,resource,owner_node_id,owner_incarnation,fence,lease_revision,lease_expiry_ms,expected_job_revision,result_id,result_ref,result_job_json,accepted_at_ms)
+            SELECT ?1,l.resource,l.owner_node_id,l.owner_incarnation,l.fence,l.revision,l.expires_at_ms,?2,?3,?4,?5,?6 FROM work_leases l
+            WHERE l.resource=?7 AND l.owner_node_id=?8 AND l.owner_incarnation=?9 AND l.fence=?10 AND l.revision>=?11 AND l.expires_at_ms>=?12 AND l.expires_at_ms>?6 AND l.terminal=0 AND l.job_revision=?2";
+        let parameters = params!(
+            receipt_id,
+            i64_value("expected job revision", expected_job_revision)?,
+            result_id,
+            result_ref,
+            result_job_json,
+            now,
+            &token.resource,
+            &token.owner_node_id,
+            &token.owner_incarnation,
+            i64_value("fence", token.fence)?,
+            i64_value("lease revision", token.revision)?,
+            token.expires_at_unix_ms
+        );
+        // Binary Raft encoding has no JSON string escaping; this conservative
+        // bound leaves at least half the 128 MiB segment for framing.
+        if serde_json::to_vec(&(sql, &parameters))
+            .map_err(|error| error.to_string())?
+            .len()
+            > 64 * 1024 * 1024
+        {
+            return Err("completion receipt exceeds 64 MiB encoded transaction limit; retain source and reduce metadata".into());
+        }
+        match self.client.execute(sql, parameters).await {
+            Ok(1) => Ok(MutationOutcome::Applied {
+                revision: expected_job_revision.saturating_add(1),
+            }),
+            Ok(_) => Ok(MutationOutcome::Conflict),
+            Err(error) => {
+                if let Some(receipt) = self.publication_record(receipt_id).await? {
+                    return Ok(
+                        if renewable_receipt_matches(
+                            &receipt,
+                            token,
+                            expected_job_revision,
+                            result_id,
+                            result_ref,
+                            result_job_json,
+                        ) {
+                            MutationOutcome::Duplicate {
+                                revision: expected_job_revision.saturating_add(1),
+                            }
+                        } else {
+                            MutationOutcome::Conflict
+                        },
+                    );
+                }
+                if error.to_string().contains("stale") {
+                    Ok(MutationOutcome::Conflict)
+                } else {
+                    Err(format!("publish renewed result: {error}"))
+                }
+            }
         }
     }
 
@@ -1138,34 +1481,55 @@ impl ControlStore {
         rows.into_iter().next().map(TryInto::try_into).transpose()
     }
 
-    pub async fn published_results(
+    /// Metadata-first bounded receipt scan. Supplying a job avoids decoding
+    /// unrelated historical descriptors while assembling that job's copies.
+    pub(crate) async fn publication_results_page(
         &self,
-    ) -> Result<Vec<(String, String, nzbd_types::Job, u64, i64, String)>, String> {
-        let rows = self
-            .client
-            .query_consistent_map::<PublishedResultRow, _>(
-                "SELECT p.result_id,p.result_ref,p.result_job_json,p.fence,p.accepted_at_ms,l.kind
-                   FROM publication_receipts p
-                   JOIN work_leases l ON l.resource=p.resource
-                  WHERE l.kind <> 'segment' ORDER BY p.accepted_at_ms",
-                params!(),
-            )
-            .await
-            .map_err(|error| format!("load published results: {error}"))?;
-        rows.into_iter()
-            .map(|row| {
-                let job: nzbd_types::Job = serde_json::from_str(&row.result_job_json)
-                    .map_err(|error| format!("decode published result job: {error}"))?;
-                Ok((
-                    row.result_id,
-                    row.result_ref,
-                    job,
-                    u64::try_from(row.fence).map_err(|error| error.to_string())?,
-                    row.accepted_at_ms,
-                    row.kind,
-                ))
-            })
-            .collect()
+        job: Option<u32>,
+        after: i64,
+        limit: u32,
+    ) -> Result<
+        (
+            Vec<(String, String, nzbd_types::Job, u64, i64, String)>,
+            i64,
+        ),
+        String,
+    > {
+        let pointers=self.client.query_consistent_map::<PublicationPointer,_>("SELECT p.rowid AS sequence,length(CAST(p.result_job_json AS BLOB)) AS bytes FROM publication_receipts p JOIN work_leases l ON l.resource=p.resource WHERE (?1 IS NULL OR l.job_id=?1) AND p.rowid>?2 AND l.kind<>'segment' ORDER BY p.rowid LIMIT ?3",params!(job.map(i64::from),after,i64::from(limit.clamp(1,16)))).await.map_err(|error|error.to_string())?;
+        let mut values = Vec::new();
+        let mut cursor = after;
+        let mut bytes = 0;
+        for pointer in pointers {
+            if pointer.bytes > crate::proto::MAX_DESCRIPTOR_BYTES as i64 {
+                tracing::warn!(sequence=pointer.sequence,"historical cluster completion exceeds descriptor limit; source retained for review");
+                cursor = pointer.sequence;
+                continue;
+            }
+            if !values.is_empty() && bytes + pointer.bytes > crate::proto::MAX_RPC_BYTES as i64 {
+                break;
+            }
+            let row=self.client.query_consistent_map::<PublishedResultRow,_>("SELECT p.result_id,p.result_ref,p.result_job_json,p.fence,p.accepted_at_ms,l.kind FROM publication_receipts p JOIN work_leases l ON l.resource=p.resource WHERE p.rowid=?1",params!(pointer.sequence)).await.map_err(|error|error.to_string())?.into_iter().next();
+            cursor = pointer.sequence;
+            if let Some(row) = row {
+                match serde_json::from_str::<nzbd_types::Job>(&row.result_job_json) {
+                    Ok(job) => {
+                        bytes += pointer.bytes;
+                        values.push((
+                            row.result_id,
+                            row.result_ref,
+                            job,
+                            u64::try_from(row.fence).map_err(|error| error.to_string())?,
+                            row.accepted_at_ms,
+                            row.kind,
+                        ));
+                    }
+                    Err(error) => {
+                        tracing::warn!(sequence=pointer.sequence,%error,"historical cluster descriptor is invalid; source retained for review")
+                    }
+                }
+            }
+        }
+        Ok((values, cursor))
     }
 
     async fn scalar_revision(&self, sql: &'static str, id: &str) -> Result<Option<u64>, String> {
@@ -1279,6 +1643,18 @@ struct RevisionRow {
 }
 struct AcceptedAtRow {
     accepted_at_ms: i64,
+}
+struct PublicationPointer {
+    sequence: i64,
+    bytes: i64,
+}
+impl From<&mut Row<'_>> for PublicationPointer {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            sequence: row.get("sequence"),
+            bytes: row.get("bytes"),
+        }
+    }
 }
 struct PublishedResultRow {
     result_id: String,
@@ -1458,6 +1834,26 @@ impl From<&mut Row<'_>> for RevisionRow {
     }
 }
 
+fn renewable_receipt_matches(
+    receipt: &PublicationReceipt,
+    token: &LeaseToken,
+    expected: u64,
+    result_id: &str,
+    result_ref: &str,
+    result_job_json: &str,
+) -> bool {
+    receipt.resource == token.resource
+        && receipt.owner_node_id == token.owner_node_id
+        && receipt.owner_incarnation == token.owner_incarnation
+        && receipt.fence == token.fence
+        && receipt.lease_revision >= token.revision
+        && receipt.lease_expiry_ms >= token.expires_at_unix_ms
+        && receipt.expected_job_revision == expected
+        && receipt.result_id == result_id
+        && receipt.result_ref == result_ref
+        && receipt.result_job_json == result_job_json
+}
+
 fn validate_identity(resource: &str, node: &str, incarnation: &str) -> Result<(), String> {
     for (label, value, max) in [
         ("resource", resource, 256usize),
@@ -1490,4 +1886,166 @@ fn expiry(now: i64, ttl: Duration) -> Result<i64, String> {
     let ttl = ttl.clamp(Duration::from_secs(1), Duration::from_secs(300));
     now.checked_add(i64::try_from(ttl.as_millis()).map_err(|error| error.to_string())?)
         .ok_or_else(|| "lease expiry overflow".to_owned())
+}
+
+pub(crate) fn unix_ms_public() -> i64 {
+    unix_ms().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod coordinator_protocol_tests {
+    use super::*;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_coordinator_scope_cannot_claim_or_renew_but_current_scope_takes_over() {
+        let temp = tempfile::tempdir().unwrap();
+        let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ClusterConfig {
+            cluster_id: "protocol-test".into(),
+            node_name: "new".into(),
+            shared_dir: temp.path().join("shared"),
+            advertise_url: "http://127.0.0.1:1".into(),
+            secret: "secret".into(),
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            pp_slots: 0,
+            lease_interval: Duration::from_millis(100),
+            takeover_after: Duration::from_secs(1),
+            worker_ttl: Duration::from_secs(2),
+            control_dir: temp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: raft.local_addr().unwrap().to_string(),
+            control_api_bind: api.local_addr().unwrap().to_string(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
+            disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
+        };
+        drop(raft);
+        drop(api);
+        let store = ControlStore::start(&cfg).await.unwrap();
+        for scope in [
+            "{}",
+            r#"{"lifecycleProtocol":1}"#,
+            r#"{"lifecycleProtocol":"2"}"#,
+        ] {
+            let error = store
+                .acquire(
+                    "cluster/leader",
+                    "protocol-test",
+                    1,
+                    "cluster-leader",
+                    "old",
+                    "old-process",
+                    "leader",
+                    scope,
+                    1,
+                    Duration::from_secs(10),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("coordinator requires lifecycleProtocol 2"),
+                "{error}"
+            );
+        }
+        // This exact row models a lease committed before the schema upgrade.
+        store
+            .client
+            .execute("DROP TRIGGER coordinator_protocol_insert", params!())
+            .await
+            .unwrap();
+        store
+            .client
+            .execute("DROP TRIGGER coordinator_protocol_update", params!())
+            .await
+            .unwrap();
+        let LeaseClaim::Acquired(old) = store
+            .acquire(
+                "cluster/leader",
+                "protocol-test",
+                1,
+                "cluster-leader",
+                "old",
+                "old-process",
+                "leader",
+                "{}",
+                1,
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("old fixture lease not committed")
+        };
+        for sql in CONTROL_SCHEMA
+            .iter()
+            .filter(|sql| sql.contains("CREATE TRIGGER IF NOT EXISTS coordinator_protocol_"))
+        {
+            store.client.execute(*sql, params!()).await.unwrap();
+        }
+        assert!(store
+            .renew(&old, Duration::from_secs(10))
+            .await
+            .unwrap_err()
+            .contains("coordinator requires lifecycleProtocol 2"));
+        // Safe relinquishment remains available to the old node; no timer is
+        // mistaken for worker cleanup or destructive-work quiescence.
+        assert!(store.release(&old).await.unwrap());
+        let scope =
+            serde_json::json!({"lifecycleProtocol":crate::proto::LIFECYCLE_PROTOCOL}).to_string();
+        let LeaseClaim::Acquired(current) = store
+            .acquire(
+                "cluster/leader",
+                "protocol-test",
+                1,
+                "cluster-leader",
+                "new",
+                "new-process",
+                "leader",
+                &scope,
+                1,
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("current coordinator did not take over")
+        };
+        assert!(current.fence > old.fence);
+        assert_eq!(current.owner_node_id, "new");
+        let renewed = store
+            .renew(&current, Duration::from_secs(10))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(renewed.revision > current.revision);
+        store.seed_job(2, "ordinary", "{}").await.unwrap();
+        assert!(
+            matches!(
+                store
+                    .acquire(
+                        "job/ordinary",
+                        "protocol-test",
+                        2,
+                        "ordinary",
+                        "worker",
+                        "worker-process",
+                        "download",
+                        "{}",
+                        1,
+                        Duration::from_secs(10)
+                    )
+                    .await
+                    .unwrap(),
+                LeaseClaim::Acquired(_)
+            ),
+            "only coordinator authority requires the coordinator capability"
+        );
+        store.shutdown().await.unwrap();
+    }
 }

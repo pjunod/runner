@@ -8,6 +8,12 @@
 //! about state. Sends toward writer tasks use `try_send` with a
 //! retry-on-tick fallback so owner ⇄ writer backpressure can never deadlock.
 
+#[path = "owner_native_failure.rs"]
+mod native_failure;
+#[path = "owner_lifecycle.rs"]
+mod native_lifecycle;
+#[path = "owner_native_seed.rs"]
+mod native_seed;
 #[path = "owner_transitions.rs"]
 mod transitions;
 
@@ -87,6 +93,9 @@ fn set_owner_param(params: &mut Vec<(String, String)>, key: &str, value: Option<
 }
 
 fn mark_new_lifecycle_cohort(job: &mut Job) {
+    if job.lifecycle_ledger().is_none() {
+        job.set_lifecycle_ledger(&nzbd_types::LifecycleLedger::default());
+    }
     if !job
         .params
         .iter()
@@ -182,7 +191,85 @@ pub(crate) enum QueueCommand {
     CommitTorrentAdmission {
         job: JobId,
         commit: Box<crate::queue::TorrentAdmissionCommit>,
-        reply: oneshot::Sender<Option<Result<JobId, JobId>>>,
+        reply: oneshot::Sender<Result<Option<Result<JobId, JobId>>, crate::EngineError>>,
+    },
+    NoteSeedKeepBlock {
+        job: JobId,
+        marker: Box<crate::torrent_acquisitions::ManagedSeedRetirement>,
+        operation: Option<String>,
+        reply: oneshot::Sender<bool>,
+    },
+    RearmSeedKeepCleared {
+        job: JobId,
+        reply: oneshot::Sender<bool>,
+    },
+    SyncManagedSeedKeep {
+        donor: JobId,
+        reply: oneshot::Sender<bool>,
+    },
+    BeginManagedSeedRetirement {
+        job: JobId,
+        reply: oneshot::Sender<bool>,
+    },
+    CompleteManagedSeedRetirement {
+        job: JobId,
+        identity: String,
+        reply: oneshot::Sender<bool>,
+    },
+    ClaimNativeFailureCleanup {
+        job: JobId,
+        reply: oneshot::Sender<Option<Job>>,
+    },
+    FailNativeTorrent {
+        job: JobId,
+        donor: Option<JobId>,
+        stage: String,
+        message: String,
+        cleanup_complete: bool,
+        reply: oneshot::Sender<bool>,
+    },
+    NativeTorrentPending {
+        job: JobId,
+        reply: oneshot::Sender<Option<nzbd_state::PendingAdmission>>,
+    },
+    ReserveManagedTorrentAdmission {
+        source: nzbd_types::TorrentSource,
+        submission_sha256: String,
+        opts: AddOpts,
+        defaults: crate::torrent_acquisitions::ManagedTorrentDefaults,
+        reply: oneshot::Sender<
+            Result<crate::torrent_acquisitions::ManagedTorrentReservation, crate::EngineError>,
+        >,
+    },
+    ConfirmManagedTorrentSource {
+        job: JobId,
+        submission_sha256: String,
+        reply: oneshot::Sender<bool>,
+    },
+    CommitManagedTorrentAdmission {
+        job: JobId,
+        commit: Box<crate::queue::TorrentAdmissionCommit>,
+        submission_sha256: String,
+        descriptor: crate::torrent_acquisitions::NativeDescriptorRef,
+        reply: oneshot::Sender<
+            Result<crate::torrent_acquisitions::ManagedTorrentAdmission, crate::EngineError>,
+        >,
+    },
+    StartTorrentAcquisition {
+        job: JobId,
+        reply: oneshot::Sender<bool>,
+    },
+    CompleteTorrentAcquisition {
+        job: JobId,
+        donor: JobId,
+        source: Box<nzbd_state::artifacts::Artifact>,
+        reply: oneshot::Sender<bool>,
+    },
+    HoldTorrentAcquisition {
+        job: JobId,
+        cause: nzbd_types::HoldCause,
+        message: String,
+        reply: oneshot::Sender<bool>,
     },
     CancelTorrentAdmission {
         job: JobId,
@@ -215,20 +302,22 @@ pub(crate) enum QueueCommand {
         request_token: String,
         reply: oneshot::Sender<Option<UrlAdmissionReceipt>>,
     },
+    ReserveUrlFiles {
+        job: JobId,
+        source_identity: String,
+        count: u32,
+        reply: oneshot::Sender<Result<u32, crate::EngineError>>,
+    },
     CompleteUrlFetch {
         job: JobId,
-        parsed: Box<ParsedNzb>,
-        reply: oneshot::Sender<bool>,
-    },
-    FailUrlFetch {
-        job: JobId,
-        error: String,
-        reply: oneshot::Sender<()>,
+        source_identity: String,
+        prepared: Box<nzbd_state::artifacts::UrlResolutionRecord>,
+        reply: oneshot::Sender<Result<bool, crate::EngineError>>,
     },
     UpdateUrlFetchProgress {
         job: JobId,
         progress: crate::fetch::FetchRetryState,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<Result<bool, crate::EngineError>>,
     },
     SetFilePaused {
         job: JobId,
@@ -247,6 +336,15 @@ pub(crate) enum QueueCommand {
     },
     Resume {
         job: JobId,
+        reply: oneshot::Sender<bool>,
+    },
+    PrepareClusterWritersStop {
+        ticket: nzbd_state::artifacts::WorkerStopTicket,
+        execution_joined: bool,
+        reply: oneshot::Sender<Result<crate::cluster_stop::StopPreparation, String>>,
+    },
+    ForgetClusterWriterStops {
+        context: nzbd_state::artifacts::WorkerControlContext,
         reply: oneshot::Sender<bool>,
     },
     QuiescePayload {
@@ -321,11 +419,20 @@ pub(crate) enum QueueCommand {
     /// Insert (or replace) a job with its ids preserved — the cluster grant
     /// / completion path. Optionally folds the job's shared journals
     /// (cross-node resume).
+    ImportFence {
+        job: JobId,
+        reply: oneshot::Sender<Result<Option<String>, crate::EngineError>>,
+    },
+    EndImportPreparation {
+        job: JobId,
+        reply: oneshot::Sender<()>,
+    },
     ImportJob {
         job: Box<Job>,
-        fold_journals: bool,
+        preparation: Option<crate::imports::PreparedImport>,
+        authority: crate::imports::ImportAuthority,
         emit_finished: bool,
-        reply: oneshot::Sender<Result<(), nzbd_state::StateError>>,
+        reply: oneshot::Sender<Result<(), crate::EngineError>>,
     },
     /// Replace only an authority copy that still exists. This is the fenced
     /// terminal-update path: a demoted worker must never resurrect a job that
@@ -333,6 +440,7 @@ pub(crate) enum QueueCommand {
     ImportJobIfPresent {
         job: Box<Job>,
         require_snapshot: bool,
+        completion_proof: Option<nzbd_state::artifacts::WorkerCompletionProof>,
         reply: oneshot::Sender<bool>,
     },
     /// Clone a job's full current state out (for grants and completion
@@ -345,6 +453,7 @@ pub(crate) enum QueueCommand {
     /// history or events — the executor-side handoff cleanup.
     RemoveJobSilent {
         job: JobId,
+        accepted_context: Option<nzbd_state::artifacts::WorkerControlContext>,
         reply: oneshot::Sender<bool>,
     },
     /// Mark a job as executing on another node: the local scheduler skips
@@ -387,6 +496,42 @@ pub(crate) enum QueueCommand {
     AdoptAuthority {
         reply: oneshot::Sender<Result<(), nzbd_state::StateError>>,
     },
+    UnacceptedUrlAdmissions {
+        limit: usize,
+        reply: oneshot::Sender<Result<Vec<UrlAdmissionReceipt>, String>>,
+    },
+    UrlAdmissionsPage {
+        after: String,
+        limit: usize,
+        reply: oneshot::Sender<Result<Vec<UrlAdmissionReceipt>, String>>,
+    },
+    BeginUrlAdmissionAdoption {
+        reply: oneshot::Sender<bool>,
+    },
+    AdoptUrlAdmissions {
+        rows: Vec<UrlAdmissionReceipt>,
+        reply: oneshot::Sender<bool>,
+    },
+    FinishUrlAdmissionAdoption {
+        reply: oneshot::Sender<bool>,
+    },
+    CheckDiscardUrlAdmission {
+        expected: Box<UrlAdmissionReceipt>,
+        reply: oneshot::Sender<bool>,
+    },
+    DiscardUrlAdmission {
+        expected: Box<UrlAdmissionReceipt>,
+        reply: oneshot::Sender<bool>,
+    },
+    AdoptReplicatedHighwater {
+        next_job_id: u32,
+        next_file_id: u32,
+        reply: oneshot::Sender<bool>,
+    },
+    SetConsumerInstanceId {
+        instance: String,
+        reply: oneshot::Sender<bool>,
+    },
     /// Replace the queue projection from replicated control. Local-only rows
     /// must not survive takeover or rollback after a failed quorum commit.
     AdoptReplicatedAuthority {
@@ -409,16 +554,27 @@ pub(crate) enum QueueCommand {
         generation: String,
         reply: oneshot::Sender<Result<nzbd_state::artifacts::Artifact, String>>,
     },
+    SchedulePostRetry {
+        job: JobId,
+        revision: String,
+        retry_attempt: u8,
+        next_retry: i64,
+        blocked_since: i64,
+        message: String,
+        reply: oneshot::Sender<bool>,
+    },
     BeginResourceProbe {
         job: JobId,
         revision: String,
         by: RetryBy,
+        guard: crate::hold_release::HoldReleaseGuard,
         reply: oneshot::Sender<bool>,
     },
     ReleaseResourceHold {
         job: JobId,
         revision: String,
         by: RetryBy,
+        guard: crate::hold_release::HoldReleaseGuard,
         reply: oneshot::Sender<bool>,
     },
     /// End a non-storage hold (`Owner::retry_hold`); the error says why not.
@@ -428,15 +584,22 @@ pub(crate) enum QueueCommand {
         job: JobId,
         revision: String,
         by: RetryBy,
+        guard: crate::hold_release::HoldReleaseGuard,
         custody_checked: bool,
         reply: oneshot::Sender<Result<(), String>>,
     },
     /// Move an automatic hold's next attempt out on its backoff, recording
     /// why the last one was refused.
+    AckAutomaticControl {
+        job: JobId,
+        identity: String,
+        reply: oneshot::Sender<bool>,
+    },
     RescheduleHold {
         job: JobId,
         revision: String,
         reason: String,
+        guard: crate::hold_release::HoldReleaseGuard,
         reply: oneshot::Sender<bool>,
     },
     HoldJob {
@@ -444,6 +607,7 @@ pub(crate) enum QueueCommand {
         cause: nzbd_types::HoldCause,
         stage: String,
         message: String,
+        not_before: Option<i64>,
         reply: oneshot::Sender<bool>,
     },
     SetJobStatus {
@@ -693,6 +857,12 @@ pub(crate) enum EngineMsg {
 
 pub(crate) struct Owner {
     state: QueueState,
+    admission_adoption: Option<HashSet<String>>,
+    admission_catalog_adopted: bool,
+    authoritative_admissions: HashMap<String, String>,
+    unaccepted_admissions: HashMap<String, UrlAdmissionReceipt>,
+    consumer_instance_id: String,
+    timing_cache: crate::lifecycle::TimingCache,
     attempts: HashMap<SegRef, SegmentAttempt>,
     blocked: HashMap<ServerId, Instant>,
     writers: HashMap<FileId, WriterHandle>,
@@ -724,6 +894,7 @@ pub(crate) struct Owner {
     /// Unlike the unrelated set of commit barriers, this protects overlapping
     /// Pause/Resume intents from releasing one another's operational fence.
     pending_control_revisions: HashMap<JobId, u64>,
+    cluster_writer_stops: crate::cluster_stop::WriterStops,
     allocated_jobs: HashSet<JobId>,
     finalize_sent: HashSet<FileId>,
     pending_finalize: Vec<(JobId, FileId)>,
@@ -755,6 +926,8 @@ pub(crate) struct Owner {
     /// a post-processing recovery job; only the listed files may receive
     /// leases, even if a user resumes another file while verification waits.
     post_fetch_files: HashMap<JobId, HashSet<FileId>>,
+    import_preparations: HashMap<JobId, u32>,
+    foreign_journal_holds: HashSet<JobId>,
     repair_progress: HashMap<JobId, (String, Option<crate::RepairProgress>)>,
     /// Per-job download-rate EMA, fed from downloaded-byte deltas at
     /// snapshot time (job id → meter).
@@ -805,6 +978,7 @@ pub(crate) struct Owner {
     payload_active: HashSet<PathBuf>,
     io_callbacks: HashMap<u64, IoContinuation>,
     pending_sources: nzbd_state::torrent_sources::PendingSourceStore,
+    pub(crate) url_resolutions: Arc<nzbd_state::artifacts::UrlResolutionStore>,
     /// How long the last snapshot write took — feeds [`save_spacing`], so a
     /// slow state volume stretches the save cadence instead of consuming
     /// the owner loop.
@@ -827,6 +1001,7 @@ pub(crate) struct Owner {
     /// Queue-authority persistence (snapshot save/compact). Worker-mode
     /// engines run with this off; journals stay on regardless.
     persist: bool,
+    persistence_fenced: bool,
     worker_mode: bool,
     persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     budget_tx: watch::Sender<crate::pool::BudgetEnvelope>,
@@ -1006,6 +1181,10 @@ impl Owner {
         let was_unclean = marker.check_and_arm()?;
         let snap_store = SnapshotStore::open(state_dir)?;
         let pending_sources = nzbd_state::torrent_sources::PendingSourceStore::open(state_dir)?;
+        let url_resolutions = Arc::new(
+            nzbd_state::artifacts::UrlResolutionStore::open(state_dir)
+                .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?,
+        );
         let journal = JobJournals::open(state_dir, journal_suffix)?;
 
         let mut state = QueueState::default();
@@ -1018,6 +1197,21 @@ impl Owner {
                 // daemon associates their paused backend handles. Cluster
                 // takeover retains its separate unsupported-protocol guard.
                 state = QueueState::from_doc(doc);
+            }
+            let mut retired = HashSet::new();
+            for job in &state.jobs {
+                if url_resolutions
+                    .is_retired(job)
+                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
+                {
+                    retired.insert(job.id);
+                }
+            }
+            state.jobs.retain(|job| !retired.contains(&job.id));
+            for receipt in &mut state.url_admission_receipts {
+                if retired.contains(&JobId(receipt.job_id)) && receipt.custody_state != "curator" {
+                    receipt.outcome = "deleted".into();
+                }
             }
 
             // Payload roots and lifecycle reconciliation are runtime work.
@@ -1138,10 +1332,20 @@ impl Owner {
                 }
             }
         }
+        state.next_file_id = state.next_file_id.max(
+            url_resolutions
+                .reserved_file_id()
+                .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?,
+        );
         let initial_disk_hold = tuning.min_free_disk_bytes > 0;
         let initial_quota_hold = tuning.daily_quota_bytes > 0 || tuning.monthly_quota_bytes > 0;
         let mut owner = Owner {
             state,
+            admission_adoption: None,
+            admission_catalog_adopted: false,
+            authoritative_admissions: HashMap::new(),
+            unaccepted_admissions: HashMap::new(),
+            consumer_instance_id: artifacts.installation.clone(),
             attempts: HashMap::new(),
             blocked: HashMap::new(),
             writers: HashMap::new(),
@@ -1170,6 +1374,7 @@ impl Owner {
             pending_journal_loads: HashMap::new(),
             pending_control_commits: HashSet::new(),
             pending_control_revisions: HashMap::new(),
+            cluster_writer_stops: Default::default(),
             allocated_jobs,
             finalize_sent: HashSet::new(),
             pending_finalize: Vec::new(),
@@ -1179,6 +1384,8 @@ impl Owner {
             delegated: HashMap::new(),
             mirror: HashMap::new(),
             post_fetch_files,
+            import_preparations: HashMap::new(),
+            foreign_journal_holds: HashSet::new(),
             repair_progress: HashMap::new(),
             job_rates: HashMap::new(),
             job_wire_ema: HashMap::new(),
@@ -1219,6 +1426,8 @@ impl Owner {
             payload_active: HashSet::new(),
             journal_suffix: journal_suffix.to_owned(),
             pending_sources,
+            url_resolutions,
+            persistence_fenced: false,
             persist,
             worker_mode: !persist,
             persist_guard,
@@ -1240,6 +1449,7 @@ impl Owner {
             engine_tx,
             tracker,
             cancel,
+            timing_cache: crate::lifecycle::TimingCache::default(),
             up_since_unix: unix_now(),
             dirty: false,
             last_save: Instant::now(),
@@ -1301,7 +1511,9 @@ impl Owner {
         if durable {
             tracing::info!("queue owner stopped after worker and acknowledgement drain");
         } else {
-            tracing::error!("queue owner stopped with final durability unresolved; unclean marker and recovery evidence retained");
+            tracing::error!(
+                "queue owner stopped with final durability unresolved; unclean marker and recovery evidence retained"
+            );
         }
     }
 
@@ -1542,11 +1754,13 @@ impl Owner {
                         QueueCommand::ImportJobIfPresent {
                             job,
                             require_snapshot,
+                            completion_proof,
                             reply,
-                        } => self.apply_post_record(
+                        } => self.apply_post_record_proven(
                             admission,
                             *job,
                             require_snapshot,
+                            completion_proof,
                             move |_, ok| {
                                 let _ = reply.send(ok);
                             },
@@ -1679,6 +1893,53 @@ impl Owner {
     }
 
     fn on_command(&mut self, cmd: QueueCommand) {
+        let pending_job = match &cmd {
+            QueueCommand::Pause { job, .. }
+            | QueueCommand::Resume { job, .. }
+            | QueueCommand::SetPriority { job, .. }
+            | QueueCommand::SetCategory { job, .. }
+            | QueueCommand::SetKeepOnFailure { job, .. }
+            | QueueCommand::HoldJob { job, .. }
+            | QueueCommand::RetryHold { job, .. }
+            | QueueCommand::RescheduleHold { job, .. }
+            | QueueCommand::BeginResourceProbe { job, .. }
+            | QueueCommand::ReleaseResourceHold { job, .. }
+            | QueueCommand::SetJobStatus { job, .. }
+            | QueueCommand::NoteSeedKeepBlock { job, .. }
+            | QueueCommand::RearmSeedKeepCleared { job, .. }
+            | QueueCommand::BeginManagedSeedRetirement { job, .. }
+            | QueueCommand::CompleteManagedSeedRetirement { job, .. }
+            | QueueCommand::ClaimNativeFailureCleanup { job, .. }
+            | QueueCommand::FailNativeTorrent { job, .. }
+            | QueueCommand::ConfirmManagedTorrentSource { job, .. }
+            | QueueCommand::CommitManagedTorrentAdmission { job, .. }
+            | QueueCommand::StartTorrentAcquisition { job, .. }
+            | QueueCommand::CompleteTorrentAcquisition { job, .. }
+            | QueueCommand::HoldTorrentAcquisition { job, .. } => Some(*job),
+            _ => None,
+        };
+        let admission_busy = match &cmd {
+            QueueCommand::ReserveManagedTorrentAdmission { opts, .. } => {
+                crate::torrent_acquisitions::managed_token(&opts.params)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|token| {
+                        self.state.url_admission_receipts.iter().any(|receipt| {
+                            receipt.request_token == token
+                                && self
+                                    .pending_control_commits
+                                    .contains(&JobId(receipt.job_id))
+                        })
+                    })
+            }
+            _ => false,
+        };
+        if admission_busy
+            || pending_job.is_some_and(|job| self.pending_control_commits.contains(&job))
+        {
+            self.deferred_replacements.push_back(cmd);
+            return;
+        }
         let replacement = match &cmd {
             QueueCommand::MaterializeGeneration { request, .. } => Some(request.job.id),
             QueueCommand::ImportJob { job, .. } | QueueCommand::ImportJobIfPresent { job, .. } => {
@@ -1784,7 +2045,354 @@ impl Owner {
                 return;
             }
         }
+        let Some(cmd) = self.on_native_lifecycle_command(cmd) else {
+            return;
+        };
         match cmd {
+            command @ (QueueCommand::NoteSeedKeepBlock { .. }
+            | QueueCommand::RearmSeedKeepCleared { .. }
+            | QueueCommand::SyncManagedSeedKeep { .. }
+            | QueueCommand::BeginManagedSeedRetirement { .. }
+            | QueueCommand::CompleteManagedSeedRetirement { .. }
+            | QueueCommand::ClaimNativeFailureCleanup { .. }
+            | QueueCommand::FailNativeTorrent { .. }
+            | QueueCommand::NativeTorrentPending { .. }
+            | QueueCommand::ReserveManagedTorrentAdmission { .. }
+            | QueueCommand::ConfirmManagedTorrentSource { .. }
+            | QueueCommand::CommitManagedTorrentAdmission { .. }
+            | QueueCommand::StartTorrentAcquisition { .. }
+            | QueueCommand::CompleteTorrentAcquisition { .. }
+            | QueueCommand::HoldTorrentAcquisition { .. }) => {
+                let _ = self.on_native_lifecycle_command(command);
+            }
+            QueueCommand::ReserveUrlFiles {
+                job,
+                source_identity,
+                count,
+                reply,
+            } => {
+                let result = if self.persistence_fenced
+                    || !self.persist
+                    || self
+                        .state
+                        .job(job)
+                        .filter(|row| row.status == JobStatus::Fetching)
+                        .and_then(|row| nzbd_state::artifacts::url_source_identity(row).ok())
+                        .as_deref()
+                        != Some(&source_identity)
+                {
+                    Err(crate::EngineError::OwnershipLost)
+                } else if let Some(maximum) = self.state.next_file_id.checked_add(count) {
+                    let first = self.state.next_file_id.saturating_add(1);
+                    self.state.next_file_id = maximum;
+                    self.dirty = true;
+                    Ok(first)
+                } else {
+                    Err(crate::EngineError::Lifecycle(
+                        "NZB file IDs exhausted".into(),
+                    ))
+                };
+                let _ = reply.send(result);
+            }
+            QueueCommand::ImportFence { job, reply } => {
+                if self.persistence_fenced {
+                    let _ = reply.send(Err(crate::EngineError::OwnershipLost));
+                } else {
+                    self.foreign_journal_holds.insert(job);
+                    *self.import_preparations.entry(job).or_default() += 1;
+                    let _ = reply.send(Ok(crate::imports::intent(self.state.job(job))));
+                }
+            }
+            QueueCommand::EndImportPreparation { job, reply } => {
+                self.finish_import_preparation(job, false);
+                let _ = reply.send(());
+            }
+            QueueCommand::UnacceptedUrlAdmissions { limit, reply } => {
+                let result = if !(1..=100).contains(&limit)
+                    || self.unaccepted_admissions.len() > limit
+                {
+                    Err("unaccepted admission index exceeds supported page bound; reconcile before accepting more requests".into())
+                } else {
+                    let mut rows = self
+                        .unaccepted_admissions
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    rows.sort_unstable_by(|left, right| {
+                        left.request_token.cmp(&right.request_token)
+                    });
+                    if crate::admissions::valid_page(&rows) {
+                        Ok(rows)
+                    } else {
+                        Err("unaccepted admission index exceeds supported 1MiB bound".into())
+                    }
+                };
+                let _ = reply.send(result);
+            }
+            QueueCommand::UrlAdmissionsPage {
+                after,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(crate::admissions::page(
+                    &self.state.url_admission_receipts,
+                    &after,
+                    limit,
+                ));
+            }
+            QueueCommand::BeginUrlAdmissionAdoption { reply } => {
+                let ok = !self.persistence_fenced;
+                if ok {
+                    self.admission_adoption = Some(HashSet::new());
+                }
+                let _ = reply.send(ok);
+            }
+            QueueCommand::AdoptUrlAdmissions { rows, reply } => {
+                let before = (
+                    self.state.url_admission_receipts.clone(),
+                    self.state.next_job_id,
+                    self.authoritative_admissions.clone(),
+                    self.unaccepted_admissions.clone(),
+                    self.admission_adoption.clone(),
+                    self.admission_catalog_adopted,
+                );
+                let ok = self.adopt_url_admissions(rows);
+                if !ok {
+                    let _ = reply.send(false);
+                    return;
+                }
+                self.persist_then(move |owner, ok| {
+                    if !ok {
+                        owner.state.url_admission_receipts = before.0;
+                        owner.state.next_job_id = owner.state.next_job_id.max(before.1);
+                        owner.authoritative_admissions = before.2;
+                        owner.unaccepted_admissions = before.3;
+                        owner.admission_adoption = before.4;
+                        owner.admission_catalog_adopted = before.5;
+                    }
+                    let _ = reply.send(ok);
+                });
+            }
+            QueueCommand::FinishUrlAdmissionAdoption { reply } => {
+                let before = (
+                    self.state.url_admission_receipts.clone(),
+                    self.state.next_job_id,
+                    self.authoritative_admissions.clone(),
+                    self.unaccepted_admissions.clone(),
+                    self.admission_adoption.clone(),
+                    self.admission_catalog_adopted,
+                );
+                let ok = self.finish_url_admission_adoption();
+                if !ok {
+                    let _ = reply.send(false);
+                    return;
+                }
+                self.persist_then(move |owner, ok| {
+                    if !ok {
+                        owner.state.url_admission_receipts = before.0;
+                        owner.state.next_job_id = owner.state.next_job_id.max(before.1);
+                        owner.authoritative_admissions = before.2;
+                        owner.unaccepted_admissions = before.3;
+                        owner.admission_adoption = before.4;
+                        owner.admission_catalog_adopted = before.5;
+                    }
+                    let _ = reply.send(ok);
+                });
+            }
+            QueueCommand::CheckDiscardUrlAdmission { expected, reply } => {
+                let _ = reply.send(self.can_discard_url_admission(&expected));
+            }
+            QueueCommand::DiscardUrlAdmission { expected, reply } => {
+                if !self.can_discard_url_admission(&expected) {
+                    let _ = reply.send(false);
+                    return;
+                }
+                let before = self
+                    .state
+                    .url_admission_receipts
+                    .iter()
+                    .filter(|row| row.request_token == expected.request_token)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let pending = self
+                    .state
+                    .pending_admissions
+                    .iter()
+                    .filter(|row| row.job_id.0 == expected.job_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.state
+                    .url_admission_receipts
+                    .retain(|row| row.request_token != expected.request_token);
+                self.state
+                    .pending_admissions
+                    .retain(|row| row.job_id.0 != expected.job_id);
+                self.persist_then(move |owner, ok| {
+                    if !ok {
+                        owner.state.url_admission_receipts.extend(before);
+                        owner.state.pending_admissions.extend(pending);
+                        let _ = reply.send(false);
+                        return;
+                    }
+                    owner.unaccepted_admissions.remove(&expected.request_token);
+                    if !pending.is_empty() {
+                        let sources = owner.pending_sources.clone();
+                        owner.io_then(
+                            move || sources.remove(JobId(expected.job_id)),
+                            move |_, result| {
+                                let _ = reply.send(result.is_ok());
+                            },
+                        );
+                    } else {
+                        let _ = reply.send(true);
+                    }
+                });
+            }
+            QueueCommand::AdoptReplicatedHighwater {
+                next_job_id,
+                next_file_id,
+                reply,
+            } => {
+                if self.persistence_fenced {
+                    let _ = reply.send(false);
+                    return;
+                }
+                self.state.next_job_id = self.state.next_job_id.max(next_job_id);
+                self.state.next_file_id = self.state.next_file_id.max(next_file_id);
+                self.persist_then(move |_, ok| {
+                    let _ = reply.send(ok);
+                });
+            }
+            QueueCommand::SetConsumerInstanceId { instance, reply } => {
+                let ok = !self.persistence_fenced
+                    && !instance.is_empty()
+                    && instance.len() <= 128
+                    && !instance.chars().any(char::is_control);
+                if ok {
+                    self.consumer_instance_id = instance;
+                }
+                let _ = reply.send(ok);
+            }
+            QueueCommand::AckAutomaticControl {
+                job,
+                identity,
+                reply,
+            } => {
+                let before = self.state.job(job).cloned();
+                let marker = before
+                    .as_ref()
+                    .and_then(crate::automatic_control::transition);
+                let source = self.artifacts.for_job(job.0);
+                let exact_source = marker.as_ref().is_some_and(|marker| {
+                    source.as_ref().is_ok_and(|source| {
+                        marker.storage_instance_id == self.artifacts.installation
+                            && source.as_ref().map(|source| {
+                                nzbd_state::artifacts::SourceGeneration {
+                                    artifact: source.id.clone(),
+                                    generation: source.generation.clone(),
+                                }
+                            }) == marker.source
+                            && source.as_ref().map(|source| source.path.clone())
+                                == marker.source_path
+                    })
+                });
+                let eligible = self.automatic_control_scope(job)
+                    && !self.persistence_fenced
+                    && exact_source
+                    && marker
+                        .as_ref()
+                        .is_some_and(|marker| marker.identity == identity);
+                if eligible {
+                    self.state.job_mut(job).unwrap().params.retain(|(key, _)| {
+                        key != crate::automatic_control::AUTOMATIC_CONTROL_PARAM
+                    });
+                }
+
+                if !eligible {
+                    let _ = reply.send(false);
+                    return;
+                }
+                self.pending_control_commits.insert(job);
+                self.persist_then(move |owner, ok| {
+                    owner.pending_control_commits.remove(&job);
+                    if !ok {
+                        if let Some(before) = before {
+                            if let Some(current) = owner.state.job_mut(job) {
+                                *current = before;
+                            }
+                        }
+                    } else {
+                        owner.publish_now();
+                        owner.bump_epoch();
+                    }
+                    let _ = reply.send(ok);
+                });
+            }
+            QueueCommand::SchedulePostRetry {
+                job,
+                revision,
+                retry_attempt,
+                next_retry,
+                blocked_since,
+                message,
+                reply,
+            } => {
+                let before = self.state.job(job).cloned();
+                let mut changed = false;
+                if !self.persistence_fenced {
+                    if let Some(row) = self.state.job_mut(job) {
+                        if row.lifecycle_eligible() {
+                            if let Some(mut control) = row.control().filter(|control| {
+                                control.revision == revision
+                                    && control.lifecycle == "held"
+                                    && !control.manual_pause
+                                    && control.hold_cause().policy().automatic()
+                                    && retry_attempt == control.retry_attempt.saturating_add(1)
+                                    && next_retry >= control.next_retry_at_unix.unwrap_or(0)
+                            }) {
+                                if let Some(next_revision) = control
+                                    .revision
+                                    .parse::<u64>()
+                                    .ok()
+                                    .and_then(|value| value.checked_add(1))
+                                {
+                                    control.revision = next_revision.to_string();
+                                    control.retry_attempt = retry_attempt;
+                                    control.next_retry_at_unix = Some(next_retry);
+                                    control.blocked_since_unix = Some(
+                                        control
+                                            .blocked_since_unix
+                                            .unwrap_or(blocked_since)
+                                            .min(blocked_since),
+                                    );
+                                    control.retry_policy = "scheduled_retry".into();
+                                    control.message = message.chars().take(2048).collect();
+                                    row.set_control(&control);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !changed {
+                    let _ = reply.send(false);
+                    return;
+                }
+                self.pending_control_commits.insert(job);
+                self.commit_control_change_then(job, before.clone(), move |owner, ok| {
+                    owner.pending_control_commits.remove(&job);
+                    if ok {
+                        owner.publish_now();
+                        owner.bump_epoch();
+                    } else if let Some(before) = before {
+                        if let Some(current) = owner.state.job_mut(job) {
+                            *current = before;
+                        }
+                    }
+                    let _ = reply.send(ok);
+                });
+            }
             QueueCommand::MaterializeGeneration { request, reply } => {
                 self.materialize_generation_then(*request, move |_, result| {
                     let _ = reply.send(result);
@@ -2037,7 +2645,7 @@ impl Owner {
                     self.dirty = true;
                     self.persist_then(move |owner, committed| {
                         if owner.job_epochs.get(&job) != Some(&generation) {
-                            let _ = reply.send(None);
+                            let _ = reply.send(Ok(None));
                             return;
                         }
                         if !committed {
@@ -2055,7 +2663,7 @@ impl Owner {
                             }
                             owner.job_epochs.remove(&job);
                             owner.dirty = true;
-                            let _ = reply.send(None);
+                            let _ = reply.send(Ok(None));
                             return;
                         }
                         owner.bump_epoch();
@@ -2065,11 +2673,11 @@ impl Owner {
                                 tracing::warn!(job=job.0,%error,"could not remove committed torrent source");
                             }
                             owner.publish_now();
-                            let _ = reply.send(Some(result));
+                            let _ = reply.send(Ok(Some(result)));
                         });
                     });
                 } else {
-                    let _ = reply.send(None);
+                    let _ = reply.send(Ok(None));
                 }
             }
             QueueCommand::CancelTorrentAdmission { job, reply } => {
@@ -2317,9 +2925,9 @@ impl Owner {
                             generation: url_admission_generation(
                                 id,
                                 token,
-                                &self.artifacts.installation,
+                                &self.consumer_instance_id,
                             ),
-                            runner_instance_id: self.artifacts.installation.clone(),
+                            runner_instance_id: self.consumer_instance_id.clone(),
                             terminal_outcome: None,
                             outcome: job_status_name(existing_job.status).into(),
                             failure_stage: None,
@@ -2331,7 +2939,8 @@ impl Owner {
                             source_artifact_id: None,
                             source_generation: None,
                         };
-                        self.state.url_admission_receipts.push(receipt);
+                        self.state.url_admission_receipts.push(receipt.clone());
+                        self.unaccepted_admissions.insert(token.clone(), receipt);
                         let token = token.clone();
                         let generation = fresh_epoch();
                         self.job_epochs.insert(id, generation);
@@ -2345,6 +2954,7 @@ impl Owner {
                                         .state
                                         .url_admission_receipts
                                         .retain(|receipt| receipt.request_token != token);
+                                    owner.unaccepted_admissions.remove(&token);
                                 }
                                 let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
                             }
@@ -2425,17 +3035,13 @@ impl Owner {
                 if let (Some(token), Some(fingerprint)) =
                     (request_token.as_ref(), submission_sha256.as_ref())
                 {
-                    self.state.url_admission_receipts.push(UrlAdmissionReceipt {
+                    let receipt = UrlAdmissionReceipt {
                         protocol_version: 1,
                         request_token: token.clone(),
                         submission_sha256: fingerprint.clone(),
                         job_id: id.0,
-                        generation: url_admission_generation(
-                            id,
-                            token,
-                            &self.artifacts.installation,
-                        ),
-                        runner_instance_id: self.artifacts.installation.clone(),
+                        generation: url_admission_generation(id, token, &self.consumer_instance_id),
+                        runner_instance_id: self.consumer_instance_id.clone(),
                         terminal_outcome: None,
                         outcome: "fetching".into(),
                         failure_stage: None,
@@ -2446,7 +3052,9 @@ impl Owner {
                         publication_path: None,
                         source_artifact_id: None,
                         source_generation: None,
-                    });
+                    };
+                    self.state.url_admission_receipts.push(receipt.clone());
+                    self.unaccepted_admissions.insert(token.clone(), receipt);
                 }
                 let generation = fresh_epoch();
                 self.job_epochs.insert(id, generation);
@@ -2466,6 +3074,9 @@ impl Owner {
                                 .state
                                 .url_admission_receipts
                                 .retain(|receipt| receipt.job_id != id.0);
+                            owner
+                                .unaccepted_admissions
+                                .retain(|_, receipt| receipt.job_id != id.0);
                         }
                         let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
                     }
@@ -2535,119 +3146,30 @@ impl Owner {
                     },
                 );
             }
-            QueueCommand::CompleteUrlFetch { job, parsed, reply } => {
-                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
-                let ok = self
-                    .state
-                    .complete_url_fetch(job, &parsed, self.tuning.pause_extra_pars);
-                if !ok {
-                    let _ = reply.send(false);
-                    return;
-                }
-                if let Some(record) = self.state.job_mut(job) {
-                    if let Some(pos) = record
-                        .params
-                        .iter()
-                        .position(|(key, _)| key == "*AddPaused")
-                    {
-                        record.params.remove(pos);
-                        record.status = JobStatus::Paused;
-                    }
-                }
-                // `complete_url_fetch` has just re-run the evidence pass
-                // against the fetched NZB. Allocation is asynchronous and
-                // must finish before this completion is acknowledged.
-                self.name_from_requestor(job, true);
-                let generation = fresh_epoch();
-                self.control_epochs.insert(job, generation);
-                let persistent = self.persist;
-                self.allocate_new_payload_then(job, move |owner, allocated| {
-                    if let Err(error) = allocated {
-                        let message = format!("payload allocation: {error}");
-                        owner.hold_job(
-                            job,
-                            allocation_hold_cause(&message),
-                            "download_write",
-                            &message,
-                        );
-                    }
-                    if owner.control_epochs.get(&job) != Some(&generation)
-                        || owner.job_epochs.get(&job) != Some(&scope_generation)
-                    {
-                        let _ = reply.send(false);
-                        return;
-                    }
-                    owner.persist_then(move |owner, committed| {
-                        let current = owner.control_epochs.get(&job) == Some(&generation)
-                            && owner.job_epochs.get(&job) == Some(&scope_generation);
-                        if (!persistent || committed) && current {
-                            tracing::info!(job = job.0, "url fetch complete");
-                            owner.publish_now();
-                            owner.emit(Event::UrlFetchResolved { job });
-                            owner.bump_epoch();
-                            let _ = reply.send(true);
-                        } else {
-                            if current {
-                                owner.hold_job(
-                                    job,
-                                    nzbd_types::HoldCause::StorageUnavailable,
-                                    "snapshot",
-                                    "URL fetch completion could not be persisted",
-                                );
-                            }
-                            let _ = reply.send(false);
-                        }
-                    });
-                });
+            QueueCommand::CompleteUrlFetch {
+                job,
+                source_identity,
+                prepared,
+                reply,
+            } => {
+                self.apply_url_resolution_then(
+                    job,
+                    source_identity,
+                    *prepared,
+                    move |_, result| {
+                        let _ = reply.send(result);
+                    },
+                );
             }
-            QueueCommand::FailUrlFetch { job, error, reply } => {
-                let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
-                let before_status = self.state.job(job).map(|record| record.status);
-                let name = match self.state.job_mut(job) {
-                    Some(j) if matches!(j.status, JobStatus::Fetching) => {
-                        j.status = JobStatus::Failed;
-                        Some(j.name.clone())
-                    }
-                    _ => None,
-                };
-                if let Some(name) = name {
-                    tracing::warn!(job = job.0, %error, "url fetch failed");
-                    let generation = fresh_epoch();
-                    self.control_epochs.insert(job, generation);
-                    let persistent = self.persist;
-                    self.persist_then(move |owner, committed| {
-                        let current = owner.control_epochs.get(&job) == Some(&generation)
-                            && owner.job_epochs.get(&job) == Some(&scope_generation);
-                        if (!persistent || committed) && current {
-                            owner.publish_now();
-                            owner.emit(Event::JobFinished {
-                                job,
-                                name,
-                                status: JobStatus::Failed,
-                                health: 0,
-                            });
-                            owner.emit(Event::UrlFetchResolved { job });
-                            owner.bump_epoch();
-                        } else if current {
-                            if let (Some(status), Some(record)) =
-                                (before_status, owner.state.job_mut(job))
-                            {
-                                record.status = status;
-                            }
-                            owner.dirty = true;
-                        }
-                        let _ = reply.send(());
-                    });
-                    return;
-                }
-                let _ = reply.send(());
-            }
+
             QueueCommand::UpdateUrlFetchProgress {
                 job,
                 progress,
                 reply,
             } => {
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+                let before = self.state.job(job).cloned();
+                let timing_before = self.timing_cache.checkpoint(job);
                 let changed = if let Some(record) = self
                     .state
                     .job_mut(job)
@@ -2678,7 +3200,7 @@ impl Owner {
                     false
                 };
                 if !changed {
-                    let _ = reply.send(false);
+                    let _ = reply.send(Ok(false));
                     return;
                 }
                 let generation = fresh_epoch();
@@ -2691,15 +3213,22 @@ impl Owner {
                     if durable {
                         owner.publish_now();
                     } else if current {
+                        // The URL fetcher owns its storage retry schedule.
+                        // A failed progress write must not replace Fetching
+                        // with a hold that prevents its next durable retry.
+                        if let Some(before) = before {
+                            if let Some(record) = owner.state.job_mut(job) {
+                                *record = before;
+                            }
+                        }
+                        owner.timing_cache.restore(job, timing_before);
                         owner.dirty = true;
-                        owner.hold_job(
-                            job,
-                            nzbd_types::HoldCause::StorageUnavailable,
-                            "snapshot",
-                            "URL fetch progress could not be persisted",
-                        );
                     }
-                    let _ = reply.send(durable);
+                    let _ = reply.send(if durable {
+                        Ok(true)
+                    } else {
+                        Err(crate::EngineError::AdmissionNotDurable)
+                    });
                 });
             }
             QueueCommand::SetFilePaused {
@@ -2809,6 +3338,10 @@ impl Owner {
                     });
                     return;
                 }
+                let prior_url_paused = self
+                    .state
+                    .job(job)
+                    .is_some_and(|record| record.params.iter().any(|(key, _)| key == "*AddPaused"));
                 let prior = self.state.job(job).map(|record| {
                     (
                         record.status,
@@ -2838,6 +3371,9 @@ impl Owner {
                     self.state.job_mut(job).is_some_and(|record| {
                         if matches!(record.status, JobStatus::Queued | JobStatus::Downloading) {
                             record.status = JobStatus::Paused;
+                            true
+                        } else if record.status == JobStatus::Fetching {
+                            set_owner_param(&mut record.params, "*AddPaused", Some("yes".into()));
                             true
                         } else {
                             false
@@ -2888,6 +3424,13 @@ impl Owner {
                                     if record.status == JobStatus::Paused {
                                         record.status = status;
                                     }
+                                    if record.status == JobStatus::Fetching {
+                                        set_owner_param(
+                                            &mut record.params,
+                                            "*AddPaused",
+                                            prior_url_paused.then(|| "yes".into()),
+                                        );
+                                    }
                                     if let (Some(torrent), Some((intent, reason))) =
                                         (record.torrent.as_mut(), prior_torrent)
                                     {
@@ -2910,6 +3453,53 @@ impl Owner {
             }
             QueueCommand::Resume { job, reply } => {
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+                if self
+                    .state
+                    .job(job)
+                    .is_some_and(|record| record.status == JobStatus::Fetching && !record.held())
+                {
+                    let changed = self.state.job_mut(job).is_some_and(|record| {
+                        let old = record.params.len();
+                        record.params.retain(|(key, _)| key != "*AddPaused");
+                        record.params.len() != old
+                    });
+                    if !changed {
+                        let _ = reply.send(false);
+                        return;
+                    }
+                    let generation = fresh_epoch();
+                    self.control_epochs.insert(job, generation);
+                    self.pending_control_revisions.insert(job, generation);
+                    self.dirty = true;
+                    let persistent = self.persist;
+                    self.persist_then(move |owner, committed| {
+                        let current = owner.control_epochs.get(&job) == Some(&generation)
+                            && owner.job_epochs.get(&job) == Some(&scope_generation);
+                        let ok = (!persistent || committed) && current;
+                        if owner.pending_control_revisions.get(&job) == Some(&generation) {
+                            owner.pending_control_revisions.remove(&job);
+                        }
+                        if current {
+                            if !ok {
+                                if let Some(record) = owner
+                                    .state
+                                    .job_mut(job)
+                                    .filter(|record| record.status == JobStatus::Fetching)
+                                {
+                                    set_owner_param(
+                                        &mut record.params,
+                                        "*AddPaused",
+                                        Some("yes".into()),
+                                    );
+                                }
+                            }
+                            owner.publish_now();
+                            owner.bump_epoch();
+                        }
+                        let _ = reply.send(ok);
+                    });
+                    return;
+                }
                 // Resource/custody release has its own admission protocol. Manual
                 // resume cannot erase a hold merely because statvfs looks healthy.
                 if self.state.job(job).is_some_and(|j| j.held()) {
@@ -2992,16 +3582,111 @@ impl Owner {
                         owner.pending_control_revisions.remove(&job);
                         if lifecycle_current {
                             owner.dirty = true;
-                            owner.hold_job(
+                            if !owner.hold_job(
                                 job,
                                 nzbd_types::HoldCause::StorageUnavailable,
                                 "snapshot",
                                 "Resume intent could not be persisted",
-                            );
+                            ) && owner.persistence_fenced {
+                                // The failed save has revoked persistence authority.
+                                // Expose the stopped state without claiming another
+                                // durable transition or clearing that fence.
+                                if let Some(record) = owner.state.job_mut(job) {
+                                    let prior = record.control();
+                                    let revision = prior.as_ref().and_then(|control| control.revision.parse::<u64>().ok()).unwrap_or(0).saturating_add(1);
+                                    record.set_control(&nzbd_types::JobControl {
+                                        version: 1,
+                                        revision: revision.to_string(),
+                                        lifecycle: "held".into(),
+                                        cause: "storage_unavailable".into(),
+                                        stage: "snapshot".into(),
+                                        retry_policy: "review".into(),
+                                        message: "Resume intent could not be persisted; queue ownership is fenced until recovery".into(),
+                                        instance: prior.as_ref().map(|control| control.instance.clone()).unwrap_or_else(|| format!("snapshot-{}", job.0)),
+                                        previous_status: Some(JobStatus::Paused),
+                                        manual_pause: true,
+                                        retry_attempt: prior.as_ref().map_or(0, |control| control.retry_attempt),
+                                        next_retry_at_unix: None,
+                                        blocked_since_unix: Some(unix_now()),
+                                        released_at_unix: None,
+                                    });
+                                    record.status = JobStatus::Paused;
+                                }
+                                owner.publish_now();
+                            }
                         }
                     }
                     let _ = reply.send(ok);
                 });
+            }
+            QueueCommand::PrepareClusterWritersStop {
+                ticket,
+                execution_joined,
+                reply,
+            } => {
+                let job = JobId(ticket.request.job);
+                let result = (|| -> Result<crate::cluster_stop::StopPreparation, String> {
+                    let current = self.state.job(job).cloned().filter(|record| {
+                        nzbd_state::artifacts::WorkerControlContext::for_job(record).is_some_and(
+                            |context| {
+                                nzbd_state::artifacts::same_worker_operation(
+                                    &context,
+                                    &ticket.request.context,
+                                )
+                            },
+                        )
+                    });
+                    if let Some(record) = current {
+                        if record.torrent.is_some() {
+                            return Err(
+                                "torrent backend must provide its own actual stop acknowledgment"
+                                    .into(),
+                            );
+                        }
+                        if ticket.never_started {
+                            return Err("live queue state contradicts absent start receipt; retain for review".into());
+                        }
+                        let source = self.artifacts.for_job(job.0).map_err(|e| e.to_string())?;
+                        self.cluster_writer_stops
+                            .observe(&record, source.as_ref(), None);
+                        for file in &record.files {
+                            if let Some(writer) = self.writers.remove(&file.id) {
+                                writer.stop.cancel();
+                                self.cluster_writer_stops.observe(
+                                    &record,
+                                    source.as_ref(),
+                                    Some(&writer),
+                                );
+                            }
+                            self.finalize_sent.remove(&file.id);
+                        }
+                        self.allocated_jobs.remove(&job);
+                        self.attempts.retain(|reference, _| reference.job != job);
+                        self.pending_finalize.retain(|(id, _)| *id != job);
+                        if let Some(record) = self.state.job_mut(job) {
+                            if !matches!(
+                                record.status,
+                                JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
+                            ) {
+                                record.status = JobStatus::Paused;
+                            }
+                        }
+                        self.bump_epoch();
+                        self.publish_now();
+                    } else if ticket.never_started
+                        && self.cluster_writer_stops.known(&ticket.request.context)
+                    {
+                        return Err(
+                            "tracked writer contradicts absent start receipt; retain for review"
+                                .into(),
+                        );
+                    }
+                    self.cluster_writer_stops.prepare(&ticket, execution_joined)
+                })();
+                let _ = reply.send(result);
+            }
+            QueueCommand::ForgetClusterWriterStops { context, reply } => {
+                let _ = reply.send(self.cluster_writer_stops.forget_joined(&context));
             }
             QueueCommand::QuiescePayload { job, reply } => {
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
@@ -3086,6 +3771,17 @@ impl Owner {
                 delete_files,
                 reply,
             } => {
+                if self.state.job(job).is_some_and(|row| row.torrent.is_some())
+                    && self
+                        .state
+                        .jobs
+                        .iter()
+                        .any(|row| crate::torrent_acquisitions::source_dependency(row) == Some(job))
+                {
+                    let _ = reply.send(false);
+                    return;
+                }
+
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 let previous_removal_intent = self
                     .state
@@ -3210,6 +3906,27 @@ impl Owner {
             QueueCommand::SetKeepOnFailure { job, keep, reply } => {
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 let before = self.state.job(job).cloned();
+                if before.is_none() {
+                    // Queue retirement does not retire separately owned source
+                    // custody. Its inventory journal remains the exact authority
+                    // for this preference; no queue row needs reconstruction.
+                    if self.persistence_fenced {
+                        let _ = reply.send(false);
+                        return;
+                    }
+                    let artifacts = self.artifacts.clone();
+                    self.io_then(
+                        move || artifacts.set_keep_on_failure(job.0, keep)
+                            .map_err(|error| nzbd_state::StateError::Corrupt(format!("artifact inventory: {error}"))),
+                        move |_, result| {
+                            if let Err(error) = &result {
+                                tracing::warn!(job = job.0, %error, "could not update retired source Keep intent");
+                            }
+                            let _ = reply.send(result.unwrap_or(false));
+                        },
+                    );
+                    return;
+                }
                 let prior_keep = before.as_ref().is_some_and(|record| {
                     record
                         .params
@@ -3529,32 +4246,63 @@ impl Owner {
             }
             QueueCommand::ImportJob {
                 job,
-                fold_journals,
+                preparation,
+                authority,
                 emit_finished,
                 reply,
             } => {
+                let id = job.id;
+                let prepared = preparation.is_some();
+                if !authority.valid()
+                    || preparation
+                        .as_ref()
+                        .is_some_and(|proof| !proof.valid(id, self.state.job(id), &self.artifacts))
+                {
+                    if prepared {
+                        self.finish_import_preparation(id, false);
+                    }
+                    let _ = reply.send(Err(crate::EngineError::StaleImport));
+                    return;
+                }
+                let mut job = *job;
+                if let Some(proof) = preparation.as_ref() {
+                    proof.merge_current_progress(&mut job, self.state.job(id));
+                }
                 self.replace_job_then(
-                    *job,
-                    fold_journals,
+                    job,
+                    false,
                     emit_finished,
                     false,
                     false,
-                    move |_, result| {
-                        let _ = reply.send(result);
+                    move |owner, result| {
+                        if result.is_ok() {
+                            if let Some(proof) = preparation.as_ref() {
+                                owner.file_sizes.extend(
+                                    proof.file_sizes.iter().map(|(key, value)| (*key, *value)),
+                                );
+                            }
+                        }
+                        if prepared {
+                            owner.finish_import_preparation(id, result.is_ok());
+                        }
+                        drop(preparation);
+                        let _ = reply.send(result.map_err(crate::EngineError::State));
                     },
                 );
             }
             QueueCommand::ImportJobIfPresent {
                 job,
                 require_snapshot,
+                completion_proof,
                 reply,
             } => {
-                self.replace_job_then(
+                self.replace_job_proven_then(
                     *job,
                     false,
                     false,
                     true,
                     require_snapshot,
+                    completion_proof,
                     move |_, result| {
                         let _ = reply.send(result.is_ok());
                     },
@@ -3584,8 +4332,24 @@ impl Owner {
                 };
                 let _ = reply.send(result);
             }
-            QueueCommand::RemoveJobSilent { job, reply } => {
-                let _ = reply.send(self.remove_job_silent(job));
+            QueueCommand::RemoveJobSilent {
+                job,
+                accepted_context,
+                reply,
+            } => {
+                let accepted = accepted_context.as_ref().is_some_and(|expected| {
+                    self.state.job(job).is_some_and(|record| {
+                        nzbd_state::artifacts::WorkerControlContext::for_job(record).as_ref()
+                            == Some(expected)
+                    })
+                });
+                if accepted_context.is_some() && !accepted {
+                    // A delayed completion must not retire another grant's journal.
+                    let _ = reply.send(false);
+                } else {
+                    let _ = reply
+                        .send(self.remove_job_silent_with_journal(job, self.persist || accepted));
+                }
             }
             QueueCommand::SetDelegated { job, node, reply } => {
                 let replacement_pending =
@@ -3777,6 +4541,7 @@ impl Owner {
                 revision,
                 by,
                 custody_checked,
+                guard,
                 reply,
             } => {
                 let publication_repair = self.state.job(job).is_some_and(|record| {
@@ -3790,24 +4555,84 @@ impl Owner {
                         let _ = reply.send(result);
                     });
                 } else {
-                    let _ = reply.send(self.retry_hold(job, &revision, by, custody_checked));
+                    let before = self.state.job(job).cloned();
+                    if let Err(error) =
+                        self.retry_hold_proven(job, &revision, by, custody_checked, &guard)
+                    {
+                        let _ = reply.send(Err(error));
+                        return;
+                    }
+                    self.pending_control_commits.insert(job);
+                    self.commit_control_change_then(job, before.clone(), move |owner, ok| {
+                        owner.pending_control_commits.remove(&job);
+                        if !ok {
+                            if let Some(before) = before {
+                                if let Some(row) = owner.state.job_mut(job) {
+                                    *row = before;
+                                }
+                            }
+                        } else {
+                            owner.publish_now();
+                            owner.bump_epoch();
+                        }
+                        let _ = reply.send(if ok {
+                            Ok(())
+                        } else {
+                            Err("retry intent is not durable".into())
+                        });
+                    });
                 }
             }
             QueueCommand::RescheduleHold {
                 job,
                 revision,
                 reason,
+                guard,
                 reply,
             } => {
-                let _ = reply.send(self.reschedule_hold(job, &revision, &reason));
+                let before = self.state.job(job).cloned();
+                if !self.reschedule_hold_proven(job, &revision, &reason, &guard) {
+                    let _ = reply.send(false);
+                    return;
+                }
+                self.pending_control_commits.insert(job);
+                self.commit_control_change_then(job, before.clone(), move |owner, ok| {
+                    owner.pending_control_commits.remove(&job);
+                    if !ok {
+                        if let Some(before) = before {
+                            if let Some(row) = owner.state.job_mut(job) {
+                                *row = before;
+                            }
+                        }
+                    } else {
+                        owner.publish_now();
+                        owner.bump_epoch();
+                    }
+                    let _ = reply.send(ok);
+                });
             }
             QueueCommand::BeginResourceProbe {
                 job,
                 revision,
                 by,
+                guard,
                 reply,
             } => {
+                if self.persistence_fenced
+                    || (by == RetryBy::Recovery && self.automatic_control_pending(job))
+                    || (by == RetryBy::Recovery
+                        && !guard.worker_checked()
+                        && self.delegated.contains_key(&job))
+                    || !self.state.job(job).is_some_and(|current| {
+                        guard.matches(&self.artifacts, current, self.persist)
+                    })
+                {
+                    let _ = reply.send(false);
+                    return;
+                }
+
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+                let before = self.state.job(job).cloned();
                 let quiescent = self.state.job(job).is_some_and(|j| {
                     j.files
                         .iter()
@@ -3859,11 +4684,12 @@ impl Owner {
                 }
                 let generation = fresh_epoch();
                 self.control_epochs.insert(job, generation);
-                let persistent = self.persist;
-                self.persist_then(move |owner, committed| {
+                self.pending_control_commits.insert(job);
+                self.commit_control_change_then(job, before, move |owner, committed| {
+                    owner.pending_control_commits.remove(&job);
                     let current = owner.control_epochs.get(&job) == Some(&generation)
                         && owner.job_epochs.get(&job) == Some(&scope_generation);
-                    let ok = (!persistent || committed) && current;
+                    let ok = committed && current;
                     if ok {
                         owner.bump_epoch();
                         owner.publish_now();
@@ -3883,9 +4709,24 @@ impl Owner {
                 job,
                 revision,
                 by,
+                guard,
                 reply,
             } => {
+                if self.persistence_fenced
+                    || (by == RetryBy::Recovery && self.automatic_control_pending(job))
+                    || (by == RetryBy::Recovery
+                        && !guard.worker_checked()
+                        && self.delegated.contains_key(&job))
+                    || !self.state.job(job).is_some_and(|current| {
+                        guard.matches(&self.artifacts, current, self.persist)
+                    })
+                {
+                    let _ = reply.send(false);
+                    return;
+                }
+
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+                let before = self.state.job(job).cloned();
                 let mut changed = None;
                 if let Some(j) = self.state.job_mut(job) {
                     if let Some(mut control) = j.control().filter(|c| {
@@ -3948,11 +4789,18 @@ impl Owner {
                 let control = changed.unwrap();
                 let generation = fresh_epoch();
                 self.control_epochs.insert(job, generation);
-                let persistent = self.persist;
-                self.persist_then(move |owner, committed| {
+                if by == RetryBy::Recovery
+                    && !self.prepare_automatic_control_change(job, before.as_ref())
+                {
+                    let _ = reply.send(false);
+                    return;
+                }
+                self.pending_control_commits.insert(job);
+                self.commit_control_change_then(job, before, move |owner, committed| {
+                    owner.pending_control_commits.remove(&job);
                     let current = owner.control_epochs.get(&job) == Some(&generation)
                         && owner.job_epochs.get(&job) == Some(&scope_generation);
-                    let ok = (!persistent || committed) && current;
+                    let ok = committed && current;
                     if ok {
                         owner.bump_epoch();
                         owner.publish_now();
@@ -3964,6 +4812,14 @@ impl Owner {
                             .flat_map(|record| record.files.iter().map(|file| file.id))
                             .collect();
                         for file in files {
+                            if owner
+                                .writers
+                                .get(&file)
+                                .is_some_and(|writer| *writer.stopped.borrow())
+                            {
+                                owner.writers.remove(&file);
+                                owner.writer_epochs.remove(&file);
+                            }
                             owner.after_file_change(job, file);
                         }
                     } else if current {
@@ -3983,12 +4839,29 @@ impl Owner {
                 cause,
                 stage,
                 message,
+                not_before,
                 reply,
             } => {
-                let committed = self.hold_job(job, cause, &stage, &message);
-                let _ = reply.send(committed);
+                let before = self.state.job(job).cloned();
+                if !self.prepare_hold_job_until(job, cause, &stage, &message, not_before) {
+                    let _ = reply.send(false);
+                    return;
+                }
+                self.pending_control_commits.insert(job);
+                self.commit_control_change_then(job, before, move |owner, ok| {
+                    owner.pending_control_commits.remove(&job);
+                    if ok {
+                        owner.publish_now();
+                        owner.bump_epoch();
+                    }
+                    let _ = reply.send(ok);
+                });
             }
             QueueCommand::SetJobStatus { job, status, reply } => {
+                if self.automatic_control_pending(job) {
+                    let _ = reply.send(false);
+                    return;
+                }
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 if self.state.job(job).is_some_and(|j| j.held()) {
                     let _ = reply.send(false);
@@ -4140,7 +5013,11 @@ impl Owner {
                     .collect();
                 for id in drop_ids {
                     let (reply, _) = oneshot::channel();
-                    self.on_command(QueueCommand::RemoveJobSilent { job: id, reply });
+                    self.on_command(QueueCommand::RemoveJobSilent {
+                        job: id,
+                        accepted_context: None,
+                        reply,
+                    });
                 }
                 self.delegated.clear();
                 self.mirror.clear();
@@ -4153,6 +5030,340 @@ impl Owner {
     }
 
     // -- cluster: import / export / delegation / adoption --------------------
+
+    fn apply_url_resolution_then(
+        &mut self,
+        job: JobId,
+        identity: String,
+        prepared: nzbd_state::artifacts::UrlResolutionRecord,
+        callback: impl FnOnce(&mut Owner, Result<bool, crate::EngineError>) + Send + 'static,
+    ) {
+        if self.persistence_fenced || !self.persist {
+            callback(self, Err(crate::EngineError::OwnershipLost));
+            return;
+        }
+        let Some(before) = self
+            .state
+            .job(job)
+            .filter(|row| row.status == JobStatus::Fetching)
+            .cloned()
+        else {
+            callback(self, Ok(false));
+            return;
+        };
+        let source_identity = match nzbd_state::artifacts::url_source_identity(&before) {
+            Ok(identity) => identity,
+            Err(error) => {
+                callback(self, Err(crate::EngineError::Lifecycle(error.to_string())));
+                return;
+            }
+        };
+        if identity != source_identity
+            || prepared.resolution_id != identity
+            || prepared.source_identity != identity
+            || prepared.origin.id != job
+            || prepared.resolved.id != job
+        {
+            callback(self, Ok(false));
+            return;
+        }
+        let timing_checkpoint = self.timing_cache.checkpoint(job);
+        let receipts = self.state.url_admission_receipts.clone();
+        let prior_allocated = self.allocated_jobs.clone();
+        let failed = prepared.resolved.status == JobStatus::Failed;
+        let row = self.state.job_mut(job).unwrap();
+        // Bulk parsing, hashes and outbox fsync completed off the actor. Only
+        // immutable file facts are applied here; current user intent wins.
+        if row.name == prepared.origin.name
+            && row.name_provisional == prepared.origin.name_provisional
+        {
+            row.name = prepared.resolved.name;
+            row.name_provisional = prepared.resolved.name_provisional;
+        }
+        if row.category.is_none() && prepared.origin.category.is_none() {
+            row.category = prepared.resolved.category;
+        }
+        if row.dir_name == prepared.origin.dir_name {
+            row.dir_name = prepared.resolved.dir_name;
+        }
+        row.files = prepared.resolved.files;
+        row.totals = prepared.resolved.totals;
+        row.status = if failed {
+            JobStatus::Failed
+        } else if row.params.iter().any(|(key, _)| key == "*AddPaused") {
+            JobStatus::Paused
+        } else {
+            JobStatus::Queued
+        };
+        row.params.retain(|(key, _)| key != "*AddPaused");
+        for (key, value) in prepared
+            .resolved
+            .params
+            .into_iter()
+            .filter(|(key, _)| matches!(key.as_str(), "Failure:Stage" | "Failure:Reason"))
+        {
+            set_owner_param(&mut row.params, &key, Some(value));
+        }
+        let maximum_file_id = row.files.iter().map(|file| file.id.0).max().unwrap_or(0);
+        self.state.next_file_id = self.state.next_file_id.max(maximum_file_id);
+        let generation = fresh_epoch();
+        self.job_epochs.insert(job, generation);
+        let finish = move |owner: &mut Owner| {
+            owner.persist_then(move |owner, ok| {
+                let current = owner.job_epochs.get(&job) == Some(&generation);
+                if !ok || !current {
+                    if current {
+                        owner.timing_cache.restore(job, timing_checkpoint);
+                        if let Some(latest) = owner.state.job(job) {
+                            let mut restored = before;
+                            restored.category = latest.category.clone();
+                            restored.priority = latest.priority;
+                            if let Some(control) = latest.control() {
+                                restored.set_control(&control);
+                            }
+                            if let Some(row) = owner.state.job_mut(job) {
+                                *row = restored;
+                            }
+                        }
+                        owner
+                            .state
+                            .url_admission_receipts
+                            .retain(|receipt| receipt.job_id != job.0);
+                        owner.state.url_admission_receipts.extend(
+                            receipts
+                                .into_iter()
+                                .filter(|receipt| receipt.job_id == job.0),
+                        );
+                        owner.allocated_jobs = prior_allocated;
+                    }
+                    callback(
+                        owner,
+                        Err(if owner.persistence_fenced {
+                            crate::EngineError::OwnershipLost
+                        } else {
+                            crate::EngineError::AdmissionNotDurable
+                        }),
+                    );
+                    return;
+                }
+                owner.publish_now();
+                owner.emit(Event::UrlFetchResolved { job });
+                if failed {
+                    owner.emit(Event::JobFinished {
+                        job,
+                        name: owner
+                            .state
+                            .job(job)
+                            .map(|row| row.name.clone())
+                            .unwrap_or_default(),
+                        status: JobStatus::Failed,
+                        health: 0,
+                    });
+                }
+                owner.bump_epoch();
+                callback(owner, Ok(true));
+            });
+        };
+        if failed {
+            finish(self);
+        } else {
+            self.allocate_new_payload_then(job, move |owner, result| {
+                if let Err(error) = result {
+                    owner.hold_job(
+                        job,
+                        allocation_hold_cause(&error.to_string()),
+                        "download_write",
+                        &format!("payload allocation: {error}"),
+                    );
+                }
+                finish(owner);
+            });
+        }
+    }
+
+    /// A worker owns no shared queue snapshot. Its retry intent commits to
+    /// the local inventory under the exact lease/source tuple instead.
+    fn automatic_control_scope(&self, job: JobId) -> bool {
+        self.persist
+            && self.persist_guard.is_some()
+            && !self.delegated.contains_key(&job)
+            && self.state.job(job).is_some_and(|job| {
+                nzbd_state::artifacts::WorkerControlContext::for_job(job).is_none()
+            })
+    }
+    fn automatic_control_pending(&self, job: JobId) -> bool {
+        self.automatic_control_scope(job)
+            && self
+                .state
+                .job(job)
+                .is_some_and(crate::automatic_control::pending)
+    }
+    fn prepare_automatic_control_change(&mut self, job: JobId, before: Option<&Job>) -> bool {
+        if self.automatic_control_scope(job) {
+            let Some(before) = before else {
+                return false;
+            };
+            let Ok(source) = self.artifacts.for_job(job.0) else {
+                return false;
+            };
+            let installation = self.artifacts.installation.clone();
+            if let Some(current) = self.state.job_mut(job) {
+                if let Err(error) =
+                    crate::automatic_control::stamp(before, current, &installation, source.as_ref())
+                {
+                    tracing::warn!(job=job.0,%error,"automatic control awaits durable authority");
+                    return false;
+                }
+            }
+        }
+        !self.persistence_fenced
+    }
+
+    pub(super) fn commit_control_change_then(
+        &mut self,
+        job: JobId,
+        before: Option<Job>,
+        callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
+    ) {
+        if self.persistence_fenced {
+            callback(self, false);
+            return;
+        }
+        if self.persist {
+            self.persist_then(callback);
+            return;
+        }
+        let Some(record) = self.state.job(job).cloned() else {
+            callback(self, false);
+            return;
+        };
+        let expected = before
+            .as_ref()
+            .and_then(Job::control)
+            .map(|control| control.revision)
+            .unwrap_or_default();
+        let artifacts = self.artifacts.clone();
+        let current_control = record.control();
+        let context = nzbd_state::artifacts::WorkerControlContext::for_job(&record);
+        self.io_then(
+            move || {
+                artifacts
+                    .checkpoint_worker_control(&record, &expected)
+                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))
+            },
+            move |owner, result| {
+                let current = owner.state.job(job).is_some_and(|row| {
+                    row.control() == current_control
+                        && nzbd_state::artifacts::WorkerControlContext::for_job(row) == context
+                });
+                callback(owner, result.is_ok() && current);
+            },
+        );
+    }
+
+    fn adopt_url_admissions(&mut self, rows: Vec<UrlAdmissionReceipt>) -> bool {
+        // A rejected authority must not mutate even the provisional catalog
+        // or its highwater before the asynchronous persistence lane refuses it.
+        if self.persist && self.persist_guard.as_ref().is_some_and(|guard| !guard()) {
+            self.persistence_fenced = true;
+            self.persist = false;
+            return false;
+        }
+        if self.persistence_fenced || !crate::admissions::valid_page(&rows) {
+            return false;
+        }
+        for row in &rows {
+            if self
+                .authoritative_admissions
+                .get(&row.request_token)
+                .is_some_and(|accepted| accepted != &crate::admissions::identity(row))
+            {
+                return false;
+            }
+            if self
+                .admission_adoption
+                .as_ref()
+                .is_some_and(|seen| seen.contains(&row.request_token))
+                && self.state.url_admission_receipts.iter().any(|current| {
+                    current.request_token == row.request_token
+                        && crate::admissions::identity(current) != crate::admissions::identity(row)
+                })
+            {
+                return false;
+            }
+        }
+        for row in rows {
+            self.state.next_job_id = self.state.next_job_id.max(row.job_id);
+            if let Some(current) = self
+                .state
+                .url_admission_receipts
+                .iter_mut()
+                .find(|current| current.request_token == row.request_token)
+            {
+                *current = crate::admissions::merge_current(current, &row);
+            } else {
+                self.state.url_admission_receipts.push(row.clone());
+            }
+            self.authoritative_admissions
+                .insert(row.request_token.clone(), crate::admissions::identity(&row));
+            self.unaccepted_admissions.remove(&row.request_token);
+            if let Some(seen) = self.admission_adoption.as_mut() {
+                seen.insert(row.request_token);
+            }
+        }
+        true
+    }
+    fn finish_url_admission_adoption(&mut self) -> bool {
+        if self.persistence_fenced {
+            return false;
+        }
+        let Some(seen) = self.admission_adoption.clone() else {
+            return false;
+        };
+        self.state
+            .url_admission_receipts
+            .retain(|row| seen.contains(&row.request_token));
+        self.authoritative_admissions
+            .retain(|token, _| seen.contains(token));
+        self.admission_adoption = None;
+        self.admission_catalog_adopted = true;
+        self.unaccepted_admissions.clear();
+        true
+    }
+    fn can_discard_url_admission(&self, expected: &UrlAdmissionReceipt) -> bool {
+        !self.persistence_fenced
+            && self.admission_adoption.is_none()
+            && !self
+                .authoritative_admissions
+                .contains_key(&expected.request_token)
+            && self.state.job(JobId(expected.job_id)).is_none_or(|job| {
+                !job.params.iter().any(|(key, value)| {
+                    key == "monarr-transfer" && value == &expected.request_token
+                })
+            })
+            && self
+                .state
+                .url_admission_receipts
+                .iter()
+                .find(|row| row.request_token == expected.request_token)
+                .is_none_or(|current| {
+                    crate::admissions::identity(current) == crate::admissions::identity(expected)
+                        && current.custody_state != "curator"
+                        && current.terminal_outcome.is_none()
+                })
+    }
+
+    fn finish_import_preparation(&mut self, job: JobId, applied: bool) {
+        if let Some(count) = self.import_preparations.get_mut(&job) {
+            if applied && *count == 1 {
+                self.foreign_journal_holds.remove(&job);
+            }
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.import_preparations.remove(&job);
+            }
+        }
+    }
 
     #[cfg(test)]
     fn import_job(&mut self, job: Job, fold_journals: bool, emit_finished: bool) -> bool {
@@ -4172,6 +5383,10 @@ impl Owner {
     }
 
     fn remove_job_silent(&mut self, job: JobId) -> bool {
+        self.remove_job_silent_with_journal(job, self.persist)
+    }
+
+    fn remove_job_silent_with_journal(&mut self, job: JobId, compact_journal: bool) -> bool {
         if self.post_admissions.contains_key(&job)
             || self
                 .verification
@@ -4222,7 +5437,7 @@ impl Owner {
             JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
         ) {
             for receipt in &mut self.state.url_admission_receipts {
-                if receipt.job_id == job.0 {
+                if receipt.job_id == job.0 && receipt.custody_state != "curator" {
                     receipt.outcome = "deleted".into();
                 }
             }
@@ -4232,13 +5447,22 @@ impl Owner {
         let retirement = fresh_epoch();
         self.retirement_epochs.insert(job, retirement);
         self.retiring_writers.entry(job).or_default();
+        let source = self.artifacts.for_job(job.0).ok().flatten();
+        self.cluster_writer_stops
+            .observe(&record, source.as_ref(), None);
         self.dirty = true;
         self.persist_then(move |owner, committed| {
             if owner.retirement_epochs.get(&job) != Some(&retirement) {
                 return;
             }
             if committed {
-                owner.remove_journal(job);
+                // A worker's local snapshot does not cover the authority's
+                // pending download. Preserve its shared verified ranges on
+                // stop/expiry; only acknowledged completion or authority
+                // retirement permits journal compaction.
+                if compact_journal {
+                    owner.remove_journal(job);
+                }
                 owner.retirement_epochs.remove(&job);
                 owner.retiring_writers.remove(&job);
                 owner.drain_replacements();
@@ -4410,6 +5634,36 @@ impl Owner {
                 };
                 let mut jobs = owner.state.jobs.clone();
                 if let Some(state) = recovered {
+                    // The first cluster authority may boot without loading the
+                    // shared queue. Preserve retired admissions for the one-time
+                    // catalog migration before replacing the projection. Once
+                    // adoption/pruning completed, a stale snapshot cannot revive
+                    // an orphan that the authoritative catalog removed.
+                    if !owner.admission_catalog_adopted {
+                        let mut receipts = owner.state.url_admission_receipts.clone();
+                        let mut positions = receipts.iter().enumerate()
+                            .map(|(index, receipt)| (receipt.request_token.clone(), index))
+                            .collect::<HashMap<_, _>>();
+                        for incoming in state.url_admission_receipts {
+                            if owner.authoritative_admissions.get(&incoming.request_token)
+                                .is_some_and(|identity| identity != &crate::admissions::identity(&incoming)) {
+                                owner.persist = false;
+                                callback(owner, Err(nzbd_state::StateError::Corrupt(
+                                    "shared snapshot admission conflicts with accepted authority catalog".into()
+                                )));
+                                return;
+                            }
+                            if let Some(index) = positions.get(&incoming.request_token).copied() {
+                                receipts[index] = crate::admissions::merge_current(&receipts[index], &incoming);
+                            } else {
+                                positions.insert(incoming.request_token.clone(), receipts.len());
+                                receipts.push(incoming);
+                            }
+                        }
+                        owner.state.next_job_id = receipts.iter().fold(owner.state.next_job_id,
+                            |next, receipt| next.max(receipt.job_id));
+                        owner.state.url_admission_receipts = receipts;
+                    }
                     owner.state.next_job_id = owner.state.next_job_id.max(state.next_job_id);
                     owner.state.next_file_id = owner.state.next_file_id.max(state.next_file_id);
                     owner.state.download_paused = state.download_paused;
@@ -4419,8 +5673,27 @@ impl Owner {
                         }
                     }
                 }
+                let was_fenced = owner.persistence_fenced;
+                // Only explicit authority adoption may reopen a fenced writer,
+                // after loading its snapshot and validating the current epoch.
+                if owner.persist_guard.as_ref().is_some_and(|guard| !guard())
+                    || (was_fenced && owner.persist_guard.is_none())
+                {
+                    owner.persist = false;
+                    callback(owner, Err(nzbd_state::StateError::Corrupt(
+                        "authority snapshot fence is not current".into(),
+                    )));
+                    return;
+                }
+                owner.persistence_fenced = false;
                 owner.persist = true;
-                owner.replace_projection_then(jobs, callback);
+                owner.replace_projection_then(jobs, move |owner, result| {
+                    if was_fenced && result.is_err() {
+                        owner.persistence_fenced = true;
+                        owner.persist = false;
+                    }
+                    callback(owner, result);
+                });
             },
         );
     }
@@ -4529,9 +5802,24 @@ impl Owner {
             };
             seg.state = SegmentState::Leased { server: server_id };
             let message_id = seg.message_id.to_string();
-            if let Some(job) = self.state.job_mut(r.job) {
+            let started = if let Some(job) = self.state.job_mut(r.job) {
                 if matches!(job.status, JobStatus::Queued) {
                     job.status = JobStatus::Downloading;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if started {
+                if let Some(job) = self.state.job_mut(r.job) {
+                    if self
+                        .timing_cache
+                        .sync(job, &self.artifacts.installation, false)
+                    {
+                        self.dirty = true;
+                    }
                 }
             }
             // Advance the cursor for the NEXT lease, whichever connection
@@ -5041,6 +6329,20 @@ impl Owner {
         stage: &str,
         message: &str,
     ) -> bool {
+        self.hold_job_until(job, cause, stage, message, None)
+    }
+    pub(super) fn prepare_hold_job_until(
+        &mut self,
+        job: JobId,
+        cause: nzbd_types::HoldCause,
+        stage: &str,
+        message: &str,
+        not_before: Option<i64>,
+    ) -> bool {
+        if self.persistence_fenced || self.automatic_control_pending(job) {
+            return false;
+        }
+        let before = self.state.job(job).cloned();
         let cause_str = cause.as_str().to_string();
         let Some(j) = self.state.job_mut(job) else {
             return false;
@@ -5111,18 +6413,53 @@ impl Owner {
             previous_status: prior_held
                 .and_then(|c| c.previous_status)
                 .or(Some(j.status)),
-            manual_pause: prior_held.map_or(j.status == JobStatus::Paused, |c| c.manual_pause),
+            manual_pause: prior_held.map_or(
+                j.status == JobStatus::Paused
+                    && !(matches!(stage, "torrent_seed_retire" | "torrent_seed_forget")
+                        && crate::torrent_acquisitions::is_managed_seed(j)
+                        && j.torrent.as_ref().is_some_and(|torrent| {
+                            torrent.stop_reason != Some(nzbd_types::TorrentStopReason::Manual)
+                        })),
+                |c| c.manual_pause,
+            ),
             retry_attempt: if timed {
                 attempts_made.saturating_add(1)
             } else {
                 attempts_made
             },
-            next_retry_at_unix: timed
-                .then(|| now.saturating_add(nzbd_types::hold_retry_delay_seconds(attempts_made))),
+            next_retry_at_unix: timed.then(|| {
+                now.saturating_add(hold_retry_delay_with_jitter(job, attempts_made, now))
+                    .max(not_before.unwrap_or(0))
+            }),
             blocked_since_unix: episode.and_then(|c| c.blocked_since_unix).or(Some(now)),
             released_at_unix: None,
         };
+        let mut control = control;
+        if control
+            .blocked_since_unix
+            .is_some_and(|since| now.saturating_sub(since) >= 1800)
+        {
+            control.message = format!(
+                "{}; warning: blocked for at least 30 minutes",
+                control.message.chars().take(1900).collect::<String>()
+            );
+        }
         j.set_control(&control);
+        if stage == "torrent_seed_retire" {
+            if let Some(mut marker) =
+                crate::torrent_acquisitions::seed_retirement(j).filter(|marker| {
+                    marker.keep_blocked_revision.is_some()
+                        && marker.keep_blocked_control_revision.is_none()
+                })
+            {
+                marker.keep_blocked_control_revision = Some(control.revision.clone());
+                set_owner_param(
+                    &mut j.params,
+                    crate::torrent_acquisitions::SEED_RETIREMENT_PARAM,
+                    Some(serde_json::to_string(&marker).unwrap()),
+                );
+            }
+        }
         j.status = JobStatus::Paused;
         for f in &mut j.files {
             for s in &mut f.segments {
@@ -5140,23 +6477,34 @@ impl Owner {
         self.pending_finalize.retain(|(id, _)| *id != job);
         self.dirty = true;
         self.bump_epoch();
-        // The local fence is immediate. Emit only the durably acknowledged
-        // control revision; stale callbacks cannot describe a newer hold.
-        let epoch = self.job_epochs.get(&job).copied();
-        self.persist_then(move |owner, ok| {
-            if ok
-                && owner.job_epochs.get(&job).copied() == epoch
-                && owner
-                    .state
-                    .job(job)
-                    .and_then(Job::control)
-                    .is_some_and(|current| current.revision == control.revision)
-            {
+        if !self.prepare_automatic_control_change(job, before.as_ref()) {
+            return false;
+        }
+        true
+    }
+
+    pub(super) fn hold_job_until(
+        &mut self,
+        job: JobId,
+        cause: nzbd_types::HoldCause,
+        stage: &str,
+        message: &str,
+        not_before: Option<i64>,
+    ) -> bool {
+        let before = self.state.job(job).cloned();
+        if !self.prepare_hold_job_until(job, cause, stage, message, not_before) {
+            return false;
+        }
+        self.pending_control_commits.insert(job);
+        self.commit_control_change_then(job, before, move |owner, ok| {
+            owner.pending_control_commits.remove(&job);
+            if ok {
                 owner.publish_now();
-                owner.emit(Event::JobControlChanged { job, control });
+                if let Some(control) = owner.state.job(job).and_then(Job::control) {
+                    owner.emit(Event::JobControlChanged { job, control });
+                }
             }
         });
-        self.publish_now();
         true
     }
 
@@ -5171,6 +6519,7 @@ impl Owner {
     /// `PostQueued`, which the post scan claims through its own guards and
     /// runs from the beginning. Storage causes release through
     /// `ReleaseResourceHold` after their capacity probe instead.
+    #[cfg(test)]
     pub(crate) fn retry_hold(
         &mut self,
         job: JobId,
@@ -5178,14 +6527,36 @@ impl Owner {
         by: RetryBy,
         custody_checked: bool,
     ) -> Result<(), String> {
-        if by == RetryBy::Recovery && !self.persist {
-            return Err("this node is not the queue authority".into());
+        self.retry_hold_proven(job, revision, by, custody_checked, &Default::default())
+    }
+
+    fn retry_hold_proven(
+        &mut self,
+        job: JobId,
+        revision: &str,
+        by: RetryBy,
+        custody_checked: bool,
+        guard: &crate::hold_release::HoldReleaseGuard,
+    ) -> Result<(), String> {
+        if self.persistence_fenced
+            || (by == RetryBy::Recovery && self.automatic_control_pending(job))
+        {
+            return Err("durable queue ownership is fenced".into());
         }
         let before = self
             .state
             .job(job)
             .cloned()
             .ok_or_else(|| "job not found".to_string())?;
+        if by == RetryBy::Recovery && !guard.worker_checked() && self.delegated.contains_key(&job) {
+            return Err("this job is assigned to its worker execution lane".into());
+        }
+        if !self.persist && !guard.worker_checked() {
+            return Err("this node is not the queue authority".into());
+        }
+        if !guard.matches(&self.artifacts, &before, self.persist) {
+            return Err("the source, control authority or live worker grant changed".into());
+        }
         let mut control = before
             .control()
             .filter(|c| c.lifecycle == "held")
@@ -5193,10 +6564,18 @@ impl Owner {
         if control.revision != revision {
             return Err("the hold changed since it was read; reload and retry".into());
         }
-        if control.hold_cause().is_storage() {
+        let native_preparation = crate::torrent_acquisitions::preparation_hold(&before, &control);
+        if control.hold_cause().is_storage() && !control.post_side() && !native_preparation {
             return Err("storage holds are released by the capacity check".into());
         }
-        if before.torrent.is_some() {
+        if by == RetryBy::Recovery
+            && (!control.hold_cause().policy().automatic()
+                || (control.hold_cause().policy().timed()
+                    && control.next_retry_at_unix.is_none_or(|at| at > unix_now())))
+        {
+            return Err("the hold is not due for automatic recovery".into());
+        }
+        if before.torrent.is_some() && !native_preparation {
             return Err("torrent holds are released from the torrent's own actions".into());
         }
         if before
@@ -5247,66 +6626,63 @@ impl Owner {
         }
         {
             let j = self.state.job_mut(job).unwrap();
-            j.status = if post_side {
+            j.status = if native_preparation && control.stage == "torrent_metadata" {
+                JobStatus::Fetching
+            } else if post_side {
                 JobStatus::PostQueued
             } else {
                 JobStatus::Queued
             };
             j.set_control(&control);
-        }
-        if !post_side {
-            for f in &before.files {
-                self.writers.remove(&f.id);
+            if by == RetryBy::Operator && control.stage == "torrent_seed_retire" {
+                if let Some(mut marker) = crate::torrent_acquisitions::seed_retirement(j) {
+                    marker.retry_revision = control.revision.clone();
+                    marker.keep_blocked_revision = None;
+                    marker.keep_blocked_control_revision = None;
+                    set_owner_param(
+                        &mut j.params,
+                        crate::torrent_acquisitions::SEED_RETIREMENT_PARAM,
+                        Some(serde_json::to_string(&marker).unwrap()),
+                    );
+                }
             }
         }
         self.dirty = true;
-        self.pending_control_commits.insert(job);
-        let epoch = self.job_epochs.get(&job).copied();
-        self.persist_then(move |owner, ok| {
-            if owner.job_epochs.get(&job).copied() != epoch {
-                return;
+        if by == RetryBy::Recovery && !self.prepare_automatic_control_change(job, Some(&before)) {
+            if let Some(row) = self.state.job_mut(job) {
+                *row = before;
             }
-            owner.pending_control_commits.remove(&job);
-            let still_current = owner
-                .state
-                .job(job)
-                .and_then(Job::control)
-                .is_some_and(|current| current.revision == control.revision);
-            if !still_current {
-                return;
-            }
-            if !ok {
-                if let Some(current) = owner.state.job_mut(job) {
-                    let paused = current.status == JobStatus::Paused;
-                    current.set_control(&before.control().unwrap());
-                    current.status = if paused {
-                        JobStatus::Paused
-                    } else {
-                        before.status
-                    };
-                }
-            } else {
-                owner.emit(Event::JobControlChanged { job, control });
-                if !post_side {
-                    for file in before.files {
-                        owner.after_file_change(job, file.id);
-                    }
-                }
-            }
-            owner.publish_now();
-            owner.bump_epoch();
-        });
-        self.publish_now();
+            return Err("automatic transition could not be prepared".into());
+        }
         Ok(())
     }
 
     /// Push an automatic hold's next attempt out on the same backoff, keeping
     /// the original reason and recording the refusal beside it. The new time
     /// lives in memory even if this save fails; the next snapshot carries it.
+    #[cfg(test)]
     fn reschedule_hold(&mut self, job: JobId, revision: &str, reason: &str) -> bool {
-        if !self.persist {
+        self.reschedule_hold_proven(job, revision, reason, &Default::default())
+    }
+
+    fn reschedule_hold_proven(
+        &mut self,
+        job: JobId,
+        revision: &str,
+        reason: &str,
+        guard: &crate::hold_release::HoldReleaseGuard,
+    ) -> bool {
+        if self.persistence_fenced
+            || self.automatic_control_pending(job)
+            || (!guard.worker_checked() && self.delegated.contains_key(&job))
+            || !self
+                .state
+                .job(job)
+                .is_some_and(|current| guard.matches(&self.artifacts, current, self.persist))
+        {
             return false;
         }
+        let before = self.state.job(job).cloned();
         let Some(j) = self.state.job_mut(job) else {
             return false;
         };
@@ -5319,7 +6695,7 @@ impl Owner {
         // its cadence and only records why it is still held.
         let timed = control.hold_cause().policy().timed();
         if timed {
-            let delay = nzbd_types::hold_retry_delay_seconds(control.retry_attempt);
+            let delay = hold_retry_delay_with_jitter(job, control.retry_attempt, unix_now());
             control.retry_attempt = control.retry_attempt.saturating_add(1);
             control.next_retry_at_unix = Some(unix_now().saturating_add(delay));
         }
@@ -5329,7 +6705,15 @@ impl Owner {
             .next()
             .unwrap_or("")
             .to_string();
-        let message: String = format!("{original}; retry refused: {reason}")
+        let warning = if control
+            .blocked_since_unix
+            .is_some_and(|since| unix_now().saturating_sub(since) >= 1800)
+        {
+            "; warning: blocked for at least 30 minutes"
+        } else {
+            ""
+        };
+        let message: String = format!("{original}; retry refused: {reason}{warning}")
             .chars()
             .take(2048)
             .collect();
@@ -5350,11 +6734,12 @@ impl Owner {
         control.revision = next.to_string();
         j.set_control(&control);
         self.dirty = true;
-        if self.persist {
-            self.save_snapshot();
+        if !self.prepare_automatic_control_change(job, before.as_ref()) {
+            if let Some(before) = before {
+                *self.state.job_mut(job).unwrap() = before;
+            }
+            return false;
         }
-        self.publish_now();
-        self.emit(Event::JobControlChanged { job, control });
         true
     }
 
@@ -6069,6 +7454,17 @@ impl Owner {
         job: JobId,
         _new_admission: bool,
     ) -> Result<(), nzbd_state::artifacts::Error> {
+        if let Some(context) = self
+            .state
+            .job(job)
+            .and_then(nzbd_state::artifacts::WorkerControlContext::for_job)
+        {
+            if self.artifacts.worker_grant_is_stopped(job.0, &context)? {
+                return Err(nzbd_state::artifacts::Error::Conflict(
+                    "worker grant was durably stopped".into(),
+                ));
+            }
+        }
         if self.retiring_writers.contains_key(&job) {
             return Err(nzbd_state::artifacts::Error::Conflict(
                 "writer retirement in progress".into(),
@@ -6308,6 +7704,12 @@ impl Owner {
                 owner.engine_tx.clone(),
                 scope,
             );
+            if let Some(record) = owner.state.job(job) {
+                let source = owner.artifacts.for_job(job.0).ok().flatten();
+                owner
+                    .cluster_writer_stops
+                    .observe(record, source.as_ref(), Some(&writer));
+            }
             owner.writer_epochs.insert(file, generation);
             owner.writers.insert(file, writer);
             owner.bump_epoch();
@@ -6423,7 +7825,10 @@ impl Owner {
                 QueueCommand::RemoveJobSilent { job, .. } | QueueCommand::Delete { job, .. } => {
                     *job
                 }
-                _ => continue,
+                _ => {
+                    self.on_command(command);
+                    continue;
+                }
             };
             if self
                 .pending_name_inspections
@@ -6585,6 +7990,9 @@ impl Owner {
         }
         let epoch = self.job_epochs.get(&job).copied();
         let inventory = self.artifacts.clone();
+        let retirement_record = self.state.job(job).cloned().unwrap();
+        let retirements = self.url_resolutions.clone();
+
         self.pending_control_commits.insert(job);
         let lane_root = self
             .allocation_cache
@@ -6602,6 +8010,9 @@ impl Owner {
                         .finish(job.0, &artifact.path, &artifact.root, "retained")
                         .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
                 }
+                retirements
+                    .retire_job(&retirement_record)
+                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
                 Ok(())
             },
             move |owner, result| {
@@ -6614,7 +8025,9 @@ impl Owner {
                     callback(owner, false);
                     return;
                 }
-                owner.persist_then(move |owner, ok| {
+                owner.persist_then(move |owner, _snapshot_ok| {
+                    // The exact cancellation tombstone is already fsync'd.
+                    let ok = true;
                     if ok {
                         owner.publish_now();
                         owner.emit(Event::JobDeleted { job });
@@ -7219,6 +8632,22 @@ impl Owner {
 
     fn fold_backend_structural(&mut self) {
         while let Ok(fact) = self.backend.try_structural() {
+            let fact_job = match &fact {
+                BackendFact::MetadataReady { job, .. }
+                | BackendFact::Ready { job, .. }
+                | BackendFact::Stopped { job, .. }
+                | BackendFact::Resumed { job }
+                | BackendFact::Removed { job, .. }
+                | BackendFact::Failed { job, .. } => *job,
+            };
+            if self
+                .state
+                .job(fact_job)
+                .and_then(crate::torrent_acquisitions::seed_retirement)
+                .is_some_and(|marker| matches!(marker.phase.as_str(), "detached" | "deleted"))
+            {
+                continue;
+            }
             match &fact {
                 BackendFact::Resumed { job } => {
                     self.backend_started.insert(*job);
@@ -7239,6 +8668,10 @@ impl Owner {
                         | RemovalOutcome::RefusedInventoryMismatch => None,
                     };
                     if let Some(disposition) = disposition {
+                        let before = self.state.job(*job).cloned();
+                        let managed_retiring = before.as_ref().is_some_and(|row| {
+                            crate::torrent_acquisitions::seed_retirement(row).is_some()
+                        });
                         if let Some(torrent) = self
                             .state
                             .job_mut(*job)
@@ -7246,7 +8679,52 @@ impl Owner {
                         {
                             torrent.removal_outcome = Some(disposition);
                             torrent.removal_confirmed_at_unix = Some(unix_now());
+                            if let Some(row) = self.state.job_mut(*job) {
+                                if let Some(mut marker) =
+                                    crate::torrent_acquisitions::seed_retirement(row)
+                                        .filter(|marker| marker.phase == "requested")
+                                {
+                                    marker.phase = "detached".into();
+                                    if let Some(mut control) = row.control().filter(|control| {
+                                        control.lifecycle == "held"
+                                            && control.stage == "torrent_seed_forget"
+                                            && !control.manual_pause
+                                    }) {
+                                        if let Some(next) = control
+                                            .revision
+                                            .parse::<u64>()
+                                            .ok()
+                                            .and_then(|value| value.checked_add(1))
+                                        {
+                                            control.revision = next.to_string();
+                                            control.lifecycle = "running".into();
+                                            control.next_retry_at_unix = None;
+                                            row.set_control(&control);
+                                        }
+                                    }
+                                    set_owner_param(
+                                        &mut row.params,
+                                        crate::torrent_acquisitions::SEED_RETIREMENT_PARAM,
+                                        Some(serde_json::to_string(&marker).unwrap()),
+                                    );
+                                }
+                            }
                             self.dirty = true;
+                        }
+                        if managed_retiring {
+                            let id = *job;
+                            self.pending_control_commits.insert(id);
+                            self.persist_then(move |owner, ok| {
+                                owner.pending_control_commits.remove(&id);
+                                if !ok {
+                                    if let Some(before) = before {
+                                        if let Some(row) = owner.state.job_mut(id) {
+                                            *row = before;
+                                        }
+                                    }
+                                }
+                                owner.publish_now();
+                            });
                         }
                         continue;
                     }
@@ -7269,7 +8747,7 @@ impl Owner {
                     &self.torrent_payload_roots,
                 );
                 self.dirty |= outcome.durable_changed;
-                if terminal_failure {
+                if terminal_failure && !crate::torrent_acquisitions::is_managed_seed(job) {
                     if let Some(torrent) = job.torrent.as_mut() {
                         torrent.removal_outcome = Some(TorrentPayloadDisposition::Retained);
                         torrent.removal_confirmed_at_unix = Some(unix_now());
@@ -7305,6 +8783,8 @@ impl Owner {
                         .torrent
                         .as_ref()
                         .is_some_and(|torrent| torrent.removal_outcome.is_some())
+                    && crate::torrent_acquisitions::seed_retirement(job)
+                        .is_none_or(|marker| marker.phase == "deleted")
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -7346,7 +8826,12 @@ impl Owner {
                 },
                 size: torrent.selected_bytes,
                 health: 1000,
-                params: job.params.clone(),
+                params: job
+                    .params
+                    .iter()
+                    .filter(|(key, _)| !key.starts_with("*Torrent:"))
+                    .cloned()
+                    .collect(),
                 dupe_key: job.dupe.key.clone(),
                 dupe_score: job.dupe.score,
                 completed_at_unix,
@@ -7557,7 +9042,22 @@ impl Owner {
             .collect()
     }
 
+    fn sync_lifecycle_timings(&mut self) {
+        let node = self.artifacts.installation.as_str();
+        let ids = self.state.jobs.iter().map(|job| job.id).collect();
+        self.timing_cache.retain(&ids);
+        for job in &mut self.state.jobs {
+            if self
+                .timing_cache
+                .sync(job, node, self.delegated.contains_key(&job.id))
+            {
+                self.dirty = true;
+            }
+        }
+    }
+
     fn publish_snapshot(&mut self, rate: u64) {
+        self.sync_lifecycle_timings();
         let jobs = self
             .state
             .jobs
@@ -7622,6 +9122,14 @@ impl Owner {
                     pp_done: j.params.iter().any(|(k, _)| k == nzbd_types::PP_DONE_PARAM),
                     ready: j.ready(),
                     ready_at_unix: j.ready_at_unix(),
+                    torrent_role: if crate::torrent_acquisitions::is_acquisition(j) {
+                        Some("acquisition")
+                    } else if j.torrent.is_some() {
+                        Some("seed")
+                    } else {
+                        None
+                    },
+                    seed_donor_job_id: crate::torrent_acquisitions::donor(j),
                     torrent_phase: j.torrent.as_ref().map(|t| t.phase),
                     torrent_control_intent: j.torrent.as_ref().map(|t| t.control_intent),
                     seed_policy: j.torrent.as_ref().map(|t| t.seed_policy),
@@ -7792,6 +9300,36 @@ impl Owner {
         let snap = QueueSnapshot {
             up_since_unix: self.up_since_unix,
             queue_authority: self.persist,
+            pending_automatic_controls: self
+                .state
+                .jobs
+                .iter()
+                .filter(|job| self.automatic_control_pending(job.id))
+                .map(|job| job.id)
+                .collect(),
+            native_descriptor_references: self
+                .state
+                .jobs
+                .iter()
+                .filter_map(|job| {
+                    crate::torrent_acquisitions::descriptor_reference(job)
+                        .and_then(|reference| reference.source_identity(job).ok())
+                })
+                .collect(),
+            native_seed_dependencies: self
+                .state
+                .jobs
+                .iter()
+                .filter_map(crate::torrent_acquisitions::source_dependency)
+                .collect(),
+            native_seed_retirements: self
+                .state
+                .jobs
+                .iter()
+                .filter_map(|job| {
+                    crate::torrent_acquisitions::seed_retirement(job).map(|marker| (job.id, marker))
+                })
+                .collect(),
             download_paused: self.state.download_paused,
             quota_reached: self.quota_reached,
             disk_low: self.disk_low,
@@ -7896,6 +9434,7 @@ impl Owner {
         tracing::error!(%error,"persistence failed; durable operations remain blocked");
         if matches!(error, nzbd_state::StateError::Corrupt(_)) {
             self.persist = false;
+            self.persistence_fenced = true;
         }
     }
 
@@ -7998,6 +9537,8 @@ fn refresh_url_admission_custody(
     receipt: &mut UrlAdmissionReceipt,
     inventory: &nzbd_state::artifacts::Inventory,
 ) -> bool {
+    // Consumer custody is terminal for this receipt. Retention of a separate
+    // processing source cannot reclaim the accepted publication.
     let Some((artifact_id, source_generation)) = receipt
         .source_artifact_id
         .as_deref()
@@ -8013,6 +9554,21 @@ fn refresh_url_admission_custody(
     }
     let keep_changed = receipt.keep_source_on_failure != artifact.keep_on_failure;
     receipt.keep_source_on_failure = artifact.keep_on_failure;
+    if receipt.custody_state == "curator" {
+        let cleanup = if artifact.state == "deleted" {
+            Some("removed")
+        } else if artifact.keep || artifact.keep_on_failure {
+            Some("retained")
+        } else {
+            None
+        };
+        let changed =
+            cleanup.is_some_and(|status| receipt.source_cleanup_status.as_deref() != Some(status));
+        if let Some(status) = cleanup {
+            receipt.source_cleanup_status = Some(status.into());
+        }
+        return keep_changed || changed;
+    }
     if artifact.state == "deleted" {
         let changed = receipt.custody_state != "deleted_by_runner"
             || receipt.source_cleanup_status.as_deref() != Some("removed")
@@ -8086,6 +9642,14 @@ pub(crate) fn unix_now() -> i64 {
 ///    `now`.
 ///
 /// The revision moves so a client holding the old one re-reads.
+fn hold_retry_delay_with_jitter(job: JobId, attempt: u8, now: i64) -> i64 {
+    let base = nzbd_types::hold_retry_delay_seconds(attempt);
+    base.saturating_add(
+        ((job.0 as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ now as u64 ^ u64::from(attempt))
+            .wrapping_rem(base.max(1) as u64 / 10 + 1) as i64,
+    )
+}
+
 pub(crate) fn rearmed_hold(
     mut control: nzbd_types::JobControl,
     now: i64,
@@ -8341,3463 +9905,5 @@ fn read_par2_name(path: &Path) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Execute genuine ordered persistence/IO completions before observing a
-    /// direct Owner fixture. The worker remains asynchronous and its bounded
-    /// result channel is drained exactly as the production owner loop does.
-    pub(super) async fn pump(owner: &mut Owner, messages: &mut mpsc::Receiver<EngineMsg>) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                while let Ok(message) = messages.try_recv() { owner.on_msg(message); }
-                if owner.persistence.in_flight() == 0 && owner.persistence_callbacks.is_empty() && owner.io_callbacks.is_empty() {
-                    tokio::task::yield_now().await;
-                    match messages.try_recv() {
-                        Ok(message) => { owner.on_msg(message); continue; },
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => panic!("fixture result channel disconnected before worker completion"),
-                    }
-                }
-                tokio::select! {
-                    message = messages.recv() => owner.on_msg(message.expect("fixture worker result channel")),
-                    _ = tokio::time::sleep(Duration::from_millis(1)) => {},
-                }
-            }
-        }).await.expect("real persistence/IO worker did not reach an idle acknowledgement boundary");
-    }
-
-    async fn allocate_for_test(
-        owner: &mut Owner,
-        messages: &mut mpsc::Receiver<EngineMsg>,
-        job: JobId,
-        fresh: bool,
-    ) {
-        let first = if fresh {
-            owner.allocate_new_payload(job)
-        } else {
-            owner.ensure_allocation(job, false)
-        };
-        assert!(
-            first.is_ok() || owner.allocating_jobs.contains(&job),
-            "allocation was refused rather than scheduled: {first:?}"
-        );
-        pump(owner, messages).await;
-        let completed = if fresh {
-            owner.allocate_new_payload(job)
-        } else {
-            owner.ensure_allocation(job, false)
-        };
-        completed
-            .expect("real allocation callback must establish the requested fixture allocation");
-        pump(owner, messages).await;
-    }
-
-    /// Drive prerequisites through real actor completions until a work
-    /// request has a definitive answer; loading is not a successful lease.
-    async fn grant_work_for_test(
-        owner: &mut Owner,
-        messages: &mut mpsc::Receiver<EngineMsg>,
-        server: ServerId,
-        max: usize,
-    ) -> Vec<Lease> {
-        for _ in 0..(owner.state.jobs.len().saturating_mul(3) + 4) {
-            let leases = owner.grant_work(server, max);
-            let pending = owner.persistence.in_flight() != 0
-                || !owner.persistence_callbacks.is_empty()
-                || !owner.io_callbacks.is_empty();
-            pump(owner, messages).await;
-            if !leases.is_empty() || !pending {
-                return leases;
-            }
-        }
-        panic!("work prerequisites did not reach a definitive fixture transition");
-    }
-
-    #[tokio::test]
-    async fn blocked_io_lane_preserves_actor_reads_and_noop_controls_without_faking_durable_pause()
-    {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        let mut checking = pending_job(1);
-        checking.status = JobStatus::Paused;
-        owner.state.jobs.push(checking);
-        owner.state.jobs.push(pending_job(2));
-        owner.queue_verification(JobId(1));
-        let before = serde_json::to_value(owner.state.to_doc()).unwrap();
-        let verification_before =
-            serde_json::to_value(owner.verification[&JobId(1)].progress()).unwrap();
-        let (started, started_rx) = oneshot::channel();
-        let (release, held) = std::sync::mpsc::channel();
-        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let completion = completed.clone();
-        owner.io_then(
-            move || {
-                let _ = started.send(());
-                held.recv().expect("explicit IO release barrier");
-                Ok(())
-            },
-            move |_, result| {
-                result.expect("real blocked worker result");
-                completion.store(true, std::sync::atomic::Ordering::Release);
-            },
-        );
-        tokio::time::timeout(Duration::from_secs(1), started_rx)
-            .await
-            .unwrap()
-            .unwrap();
-
-        let (reply, snapshot) = oneshot::channel();
-        owner.on_command(QueueCommand::RecoveryDocument { reply });
-        let document = tokio::time::timeout(Duration::from_millis(100), snapshot)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(serde_json::to_value(document).unwrap(), before);
-        let (reply, noop) = oneshot::channel();
-        owner.on_command(QueueCommand::Pause {
-            job: JobId(1),
-            reply,
-        });
-        assert!(!tokio::time::timeout(Duration::from_millis(100), noop)
-            .await
-            .unwrap()
-            .unwrap());
-        assert_eq!(serde_json::to_value(owner.state.to_doc()).unwrap(), before);
-        assert_eq!(
-            serde_json::to_value(owner.verification[&JobId(1)].progress()).unwrap(),
-            verification_before
-        );
-        assert!(!completed.load(std::sync::atomic::Ordering::Acquire));
-        assert_eq!(
-            owner.persistence.in_flight(),
-            1,
-            "the blocked actual worker retains its slot"
-        );
-
-        let (reply, mut pause) = oneshot::channel();
-        owner.on_command(QueueCommand::Pause {
-            job: JobId(2),
-            reply,
-        });
-        assert!(
-            matches!(pause.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
-            "a valid persistent intent cannot acknowledge through a blocked durability lane"
-        );
-        assert_eq!(owner.state.job(JobId(2)).unwrap().status, JobStatus::Paused);
-        assert_eq!(
-            serde_json::to_value(owner.verification[&JobId(1)].progress()).unwrap(),
-            verification_before
-        );
-        assert!(!completed.load(std::sync::atomic::Ordering::Acquire));
-
-        release.send(()).unwrap();
-        pump(&mut owner, &mut messages).await;
-        assert!(pause.await.unwrap());
-        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
-        let saved = SnapshotStore::open(&owner.state_dir)
-            .unwrap()
-            .load()
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            saved
-                .jobs
-                .iter()
-                .find(|job| job.id == JobId(2))
-                .unwrap()
-                .status,
-            JobStatus::Paused
-        );
-        let verification_after = owner.verification[&JobId(1)].progress();
-        assert_eq!(verification_after.reason, None);
-        assert_eq!(verification_after.checked_bytes, 0);
-        assert_eq!(verification_after.total_bytes, 0);
-    }
-
-    #[tokio::test]
-    async fn engine_shutdown_drains_real_writer_acknowledgement_behind_full_result_channel() {
-        let (tmp, mut owner, adapter, mut messages) = control_test_owner();
-        let mut job = pending_job(1);
-        job.files[0].segments[0].size = 5;
-        recompute_job_totals(&mut job);
-        let file = job.files[0].id;
-        owner.state.jobs.push(job);
-        allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
-        let directory = owner.allocation_cache[&JobId(1)].path.clone();
-        let tracker = owner.tracker.clone();
-        let writer = crate::writer::spawn_writer(
-            &tracker,
-            JobId(1),
-            file,
-            directory.clone(),
-            "payload.bin".into(),
-            owner.engine_tx.clone(),
-        );
-        owner.writers.insert(file, writer.clone());
-        owner.writer_epochs.insert(file, writer.generation);
-        // No owner is receiving yet, so this fills the real one-slot channel.
-        owner
-            .engine_tx
-            .try_send(EngineMsg::ConnectFailed {
-                server: ServerId(99),
-            })
-            .unwrap();
-        assert_eq!(owner.engine_tx.capacity(), 0);
-        writer
-            .tx
-            .send(WriteCmd::Segment {
-                seg_number: 1,
-                offset: 0,
-                data: b"hello".to_vec(),
-                crc: crc32fast::hash(b"hello"),
-                file_size: 5,
-                server: ServerId(1),
-            })
-            .await
-            .unwrap();
-        let partial = directory.join(format!(".runner-file-{}.part", file.0));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while std::fs::read(&partial).ok().as_deref() != Some(b"hello".as_slice()) {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("real writer did not reach the acknowledgement barrier");
-        writer.stop.cancel();
-        assert!(
-            !*writer.stopped.borrow(),
-            "cancellation cannot stop a writer whose acknowledgement has no channel room"
-        );
-        assert_eq!(owner.engine_tx.capacity(), 0);
-
-        let handle = crate::EngineHandle {
-            artifacts: owner.artifacts.clone(),
-            cmd_tx: owner.engine_tx.clone(),
-            shared: owner.shared.clone(),
-            events: owner.events.clone(),
-            cancel: owner.cancel.clone(),
-            tracker: tracker.clone(),
-            backend_adapter: Arc::new(std::sync::Mutex::new(Some(adapter))),
-            budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
-            url_fetches: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            post_scope: None,
-            queue_changes: owner.epoch_tx.subscribe(),
-            owner_heartbeat: owner.owner_heartbeat.clone(),
-            shutdown_complete: owner.shutdown_complete.clone(),
-        };
-        // Enter the actual owner task already cancelled; its shutdown drain
-        // must create channel room before it can wait for the writer.
-        handle.cancel.cancel();
-        tracker.spawn(owner.run(messages));
-        tracker.close();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
-                .await
-                .expect("shutdown deadlocked behind a final writer acknowledgement")
-        );
-        assert!(*writer.stopped.borrow());
-        let saved = SnapshotStore::open(&tmp.path().join("state"))
-            .unwrap()
-            .load()
-            .unwrap()
-            .unwrap();
-        assert!(
-            matches!(saved.jobs[0].files[0].segments[0].state, SegmentState::Done { offset: 0, len: 5, crc } if crc == crc32fast::hash(b"hello"))
-        );
-        assert_eq!(std::fs::read(partial).unwrap(), b"hello");
-        assert!(
-            !tmp.path()
-                .join("state/unclean.control-test")
-                .try_exists()
-                .unwrap(),
-            "marker clears only after the accepted acknowledgement is durably captured"
-        );
-    }
-
-    #[tokio::test]
-    async fn fresh_default_root_initializes_in_payload_worker_but_enrolled_missing_root_stays_missing(
-    ) {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        assert!(
-            !owner.dest_dir.exists(),
-            "metadata recovery must not create the payload root inline"
-        );
-        pump(&mut owner, &mut messages).await;
-        assert!(owner.dest_dir.is_dir());
-        owner.state.jobs.push(pending_job(1));
-        allocate_for_test(&mut owner, &mut messages, JobId(1), true).await;
-        let allocation = owner.allocation_cache[&JobId(1)].clone();
-        std::fs::remove_dir(&allocation.path).unwrap();
-        std::fs::remove_dir(&allocation.root).unwrap();
-        prepare_unenrolled_payload_root(&owner.artifacts, &allocation.root).unwrap();
-        assert!(
-            !allocation.root.exists(),
-            "an absent enrolled mount cannot be recreated as an empty directory"
-        );
-    }
-
-    #[tokio::test]
-    async fn fresh_admission_prepares_root_before_startup_callback_and_refuses_missing_enrolled_root(
-    ) {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        // Hold the completed state-lane enumeration before the owner can queue
-        // root reconciliation. Immediate user admission must work in this order.
-        let startup = tokio::time::timeout(Duration::from_secs(5), messages.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!owner.startup_roots_ready);
-        assert!(!owner.dest_dir.exists());
-        owner.state.jobs.push(pending_job(1));
-        let (reply, mut allocated) = oneshot::channel();
-        owner.allocate_new_payload_then(JobId(1), move |_, result| {
-            reply.send(result).unwrap();
-        });
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                tokio::select! {
-                    result = &mut allocated => break result.unwrap().unwrap(),
-                    message = messages.recv() => owner.on_msg(message.unwrap()),
-                }
-            }
-        })
-        .await
-        .expect("fresh admission must not depend on startup enumeration delivery");
-        assert!(!owner.startup_roots_ready);
-        let allocation = owner.allocation_cache[&JobId(1)].clone();
-        assert_eq!(allocation.root, owner.dest_dir);
-        assert!(allocation.path.is_dir());
-        let bound = owner.artifacts.for_job(1).unwrap().unwrap();
-        assert_eq!(bound.id, allocation.id);
-        assert_eq!(bound.generation, allocation.generation);
-        assert_eq!(bound.path, allocation.path);
-
-        owner.on_msg(startup);
-        pump(&mut owner, &mut messages).await;
-        std::fs::remove_dir_all(&allocation.path).unwrap();
-        std::fs::remove_dir(&allocation.root).unwrap();
-        owner.state.jobs.push(pending_job(2));
-        let (reply, refused) = oneshot::channel();
-        owner.allocate_new_payload_then(JobId(2), move |_, result| {
-            reply.send(result).unwrap();
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(refused.await.unwrap().is_err());
-        assert!(
-            !allocation.root.exists(),
-            "missing enrolled custody cannot become a fresh root"
-        );
-        let retained = owner.artifacts.for_job(1).unwrap().unwrap();
-        assert_eq!(retained.path, allocation.path);
-        assert_eq!(retained.generation, allocation.generation);
-        assert_eq!(retained.root_identity, allocation.root_identity);
-        assert!(owner.artifacts.for_job(2).unwrap().is_none());
-        assert!(!owner.allocation_cache.contains_key(&JobId(2)));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn metadata_boot_and_other_root_controls_do_not_wait_for_blocked_active_allocation() {
-        use std::io::Write;
-        let (tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        let state_dir = owner.state_dir.clone();
-        let root_a = owner.dest_dir.clone();
-        let root_b = tmp.path().join("healthy-payload");
-        std::fs::create_dir_all(&root_a).unwrap();
-        std::fs::create_dir_all(&root_b).unwrap();
-        let mut first = pending_job(1);
-        first.status = JobStatus::Paused;
-        owner.state.jobs = vec![first, pending_job(2)];
-        let first = owner
-            .artifacts
-            .allocate_for_delivery(1, &root_a, &root_a.join("job-1"), false, false)
-            .unwrap();
-        owner
-            .artifacts
-            .allocate_for_delivery(2, &root_b, &root_b.join("job-2"), false, false)
-            .unwrap();
-        owner.save_snapshot();
-        pump(&mut owner, &mut messages).await;
-        let marker = state_dir
-            .join("artifact-identities")
-            .join(&first.id)
-            .join(format!("{}.json", first.generation));
-        let original = std::fs::read(&marker).unwrap();
-        owner.artifacts.close().unwrap();
-        drop(owner);
-        drop(messages);
-        std::fs::remove_file(&marker).unwrap();
-        assert!(std::process::Command::new("mkfifo")
-            .arg(&marker)
-            .status()
-            .unwrap()
-            .success());
-        let (opened, reader_started) = oneshot::channel();
-        let opening_path = marker.clone();
-        let writer = std::thread::spawn(move || {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(opening_path)
-                .unwrap();
-            let _ = opened.send(file);
-        });
-        let config = crate::EngineConfig::single_node(
-            Vec::new(),
-            state_dir.clone(),
-            root_a.clone(),
-            Tuning::default(),
-            None,
-        );
-        let starting = tokio::spawn(crate::Engine::spawn(config));
-        let engine = tokio::time::timeout(Duration::from_secs(2), starting)
-            .await
-            .expect("payload I/O blocked healthy queue metadata construction")
-            .unwrap()
-            .unwrap();
-        let blocked = tokio::time::timeout(Duration::from_secs(2), reader_started).await
-            .expect("active-allocation capability worker did not reach the explicit sidecar read barrier").unwrap();
-        writer.join().unwrap();
-        // Restore the pathname before releasing the existing descriptor, so
-        // later verification observes ordinary identity material rather than
-        // accidentally creating a second FIFO barrier.
-        struct Release {
-            path: PathBuf,
-            bytes: Vec<u8>,
-            writer: Option<std::fs::File>,
-        }
-        impl Drop for Release {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.path);
-                let _ = std::fs::write(&self.path, &self.bytes);
-                if let Some(mut writer) = self.writer.take() {
-                    let _ = writer.write_all(&self.bytes);
-                }
-            }
-        }
-        let release = Release {
-            path: marker,
-            bytes: original,
-            writer: Some(blocked),
-        };
-        assert_eq!(
-            engine.snapshot().jobs.len(),
-            2,
-            "metadata must retain both jobs while root A is blocked"
-        );
-        let document = tokio::time::timeout(Duration::from_secs(1), engine.recovery_document())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(document.jobs.len(), 2);
-        let first = document.jobs.iter().find(|job| job.id == JobId(1)).unwrap();
-        assert_eq!(first.status, JobStatus::Paused);
-        assert!(matches!(
-            first.files[0].segments[0].state,
-            SegmentState::Pending
-        ));
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if engine
-                    .snapshot()
-                    .jobs
-                    .iter()
-                    .find(|job| job.id == JobId(2))
-                    .is_some_and(|job| job.verification.is_none())
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("root B capability was held behind unrelated root A");
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), engine.pause_job(JobId(2)))
-                .await
-                .unwrap()
-                .unwrap(),
-            "healthy-state durable metadata control cannot wait for root A"
-        );
-        assert!(
-            release.writer.is_some(),
-            "the barrier remains closed through every metadata/control assertion"
-        );
-        drop(release);
-        assert!(
-            tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
-                .await
-                .unwrap()
-        );
-    }
-
-    fn guard_test_owner(
-        tuning: Tuning,
-    ) -> (
-        tempfile::TempDir,
-        Owner,
-        watch::Receiver<u64>,
-        mpsc::Receiver<EngineMsg>,
-    ) {
-        let (tmp, owner, epoch, _adapter, engine_messages) = guard_test_owner_with_backend(tuning);
-        (tmp, owner, epoch, engine_messages)
-    }
-
-    fn guard_test_owner_with_backend(
-        tuning: Tuning,
-    ) -> (
-        tempfile::TempDir,
-        Owner,
-        watch::Receiver<u64>,
-        crate::backend::BackendAdapterPort,
-        mpsc::Receiver<EngineMsg>,
-    ) {
-        let tmp = tempfile::tempdir().unwrap();
-        let (budget_tx, _) = watch::channel(crate::pool::BudgetEnvelope::default());
-        let (events, _) = broadcast::channel(1);
-        let (epoch_tx, epoch_rx) = watch::channel(0);
-        let (engine_tx, engine_messages) = mpsc::channel(1);
-        let (backend, adapter) = crate::backend::backend_channel(1, 1);
-        let owner = Owner::recover(
-            &tmp.path().join("state"),
-            None,
-            None,
-            tmp.path().join("dest"),
-            Vec::new(),
-            None,
-            Arc::new(Vec::new()),
-            tuning,
-            true,
-            false,
-            "guard-test",
-            None,
-            budget_tx,
-            crate::new_shared_snapshot(),
-            events,
-            epoch_tx,
-            Arc::new(SpeedMeter::new()),
-            Arc::new(RateLimiter::new(None)),
-            None,
-            None,
-            backend,
-            engine_tx,
-            TaskTracker::new(),
-            CancellationToken::new(),
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        )
-        .unwrap();
-        (tmp, owner, epoch_rx, adapter, engine_messages)
-    }
-
-    pub(super) fn control_test_owner() -> (
-        tempfile::TempDir,
-        Owner,
-        crate::backend::BackendAdapterPort,
-        mpsc::Receiver<EngineMsg>,
-    ) {
-        control_test_owner_with_persistence(true, None)
-    }
-
-    #[tokio::test]
-    async fn lifecycle_cohort_is_stamped_at_admission_not_later_url_allocation() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        let old = owner.state.admit_url(
-            "old-fetching".into(),
-            "http://example.test/old.nzb",
-            None,
-            0,
-        );
-        allocate_for_test(&mut owner, &mut messages, old, true).await;
-        let old_row = owner.state.job(old).unwrap();
-        assert!(!old_row.lifecycle_eligible());
-        assert!(
-            !owner
-                .artifacts
-                .for_job(old.0)
-                .unwrap()
-                .unwrap()
-                .automatic_cleanup_eligible
-        );
-
-        let new = owner.state.admit_url(
-            "new-fetching".into(),
-            "http://example.test/new.nzb",
-            None,
-            0,
-        );
-        mark_new_lifecycle_cohort(owner.state.job_mut(new).unwrap());
-        allocate_for_test(&mut owner, &mut messages, new, true).await;
-        let new_row = owner.state.job(new).unwrap();
-        assert!(new_row.lifecycle_eligible());
-        assert!(
-            owner
-                .artifacts
-                .for_job(new.0)
-                .unwrap()
-                .unwrap()
-                .automatic_cleanup_eligible
-        );
-
-        let mut torrent = new_row.clone();
-        torrent.kind = nzbd_types::JobKind::Torrent;
-        torrent
-            .params
-            .retain(|(key, _)| key != "*Runner:LifecycleEligible");
-        assert!(
-            !torrent.lifecycle_eligible(),
-            "torrent seeding sources stay outside the NZB cohort"
-        );
-    }
-
-    fn control_test_owner_with_persistence(
-        persist: bool,
-        persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-    ) -> (
-        tempfile::TempDir,
-        Owner,
-        crate::backend::BackendAdapterPort,
-        mpsc::Receiver<EngineMsg>,
-    ) {
-        let tmp = tempfile::tempdir().unwrap();
-        let (budget_tx, _) = watch::channel(crate::pool::BudgetEnvelope::default());
-        let (events, _) = broadcast::channel(1);
-        let (epoch_tx, _) = watch::channel(0);
-        let (engine_tx, engine_messages) = mpsc::channel(1);
-        let (backend, adapter) = crate::backend::backend_channel(1, 1);
-        let owner = Owner::recover(
-            &tmp.path().join("state"),
-            None,
-            None,
-            tmp.path().join("dest"),
-            Vec::new(),
-            None,
-            Arc::new(Vec::new()),
-            Tuning::default(),
-            true,
-            persist,
-            "control-test",
-            persist_guard,
-            budget_tx,
-            crate::new_shared_snapshot(),
-            events,
-            epoch_tx,
-            Arc::new(SpeedMeter::new()),
-            Arc::new(RateLimiter::new(None)),
-            None,
-            None,
-            backend,
-            engine_tx,
-            TaskTracker::new(),
-            CancellationToken::new(),
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        )
-        .unwrap();
-        (tmp, owner, adapter, engine_messages)
-    }
-
-    #[tokio::test]
-    async fn keep_on_failure_is_opt_in_and_snapshot_committed_before_ack() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(pending_job(1));
-        let (reply, result) = oneshot::channel();
-        owner.on_command(QueueCommand::SetKeepOnFailure {
-            job: JobId(1),
-            keep: true,
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(result.await.unwrap());
-        let saved = SnapshotStore::open(&owner.state_dir)
-            .unwrap()
-            .load()
-            .unwrap()
-            .unwrap();
-        assert!(saved.jobs[0]
-            .params
-            .iter()
-            .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1"));
-
-        // A preallocation opt-in must be copied atomically into the first
-        // source generation, then consulted by the real failed-payload
-        // disposal path. The queue snapshot remains the authority only until
-        // that generation exists.
-        allocate_for_test(&mut owner, &mut messages, JobId(1), true).await;
-        let source = owner.artifacts.for_job(1).unwrap().unwrap();
-        assert!(source.keep_on_failure);
-        std::fs::write(source.path.join("partial.bin"), b"failed partial payload").unwrap();
-        owner
-            .artifacts
-            .finish(1, &source.path, &source.root, "active")
-            .unwrap();
-        let attempt = owner.artifacts.acquire_attempt_use(1).unwrap().unwrap();
-        assert!(owner
-            .artifacts
-            .delete_failed_payload(&attempt, 1, &|| Ok(()))
-            .is_err());
-        assert!(source.path.join("partial.bin").exists());
-
-        let (reply, result) = oneshot::channel();
-        owner.on_command(QueueCommand::SetKeepOnFailure {
-            job: JobId(1),
-            keep: false,
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(result.await.unwrap());
-        let saved = SnapshotStore::open(&owner.state_dir)
-            .unwrap()
-            .load()
-            .unwrap()
-            .unwrap();
-        assert!(!saved.jobs[0]
-            .params
-            .iter()
-            .any(|(key, _)| key == "*Runner:KeepOnFailure"));
-        assert!(owner
-            .artifacts
-            .delete_failed_payload(&attempt, 1, &|| Ok(()))
-            .is_ok());
-    }
-
-    #[tokio::test]
-    async fn terminal_failed_job_can_keep_only_its_retained_delivery_source() {
-        let (tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        let mut job = pending_job(57);
-        job.status = JobStatus::Failed;
-        owner.state.jobs.push(job);
-
-        let source = owner.dest_dir.join("failed-source-57");
-        owner
-            .artifacts
-            .allocate_for_delivery(57, &owner.dest_dir, &source, true, true)
-            .unwrap();
-        std::fs::write(source.join("episode.mkv"), b"verified payload").unwrap();
-        owner
-            .artifacts
-            .finish(57, &source, &owner.dest_dir, "active")
-            .unwrap();
-        let selected = owner
-            .artifacts
-            .for_job(57)
-            .unwrap()
-            .unwrap()
-            .files
-            .into_iter()
-            .filter(|entry| entry.path == "episode.mkv")
-            .collect::<Vec<_>>();
-        let completed = tmp.path().join("completed");
-        std::fs::create_dir(&completed).unwrap();
-        owner
-            .artifacts
-            .publish_selected_for_delivery_checked(
-                57,
-                &completed.join("published-generation"),
-                selected,
-                vec![nzbd_state::artifacts::DeliveryFileOutcome {
-                    source_path: "episode.mkv".into(),
-                    publication_path: Some("episode.mkv".into()),
-                    classification: "video".into(),
-                    outcome: "published".into(),
-                    reason: Some("verified complete media".into()),
-                    repair_dependency: false,
-                    source_cleanup_status: "pending".into(),
-                }],
-                &|| Ok(()),
-            )
-            .unwrap();
-        let delivery = owner
-            .artifacts
-            .create_delivery_with_outcome_and_keep(
-                57,
-                true,
-                Some("keep-terminal-source-test"),
-                "FAILURE/HEALTH",
-                Some("health"),
-                Some("partial salvage"),
-                false,
-            )
-            .unwrap();
-        let source_id = delivery.source_artifact_id.clone();
-        let source_generation = delivery.source_generation.clone();
-        owner
-            .state
-            .url_admission_receipts
-            .push(UrlAdmissionReceipt {
-                protocol_version: 1,
-                request_token: "keep-source-tombstone-57".into(),
-                submission_sha256: "submission-hash".into(),
-                job_id: 57,
-                generation: "admission-generation".into(),
-                runner_instance_id: "runner-instance".into(),
-                terminal_outcome: Some("FAILURE/HEALTH".into()),
-                outcome: "failed".into(),
-                failure_stage: Some("health".into()),
-                failure_cause: Some("partial salvage".into()),
-                custody_state: "runner_owned".into(),
-                keep_source_on_failure: false,
-                source_cleanup_status: Some("pending".into()),
-                publication_path: Some(
-                    completed.join("published-generation").display().to_string(),
-                ),
-                source_artifact_id: Some(source_id.clone()),
-                source_generation: Some(source_generation.clone()),
-            });
-
-        let (reply, result) = oneshot::channel();
-        owner.on_command(QueueCommand::SetKeepOnFailure {
-            job: JobId(57),
-            keep: true,
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(result.await.unwrap());
-        assert!(owner.artifacts.get(&source_id).unwrap().keep_on_failure);
-        assert!(owner.state.url_admission_receipts[0].keep_source_on_failure);
-        assert_eq!(
-            owner.artifacts.get(&delivery.artifact_id).unwrap().state,
-            "transferred"
-        );
-
-        let (reply, result) = oneshot::channel();
-        owner.on_command(QueueCommand::SetKeepOnFailure {
-            job: JobId(57),
-            keep: false,
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(result.await.unwrap());
-        assert!(!owner.artifacts.get(&source_id).unwrap().keep_on_failure);
-        assert!(!owner.state.url_admission_receipts[0].keep_source_on_failure);
-
-        // Once the visible queue/history row is gone, the durable source
-        // generation still refreshes the receipt, and stale queue params no
-        // longer overwrite its live Keep preference.
-        owner.state.jobs.clear();
-        owner.artifacts.set_keep_on_failure(57, true).unwrap();
-        let (reply, result) = oneshot::channel();
-        owner.on_command(QueueCommand::GetUrlAdmission {
-            request_token: "keep-source-tombstone-57".into(),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(result.await.unwrap().unwrap().keep_source_on_failure);
-        owner.artifacts.set_keep_on_failure(57, false).unwrap();
-        let (reply, result) = oneshot::channel();
-        owner.on_command(QueueCommand::GetUrlAdmission {
-            request_token: "keep-source-tombstone-57".into(),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(!result.await.unwrap().unwrap().keep_source_on_failure);
-        assert!(
-            !owner
-                .artifacts
-                .delivery(&delivery.delivery_id)
-                .unwrap()
-                .keep_source_on_failure,
-            "the original Delivery choice remains immutable"
-        );
-    }
-
-    #[tokio::test]
-    async fn keep_request_does_not_succeed_after_source_generation_is_deleted() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        let mut job = pending_job(63);
-        job.status = JobStatus::Failed;
-        owner.state.jobs.push(job);
-        let source = owner.dest_dir.join("deleted-source-63");
-        owner
-            .artifacts
-            .allocate_for_delivery(63, &owner.dest_dir, &source, true, false)
-            .unwrap();
-        std::fs::write(source.join("payload.mkv"), b"failed payload").unwrap();
-        owner
-            .artifacts
-            .finish(63, &source, &owner.dest_dir, "parked_failed")
-            .unwrap();
-        let artifact = owner.artifacts.for_job(63).unwrap().unwrap();
-        let deletion = owner
-            .artifacts
-            .request_delete(&artifact.id, artifact.revision, "delete-source-63", 0)
-            .unwrap();
-        owner.artifacts.execute_delete(&deletion.id).unwrap();
-
-        let (reply, result) = oneshot::channel();
-        owner.on_command(QueueCommand::SetKeepOnFailure {
-            job: JobId(63),
-            keep: true,
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(!result.await.unwrap());
-        assert!(!owner.state.jobs[0]
-            .params
-            .iter()
-            .any(|(key, _)| key == "*Runner:KeepOnFailure"));
-    }
-
-    #[tokio::test]
-    async fn intact_publication_clears_previous_private_repair_marker() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        let mut job = pending_job(1);
-        let file = job.files[0].id;
-        job.params
-            .push((format!("*File:repair:{}", file.0), "5".into()));
-        job.files[0].segments[0].state = SegmentState::Done {
-            offset: 0,
-            len: 5,
-            crc: crc32fast::hash(b"hello"),
-        };
-        owner.state.jobs.push(job);
-        owner.file_sizes.insert(file, 5);
-        let (tx, mut rx) = mpsc::channel(8);
-        let (_done, stopped) = watch::channel(false);
-        owner.writers.insert(
-            file,
-            WriterHandle {
-                tx,
-                stop: CancellationToken::new(),
-                stopped,
-                generation: 0,
-            },
-        );
-        owner.send_finalize(JobId(1), file);
-        pump(&mut owner, &mut messages).await;
-        assert!(!owner.state.job(JobId(1)).unwrap().file_needs_repair(file));
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            WriteCmd::PublicationName(_)
-        ));
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            WriteCmd::Finalize {
-                combined_crc: Some(_),
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn yenc_name_variations_keep_the_first_name_but_size_and_path_conflicts_hold() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        for id in 1..=3 {
-            owner.state.jobs.push(pending_job(id));
-        }
-        let file = owner.state.job(JobId(1)).unwrap().files[0].id;
-        owner.accept_file_metadata(JobId(1), file, "first.bin", 100);
-        pump(&mut owner, &mut messages).await;
-        owner.accept_file_metadata(JobId(1), file, "different-obfuscated-name", 100);
-        pump(&mut owner, &mut messages).await;
-        assert!(!owner.state.job(JobId(1)).unwrap().held());
-        assert_eq!(
-            owner.state.job(JobId(1)).unwrap().files[0].filename,
-            "first.bin"
-        );
-        owner.accept_file_metadata(JobId(1), file, "third-name", 101);
-        pump(&mut owner, &mut messages).await;
-        let control = owner.state.job(JobId(1)).unwrap().control().unwrap();
-        assert_eq!(control.cause, "identity_conflict");
-        assert_eq!(control.message, "conflicting yEnc declared size");
-
-        for (id, name, size) in [(2, "../unsafe", 100), (3, "empty.bin", 0)] {
-            let file = owner.state.job(JobId(id)).unwrap().files[0].id;
-            owner.accept_file_metadata(JobId(id), file, name, size);
-            pump(&mut owner, &mut messages).await;
-            assert!(owner.state.job(JobId(id)).unwrap().held());
-        }
-    }
-
-    #[tokio::test]
-    async fn payload_retirement_retries_keep_original_acknowledgements_and_fence_resume() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        std::fs::create_dir_all(&owner.dest_dir).unwrap();
-        let job = pending_job(1);
-        let file = job.files[0].id;
-        owner.state.jobs.push(job);
-        allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
-        let (tx, _rx) = mpsc::channel(1);
-        let (done, stopped) = watch::channel(false);
-        owner.writers.insert(
-            file,
-            WriterHandle {
-                tx,
-                stop: CancellationToken::new(),
-                stopped,
-                generation: 0,
-            },
-        );
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::QuiescePayload {
-            job: JobId(1),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        let first = rx.await.unwrap().unwrap();
-        assert_eq!(first.len(), 1);
-        assert!(!*first[0].stopped.borrow());
-        drop(first); // the timed-out HTTP request loses its receivers
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::Resume {
-            job: JobId(1),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(!rx.await.unwrap());
-        assert!(owner.ensure_allocation(JobId(1), false).is_err());
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::QuiescePayload {
-            job: JobId(1),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        let mut retry = rx.await.unwrap().unwrap();
-        assert_eq!(retry.len(), 1);
-        assert!(!*retry[0].stopped.borrow());
-        done.send(true).unwrap();
-        retry[0].stopped.wait_for(|v| *v).await.unwrap();
-        assert_eq!(
-            owner.artifacts.for_job(1).unwrap().unwrap().state,
-            "retiring"
-        );
-    }
-
-    fn control_torrent_job() -> Job {
-        let mut job = bare_job();
-        job.kind = JobKind::Torrent;
-        job.status = JobStatus::Queued;
-        job.torrent = Some(nzbd_types::TorrentRecord {
-            info_hash_v1: "0123456789abcdef0123456789abcdef01234567".into(),
-            source: nzbd_types::TorrentSource::Metainfo,
-            metadata_file: "meta/control.torrent".into(),
-            payload_root: PathBuf::new(),
-            phase: nzbd_types::TorrentPhase::Queued,
-            control_intent: TorrentControlIntent::Running,
-            removal_intent: None,
-            removal_outcome: None,
-            removal_confirmed_at_unix: None,
-            stop_reason: None,
-            files: Vec::new(),
-            total_bytes: 1,
-            selected_bytes: 1,
-            downloaded_bytes: 0,
-            uploaded_bytes: 0,
-            seeding_seconds: 0,
-            ready_at_unix: None,
-            content_path: None,
-            seed_policy: Default::default(),
-            last_activity_unix: None,
-            last_error: None,
-        });
-        job
-    }
-
-    #[tokio::test]
-    async fn torrent_snapshot_reports_payload_progress_and_live_rates() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        let mut job = control_torrent_job();
-        job.status = JobStatus::Downloading;
-        let id = job.id;
-        let torrent = job.torrent.as_mut().unwrap();
-        torrent.total_bytes = 8192;
-        torrent.selected_bytes = 4096;
-        torrent.downloaded_bytes = 1024;
-        torrent.files = vec![
-            nzbd_types::TorrentFileRecord {
-                path: "first.iso".into(),
-                length: 1024,
-                selected: true,
-                downloaded_bytes: 1024,
-            },
-            nzbd_types::TorrentFileRecord {
-                path: "second.iso".into(),
-                length: 3072,
-                selected: true,
-                downloaded_bytes: 0,
-            },
-            nzbd_types::TorrentFileRecord {
-                path: "unselected.iso".into(),
-                length: 4096,
-                selected: false,
-                downloaded_bytes: 0,
-            },
-        ];
-        owner.state.jobs.push(job);
-        owner.torrent_progress.insert(
-            id,
-            crate::backend::TransferProgress {
-                download_bps: 512,
-                upload_bps: 128,
-                useful_peers: 3,
-                ..Default::default()
-            },
-        );
-        owner.server_wire_ema.insert(1, 256.0);
-        owner.publish_now();
-        owner.publish_now(); // Structural publications must not add the torrent rate twice.
-        let snapshot = owner.shared.load();
-        let row = &snapshot.jobs[0];
-        assert_eq!(
-            (row.size_bytes, row.downloaded_bytes, row.remaining_bytes),
-            (4096, 1024, 3072)
-        );
-        assert_eq!((row.files_total, row.files_done), (2, 1));
-        assert_eq!(
-            (row.rate_bps, row.upload_rate_bps, row.useful_peers),
-            (512, 128, 3)
-        );
-        assert_eq!(snapshot.remaining_bytes, 3072);
-        assert_eq!(snapshot.download_rate_bps, 768);
-        assert_eq!(
-            snapshot
-                .server_volumes
-                .iter()
-                .map(|v| v.rate_bps)
-                .sum::<u64>(),
-            768
-        );
-    }
-
-    #[tokio::test]
-    async fn seed_policy_stop_survives_restart_and_requires_a_new_policy_to_resume() {
-        let (_tmp, mut owner, mut adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        let mut job = control_torrent_job();
-        job.status = JobStatus::Downloading;
-        let torrent = job.torrent.as_mut().unwrap();
-        torrent.phase = TorrentPhase::Seeding;
-        torrent.ready_at_unix = Some(100);
-        torrent.downloaded_bytes = 1;
-        owner.state.jobs.push(job);
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::SetTorrentSeedPolicy {
-            job: JobId(1),
-            policy: nzbd_types::SeedPolicy {
-                stop_on_complete: true,
-                ..Default::default()
-            },
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(rx.await.unwrap());
-        assert_eq!(
-            adapter.next_command().await,
-            Some(BackendCommand::PauseForSeedPolicy { job: JobId(1) })
-        );
-        let persisted = SnapshotStore::open(&owner.state_dir)
-            .unwrap()
-            .load()
-            .unwrap()
-            .unwrap();
-        let saved = persisted.jobs[0].torrent.as_ref().unwrap();
-        assert!(saved.seed_policy.stop_on_complete);
-        assert_eq!(
-            saved.stop_reason,
-            Some(nzbd_types::TorrentStopReason::DownloadComplete)
-        );
-        assert_eq!(saved.control_intent, TorrentControlIntent::Paused);
-        assert_eq!(
-            owner.shared.load().jobs[0].seed_stop_reason,
-            saved.stop_reason
-        );
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::Resume {
-            job: JobId(1),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(!rx.await.unwrap());
-
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::SetTorrentSeedPolicy {
-            job: JobId(1),
-            policy: Default::default(),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(rx.await.unwrap());
-        assert_eq!(
-            owner.state.jobs[0].status,
-            JobStatus::Paused,
-            "editing a policy must not restart a stopped seed"
-        );
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::Resume {
-            job: JobId(1),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(rx.await.unwrap());
-        assert_eq!(
-            owner.state.jobs[0].torrent.as_ref().unwrap().stop_reason,
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn torrent_missing_file_recovery_is_not_blocked_by_a_completed_seed_policy() {
-        let (tmp, mut owner, mut adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        let mut job = control_torrent_job();
-        job.status = JobStatus::Paused;
-        let torrent = job.torrent.as_mut().unwrap();
-        torrent.phase = TorrentPhase::MissingFiles;
-        torrent.ready_at_unix = Some(100);
-        torrent.content_path = Some(PathBuf::from("/payload"));
-        torrent.seed_policy.stop_on_complete = true;
-        owner.state.jobs.push(job);
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::Resume {
-            job: JobId(1),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(rx.await.unwrap());
-        owner.schedule_torrent_starts();
-        pump(&mut owner, &mut messages).await;
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), adapter.next_command())
-                .await
-                .unwrap(),
-            Some(BackendCommand::Start { job: JobId(1) })
-        );
-        let torrent = owner.state.jobs[0].torrent.as_ref().unwrap();
-        assert_eq!(torrent.phase, TorrentPhase::Queued);
-        assert_eq!(torrent.ready_at_unix, None);
-        assert_eq!(torrent.content_path, None);
-        assert!(torrent.seed_policy.stop_on_complete);
-        let persisted = SnapshotStore::open(&owner.state_dir)
-            .unwrap()
-            .load()
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            persisted.jobs[0].torrent.as_ref().unwrap().ready_at_unix,
-            None
-        );
-        let payload_root = tmp.path().join("payload");
-        std::fs::create_dir_all(&payload_root).unwrap();
-        let content_path = payload_root.join("recovered.bin");
-        std::fs::write(&content_path, b"x").unwrap();
-        owner.torrent_payload_roots = vec![payload_root];
-        adapter.progress(
-            JobId(1),
-            crate::backend::TransferProgress {
-                verified_bytes: 1,
-                ..Default::default()
-            },
-        );
-        adapter
-            .structural(BackendFact::Ready {
-                job: JobId(1),
-                content_path,
-            })
-            .await
-            .unwrap();
-        owner.fold_backend_progress();
-        pump(&mut owner, &mut messages).await;
-        owner.fold_backend_structural();
-        pump(&mut owner, &mut messages).await;
-        owner.update_seed_policies(200);
-        pump(&mut owner, &mut messages).await;
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), adapter.next_command())
-                .await
-                .unwrap(),
-            Some(BackendCommand::PauseForSeedPolicy { job: JobId(1) })
-        );
-        let torrent = owner.state.jobs[0].torrent.as_ref().unwrap();
-        assert!(torrent.ready_at_unix.is_some());
-        assert_eq!(
-            torrent.stop_reason,
-            Some(nzbd_types::TorrentStopReason::DownloadComplete)
-        );
-    }
-
-    #[tokio::test]
-    async fn torrent_storage_recovery_clears_the_stop_reason() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        let mut job = control_torrent_job();
-        job.status = JobStatus::Paused;
-        let torrent = job.torrent.as_mut().unwrap();
-        torrent.phase = TorrentPhase::PausedDownload;
-        torrent.last_error = Some("storage full".into());
-        torrent.stop_reason = Some(nzbd_types::TorrentStopReason::StorageFull);
-        owner.state.jobs.push(job);
-        owner.release_torrents_after_storage_recovery();
-        pump(&mut owner, &mut messages).await;
-        let torrent = owner.state.jobs[0].torrent.as_ref().unwrap();
-        assert_eq!(torrent.phase, TorrentPhase::Queued);
-        assert_eq!(torrent.stop_reason, None);
-        assert_eq!(torrent.last_error, None);
-    }
-
-    #[tokio::test]
-    async fn seed_policy_save_failure_rolls_back_without_stopping_the_torrent() {
-        let (_tmp, mut owner, mut adapter, mut messages) =
-            control_test_owner_with_persistence(true, Some(Arc::new(|| false)));
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(control_torrent_job());
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::SetTorrentSeedPolicy {
-            job: JobId(1),
-            policy: nzbd_types::SeedPolicy {
-                stop_on_complete: true,
-                ..Default::default()
-            },
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(!rx.await.unwrap());
-        assert_eq!(
-            owner.state.jobs[0].torrent.as_ref().unwrap().seed_policy,
-            Default::default()
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn torrent_control_is_persisted_before_fifo_delivery_and_is_idempotent() {
-        let (tmp, mut owner, mut adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(control_torrent_job());
-
-        let (reply, mut rx) = oneshot::channel();
-        owner.on_command(QueueCommand::Pause {
-            job: JobId(1),
-            reply,
-        });
-        assert!(
-            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
-            "control acknowledgement must wait for the actual worker completion"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(1), adapter.next_command())
-                .await
-                .is_err(),
-            "backend delivery must wait for durable owner acceptance"
-        );
-        pump(&mut owner, &mut messages).await;
-        assert!(rx.await.unwrap());
-        assert_eq!(
-            adapter.next_command().await,
-            Some(BackendCommand::Pause { job: JobId(1) })
-        );
-
-        let persisted = SnapshotStore::open(&owner.state_dir)
-            .unwrap()
-            .load()
-            .unwrap()
-            .unwrap();
-        let torrent = persisted.jobs[0].torrent.as_ref().unwrap();
-        assert_eq!(persisted.jobs[0].status, JobStatus::Paused);
-        assert_eq!(torrent.control_intent, TorrentControlIntent::Paused);
-        assert_eq!(
-            torrent.stop_reason,
-            Some(nzbd_types::TorrentStopReason::Manual)
-        );
-
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::Pause {
-            job: JobId(1),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(!rx.await.unwrap());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
-                .await
-                .is_err()
-        );
-
-        let paused = owner.state.jobs[0].torrent.as_mut().unwrap();
-        paused.phase = nzbd_types::TorrentPhase::PausedDownload;
-        paused.last_activity_unix = Some(1);
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::Resume {
-            job: JobId(1),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(rx.await.unwrap());
-        owner.schedule_torrent_starts();
-        pump(&mut owner, &mut messages).await;
-        assert_eq!(
-            adapter.next_command().await,
-            Some(BackendCommand::Start { job: JobId(1) })
-        );
-        assert!(tmp.path().join("state/queue.json").exists());
-    }
-
-    #[tokio::test]
-    async fn failed_persistence_never_emits_a_torrent_control() {
-        let (_tmp, mut owner, mut adapter, mut messages) =
-            control_test_owner_with_persistence(true, Some(Arc::new(|| false)));
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(control_torrent_job());
-
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::Pause {
-            job: JobId(1),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-
-        assert!(!rx.await.unwrap());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
-                .await
-                .is_err(),
-            "a failed durability barrier must prevent FIFO delivery"
-        );
-        let job = owner.state.job(JobId(1)).unwrap();
-        assert_eq!(job.status, JobStatus::Queued);
-        assert_eq!(
-            job.torrent.as_ref().unwrap().control_intent,
-            TorrentControlIntent::Running
-        );
-    }
-
-    #[tokio::test]
-    async fn full_backend_fifo_retries_retained_torrent_commands_in_order() {
-        let (_tmp, mut owner, mut adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(control_torrent_job());
-
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::Pause {
-            job: JobId(1),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(rx.await.unwrap());
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::SetPriority {
-            job: JobId(1),
-            priority: 77,
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(rx.await.unwrap());
-        assert_eq!(owner.pending_backend_commands.len(), 1);
-
-        assert_eq!(
-            adapter.next_command().await,
-            Some(BackendCommand::Pause { job: JobId(1) })
-        );
-        owner.flush_backend_commands();
-        assert_eq!(
-            adapter.next_command().await,
-            Some(BackendCommand::SetPriority {
-                job: JobId(1),
-                priority: 77
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn retained_backend_commands_precede_later_control_requests() {
-        let (_tmp, mut owner, mut adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(control_torrent_job());
-
-        for command in [
-            QueueCommand::Pause {
-                job: JobId(1),
-                reply: oneshot::channel().0,
-            },
-            QueueCommand::SetPriority {
-                job: JobId(1),
-                priority: 77,
-                reply: oneshot::channel().0,
-            },
-        ] {
-            owner.on_command(command);
-            pump(&mut owner, &mut messages).await;
-        }
-        assert_eq!(owner.pending_backend_commands.len(), 1);
-        assert_eq!(
-            adapter.next_command().await,
-            Some(BackendCommand::Pause { job: JobId(1) })
-        );
-
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::Resume {
-            job: JobId(1),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(rx.await.unwrap());
-        owner.schedule_torrent_starts();
-        pump(&mut owner, &mut messages).await;
-        assert_eq!(owner.pending_backend_commands.len(), 2);
-
-        owner.flush_backend_commands();
-        assert_eq!(
-            adapter.next_command().await,
-            Some(BackendCommand::SetPriority {
-                job: JobId(1),
-                priority: 77
-            })
-        );
-        owner.flush_backend_commands();
-        assert_eq!(
-            adapter.next_command().await,
-            Some(BackendCommand::Start { job: JobId(1) })
-        );
-    }
-
-    #[tokio::test]
-    async fn worker_mode_torrent_controls_do_not_require_queue_persistence() {
-        let (_tmp, mut owner, mut adapter, mut messages) =
-            control_test_owner_with_persistence(false, None);
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(control_torrent_job());
-
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::Pause {
-            job: JobId(1),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-
-        assert!(rx.await.unwrap());
-        assert_eq!(
-            adapter.next_command().await,
-            Some(BackendCommand::Pause { job: JobId(1) })
-        );
-    }
-
-    #[tokio::test]
-    async fn retained_backend_commands_are_bounded_before_persisting_new_intent() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(control_torrent_job());
-
-        for priority in 1..=MAX_PENDING_BACKEND_COMMANDS + 1 {
-            let (reply, rx) = oneshot::channel();
-            owner.on_command(QueueCommand::SetPriority {
-                job: JobId(1),
-                priority: priority as i32,
-                reply,
-            });
-            pump(&mut owner, &mut messages).await;
-            assert!(rx.await.unwrap());
-        }
-        assert_eq!(
-            owner.pending_backend_commands.len(),
-            MAX_PENDING_BACKEND_COMMANDS
-        );
-
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::SetPriority {
-            job: JobId(1),
-            priority: (MAX_PENDING_BACKEND_COMMANDS + 2) as i32,
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(!rx.await.unwrap());
-        assert_eq!(
-            owner.pending_backend_commands.len(),
-            MAX_PENDING_BACKEND_COMMANDS
-        );
-        assert_eq!(
-            owner.state.job(JobId(1)).unwrap().priority,
-            (MAX_PENDING_BACKEND_COMMANDS + 1) as i32
-        );
-    }
-
-    #[tokio::test]
-    async fn latest_backend_progress_is_folded_without_a_fifo_backlog() {
-        let (_tmp, mut owner, adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(control_torrent_job());
-        for verified in 0..50_000 {
-            adapter.progress(
-                JobId(1),
-                crate::backend::TransferProgress {
-                    verified_bytes: verified,
-                    ..Default::default()
-                },
-            );
-        }
-        owner.fold_backend_progress();
-        pump(&mut owner, &mut messages).await;
-        assert_eq!(
-            owner
-                .state
-                .job(JobId(1))
-                .unwrap()
-                .torrent
-                .as_ref()
-                .unwrap()
-                .downloaded_bytes,
-            1,
-            "the latest sample is folded once and clamped to selected bytes"
-        );
-    }
-
-    fn bare_job() -> Job {
-        Job {
-            id: JobId(1),
-            kind: nzbd_types::JobKind::Nzb,
-            name: "x".into(),
-            dir_name: String::new(),
-            name_provisional: false,
-            delivery_lifecycle: false,
-            queued_at_unix: 0,
-            original_name: String::new(),
-            category: None,
-            priority: 0,
-            dupe: Default::default(),
-            params: vec![],
-            files: vec![],
-            totals: Default::default(),
-            status: JobStatus::PostQueued,
-            torrent: None,
-            stages: vec![],
-        }
-    }
-
-    fn pending_job(id: u32) -> Job {
-        let mut job = bare_job();
-        job.id = JobId(id);
-        job.name = format!("job-{id}");
-        job.dir_name = job.name.clone();
-        job.status = JobStatus::Queued;
-        job.files = vec![nzbd_types::FileEntry {
-            id: FileId(id * 10),
-            subject: "payload.bin".into(),
-            filename: "payload.bin".into(),
-            filename_confirmed: true,
-            is_par2: false,
-            paused: false,
-            groups: vec!["alt.test".into()],
-            date: None,
-            segments: vec![nzbd_types::Segment {
-                message_id: "part@example".into(),
-                number: 1,
-                size: 100,
-                state: SegmentState::Pending,
-            }],
-            crc32: None,
-            finalized: false,
-        }];
-        recompute_job_totals(&mut job);
-        job
-    }
-
-    fn install_control_test_server(owner: &mut Owner) {
-        owner.servers = Arc::new(vec![ServerDef {
-            id: ServerId(1),
-            name: "test".into(),
-            host: "localhost".into(),
-            port: 119,
-            tls: nzbd_types::TlsMode::None,
-            username: None,
-            password: None,
-            active: true,
-            tier: 0,
-            group: 0,
-            fill: false,
-            max_connections: 2,
-            pipeline_depth: 1,
-            retention_days: 0,
-            cert_verification: nzbd_types::CertLevel::Strict,
-        }]);
-    }
-
-    async fn block_control_test_io(owner: &mut Owner) -> std::sync::mpsc::Sender<()> {
-        let (started, started_rx) = oneshot::channel();
-        let (release, wait) = std::sync::mpsc::channel();
-        owner.io_then(
-            move || {
-                let _ = started.send(());
-                wait.recv().expect("release blocked control test IO");
-                Ok(())
-            },
-            |_, result| result.expect("blocked control test IO completes"),
-        );
-        tokio::time::timeout(Duration::from_secs(1), started_rx)
-            .await
-            .expect("IO worker started")
-            .expect("worker start signal");
-        release
-    }
-
-    #[tokio::test]
-    async fn pending_payload_allocation_does_not_starve_an_allocated_job() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        install_control_test_server(&mut owner);
-        owner.state.jobs = vec![pending_job(1), pending_job(2)];
-        allocate_for_test(&mut owner, &mut messages, JobId(2), false).await;
-        owner.allocating_jobs.insert(JobId(1));
-
-        let leases = grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1).await;
-        assert_eq!(leases.len(), 1);
-        assert_eq!(leases[0].r.job, JobId(2));
-        assert!(matches!(
-            &owner
-                .state
-                .segment_mut(SegRef {
-                    job: JobId(1),
-                    file: FileId(10),
-                    seg_number: 1,
-                })
-                .unwrap()
-                .state,
-            SegmentState::Pending
-        ));
-    }
-
-    #[tokio::test]
-    async fn resume_waits_for_durable_revision_and_failure_keeps_both_schedulers_fenced() {
-        // NZB lease path: a queued in-memory Resume stays ineligible while its
-        // exact control revision is waiting on the ordered IO/snapshot lane.
-        let (_tmp, mut owner, _adapter, mut messages) =
-            control_test_owner_with_persistence(true, Some(Arc::new(|| false)));
-        pump(&mut owner, &mut messages).await;
-        install_control_test_server(&mut owner);
-        let mut job = pending_job(1);
-        job.status = JobStatus::Paused;
-        owner.state.jobs.push(job);
-        allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
-        let release = block_control_test_io(&mut owner).await;
-        let (reply, resumed) = oneshot::channel();
-        owner.on_command(QueueCommand::Resume {
-            job: JobId(1),
-            reply,
-        });
-        assert!(owner.pending_control_revisions.contains_key(&JobId(1)));
-        assert!(owner.grant_work(ServerId(1), 1).is_empty());
-        assert!(
-            owner.writer_for(JobId(1), FileId(10)).is_closed(),
-            "direct writer acquisition must honor the same durable control fence"
-        );
-        release.send(()).unwrap();
-        pump(&mut owner, &mut messages).await;
-        assert!(!resumed.await.unwrap());
-        assert!(owner.state.job(JobId(1)).unwrap().held());
-        assert!(!owner.pending_control_revisions.contains_key(&JobId(1)));
-        assert!(owner.grant_work(ServerId(1), 1).is_empty());
-
-        // Torrent Start follows the same fence and remains stopped on failed
-        // persistence, even though the in-memory control intent is Running.
-        let (_tmp, mut owner, mut adapter, mut messages) =
-            control_test_owner_with_persistence(true, Some(Arc::new(|| false)));
-        pump(&mut owner, &mut messages).await;
-        let mut torrent = control_torrent_job();
-        torrent.status = JobStatus::Paused;
-        let control = torrent.torrent.as_mut().unwrap();
-        control.phase = TorrentPhase::PausedDownload;
-        control.control_intent = TorrentControlIntent::Paused;
-        owner.state.jobs.push(torrent);
-        let release = block_control_test_io(&mut owner).await;
-        let (reply, resumed) = oneshot::channel();
-        owner.on_command(QueueCommand::Resume {
-            job: JobId(1),
-            reply,
-        });
-        owner.schedule_torrent_starts();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
-                .await
-                .is_err()
-        );
-        release.send(()).unwrap();
-        pump(&mut owner, &mut messages).await;
-        assert!(!resumed.await.unwrap());
-        assert!(owner.state.job(JobId(1)).unwrap().held());
-        owner.schedule_torrent_starts();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn obsolete_resume_callback_cannot_release_newer_pause_revision() {
-        let (_tmp, mut owner, mut adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        let mut torrent = control_torrent_job();
-        torrent.status = JobStatus::Paused;
-        let control = torrent.torrent.as_mut().unwrap();
-        control.phase = TorrentPhase::PausedDownload;
-        control.control_intent = TorrentControlIntent::Paused;
-        owner.state.jobs.push(torrent);
-        let release = block_control_test_io(&mut owner).await;
-
-        let (resume_reply, resumed) = oneshot::channel();
-        owner.on_command(QueueCommand::Resume {
-            job: JobId(1),
-            reply: resume_reply,
-        });
-        let resume_revision = *owner.pending_control_revisions.get(&JobId(1)).unwrap();
-        let (pause_reply, paused) = oneshot::channel();
-        owner.on_command(QueueCommand::Pause {
-            job: JobId(1),
-            reply: pause_reply,
-        });
-        let pause_revision = *owner.pending_control_revisions.get(&JobId(1)).unwrap();
-        assert_ne!(resume_revision, pause_revision);
-        owner.schedule_torrent_starts();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
-                .await
-                .is_err()
-        );
-
-        release.send(()).unwrap();
-        pump(&mut owner, &mut messages).await;
-        assert!(!resumed.await.unwrap());
-        assert!(paused.await.unwrap());
-        assert!(!owner.pending_control_revisions.contains_key(&JobId(1)));
-        assert_eq!(owner.state.job(JobId(1)).unwrap().status, JobStatus::Paused);
-        assert!(
-            matches!(
-                tokio::time::timeout(Duration::from_secs(1), adapter.next_command())
-                    .await
-                    .expect("durable Pause reaches the backend"),
-                Some(BackendCommand::Pause { job: JobId(1) })
-            ),
-            "only the newer durable Pause may reach the backend"
-        );
-        owner.schedule_torrent_starts();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn url_download_allocates_fresh_directory_beside_retained_payload() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        let post = nzbd_nserv::build_post("release", &[("payload.bin", vec![7; 100])], 100);
-        let parsed = nzbd_nzb::parse(post.nzb.as_bytes()).unwrap();
-        let id = owner
-            .state
-            .admit_url("release".into(), "http://example.test/file.nzb", None, 0);
-        let retained = owner.dest_dir.join("release");
-        std::fs::create_dir_all(&retained).unwrap();
-        std::fs::write(retained.join("old.bin"), b"retained bytes").unwrap();
-        let collision = owner.dest_dir.join(format!("release.job-{}-0", id.0));
-        std::fs::create_dir(&collision).unwrap();
-
-        let (reply, result) = oneshot::channel();
-        owner.on_command(QueueCommand::CompleteUrlFetch {
-            job: id,
-            parsed: Box::new(parsed),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(result.await.unwrap());
-        let job = owner.state.job(id).unwrap();
-        assert_eq!(job.name, "release");
-        assert_eq!(job.status, JobStatus::Queued);
-        let expected = format!("release.job-{}-1", id.0);
-        assert_eq!(job.dir_name, expected);
-        let allocation = owner.artifacts.for_job(id.0).unwrap().unwrap();
-        assert_eq!(allocation.path, owner.dest_dir.join(&expected));
-        owner
-            .artifacts
-            .allocate(id.0, &owner.dest_dir, &allocation.path)
-            .unwrap();
-        assert_eq!(
-            std::fs::read(retained.join("old.bin")).unwrap(),
-            b"retained bytes"
-        );
-        assert!(collision.is_dir());
-        let saved = SnapshotStore::open(&owner.state_dir)
-            .unwrap()
-            .load()
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            saved.jobs.iter().find(|j| j.id == id).unwrap().dir_name,
-            expected
-        );
-    }
-
-    #[tokio::test]
-    async fn allocation_refusal_holds_only_that_job_and_release_retries_it() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        owner.servers = Arc::new(vec![ServerDef {
-            id: ServerId(1),
-            name: "test".into(),
-            host: "localhost".into(),
-            port: 119,
-            tls: nzbd_types::TlsMode::None,
-            username: None,
-            password: None,
-            active: true,
-            tier: 0,
-            group: 0,
-            fill: false,
-            max_connections: 1,
-            pipeline_depth: 1,
-            retention_days: 0,
-            cert_verification: nzbd_types::CertLevel::Strict,
-        }]);
-        owner.state.jobs = (1..=3).map(pending_job).collect();
-        let conflict = owner.dest_dir.join("job-1");
-        std::fs::create_dir_all(&conflict).unwrap();
-        let leases = grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1).await;
-        assert_eq!(leases.len(), 1, "a hold must not consume the lease budget");
-        assert_eq!(leases[0].r.job, JobId(2));
-        assert_eq!(owner.state.jobs[0].control().unwrap().cause, "allocation");
-        assert_eq!(
-            grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1).await[0]
-                .r
-                .job,
-            JobId(3)
-        );
-        let revision = owner.state.jobs[0].control().unwrap().revision;
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::ReleaseResourceHold {
-            by: RetryBy::Operator,
-            job: JobId(1),
-            revision: revision.clone(),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(rx.await.unwrap());
-        assert!(
-            grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1)
-                .await
-                .is_empty()
-        );
-        let held = owner.state.jobs[0].control().unwrap();
-        assert_eq!(held.lifecycle, "held");
-        assert!(held.revision.parse::<u64>().unwrap() > revision.parse::<u64>().unwrap());
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::ReleaseResourceHold {
-            by: RetryBy::Operator,
-            job: JobId(1),
-            revision,
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(!rx.await.unwrap(), "stale release must be rejected");
-        std::fs::remove_dir(&conflict).unwrap();
-        let mut epoch = owner.epoch_tx.subscribe();
-        epoch.borrow_and_update();
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::ReleaseResourceHold {
-            by: RetryBy::Operator,
-            job: JobId(1),
-            revision: owner.state.jobs[0].control().unwrap().revision,
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(rx.await.unwrap());
-        assert!(epoch.has_changed().unwrap());
-        assert_eq!(
-            grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1).await[0]
-                .r
-                .job,
-            JobId(1)
-        );
-    }
-
-    use nzbd_types::HoldCause;
-
-    /// The release an operator `resume` runs, minus the off-loop part: the
-    /// custody check is done here exactly as `EngineHandle::release_hold`
-    /// does it in `spawn_blocking`.
-    async fn operator_retry(
-        owner: &mut Owner,
-        messages: &mut mpsc::Receiver<EngineMsg>,
-        job: JobId,
-    ) -> Result<(), String> {
-        let control = owner.state.job(job).unwrap().control().unwrap();
-        let custody_checked =
-            control.post_side() && owner.artifacts.validate_post_retry(job.0).is_ok();
-        let result = owner.retry_hold(job, &control.revision, RetryBy::Operator, custody_checked);
-        pump(owner, messages).await;
-        result
-    }
-
-    #[tokio::test]
-    async fn post_hold_retry_checks_revision_custody_and_stage_then_persists() {
-        let (tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        let mut job = bare_job();
-        job.dir_name = "pp".into();
-        owner.state.jobs.push(job);
-        allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
-        assert!(owner.hold_job(JobId(1), HoldCause::PostFailure, "unpack", "tool failed"));
-        pump(&mut owner, &mut messages).await;
-        let revision = owner.state.jobs[0].control().unwrap().revision;
-        assert!(owner
-            .retry_hold(JobId(1), "stale", RetryBy::Operator, true)
-            .is_err());
-        pump(&mut owner, &mut messages).await;
-        assert!(
-            owner
-                .retry_hold(JobId(1), &revision, RetryBy::Operator, false)
-                .is_err(),
-            "a post-side release needs its custody checked off-loop first"
-        );
-        pump(&mut owner, &mut messages).await;
-        assert_eq!(
-            owner.retry_hold(JobId(1), &revision, RetryBy::Operator, true),
-            Ok(())
-        );
-        pump(&mut owner, &mut messages).await;
-        assert_eq!(owner.state.jobs[0].status, JobStatus::PostQueued);
-        let persisted = SnapshotStore::open(&tmp.path().join("state"))
-            .unwrap()
-            .load()
-            .unwrap()
-            .unwrap();
-        let restored = QueueState::from_doc(persisted);
-        assert!(!restored.jobs[0].held());
-        // A post-side retry always restarts post-processing from the
-        // beginning, so the stage a hold names never makes it unsafe; one
-        // this build does not recognise must still have an exit.
-        assert!(owner.hold_job(
-            JobId(1),
-            HoldCause::Unrecognized("from_a_newer_build".into()),
-            "unrecognised_stage",
-            "why"
-        ));
-        pump(&mut owner, &mut messages).await;
-        assert_eq!(
-            operator_retry(&mut owner, &mut messages, JobId(1)).await,
-            Ok(())
-        );
-        assert_eq!(owner.state.jobs[0].status, JobStatus::PostQueued);
-    }
-
-    /// Field report 2026-11-01: `/processing` lost its transport (ENOTCONN)
-    /// mid-download and the job sat HELD with only delete to click. The
-    /// errno makes it `storage_unavailable`, and its retry time is in the
-    /// same save as the hold.
-    #[tokio::test]
-    async fn storage_errno_writer_error_schedules_itself() {
-        let (tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(pending_job(1));
-        let before = unix_now();
-        owner.on_msg(EngineMsg::WriterError {
-            job: JobId(1),
-            file: FileId(10),
-            error: "write /processing/x/.runner-file-10.part: Transport endpoint is not connected (os error 107)".into(),
-        });
-        pump(&mut owner, &mut messages).await;
-        let held = owner.state.jobs[0].control().unwrap();
-        assert_eq!(held.cause, "storage_unavailable");
-        assert_eq!(held.retry_policy, "scheduled_retry");
-        assert_eq!(held.retry_attempt, 1);
-        let at = held
-            .next_retry_at_unix
-            .expect("scheduled in the hold itself");
-        assert!(
-            at >= before + 30 && at <= unix_now() + 30,
-            "first retry after 30 s: {at}"
-        );
-        let persisted = SnapshotStore::open(&tmp.path().join("state"))
-            .unwrap()
-            .load()
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            QueueState::from_doc(persisted).jobs[0]
-                .control()
-                .unwrap()
-                .next_retry_at_unix,
-            Some(at),
-            "the schedule is durable with the hold, not a second write"
-        );
-
-        assert_eq!(
-            owner.retry_hold(JobId(1), &held.revision, RetryBy::Recovery, false),
-            Ok(())
-        );
-        pump(&mut owner, &mut messages).await;
-        let job = &owner.state.jobs[0];
-        assert!(!job.held());
-        assert_eq!(
-            job.status,
-            JobStatus::Queued,
-            "a download-side hold resumes the download"
-        );
-        assert!(job
-            .control()
-            .unwrap()
-            .message
-            .starts_with("Automatic retry 1"));
-
-        // Still broken: held again, one step further out, same outage start.
-        assert!(owner.hold_job(
-            JobId(1),
-            HoldCause::StorageUnavailable,
-            "download_write",
-            "still ENOTCONN"
-        ));
-        pump(&mut owner, &mut messages).await;
-        let again = owner.state.jobs[0].control().unwrap();
-        assert_eq!(again.retry_attempt, 2);
-        assert!(again.next_retry_at_unix.unwrap() >= unix_now() + 59);
-        assert_eq!(again.blocked_since_unix, held.blocked_since_unix);
-
-        // A refusal pushes it out again and says why.
-        let revision = again.revision.clone();
-        assert!(owner.reschedule_hold(JobId(1), &revision, "volume still unavailable"));
-        let pushed = owner.state.jobs[0].control().unwrap();
-        assert_eq!(pushed.retry_attempt, 3);
-        assert!(pushed
-            .message
-            .ends_with("; retry refused: volume still unavailable"));
-        assert!(
-            !owner.reschedule_hold(JobId(1), &revision, "stale"),
-            "a reschedule is a new revision; a second actor on the old one is refused"
-        );
-        assert!(owner.reschedule_hold(JobId(1), &pushed.revision, "and again"));
-        assert_eq!(
-            owner.state.jobs[0]
-                .control()
-                .unwrap()
-                .message
-                .matches("retry refused")
-                .count(),
-            1,
-            "refusals replace each other instead of piling up"
-        );
-    }
-
-    /// A digest or size mismatch fails the same way on every attempt: it
-    /// waits for a person instead of re-checking a whole file forever.
-    #[tokio::test]
-    async fn permanent_writer_error_waits_for_review() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(pending_job(1));
-        owner.on_msg(EngineMsg::WriterError {
-            job: JobId(1),
-            file: FileId(10),
-            error: "finalize: complete checkpoint digest differs".into(),
-        });
-        pump(&mut owner, &mut messages).await;
-        let held = owner.state.jobs[0].control().unwrap();
-        assert_eq!(
-            (held.cause.as_str(), held.stage.as_str()),
-            ("io", "finalize")
-        );
-        assert_eq!(held.retry_policy, "review");
-        assert_eq!(held.next_retry_at_unix, None);
-        assert!(
-            owner
-                .retry_hold(JobId(1), &held.revision, RetryBy::Recovery, false)
-                .is_ok(),
-            "the owner itself does not police policy; the recovery task never asks"
-        );
-        pump(&mut owner, &mut messages).await;
-    }
-
-    #[tokio::test]
-    async fn paused_hold_waits_for_the_operator_and_followers_never_auto_release() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(pending_job(1));
-        assert!(owner.hold_job(
-            JobId(1),
-            HoldCause::StorageUnavailable,
-            "download_write",
-            "EIO (os error 5)"
-        ));
-        pump(&mut owner, &mut messages).await;
-        let mut c = owner.state.jobs[0].control().unwrap();
-        c.manual_pause = true;
-        owner.state.jobs[0].set_control(&c);
-        assert!(owner
-            .retry_hold(JobId(1), &c.revision, RetryBy::Recovery, false)
-            .is_err());
-        pump(&mut owner, &mut messages).await;
-        owner.persist = false;
-        c.manual_pause = false;
-        owner.state.jobs[0].set_control(&c);
-        assert_eq!(
-            owner.retry_hold(JobId(1), &c.revision, RetryBy::Recovery, false),
-            Err("this node is not the queue authority".into())
-        );
-        pump(&mut owner, &mut messages).await;
-        owner.persist = true;
-        c.manual_pause = true;
-        c.retry_attempt = 4;
-        owner.state.jobs[0].set_control(&c);
-        assert_eq!(
-            owner.retry_hold(JobId(1), &c.revision, RetryBy::Operator, false),
-            Ok(())
-        );
-        pump(&mut owner, &mut messages).await;
-        let c = owner.state.jobs[0].control().unwrap();
-        assert!(
-            !c.manual_pause && c.retry_attempt == 0,
-            "an operator retry clears both"
-        );
-        assert_eq!(owner.state.jobs[0].status, JobStatus::Queued);
-    }
-
-    /// The closed set: every cause this build writes, on both sides of the
-    /// pipeline, stamps its policy (with a time when the policy is timed)
-    /// and answers an operator release. Storage causes take
-    /// `ReleaseResourceHold` after their probe; the rest take `retry_hold`.
-    #[tokio::test]
-    async fn every_hold_cause_has_an_exit() {
-        let causes = HoldCause::ALL
-            .iter()
-            .cloned()
-            .chain([HoldCause::Unrecognized("from_a_newer_build".into())]);
-        for cause in causes {
-            for post in [false, true] {
-                let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-                pump(&mut owner, &mut messages).await;
-                let mut job = bare_job();
-                job.dir_name = "exit".into();
-                job.status = if post {
-                    JobStatus::Post {
-                        stage: nzbd_types::PostStage::Unpack,
-                    }
-                } else {
-                    JobStatus::Downloading
-                };
-                owner.state.jobs.push(job);
-                allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
-                assert!(
-                    owner.hold_job(JobId(1), cause.clone(), "stage", "why"),
-                    "{cause}"
-                );
-                pump(&mut owner, &mut messages).await;
-                let control = owner.state.jobs[0].control().unwrap();
-                let policy = cause.policy();
-                assert_eq!(control.retry_policy, policy.as_str());
-                assert_eq!(
-                    control.next_retry_at_unix.is_some(),
-                    policy.timed(),
-                    "{cause}"
-                );
-                if cause.is_storage() {
-                    let (reply, rx) = oneshot::channel();
-                    owner.on_command(QueueCommand::ReleaseResourceHold {
-                        by: RetryBy::Operator,
-                        job: JobId(1),
-                        revision: control.revision,
-                        reply,
-                    });
-                    pump(&mut owner, &mut messages).await;
-                    assert!(rx.await.unwrap(), "{cause} post={post} has no exit");
-                } else {
-                    assert_eq!(
-                        operator_retry(&mut owner, &mut messages, JobId(1)).await,
-                        Ok(()),
-                        "{cause} post={post} has no exit"
-                    );
-                }
-                assert!(!owner.state.jobs[0].held(), "{cause} post={post}");
-                assert_eq!(
-                    owner.state.jobs[0].status,
-                    if post {
-                        JobStatus::PostQueued
-                    } else {
-                        JobStatus::Queued
-                    },
-                    "{cause} post={post} goes back to the step it stopped in"
-                );
-            }
-        }
-    }
-
-    /// §3.3: `import_job` keeps a held fence, which is why a scheduling
-    /// write that went through it could never land. The fence stays; the
-    /// schedule now lives in `hold_job`, and only owner methods change it.
-    #[tokio::test]
-    async fn held_control_survives_only_owner_writes() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(pending_job(1));
-        assert!(owner.hold_job(JobId(1), HoldCause::Io, "download_write", "digest differs"));
-        pump(&mut owner, &mut messages).await;
-        let held = owner.state.jobs[0].control().unwrap();
-        let mut row = owner.state.jobs[0].clone();
-        let mut forged = held.clone();
-        forged.retry_policy = "scheduled_retry".into();
-        forged.next_retry_at_unix = Some(1);
-        row.set_control(&forged);
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::ImportJobIfPresent {
-            job: Box::new(row),
-            require_snapshot: false,
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        let _ = rx.await;
-        assert_eq!(
-            owner.state.jobs[0].control().unwrap(),
-            held,
-            "imports cannot rewrite a fence"
-        );
-        // RescheduleHold is an owner write: it does change a fence.
-        let mut storage = held.clone();
-        storage.cause = "storage_unavailable".into();
-        storage.retry_policy = "scheduled_retry".into();
-        owner.state.jobs[0].set_control(&storage);
-        assert!(owner.reschedule_hold(JobId(1), &storage.revision, "still down"));
-        assert_ne!(owner.state.jobs[0].control().unwrap(), storage);
-    }
-
-    /// Review finding: `previous_status` was sticky across holds, so a job
-    /// first held while downloading and later held in post-processing was
-    /// released to the download queue without its custody check.
-    #[tokio::test]
-    async fn rehold_after_release_routes_by_where_the_job_is_now() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(pending_job(1));
-        assert!(owner.hold_job(
-            JobId(1),
-            HoldCause::StorageUnavailable,
-            "download_write",
-            "x (os error 107)"
-        ));
-        pump(&mut owner, &mut messages).await;
-        let first = owner.state.jobs[0].control().unwrap();
-        assert!(!first.post_side());
-        owner
-            .retry_hold(JobId(1), &first.revision, RetryBy::Recovery, false)
-            .unwrap();
-        pump(&mut owner, &mut messages).await;
-        // The download finished; post-processing hits the dead mount.
-        owner.state.jobs[0].status = JobStatus::Post {
-            stage: nzbd_types::PostStage::PostUnpackRename,
-        };
-        assert!(owner.hold_job(
-            JobId(1),
-            HoldCause::StorageUnavailable,
-            "post_unpack_rename",
-            "y (os error 5)"
-        ));
-        pump(&mut owner, &mut messages).await;
-        let second = owner.state.jobs[0].control().unwrap();
-        assert!(second.post_side(), "this hold happened in post-processing");
-        assert!(
-            owner
-                .retry_hold(JobId(1), &second.revision, RetryBy::Recovery, false)
-                .is_err(),
-            "so its release must go through the custody check"
-        );
-        pump(&mut owner, &mut messages).await;
-        assert_eq!(
-            second.retry_attempt, 2,
-            "a re-hold right after a release is the same outage"
-        );
-        assert_eq!(second.blocked_since_unix, first.blocked_since_unix);
-        assert!(!second.manual_pause);
-
-        // An hour after the last release, a new hold is a new episode.
-        let mut released = second.clone();
-        released.lifecycle = "running".into();
-        released.released_at_unix = Some(unix_now() - nzbd_types::HOLD_EPISODE_SECONDS - 1);
-        released.blocked_since_unix = Some(1);
-        owner.state.jobs[0].set_control(&released);
-        owner.state.jobs[0].status = JobStatus::Downloading;
-        assert!(owner.hold_job(
-            JobId(1),
-            HoldCause::StorageUnavailable,
-            "download_write",
-            "z (os error 107)"
-        ));
-        pump(&mut owner, &mut messages).await;
-        let fresh = owner.state.jobs[0].control().unwrap();
-        assert_eq!(fresh.retry_attempt, 1, "backoff starts over");
-        assert_ne!(
-            fresh.blocked_since_unix,
-            Some(1),
-            "so does the outage clock"
-        );
-        assert!(!fresh.post_side());
-    }
-
-    /// Review finding: an operator retry on a paused storage hold left the
-    /// job paused, and the probe's spacing outlived its episode.
-    #[tokio::test]
-    async fn operator_storage_release_runs_the_job_and_resets_the_probe() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(pending_job(1));
-        assert!(owner.hold_job(JobId(1), HoldCause::Capacity, "download_write", "full"));
-        pump(&mut owner, &mut messages).await;
-        let mut c = owner.state.jobs[0].control().unwrap();
-        c.manual_pause = true;
-        owner.state.jobs[0].set_control(&c);
-        // A probe just ran: the recovery task must wait, a person need not.
-        owner.state.jobs[0].params.extend([
-            (
-                "*Control:probe_after".to_string(),
-                (unix_now() + 999).to_string(),
-            ),
-            ("*Control:attempts".to_string(), "6".to_string()),
-        ]);
-        for (by, expected) in [(RetryBy::Recovery, false), (RetryBy::Operator, true)] {
-            let (reply, rx) = oneshot::channel();
-            owner.on_command(QueueCommand::BeginResourceProbe {
-                job: JobId(1),
-                revision: c.revision.clone(),
-                by,
-                reply,
-            });
-            pump(&mut owner, &mut messages).await;
-            assert_eq!(rx.await.unwrap(), expected, "{by:?}");
-        }
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::ReleaseResourceHold {
-            job: JobId(1),
-            revision: c.revision.clone(),
-            by: RetryBy::Operator,
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(rx.await.unwrap());
-        let job = &owner.state.jobs[0];
-        assert_eq!(
-            job.status,
-            JobStatus::Queued,
-            "an operator retry runs the job"
-        );
-        let c = job.control().unwrap();
-        assert!(!c.manual_pause && c.retry_attempt == 0 && c.next_retry_at_unix.is_none());
-        assert!(c.released_at_unix.is_some());
-        assert!(
-            !job.params
-                .iter()
-                .any(|(k, _)| k.starts_with("*Control:probe_after")
-                    || k.starts_with("*Control:attempts")),
-            "the probe's spacing belongs to the episode that ended"
-        );
-    }
-
-    #[tokio::test]
-    async fn reobserve_refusal_records_why_without_moving_its_cadence() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(pending_job(1));
-        assert!(owner.hold_job(
-            JobId(1),
-            HoldCause::MountUnavailable,
-            "extract",
-            "root changed"
-        ));
-        pump(&mut owner, &mut messages).await;
-        let c = owner.state.jobs[0].control().unwrap();
-        assert_eq!(c.next_retry_at_unix, None);
-        assert!(owner.reschedule_hold(JobId(1), &c.revision, "wrong root mounted"));
-        let after = owner.state.jobs[0].control().unwrap();
-        assert_eq!(
-            after.next_retry_at_unix, None,
-            "re-observed every pass, not timed"
-        );
-        assert_eq!(after.retry_attempt, c.retry_attempt);
-        assert!(after
-            .message
-            .ends_with("; retry refused: wrong root mounted"));
-        owner.persist = false;
-        assert!(
-            !owner.reschedule_hold(JobId(1), &c.revision, "follower"),
-            "a node that is not the authority writes nothing"
-        );
-    }
-
-    #[test]
-    fn rearm_reclassifies_by_errno_and_derives_policy() {
-        let hold = |cause: &str, policy: &str, message: &str| nzbd_types::JobControl {
-            version: 1,
-            revision: "4".into(),
-            lifecycle: "held".into(),
-            cause: cause.into(),
-            stage: "post_unpack_rename".into(),
-            retry_policy: policy.into(),
-            message: message.into(),
-            instance: "i".into(),
-            previous_status: None,
-            manual_pause: false,
-            retry_attempt: 0,
-            next_retry_at_unix: None,
-            blocked_since_unix: Some(1),
-            released_at_unix: None,
-        };
-        // #2181 exactly.
-        let fixed = rearmed_hold(
-            hold("io", "review", "io: Input/output error (os error 5)"),
-            1000,
-        )
-        .expect("re-armed");
-        assert_eq!(fixed.cause, "storage_unavailable");
-        assert_eq!(fixed.retry_policy, "scheduled_retry");
-        assert_eq!(
-            fixed.next_retry_at_unix,
-            Some(1000),
-            "due on the first pass"
-        );
-        assert_eq!(fixed.revision, "5");
-        // #2183 exactly.
-        assert!(rearmed_hold(
-            hold(
-                "io",
-                "review",
-                "write /processing/x.part: Transport endpoint is not connected (os error 107)"
-            ),
-            1000
-        )
-        .is_some_and(|c| c.cause == "storage_unavailable"));
-        // A permanent io failure stays with a person.
-        assert!(rearmed_hold(
-            hold("io", "review", "complete checkpoint digest differs"),
-            1000
-        )
-        .is_none());
-        // Policy this build changed: password_required used to claim resume_same_job.
-        assert_eq!(
-            rearmed_hold(hold("password_required", "resume_same_job", "x"), 1000)
-                .unwrap()
-                .retry_policy,
-            "review"
-        );
-        // Capacity used to carry no time.
-        assert_eq!(
-            rearmed_hold(hold("capacity", "resume_same_job", "x"), 1000)
-                .unwrap()
-                .next_retry_at_unix,
-            Some(1000)
-        );
-        // Already right: untouched.
-        assert!(rearmed_hold(hold("identity_conflict", "review", "x"), 1000).is_none());
-        let mut scheduled = hold("storage_unavailable", "scheduled_retry", "x");
-        scheduled.next_retry_at_unix = Some(5);
-        assert!(rearmed_hold(scheduled, 1000).is_none());
-    }
-
-    /// Cluster engines start without `persist`, so `Owner::new` recovery
-    /// never runs for them; adoption must re-arm too.
-    #[tokio::test]
-    async fn adopting_authority_rearms_holds() {
-        let (tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        let mut job = pending_job(1);
-        job.set_control(&nzbd_types::JobControl {
-            version: 1,
-            revision: "1".into(),
-            lifecycle: "held".into(),
-            cause: "io".into(),
-            stage: "download_write".into(),
-            retry_policy: "review".into(),
-            message: "write x: Transport endpoint is not connected (os error 107)".into(),
-            instance: "i".into(),
-            previous_status: Some(JobStatus::Downloading),
-            manual_pause: false,
-            retry_attempt: 0,
-            next_retry_at_unix: None,
-            blocked_since_unix: Some(1),
-            released_at_unix: None,
-        });
-        job.status = JobStatus::Paused;
-        let mut doc_state = QueueState::default();
-        doc_state.jobs.push(job);
-        SnapshotStore::open(&tmp.path().join("state"))
-            .unwrap()
-            .save(&doc_state.to_doc())
-            .unwrap();
-        owner.persist = false;
-        owner.state.jobs.clear();
-        owner.adopt_authority().unwrap();
-        pump(&mut owner, &mut messages).await;
-        let c = owner.state.jobs[0].control().unwrap();
-        assert_eq!(
-            (c.cause.as_str(), c.retry_policy.as_str()),
-            ("storage_unavailable", "scheduled_retry")
-        );
-        assert!(c.next_retry_at_unix.is_some());
-    }
-
-    #[tokio::test]
-    async fn mount_unavailable_hold_resumes_only_after_expected_root_returns() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        let mut job = bare_job();
-        job.dir_name = "remount".into();
-        job.status = JobStatus::Completed;
-        job.params.push(("monarr-delivery".into(), "1".into()));
-        owner.state.jobs.push(job);
-        allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
-        assert!(owner.hold_job(
-            JobId(1),
-            HoldCause::MountUnavailable,
-            "extract",
-            "configured root identity changed or volume is unavailable",
-        ));
-        pump(&mut owner, &mut messages).await;
-        let root = owner.dest_dir.clone();
-        let offline = root.with_extension("expected-volume-offline");
-        std::fs::rename(&root, &offline).unwrap();
-        std::fs::create_dir(&root).unwrap();
-        assert!(
-            operator_retry(&mut owner, &mut messages, JobId(1))
-                .await
-                .is_err(),
-            "wrong root must stay fenced"
-        );
-        assert!(owner.state.jobs[0].held());
-
-        std::fs::remove_dir(&root).unwrap();
-        std::fs::rename(&offline, &root).unwrap();
-        assert_eq!(
-            operator_retry(&mut owner, &mut messages, JobId(1)).await,
-            Ok(()),
-            "restored expected root should resume"
-        );
-        assert_eq!(owner.state.jobs[0].status, JobStatus::PostQueued);
-    }
-
-    #[tokio::test]
-    async fn admission_tombstone_refreshes_exact_source_keep_and_delete_evidence() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        let mut job = bare_job();
-        job.dir_name = "admission-source".into();
-        owner.state.jobs.push(job);
-        allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
-        let source = owner.artifacts.for_job(1).unwrap().unwrap();
-        owner
-            .artifacts
-            .finish(1, &source.path, &source.root, "retained")
-            .unwrap();
-        let source = owner.artifacts.for_job(1).unwrap().unwrap();
-        owner
-            .state
-            .url_admission_receipts
-            .push(UrlAdmissionReceipt {
-                protocol_version: 1,
-                request_token: "receipt-token".into(),
-                submission_sha256: "hash".into(),
-                job_id: 1,
-                generation: "admission-generation".into(),
-                runner_instance_id: "runner".into(),
-                terminal_outcome: Some("FAILURE/UNPACK".into()),
-                outcome: "failed".into(),
-                failure_stage: Some("unpack".into()),
-                failure_cause: Some("corrupt_archive".into()),
-                custody_state: "runner_owned".into(),
-                keep_source_on_failure: false,
-                source_cleanup_status: None,
-                publication_path: None,
-                source_artifact_id: Some(source.id.clone()),
-                source_generation: Some(source.generation.clone()),
-            });
-
-        let kept = owner
-            .artifacts
-            .retention(&source.id, source.revision, true, None)
-            .unwrap();
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::GetUrlAdmission {
-            request_token: "receipt-token".into(),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        let receipt = rx.await.unwrap().unwrap();
-        assert_eq!(receipt.custody_state, "kept_by_user");
-        assert_eq!(
-            receipt.source_generation.as_deref(),
-            Some(kept.generation.as_str())
-        );
-
-        let released = owner
-            .artifacts
-            .retention(&kept.id, kept.revision, false, None)
-            .unwrap();
-        let deletion = owner
-            .artifacts
-            .request_delete(
-                &released.id,
-                released.revision,
-                "delete-admission-source",
-                0,
-            )
-            .unwrap();
-        owner.artifacts.execute_delete(&deletion.id).unwrap();
-        let (reply, rx) = oneshot::channel();
-        owner.on_command(QueueCommand::GetUrlAdmission {
-            request_token: "receipt-token".into(),
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        let receipt = rx.await.unwrap().unwrap();
-        assert_eq!(receipt.custody_state, "deleted_by_runner");
-        assert_eq!(receipt.source_cleanup_status.as_deref(), Some("removed"));
-
-        // A missing or reused artifact ID is not proof of deletion.
-        let mut receipt = owner.state.url_admission_receipts[0].clone();
-        receipt.custody_state = "runner_owned".into();
-        receipt.source_cleanup_status = None;
-        receipt.source_generation = Some("different-generation".into());
-        let unchanged = refresh_url_admission_custody(&mut receipt, &owner.artifacts);
-        assert!(!unchanged);
-        assert_eq!(receipt.custody_state, "runner_owned");
-    }
-
-    #[tokio::test]
-    async fn writer_retirement_does_not_create_an_allocation_review_hold() {
-        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(pending_job(1));
-        owner.retiring_writers.insert(JobId(1), Vec::new());
-        assert!(owner.ensure_allocation(JobId(1), false).is_err());
-        assert!(!owner.state.jobs[0].held());
-    }
-
-    fn restarted_recovery_job(id: u32, state: SegmentState) -> Job {
-        let mut job = pending_job(id);
-        job.status = JobStatus::Queued;
-        job.stages.push(StageSpan {
-            stage: PostStage::ParVerify,
-            started_at_unix: 1_000,
-            ms: None,
-        });
-        job.files[0].filename = "release.vol00+01.par2".into();
-        job.files[0].is_par2 = true;
-        job.files[0].segments[0].state = state;
-        job.files[0].finalized = matches!(state, SegmentState::Done { .. });
-        recompute_job_totals(&mut job);
-        job
-    }
-
-    #[tokio::test]
-    async fn writer_resource_errors_hold_pending_segments_and_latch_out_of_space() {
-        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(pending_job(2));
-
-        owner.on_msg(EngineMsg::WriterError {
-            job: JobId(2),
-            file: FileId(20),
-            error: "write payload.bin: No space left on device (os error 28)".into(),
-        });
-        pump(&mut owner, &mut messages).await;
-        let job = owner.state.job(JobId(2)).unwrap();
-        assert_eq!(job.files[0].segments[0].state, SegmentState::Pending);
-        assert!(!job.files[0].finalized);
-        assert_eq!(job.status, JobStatus::Paused);
-        assert!(job.held());
-        assert!(!job.ready());
-        assert!(owner.disk_low);
-        assert!(owner.enospc_latched);
-        assert_eq!(owner.enospc_observed, 1);
-
-        // Re-reporting an already-terminal segment is idempotent, while a
-        // missing file/job is ignored rather than corrupting another row.
-        owner.on_msg(EngineMsg::WriterError {
-            job: JobId(2),
-            file: FileId(20),
-            error: "permission denied".into(),
-        });
-        pump(&mut owner, &mut messages).await;
-        owner.on_msg(EngineMsg::WriterError {
-            job: JobId(2),
-            file: FileId(999),
-            error: "gone".into(),
-        });
-        pump(&mut owner, &mut messages).await;
-        owner.on_msg(EngineMsg::SegmentWritten {
-            job: JobId(999),
-            file: FileId(999),
-            seg_number: 1,
-            offset: 0,
-            len: 1,
-            crc: 0,
-            file_size: 1,
-            server: ServerId(1),
-        });
-        pump(&mut owner, &mut messages).await;
-        owner.on_msg(EngineMsg::WriterFinalized {
-            job: JobId(999),
-            file: FileId(999),
-            ok: true,
-            final_path: None,
-            combined_crc: None,
-        });
-        pump(&mut owner, &mut messages).await;
-
-        owner.disk_low = false;
-        let (reply, received) = oneshot::channel();
-        owner.on_msg(EngineMsg::WorkRequest {
-            server: ServerId(999),
-            max: 1,
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(received.await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn failed_fenced_replace_restores_delegation_and_mirror_overlay() {
-        let (_tmp, mut owner, _adapter, mut messages) =
-            control_test_owner_with_persistence(true, Some(Arc::new(|| false)));
-        pump(&mut owner, &mut messages).await;
-        let original = pending_job(3);
-        owner.state.jobs.push(original.clone());
-        owner.delegated.insert(JobId(3), "worker-a".into());
-        owner.mirror.insert(
-            JobId(3),
-            MirrorStats {
-                repair_progress: None,
-                done_articles: 4,
-                failed_articles: 1,
-                downloaded_bytes: 40,
-                health: 800,
-                remaining_bytes: Some(60),
-                stages: vec![StageSpan {
-                    stage: PostStage::ParVerify,
-                    started_at_unix: 1_000,
-                    ms: None,
-                }],
-            },
-        );
-        let mut replacement = original;
-        replacement.priority = 99;
-        let (reply, mut received) = oneshot::channel();
-        owner.on_command(QueueCommand::ImportJobIfPresent {
-            job: Box::new(replacement),
-            require_snapshot: true,
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-
-        assert!(!received.try_recv().unwrap());
-        assert_eq!(owner.state.job(JobId(3)).unwrap().priority, 0);
-        assert_eq!(
-            owner.delegated.get(&JobId(3)).map(String::as_str),
-            Some("worker-a")
-        );
-        assert_eq!(owner.mirror[&JobId(3)].downloaded_bytes, 40);
-        assert_eq!(
-            owner.mirror[&JobId(3)].stages[0].stage,
-            PostStage::ParVerify
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_remote_pp_remaining_fallback_stays_paused_aware() {
-        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
-        pump(&mut owner, &mut messages).await;
-        let mut job = pending_job(4);
-        job.status = JobStatus::Completed;
-        job.files[0].paused = true;
-        recompute_job_totals(&mut job);
-        owner.state.jobs.push(job);
-        owner.delegated.insert(JobId(4), "old-worker".into());
-        owner.mirror.insert(
-            JobId(4),
-            MirrorStats {
-                repair_progress: None,
-                done_articles: 1,
-                failed_articles: 0,
-                downloaded_bytes: 0,
-                health: 999,
-                remaining_bytes: None,
-                stages: vec![StageSpan {
-                    stage: PostStage::ParVerify,
-                    started_at_unix: 1_000,
-                    ms: None,
-                }],
-            },
-        );
-
-        owner.publish_now();
-        let snapshot = owner.shared.load();
-        assert_eq!(snapshot.jobs[0].remaining_bytes, 0);
-        assert_eq!(snapshot.remaining_bytes, 0);
-    }
-
-    /// The monotonic figure the post manager measured is what lands on the
-    /// span. Wall-clock is a fallback, not the primary — an NTP step
-    /// during a long repair must not produce a duration nobody can trust.
-    #[test]
-    fn close_span_prefers_the_measured_duration() {
-        let mut j = bare_job();
-        j.stages.push(StageSpan {
-            stage: PostStage::ParRepair,
-            started_at_unix: 1_000,
-            ms: None,
-        });
-        // Wall clock says 60s; the manager measured 4500ms.
-        close_span(&mut j, Some(4500), 1_060);
-        assert_eq!(j.stages[0].ms, Some(4500));
-    }
-
-    /// A span that outlived the process has no `Instant` left to consult,
-    /// so the seconds that survived in the snapshot are all there is.
-    #[test]
-    fn close_span_falls_back_to_wall_clock() {
-        let mut j = bare_job();
-        j.stages.push(StageSpan {
-            stage: PostStage::Unpack,
-            started_at_unix: 1_000,
-            ms: None,
-        });
-        close_span(&mut j, None, 1_007);
-        assert_eq!(j.stages[0].ms, Some(7_000));
-    }
-
-    /// `Stages::finish` closes the span and `Drop` closes it again. The
-    /// second close must not overwrite the first — otherwise every job's
-    /// last stage would report the few milliseconds between the two.
-    #[test]
-    fn close_span_is_idempotent() {
-        let mut j = bare_job();
-        j.stages.push(StageSpan {
-            stage: PostStage::Move,
-            started_at_unix: 1_000,
-            ms: None,
-        });
-        close_span(&mut j, Some(9_000), 1_009);
-        close_span(&mut j, Some(3), 1_009);
-        assert_eq!(j.stages[0].ms, Some(9_000));
-    }
-
-    /// A clock that went backwards between entering and leaving a stage
-    /// yields 0, never a wrapped-around u64.
-    #[test]
-    fn close_span_survives_a_backwards_clock() {
-        let mut j = bare_job();
-        j.stages.push(StageSpan {
-            stage: PostStage::ParVerify,
-            started_at_unix: 2_000,
-            ms: None,
-        });
-        close_span(&mut j, None, 1_900);
-        assert_eq!(j.stages[0].ms, Some(0));
-    }
-
-    #[test]
-    fn close_span_on_a_job_that_never_post_processed() {
-        let mut j = bare_job();
-        close_span(&mut j, Some(5), 1_000);
-        assert!(j.stages.is_empty());
-    }
-
-    /// Delayed PAR fetching temporarily returns the download half of the job
-    /// to Queued/Downloading, but verification keeps running in parallel. The
-    /// selected fetch returns to the open Post stage when it ends. Only the
-    /// verifier-selected PAR may use that lane; generic FileResume and a
-    /// PP-only node cannot broaden it to ordinary files.
-    #[tokio::test]
-    async fn delayed_par_download_keeps_the_open_post_span() {
-        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
-        pump(&mut owner, &mut messages).await;
-        let mut job = pending_job(402);
-        job.status = JobStatus::Post {
-            stage: PostStage::ParVerify,
-        };
-        job.stages.push(StageSpan {
-            stage: PostStage::ParVerify,
-            started_at_unix: 1_000,
-            ms: None,
-        });
-        job.files[0].filename = "release.vol00+01.par2".into();
-        job.files[0].is_par2 = true;
-        job.files[0].paused = true;
-        let recovery_file = job.files[0].id;
-        let mut unrelated = job.files[0].clone();
-        unrelated.id = FileId(4021);
-        unrelated.filename = "release.part001.rar".into();
-        unrelated.is_par2 = false;
-        unrelated.paused = true;
-        job.files.push(unrelated);
-        recompute_job_totals(&mut job);
-        owner.state.jobs.push(job);
-
-        assert_eq!(owner.unpause_par_blocks(JobId(402), 1, None), 1);
-        pump(&mut owner, &mut messages).await;
-        assert_eq!(
-            owner.state.job(JobId(402)).unwrap().status,
-            JobStatus::Queued
-        );
-        assert!(owner.state.job(JobId(402)).unwrap().stages[0].ms.is_none());
-        assert_eq!(
-            owner.post_fetch_files[&JobId(402)],
-            HashSet::from([recovery_file])
-        );
-
-        let (reply, mut result) = oneshot::channel();
-        owner.on_command(QueueCommand::SetFilePaused {
-            job: JobId(402),
-            file: FileId(4021),
-            paused: false,
-            reply,
-        });
-        pump(&mut owner, &mut messages).await;
-        assert!(
-            !result.try_recv().unwrap(),
-            "FileResume is not recovery authority"
-        );
-
-        // Even if an unrelated file is already unpaused in imported/stale
-        // state, selector enforcement still admits only the explicit PAR.
-        owner.state.job_mut(JobId(402)).unwrap().files[1].paused = false;
-        owner.delegated.insert(JobId(402), "this-node".into());
-        owner.download_enabled = false;
-        let servers = vec![ServerDef {
-            id: ServerId(1),
-            name: "provider".into(),
-            host: "127.0.0.1".into(),
-            port: 119,
-            tls: nzbd_types::TlsMode::None,
-            username: None,
-            password: None,
-            active: true,
-            tier: 0,
-            group: 0,
-            fill: false,
-            max_connections: 1,
-            pipeline_depth: 1,
-            retention_days: 0,
-            cert_verification: nzbd_types::CertLevel::Strict,
-        }];
-        let ladder = Ladder::new(&servers);
-        let not_blocked = |_: ServerId| false;
-        let mut ctx = SelectionCtx {
-            ladder: &ladder,
-            attempts: &mut owner.attempts,
-            is_blocked: &not_blocked,
-            delegated: &owner.delegated,
-            post_fetch_files: &owner.post_fetch_files,
-            regular_downloads: owner.download_enabled,
-            article_retries: 3,
-            now_unix: 1_800_000_000,
-            propagation_delay_secs: 0,
-            soft_hold: false,
-            rotate: 0,
-        };
-        let selected = next_for_server(&owner.state, &servers[0], &mut ctx)
-            .lease
-            .unwrap();
-        assert_eq!(selected.file, recovery_file);
-        owner.delegated.remove(&JobId(402));
-
-        let job = owner.state.job_mut(JobId(402)).unwrap();
-        job.files[1].paused = true;
-        job.files[0].segments[0].state = SegmentState::Done {
-            offset: 0,
-            len: 100,
-            crc: 0,
-        };
-        job.files[0].finalized = true;
-        recompute_job_totals(job);
-        let mut events = owner.events.subscribe();
-        owner.check_job_complete(JobId(402));
-        pump(&mut owner, &mut messages).await;
-        let job = owner.state.job(JobId(402)).unwrap();
-        assert_eq!(
-            job.status,
-            JobStatus::Post {
-                stage: PostStage::ParVerify
-            },
-            "finishing a recovery-volume download resumes the open PP stage"
-        );
-        assert!(!owner.post_fetch_files.contains_key(&JobId(402)));
-        assert!(
-            job.stages[0].ms.is_none(),
-            "the post manager, not delayed download completion, closes verification"
-        );
-        assert!(
-            matches!(
-                events.try_recv(),
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-            ),
-            "a delayed PAR fetch must not announce a second download completion"
-        );
-    }
-
-    #[tokio::test]
-    async fn restarted_delayed_par_completion_recovers_from_the_persisted_open_span() {
-        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(restarted_recovery_job(
-            403,
-            SegmentState::Done {
-                offset: 0,
-                len: 100,
-                crc: 0,
-            },
-        ));
-        assert!(
-            !owner.post_fetch_files.contains_key(&JobId(403)),
-            "the authorization map is intentionally absent after restart"
-        );
-
-        let mut events = owner.events.subscribe();
-        owner.check_job_complete(JobId(403));
-        pump(&mut owner, &mut messages).await;
-        assert_eq!(
-            owner.state.job(JobId(403)).unwrap().status,
-            JobStatus::Post {
-                stage: PostStage::ParVerify
-            }
-        );
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test]
-    async fn restarted_pp_only_node_reauthorizes_only_the_pending_par_file() {
-        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
-        pump(&mut owner, &mut messages).await;
-        owner.download_enabled = false;
-        let mut job = restarted_recovery_job(406, SegmentState::Pending);
-        let recovery_file = job.files[0].id;
-        let mut unrelated = job.files[0].clone();
-        unrelated.id = FileId(4061);
-        unrelated.filename = "release.part001.rar".into();
-        unrelated.is_par2 = false;
-        job.files.push(unrelated);
-        owner.import_job(job, false, false);
-        pump(&mut owner, &mut messages).await;
-
-        assert_eq!(
-            owner.post_fetch_files[&JobId(406)],
-            HashSet::from([recovery_file]),
-            "restart recovery may authorize the selected PAR and nothing else"
-        );
-        let servers = vec![ServerDef {
-            id: ServerId(1),
-            name: "provider".into(),
-            host: "127.0.0.1".into(),
-            port: 119,
-            tls: nzbd_types::TlsMode::None,
-            username: None,
-            password: None,
-            active: true,
-            tier: 0,
-            group: 0,
-            fill: false,
-            max_connections: 1,
-            pipeline_depth: 1,
-            retention_days: 0,
-            cert_verification: nzbd_types::CertLevel::Strict,
-        }];
-        let ladder = Ladder::new(&servers);
-        let not_blocked = |_: ServerId| false;
-        let mut ctx = SelectionCtx {
-            ladder: &ladder,
-            attempts: &mut owner.attempts,
-            is_blocked: &not_blocked,
-            delegated: &owner.delegated,
-            post_fetch_files: &owner.post_fetch_files,
-            regular_downloads: owner.download_enabled,
-            article_retries: 3,
-            now_unix: 1_800_000_000,
-            propagation_delay_secs: 0,
-            soft_hold: false,
-            rotate: 0,
-        };
-        let selected = next_for_server(&owner.state, &servers[0], &mut ctx)
-            .lease
-            .expect("the PP-only node should resume its recovery download");
-        assert_eq!(selected.file, recovery_file);
-    }
-
-    #[tokio::test]
-    async fn failed_recovery_articles_return_to_verification_instead_of_disposition() {
-        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
-        pump(&mut owner, &mut messages).await;
-        let mut job = restarted_recovery_job(404, SegmentState::Failed);
-        let mut failed_payload = job.files[0].clone();
-        failed_payload.id = FileId(4041);
-        failed_payload.filename = "release.part001.rar".into();
-        failed_payload.is_par2 = false;
-        failed_payload.segments[0].state = SegmentState::Failed;
-        job.files.push(failed_payload);
-        recompute_job_totals(&mut job);
-        assert_eq!(final_status(&job).0, JobStatus::Failed);
-        owner.state.jobs.push(job);
-
-        let mut events = owner.events.subscribe();
-        owner.check_job_complete(JobId(404));
-        pump(&mut owner, &mut messages).await;
-        assert_eq!(
-            owner.state.job(JobId(404)).unwrap().status,
-            JobStatus::Post {
-                stage: PostStage::ParVerify
-            }
-        );
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test]
-    async fn recovery_write_failure_stays_owned_by_the_active_post_task() {
-        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
-        pump(&mut owner, &mut messages).await;
-        owner.state.jobs.push(restarted_recovery_job(
-            405,
-            SegmentState::Done {
-                offset: 0,
-                len: 100,
-                crc: 0,
-            },
-        ));
-        owner
-            .write_failures
-            .insert(JobId(405), "write recovery volume: no space left".into());
-
-        let mut events = owner.events.subscribe();
-        owner.check_job_complete(JobId(405));
-        pump(&mut owner, &mut messages).await;
-        assert_eq!(
-            owner.state.job(JobId(405)).unwrap().status,
-            JobStatus::Post {
-                stage: PostStage::ParVerify
-            }
-        );
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[test]
-    fn url_refetch_plan_keeps_first_fails_dupes() {
-        let a = "https://indexer.example/getnzb/aaa.nzb&i=1&r=k".to_string();
-        let b = "https://indexer.example/getnzb/bbb.nzb&i=1&r=k".to_string();
-        let pending = vec![
-            (JobId(4), a.clone()),
-            (JobId(5), a.clone()),
-            (JobId(7), b.clone()),
-            (JobId(9), a.clone()),
-        ];
-        let (refetch, dupes) = plan_url_refetches(pending);
-        assert_eq!(refetch, vec![(JobId(4), a), (JobId(7), b)]);
-        assert_eq!(dupes, vec![(JobId(5), JobId(4)), (JobId(9), JobId(4))]);
-    }
-
-    #[test]
-    fn url_refetch_plan_empty() {
-        let (refetch, dupes) = plan_url_refetches(Vec::new());
-        assert!(refetch.is_empty());
-        assert!(dupes.is_empty());
-    }
-
-    #[test]
-    fn scoped_url_refetch_preserves_distinct_manual_tokens_and_replays_same_token() {
-        let url = "https://indexer.example/release.nzb".to_string();
-        let request = |job, token: &str| UrlFetchRequest {
-            job: JobId(job),
-            url: url.clone(),
-            request_token: Some(token.into()),
-            manual_additional: true,
-        };
-        let (refetch, dupes) = plan_url_refetches_scoped(vec![
-            request(10, "transfer-a"),
-            request(11, "transfer-b"),
-            request(12, "transfer-a"),
-        ]);
-        assert_eq!(refetch, vec![(JobId(10), url.clone()), (JobId(11), url)]);
-        assert_eq!(dupes, vec![(JobId(12), JobId(10))]);
-    }
-
-    #[test]
-    fn scoped_url_refetch_does_not_collapse_manual_additional_without_token() {
-        let url = "https://indexer.example/release.nzb".to_string();
-        let request = |job| UrlFetchRequest {
-            job: JobId(job),
-            url: url.clone(),
-            request_token: None,
-            manual_additional: true,
-        };
-        let (refetch, dupes) = plan_url_refetches_scoped(vec![request(20), request(21)]);
-        assert_eq!(refetch, vec![(JobId(20), url.clone()), (JobId(21), url)]);
-        assert!(dupes.is_empty());
-    }
-
-    #[test]
-    fn token_replay_matches_terminal_job_without_overwriting_changed_submission() {
-        let url = "https://indexer.example/release.nzb";
-        let mut original = bare_job();
-        original.id = JobId(31);
-        original.status = JobStatus::Failed;
-        original.params = vec![
-            ("*URL".into(), url.into()),
-            ("monarr-transfer".into(), "transfer-31".into()),
-            ("monarr-delivery".into(), "1".into()),
-            ("monarr-manual-additional".into(), "1".into()),
-        ];
-        let jobs = vec![original.clone()];
-        let replay = find_url_request(&jobs, url, Some("transfer-31"), true).unwrap();
-        assert_eq!(replay.id, JobId(31));
-        assert!(url_request_matches(replay, url, true, true));
-        assert!(!url_request_matches(
-            replay,
-            "https://indexer.example/another.nzb",
-            true,
-            true
-        ));
-        assert!(!url_request_matches(replay, url, false, true));
-        assert!(find_url_request(&jobs, url, Some("new-transfer"), true).is_none());
-    }
-
-    #[test]
-    fn save_spacing_scales_with_save_cost() {
-        // Fast volume: the historical 2 s cadence.
-        assert_eq!(save_spacing(0), Duration::from_secs(2));
-        assert_eq!(save_spacing(120), Duration::from_secs(2));
-        // A 1 s save gets 10 s between saves (~10% duty cycle)…
-        assert_eq!(save_spacing(1_000), Duration::from_secs(10));
-        // …the field report's 65 s save gets spaced way out…
-        assert_eq!(save_spacing(65_000), Duration::from_secs(300));
-        // …and the cap holds even for absurd values.
-        assert_eq!(save_spacing(u64::MAX / 20), Duration::from_secs(300));
-    }
-
-    #[test]
-    fn incomplete_probe_cannot_clear_a_forecast_hold() {
-        let reading = DiskGuardReading {
-            available_bytes: Some(10_000),
-            all_roots_known: false,
-            ..Default::default()
-        };
-        assert_eq!(
-            disk_guard_decision(true, false, &reading, 100),
-            (false, true)
-        );
-    }
-
-    #[test]
-    fn incomplete_probe_cannot_clear_an_observed_write_latch() {
-        let reading = DiskGuardReading {
-            available_bytes: Some(10_000),
-            all_roots_known: false,
-            ..Default::default()
-        };
-        assert_eq!(disk_guard_decision(true, true, &reading, 100), (true, true));
-    }
-
-    #[test]
-    fn recovered_high_known_root_plus_unknown_sibling_retains_hold() {
-        let reading = DiskGuardReading {
-            available_bytes: Some(1_000_000_000),
-            all_roots_known: false,
-            ..Default::default()
-        };
-        assert_eq!(
-            disk_guard_decision(true, false, &reading, 100),
-            (false, true)
-        );
-    }
-
-    #[test]
-    fn complete_high_probe_releases_a_forecast_hold() {
-        let reading = DiskGuardReading {
-            available_bytes: Some(101),
-            all_roots_known: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            disk_guard_decision(true, false, &reading, 100),
-            (false, false)
-        );
-    }
-
-    #[test]
-    fn write_latch_requires_twice_the_floor_from_a_complete_probe() {
-        let below_clear = DiskGuardReading {
-            available_bytes: Some(199),
-            all_roots_known: true,
-            ..Default::default()
-        };
-        let at_clear = DiskGuardReading {
-            available_bytes: Some(200),
-            all_roots_known: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            disk_guard_decision(true, true, &below_clear, 100),
-            (true, true)
-        );
-        assert_eq!(
-            disk_guard_decision(true, true, &at_clear, 100),
-            (false, false)
-        );
-    }
-
-    #[tokio::test]
-    async fn clearing_disk_guard_wakes_parked_connection_tasks() {
-        let tuning = Tuning {
-            min_free_disk_bytes: 100,
-            ..Tuning::default()
-        };
-        let (_tmp, mut owner, mut epoch, mut messages) = guard_test_owner(tuning);
-        pump(&mut owner, &mut messages).await;
-        assert!(owner.disk_low, "a configured floor starts fail-safe");
-        let _ = epoch.borrow_and_update();
-        assert!(!epoch.has_changed().unwrap());
-
-        owner.disk_guard.store(Arc::new(DiskGuardReading {
-            available_bytes: Some(101),
-            all_roots_known: true,
-            ..Default::default()
-        }));
-        owner.update_disk_guard();
-
-        assert!(!owner.disk_low, "the complete high probe clears the hold");
-        assert!(
-            epoch.has_changed().unwrap(),
-            "a task parked on the work epoch must be woken"
-        );
-    }
-
-    #[tokio::test]
-    async fn clearing_quota_guard_wakes_parked_connection_tasks() {
-        let tuning = Tuning {
-            daily_quota_bytes: 1,
-            ..Tuning::default()
-        };
-        let (_tmp, mut owner, mut epoch, mut messages) = guard_test_owner(tuning);
-        pump(&mut owner, &mut messages).await;
-        owner.quota_reached = true;
-        let _ = epoch.borrow_and_update();
-        assert!(!epoch.has_changed().unwrap());
-
-        // The empty volume book is deterministically below the configured
-        // quota, directly exercising the rollover/recovery transition.
-        owner.update_quota_guard();
-        pump(&mut owner, &mut messages).await;
-
-        assert!(
-            !owner.quota_reached,
-            "the fresh quota period clears the hold"
-        );
-        assert!(
-            epoch.has_changed().unwrap(),
-            "a task parked on the work epoch must be woken"
-        );
-    }
-}
+#[path = "owner_tests.rs"]
+mod tests;

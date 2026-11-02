@@ -213,7 +213,7 @@ fn preserve_user_intent(old: &mut Job, current: &Job) {
 /// Rollback starts from the last durable row. Only intent changed after the
 /// provisional row was installed belongs to a concurrent operator command;
 /// unchanged candidate fields must not leak back into the restored record.
-fn preserve_intent_changes(restored: &mut Job, current: &Job, provisional: &Job) {
+pub(super) fn preserve_intent_changes(restored: &mut Job, current: &Job, provisional: &Job) {
     if current.category != provisional.category {
         restored.category = current.category.clone();
     }
@@ -451,8 +451,19 @@ impl Owner {
     pub(super) fn apply_post_record(
         &mut self,
         admission: crate::PostAdmission,
+        candidate: Job,
+        require_snapshot: bool,
+        callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
+    ) {
+        self.apply_post_record_proven(admission, candidate, require_snapshot, None, callback);
+    }
+
+    pub(super) fn apply_post_record_proven(
+        &mut self,
+        admission: crate::PostAdmission,
         mut candidate: Job,
         require_snapshot: bool,
+        completion_proof: Option<nzbd_state::artifacts::WorkerCompletionProof>,
         callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
     ) {
         if !self.post_scope_current(&admission)
@@ -464,6 +475,19 @@ impl Owner {
         {
             callback(self, false);
             return;
+        }
+        if completion_proof.is_some() {
+            match self.prepare_replacement_control(&mut candidate, completion_proof.as_ref()) {
+                Ok((true, _)) => {
+                    callback(self, true);
+                    return;
+                }
+                Ok((false, _)) => {}
+                Err(_) => {
+                    callback(self, false);
+                    return;
+                }
+            }
         }
         let Some(previous) = self.state.job(candidate.id).cloned() else {
             callback(self, false);
@@ -580,13 +604,187 @@ impl Owner {
         });
     }
 
+    /// Validate the imported grant and completion against the current local
+    /// generation before entering the asynchronous durable replacement lane.
+    fn prepare_replacement_control(
+        &self,
+        job: &mut Job,
+        completion_proof: Option<&nzbd_state::artifacts::WorkerCompletionProof>,
+    ) -> Result<(bool, bool), nzbd_state::StateError> {
+        if self.persistence_fenced
+            || (self.persist && self.persist_guard.as_ref().is_some_and(|guard| !guard()))
+        {
+            return Err(failure(
+                "import authority, source generation, or worker control changed",
+            ));
+        }
+        let preserve_publication = if let Some(proof) = completion_proof {
+            let exact_context = nzbd_state::artifacts::WorkerControlContext::for_job(job).as_ref()
+                == Some(&proof.context)
+                && self
+                    .state
+                    .job(job.id)
+                    .and_then(nzbd_state::artifacts::WorkerControlContext::for_job)
+                    .as_ref()
+                    == Some(&proof.context);
+            let exact_source =
+                self.artifacts
+                    .for_job(job.id.0)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|artifact| {
+                        artifact.id == proof.source.artifact
+                            && artifact.generation == proof.source.generation
+                            && artifact.owned
+                    });
+            if proof.job != job.id || !exact_context || !exact_source {
+                return Err(failure(
+                    "import authority, source generation, or worker control changed",
+                ));
+            }
+            // Acceptance is terminal. Late selected-outcome preparations may
+            // acknowledge it but must never regress PP_DONE or queue state.
+            match self
+                .artifacts
+                .worker_completion_accepted(&proof.context, &proof.source)
+            {
+                Ok(true) => return Ok((true, true)),
+                Ok(false) => {}
+                Err(_) => return Err(failure("worker completion acceptance unavailable")),
+            }
+            if proof.accepted {
+                return Ok((true, true));
+            }
+            if let Some(done) = self.state.job(job.id).and_then(|current| {
+                current
+                    .params
+                    .iter()
+                    .find(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                    .map(|(_, value)| value)
+            }) {
+                return if job
+                    .params
+                    .iter()
+                    .find(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                    .is_none_or(|(_, value)| value == done)
+                {
+                    Ok((true, true))
+                } else {
+                    Err(failure("worker completion conflicts with terminal outcome"))
+                };
+            }
+            true
+        } else {
+            false
+        };
+        let mut worker_control_restored = false;
+        let incoming_context = nzbd_state::artifacts::WorkerControlContext::for_job(job);
+        let current_context = self
+            .state
+            .job(job.id)
+            .and_then(nzbd_state::artifacts::WorkerControlContext::for_job);
+        if let (Some(incoming), Some(current)) = (&incoming_context, &current_context) {
+            if incoming.job_incarnation == current.job_incarnation
+                && (incoming.epoch < current.epoch
+                    || incoming.job_revision < current.job_revision
+                    || incoming.control_revision < current.control_revision)
+            {
+                return Err(failure(
+                    "import authority, source generation, or worker control changed",
+                ));
+            }
+        }
+        if self.worker_mode {
+            if let Some(context) = incoming_context.as_ref() {
+                if let Err(error) = self.artifacts.bind_worker_context(job.id.0, context) {
+                    tracing::warn!(job=job.id.0, %error, "worker grant binding refused");
+                    return Err(failure(
+                        "import authority, source generation, or worker control changed",
+                    ));
+                }
+                match self.artifacts.worker_control_for_job_metadata(job, context) {
+                    Ok(Some(checkpoint)) => {
+                        worker_control_restored = true;
+                        job.set_control(&checkpoint.control);
+                        job.status = if checkpoint.control.lifecycle == "held"
+                            || checkpoint.control.manual_pause
+                        {
+                            JobStatus::Paused
+                        } else if matches!(
+                            checkpoint.control.previous_status,
+                            Some(
+                                JobStatus::Post { .. }
+                                    | JobStatus::PostQueued
+                                    | JobStatus::Completed
+                            )
+                        ) {
+                            JobStatus::PostQueued
+                        } else {
+                            JobStatus::Queued
+                        };
+                        job.params.retain(|(key, _)| {
+                            !matches!(key.as_str(), "*Control:attempts" | "*Control:probe_after")
+                        });
+                        job.params.extend(checkpoint.probe_params);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(job=job.id.0, %error, "worker control recovery refused");
+                        return Err(failure(
+                            "import authority, source generation, or worker control changed",
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(control) = self
+            .state
+            .job(job.id)
+            .and_then(|j| j.control())
+            .filter(|c| {
+                c.lifecycle == "held"
+                    && !worker_control_restored
+                    && (incoming_context.is_none() && current_context.is_none()
+                        || incoming_context == current_context)
+            })
+        {
+            // Remote/exported legacy snapshots cannot erase a newer local fence.
+            job.set_control(&control);
+            job.status = JobStatus::Paused;
+            job.params.retain(|(k, _)| k != nzbd_types::PP_DONE_PARAM);
+        }
+        Ok((false, preserve_publication))
+    }
+
     pub(super) fn replace_job_then(
+        &mut self,
+        candidate: Job,
+        fold: bool,
+        emit_finished: bool,
+        require_existing: bool,
+        require_snapshot: bool,
+        callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
+    ) {
+        self.replace_job_proven_then(
+            candidate,
+            fold,
+            emit_finished,
+            require_existing,
+            require_snapshot,
+            None,
+            callback,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn replace_job_proven_then(
         &mut self,
         mut candidate: Job,
         fold: bool,
         emit_finished: bool,
         require_existing: bool,
         require_snapshot: bool,
+        completion_proof: Option<nzbd_state::artifacts::WorkerCompletionProof>,
         callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
     ) {
         let job = candidate.id;
@@ -622,19 +820,26 @@ impl Owner {
             callback(self, Err(failure("unsafe replacement storage namespace")));
             return;
         }
-        let previous = self.state.job(job).cloned();
-        if let Some(previous) = &previous {
-            if let Some(control) = previous
-                .control()
-                .filter(|control| control.lifecycle == "held")
-            {
-                candidate.set_control(&control);
-                candidate.status = JobStatus::Paused;
-                candidate
-                    .params
-                    .retain(|(key, _)| key != nzbd_types::PP_DONE_PARAM);
-            }
+        let (already_accepted, preserve_publication) =
+            match self.prepare_replacement_control(&mut candidate, completion_proof.as_ref()) {
+                Ok(result) => result,
+                Err(error) => {
+                    callback(self, Err(error));
+                    return;
+                }
+            };
+        if already_accepted {
+            callback(self, Ok(()));
+            return;
         }
+        let previous = self.state.job(job).cloned();
+        let prior_receipts = self
+            .state
+            .url_admission_receipts
+            .iter()
+            .filter(|receipt| receipt.job_id == job.0)
+            .cloned()
+            .collect::<Vec<_>>();
         normalize(&mut candidate);
         let epoch = fresh_epoch();
         self.job_epochs.insert(job, epoch);
@@ -647,6 +852,11 @@ impl Owner {
             self.writers.remove(&file.id);
         }
         let old_allocation = self.allocation_cache.remove(&job);
+        if preserve_publication {
+            if let Some(allocation) = old_allocation.as_ref() {
+                self.allocation_cache.insert(job, allocation.clone());
+            }
+        }
         self.allocated_jobs.remove(&job);
         let old_delegated = self.delegated.remove(&job);
         let old_mirror = self.mirror.remove(&job);
@@ -667,7 +877,7 @@ impl Owner {
         }
         self.pending_control_commits.insert(job);
         self.record_transitions.insert(job);
-        if needs_payload(&candidate) {
+        if !preserve_publication && needs_payload(&candidate) {
             self.queue_verification(job);
             if let Some(state) = self.verification.get_mut(&job) {
                 state.phase = "saving".into();
@@ -699,6 +909,11 @@ impl Owner {
                     }
                     None => owner.state.jobs.retain(|current| current.id != job),
                 }
+                owner
+                    .state
+                    .url_admission_receipts
+                    .retain(|receipt| receipt.job_id != job.0);
+                owner.state.url_admission_receipts.extend(prior_receipts);
                 owner.verification.remove(&job);
                 if let Some(allocation) = old_allocation {
                     owner.allocation_cache.insert(job, allocation);
@@ -732,7 +947,13 @@ impl Owner {
             }
             owner.pending_control_commits.remove(&job);
             owner.record_transitions.remove(&job);
-            if needs_payload(&candidate) {
+            for file in previous.as_ref().into_iter().flat_map(|row| &row.files) {
+                owner.file_sizes.remove(&file.id);
+                owner.finalize_sent.remove(&file.id);
+            }
+            owner.pending_finalize.retain(|(id, _)| *id != job);
+            owner.attempts.retain(|reference, _| reference.job != job);
+            if !preserve_publication && needs_payload(&candidate) {
                 owner.queue_payload_recovery(job);
             }
             if fold {
@@ -1794,7 +2015,7 @@ mod tests {
         stamp
             .params
             .push((nzbd_types::PP_DONE_PARAM.into(), "SUCCESS/ALL".into()));
-        assert!(scoped.import_worker_job_if_present(stamp).await.unwrap());
+        assert!(scoped.import_job_if_present(stamp).await.unwrap());
         engine.end_post_admission(admission).await.unwrap();
         engine.shutdown().await;
     }

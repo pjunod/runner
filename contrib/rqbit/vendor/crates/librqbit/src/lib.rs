@@ -78,6 +78,7 @@ pub use api::Api;
 pub use api_error::ApiError;
 pub use create_torrent_file::{create_torrent, CreateTorrentOptions};
 pub use dht;
+pub use file_ops::verify_selected_piece_ranges;
 pub use peer_connection::PeerConnectionOptions;
 pub use session::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, InvalidResolvedMagnetMetadataError,

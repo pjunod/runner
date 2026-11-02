@@ -3,6 +3,8 @@
 //! (ARCHITECTURE.md §10.1). OpenAPI + roles are the remaining items.
 
 mod artifacts;
+pub mod cluster_removal;
+pub mod control_pending;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -589,7 +591,11 @@ fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -
 }
 
 async fn get_status(State(st): State<ApiState>) -> Json<StatusDto> {
-    Json(status_dto(&st.engine.snapshot()))
+    let mut status = status_dto(&st.engine.snapshot());
+    if st.torrent.is_some() && st.engine.native_torrent_delivery_supported() {
+        status.capabilities.push("native-torrent-deliveries-v1");
+    }
+    Json(status)
 }
 
 async fn healthz() -> &'static str {
@@ -703,18 +709,40 @@ fn auth_exempt(path: &str) -> bool {
     ) || path.starts_with("/icons/")
 }
 
-async fn list_jobs(State(st): State<ApiState>) -> Response {
+async fn list_jobs(
+    State(st): State<ApiState>,
+    observations: Option<axum::Extension<control_pending::ControlPendingObservations>>,
+) -> Response {
     let snap = st.engine.snapshot();
-    Json(json!({ "jobs": snap.jobs })).into_response()
+    let jobs = snap
+        .jobs
+        .iter()
+        .map(|job| {
+            control_pending::render(
+                job,
+                snap.pending_automatic_controls.contains(&job.id),
+                observations.as_ref().map(|observations| &observations.0),
+            )
+        })
+        .collect::<Vec<_>>();
+    Json(json!({ "jobs": jobs })).into_response()
 }
 
-async fn get_job(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
+async fn get_job(
+    State(st): State<ApiState>,
+    Path(id): Path<u32>,
+    observations: Option<axum::Extension<control_pending::ControlPendingObservations>>,
+) -> Response {
     let snap = st.engine.snapshot();
     match snap.jobs.iter().find(|j| j.id == JobId(id)) {
         Some(job) if job.kind == nzbd_types::JobKind::Torrent => {
             match st.engine.export_job(JobId(id)).await {
                 Ok(Some(record)) => {
-                    let mut value = serde_json::to_value(job).unwrap_or_else(|_| json!({}));
+                    let mut value = control_pending::render(
+                        job,
+                        snap.pending_automatic_controls.contains(&job.id),
+                        observations.as_ref().map(|observations| &observations.0),
+                    );
                     if let Some(object) = value.as_object_mut() {
                         object.insert("torrent".into(), json!(record.torrent));
                     }
@@ -724,7 +752,12 @@ async fn get_job(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
                 Err(err) => error(StatusCode::SERVICE_UNAVAILABLE, &err.to_string()),
             }
         }
-        Some(job) => Json(job.clone()).into_response(),
+        Some(job) => Json(control_pending::render(
+            job,
+            snap.pending_automatic_controls.contains(&job.id),
+            observations.as_ref().map(|observations| &observations.0),
+        ))
+        .into_response(),
         None => not_found(),
     }
 }
@@ -974,6 +1007,33 @@ struct KeepOnFailureBody {
     keep: bool,
 }
 
+async fn get_failure_keep(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
+    let inventory = st.engine.artifacts();
+    let lookup = tokio::task::spawn_blocking(move || -> nzbd_state::artifacts::Result<_> {
+        let source = inventory.failure_keep_source(id)?;
+        let allocated = if source.is_some() {
+            true
+        } else {
+            inventory.for_job(id)?.is_some()
+        };
+        Ok((source, allocated))
+    })
+    .await;
+    match lookup {
+        Ok(Ok((Some(source),_)))=>Json(json!({"available":true,"keep":source.keep_on_failure,"sourceArtifactId":source.id,"sourceGeneration":source.generation})).into_response(),
+        Ok(Ok((None,true)))=>Json(json!({"available":false,"keep":false})).into_response(),
+        Ok(Ok((None,false)))=>match st.engine.export_job(JobId(id)).await {
+            Ok(Some(job)) if matches!(job.status,nzbd_types::JobStatus::Fetching|nzbd_types::JobStatus::Queued|nzbd_types::JobStatus::Paused)
+                || (nzbd_engine::torrent_acquisitions::is_acquisition(&job)
+                    && !job.params.iter().any(|(key,value)|key == "Delivery:SourceCleanup" && matches!(value.as_str(),"deleting"|"deleted")))=>Json(json!({"available":true,"keep":job.params.iter().any(|(key,value)|key=="*Runner:KeepOnFailure"&&value=="1")})).into_response(),
+            Ok(_)=>Json(json!({"available":false,"keep":false})).into_response(),
+            Err(failure)=>error(StatusCode::SERVICE_UNAVAILABLE,&failure.to_string()),
+        },
+        Ok(Err(failure))=>error(StatusCode::SERVICE_UNAVAILABLE,&failure.to_string()),
+        Err(failure)=>error(StatusCode::SERVICE_UNAVAILABLE,&failure.to_string()),
+    }
+}
+
 /// `PUT /api/v1/jobs/{id}/failure-keep` persists this job's explicit choice
 /// to retain its Runner-owned source if the transfer fails.
 async fn set_keep_on_failure(
@@ -989,6 +1049,24 @@ async fn set_keep_on_failure(
 }
 
 async fn retry_job_now(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
+    if let Ok(Some(row)) = st.engine.export_job(JobId(id)).await {
+        if nzbd_engine::torrent_acquisitions::is_acquisition(&row) {
+            if let Some(control) = row.control().filter(|control| {
+                control.lifecycle == "held"
+                    && matches!(control.stage.as_str(), "torrent_copy" | "torrent_metadata")
+            }) {
+                return match st
+                    .engine
+                    .release_hold(row.id, control.revision, nzbd_engine::RetryBy::Operator)
+                    .await
+                {
+                    Ok(Ok(())) => Json(json!({"ok":true,"retrying":true})).into_response(),
+                    Ok(Err(reason)) => error(StatusCode::CONFLICT, &reason),
+                    Err(failure) => error(StatusCode::SERVICE_UNAVAILABLE, &failure.to_string()),
+                };
+            }
+        }
+    }
     let Some(manager) = st.pp_manager.as_ref() else {
         return error(
             StatusCode::NOT_IMPLEMENTED,
@@ -1220,6 +1298,7 @@ async fn park_write(st: &ApiState, mut parked: Parked) -> bool {
 async fn job_action(
     State(st): State<ApiState>,
     Path((id, action)): Path<(u32, String)>,
+    cluster_removal: Option<axum::Extension<cluster_removal::ClusterRemovalContext>>,
 ) -> Response {
     let engine = &st.engine;
     let job = JobId(id);
@@ -1266,13 +1345,24 @@ async fn job_action(
     if action == "delete" || action == "delete-files" {
         let files = action == "delete-files";
         let snapshot = park_snapshot(&st, job).await;
-        return match engine.delete_job(job, files).await {
+        let requeue_reason = snapshot
+            .as_ref()
+            .and_then(|parked| history_requeue_refusal(&parked.entry));
+        // Cluster control commits the original removal mode first, then
+        // exact source owners stop/join writers and drain their own copies.
+        return match engine
+            .delete_job(job, files && cluster_removal.is_none())
+            .await
+        {
             Ok(true) => {
+                if let Some(context) = &cluster_removal {
+                    context.record(id, files);
+                }
                 let mut parked = false;
                 if let Some(s) = snapshot {
                     parked = park_write(&st, s).await;
                 }
-                Json(json!({ "ok": true, "parked": parked })).into_response()
+                Json(json!({ "ok": true, "parked": parked, "can_requeue": parked && requeue_reason.is_none(), "requeue_reason": requeue_reason })).into_response()
             }
             Ok(false) => not_found(),
             Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
@@ -1716,7 +1806,14 @@ fn unix_now() -> i64 {
 
 /// The 1 Hz SSE `tick` body: header status + job rows from one snapshot.
 fn tick_payload(snap: &QueueSnapshot) -> String {
-    json!({ "status": status_dto(snap), "jobs": snap.jobs }).to_string()
+    let jobs = snap
+        .jobs
+        .iter()
+        .map(|job| {
+            control_pending::render(job, snap.pending_automatic_controls.contains(&job.id), None)
+        })
+        .collect::<Vec<_>>();
+    json!({ "status": status_dto(snap), "jobs": jobs }).to_string()
 }
 
 /// Resolve when the daemon is shutting down; pend forever if no shutdown
@@ -2081,11 +2178,28 @@ async fn get_history(
             let entries = entries
                 .into_iter()
                 .map(|e| {
-                    let can =
-                        spooled.contains(&e.job.0) || e.params.iter().any(|(k, _)| k == "*URL");
+                    let reason = history_requeue_refusal(&e);
+                    let can = reason.is_none()
+                        && (spooled.contains(&e.job.0)
+                            || e.params.iter().any(|(k, _)| k == "*URL"));
                     let mut v = serde_json::to_value(&e).unwrap_or_else(|_| json!({}));
                     if let Some(o) = v.as_object_mut() {
+                        o.insert(
+                            "torrent_role".into(),
+                            json!(e
+                                .record
+                                .as_ref()
+                                .and_then(|record| record.torrent_role.as_deref())),
+                        );
+                        o.insert(
+                            "seed_donor_job_id".into(),
+                            json!(e
+                                .record
+                                .as_ref()
+                                .and_then(|record| record.seed_donor_job_id)),
+                        );
                         o.insert("can_requeue".into(), json!(can));
+                        o.insert("requeue_reason".into(), json!(reason));
                         o.insert(
                             "kind".into(),
                             json!(e
@@ -2611,6 +2725,11 @@ async fn get_clients(State(st): State<ApiState>) -> Response {
 /// NZB, or the `*URL` param when the job was still fetching when it was
 /// deleted. On success the history entry and its spool are removed: the
 /// job is queued again, so a `DELETED` record for it would be a lie.
+fn history_requeue_refusal(entry: &nzbd_state::HistoryEntry) -> Option<&'static str> {
+    entry.params.iter().any(|(key, _)| key == "monarr-transfer")
+        .then_some("This download belongs to a Curator request. Use a fresh Grab in Curator to acquire it again with a new request token, or retry its retained source.")
+}
+
 async fn history_requeue(st: &ApiState, db: Arc<HistoryDb>, job: JobId) -> Response {
     let lookup = db.clone();
     let found = tokio::task::spawn_blocking(move || {
@@ -2626,6 +2745,13 @@ async fn history_requeue(st: &ApiState, db: Arc<HistoryDb>, job: JobId) -> Respo
     let Ok(Some((entry, nzb))) = found else {
         return not_found();
     };
+    if let Some(reason) = history_requeue_refusal(&entry) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error":reason,"code":"consumer_request_requires_fresh_grab"})),
+        )
+            .into_response();
+    }
     let url = entry
         .params
         .iter()
@@ -2641,13 +2767,11 @@ async fn history_requeue(st: &ApiState, db: Arc<HistoryDb>, job: JobId) -> Respo
             mode: None,
         }),
         paused: false,
-        // A requeue is the same download again, so it carries the same
-        // consumer params — the tracking id that names this transfer must
-        // survive an undo, or the trace it belongs to ends mid-story.
+        // Ordinary Runner history entries retain their consumer parameters.
         params: entry
             .params
             .iter()
-            .filter(|(k, _)| !k.starts_with('*'))
+            .filter(|(key, _)| !key.starts_with('*'))
             .cloned()
             .collect(),
         ..Default::default()
@@ -2847,7 +2971,10 @@ pub fn router_with(state: ApiState) -> Router {
         )
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/priority", put(set_job_priority))
-        .route("/api/v1/jobs/{id}/failure-keep", put(set_keep_on_failure))
+        .route(
+            "/api/v1/jobs/{id}/failure-keep",
+            get(get_failure_keep).put(set_keep_on_failure),
+        )
         .route("/api/v1/jobs/{id}/retry", post(retry_job_now))
         .route("/api/v1/jobs/{id}/files", get(get_job_files))
         .route("/api/v1/jobs/{id}/torrent", get(get_job_torrent))
@@ -3210,6 +3337,8 @@ mod tests {
             ratio: 0.0,
             seeding_seconds: 0,
             useful_peers: 0,
+            torrent_role: None,
+            seed_donor_job_id: None,
             torrent_phase: None,
             torrent_control_intent: None,
             seed_policy: None,
@@ -3596,6 +3725,231 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivery_router_advances_past_huge_row_and_rejects_bad_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let inventory = engine.artifacts();
+        let root = tmp.path().join("source");
+        std::fs::create_dir(&root).unwrap();
+        let mut deliveries = Vec::new();
+        for (job, huge) in [(91u32, true), (92u32, false)] {
+            let source = root.join(format!("job-{job}"));
+            inventory
+                .allocate_for_delivery(job, &root, &source, true, true)
+                .unwrap();
+            std::fs::write(source.join("episode.mkv"), b"verified payload").unwrap();
+            inventory.finish(job, &source, &root, "active").unwrap();
+            let selected = inventory.for_job(job).unwrap().unwrap().files;
+            let outcomes = vec![nzbd_state::artifacts::DeliveryFileOutcome {
+                source_path: "episode.mkv".into(),
+                publication_path: Some("episode.mkv".into()),
+                classification: "video".into(),
+                outcome: "published".into(),
+                reason: Some(if huge {
+                    "x".repeat(8 * 1024 * 1024 + 1)
+                } else {
+                    "verified".into()
+                }),
+                repair_dependency: false,
+                source_cleanup_status: "pending".into(),
+            }];
+            let target = tmp.path().join("completed").join(format!("job-{job}"));
+            inventory
+                .publish_selected_for_delivery_checked(job, &target, selected, outcomes, &|| Ok(()))
+                .unwrap();
+            deliveries.push(
+                inventory
+                    .create_delivery(job, true, Some(&format!("request-{job}")))
+                    .unwrap(),
+            );
+        }
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: None,
+            torrent: None,
+            log: None,
+            setup: None,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/deliveries")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = body_json(response).await;
+        let rows = page["deliveries"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["deliveryId"], deliveries[0].delivery_id);
+        assert!(rows[0]["discoveryError"]
+            .as_str()
+            .unwrap()
+            .contains("exceeds"));
+        assert_eq!(rows[1]["deliveryId"], deliveries[1].delivery_id);
+        assert_eq!(page["nextCursor"], deliveries[1].sequence);
+        assert!(serde_json::to_vec(&page).unwrap().len() <= 16 * 1024 * 1024);
+        for query in ["after=-1", "limit=0", "limit=101"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(format!("/api/v1/deliveries?{query}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn retired_source_keep_route_reports_live_preference_without_exposing_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let engine = test_engine(&temporary).await;
+        let inventory = engine.artifacts();
+        let root = temporary.path().join("retained");
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("failed-source");
+        inventory
+            .allocate_for_delivery(86, &root, &source, true, false)
+            .unwrap();
+        std::fs::write(source.join("partial.mkv"), b"retained failed bytes").unwrap();
+        inventory
+            .finish(86, &source, &root, "parked_failed")
+            .unwrap();
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: None,
+            torrent: None,
+            log: None,
+            setup: None,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+        for keep in [true, false] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::put("/api/v1/jobs/86/failure-keep")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(json!({"keep":keep}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::get("/api/v1/jobs/86/failure-keep")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            assert_eq!(body["available"], true);
+            assert_eq!(body["keep"], keep);
+            assert!(body["sourceArtifactId"].is_string());
+            assert!(body["sourceGeneration"].is_string());
+            assert!(body.get("path").is_none());
+        }
+        let artifact = inventory.for_job(86).unwrap().unwrap();
+        let operation = inventory
+            .request_delete(
+                &artifact.id,
+                artifact.revision,
+                "explicit-retained-delete-86",
+                0,
+            )
+            .unwrap();
+        inventory.execute_delete(&operation.id).unwrap();
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/jobs/86/failure-keep")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(response).await["available"], false);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn consumer_history_requeue_refuses_both_sources_without_retiring_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let db = Arc::new(HistoryDb::open(&tmp.path().join("history.sqlite"), None).unwrap());
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: Some(db.clone()),
+            torrent: None,
+            log: None,
+            setup: None,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+        for (id, spooled) in [(81u32, false), (82u32, true)] {
+            let entry: nzbd_state::HistoryEntry = serde_json::from_value(json!({
+                "job": id, "name": "consumer", "category": null, "final_dir": null,
+                "status": "DELETED", "size": 0, "completed_at_unix": 1,
+                "params": [["monarr-transfer", format!("request-{id}")], ["*URL", "http://example.test/request.nzb"]]
+            })).unwrap();
+            db.record(&entry).unwrap();
+            if spooled {
+                db.spool_nzb(JobId(id), NZB.as_bytes()).unwrap();
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::post(format!("/api/v1/history/{id}/actions/requeue"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                body_json(response).await["code"],
+                "consumer_request_requires_fresh_grab"
+            );
+            assert!(db.get(JobId(id)).unwrap().is_some());
+            assert!(engine.snapshot().jobs.is_empty());
+        }
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/history")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let page = body_json(response).await;
+        for row in page["entries"].as_array().unwrap() {
+            assert_eq!(row["can_requeue"], false);
+            assert!(row["requeue_reason"].as_str().unwrap().contains("Curator"));
+        }
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn requeue_durably_removes_the_deleted_history_record() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = test_engine(&tmp).await;
@@ -3661,6 +4015,29 @@ mod tests {
             "a fresh node must not rebuild the obsolete DELETED record"
         );
         engine.shutdown().await;
+    }
+
+    #[test]
+    fn sse_tick_preserves_pending_control_until_exact_ack() {
+        let mut snapshot = QueueSnapshot::default();
+        snapshot.jobs.push(summary(44, JobStatus::Queued));
+        snapshot.pending_automatic_controls.insert(JobId(44));
+        let value: serde_json::Value = serde_json::from_str(&tick_payload(&snapshot)).unwrap();
+        assert_eq!(value["jobs"][0]["controlPending"]["state"], "pending");
+        assert!(value["jobs"][0]["controlPending"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("source custody"));
+        assert_eq!(
+            value["jobs"][0]["status"],
+            serde_json::to_value(JobStatus::Queued).unwrap()
+        );
+        snapshot.pending_automatic_controls.clear();
+        let accepted: serde_json::Value = serde_json::from_str(&tick_payload(&snapshot)).unwrap();
+        assert!(
+            accepted["jobs"][0].get("controlPending").is_none(),
+            "accepted ACK clears the observation without inventing a control"
+        );
     }
 
     #[tokio::test]

@@ -189,11 +189,19 @@ impl Owner {
         &mut self,
         continuation: impl FnOnce(&mut Owner, bool) + Send + 'static,
     ) {
-        if !self.persist && !self.worker_mode {
+        if self.persistence_fenced || (!self.persist && !self.worker_mode) {
             continuation(self, false);
             return;
         }
+        self.sync_lifecycle_timings();
+        for job in &mut self.state.jobs {
+            crate::automatic_control::invalidate_changed(job);
+        }
         self.state.sync_url_admission_receipts();
+        for receipt in &mut self.state.url_admission_receipts {
+            refresh_url_admission_custody(receipt, &self.artifacts);
+        }
+
         let revision = fresh_epoch();
         let request = Request::Snapshot {
             revision,

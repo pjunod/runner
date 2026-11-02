@@ -7,7 +7,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub mod lifecycle;
 pub mod metrics;
+pub use lifecycle::*;
 
 // ---------------------------------------------------------------------------
 // Identifiers
@@ -804,6 +806,28 @@ pub struct Job {
 }
 
 impl Job {
+    pub fn torrent_role(&self) -> Option<&'static str> {
+        if self.kind != JobKind::Torrent {
+            return None;
+        }
+        if self.torrent.is_some() {
+            return Some("seed");
+        }
+        self.params
+            .iter()
+            .any(|(key, value)| key == "*Torrent:Acquisition" && value == "1")
+            .then_some("acquisition")
+    }
+    pub fn seed_donor_job_id(&self) -> Option<JobId> {
+        if self.torrent_role() != Some("acquisition") {
+            return None;
+        }
+        self.params
+            .iter()
+            .find(|(key, _)| key == "*Torrent:Donor")
+            .and_then(|(_, value)| value.parse().ok())
+            .map(JobId)
+    }
     /// New-work lifecycle policy is broader than an optional Curator handoff:
     /// every newly allocated Runner job gets reason-based recovery, while only
     /// jobs with delivery intent publish a Curator Delivery record. Old queue
@@ -860,8 +884,8 @@ impl Job {
             return false;
         }
         match self.kind {
-            JobKind::Torrent => self.ready_at_unix().is_some(),
-            JobKind::Nzb | JobKind::Url => self
+            JobKind::Torrent if self.torrent.is_some() => self.ready_at_unix().is_some(),
+            JobKind::Torrent | JobKind::Nzb | JobKind::Url => self
                 .params
                 .iter()
                 .any(|(key, value)| key == PP_DONE_PARAM && value == "SUCCESS"),

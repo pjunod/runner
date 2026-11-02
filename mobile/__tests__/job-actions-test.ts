@@ -31,3 +31,9 @@ test('ordinary action failures are not swallowed', async () => {
   await expect(runJobAction(client, seed, seed.id, 'pause', jest.fn())).rejects.toBeInstanceOf(ApiError);
   expect(client.getJobs).not.toHaveBeenCalled();
 });
+
+test('managed child resume refusal does not invoke donor seed recovery', async () => {
+  const child = { ...seed, torrent_role: 'acquisition', seed_donor_job_id: seed.id } as JobSummary;
+  await expect(runJobAction(client, child, child.id, 'resume', jest.fn())).rejects.toBeInstanceOf(ApiError);
+  expect(client.getJobs).not.toHaveBeenCalled();
+});

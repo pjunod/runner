@@ -178,6 +178,11 @@ fn rename_with_companions(
         }
         let name = f.file_name().map(|n| n.to_string_lossy().into_owned());
         let Some(name) = name else { continue };
+        // Preserve the exact existing incidental identity used by source
+        // disposition; a renamed readme must not become unknown payload.
+        if crate::manager::is_disposable_name(&name.to_ascii_lowercase()) {
+            continue;
+        }
         let Some(suffix) = name.strip_prefix(old_stem) else {
             continue;
         };
@@ -352,7 +357,12 @@ pub fn deobfuscate_dir_owned(
     // themselves renamed.
     let mut cands: Vec<(PathBuf, u64)> = files
         .iter()
-        .filter(|p| !skip_ext(p))
+        .filter(|p| {
+            !skip_ext(p)
+                && !p.file_name().is_some_and(|name| {
+                    crate::manager::is_disposable_name(&name.to_string_lossy().to_ascii_lowercase())
+                })
+        })
         .map(|p| {
             let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
             (p.clone(), size)
@@ -386,6 +396,34 @@ pub fn deobfuscate_dir_owned(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_incidental_names_keep_their_identity_through_deobfuscation() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("readme.txt"), b"release notes").unwrap();
+        assert!(
+            deobfuscate_dir(temp.path(), "Release.Title", &Default::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(temp.path().join("readme.txt").is_file());
+        std::fs::write(temp.path().join("readme.mkv"), [b'x'; 300]).unwrap();
+        std::fs::write(
+            temp.path().join("Intended.Novel.epub"),
+            b"book payload preserved",
+        )
+        .unwrap();
+        deobfuscate_dir(temp.path(), "Release.Title", &Default::default()).unwrap();
+        assert!(
+            temp.path().join("readme.txt").is_file(),
+            "media companions must not erase incidental identity"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("Intended.Novel.epub")).unwrap(),
+            b"book payload preserved"
+        );
+        assert!(temp.path().join("Release.Title.mkv").is_file());
+    }
 
     #[test]
     fn media_container_extensions_do_not_invent_pack_names_or_override_evidence() {

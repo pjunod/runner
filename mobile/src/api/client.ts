@@ -8,6 +8,8 @@ import {
   AddTorrentResult,
   ConnectionConfig,
   HistoryPage,
+  DeliveryTrace,
+  FailureKeepPreference,
   JobSummary,
   LogsPage,
   QueueSnapshot,
@@ -41,8 +43,8 @@ export class NzbdClient {
     return this.json<StatusDto>('/api/v1/status');
   }
 
-  async getJobs(): Promise<JobSummary[]> {
-    const result = await this.json<{ jobs: JobSummary[] }>('/api/v1/jobs');
+  async getJobs(signal?: AbortSignal): Promise<JobSummary[]> {
+    const result = await this.json<{ jobs: JobSummary[] }>('/api/v1/jobs', { signal });
     return result.jobs;
   }
 
@@ -54,6 +56,60 @@ export class NzbdClient {
   async getHistory(limit = 200, offset = 0): Promise<HistoryPage> {
     const query = new URLSearchParams({ limit: String(limit), offset: String(offset) });
     return this.json<HistoryPage>(`/api/v1/history?${query.toString()}`);
+  }
+
+  async getDelivery(id: string): Promise<DeliveryTrace> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12_000);
+    try {
+      const response = await fetch(`${this.config.baseUrl}/api/v1/deliveries/${encodeURIComponent(id)}`, {
+        headers: this.headers(), signal: controller.signal,
+      });
+      if (!response.ok) return this.readJson<DeliveryTrace>(response);
+      const reader = response.body?.getReader();
+      if (!reader) throw new ApiError('Runner did not provide a bounded publication response.');
+      const chunks: Uint8Array[] = []; let size = 0;
+      try {
+        while (true) {
+          const chunk = await reader.read(); if (chunk.done) break;
+          size += chunk.value.byteLength;
+          if (size > 8 * 1024 * 1024) { await reader.cancel(); throw new ApiError('Publication manifest exceeds supported display size; review it in Curator.'); }
+          chunks.push(chunk.value);
+        }
+      } finally { reader.releaseLock(); }
+      const bytes = new Uint8Array(size); let offset = 0;
+      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+      const value = JSON.parse(new TextDecoder().decode(bytes)) as DeliveryTrace;
+      if (value.deliveryId !== id) throw new ApiError('Runner returned a different publication; refresh and review.');
+      if (value.discoveryError) throw new ApiError(value.discoveryError);
+      if (value.lifecycleTiming?.version === 1 && (!Array.isArray(value.lifecycleTiming.intervals) || value.lifecycleTiming.intervals.length > 128 || value.lifecycleTiming.intervals.some(i => !i || ![i.stage, i.nodeId, i.clockDomain, i.state].every(v => typeof v === 'string')))
+        || value.runnerStages && (!Array.isArray(value.runnerStages.spans) || value.runnerStages.spans.length > 128 || value.runnerStages.spans.some(span => typeof span?.stage !== 'string'))
+        || value.sourceCopies && (!Array.isArray(value.sourceCopies) || value.sourceCopies.length > 64 || value.sourceCopies.some(copy => !copy || ![copy.id, copy.ownerNode, copy.status].every(v => typeof v === 'string')))
+        || value.sourceCleanup && typeof value.sourceCleanup.status !== 'string') throw new ApiError('Runner returned malformed lifecycle details; refresh and review.');
+      return value;
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      if (controller.signal.aborted) throw new ApiError('Runner lifecycle details did not answer within 12 seconds.');
+      throw error;
+    } finally { clearTimeout(timeout); }
+  }
+
+  async retryDeliveryCleanup(id: string): Promise<void> {
+    await this.json(`/api/v1/deliveries/${encodeURIComponent(id)}/source-cleanup/retry`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+  }
+
+  async getFailureKeep(id: number): Promise<FailureKeepPreference> {
+    return this.json<FailureKeepPreference>(`/api/v1/jobs/${id}/failure-keep`);
+  }
+
+  async setFailureKeep(id: number, keep: boolean): Promise<Partial<FailureKeepPreference>> {
+    const response = await this.request(`/api/v1/jobs/${id}/failure-keep`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ keep }),
+    });
+    const result = await this.readJson<Partial<FailureKeepPreference>>(response);
+    return response.status === 202 ? { ...result, applied: false } : result;
   }
 
   async getLogs(includeFiles = false, limit = 1000): Promise<LogsPage> {
@@ -153,19 +209,24 @@ export class NzbdClient {
   }
 
   private async json<T>(path: string, init: RequestInit = {}): Promise<T> {
-    return this.readJson<T>(await this.request(path, init));
+    return this.request(path, init, response => this.readJson<T>(response));
   }
 
-  private async request(path: string, init: RequestInit = {}): Promise<Response> {
+  private async request<T = Response>(path: string, init: RequestInit = {}, read?: (response: Response) => Promise<T>): Promise<T> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 12_000);
+    const abort = () => controller.abort();
+    init.signal?.addEventListener('abort', abort, { once: true });
+    if (init.signal?.aborted) abort();
     try {
-      return await fetch(`${this.config.baseUrl}${path}`, {
+      const response = await fetch(`${this.config.baseUrl}${path}`, {
         ...init,
         headers: this.headers(init.headers as Record<string, string> | undefined),
         signal: controller.signal,
       });
+      return read ? await read(response) : response as T;
     } catch (error) {
+      if (error instanceof ApiError) throw error;
       if (controller.signal.aborted) {
         throw new ApiError('The Runner server did not answer within 12 seconds.');
       }
@@ -174,6 +235,7 @@ export class NzbdClient {
       );
     } finally {
       clearTimeout(timeout);
+      init.signal?.removeEventListener('abort', abort);
     }
   }
 

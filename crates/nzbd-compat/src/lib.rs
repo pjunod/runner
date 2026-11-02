@@ -259,13 +259,21 @@ pub async fn dispatch(
     method: &str,
     params: &Value,
 ) -> Result<Value, (i64, &'static str)> {
+    dispatch_cluster(state, method, params, None).await
+}
+async fn dispatch_cluster(
+    state: &CompatState,
+    method: &str,
+    params: &Value,
+    context: Option<&nzbd_api::cluster_removal::ClusterRemovalContext>,
+) -> Result<Value, (i64, &'static str)> {
     match method {
         "version" => Ok(Value::String(state.config.version.clone())),
         "status" => Ok(status_json(state)),
         "listgroups" => Ok(listgroups_json(state)),
         "append" => append(state, params).await,
         "history" => history(state, params).await,
-        "editqueue" => editqueue(state, params).await,
+        "editqueue" => editqueue(state, params, context).await,
         "config" | "loadconfig" => {
             let opts: Vec<Value> = state
                 .options
@@ -729,7 +737,11 @@ async fn history(state: &CompatState, params: &Value) -> Result<Value, (i64, &'s
 
 /// `editqueue` — v16+ `(Command, Param, IDs)` and v13 `(Command, Offset,
 /// Param, IDs)`; both accepted by arity. Returns bool like NZBGet.
-async fn editqueue(state: &CompatState, params: &Value) -> Result<Value, (i64, &'static str)> {
+async fn editqueue(
+    state: &CompatState,
+    params: &Value,
+    context: Option<&nzbd_api::cluster_removal::ClusterRemovalContext>,
+) -> Result<Value, (i64, &'static str)> {
     let command = p_str(params, 0);
     // 4-arg legacy form has a numeric Offset at [1] and IDs at [3].
     let legacy = params.get(3).is_some() && params.get(1).map(|v| v.is_number()).unwrap_or(false);
@@ -750,7 +762,13 @@ async fn editqueue(state: &CompatState, params: &Value) -> Result<Value, (i64, &
             "GroupDelete" | "GroupParkDelete" | "GroupTrashDelete" => {
                 delete_to_history(state, id, false).await
             }
-            "GroupFinalDelete" => state.engine.delete_job(id, true).await.unwrap_or(false),
+            "GroupFinalDelete" => {
+                if context.is_some() {
+                    delete_to_history(state, id, false).await
+                } else {
+                    state.engine.delete_job(id, true).await.unwrap_or(false)
+                }
+            }
             "GroupSetPriority" => {
                 let prio: i32 = text.parse().unwrap_or(0);
                 state.engine.set_priority(id, prio).await.unwrap_or(false)
@@ -796,6 +814,7 @@ async fn editqueue(state: &CompatState, params: &Value) -> Result<Value, (i64, &
                 .await
             }
             "GroupSetParameter" => match text.split_once('=') {
+                Some((k, _)) if k.starts_with('*') => false,
                 Some((k, v)) => {
                     let (k, v) = (k.to_string(), v.to_string());
                     edit_job(state, id, move |j| {
@@ -870,6 +889,17 @@ async fn editqueue(state: &CompatState, params: &Value) -> Result<Value, (i64, &
                 false
             }
         };
+        if done {
+            if let Some(context) = context {
+                match command.as_str() {
+                    "GroupFinalDelete" => context.record(id.0, true),
+                    "GroupDelete" | "GroupParkDelete" | "GroupTrashDelete" => {
+                        context.record(id.0, false)
+                    }
+                    _ => {}
+                }
+            }
+        }
         ok &= done;
     }
     Ok(Value::Bool(ok))
@@ -1022,6 +1052,7 @@ fn nowish() -> i64 {
 async fn jsonrpc_get(
     State(state): State<CompatState>,
     headers: axum::http::HeaderMap,
+    cluster_removal: Option<axum::Extension<nzbd_api::cluster_removal::ClusterRemovalContext>>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -1031,7 +1062,13 @@ async fn jsonrpc_get(
         .get("params")
         .and_then(|p| serde_json::from_str(p).ok())
         .unwrap_or(Value::Array(vec![]));
-    let result = dispatch(&state, &method, &params).await;
+    let result = dispatch_cluster(
+        &state,
+        &method,
+        &params,
+        cluster_removal.as_ref().map(|context| &context.0),
+    )
+    .await;
     let env = envelope(Value::Null, result);
     match q.get("callback") {
         // JSON-P: cb({...});
@@ -1047,6 +1084,7 @@ async fn jsonrpc_get(
 async fn jsonrpc(
     State(state): State<CompatState>,
     headers: axum::http::HeaderMap,
+    cluster_removal: Option<axum::Extension<nzbd_api::cluster_removal::ClusterRemovalContext>>,
     body: String,
 ) -> Json<Value> {
     let req: Value = match serde_json::from_str(&body) {
@@ -1060,7 +1098,16 @@ async fn jsonrpc(
         .unwrap_or_default();
     let params = req.get("params").cloned().unwrap_or(Value::Array(vec![]));
     note_client(&state, &headers, method);
-    Json(envelope(id, dispatch(&state, method, &params).await))
+    Json(envelope(
+        id,
+        dispatch_cluster(
+            &state,
+            method,
+            &params,
+            cluster_removal.as_ref().map(|context| &context.0),
+        )
+        .await,
+    ))
 }
 
 /// Record who is talking to the compat API (User-Agent), so the UI can
@@ -1287,6 +1334,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r, json!(true));
+
+        let forbidden = dispatch(
+            &state,
+            "editqueue",
+            &json!(["GroupSetParameter", "*Runner:LifecycleEligible=1", [id.0]]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(forbidden, json!(false));
+        let job = state.engine.export_job(id).await.unwrap().unwrap();
+        assert!(!job
+            .params
+            .iter()
+            .any(|(key, _)| key == "*Runner:LifecycleEligible"));
 
         // Set a parameter then a category, verify via export.
         let r = dispatch(

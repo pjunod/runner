@@ -510,6 +510,7 @@ async fn torrent_add(State(state): State<QbitState>, headers: HeaderMap, body: B
         torrent_tags,
         ..Default::default()
     };
+    let requested_tags = opts.torrent_tags.clone();
     let result = if let Some(bytes) = parts.get("torrents") {
         state.torrent.admit_raw(bytes.clone(), opts).await
     } else if let Some(uri) = nonempty(text("urls")) {
@@ -523,6 +524,29 @@ async fn torrent_add(State(state): State<QbitState>, headers: HeaderMap, body: B
         return (StatusCode::BAD_REQUEST, "Fails.").into_response();
     };
     match result {
+        Ok(result) if !result.created && !requested_tags.is_empty() => {
+            let bound = state
+                .engine
+                .export_job(result.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|job| qbit_tags_from_params(&job.params))
+                .unwrap_or_default();
+            let mut requested = requested_tags;
+            requested.sort();
+            let mut existing = bound
+                .split(',')
+                .filter(|tag| !tag.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            existing.sort();
+            if requested == existing {
+                "Ok.".into_response()
+            } else {
+                (StatusCode::CONFLICT,"Existing torrent belongs to a different request. Use native Runner torrent Deliveries for an additional copy.").into_response()
+            }
+        }
         Ok(_) => "Ok.".into_response(),
         Err(error) => {
             tracing::debug!(error = %error, "qBittorrent-compatible add rejected");
@@ -1049,11 +1073,30 @@ mod tests {
             .clone()
             .oneshot(multipart_add_request(
                 torrent,
-                "tv,monarr-transfer-second-token",
+                "tv,monarr-transfer-first-token",
             ))
             .await
             .unwrap();
         assert_eq!(duplicate.status(), StatusCode::OK);
+
+        let different_request = app
+            .clone()
+            .oneshot(multipart_add_request(
+                torrent,
+                "tv,monarr-transfer-second-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(different_request.status(), StatusCode::CONFLICT);
+        let reason = different_request
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(std::str::from_utf8(&reason)
+            .unwrap()
+            .contains("different request"));
 
         let before_restart = app.clone().oneshot(info_request()).await.unwrap();
         let before_restart: Value = serde_json::from_slice(
@@ -1065,6 +1108,7 @@ mod tests {
                 .to_bytes(),
         )
         .unwrap();
+        assert_eq!(before_restart.as_array().unwrap().len(), 1);
         assert_eq!(before_restart[0]["tags"], "tv,monarr-transfer-first-token");
 
         engine.shutdown().await;

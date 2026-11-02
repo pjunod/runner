@@ -32,6 +32,7 @@ pub fn spawn_registry(
                 .filter(|j| j.assigned_node.is_none() && matches!(j.status, JobStatus::Downloading))
                 .count() as u32;
             let rec = NodeRecord {
+                lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
                 name: cfg.node_name.clone(),
                 api_url: cfg.advertise_url.clone(),
                 download: cfg.download,

@@ -424,7 +424,12 @@ fn sfv_restore_archives(dir: &Path, custody: Custody<'_>) -> Renames {
     let files = crate::namespace::files(dir)?;
     let archives: Vec<_> = files
         .iter()
-        .filter(|path| head(path, 7).starts_with(RAR_MAGIC))
+        .filter(|path| {
+            !["epub", "cbz", "cbr"]
+                .iter()
+                .any(|extension| ext_is(path, extension))
+                && head(path, 7).starts_with(RAR_MAGIC)
+        })
         .collect();
     let unresolved: std::collections::HashSet<_> = archives
         .iter()
@@ -573,6 +578,11 @@ pub fn rar_rename_owned(dir: &Path, custody: Custody<'_>) -> Renames {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
+        // These containers are themselves library payloads, even though their
+        // magic bytes match a generic ZIP/RAR archive.
+        if matches!(ext.as_str(), "epub" | "cbz" | "cbr") {
+            continue;
+        }
         let h = head(&p, 128);
         if h.starts_with(RAR_MAGIC) {
             groups

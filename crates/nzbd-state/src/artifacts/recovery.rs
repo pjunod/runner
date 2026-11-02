@@ -472,9 +472,10 @@ impl Inventory {
                 .operation(&format!("publish-recovery-{}", r.id))
                 .is_ok()
             {
-                if let Err(e) =
-                    self.retire_publication_source_unlocked(&format!("recovery-{}", r.id))
-                {
+                if let Err(e) = self.retire_publication_source_unlocked(
+                    &mut publication_guard,
+                    &format!("recovery-{}", r.id),
+                ) {
                     tracing::warn!(recovery=%r.id, error=%e, "recovery published; scratch cleanup pending");
                 }
             }
@@ -638,9 +639,10 @@ impl Inventory {
                 .operation(&format!("publish-recovery-{}", r.id))
                 .is_ok()
             {
-                if let Err(e) =
-                    self.retire_publication_source_unlocked(&format!("recovery-{}", r.id))
-                {
+                if let Err(e) = self.retire_publication_source_unlocked(
+                    &mut publication_guard,
+                    &format!("recovery-{}", r.id),
+                ) {
                     tracing::warn!(recovery=%r.id, error=%e, "recovery published; scratch cleanup pending");
                 }
             }
@@ -726,7 +728,9 @@ impl Inventory {
             let Some(_lease) = self.reserve_reconciliation(&participants)? else {
                 continue;
             };
-            if let Err(e) = self.retire_publication_source_unlocked(&format!("recovery-{id}")) {
+            if let Err(e) =
+                self.retire_publication_source_unlocked(&mut None, &format!("recovery-{id}"))
+            {
                 tracing::warn!(recovery=%id, error=%e, "recovery scratch cleanup remains pending");
             }
         }

@@ -965,7 +965,14 @@ fn clearing_keep_retries_partial_delivery_cleanup_without_deleting_recoverable_i
     db.publish_selected_for_delivery_checked(61, &target, selected, outcomes, &|| Ok(()))
         .unwrap();
     let delivery = db
-        .create_delivery(61, true, Some("keep-partial-token"))
+        .create_delivery_with_outcome(
+            61,
+            true,
+            Some("keep-partial-token"),
+            "PARTIAL",
+            Some("assessment"),
+            Some("archive_review"),
+        )
         .unwrap();
     assert!(db.set_keep_on_failure(61, true).unwrap());
     let kept = db.retire_delivery_source(&delivery.delivery_id).unwrap();
@@ -1153,6 +1160,74 @@ fn live_failure_keep_blocks_runner_disposal_but_not_explicit_delete() {
         .unwrap();
     assert_eq!(db.execute_delete(&explicit.id).unwrap().state, "succeeded");
     assert!(!source.exists());
+}
+
+#[test]
+fn legacy_whole_source_relocation_replays_only_owned_private_staging() {
+    for phase in ["before-staging", "owned-partial", "unknown-nonempty"] {
+        let (tmp, db, root) = fixture();
+        let source = root.join("legacy-source");
+        db.allocate_for_delivery(95, &root, &source, true, true)
+            .unwrap();
+        let bytes = vec![0x35; 256 * 1024];
+        std::fs::write(source.join("episode.mkv"), &bytes).unwrap();
+        db.finish(95, &source, &root, "active").unwrap();
+        let target_root = tmp.path().join("completed-legacy");
+        std::fs::create_dir(&target_root).unwrap();
+        let target = target_root.join("release");
+        relocation::FAULTS.with(|faults| {
+            faults.borrow_mut().insert(
+                if phase == "owned-partial" {
+                    "copy_chunk"
+                } else {
+                    "before_move"
+                },
+                libc::EIO,
+            );
+        });
+        assert!(db
+            .relocate_for_delivery_checked(95, &target, &|| Ok(()))
+            .is_err());
+        let artifact = db.for_job(95).unwrap().unwrap();
+        let op = db.pending_relocations(&artifact.id).unwrap().remove(0);
+        let request: serde_json::Value = serde_json::from_str(&op.request).unwrap();
+        assert!(request["publication_files"].is_null());
+        assert_eq!(request["scratch"].is_null(), phase != "owned-partial");
+        let scratch = target_root.join(format!(".runner-{}", op.id));
+        if phase == "unknown-nonempty" {
+            std::fs::create_dir(&scratch).unwrap();
+            std::fs::write(scratch.join("unknown.bin"), b"unrelated").unwrap();
+        }
+        drop(db);
+        let reopened = Inventory::open(&tmp.path().join("state")).unwrap();
+        reopened.reconcile_startup(&[95]).unwrap();
+        reopened
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE operations SET data=json_set(data,'$.next_retry',0) WHERE id=?1",
+                [&op.id],
+            )
+            .unwrap();
+        reopened.reconcile_relocations().unwrap();
+        if phase == "unknown-nonempty" {
+            assert_eq!(reopened.operation(&op.id).unwrap().state, "review");
+            assert_eq!(
+                std::fs::read(scratch.join("unknown.bin")).unwrap(),
+                b"unrelated"
+            );
+            assert!(!target.exists());
+        } else {
+            assert_eq!(reopened.operation(&op.id).unwrap().state, "succeeded");
+            assert_eq!(std::fs::read(target.join("episode.mkv")).unwrap(), bytes);
+            let delivery = reopened
+                .create_delivery(95, true, Some("legacy-95"))
+                .unwrap();
+            assert_eq!(delivery.files.len(), 1);
+        }
+        assert_eq!(std::fs::read(source.join("episode.mkv")).unwrap(), bytes);
+    }
 }
 
 #[test]
@@ -1771,6 +1846,45 @@ fn relocation_refuses_existing_destination_and_commits_identity_after_rename() {
     assert_eq!(a.path, target);
     assert!(a.owned);
 }
+#[test]
+fn succeeded_relocation_proof_requires_exact_owned_current_generation_and_paths() {
+    let (tmp, db, root) = fixture();
+    let source = root.join("proof-source");
+    let artifact = db.allocate(91, &root, &source).unwrap();
+    std::fs::write(source.join("media.mkv"), b"whole media").unwrap();
+    let target_root = tmp.path().join("proof-target");
+    std::fs::create_dir(&target_root).unwrap();
+    let target = target_root.join("published");
+    let generation = SourceGeneration {
+        artifact: artifact.id.clone(),
+        generation: artifact.generation.clone(),
+    };
+    assert!(!db
+        .has_succeeded_relocation(&generation, &source, &target)
+        .unwrap());
+    db.relocate(91, &target).unwrap();
+    assert!(db
+        .has_succeeded_relocation(&generation, &source, &target)
+        .unwrap());
+    assert!(!db
+        .has_succeeded_relocation(&generation, &target, &source)
+        .unwrap());
+    assert!(!db
+        .has_succeeded_relocation(&generation, &root.join("other"), &target)
+        .unwrap());
+    let mut stale = generation.clone();
+    stale.generation.push_str("-stale");
+    assert!(!db
+        .has_succeeded_relocation(&stale, &source, &target)
+        .unwrap());
+    let mut current = db.get(&artifact.id).unwrap();
+    current.owned = false;
+    save_artifact(&db.db.lock().unwrap(), &current).unwrap();
+    assert!(!db
+        .has_succeeded_relocation(&generation, &source, &target)
+        .unwrap());
+}
+
 #[test]
 fn published_recovery_reconciles_after_lost_acknowledgement() {
     let (tmp, db, root) = fixture();
@@ -2545,6 +2659,401 @@ fn recovery_cleanup_failure_keeps_publication_claimable_and_retries_after_restar
         assert!(!scratch.exists());
         assert!(r.published.join("payload/episode.mkv").is_file());
     }
+}
+
+#[test]
+fn selected_publication_io_failure_resumes_in_process_on_tick() {
+    let (tmp, db, root) = fixture();
+    let source = root.join("working-retry");
+    db.allocate_for_delivery(50, &root, &source, true, true)
+        .unwrap();
+    std::fs::write(source.join("episode.mkv"), b"verified payload").unwrap();
+    db.finish(50, &source, &root, "active").unwrap();
+    let artifact = db.for_job(50).unwrap().unwrap();
+    let selected = artifact
+        .files
+        .iter()
+        .filter(|entry| entry.path == "episode.mkv")
+        .cloned()
+        .collect::<Vec<_>>();
+    let outcomes = vec![DeliveryFileOutcome {
+        source_path: "episode.mkv".into(),
+        publication_path: Some("episode.mkv".into()),
+        classification: "media".into(),
+        outcome: "published".into(),
+        reason: Some("verified complete media".into()),
+        repair_dependency: false,
+        source_cleanup_status: "pending".into(),
+    }];
+    let target_parent = tmp.path().join("not-yet-mounted-completed");
+    let target = target_parent.join("release-generation");
+    relocation::FAULTS.with(|faults| {
+        faults.borrow_mut().insert("copy_chunk", libc::EIO);
+    });
+    assert!(db
+        .publish_selected_for_delivery_checked(
+            50,
+            &target,
+            selected.clone(),
+            outcomes.clone(),
+            &|| Ok(()),
+        )
+        .is_err());
+    let held = db.for_job(50).unwrap().unwrap();
+    assert!(held.owned);
+    assert_eq!(held.path, source);
+    assert_eq!(
+        std::fs::read(source.join("episode.mkv")).unwrap(),
+        b"verified payload"
+    );
+
+    let relocation_id = db
+        .pending_relocations(&artifact.id)
+        .unwrap()
+        .into_iter()
+        .find(|operation| operation.kind == "relocate")
+        .unwrap()
+        .id;
+    db.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE operations SET data=json_set(data,'$.next_retry',0) WHERE id=?1",
+            [&relocation_id],
+        )
+        .unwrap();
+    relocation::FAULTS.with(|faults| {
+        faults.borrow_mut().insert("copy_chunk", libc::ENOSPC);
+    });
+    db.tick().unwrap();
+    let retry = db.operation(&relocation_id).unwrap();
+    assert_eq!(retry.state, "retry");
+    assert!(
+        db.for_job(50).unwrap().unwrap().hold.is_none(),
+        "repeat I/O must not create a permanent review hold"
+    );
+    let mut previously_stuck = db.for_job(50).unwrap().unwrap();
+    previously_stuck.hold = Some("review: interrupted move".into());
+    save_artifact(&db.db.lock().unwrap(), &previously_stuck).unwrap();
+    db.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE operations SET data=json_set(data,'$.next_retry',0) WHERE id=?1",
+            [&relocation_id],
+        )
+        .unwrap();
+    db.tick().unwrap();
+    db.publish_selected_for_delivery_checked(50, &target, selected, outcomes, &|| Ok(()))
+        .unwrap();
+    let attempts: i64 = db.db.lock().unwrap().query_row(
+        "SELECT count(*) FROM operations WHERE artifact=?1 AND json_extract(data,'$.kind')='relocate'",
+        [&artifact.id], |row| row.get(0)).unwrap();
+    assert_eq!(attempts, 1, "live retries reuse the original attempt");
+    let delivery = db.create_delivery(50, true, Some("retry-50")).unwrap();
+    assert_eq!(delivery.files.len(), 1);
+    assert!(target.join("episode.mkv").exists());
+    assert!(source.join("episode.mkv").exists());
+}
+
+#[test]
+fn successful_publication_ignores_failure_keep_for_incidental_cleanup() {
+    let (tmp, db, root) = fixture();
+    let source = root.join("keep-success");
+    db.allocate_for_delivery(72, &root, &source, true, true)
+        .unwrap();
+    std::fs::write(source.join("episode.mkv"), b"verified payload").unwrap();
+    std::fs::write(source.join("release.nzb"), b"descriptor").unwrap();
+    db.finish(72, &source, &root, "active").unwrap();
+    let selected = db
+        .for_job(72)
+        .unwrap()
+        .unwrap()
+        .files
+        .into_iter()
+        .filter(|entry| entry.path == "episode.mkv")
+        .collect();
+    let outcomes = vec![
+        DeliveryFileOutcome {
+            source_path: "episode.mkv".into(),
+            publication_path: Some("episode.mkv".into()),
+            classification: "video".into(),
+            outcome: "published".into(),
+            reason: None,
+            repair_dependency: false,
+            source_cleanup_status: "pending".into(),
+        },
+        DeliveryFileOutcome {
+            source_path: "release.nzb".into(),
+            publication_path: None,
+            classification: "incidental".into(),
+            outcome: "excluded_source_cleanup".into(),
+            reason: None,
+            repair_dependency: false,
+            source_cleanup_status: "pending".into(),
+        },
+    ];
+    let target = tmp.path().join("completed/release");
+    db.publish_selected_for_delivery_checked(72, &target, selected, outcomes, &|| Ok(()))
+        .unwrap();
+    let delivery = db
+        .create_delivery(72, true, Some("keep-success-72"))
+        .unwrap();
+    assert!(db.set_keep_on_failure(72, true).unwrap());
+    let cleanup = db.retire_delivery_source(&delivery.delivery_id).unwrap();
+    assert_eq!(
+        cleanup.source_cleanup.status, "succeeded",
+        "{:?}",
+        cleanup.source_cleanup.error
+    );
+    assert!(!source.exists());
+    assert!(target.join("episode.mkv").exists());
+}
+
+#[test]
+fn keep_enabled_between_source_lookup_and_unlink_retains_failed_incidental_bytes() {
+    let (tmp, db, root) = fixture();
+    let db = Arc::new(db);
+    let source = root.join("keep-success");
+    db.allocate_for_delivery(72, &root, &source, true, true)
+        .unwrap();
+    std::fs::write(source.join("episode.mkv"), b"verified payload").unwrap();
+    std::fs::write(source.join("release.nzb"), b"descriptor").unwrap();
+    db.finish(72, &source, &root, "active").unwrap();
+    let selected = db
+        .for_job(72)
+        .unwrap()
+        .unwrap()
+        .files
+        .into_iter()
+        .filter(|entry| entry.path == "episode.mkv")
+        .collect();
+    let outcomes = vec![
+        DeliveryFileOutcome {
+            source_path: "episode.mkv".into(),
+            publication_path: Some("episode.mkv".into()),
+            classification: "video".into(),
+            outcome: "published".into(),
+            reason: None,
+            repair_dependency: false,
+            source_cleanup_status: "pending".into(),
+        },
+        DeliveryFileOutcome {
+            source_path: "release.nzb".into(),
+            publication_path: None,
+            classification: "incidental".into(),
+            outcome: "excluded_source_cleanup".into(),
+            reason: None,
+            repair_dependency: false,
+            source_cleanup_status: "pending".into(),
+        },
+    ];
+    let target = tmp.path().join("completed/release");
+    db.publish_selected_for_delivery_checked(72, &target, selected, outcomes, &|| Ok(()))
+        .unwrap();
+    let delivery = db
+        .create_delivery_with_outcome(
+            72,
+            true,
+            Some("keep-race-72"),
+            "PARTIAL",
+            Some("unpack"),
+            Some("io"),
+        )
+        .unwrap();
+    let identity = db
+        .get(&delivery.source_artifact_id)
+        .unwrap()
+        .identity
+        .unwrap();
+    let gate = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+    *relocation::COPY_GATE.lock().unwrap() = Some((identity, gate.clone()));
+    let worker_db = db.clone();
+    let worker =
+        std::thread::spawn(move || worker_db.retire_delivery_source(&delivery.delivery_id));
+    gate.0.wait();
+    assert!(db.set_keep_on_failure(72, true).unwrap());
+    gate.1.wait();
+    let cleanup = worker.join().unwrap().unwrap();
+    assert_eq!(cleanup.source_cleanup.status, "blocked");
+    assert!(source.join("release.nzb").exists());
+    assert!(target.join("episode.mkv").exists());
+}
+
+#[test]
+fn selected_publication_reserves_only_selected_bytes() {
+    let (tmp, db, root) = fixture();
+    let source = root.join("capacity-selection");
+    db.allocate_for_delivery(73, &root, &source, true, true)
+        .unwrap();
+    std::fs::write(source.join("episode.mkv"), b"verified payload").unwrap();
+    let completed = tmp.path().join("selected-completed");
+    std::fs::create_dir(&completed).unwrap();
+    // A sparse unresolved sibling exceeds all available destination capacity
+    // without consuming that capacity. Only the small selected file is copied.
+    let sibling = std::fs::File::create(source.join("unresolved.bin")).unwrap();
+    sibling
+        .set_len(
+            crate::capacity::available(&completed)
+                .unwrap()
+                .saturating_add(1),
+        )
+        .unwrap();
+    db.finish(73, &source, &root, "active").unwrap();
+    let selected = db
+        .for_job(73)
+        .unwrap()
+        .unwrap()
+        .files
+        .into_iter()
+        .filter(|entry| entry.path == "episode.mkv")
+        .collect();
+    let outcomes = vec![DeliveryFileOutcome {
+        source_path: "episode.mkv".into(),
+        publication_path: Some("episode.mkv".into()),
+        classification: "video".into(),
+        outcome: "published".into(),
+        reason: None,
+        repair_dependency: false,
+        source_cleanup_status: "pending".into(),
+    }];
+    let target = completed.join("release");
+    db.publish_selected_for_delivery_checked(73, &target, selected, outcomes, &|| Ok(()))
+        .unwrap();
+    assert_eq!(
+        std::fs::read(target.join("episode.mkv")).unwrap(),
+        b"verified payload"
+    );
+    assert!(source.join("unresolved.bin").exists());
+    assert!(!target.join("unresolved.bin").exists());
+}
+
+#[test]
+fn delivery_stage_snapshot_is_bounded_optional_and_immutable_on_replay() {
+    let (tmp, db, root) = fixture();
+    let source = root.join("stage-snapshot");
+    db.allocate_for_delivery(74, &root, &source, true, true)
+        .unwrap();
+    std::fs::write(source.join("episode.mkv"), b"verified payload").unwrap();
+    db.finish(74, &source, &root, "active").unwrap();
+    let snapshot = DeliveryRunnerStages {
+        node_id: "worker-one".into(),
+        clock_domain: "worker-one:boot-one".into(),
+        spans: vec![nzbd_types::StageSpan {
+            stage: nzbd_types::PostStage::Move,
+            started_at_unix: 123,
+            ms: None,
+        }],
+    };
+    let timing = nzbd_types::LifecycleTiming {
+        version: 1,
+        intervals: vec![nzbd_types::LifecycleInterval {
+            stage: nzbd_types::LifecycleStage::Download,
+            node_id: "worker-one".into(),
+            clock_domain: "worker-one:boot-one".into(),
+            start_unix_ms: 1000,
+            end_unix_ms: Some(900),
+            start_monotonic_ms: Some(0),
+            end_monotonic_ms: Some(10),
+            duration_ms: Some(10),
+            state: nzbd_types::LifecycleIntervalState::Completed,
+            observations: 1,
+        }],
+        omitted_intervals: std::collections::BTreeMap::from([(
+            nzbd_types::LifecycleStage::Queue,
+            2,
+        )]),
+    };
+    let delivery = db
+        .create_delivery_with_lifecycle_snapshot(
+            74,
+            true,
+            Some("stage-74"),
+            "SUCCESS",
+            None,
+            None,
+            false,
+            Some(snapshot.clone()),
+            Some(timing.clone()),
+        )
+        .unwrap();
+    assert_eq!(delivery.runner_stages, Some(snapshot.clone()));
+    assert_eq!(delivery.lifecycle_timing, Some(timing.clone()));
+    drop(db);
+    let db = Inventory::open(&tmp.path().join("state")).unwrap();
+    assert_eq!(
+        db.delivery(&delivery.delivery_id).unwrap().lifecycle_timing,
+        Some(timing.clone())
+    );
+    let mut later = snapshot.clone();
+    later.spans[0].ms = Some(99);
+    let replay = db
+        .create_delivery_with_outcome_keep_and_stages(
+            74,
+            true,
+            Some("stage-74"),
+            "SUCCESS",
+            None,
+            None,
+            false,
+            Some(later),
+        )
+        .unwrap();
+    assert_eq!(replay.lifecycle_timing, Some(timing));
+    assert_eq!(
+        replay.runner_stages,
+        Some(snapshot.clone()),
+        "READY freezes the original clock evidence, including unknown duration"
+    );
+    let mut excessive = snapshot;
+    excessive.spans = vec![excessive.spans[0]; 129];
+    assert!(db
+        .create_delivery_with_outcome_keep_and_stages(
+            74,
+            true,
+            Some("stage-74"),
+            "SUCCESS",
+            None,
+            None,
+            false,
+            Some(excessive)
+        )
+        .is_err());
+}
+
+#[test]
+fn delivery_discovery_skips_malformed_row_with_trusted_cursor() {
+    let (_tmp, db, root) = fixture();
+    let mut deliveries = Vec::new();
+    for job in [75, 76] {
+        let source = root.join(format!("discovery-{job}"));
+        db.allocate_for_delivery(job, &root, &source, true, true)
+            .unwrap();
+        std::fs::write(source.join("episode.mkv"), b"payload").unwrap();
+        db.finish(job, &source, &root, "active").unwrap();
+        deliveries.push(
+            db.create_delivery(job, true, Some(&format!("request-{job}")))
+                .unwrap(),
+        );
+    }
+    db.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE deliveries SET data='{' WHERE id=?1",
+            [&deliveries[0].delivery_id],
+        )
+        .unwrap();
+    let (page, cursor) = db.deliveries_discovery_page(0, 100, false).unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0]["deliveryId"], deliveries[0].delivery_id);
+    assert_eq!(page[0]["sequence"], deliveries[0].sequence);
+    assert!(page[0]["discoveryError"]
+        .as_str()
+        .unwrap()
+        .contains("invalid"));
+    assert_eq!(page[1]["deliveryId"], deliveries[1].delivery_id);
+    assert_eq!(cursor, deliveries[1].sequence);
 }
 
 #[test]

@@ -145,6 +145,25 @@ mount guarantee.
 
 ## 5. Seeding
 
+Managed acquisition amendment: ordinary existing torrents retain the seed-limit
+behavior described below. A newly owned managed donor may retire after its
+configured policy completes only when the backend has acknowledged stop and
+forget, no acquisition child still depends on it, and current Keep/recovery
+obligations permit exact cleanup. A seed-limit observation alone authorizes no
+unlink. Explicit DeleteFiles remains a separate exact operator action.
+
+```mermaid
+flowchart LR
+    D[Managed donor] --> C[Owned private child copy]
+    C --> P[Existing POST pipeline]
+    P --> R[Durable Delivery]
+    D --> S[Seed policy satisfied]
+    S --> A[Backend stop / forget ACK]
+    A --> G[No child or Keep obligation]
+    G --> E[Exact owned donor cleanup]
+```
+
+
 The queue owner checkpoints cumulative uploaded bytes and seeding time, applies
 per-add → category → global limits at exact boundaries, and pauses without
 deleting payloads.

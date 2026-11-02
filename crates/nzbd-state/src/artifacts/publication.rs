@@ -191,6 +191,7 @@ fn link_file<'a>(
     source: &File,
     target: &File,
     entry: &FileEntry,
+    checkpoint: &dyn Fn() -> std::io::Result<()>,
 ) -> Result<()> {
     use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
     let (src, name) = parent(source, &entry.path)?;
@@ -207,8 +208,10 @@ fn link_file<'a>(
     {
         return Err(Error::Conflict("publication source file changed".into()));
     }
+    checkpoint()?;
     inventory.ensure_publication_active(operation_id)?;
     input.sync_all()?;
+    checkpoint()?;
     let name_c = std::ffi::CString::new(name.as_os_str().as_bytes())
         .map_err(|_| Error::Conflict("invalid publication file name".into()))?;
     if unsafe {
@@ -244,7 +247,15 @@ fn link_file<'a>(
     Ok(())
 }
 #[cfg(not(unix))]
-fn link_file(_: &File, _: &File, _: &FileEntry) -> Result<()> {
+fn link_file(
+    _: &Inventory,
+    _: &mut Option<MutationGuard<'_>>,
+    _: &str,
+    _: &File,
+    _: &File,
+    _: &FileEntry,
+    _: &dyn Fn() -> std::io::Result<()>,
+) -> Result<()> {
     Err(Error::Conflict(
         "descriptor link publication unsupported".into(),
     ))
@@ -406,6 +417,19 @@ impl Inventory {
         artifact: &str,
         key: &str,
     ) -> Result<PublishedDirectory> {
+        self.publish_directory_unlocked_checked(guard, source, target, artifact, key, &|| Ok(()))
+    }
+
+    pub(super) fn publish_directory_unlocked_checked<'a>(
+        &'a self,
+        guard: &mut Option<MutationGuard<'a>>,
+        source: &Path,
+        target: &Path,
+        artifact: &str,
+        key: &str,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> Result<PublishedDirectory> {
+        checkpoint()?;
         let key = format!("publish-{key}");
         if !self.publication_active.lock().unwrap().insert(key.clone()) {
             return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
@@ -486,6 +510,7 @@ impl Inventory {
                 if entry.digest.is_some() {
                     continue;
                 }
+                checkpoint()?;
                 entry.digest = Some(self.digest_file_yielding(
                     guard,
                     &hash_root,
@@ -496,6 +521,7 @@ impl Inventory {
             }
         }
         if hashes_added {
+            checkpoint()?;
             self.ensure_publication_active(&op.id)?;
             let current_source = fs::open_dir(source)?;
             let current_parent = fs::open_dir(target.parent().unwrap())?;
@@ -529,6 +555,7 @@ impl Inventory {
                     "publication journal advanced during manifest capture".into(),
                 ));
             }
+            checkpoint()?;
             op.request = serde_json::to_string(&p)?;
             save_operation(&self.db.lock().unwrap(), &op)?;
         }
@@ -543,6 +570,7 @@ impl Inventory {
             return verified_target(self, guard, &p);
         }
         let persist = |op: &mut Operation, p: &Publication| -> Result<()> {
+            checkpoint()?;
             op.request = serde_json::to_string(p)?;
             save_operation(&self.db.lock().unwrap(), op)
         };
@@ -568,6 +596,7 @@ impl Inventory {
                 {
                     return Err(Error::Conflict("publication source changed".into()));
                 }
+                checkpoint()?;
                 self.ensure_publication_active(&op.id)?;
                 match fs::rename_exclusive(source, target) {
                     Ok(()) => p.published = Some(verified_target(self, guard, &p)?),
@@ -608,6 +637,7 @@ impl Inventory {
             {
                 return Err(Error::Conflict("publication source changed".into()));
             }
+            checkpoint()?;
             self.ensure_publication_active(&op.id)?;
             let root = if let Some(expected) = p.directories.get("") {
                 let dir = fs::open_dir(target)?;
@@ -618,6 +648,7 @@ impl Inventory {
             } else {
                 // If creation survived but its checkpoint did not, EEXIST
                 // requires review. Never infer ownership of that directory.
+                checkpoint()?;
                 self.ensure_publication_active(&op.id)?;
                 let dir = mkdir_at(&target_parent, Path::new(target.file_name().unwrap()))?;
                 p.directories
@@ -626,6 +657,7 @@ impl Inventory {
                 dir
             };
             for entry in p.files.clone().iter().filter(|e| e.identity.directory) {
+                checkpoint()?;
                 if let Some(expected) = p.directories.get(&entry.path) {
                     let dir = fs::open_relative(&root, &entry.path)?;
                     if !expected.same_object(&fs::identity_for_file(&dir)?) {
@@ -640,16 +672,19 @@ impl Inventory {
                 }
             }
             for entry in p.files.iter().filter(|e| !e.identity.directory) {
+                checkpoint()?;
                 self.ensure_publication_active(&op.id)?;
-                link_file(self, guard, &op.id, &src, &root, entry)?;
+                link_file(self, guard, &op.id, &src, &root, entry, checkpoint)?;
             }
             for entry in p.files.iter().rev().filter(|e| e.identity.directory) {
+                checkpoint()?;
                 fs::sync_directory(&fs::open_relative(&root, &entry.path)?)?;
             }
             fs::sync_directory(&root)?;
             fs::sync_directory(&target_parent)?;
             p.published = Some(verified_target(self, guard, &p)?);
         }
+        checkpoint()?;
         self.ensure_publication_active(&op.id)?;
         op.state = "succeeded".into();
         persist(&mut op, &p)?;
@@ -658,13 +693,36 @@ impl Inventory {
 
     /// Only after the owning operation commits. A partial cleanup can resume;
     /// unexpected files or identities are retained for explicit review.
-    pub(super) fn retire_publication_source_unlocked(&self, key: &str) -> Result<()> {
+    pub(super) fn retire_publication_source_unlocked<'a>(
+        &'a self,
+        guard: &mut Option<MutationGuard<'a>>,
+        key: &str,
+    ) -> Result<()> {
+        let flight = format!("publish-{key}");
+        if !self
+            .publication_active
+            .lock()
+            .unwrap()
+            .insert(flight.clone())
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+        }
+        let _lease = PublicationLease {
+            inventory: self,
+            id: flight,
+        };
         let mut op = self.operation(&format!("publish-{key}"))?;
         let mut p: Publication = serde_json::from_str(&op.request)?;
         if p.retirement_done {
             return Ok(());
         }
-        let result = self.retire_publication_entries_unlocked(key);
+        let result = self.retire_publication_entries_unlocked(guard, key);
+        let current = self.operation(&op.id)?;
+        if current.request != op.request || current.state != op.state {
+            return Err(Error::Conflict(
+                "publication cleanup journal changed while hashing".into(),
+            ));
+        }
         p.retirement_done = result.is_ok();
         op.error = result
             .as_ref()
@@ -675,7 +733,11 @@ impl Inventory {
         result
     }
 
-    fn retire_publication_entries_unlocked(&self, key: &str) -> Result<()> {
+    fn retire_publication_entries_unlocked<'a>(
+        &'a self,
+        guard: &mut Option<MutationGuard<'a>>,
+        key: &str,
+    ) -> Result<()> {
         #[cfg(test)]
         if RETIRE_FAILURE.with(|f| f.replace(false)) {
             return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
@@ -707,7 +769,8 @@ impl Inventory {
                 if !controlled_link_matches(&expected.identity, &entry.identity) {
                     false
                 } else if let Some(expected_digest) = expected.digest.as_deref() {
-                    digest_file(&dir, &entry.path, &entry.identity)? == expected_digest
+                    self.digest_file_yielding(guard, &dir, &entry.path, &entry.identity)?
+                        == expected_digest
                 } else {
                     false
                 }
@@ -717,6 +780,17 @@ impl Inventory {
                     "publication cleanup source contents changed".into(),
                 ));
             }
+        }
+        // Digest work yields the mutation lease. Revalidate the journal and
+        // complete identity set before the first physical mutation.
+        let current = self.operation(&op.id)?;
+        if current.request != op.request
+            || current.state != op.state
+            || fs::manifest(&dir, 100_000)? != entries
+        {
+            return Err(Error::Conflict(
+                "publication cleanup authority changed while hashing".into(),
+            ));
         }
         for entry in entries.iter().rev() {
             fs::remove_entry(&dir, entry)?;
@@ -779,14 +853,65 @@ mod tests {
         drop(inventory);
         let inventory = Inventory::open(&temp.path().join("state")).unwrap();
         publish(&inventory, &source, &target).unwrap();
-        inventory.retire_publication_source_unlocked("one").unwrap();
-        inventory.retire_publication_source_unlocked("one").unwrap();
+        inventory
+            .retire_publication_source_unlocked(
+                &mut Some(inventory.mutation_guard().unwrap()),
+                "one",
+            )
+            .unwrap();
+        inventory
+            .retire_publication_source_unlocked(
+                &mut Some(inventory.mutation_guard().unwrap()),
+                "one",
+            )
+            .unwrap();
         assert!(!source.exists());
         assert_eq!(
             std::fs::read(target.join("nested/media.mkv")).unwrap(),
             b"original"
         );
     }
+    #[test]
+    fn staging_retirement_hash_yields_mutation_lock_and_rechecks_journal() {
+        use std::sync::{Arc, Barrier};
+        let (_temp, inventory, source, target) = fixture();
+        fs::RENAME_FAILURE.with(|failure| failure.set(Some(libc::EINVAL)));
+        publish(&inventory, &source, &target).unwrap();
+        let inventory = Arc::new(inventory);
+        let gate = Arc::new((Barrier::new(2), Barrier::new(2)));
+        arm_digest_gate(&source, "nested/media.mkv", gate.clone());
+        let worker_inventory = inventory.clone();
+        let worker = std::thread::spawn(move || {
+            let mut guard = Some(worker_inventory.mutation_guard().unwrap());
+            worker_inventory.retire_publication_source_unlocked(&mut guard, "one")
+        });
+        gate.0.wait();
+        // A mutation can complete while staging cleanup is hashing. Revoke
+        // its journal authority to prove that yielding cannot unlink stale work.
+        let mutation_inventory = inventory.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let mutation = std::thread::spawn(move || {
+            let _guard = mutation_inventory.mutation_guard().unwrap();
+            let mut operation = mutation_inventory.operation("publish-one").unwrap();
+            operation.state = "cancelled".into();
+            save_operation(&mutation_inventory.db.lock().unwrap(), &operation).unwrap();
+            sent.send(()).unwrap();
+        });
+        let completed = received.recv_timeout(std::time::Duration::from_secs(2));
+        gate.1.wait();
+        mutation.join().unwrap();
+        assert!(
+            completed.is_ok(),
+            "hash must not hold the global mutation coordinator"
+        );
+        assert!(worker.join().unwrap().is_err());
+        assert!(source.join("nested/media.mkv").exists());
+        assert_eq!(
+            inventory.operation("publish-one").unwrap().state,
+            "cancelled"
+        );
+    }
+
     #[test]
     fn nested_hardlinks_verify_and_target_eio_remains_retryable() {
         let (_temp, inventory, source, target) = fixture();

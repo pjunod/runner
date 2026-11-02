@@ -8,8 +8,20 @@ export type TorrentDisplayPhase =
 const phases: readonly string[] = ['fetching_source', 'fetching_metadata', 'queued',
   'checking', 'downloading', 'seeding', 'paused_download', 'paused_seed', 'missing_files', 'failed'];
 
+export function isTorrentAcquisition(job: JobSummary): boolean {
+  return job.kind === 'torrent' && job.torrent_role === 'acquisition';
+}
+export function acquisitionStatus(job: JobSummary): string | undefined {
+  if (!isTorrentAcquisition(job)) return undefined;
+  if (job.status === 'queued' && job.seed_donor_job_id != null) return 'Waiting for seed source';
+  if (job.status === 'downloading') return 'Copying seed files';
+  return undefined;
+}
+export function isSeedTorrent(job: JobSummary): boolean {
+  return job.kind === 'torrent' && !isTorrentAcquisition(job);
+}
 export function torrentDisplayPhase(job: JobSummary): TorrentDisplayPhase | null {
-  if (job.kind !== 'torrent') return null;
+  if (!isSeedTorrent(job)) return null;
   const phase = job.torrent_phase;
   if (job.status === 'failed') return 'failed';
   if (phase === 'missing_files' || phase === 'failed' || phase === 'checking') return phase;

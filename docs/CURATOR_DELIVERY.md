@@ -204,9 +204,12 @@ Runner publishes the same recognized video (`.mkv`, `.mp4`, `.avi`, `.m4v`,
 `.flac`, `.ogg`, `.opus`, `.wav`, `.wma`), and native-book (`.epub`, `.azw3`,
 `.azw`, `.mobi`, `.pdf`, `.cbz`, `.cbr`, `.djvu`) formats that Curator imports,
 plus paired subtitle, NFO, and established cover art sidecars. Explicit
-`.sample`/`-sample`/`_sample` and proof filename tokens and files under
-`Sample/` or `Proof/` directories are excluded; ordinary titles containing
-“Sample” remain eligible. Samples and repair/temp inputs are excluded. An archive is marked
+`.sample`/`-sample`/`_sample`, bracketed `[proof]`/`(proof)` filename tags,
+and files under `Sample/` or `Proof/` directories are excluded. Ordinary
+`Sample` and `Proof` titles remain eligible, including `Burden.of.Proof.mkv`,
+`Living_Proof.flac`, and `Proof.epub`. Samples and disposable temp inputs are
+excluded. Native EPUB, CBZ, and CBR containers remain payloads: ZIP/RAR magic
+never renames them into extraction inputs. An archive is marked
 consumed only when the transform journal proves its extraction was published.
 Extraction and repair outputs keep their proof across Runner's own later
 renames (PAR naming restoration and the final deobfuscation pass, which gives
@@ -297,14 +300,27 @@ the default failed-work disposition unless Keep is selected. A file format
 with no importer, transform, or parser is not retained under a generic review
 label: its outcome records that no handler exists, and no unsupported file is
 published. PAR inputs are retained only while the matching set has a verified
-repair path. Incidental files and known sample inputs are excluded.
+repair path. Failed-health assessment maps exact job-file IDs from the writer's
+`.runner-file-N.part` layout to safe PAR catalog paths before counting damaged
+slices. A repairable sealed partial and intact members needed by its set remain
+source dependencies if repair fails. Complete old-style `.rNN` continuations
+without a repairable first volume are unusable, rather than offering an
+impossible extraction retry. Sidecars and folder art needed by a retained
+payload remain with that source; unmatched sidecars and disposable junk drain
+independently. Recognizable unknown usable files stay in Resolve with a named
+verification, rename, or transform action. A completed attempt containing only
+positively disposable inputs finishes as a failure and drains its owned source
+unless Keep is selected. This policy does not authorize legacy backlog cleanup.
+Deletion replay reads the durable deleted state before diagnosing source paths,
+so a crash before the terminal history/stamp cannot strand an absent tree.
 
-Recoverable I/O and missing-tool post-processing holds keep the same source
-and admission receipt in Runner. New delivery jobs retry after 30, 60, 120,
-then 300 seconds, repeating every five minutes until the storage or tool is
-available. The retry schedule and first blocked time survive restart; after
-30 minutes the queue shows a warning while retries continue. Capacity and
-quota holds use Runner's existing resource recovery lane. Identity conflicts
+Recoverable I/O, missing-tool, capacity, and quota post-processing holds keep
+the same source and admission receipt in Runner. New delivery jobs retry after
+30, 60, 120, then 300 seconds, repeating with up to 10% positive jitter until
+the storage or tool is available. Failed-source cleanup uses the same jitter
+bounds. The absolute retry deadline and first blocked time survive restart;
+after 30 minutes active scheduled retries show a warning while continuing.
+Capacity and quota also use Runner's resource recovery lane. Identity conflicts
 and uncertain outcomes remain in review rather than being retried blindly.
 A configured-root mount mismatch is handled separately: Runner keeps writes
 fenced and periodically checks the expected mount tuple, resuming only after
@@ -449,3 +465,45 @@ admission receipt even after history and the queue row are cleared.
 accepted, including current source-cleanup progress. Use it after acceptance
 when cleanup state needs refreshing; the collection endpoint intentionally
 omits accepted rows from pending discovery.
+
+## Cluster replay, bounded discovery, and timing
+
+Cluster publication commits READY only after durable payload materialization.
+Its stable consumer identity, sequence/cursor, admission identity and consumer
+receipt survive a leader change. Node storage identity remains an exact-copy
+owner fact. A consumed path may disappear after acceptance; the immutable READY
+receipt still proves publication and must not be replaced by a fresh path hash.
+
+List, detail and action responses include the same bounded public
+`sourceCopies` progress projection: copy ID, owner, status, reason, attempts and
+next retry. Raw deletion manifests stay private. Source cleanup retry queues
+eligible work without reporting an owner ACK prematurely; all-removed cleanup
+remains succeeded. Failure Keep responses distinguish desired policy from
+actual owner application with `applied` and `pendingOwners`.
+
+Each discovery row is at most 8 MiB and a page at most 16 MiB. A malformed or
+unsupported row is returned as `{protocolVersion,sequence,deliveryId,
+discoveryError}`. This is retained review evidence, not acceptance authority.
+Clients advance only through the server's trusted cursor and continue to later
+rows. Upgrade Curator before Runner: older clients may reject a page containing
+these stubs. Unsupported manifests remain reviewable and their sources remain
+retained; this change does not renew old custody or clean old backlog.
+
+New READY records may include immutable `runnerStages` and `lifecycleTiming`.
+Legacy StageSpan durations have `nodeId:unrecorded` and
+`clockDomain:unrecorded`; their original host/boot cannot be reconstructed.
+Major lifecycle intervals retain their recorded node/process clock domains and
+bounded omitted-interval counts. Missing legacy timing stays unknown. Do not
+add overlapping stage intervals or invent cross-host elapsed totals. Handoff
+and source-cleanup retries are mutable receipt progress after the frozen READY
+snapshot.
+
+```mermaid
+flowchart LR
+    R[Durable Runner READY] --> D[Bounded discovery]
+    D --> I[Curator import]
+    D --> X[Unsupported row: retained review]
+    I --> A[Durable consumer acceptance]
+    A --> O[Exact source-owner cleanup]
+    O --> P[Pending / retained / actual removed]
+```

@@ -50,7 +50,16 @@ export interface JobControl {
   manual_pause?: boolean;
 }
 
+export interface ControlPending {
+  jobId: number;
+  owner: string | null;
+  state: 'pending' | 'verified' | 'retry' | 'review_required';
+  error: string | null;
+  nextRetryAtMs: number | null;
+}
+
 export interface JobSummary {
+  controlPending?: ControlPending | null;
   verification?: {
     state: string;
     reason?: string | null;
@@ -60,6 +69,8 @@ export interface JobSummary {
   control?: JobControl | null;
   id: number;
   kind?: 'nzb' | 'torrent';
+  torrent_role?: 'acquisition' | 'seed' | null;
+  seed_donor_job_id?: number | null;
   torrent_phase?: TorrentPhase | null;
   torrent_control_intent?: 'running' | 'paused' | null;
   seed_policy?: SeedPolicy | null;
@@ -212,7 +223,16 @@ export interface HistoryJobRecord {
   dir_name: string | null;
 }
 
+export interface FailureKeepPreference {
+  available: boolean;
+  keep: boolean;
+  applied?: boolean;
+  pendingOwners?: string[];
+  message?: string;
+}
+
 export interface HistoryEntry {
+  params?: [string, string][];
   job: number;
   name: string;
   category: string | null;
@@ -224,6 +244,7 @@ export interface HistoryEntry {
   picked_up_by: string | null;
   removed_at_unix: number | null;
   can_requeue: boolean;
+  requeue_reason?: string | null;
   record: HistoryJobRecord | null;
   stages: StageSpan[];
 }
@@ -256,3 +277,17 @@ export type ConnectionState =
   | 'polling'
   | 'reconnecting'
   | 'offline';
+
+export interface DeliveryInterval {
+  stage: string; nodeId: string; clockDomain: string; state: string;
+  startUnixMs: number; endUnixMs?: number | null; startMonotonicMs?: number | null;
+  endMonotonicMs?: number | null; durationMs?: number | null;
+}
+export interface DeliveryTrace {
+  deliveryId: string; readyAt: number; acceptedAt?: number | null; status: string;
+  discoveryError?: string;
+  lifecycleTiming?: { version: number; intervals: DeliveryInterval[]; omittedIntervals?: Record<string, number> } | null;
+  runnerStages?: { nodeId: string; clockDomain: string; spans: StageSpan[] } | null;
+  sourceCleanup?: { status: string; attempts: number; error?: string | null; nextRetryAt?: number | null };
+  sourceCopies?: { id: string; ownerNode: string; status: string; attempts: number; error?: string | null; nextRetryAt?: number | null }[];
+}

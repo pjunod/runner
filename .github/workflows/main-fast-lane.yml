@@ -69,11 +69,13 @@ jobs:
       - name: Verify self-hosted post-processing dependencies
         if: runner.environment == 'self-hosted'
         run: command -v par2 && command -v 7z
-      - run: make fast-check-rust
+      - id: rust_checks
+        run: make fast-check-rust
       - name: Torrent transfer and recovery regressions
-        if: needs.scope.outputs.torrent == 'true'
+        if: ${{ !cancelled() && (steps.rust_checks.outcome == 'success' || steps.rust_checks.outcome == 'failure') && needs.scope.outputs.torrent == 'true' }}
         run: make fast-check-torrent
       - name: Startup recovery and enrollment regressions
+        if: ${{ !cancelled() && (steps.rust_checks.outcome == 'success' || steps.rust_checks.outcome == 'failure') }}
         run: make fast-check-startup
 
   mobile:

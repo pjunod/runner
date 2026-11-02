@@ -13,6 +13,9 @@ import { NzbdClient } from '../api/client';
 import { formatBytes } from '../api/format';
 import { ConnectionConfig, HistoryEntry, HistoryPage } from '../api/types';
 import { Theme, useTheme } from '../theme';
+import { FailureKeepControl } from '../components/FailureKeepControl';
+import { DeliveryLifecyclePanel } from '../components/DeliveryLifecyclePanel';
+import { deliveryReference } from '../deliveryTiming';
 
 export function HistoryView({ config }: { config: ConnectionConfig }) {
   const theme = useTheme();
@@ -97,6 +100,7 @@ export function HistoryView({ config }: { config: ConnectionConfig }) {
           {page?.entries.map((entry) => (
             <HistoryCard
               entry={entry}
+              client={client}
               expanded={expanded === entry.job}
               key={`${entry.job}:${entry.completed_at_unix}`}
               onToggle={() => setExpanded(expanded === entry.job ? null : entry.job)}
@@ -121,11 +125,13 @@ export function HistoryView({ config }: { config: ConnectionConfig }) {
 }
 
 function HistoryCard({
+  client,
   entry,
   expanded,
   onToggle,
   styles,
 }: {
+  client: NzbdClient;
   entry: HistoryEntry;
   expanded: boolean;
   onToggle: () => void;
@@ -158,6 +164,9 @@ function HistoryCard({
 
       {expanded ? (
         <View style={styles.details}>
+          {entry.requeue_reason ? <Text style={styles.metaText}>{entry.requeue_reason}</Text> : null}
+          {deliveryReference(entry.params) ? <DeliveryLifecyclePanel client={client} receiptId={deliveryReference(entry.params)!} /> : null}
+          <FailureKeepControl client={client} jobId={entry.job} />
           <Detail label="Job" value={`#${entry.job}`} styles={styles} />
           <Detail label="Folder" value={entry.final_dir || record?.dir_name || '—'} styles={styles} />
           <Detail

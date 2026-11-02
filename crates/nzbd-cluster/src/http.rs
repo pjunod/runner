@@ -1,7 +1,7 @@
 //! Minimal intra-cluster HTTP client (worker → leader JSON calls and the
 //! any-node → leader reverse proxy) on hyper-util's pooled legacy client.
 
-use crate::proto::SECRET_HEADER;
+use crate::proto::{MAX_RPC_BYTES, SECRET_HEADER};
 use axum::body::Body;
 use http_body_util::BodyExt;
 use hyper::body::Body as _;
@@ -14,7 +14,7 @@ use std::time::Duration;
 
 const WORK_RPC_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 const WORK_RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const WORK_RPC_MAX_BODY: usize = 1024 * 1024;
+const WORK_RPC_MAX_BODY: usize = MAX_RPC_BYTES;
 
 #[derive(Clone)]
 pub struct ClusterClient {
@@ -42,6 +42,9 @@ impl ClusterClient {
             .parse()
             .map_err(|e| format!("bad url: {e}"))?;
         let body = serde_json::to_vec(req).map_err(|e| e.to_string())?;
+        if body.len() > WORK_RPC_MAX_BODY {
+            return Err(format!("request exceeds {WORK_RPC_MAX_BODY} byte cluster RPC limit; reduce the descriptor before retrying"));
+        }
         let request = hyper::Request::post(uri)
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .header(SECRET_HEADER, &self.secret)
@@ -60,14 +63,18 @@ impl ClusterClient {
                 .upper()
                 .is_some_and(|size| size > WORK_RPC_MAX_BODY as u64)
             {
-                return Err("response body exceeds 1 MiB limit".into());
+                return Err(format!(
+                    "response exceeds {WORK_RPC_MAX_BODY} byte cluster RPC limit"
+                ));
             }
             let mut bytes = Vec::new();
             while let Some(frame) = resp.body_mut().frame().await {
                 let frame = frame.map_err(|e| format!("body: {e}"))?;
                 if let Some(data) = frame.data_ref() {
                     if bytes.len().saturating_add(data.len()) > WORK_RPC_MAX_BODY {
-                        return Err("response body exceeds 1 MiB limit".into());
+                        return Err(format!(
+                            "response exceeds {WORK_RPC_MAX_BODY} byte cluster RPC limit"
+                        ));
                     }
                     bytes.extend_from_slice(data);
                 }
@@ -128,5 +135,42 @@ mod tests {
         assert!(!secret_matches(Some("abd"), "abc"));
         assert!(!secret_matches(Some("ab"), "abc"));
         assert!(!secret_matches(None, "abc"));
+    }
+    #[tokio::test]
+    async fn work_rpc_round_trips_descriptors_above_one_mib_and_bounds_both_directions() {
+        use axum::{extract::DefaultBodyLimit, routing::post, Json, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/rpc",
+                post(|Json(value): Json<serde_json::Value>| async move { Json(value) }),
+            )
+            .route(
+                "/oversized-response",
+                post(|| async { Json("x".repeat(MAX_RPC_BYTES + 1)) }),
+            )
+            .layer(DefaultBodyLimit::max(MAX_RPC_BYTES));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = ClusterClient::new("secret".into());
+        let descriptor = serde_json::json!({"job": {"files": "x".repeat(2 * 1024 * 1024)}});
+        let base = format!("http://{address}");
+        let response: serde_json::Value =
+            client.post_json(&base, "/rpc", &descriptor).await.unwrap();
+        assert_eq!(response, descriptor);
+        let too_large = "x".repeat(MAX_RPC_BYTES + 1);
+        let error = client
+            .post_json::<_, serde_json::Value>(&base, "/rpc", &too_large)
+            .await
+            .unwrap_err();
+        assert!(error.contains("request exceeds"));
+        let error = client
+            .post_json::<_, serde_json::Value>(&base, "/oversized-response", &())
+            .await
+            .unwrap_err();
+        assert!(error.contains("response exceeds"));
+        server.abort();
     }
 }

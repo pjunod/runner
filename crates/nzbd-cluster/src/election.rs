@@ -147,7 +147,8 @@ async fn replicated_election_task(
                     &cfg.node,
                     &owner_incarnation,
                     "leader",
-                    "{}",
+                    &serde_json::json!({"lifecycleProtocol":crate::proto::LIFECYCLE_PROTOCOL})
+                        .to_string(),
                     1,
                     cfg.takeover_after,
                 )

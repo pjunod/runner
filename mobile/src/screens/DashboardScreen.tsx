@@ -38,6 +38,10 @@ import {
   StoragePath,
   StatusDto,
 } from '../api/types';
+import { NzbdClient } from '../api/client';
+import { FailureKeepControl } from '../components/FailureKeepControl';
+import { DeliveryLifecyclePanel } from '../components/DeliveryLifecyclePanel';
+import { deliveryReference } from '../deliveryTiming';
 import { ActionButton } from '../components/ActionButton';
 import { ThemeSwitcher } from '../components/ThemeSwitcher';
 import { useNzbd } from '../hooks/useNzbd';
@@ -46,7 +50,8 @@ import { DOWNLOAD_PRIORITIES, downloadPriorityLabel } from '../priority';
 import { Theme, useDisplayPreferences, useTheme } from '../theme';
 import { useCollapsedSections } from '../storage/queuePreferences';
 import { SeedPolicyEditor } from '../components/SeedPolicyEditor';
-import { torrentDisplayPhase, torrentStatus, torrentPrimaryAction, seedPolicyText, seedStopText } from '../torrentPresentation';
+import { controlPendingLabel, controlPendingText } from '../controlPending';
+import { acquisitionStatus, torrentDisplayPhase, torrentStatus, torrentPrimaryAction, seedPolicyText, seedStopText, isTorrentAcquisition, isSeedTorrent } from '../torrentPresentation';
 import { urlFetchDetail, useNow } from '../urlFetchPresentation';
 import { HistoryView } from './HistoryView';
 import { LogsView } from './LogsView';
@@ -70,6 +75,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
   const [seedEditor, setSeedEditor] = useState<number | null>(null);
   const [seedExplanation, setSeedExplanation] = useState<string | null>(null);
   const { collapsed, toggle: toggleCollapsed } = useCollapsedSections();
+  const lifecycleClient = useMemo(() => new NzbdClient(config), [config]);
   const activeConfig = useRef<Props['config'] | null>(config);
   activeConfig.current = config;
   useEffect(() => { activeConfig.current = config; return () => { activeConfig.current = null; }; }, [config]);
@@ -126,7 +132,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
   };
 
   const confirmDelete = (job: JobSummary) => {
-    const choices = job.kind === 'torrent'
+    const choices = isSeedTorrent(job)
       ? [
           { text: 'Cancel', style: 'cancel' as const },
           { text: 'Keep files', onPress: () => void mutateJob(job, 'delete') },
@@ -138,8 +144,9 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
         ];
     Alert.alert(
       'Remove this job?',
-      job.kind === 'torrent'
+      isSeedTorrent(job)
         ? `Remove “${job.name}”? Choose whether its payload is retained.`
+        : isTorrentAcquisition(job) ? `Remove “${job.name}” from the acquisition queue? Its separate seed source is unchanged.`
         : `Remove “${job.name}” from the queue? Downloaded files are left in place.`,
       choices,
     );
@@ -357,6 +364,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
                         {!hidden ? <View style={styles.queueGroupJobs}>
                           {sectionJobs.map(({ job, index }) => (
                             <JobCard
+                              client={lifecycleClient}
                               busy={busyKey !== null}
                               expanded={expanded === job.id}
                               index={index}
@@ -580,6 +588,7 @@ function StorageVolume({
 }
 
 export function JobCard({
+  client,
   job,
   index,
   total,
@@ -596,6 +605,7 @@ export function JobCard({
   styles,
   tone,
 }: {
+  client?: NzbdClient;
   job: JobSummary;
   index: number;
   total: number;
@@ -623,13 +633,17 @@ export function JobCard({
   const phase = torrentDisplayPhase(job);
   const torrentAction = torrentPrimaryAction(job);
   const seed = phase === 'seeding' || phase === 'paused_seed';
-  const postProcessing = job.kind !== 'torrent' && isPostProcessingSection(sectionKey);
-  const showStatus = !!phase || ['waiting', 'attention', 'paused'].includes(sectionKey);
+  const acquisition = isTorrentAcquisition(job);
+  const postProcessing = !isSeedTorrent(job) && isPostProcessingSection(sectionKey);
+  const pendingLabel = controlPendingLabel(job);
+  const acquisitionLabel = acquisitionStatus(job);
+  const showStatus = !!pendingLabel || !!acquisitionLabel || !!phase || ['waiting', 'attention', 'paused'].includes(sectionKey);
   // An NZB URL job has no bytes until its NZB arrives: no bar, and the card
   // says why it is waiting instead (urlFetchDetail).
-  const fetchingNzb = statusKey === 'fetching' && !phase;
+  const fetchingNzb = statusKey === 'fetching' && !phase && !acquisition;
+  const fetchingAcquisition = statusKey === 'fetching' && acquisition;
   const now = useNow(30_000, fetchingNzb && !hold);
-  const showProgress = !fetchingNzb && !postProcessing && !seed && !['fetching_source', 'fetching_metadata', 'failed', 'missing_files'].includes(phase ?? '');
+  const showProgress = !fetchingNzb && !fetchingAcquisition && !postProcessing && !seed && !['fetching_source', 'fetching_metadata', 'failed', 'missing_files'].includes(phase ?? '');
   return (
     <View
       style={[
@@ -653,7 +667,8 @@ export function JobCard({
             <Text style={styles.jobPercent}>{Math.floor(progress * 100)}%</Text>
           ) : null}
         </View>
-        {job.kind === 'torrent' ? <Text style={styles.eyebrow}>BITTORRENT</Text> : null}
+        {job.kind === 'torrent' ? <Text style={styles.eyebrow}>{acquisition ? 'TORRENT ACQUISITION' : 'BITTORRENT'}</Text> : null}
+        {acquisition ? <Text style={styles.metaText}>Separate seed source{job.seed_donor_job_id != null ? ` #${job.seed_donor_job_id}` : ''} · seed policy unchanged</Text> : null}
         {showProgress ? (
           <View style={styles.progressTrack}>
             <View style={[styles.progressFill, { width: `${Math.max(progress * 100, 1)}%` }]} />
@@ -662,9 +677,10 @@ export function JobCard({
         <View style={styles.jobMeta}>
           {showStatus ? (
             <Text style={[styles.status, (statusKey === 'failed' || phase === 'missing_files' || phase === 'failed') && styles.statusFailed]}>
-              {hold ? 'held' : job.verification && job.status !== 'paused' ? 'Verifying recovery' : phase ? torrentStatus(job) : jobStatusLabel(job.status, job.ready)}
+              {pendingLabel ?? (hold ? 'held' : job.verification && job.status !== 'paused' ? 'Verifying recovery' : acquisitionLabel ?? (phase ? torrentStatus(job) : jobStatusLabel(job.status, job.ready)))}
             </Text>
           ) : null}
+          {pendingLabel ? <Text style={job.controlPending?.state === 'review_required' ? styles.statusFailed : styles.metaText}>{controlPendingText(job)}</Text> : null}
           {hold ? <Text style={styles.statusFailed}>{hold.message}</Text> : null}
           {job.verification ? (
             <Text style={styles.metaText}>
@@ -673,7 +689,7 @@ export function JobCard({
               {job.verification.reason ? ` · ${job.verification.reason}` : ''}
             </Text>
           ) : null}
-          {fetchingNzb ? null : (
+          {fetchingNzb || fetchingAcquisition ? null : (
             <Text style={styles.metaText}>
               {seed ? 'Files ready' : `${formatBytes(job.downloaded_bytes)} / ${formatBytes(job.size_bytes)}`}
             </Text>
@@ -692,7 +708,7 @@ export function JobCard({
             <Text style={[styles.metaText, { color: tone.accent }]}>
               {postProcessingDetail(job, sectionKey, sectionLabel)}
             </Text>
-          ) : fetchingNzb ? (
+          ) : fetchingAcquisition ? <Text style={styles.metaText}>Waiting for acquisition payload</Text> : fetchingNzb ? (
             hold ? null : (
               <Text style={[styles.metaText, job.url_fetch?.attempts ? styles.statusFailed : null]}>
                 {urlFetchDetail(job, now)}
@@ -709,12 +725,14 @@ export function JobCard({
 
       {expanded ? (
         <View style={styles.jobActions}>
+          {client && deliveryReference(job.params) ? <DeliveryLifecyclePanel client={client} receiptId={deliveryReference(job.params)!} /> : null}
+          {client && !isSeedTorrent(job) ? <FailureKeepControl client={client} jobId={job.id} /> : null}
           <View style={styles.jobFacts}>
-            {!phase ? <Fact label="Health" styles={styles} value={`${(job.health / 10).toFixed(1)}%`} /> : null}
+            {job.kind !== 'torrent' ? <Fact label="Health" styles={styles} value={`${(job.health / 10).toFixed(1)}%`} /> : null}
             <Fact label="Files" styles={styles} value={`${job.files_done}/${job.files_total}`} />
             <Fact label="Priority" styles={styles} value={downloadPriorityLabel(job.priority)} />
             <Fact label="Category" styles={styles} value={job.category || '—'} />
-            {job.kind === 'torrent' ? (
+            {isSeedTorrent(job) ? (
               <>
                 {job.ready_at_unix != null && seed ? <Fact label="Files ready since" styles={styles} value={new Date(job.ready_at_unix * 1000).toLocaleString()} /> : null}
                 <Fact label="Uploaded" styles={styles} value={formatBytes(job.uploaded_bytes ?? 0)} />

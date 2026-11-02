@@ -1306,19 +1306,19 @@ fn verify_job_batch(
                     return Err(VerificationFailure::conflict(
                         format!("file {} contradicts current durable range proof", file.id.0),
                         checked,
-                    ))
+                    ));
                 }
                 ValidationOutcome::Mismatch | ValidationOutcome::Missing => {
                     verified.invalid.push((file.id, range.seg_number))
                 }
                 ValidationOutcome::Unavailable(reason) => {
-                    return Err(VerificationFailure::unavailable(reason, checked))
+                    return Err(VerificationFailure::unavailable(reason, checked));
                 }
                 ValidationOutcome::IdentityConflict => {
                     return Err(VerificationFailure::conflict(
                         "file changed during verification batch",
                         checked,
-                    ))
+                    ));
                 }
             }
             accepted.insert(range.seg_number);

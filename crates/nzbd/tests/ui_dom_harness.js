@@ -604,12 +604,13 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   ok(old.meta.includes("predates"), `pre-upgrade entries say so (got ${old.meta})`);
   eq(old.files.length, 0);
 
-  // The panel is a toggle, and opening one does not fetch anything.
+  // Historical facts remain local; only current retained-source custody is fetched.
   routes.clear(); seen.length = 0;
   T.store.history = [withRecord];
   T.toggleHist(182);
   eq(T.getOpenHist(), 182, "details open");
-  eq(seen.length, 0, "no request — the record is already in hand");
+  eq(seen.length, 1, "one current source preference lookup, no historical record fetch");
+  ok(seen[0].url.endsWith("/jobs/182/failure-keep"), "history does not depend on live queue membership");
   const body = sandbox.document.getElementById("history-body");
   eq(body.children.length, 2, "the detail row renders under its own row");
   const dc = body.children[1].__c;
@@ -1206,6 +1207,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   // exposes a bounded next-page action so an early accepted window cannot
   // hide later publications, and cleanup retry remains independent of ack.
   reset();
+  const deliveryText = () => { const visit = n => [n.textContent || "", n.innerHTML || "", ...(n.children || []).map(visit)].join(" "); return visit(sandbox.document.getElementById("files-deliveries")); };
   const delivery = (id, status, sequence) => ({ deliveryId: id, status, sequence, artifactId: "published-" + id,
     sourceArtifactId: "source-" + id, sourceGeneration: "source-generation", fileOutcomes: [], files: [],
     readyAt: 1, sourceCleanup: { status: "retry", attempts: 1, attemptHistory: [] } });
@@ -1213,9 +1215,9 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   repairDelivery.fileOutcomes = [{ repairDependency: true, outcome: "published" }];
   T.setDeliveriesForTest([repairDelivery], 0, 100);
   T.renderDeliveries();
-  ok(sandbox.document.getElementById("files-deliveries").innerHTML.includes("accepted"),
+  ok(deliveryText().includes("accepted"),
     "accepted deliveries remain visible in the durable listing");
-  ok(sandbox.document.getElementById("files-deliveries").innerHTML.includes("1 PAR repair inputs retained"),
+  ok(deliveryText().includes("1 PAR repair inputs retained"),
     "a published sibling can visibly remain a required PAR repair input");
   routes.set("/api/v1/deliveries?after=100", { status: 200, body: { deliveries: [delivery("d2", "pending", 101)], nextCursor: 200 } });
   await T.loadOlderDeliveries();
@@ -1229,6 +1231,34 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   await T.retryDeliveryCleanup("d2");
   ok(seen.some(r => r.url.endsWith("/api/v1/deliveries/d2/source-cleanup/retry") && r.method === "POST"),
     "source cleanup retry calls its independent Runner endpoint");
+
+  // One machine/session subtotal counts overlap once, no wall-time guesses.
+  const timed = delivery("timed", "accepted", 4);
+  const span = (stage, start, end, nodeId = "worker-a", clockDomain = "boot-a") => ({ stage, nodeId, clockDomain, state: "completed", startUnixMs: 100000,
+    startMonotonicMs: start, endMonotonicMs: end, durationMs: end - start });
+  timed.lifecycleTiming = { version: 1, intervals: [span("download", 0, 2000), span("post_processing", 1000, 3000), span("queue", 0, 1000, "worker-b"),
+    { ...span("url_fetch", 0, 9999), state: "interrupted" }, { stage: "queue", nodeId: "worker-a", clockDomain: "legacy", state: "completed", startUnixMs: 1, endUnixMs: 99999, durationMs: 99998 }] };
+  timed.lifecycleTiming.omittedIntervals = { queue: 2 };
+  ok(T.deliveryTraceHtml(timed).includes("Recorded subset"), "omitted intervals label timing totals as recorded subset");
+  timed.sourceCopies = [{ id: "copy-long-reference", ownerNode: "worker-a", status: "retry", attempts: 2, error: "Mount unavailable" }];
+  const lanes = T.measuredDeliveryLanes(timed);
+  eq(lanes.length, 3, "node and session identities keep separate subtotals");
+  eq(lanes[0].measuredMs, 3000, "overlap counted once");
+  eq(lanes[0].unknown, 1, "interrupted timing excluded");
+  eq(lanes[2].measuredMs, null, "legacy wall timestamps cannot invent measured total");
+  ok(T.deliveryTraceHtml({ ...timed, lifecycleTiming: { version: 1, intervals: [timed.lifecycleTiming.intervals[4]] } }).includes("completed · duration unknown"), "legacy row duration is unknown without measured endpoints");
+  ok(T.deliveryTraceHtml(timed).includes("Mount unavailable"), "per-copy reason visible");
+  ok(T.deliveryTraceHtml(timed).includes("Timing reference"), "raw session identity secondary");
+  reset(); T.setDeliveriesForTest([timed], 0, 4); T.renderDeliveries();
+  const timedRow = sandbox.document.getElementById("files-deliveries").__rows.get("timed");
+  const retryNode = timedRow.__c.retry;
+  timed.sourceCleanup.attempts = 3; T.renderDeliveries();
+  ok(sandbox.document.getElementById("files-deliveries").__rows.get("timed").__c.retry === retryNode, "polling preserves actual retry button identity");
+  routes.set("/api/v1/deliveries/timed", { status: 200, body: timed });
+  await T.refreshJobDelivery(22, [["Delivery:Id", "timed"]]);
+  ok(seen.some(r => r.url === "/api/v1/deliveries/timed" && r.method === "GET"), "expanded detail uses exact receipt reference");
+  ok(!seen.some(r => r.url.includes("deliveries?")), "expanded detail never fans out through collection");
+  ok(T.jobDeliveryHtml(22, [["Delivery:Id", "timed"]]).includes("Mount unavailable"), "retired job can show exact receipt lifecycle");
 
   // Source removal requires two clicks bound to the exact delivery and
   // source generation. The first click cannot issue a destructive request;
@@ -1247,7 +1277,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   const changedSourceDelivery = { ...sourceDelivery, sourceGeneration: "replacement-generation" };
   T.setDeliveriesForTest([changedSourceDelivery], 100, 200);
   T.renderDeliveries();
-  ok(!sandbox.document.getElementById("files-deliveries").innerHTML.includes("click again to remove"),
+  ok(!deliveryText().includes("click again to remove"),
     "a changed source generation clears the old armed control");
   routes.set("/api/v1/artifacts/source-d2", { status: 200, body: {
     id: "source-d2", generation: "replacement-generation", owned: true, revision: 7,
@@ -1361,6 +1391,59 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(stack.children[0].children.length, 2, "but with no action button — just the dismiss ×");
   ok(stack.children[0].children[0].textContent.includes("can't be undone"),
     "…and it says why");
+
+  // Consumer-owned parked jobs need fresh Curator authority, never a fake Undo.
+  reset();
+  T.store.jobs = [job(22, { name: "Curator movie", params: [["monarr-transfer", "transfer-22"]] })];
+  routes.set("/actions/delete", { status: 200, body: { ok: true, parked: true } });
+  await T.deleteJob(22, "Curator movie");
+  eq(stack.children[0].children.length, 2, "consumer parked deletion has no Undo");
+  ok(stack.children[0].children[0].textContent.includes("fresh Grab in Curator"), "consumer delete explains fresh request authority");
+  const refused = T.histModel({ job: 22, name: "Curator movie", status: "DELETED", can_requeue: false,
+    requeue_reason: "Use a fresh Grab in Curator", stages: [] });
+  eq(refused.requeueHidden, true, "consumer history cannot offer requeue");
+  eq(refused.requeueReason, "Requeue unavailable — see details", "history points to its refusal explanation");
+  eq(T.histDetailModel({ job: 22, can_requeue: false, requeue_reason: "Use a fresh Grab in Curator" }).requeueNote, "Use a fresh Grab in Curator", "expanded history renders full server explanation");
+
+  // Queue retirement does not remove a durable source's current Keep control.
+  reset(); T.store.jobs = []; T.failureKeepState.clear();
+  let retainedKeep = false;
+  routes.set("/jobs/22/failure-keep", (_url, init) => {
+    if (init.method === "PUT") retainedKeep = JSON.parse(init.body).keep;
+    return { status: 200, body: { available: true, keep: retainedKeep } };
+  });
+  await T.refreshFailureKeep(22);
+  eq(T.histDetailModel({ job: 22, stages: [] }).failureKeepHidden, false, "retired history exposes proven source preference");
+  await T.toggleFailureKeep(22);
+  eq(retainedKeep, true, "history toggle writes current retained-source preference");
+  eq(T.histDetailModel({ job: 22, stages: [] }).failureKeep, true, "GET refresh confirms the changed current value");
+  routes.set("/jobs/22/failure-keep", { status: 409, body: { error: "source changed; review current source" } });
+  await T.toggleFailureKeep(22);
+  eq(T.histDetailModel({ job: 22, stages: [] }).failureKeep, true, "failed toggle preserves confirmed preference");
+  ok(stack.children.some(n => n.children[0].textContent.includes("source changed")), "retention failure is visible");
+  await T.refreshFailureKeep(22);
+  eq(T.histDetailModel({ job: 22, stages: [] }).failureKeepHidden, true, "unconfirmed current custody cannot toggle");
+  ok(T.histDetailModel({ job: 22, stages: [] }).failureKeepNote.includes("source changed"), "failed current lookup has actionable feedback");
+  routes.set("/jobs/22/failure-keep", { status: 200, body: { available: false, keep: false } });
+  await T.refreshFailureKeep(22);
+  ok(T.histDetailModel({ job: 22, stages: [] }).failureKeepNote.includes("No retained source"), "unavailable source is explained");
+  let keepPending = false;
+  routes.set("/jobs/23/failure-keep", (_url, init) => {
+    if (init.method === "PUT") keepPending = true;
+    return { status: init.method === "PUT" ? 202 : 200, body: { available: true, keep: keepPending, applied: !keepPending, pendingOwners: keepPending ? ["worker-a"] : [] } };
+  });
+  await T.refreshFailureKeep(23); await T.toggleFailureKeep(23);
+  const pendingKeep = T.histDetailModel({ job: 23, stages: [] });
+  eq(pendingKeep.failureKeep, true, "pending Keep retains desired preference");
+  eq(pendingKeep.failureKeepPending, true, "202 desired preference is not owner-applied");
+  ok(pendingKeep.failureKeepNote.includes("Waiting for source owners (1)"), "pending owner application is explicit");
+  ok(stack.children.at(-1).children[0].textContent.includes("requested. Waiting"), "pending request never confirms applied protection");
+  T.failureKeepState.clear(); await T.refreshFailureKeep(23);
+  eq(T.histDetailModel({ job: 23, stages: [] }).failureKeepPending, true, "GET after reload restores pending owner state");
+  routes.set("/jobs/23/failure-keep", { status: 200, body: { available: false, keep: true, applied: false, pendingOwners: [] } });
+  await T.refreshFailureKeep(23);
+  ok(T.histDetailModel({ job: 23, stages: [] }).failureKeepNote.includes("No retained source"), "desired Keep cannot restore an absent source");
+  T.failureKeepState.clear();
 
   // (d) a failed delete reverts the row and quotes the daemon
   reset();
@@ -1631,6 +1714,64 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     T.toggleSection("seeding");
     eq(T.queueModels().filter(m => m.kind === "job").length, 20, "reopening seeds restores pagination");
     T.collapsedSections.clear();
+
+    const child = { ...seed, id: 900, torrent_role: "acquisition", seed_donor_job_id: seed.id,
+      status: { post: { stage: "unpack" } }, ready: false, stages: [{ stage: "unpack", since: 1 }] };
+    eq(T.torrentPhase(child), null, "managed child never derives a seed phase from donor counters");
+    eq(T.rowModel({ ...child, status: "queued" }).st, "WAITING FOR SEED SOURCE", "child queue waits for separate seed network acquisition");
+    eq(T.rowModel({ ...child, status: "downloading" }).st, "COPYING SEED FILES", "child download interval is a private copy");
+    const proof = { ...child, control: { revision: "7", instance: "authority" },
+      controlPending: { jobId: child.id, state: "review_required", owner: "worker-west", error: "Exact source identity changed", nextRetryAtMs: 1e300 } };
+    const pendingRow = T.rowModel(proof, { mixedSection: false });
+    eq(pendingRow.st, "SOURCE NEEDS REVIEW", "pending proof does not appear as ordinary queued work");
+    eq(pendingRow.stHidden, false, "pending state stays visible under processing headings");
+    ok(pendingRow.dRest.includes("worker-west") && pendingRow.dRest.includes("Exact source identity changed"), "pending reason and owner are visible");
+    ok(!pendingRow.pauseHidden, "pending proof does not remove existing pause control");
+    ok(!T.detailModel(proof).lifecycleHidden && T.detailModel(proof).lifecycleStatus.includes("Exact source identity changed"), "inspector shows review boundary");
+    const generic = { ...proof, controlPending: { jobId: child.id, state: "pending", owner: null, error: "Waiting for proof", nextRetryAtMs: null } };
+    T.store.jobs = [proof];
+    T.applyTick({ jobs: [generic], status: { download_rate_bps: 0 } });
+    eq(T.store.jobs[0].controlPending.owner, "worker-west", "generic SSE preserves detailed owner observation");
+    eq(T.store.jobs[0].controlPending.state, "review_required", "generic SSE cannot erase recorded review reason");
+    T.applyTick({ jobs: [{ ...generic, controlPending: undefined }], status: { download_rate_bps: 0 } });
+    ok(!T.store.jobs[0].controlPending, "ACK tick omission clears pending observation");
+    eq(T.mergePendingJobs([proof], [{ ...generic, control: { revision: "8", instance: "authority" } }])[0].controlPending.owner, null, "new control cannot inherit old proof detail");
+    routes.clear(); seen.length = 0;
+    T.store.jobs = [generic]; T.__setClocks(Date.now(), Date.now());
+    routes.set("/api/v1/jobs", {status:200,body:{jobs:[proof]}});
+    T.pollPass(); await T.refreshPendingObservations();
+    eq(T.store.jobs[0].controlPending.error, "Exact source identity changed", "healthy SSE still fetches first detailed observation");
+    eq(seen.filter(r=>r.url==="/api/v1/jobs").length,1,"one observation refresh in flight");
+    routes.set("/api/v1/jobs", {status:200,body:{jobs:[{...proof,controlPending:{...proof.controlPending,error:"Source owner has returned; rechecking"}}]}});
+    T.pollPass(); await T.refreshPendingObservations();
+    eq(T.store.jobs[0].controlPending.error,"Source owner has returned; rechecking","healthy SSE refresh updates changed reason");
+    let resolveObservation;
+    routes.set("/api/v1/jobs",()=>new Promise(resolve=>{resolveObservation=resolve}));
+    const delayed=T.refreshPendingObservations();
+    T.applyTick({jobs:[{...generic,controlPending:undefined}],status:{download_rate_bps:0}});
+    resolveObservation({status:200,body:{jobs:[proof]}});await delayed;
+    ok(!T.store.jobs[0].controlPending,"late GET cannot resurrect ACK-cleared marker");
+    T.store.jobs=[generic];
+    const changed=T.refreshPendingObservations();
+    T.applyTick({jobs:[{...generic,control:{revision:"8",instance:"authority"}}],status:{download_rate_bps:0}});
+    resolveObservation({status:200,body:{jobs:[proof]}});await changed;
+    eq(T.store.jobs[0].controlPending.owner,null,"late GET cannot annotate newer control");
+    routes.clear();
+    const childRow = T.rowModel(child);
+    ok(childRow.sub.includes("TORRENT ACQUISITION") && childRow.sub.includes("#" + seed.id), "child identifies its separate seed source");
+    ok(!childRow.sub.includes("USENET"), "child is never labeled Usenet");
+    eq(childRow.deleteDataHidden, true, "child offers no donor data deletion control");
+    eq(childRow.pauseLabel, "pause", "child retains ordinary processing control");
+    eq(childRow.health, "—", "child invents neither article health nor seed ratio");
+    T.failureKeepState.set(child.id, { available: true, keep: false });
+    const childDetail = T.detailModel(child);
+    eq(childDetail.torrent, false, "child has no seed editor or peer counters");
+    eq(childDetail.failureKeepHidden, false, "child has scoped processing source Keep");
+    eq(childDetail.nzbHidden, true, "child does not issue NZB or donor metainfo requests");
+    ok(childDetail.meta.includes("separate seed source"), "child inspector explains source separation");
+    const heldChild = { ...child, control: { lifecycle: "held", retry_policy: "review", manual_pause: true, message: "Review payload" } };
+    eq(T.rowModel(heldChild).pauseLabel, "retry", "child preserves main held-job Retry");
+    eq(T.rowModel({ ...heldChild, control: { ...heldChild.control, retry_policy: "scheduled_retry", manual_pause: false } }).pauseLabel, "pause", "child preserves pause of automatic retries");
 
     const detail = T.detailModel(seed);
     eq(detail.torPeers, "3", "inspector exposes peer count");

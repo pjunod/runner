@@ -6,7 +6,7 @@ readonly series_file="$repository_root/contrib/rqbit/maintained-series.txt"
 readonly checksum_file="$repository_root/contrib/rqbit/upstream-v8.1.1.sha256"
 readonly vendor_dir="$repository_root/contrib/rqbit/vendor"
 readonly upstream_url="https://github.com/ikatson/rqbit/archive/refs/tags/v8.1.1.tar.gz"
-readonly expected_series=$'0001-allow-persistence-without-auto-restore.patch\n0005-bound-tracker-requests.patch\n0007-bound-session-peers.patch\n0009-bound-pending-incoming-handshakes.patch\n0010-bound-known-peer-records.patch\n0012-bound-peer-response-backlog.patch\n0014-bound-discovery-pressure.patch\n0016-limit-peer-metadata-before-allocation.patch\n0018-propagate-file-sizing-errors.patch\n0019-disable-peer-exchange.patch\n0020-expose-test-only-dht-bootstrap.patch\n0021-configurable-client-identity-and-announce-lifecycle.patch'
+readonly expected_series=$'0001-allow-persistence-without-auto-restore.patch\n0005-bound-tracker-requests.patch\n0007-bound-session-peers.patch\n0009-bound-pending-incoming-handshakes.patch\n0010-bound-known-peer-records.patch\n0012-bound-peer-response-backlog.patch\n0014-bound-discovery-pressure.patch\n0016-limit-peer-metadata-before-allocation.patch\n0018-propagate-file-sizing-errors.patch\n0019-disable-peer-exchange.patch\n0020-expose-test-only-dht-bootstrap.patch\n0021-configurable-client-identity-and-announce-lifecycle.patch\n0022-read-only-piece-verifier.patch'
 readonly expected_vendor_entries=$'LICENSE\nREADME.md\ncrates'
 
 if [[ "$(<"$series_file")" != "$expected_series" ]]; then

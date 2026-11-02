@@ -19,6 +19,7 @@ required-features = ["fuzzing"]
 
 [dependencies]
 bytes = { workspace = true }
+httpdate = { workspace = true }
 icu_normalizer = { workspace = true }
 icu_casemap = { workspace = true }
 librqbit = { workspace = true }

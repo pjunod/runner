@@ -825,12 +825,21 @@ async fn handle_failed_job_admitted(
             }
         }
     }
+    // Deletion is durable before history/stamp finalization. Replay must not
+    // try to diagnose the now-absent source tree.
+    let source_deleted = match engine.artifacts().for_job(job.0) {
+        Ok(source) => source.is_some_and(|source| source.state == "deleted"),
+        Err(error) => {
+            record_failed_cleanup_retry(engine, job, error.to_string()).await;
+            return;
+        }
+    };
     let mut early_archive_assessment = EarlyArchiveAssessment::default();
     let salvage = match (
         durable_delivery,
         exported
             .as_ref()
-            .filter(|j| j.lifecycle_eligible() && !fetch_failure),
+            .filter(|j| j.lifecycle_eligible() && !fetch_failure && !source_deleted),
     ) {
         (Some(delivery), _) => Some(FailedSalvage {
             published_path: PathBuf::from(&delivery.publication_path),
@@ -956,7 +965,7 @@ async fn handle_failed_job_admitted(
         "FAILURE/HEALTH"
     };
     let keep_on_failure = exported.as_ref().is_some_and(job_keeps_failed_source);
-    let failed_source_assessment = if salvage.is_none() && !fetch_failure {
+    let failed_source_assessment = if salvage.is_none() && !fetch_failure && !source_deleted {
         match exported.as_ref().filter(|row| row.lifecycle_eligible()) {
             Some(row) => {
                 let row = row.clone();
@@ -1125,7 +1134,11 @@ async fn handle_failed_job_admitted(
                                 &mut finalizing.params,
                                 PP_FAILED_CLEANUP_NEXT_RETRY_PARAM,
                                 now()
-                                    .saturating_add(failed_cleanup_retry_delay(attempts))
+                                    .saturating_add(retry_delay_with_jitter(
+                                        failed_cleanup_retry_delay(attempts),
+                                        job,
+                                        attempts,
+                                    ))
                                     .to_string(),
                             );
                             if !finalizing
@@ -1561,10 +1574,11 @@ async fn repair_failed_health_par_sets(
         .ok_or_else(|| "failed job has no source artifact".to_string())?;
     let root = source.path.clone();
     let entries = source.files.clone();
+    let partial_paths = sealed_partial_paths(job, &source);
     let gate_for_scan = gate.clone();
     let id = job.id;
     let sets = tokio::task::spawn_blocking(move || {
-        par_repairable_evidence_checked(&root, &entries, &|| {
+        par_repairable_evidence_with_partials(&root, &entries, &partial_paths, &|| {
             crate::attempt::checkpoint()?;
             if gate_for_scan.as_ref().is_some_and(|claim| !claim(id)) {
                 return Err(std::io::ErrorKind::Interrupted.into());
@@ -1864,7 +1878,7 @@ fn salvage_failed_delivery(
             .map(|(_, value)| value.as_str());
         Some(
             inventory
-                .create_delivery_with_outcome_and_keep(
+                .create_delivery_with_lifecycle_snapshot(
                     job.id.0,
                     true,
                     token,
@@ -1872,6 +1886,8 @@ fn salvage_failed_delivery(
                     Some(failure_stage),
                     Some(failure_cause),
                     job_keeps_failed_source(job),
+                    delivery_stage_snapshot(inventory, job),
+                    nzbd_engine::frozen_lifecycle_timing(job),
                 )
                 .map_err(|error| error.to_string())?,
         )
@@ -2124,6 +2140,126 @@ async fn scan_queue(
             active.insert(j.id, attempt);
         }
     }
+}
+
+async fn schedule_recoverable_post_retry(engine: &EngineHandle, job: JobId) {
+    let Ok(Some(row)) = engine.export_job(job).await else {
+        return;
+    };
+    if !row.lifecycle_eligible() {
+        return;
+    }
+    let Some(mut control) = row.control().filter(|control| {
+        control.lifecycle == "held"
+            && control.hold_cause().policy().timed()
+            && !control.manual_pause
+    }) else {
+        return;
+    };
+
+    if control.next_retry_at_unix.is_some()
+        && control.retry_policy == control.hold_cause().policy().as_str()
+    {
+        return;
+    }
+    let delay = retry_delay_with_jitter(
+        post_retry_delay_seconds(control.retry_attempt),
+        job,
+        u32::from(control.retry_attempt),
+    );
+    control.retry_attempt = control.retry_attempt.saturating_add(1);
+    control.next_retry_at_unix = Some(
+        now()
+            .saturating_add(delay)
+            .max(control.next_retry_at_unix.unwrap_or(0)),
+    );
+    control.blocked_since_unix.get_or_insert_with(now);
+    control.retry_policy = "scheduled_retry".into();
+    let reason = control
+        .message
+        .split("; retry ")
+        .next()
+        .unwrap_or("recoverable post-processing error")
+        .chars()
+        .take(1200)
+        .collect::<String>();
+    control.message = format!(
+        "{reason}; retry {} scheduled in {} seconds; source retained while Runner retries{}",
+        control.retry_attempt,
+        delay,
+        if now().saturating_sub(control.blocked_since_unix.unwrap_or_else(now)) >= 30 * 60 {
+            "; warning: blocked for at least 30 minutes"
+        } else {
+            ""
+        },
+    );
+    if !engine
+        .schedule_post_retry(
+            job,
+            control.revision,
+            control.retry_attempt,
+            control.next_retry_at_unix.expect("scheduled deadline"),
+            control.blocked_since_unix.expect("blocked time"),
+            control.message,
+        )
+        .await
+        .unwrap_or(false)
+    {
+        tracing::warn!(job = job.0, "recoverable retry schedule was not committed");
+    }
+}
+
+/// Retain the exact leased worker attempt through recoverable post failures.
+/// Scheduling itself is an owner CAS and, on cluster workers, a durable local
+/// inventory checkpoint rather than a volatile queue import.
+pub async fn retain_worker_post_retry(
+    engine: &EngineHandle,
+    job: JobId,
+    error: &PostError,
+) -> bool {
+    if !matches!(error, PostError::Held) {
+        let cause = post_hold_cause(error);
+        let stage = engine
+            .snapshot()
+            .jobs
+            .iter()
+            .find(|row| row.id == job)
+            .and_then(|row| row.stages.last())
+            .map(|span| span.stage.as_str().to_owned())
+            .unwrap_or_else(|| "extract".into());
+        if !engine
+            .hold_job(job, cause, &stage, &error.to_string())
+            .await
+            .unwrap_or(false)
+        {
+            return false;
+        }
+    }
+    schedule_recoverable_post_retry(engine, job).await;
+    engine
+        .export_job(job)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|job| job.control())
+        .is_some_and(|control| {
+            control.lifecycle == "held"
+                && control.hold_cause().policy().automatic()
+                && control.next_retry_at_unix.is_some()
+                && !control.manual_pause
+        })
+}
+
+fn retry_delay_with_jitter(base: i64, job: JobId, attempt: u32) -> i64 {
+    let seed = u64::from(job.0).wrapping_mul(0x9e3779b97f4a7c15)
+        ^ u64::from(attempt).wrapping_mul(0xbf58476d1ce4e5b9)
+        ^ now() as u64;
+    base.saturating_add((seed % (base.max(1) as u64 / 10 + 1)) as i64)
+}
+
+const POST_RETRY_DELAYS_SECONDS: [i64; 4] = [30, 60, 120, 300];
+fn post_retry_delay_seconds(retry_attempt: u8) -> i64 {
+    POST_RETRY_DELAYS_SECONDS[usize::from(retry_attempt).min(POST_RETRY_DELAYS_SECONDS.len() - 1)]
 }
 
 /// Replay a crash after the terminal stamp using the exact history cursor,
@@ -2667,12 +2803,15 @@ async fn record_failed_cleanup_retry(engine: &EngineHandle, id: JobId, error: St
         PP_FAILURE_DISPOSITION_ATTEMPTS_PARAM,
         attempts.to_string(),
     );
+    let next_retry = now().saturating_add(retry_delay_with_jitter(
+        failed_cleanup_retry_delay(attempts),
+        id,
+        attempts,
+    ));
     set_param(
         &mut row.params,
         PP_FAILED_CLEANUP_NEXT_RETRY_PARAM,
-        now()
-            .saturating_add(failed_cleanup_retry_delay(attempts))
-            .to_string(),
+        next_retry.to_string(),
     );
     if param_i64(&row.params, PP_FAILED_CLEANUP_BLOCKED_SINCE_PARAM).is_none() {
         set_param(
@@ -2695,7 +2834,7 @@ async fn record_failed_cleanup_retry(engine: &EngineHandle, id: JobId, error: St
     tracing::warn!(
         job = id.0,
         attempts,
-        next_retry_at = now().saturating_add(failed_cleanup_retry_delay(attempts)),
+        next_retry_at = next_retry,
         warning = now().saturating_sub(blocked_since) >= 30 * 60,
         %error,
         "failed-source cleanup remains retryable"
@@ -2981,6 +3120,19 @@ async fn resume_committed_publication(
     resume_durable_delivery(engine, history, job_id).await
 }
 
+fn delivery_stage_snapshot(
+    _inventory: &nzbd_state::artifacts::Inventory,
+    job: &Job,
+) -> Option<nzbd_state::artifacts::DeliveryRunnerStages> {
+    (!job.stages.is_empty()).then(|| nzbd_state::artifacts::DeliveryRunnerStages {
+        // StageSpan persists without per-span node/boot context. A later
+        // process must not relabel mixed historical spans as its own clock.
+        node_id: "unrecorded".into(),
+        clock_domain: "unrecorded".into(),
+        spans: job.stages.iter().take(128).cloned().collect(),
+    })
+}
+
 fn finish_committed_publication_receipt(
     inventory: &Arc<nzbd_state::artifacts::Inventory>,
     job: &Job,
@@ -3027,7 +3179,7 @@ fn finish_committed_publication_receipt(
         )
         .map_err(PostError::from)?;
     let delivery = inventory
-        .create_delivery_with_outcome_and_keep(
+        .create_delivery_with_lifecycle_snapshot(
             job.id.0,
             true,
             request_token,
@@ -3035,6 +3187,8 @@ fn finish_committed_publication_receipt(
             failure_stage,
             failure_cause,
             outcome != PpFinal::Success.as_str() && job_keeps_failed_source(job),
+            delivery_stage_snapshot(inventory, job),
+            nzbd_engine::frozen_lifecycle_timing(job),
         )
         .map_err(PostError::from)?;
     Ok(Some(delivery))
@@ -3638,7 +3792,10 @@ async fn process_job_ctx_from_inner(
         )?;
         deobfuscated.extend(crate::deobfuscate::deobfuscate_dir_owned(
             &dir,
-            &sanitized,
+            job.params
+                .iter()
+                .find(|(key, _)| key == "*Cluster:original-dir")
+                .map_or(sanitized.as_str(), |(_, name)| name.as_str()),
             &par2_names,
             Some((&engine.artifacts(), job_id.0)),
         )?);
@@ -3852,7 +4009,7 @@ async fn process_job_ctx_from_inner(
     }
 
     // ---- finalize ----------------------------------------------------------
-    let outcome = if !par_ok {
+    let mut outcome = if !par_ok {
         PpFinal::ParFailure
     } else if !unpack_ok {
         PpFinal::UnpackFailure
@@ -3910,6 +4067,49 @@ async fn process_job_ctx_from_inner(
         .into_iter()
         .chain(verified_direct)
         .collect::<std::collections::HashSet<_>>();
+    // A completed download containing only positively disposable inputs is
+    // a terminal unusable attempt, rather than an endless publication hold.
+    // Recognizable usable inputs still have an explicit review action below.
+    let mut unusable_source_reason = None;
+    let mut assessed_inputs = None;
+    if job.lifecycle_eligible() && outcome == PpFinal::Success {
+        if let Some(source) = engine.artifacts().for_job(job_id.0)? {
+            // Writer CRCs can prove a readme or sidecar intact without making
+            // it publishable. Only a positive selected payload skips the
+            // checkpointed diagnostic pass; the selector itself is cheap.
+            let (publishable, _) = select_delivery_payload(
+                &source.files,
+                &consumed_archive_paths,
+                &verified_payload_paths,
+                &terminal_unusable_archive_paths,
+                &Default::default(),
+            );
+            if publishable.is_empty() {
+                let assessment_job = job.clone();
+                let assessment_source = source.clone();
+                let complete_paths = verified_payload_paths.clone();
+                let diagnostics = crate::attempt::current()
+                    .expect("processing control")
+                    .blocking(move |control| {
+                        control.checkpoint()?;
+                        assess_file_inputs(&assessment_job, &assessment_source, &complete_paths)
+                    })
+                    .await?;
+                assessed_inputs = Some(diagnostics.clone());
+                let (selected, outcomes) = select_delivery_payload(
+                    &source.files,
+                    &consumed_archive_paths,
+                    &verified_payload_paths,
+                    &terminal_unusable_archive_paths,
+                    &diagnostics,
+                );
+                if selected.is_empty() && recovery_reason(&outcomes).is_none() {
+                    outcome = PpFinal::UnpackFailure;
+                    unusable_source_reason = Some("no publishable payload or verified recovery path remains after bounded assessment".to_string());
+                }
+            }
+        }
+    }
     // ---- disposition of a terminal failure ---------------------------------
     // A failed job's bytes are known-bad, and until this existed nothing
     // ever removed them: the directory stayed in the very tree the
@@ -3922,7 +4122,21 @@ async fn process_job_ctx_from_inner(
         let inventory = engine.artifacts();
         match inventory.for_job(job_id.0).map_err(PostError::from)? {
             Some(source) => {
-                let mut diagnostics = assess_file_inputs(&job, &source, &verified_payload_paths)?;
+                let mut diagnostics = match &assessed_inputs {
+                    Some(diagnostics) => diagnostics.clone(),
+                    None => {
+                        let assessment_job = job.clone();
+                        let assessment_source = source.clone();
+                        let verified = verified_payload_paths.clone();
+                        crate::attempt::current()
+                            .expect("processing control")
+                            .blocking(move |control| {
+                                control.checkpoint()?;
+                                assess_file_inputs(&assessment_job, &assessment_source, &verified)
+                            })
+                            .await?
+                    }
+                };
                 for path in &password_required_archive_paths {
                     diagnostics.insert(path.clone(), FileAssessment::Repairable(
                         "archive requires a password; set *Unpack:Password and retry extraction".into(),
@@ -3935,7 +4149,20 @@ async fn process_job_ctx_from_inner(
                     &terminal_unusable_archive_paths,
                     &diagnostics,
                 );
-                (!selected.is_empty(), recovery_reason(&outcomes))
+                let recovery = recovery_reason(&outcomes);
+                let usable = !selected.is_empty() || recovery.is_some();
+                let mut reason=recovery.clone().unwrap_or_else(||if usable {"verified sibling payload remains available for publication".into()}else{"bounded post-failure assessment found no usable payload or repairable input".into()});
+                while reason.len() > 2048 {
+                    reason.pop();
+                }
+                inventory.set_failure_assessment(
+                    &source.id,
+                    &source.generation,
+                    if usable { "recoverable" } else { "unusable" },
+                    &reason,
+                )?;
+                assessed_inputs = Some(diagnostics);
+                (!selected.is_empty(), recovery)
             }
             None => (false, None),
         }
@@ -3995,6 +4222,9 @@ async fn process_job_ctx_from_inner(
         if outcome != PpFinal::Success && keep_at_disposition {
             fin.params
                 .push(("Failure:KeepOnFailure".into(), "true".into()));
+        }
+        if let Some(reason) = &unusable_source_reason {
+            fin.params.push(("Failure:Reason".into(), reason.clone()));
         }
         if let Some(reason) = &recoverable_source_reason {
             fin.params.push((
@@ -4101,7 +4331,10 @@ async fn process_job_ctx_from_inner(
                 let source = inventory
                     .refresh_for_delivery(job_id.0)
                     .map_err(PostError::from)?;
-                let mut diagnostics = assess_file_inputs(&job, &source, &verified_payload_paths)?;
+                let mut diagnostics = match &assessed_inputs {
+                    Some(diagnostics) => diagnostics.clone(),
+                    None => assess_file_inputs(&job, &source, &verified_payload_paths)?,
+                };
                 for path in &password_required_archive_paths {
                     diagnostics.insert(path.clone(), FileAssessment::Repairable(
                         "archive requires a password; set *Unpack:Password and retry extraction".into(),
@@ -4126,7 +4359,13 @@ async fn process_job_ctx_from_inner(
                 let target_root = configured_root
                     .cloned()
                     .unwrap_or_else(|| source.path.parent().unwrap_or(dest_dir).to_path_buf());
-                let target = target_root.join(format!("{sanitized}.runner-{}", source.generation));
+                let publication_name = if ctx.publish_history {
+                    sanitized.as_str()
+                } else {
+                    "private-payload"
+                };
+                let target =
+                    target_root.join(format!("{publication_name}.runner-{}", source.generation));
                 stages.enter(PostStage::Move).await;
                 if !(ctx.commit_ok)() {
                     return Err(PostError::Subprocess(
@@ -4148,11 +4387,12 @@ async fn process_job_ctx_from_inner(
                         PP_SELECTED_OUTCOME_PARAM,
                         outcome.as_str().into(),
                     );
-                    if !engine
-                        .import_job_if_present(marker)
-                        .await
-                        .map_err(|error| PostError::Subprocess(error.to_string()))?
-                    {
+                    let marker_commit = if ctx.publish_history {
+                        engine.import_job_if_present(marker).await
+                    } else {
+                        engine.import_worker_job_if_present(marker).await
+                    };
+                    if !marker_commit.map_err(|error| PostError::Subprocess(error.to_string()))? {
                         return Err(PostError::Subprocess(
                             "publication outcome was not committed".into(),
                         ));
@@ -4281,12 +4521,21 @@ async fn process_job_ctx_from_inner(
                     .iter()
                     .find(|(key, _)| key == "Failure:Reason" || key == "Failure:Files")
                     .map(|(_, value)| value.clone());
+                let timing_job = engine
+                    .export_job(job_id)
+                    .await
+                    .map_err(|error| {
+                        PostError::Subprocess(format!("publication timing snapshot: {error}"))
+                    })?
+                    .unwrap_or_else(|| job.clone());
+                let runner_stages = delivery_stage_snapshot(&inventory, &timing_job);
+                let lifecycle_timing = nzbd_engine::frozen_lifecycle_timing(&timing_job);
                 let delivery_inventory = inventory.clone();
                 let delivery = crate::attempt::current()
                     .expect("processing control")
                     .blocking(move |_| {
                         delivery_inventory
-                            .create_delivery_with_outcome_and_keep(
+                            .create_delivery_with_lifecycle_snapshot(
                                 job_id.0,
                                 true,
                                 request_token.as_deref(),
@@ -4294,6 +4543,8 @@ async fn process_job_ctx_from_inner(
                                 failure_stage.as_deref(),
                                 failure_cause.as_deref(),
                                 outcome != PpFinal::Success && job_keeps_failed_source(&job),
+                                runner_stages,
+                                lifecycle_timing,
                             )
                             .map_err(PostError::from)
                     })
@@ -4511,6 +4762,51 @@ fn select_delivery_payload(
             })
         })
         .collect();
+    let retained_payload_names: Vec<_> = files
+        .iter()
+        .filter_map(|entry| {
+            let path = Path::new(&entry.path);
+            let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+            let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
+            (payload_kind(&extension)
+                && !is_sample_or_proof(path, &stem)
+                && !verified_payload_paths.contains(&entry.path)
+                && !matches!(
+                    diagnostics.get(&entry.path),
+                    Some(FileAssessment::Incomplete(_) | FileAssessment::Corrupt(_))
+                ))
+            .then(|| {
+                (
+                    path.parent()
+                        .unwrap_or(Path::new(""))
+                        .to_string_lossy()
+                        .to_ascii_lowercase(),
+                    stem,
+                )
+            })
+        })
+        .collect();
+    let mut retained_payload_names = retained_payload_names;
+    for (name, assessment) in diagnostics {
+        let path = Path::new(name);
+        if matches!(assessment, FileAssessment::Repairable(_))
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| payload_kind(&extension.to_ascii_lowercase()))
+        {
+            retained_payload_names.push((
+                path.parent()
+                    .unwrap_or(Path::new(""))
+                    .to_string_lossy()
+                    .to_ascii_lowercase(),
+                path.file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_ascii_lowercase(),
+            ));
+        }
+    }
     let mut classifications = Vec::with_capacity(files.len());
 
     for entry in &files {
@@ -4570,7 +4866,19 @@ fn select_delivery_payload(
                 && payload_names
                     .iter()
                     .any(|(media_parent, _)| media_parent == &parent);
-            if paired || folder_art {
+            let retained_sibling =
+                retained_payload_names
+                    .iter()
+                    .any(|(media_parent, media_stem)| {
+                        media_parent == &parent
+                            && (sidecar_stem == *media_stem
+                                || sidecar_stem.starts_with(&format!("{media_stem}."))
+                                || is_cover_name(&lower))
+                    });
+            if retained_sibling {
+                classifications.push(("sidecar", "retained_processing",
+                    Some("sidecar belongs to a retained payload; resolve that sibling before source cleanup")));
+            } else if paired || folder_art {
                 selected.push((*entry).clone());
                 selected_paths.insert(entry.path.as_str());
                 classifications.push((
@@ -4773,6 +5081,12 @@ fn unpublishable_summary(outcomes: &[DeliveryFileOutcome]) -> String {
             matches!(
                 file.classification.as_str(),
                 "video" | "native_book" | "audio"
+            ) || matches!(
+                file.outcome.as_str(),
+                "unsupported_review"
+                    | "archive_review"
+                    | "unverified_review"
+                    | "retained_processing"
             )
         })
         .collect();
@@ -4833,7 +5147,14 @@ fn assess_file_inputs(
     verified_paths: &std::collections::HashSet<String>,
 ) -> Result<std::collections::HashMap<String, FileAssessment>, PostError> {
     let mut results = bounded_file_diagnostics(&source.path, &source.files, verified_paths)?;
-    for (path, reason) in par_repairable_paths(&source.path, &source.files)? {
+    for (path, reason) in par_repairable_evidence_with_partials(
+        &source.path,
+        &source.files,
+        &sealed_partial_paths(job, source),
+        &crate::attempt::checkpoint,
+    )?
+    .0
+    {
         results.insert(path, FileAssessment::Repairable(reason));
     }
     for file in &job.files {
@@ -4916,12 +5237,71 @@ fn assess_file_inputs(
             }
         }
     }
+    // Old-style continuation volumes cannot be extracted when the first
+    // volume is unfinished and no measured PAR path can restore it.
+    for file in &job.files {
+        let path = Path::new(&file.filename);
+        if !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("rar"))
+            || !(job.file_needs_repair(file.id)
+                || !file.finalized
+                || file
+                    .segments
+                    .iter()
+                    .any(|segment| !matches!(segment.state, nzbd_types::SegmentState::Done { .. })))
+            || matches!(
+                results.get(&file.filename),
+                Some(FileAssessment::Repairable(_))
+            )
+        {
+            continue;
+        }
+        for entry in &source.files {
+            let sibling = Path::new(&entry.path);
+            if sibling.parent() == path.parent()
+                && sibling.file_stem() == path.file_stem()
+                && sibling.extension().is_some_and(|extension| {
+                    let extension = extension.to_string_lossy().to_ascii_lowercase();
+                    extension.len() == 3
+                        && extension.starts_with('r')
+                        && extension[1..].bytes().all(|byte| byte.is_ascii_digit())
+                })
+                && !matches!(
+                    results.get(&entry.path),
+                    Some(FileAssessment::Repairable(_))
+                )
+            {
+                results.insert(entry.path.clone(), FileAssessment::Incomplete(
+                    "archive first volume is incomplete and no measured PAR repair path remains; acquire a complete release".into(),
+                ));
+            }
+        }
+    }
     Ok(results)
+}
+
+/// Only exact job IDs and safe NZB names may map a sealed writer file to a
+/// catalog member. Never infer this mapping from an arbitrary .part suffix.
+fn sealed_partial_paths(job: &Job, source: &Artifact) -> HashMap<String, String> {
+    job.files
+        .iter()
+        .filter_map(|file| {
+            let relative = crate::namespace::relative(&file.filename).ok()?;
+            let partial = format!(".runner-file-{}.part", file.id.0);
+            source
+                .files
+                .iter()
+                .any(|entry| !entry.identity.directory && entry.path == partial)
+                .then(|| (relative.to_string_lossy().into_owned(), partial))
+        })
+        .collect()
 }
 
 /// Count the actual damaged slices of each PAR set. A recovery volume's
 /// presence alone is not repair evidence: the distinct block count must
 /// cover every missing or corrupt slice in the same set.
+#[cfg(test)]
 fn par_repairable_paths(
     root: &Path,
     entries: &[FileEntry],
@@ -4929,6 +5309,7 @@ fn par_repairable_paths(
     Ok(par_repairable_evidence(root, entries)?.0)
 }
 
+#[cfg(test)]
 fn par_repairable_evidence(
     root: &Path,
     entries: &[FileEntry],
@@ -4942,6 +5323,7 @@ fn par_repairable_evidence(
     par_repairable_evidence_checked(root, entries, &crate::attempt::checkpoint)
 }
 
+#[cfg(test)]
 fn par_repairable_evidence_checked(
     root: &Path,
     entries: &[FileEntry],
@@ -4953,6 +5335,15 @@ fn par_repairable_evidence_checked(
     ),
     PostError,
 > {
+    par_repairable_evidence_with_partials(root, entries, &HashMap::new(), checkpoint)
+}
+
+fn par_repairable_evidence_with_partials(
+    root: &Path,
+    entries: &[FileEntry],
+    partials: &HashMap<String, String>,
+    checkpoint: &dyn Fn() -> std::io::Result<()>,
+) -> Result<(HashMap<String, String>, Vec<par2::Par2Set>), PostError> {
     let mut repairable = std::collections::HashMap::new();
     let mut repair_sets = Vec::new();
     let (sets, rejected_par_inputs) = par2::load_recovery_sets_checked(root, checkpoint)?;
@@ -4982,9 +5373,23 @@ fn par_repairable_evidence_checked(
             };
             let source_relative = source_relative.to_string_lossy().into_owned();
             members.push(source_relative.clone());
+            let actual_relative = if entries
+                .iter()
+                .any(|entry| !entry.identity.directory && entry.path == source_relative)
+            {
+                source_relative.as_str()
+            } else {
+                partials
+                    .get(&source_relative)
+                    .map_or(source_relative.as_str(), String::as_str)
+            };
+            // Every measured member is a dependency, including intact sealed
+            // aliases needed to repair a different damaged catalog member.
+            members.push(actual_relative.to_string());
             let entry = entries
                 .iter()
-                .find(|entry| !entry.identity.directory && entry.path == source_relative);
+                .find(|entry| !entry.identity.directory && entry.path == actual_relative);
+            let absolute = root.join(actual_relative);
             let slices = descriptor.length.div_ceil(set.slice_size);
             if descriptor.slice_crcs.len() as u64 != slices {
                 assessable = false;
@@ -5183,7 +5588,8 @@ fn bounded_file_diagnostics_with_limit(
             (Some(_), false) => FileAssessment::Incomplete(
                 "recognized signature alone cannot repair an incomplete file; no complete NZB/CRC or transform proof".into(),
             ),
-            (None, _) => FileAssessment::NoSignature,
+            (None,true)=>FileAssessment::Recognized("completed NZB/CRC file has no supported format signature; review its intended content and choose a supported publication format".into()),
+            (None,false)=>FileAssessment::NoSignature,
         };
         results.insert(entry.path.clone(), result);
     }
@@ -5239,7 +5645,7 @@ fn verified_direct_payload_paths(
         .params
         .iter()
         .filter(|(key, _)| key.starts_with("*File:repair:"))
-        .map(|(key, _)| key.as_str())
+        .filter_map(|(key, _)| key.strip_prefix("*File:repair:")?.parse::<u32>().ok())
         .collect::<std::collections::HashSet<_>>();
     for file in &job.files {
         if !file.finalized
@@ -5248,9 +5654,7 @@ fn verified_direct_payload_paths(
                 .segments
                 .iter()
                 .all(|segment| matches!(segment.state, nzbd_types::SegmentState::Done { .. }))
-            || repair_markers
-                .iter()
-                .any(|marker| marker.ends_with(&file.id.0.to_string()))
+            || repair_markers.contains(&file.id.0)
         {
             continue;
         }
@@ -5358,7 +5762,7 @@ fn payload_classification(extension: &str) -> &'static str {
 }
 fn is_sample_or_proof(path: &Path, stem: &str) -> bool {
     let token = |s: &str| {
-        ["sample", "proof"].iter().any(|word| {
+        ["sample"].iter().any(|word| {
             s.eq_ignore_ascii_case(word)
                 || [".", "-", "_"].iter().any(|separator| {
                     s.to_ascii_lowercase()
@@ -5371,6 +5775,8 @@ fn is_sample_or_proof(path: &Path, stem: &str) -> bool {
             name.eq_ignore_ascii_case("sample") || name.eq_ignore_ascii_case("proof")
         })
     }) || token(stem)
+        || stem.to_ascii_lowercase().ends_with("[proof]")
+        || stem.to_ascii_lowercase().ends_with("(proof)")
 }
 fn is_cover_name(name: &str) -> bool {
     matches!(
@@ -5407,9 +5813,8 @@ fn is_incidental_extension(extension: &str) -> bool {
         "par2" | "nzb" | "sfv" | "srr" | "tmp" | "temp" | "part" | "!ut" | "crdownload"
     )
 }
-fn is_disposable_name(name: &str) -> bool {
+pub(crate) fn is_disposable_name(name: &str) -> bool {
     name.starts_with("sample.")
-        || name.starts_with("proof.")
         || matches!(
             name,
             "readme" | "readme.txt" | "info.txt" | "thumbs.db" | ".ds_store"
@@ -6445,7 +6850,9 @@ mod decision_tests {
             .unwrap();
         let good = b"complete episode";
         std::fs::write(source.join("episode-01.mkv"), good).unwrap();
-        std::fs::write(source.join("episode-02.rar"), b"Rar!\x1a\x07partial").unwrap();
+        std::fs::write(source.join(".runner-file-2.part"), b"Rar!\x1a\x07partial").unwrap();
+        let continuation = b"Rar!\x1a\x07complete continuation";
+        std::fs::write(source.join("episode-02.r00"), continuation).unwrap();
         inventory.finish(41, &source, &root, "active").unwrap();
         let mut good_file = file(1, "episode-01.mkv", Some(crc32fast::hash(good)));
         good_file.segments = vec![Segment {
@@ -6465,8 +6872,19 @@ mod decision_tests {
             size: 20,
             state: SegmentState::Failed,
         }];
+        let mut continuation_file = file(3, "episode-02.r00", Some(crc32fast::hash(continuation)));
+        continuation_file.segments = vec![Segment {
+            message_id: "continuation".into(),
+            number: 1,
+            size: continuation.len() as u32,
+            state: SegmentState::Done {
+                offset: 0,
+                len: continuation.len() as u32,
+                crc: crc32fast::hash(continuation),
+            },
+        }];
         let mut request = job(
-            vec![good_file, bad_file],
+            vec![good_file, bad_file, continuation_file],
             vec![("monarr-transfer".into(), "failed-pack-token".into())],
         );
         request.delivery_lifecycle = true;
@@ -6491,11 +6909,19 @@ mod decision_tests {
         assert_eq!(
             outcomes
                 .iter()
-                .find(|row| row.source_path == "episode-02.rar")
+                .find(|row| row.source_path == "episode-02.r00")
                 .unwrap()
                 .outcome,
             "excluded_source_cleanup"
         );
+        assert!(outcomes
+            .iter()
+            .find(|row| row.source_path == "episode-02.r00")
+            .unwrap()
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("first volume is incomplete"));
         inventory
             .retire_delivery_source(&delivery.delivery_id)
             .unwrap();
@@ -6938,6 +7364,12 @@ mod decision_tests {
             .unwrap();
         damaged.write_all(b"x").unwrap();
         damaged.sync_all().unwrap();
+        drop(damaged);
+        std::fs::rename(
+            source.join("episode-02.mkv"),
+            source.join(".runner-file-2.part"),
+        )
+        .unwrap();
         inventory.finish(41, &source, &downloads, "active").unwrap();
         let mut good_file = file(1, "episode-01.mkv", Some(crc32fast::hash(&good)));
         good_file.segments = vec![Segment {
@@ -6963,8 +7395,13 @@ mod decision_tests {
         );
         request.delivery_lifecycle = true;
         let source_files = inventory.for_job(request.id.0).unwrap().unwrap().files;
-        let (repairable_paths, repair_sets) =
-            par_repairable_evidence(&source, &source_files).unwrap();
+        let (repairable_paths, repair_sets) = par_repairable_evidence_with_partials(
+            &source,
+            &source_files,
+            &sealed_partial_paths(&request, &inventory.for_job(41).unwrap().unwrap()),
+            &|| Ok(()),
+        )
+        .unwrap();
         assert_eq!(repair_sets.len(), 1, "expected one valid PAR set");
         assert_eq!(
             repair_sets[0].recovery_blocks, 1,
@@ -6974,29 +7411,53 @@ mod decision_tests {
             repairable_paths.contains_key("episode-02.mkv"),
             "fixture must measure the damaged source slice"
         );
-        let failures =
-            repair_failed_health_par_sets(&engine, &PostConfig::default(), &request, &None)
-                .await
-                .unwrap();
-        assert!(
-            failures.is_empty(),
-            "PAR salvage did not repair the measured set: {failures:?}"
+        let history = Arc::new(
+            HistoryDb::open(&temp.path().join("history.sqlite"), Some(temp.path())).unwrap(),
         );
-        assert_eq!(
-            std::fs::read(source.join("episode-02.mkv")).unwrap(),
-            damaged_original
-        );
-        let salvage = salvage_failed_delivery(
-            &inventory,
-            &request,
-            &temp.path().join("completed"),
-            "FAILURE/HEALTH",
-            "health",
-            "one failed segment covered by PAR",
-            &EarlyArchiveAssessment::default(),
+        request.status = JobStatus::Failed;
+        engine
+            .import_job(request.clone(), false, false)
+            .await
+            .unwrap();
+        handle_failed_job(
+            &engine,
+            &PostConfig {
+                completed_dir: Some(temp.path().join("completed")),
+                ..PostConfig::default()
+            },
+            &history,
+            &downloads,
+            &None,
+            request.id,
+            request.name.clone(),
+            100,
+            &mut HashMap::new(),
         )
-        .unwrap()
-        .expect("journaled repaired episode should publish");
+        .await;
+        let delivery = inventory
+            .delivery_for_job(41)
+            .unwrap()
+            .expect("manager must publish repair output");
+        let salvage = FailedSalvage {
+            published_path: PathBuf::from(&delivery.publication_path),
+            artifact_id: delivery.artifact_id.clone(),
+            generation: delivery.publication_generation.clone(),
+            source_artifact_id: delivery.source_artifact_id.clone(),
+            source_generation: delivery.source_generation.clone(),
+            delivery: Some(delivery),
+        };
+        assert_eq!(
+            history.get(request.id).unwrap().unwrap().status,
+            "FAILURE/HEALTH"
+        );
+        assert!(engine
+            .export_job(request.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .params
+            .iter()
+            .any(|(key, _)| key == PP_DONE_PARAM));
         assert!(salvage.published_path.join("episode-01.mkv").exists());
         assert_eq!(
             std::fs::read(salvage.published_path.join("episode-02.mkv")).unwrap(),
@@ -7031,6 +7492,8 @@ mod decision_tests {
         let damaged_original = vec![b'x'; 51_200];
         std::fs::write(source.join("episode-01.mkv"), &good).unwrap();
         std::fs::write(source.join("episode-02.mkv"), &damaged_original).unwrap();
+        let intact_partial = vec![b'z'; 60_000];
+        std::fs::write(source.join("episode-03.mkv"), &intact_partial).unwrap();
         assert!(std::process::Command::new("par2")
             .args([
                 "create",
@@ -7040,7 +7503,8 @@ mod decision_tests {
                 "-c1",
                 "set.par2",
                 "episode-01.mkv",
-                "episode-02.mkv"
+                "episode-02.mkv",
+                "episode-03.mkv"
             ])
             .current_dir(&source)
             .status()
@@ -7052,6 +7516,23 @@ mod decision_tests {
             .unwrap();
         damaged.write_all(b"y").unwrap();
         damaged.sync_all().unwrap();
+        drop(damaged);
+        std::fs::rename(
+            source.join("episode-02.mkv"),
+            source.join(".runner-file-2.part"),
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("episode-02.en.srt"),
+            b"subtitle for retained episode",
+        )
+        .unwrap();
+        std::fs::write(source.join("readme.txt"), b"junk").unwrap();
+        std::fs::rename(
+            source.join("episode-03.mkv"),
+            source.join(".runner-file-3.part"),
+        )
+        .unwrap();
         inventory.finish(41, &source, &downloads, "active").unwrap();
         let mut good_file = file(1, "episode-01.mkv", Some(crc32fast::hash(&good)));
         good_file.segments = vec![Segment {
@@ -7071,8 +7552,15 @@ mod decision_tests {
             size: damaged_original.len() as u32,
             state: SegmentState::Failed,
         }];
+        let mut intact_file = file(3, "episode-03.mkv", None);
+        intact_file.segments = vec![Segment {
+            message_id: "failed-but-intact-bytes".into(),
+            number: 1,
+            size: intact_partial.len() as u32,
+            state: SegmentState::Failed,
+        }];
         let mut request = job(
-            vec![good_file, bad_file],
+            vec![good_file, bad_file, intact_file],
             vec![("monarr-transfer".into(), "mixed-token".into())],
         );
         request.delivery_lifecycle = true;
@@ -7130,7 +7618,7 @@ mod decision_tests {
         assert!(
             outcomes
                 .iter()
-                .find(|outcome| outcome.source_path == "episode-02.mkv")
+                .find(|outcome| outcome.source_path == ".runner-file-2.part")
                 .unwrap()
                 .repair_dependency
         );
@@ -7144,7 +7632,7 @@ mod decision_tests {
         assert_eq!(
             outcomes
                 .iter()
-                .find(|outcome| outcome.source_path == "episode-02.mkv")
+                .find(|outcome| outcome.source_path == ".runner-file-2.part")
                 .unwrap()
                 .outcome,
             "retained_processing"
@@ -7154,11 +7642,27 @@ mod decision_tests {
             .unwrap();
         assert_ne!(cleanup.source_cleanup.status, "succeeded");
         assert!(source.join("episode-01.mkv").exists());
-        assert!(source.join("episode-02.mkv").exists());
+        assert!(source.join(".runner-file-2.part").exists());
+        assert_eq!(
+            std::fs::read(source.join(".runner-file-3.part")).unwrap(),
+            intact_partial
+        );
+        assert!(outcomes
+            .iter()
+            .any(|outcome| outcome.source_path == ".runner-file-3.part"
+                && outcome.outcome == "retained_processing"
+                && outcome.repair_dependency));
         assert!(source.join("set.par2").exists());
+        assert!(source.join("episode-02.en.srt").exists());
+        assert!(!source.join("readme.txt").exists());
         std::fs::remove_dir_all(&salvage.published_path).unwrap();
         let verify = std::process::Command::new("par2")
-            .args(["verify", "set.par2"])
+            .args([
+                "verify",
+                "set.par2",
+                ".runner-file-2.part",
+                ".runner-file-3.part",
+            ])
             .current_dir(&source)
             .output()
             .unwrap();
@@ -7251,6 +7755,34 @@ mod decision_tests {
             torrent: None,
             stages: Vec::new(),
         }
+    }
+
+    #[test]
+    fn historical_post_spans_do_not_acquire_a_current_process_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state");
+        let inventory = nzbd_state::artifacts::Inventory::open(&path).unwrap();
+        let mut row = job(Vec::new(), Vec::new());
+        row.stages = vec![
+            nzbd_types::StageSpan {
+                stage: nzbd_types::PostStage::ParVerify,
+                started_at_unix: 100,
+                ms: Some(17),
+            },
+            nzbd_types::StageSpan {
+                stage: nzbd_types::PostStage::Move,
+                started_at_unix: 200,
+                ms: None,
+            },
+        ];
+        let first = delivery_stage_snapshot(&inventory, &row).unwrap();
+        drop(inventory);
+        let restarted = nzbd_state::artifacts::Inventory::open(&path).unwrap();
+        let replay = delivery_stage_snapshot(&restarted, &row).unwrap();
+        assert_eq!(first, replay);
+        assert_eq!(replay.node_id, "unrecorded");
+        assert_eq!(replay.clock_domain, "unrecorded");
+        assert_eq!(replay.spans, row.stages);
     }
 
     #[tokio::test]
@@ -8768,5 +9300,416 @@ mod decision_tests {
             );
         }
         engine.shutdown().await;
+    }
+    #[tokio::test]
+    async fn deleted_failed_source_replays_terminal_history_without_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let downloads = temp.path().join("downloads");
+        let config = nzbd_engine::EngineConfig::single_node(
+            Vec::new(),
+            temp.path().join("queue"),
+            downloads.clone(),
+            nzbd_engine::Tuning::default(),
+            None,
+        );
+        let engine = nzbd_engine::Engine::spawn(config).await.unwrap();
+        let history = Arc::new(
+            HistoryDb::open(&temp.path().join("history.sqlite"), Some(temp.path())).unwrap(),
+        );
+        let mut request = job(vec![file(1, "missing.mkv", None)], vec![]);
+        request.status = JobStatus::Failed;
+        request.delivery_lifecycle = true;
+        let source = downloads.join(nzbd_engine::queue::job_dir_name(&request));
+        let inventory = engine.artifacts();
+        inventory
+            .allocate_for_delivery(41, &downloads, &source, true, true)
+            .unwrap();
+        std::fs::write(source.join(".runner-file-1.part"), b"unrecoverable").unwrap();
+        inventory.finish(41, &source, &downloads, "active").unwrap();
+        engine
+            .import_job(request.clone(), false, false)
+            .await
+            .unwrap();
+        let cfg = PostConfig {
+            failure_action: FailureAction::Delete,
+            ..PostConfig::default()
+        };
+        assert_eq!(
+            dispose_failed(
+                inventory.clone(),
+                &cfg,
+                request.id,
+                &source,
+                &downloads,
+                "job",
+                "local"
+            )
+            .await
+            .note,
+            "deleted"
+        );
+        // Exact crash boundary: deletion committed, neither history nor PP_DONE.
+        handle_failed_job(
+            &engine,
+            &cfg,
+            &history,
+            &downloads,
+            &None,
+            request.id,
+            request.name.clone(),
+            0,
+            &mut HashMap::new(),
+        )
+        .await;
+        let row = engine.export_job(request.id).await.unwrap().unwrap();
+        assert!(pp_done(&row));
+        let entry = history.get(request.id).unwrap().unwrap();
+        assert!(entry.final_dir.is_none());
+        assert!(entry
+            .params
+            .iter()
+            .any(|(key, value)| key == "Failure:Files" && value == "deleted"));
+        assert!(!source.exists());
+        engine.shutdown().await;
+    }
+
+    #[test]
+    fn ordinary_proof_titles_remain_payloads() {
+        for name in ["Burden.of.Proof.mkv", "Living_Proof.flac", "Proof.epub"] {
+            let path = Path::new(name);
+            assert!(!is_sample_or_proof(
+                path,
+                path.file_stem().unwrap().to_str().unwrap()
+            ));
+            assert!(!is_disposable_name(&name.to_ascii_lowercase()));
+        }
+        assert!(is_sample_or_proof(
+            Path::new("release.[proof].mkv"),
+            "release.[proof]"
+        ));
+    }
+
+    #[test]
+    fn repair_markers_match_exact_file_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let inventory = nzbd_state::artifacts::Inventory::open(&temp.path().join("state")).unwrap();
+        let root = temp.path().join("downloads");
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("job");
+        inventory
+            .allocate_for_delivery(41, &root, &source, true, true)
+            .unwrap();
+        let bytes = b"verified file";
+        std::fs::write(source.join("episode.mkv"), bytes).unwrap();
+        let source = inventory.finish(41, &source, &root, "active").unwrap();
+        let mut media = file(1, "episode.mkv", Some(crc32fast::hash(bytes)));
+        media.segments = vec![Segment {
+            message_id: "one".into(),
+            number: 1,
+            size: bytes.len() as u32,
+            state: SegmentState::Done {
+                offset: 0,
+                len: bytes.len() as u32,
+                crc: crc32fast::hash(bytes),
+            },
+        }];
+        let mut request = job(vec![media], vec![("*File:repair:11".into(), "1".into())]);
+        assert!(
+            verified_direct_payload_paths(&request, &source, &Default::default(), || Ok(()))
+                .unwrap()
+                .contains("episode.mkv")
+        );
+        request.params.push(("*File:repair:1".into(), "1".into()));
+        assert!(
+            verified_direct_payload_paths(&request, &source, &Default::default(), || Ok(()))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_book_containers_publish_without_rename_or_extraction() {
+        let temp = tempfile::tempdir().unwrap();
+        let downloads = temp.path().join("downloads");
+        let completed = temp.path().join("completed");
+        let config = nzbd_engine::EngineConfig::single_node(
+            Vec::new(),
+            temp.path().join("queue"),
+            downloads.clone(),
+            nzbd_engine::Tuning::default(),
+            None,
+        );
+        let engine = nzbd_engine::Engine::spawn(config).await.unwrap();
+        let history = Arc::new(
+            HistoryDb::open(&temp.path().join("history.sqlite"), Some(temp.path())).unwrap(),
+        );
+        let payloads: [(&str, &[u8]); 3] = [
+            ("Proof.epub", b"PK\x03\x04native epub bytes"),
+            ("comic.cbz", b"PK\x03\x04native cbz bytes"),
+            ("comic.cbr", b"Rar!\x1a\x07\x00native cbr bytes"),
+        ];
+        let mut files: Vec<_> = payloads
+            .iter()
+            .enumerate()
+            .map(|(index, (name, bytes))| {
+                let mut media = file(index as u32 + 1, name, Some(crc32fast::hash(bytes)));
+                media.segments = vec![Segment {
+                    message_id: format!("book-{index}").into(),
+                    number: 1,
+                    size: bytes.len() as u32,
+                    state: SegmentState::Done {
+                        offset: 0,
+                        len: bytes.len() as u32,
+                        crc: crc32fast::hash(bytes),
+                    },
+                }];
+                media
+            })
+            .collect();
+        let opaque = b"\x1a\x45\xdf\xa3recognized complete container";
+        let mut unknown = file(4, "opaque-media", Some(crc32fast::hash(opaque)));
+        unknown.segments = vec![Segment {
+            message_id: "opaque".into(),
+            number: 1,
+            size: opaque.len() as u32,
+            state: SegmentState::Done {
+                offset: 0,
+                len: opaque.len() as u32,
+                crc: crc32fast::hash(opaque),
+            },
+        }];
+        files.push(unknown);
+        let mut request = job(files, vec![("monarr-transfer".into(), "books".into())]);
+        request.delivery_lifecycle = true;
+        request.status = JobStatus::PostQueued;
+        let source = downloads.join(nzbd_engine::queue::job_dir_name(&request));
+        let inventory = engine.artifacts();
+        inventory
+            .allocate_for_delivery(41, &downloads, &source, true, true)
+            .unwrap();
+        engine.import_job(request, false, false).await.unwrap();
+        for (name, bytes) in payloads {
+            std::fs::write(source.join(name), bytes).unwrap();
+        }
+        std::fs::write(source.join("readme.txt"), b"junk").unwrap();
+        std::fs::write(source.join("unmatched.srt"), b"unmatched subtitle").unwrap();
+        std::fs::write(
+            source.join("opaque-media"),
+            b"\x1a\x45\xdf\xa3recognized complete container",
+        )
+        .unwrap();
+        inventory.finish(41, &source, &downloads, "active").unwrap();
+        let cfg = PostConfig {
+            completed_dir: Some(completed),
+            deobfuscate_final: false,
+            cleanup: false,
+            unrar_cmd: "missing-extractor-must-not-run".into(),
+            sevenzip_cmd: "missing-extractor-must-not-run".into(),
+            ..PostConfig::default()
+        };
+        assert_eq!(
+            process_job_ctx(
+                &engine,
+                &cfg,
+                &history,
+                &downloads,
+                JobId(41),
+                &PpCtx::default()
+            )
+            .await
+            .unwrap(),
+            PpFinal::Success
+        );
+        let delivery = inventory.delivery_for_job(41).unwrap().unwrap();
+        assert_eq!(delivery.files.len(), 3);
+        for (name, bytes) in payloads {
+            assert_eq!(
+                std::fs::read(Path::new(&delivery.publication_path).join(name)).unwrap(),
+                bytes
+            );
+            assert!(delivery.files.iter().any(|entry| entry.path == name));
+        }
+        let outcomes = inventory
+            .delivery_file_outcomes(&delivery.artifact_id, &delivery.publication_generation)
+            .unwrap();
+        assert!(outcomes
+            .iter()
+            .any(|entry| entry.source_path == "opaque-media"
+                && entry.outcome == "unsupported_review"
+                && entry
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("rename"))));
+        inventory
+            .retire_delivery_source(&delivery.delivery_id)
+            .unwrap();
+        assert!(source.join("opaque-media").exists());
+        assert!(!source.join("readme.txt").exists());
+        assert!(!source.join("unmatched.srt").exists());
+        engine.shutdown().await;
+    }
+    #[tokio::test]
+    async fn completed_junk_only_attempt_drains_owned_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let downloads = temp.path().join("downloads");
+        let config = nzbd_engine::EngineConfig::single_node(
+            Vec::new(),
+            temp.path().join("queue"),
+            downloads.clone(),
+            nzbd_engine::Tuning::default(),
+            None,
+        );
+        let engine = nzbd_engine::Engine::spawn(config).await.unwrap();
+        let history = Arc::new(
+            HistoryDb::open(&temp.path().join("history.sqlite"), Some(temp.path())).unwrap(),
+        );
+        let mut request = job(vec![], vec![]);
+        request.delivery_lifecycle = true;
+        request.status = JobStatus::PostQueued;
+        let source = downloads.join(nzbd_engine::queue::job_dir_name(&request));
+        let inventory = engine.artifacts();
+        inventory
+            .allocate_for_delivery(41, &downloads, &source, true, true)
+            .unwrap();
+        engine.import_job(request, false, false).await.unwrap();
+        std::fs::write(source.join("readme.txt"), b"junk").unwrap();
+        std::fs::write(source.join("orphan.srt"), b"unmatched sidecar").unwrap();
+        inventory.finish(41, &source, &downloads, "active").unwrap();
+        let cfg = PostConfig {
+            deobfuscate_final: true,
+            cleanup: false,
+            ..PostConfig::default()
+        };
+        assert_eq!(
+            process_job_ctx(
+                &engine,
+                &cfg,
+                &history,
+                &downloads,
+                JobId(41),
+                &PpCtx::default()
+            )
+            .await
+            .unwrap(),
+            PpFinal::UnpackFailure
+        );
+        assert!(!source.exists());
+        assert_eq!(inventory.for_job(41).unwrap().unwrap().state, "deleted");
+        let entry = history.get(JobId(41)).unwrap().unwrap();
+        assert!(entry.final_dir.is_none());
+        assert!(entry.params.iter().any(
+            |(key, value)| key == "Failure:Reason" && value.contains("no publishable payload")
+        ));
+        engine.shutdown().await;
+    }
+    #[tokio::test]
+    async fn recoverable_post_schedule_preserves_deadlines_first_block_and_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = || {
+            nzbd_engine::EngineConfig::single_node(
+                Vec::new(),
+                temp.path().join("queue"),
+                temp.path().join("downloads"),
+                nzbd_engine::Tuning::default(),
+                None,
+            )
+        };
+        let engine = nzbd_engine::Engine::spawn(config()).await.unwrap();
+        let first_block = now() - 1801;
+        let deadline = now() + 900;
+        for (index, cause) in ["storage_unavailable", "missing_tool", "capacity", "quota"]
+            .iter()
+            .enumerate()
+        {
+            let mut request = job(vec![], vec![]);
+            request.id = JobId(41 + index as u32);
+            request.delivery_lifecycle = true;
+            request.status = JobStatus::Paused;
+            request.set_control(&nzbd_types::JobControl {
+                version: 1,
+                revision: "1".into(),
+                lifecycle: "held".into(),
+                cause: (*cause).into(),
+                stage: "move".into(),
+                retry_policy: "review".into(),
+                message: "temporarily blocked".into(),
+                instance: "retry-test".into(),
+                previous_status: Some(JobStatus::PostQueued),
+                manual_pause: false,
+                retry_attempt: 0,
+                next_retry_at_unix: Some(deadline),
+                blocked_since_unix: Some(first_block),
+                released_at_unix: None,
+            });
+            engine
+                .import_job(request.clone(), false, false)
+                .await
+                .unwrap();
+            schedule_recoverable_post_retry(&engine, request.id).await;
+            let scheduled = engine
+                .export_job(request.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .control()
+                .unwrap();
+            assert_eq!(scheduled.cause, *cause);
+            assert_eq!(scheduled.revision, "2");
+            assert_eq!(
+                scheduled.next_retry_at_unix,
+                Some(deadline),
+                "an existing deadline cannot be shortened"
+            );
+            assert_eq!(scheduled.blocked_since_unix, Some(first_block));
+            assert_eq!(scheduled.retry_policy, "scheduled_retry");
+            assert!(scheduled
+                .message
+                .contains("warning: blocked for at least 30 minutes"));
+        }
+        let expected = engine
+            .export_job(JobId(44))
+            .await
+            .unwrap()
+            .unwrap()
+            .control()
+            .unwrap();
+        let mut paused = job(vec![], vec![]);
+        paused.id = JobId(45);
+        paused.delivery_lifecycle = true;
+        paused.status = JobStatus::Paused;
+        let mut manual = expected.clone();
+        manual.manual_pause = true;
+        paused.set_control(&manual);
+        engine.import_job(paused, false, false).await.unwrap();
+        schedule_recoverable_post_retry(&engine, JobId(45)).await;
+        assert_eq!(
+            engine
+                .export_job(JobId(45))
+                .await
+                .unwrap()
+                .unwrap()
+                .control()
+                .unwrap(),
+            manual
+        );
+        engine.shutdown().await;
+        let reopened = nzbd_engine::Engine::spawn(config()).await.unwrap();
+        let control = reopened
+            .export_job(JobId(44))
+            .await
+            .unwrap()
+            .unwrap()
+            .control()
+            .unwrap();
+        assert_eq!(control.next_retry_at_unix, expected.next_retry_at_unix);
+        assert_eq!(control.blocked_since_unix, expected.blocked_since_unix);
+        assert_eq!(control.retry_attempt, expected.retry_attempt);
+        reopened.shutdown().await;
+        for base in [30, 60, 120, 300] {
+            for attempt in 0..100 {
+                let delay = retry_delay_with_jitter(base, JobId(attempt), attempt);
+                assert!((base..=base + base / 10).contains(&delay));
+            }
+        }
     }
 }

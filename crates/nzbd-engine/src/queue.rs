@@ -230,31 +230,35 @@ impl QueueState {
                     .iter()
                     .any(|(key, value)| key == "monarr-transfer" && value == &receipt.request_token)
             }) {
-                receipt.outcome = match job.status {
-                    JobStatus::Fetching => "fetching",
-                    JobStatus::Queued => "queued",
-                    JobStatus::Downloading => "downloading",
-                    JobStatus::Paused => "paused",
-                    JobStatus::PostQueued => "post_queued",
-                    JobStatus::Post { .. } => "post_processing",
-                    JobStatus::Completed => "completed",
-                    JobStatus::Failed => "failed",
-                    JobStatus::Deleted => "deleted",
+                if receipt.custody_state != "curator" {
+                    receipt.outcome = match job.status {
+                        JobStatus::Fetching => "fetching",
+                        JobStatus::Queued => "queued",
+                        JobStatus::Downloading => "downloading",
+                        JobStatus::Paused => "paused",
+                        JobStatus::PostQueued => "post_queued",
+                        JobStatus::Post { .. } => "post_processing",
+                        JobStatus::Completed => "completed",
+                        JobStatus::Failed => "failed",
+                        JobStatus::Deleted => "deleted",
+                    }
+                    .to_string();
                 }
-                .to_string();
                 let param = |name: &str| {
                     job.params
                         .iter()
                         .find(|(key, _)| key == name)
                         .map(|(_, value)| value.clone())
                 };
-                if let Some(stage) = param("Failure:Stage") {
-                    receipt.failure_stage = Some(stage);
+                if receipt.custody_state != "curator" {
+                    if let Some(stage) = param("Failure:Stage") {
+                        receipt.failure_stage = Some(stage);
+                    }
+                    receipt.failure_cause = param("Failure:Reason")
+                        .or_else(|| param("*Failure:Reason"))
+                        .or_else(|| param("Failure:Files"));
+                    receipt.terminal_outcome = param(nzbd_types::PP_DONE_PARAM);
                 }
-                receipt.failure_cause = param("Failure:Reason")
-                    .or_else(|| param("*Failure:Reason"))
-                    .or_else(|| param("Failure:Files"));
-                receipt.terminal_outcome = param(nzbd_types::PP_DONE_PARAM);
                 // Once source custody is pinned to an artifact generation,
                 // its live preference is authoritative. Queue params are only
                 // a fallback before that durable relation exists.
@@ -262,14 +266,20 @@ impl QueueState {
                     receipt.keep_source_on_failure = param("Failure:KeepOnFailure")
                         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
                 }
-                receipt.source_cleanup_status = param("Delivery:SourceCleanup");
+                if let Some(status) = param("Delivery:SourceCleanup") {
+                    receipt.source_cleanup_status = Some(status);
+                }
                 if let Some(custody) =
                     param("Delivery:Custody").or_else(|| param("Artifact:Custody"))
                 {
-                    receipt.custody_state = custody;
+                    if receipt.custody_state != "curator" {
+                        receipt.custody_state = custody;
+                    }
                 }
-                receipt.publication_path =
-                    param("Delivery:Path").or_else(|| param("*Cluster:final-dir"));
+                if receipt.custody_state != "curator" {
+                    receipt.publication_path =
+                        param("Delivery:Path").or_else(|| param("*Cluster:final-dir"));
+                }
                 let nonempty = |value: Option<String>| value.filter(|value| !value.is_empty());
                 let delivery_source = (
                     nonempty(param("Delivery:SourceArtifactId")),
@@ -290,7 +300,9 @@ impl QueueState {
                     // both fields arrive; do not fall back to Artifact data.
                     _ => None,
                 };
-                if let Some((source_id, source_generation)) = source {
+                if let Some((source_id, source_generation)) =
+                    source.filter(|_| receipt.custody_state != "curator")
+                {
                     receipt.source_artifact_id = Some(source_id);
                     receipt.source_generation = Some(source_generation);
                 }
@@ -373,13 +385,6 @@ impl QueueState {
                 && !matches!(job.status, JobStatus::Failed | JobStatus::Deleted)
         }) {
             let existing_id = self.jobs[position].id;
-            let existing = &mut self.jobs[position];
-            for (key, value) in params {
-                match existing.params.iter_mut().find(|(k, _)| *k == key) {
-                    Some(slot) => slot.1 = value,
-                    None => existing.params.push((key, value)),
-                }
-            }
             self.cancel_torrent_admission(id);
             return Some(Err(existing_id));
         }
@@ -417,6 +422,315 @@ impl QueueState {
             stages: Vec::new(),
         });
         Some(Ok(id))
+    }
+
+    pub(crate) fn reserve_managed_torrent_admission(
+        &mut self,
+        source: TorrentSource,
+        submission_sha256: String,
+        opts: AddOpts,
+        defaults: crate::torrent_acquisitions::ManagedTorrentDefaults,
+        instance: &str,
+        storage_instance: &str,
+    ) -> Result<crate::torrent_acquisitions::ManagedTorrentReservation, crate::EngineError> {
+        use crate::torrent_acquisitions::*;
+        let token = managed_token(&opts.params)?
+            .ok_or_else(|| {
+                crate::EngineError::RequestConflict(
+                    "managed admission has no Delivery token".into(),
+                )
+            })?
+            .to_string();
+        if let Some(receipt) = self
+            .url_admission_receipts
+            .iter()
+            .find(|receipt| receipt.request_token == token)
+        {
+            if receipt.submission_sha256 != submission_sha256 {
+                return Err(crate::EngineError::RequestConflict(
+                    "transfer token was already used for a different submission".into(),
+                ));
+            }
+            let id = JobId(receipt.job_id);
+            let pending = self
+                .pending_admissions
+                .iter()
+                .any(|pending| pending.job_id == id);
+            return Ok(ManagedTorrentReservation {
+                id,
+                created: false,
+                pending,
+                source_ready: self.job(id).is_some_and(|job| {
+                    job.params
+                        .iter()
+                        .any(|(key, value)| key == SOURCE_READY_PARAM && value == "1")
+                }),
+            });
+        }
+        self.next_job_id.checked_add(1).ok_or_else(|| {
+            crate::EngineError::RequestConflict("job identifiers exhausted".into())
+        })?;
+        let encoded_defaults = serde_json::to_string(&defaults)
+            .map_err(|_| crate::EngineError::RequestConflict("invalid torrent defaults".into()))?;
+        if encoded_defaults.len() > 32 * 1024 {
+            return Err(crate::EngineError::RequestConflict(
+                "torrent defaults exceed supported bound".into(),
+            ));
+        }
+        let category = defaults.category.clone();
+        let priority = opts.priority;
+        let paused = opts.paused;
+        let mut params = crate::with_client(opts.params.clone(), opts.client.clone());
+        let id = self.reserve_torrent_admission(source, opts);
+        params.push((DEFAULTS_PARAM.into(), encoded_defaults));
+        params.push((ACQUISITION_PARAM.into(), "1".into()));
+        params.push((SUBMISSION_PARAM.into(), submission_sha256.clone()));
+        params.push((SOURCE_READY_PARAM.into(), "0".into()));
+        params.push((
+            ADMISSION_GENERATION_PARAM.into(),
+            format!("{storage_instance}-torrent-{}", id.0),
+        ));
+        params.push((METADATA_ATTEMPT_PARAM.into(), "0".into()));
+        self.jobs.push(Job {
+            id,
+            kind: JobKind::Torrent,
+            name: "Torrent metadata pending".into(),
+            dir_name: format!("torrent-acquisition-{}", id.0),
+            name_provisional: true,
+            delivery_lifecycle: true,
+            queued_at_unix: unix_now(),
+            original_name: String::new(),
+            category,
+            priority,
+            dupe: DupeInfo::default(),
+            params,
+            files: Vec::new(),
+            totals: Default::default(),
+            status: if paused {
+                JobStatus::Paused
+            } else {
+                JobStatus::Fetching
+            },
+            torrent: None,
+            stages: Vec::new(),
+        });
+        self.url_admission_receipts.push(UrlAdmissionReceipt {
+            protocol_version: 1,
+            request_token: token,
+            submission_sha256,
+            job_id: id.0,
+            generation: format!("{instance}-torrent-{}", id.0),
+            runner_instance_id: instance.into(),
+            terminal_outcome: None,
+            outcome: "fetching".into(),
+            failure_stage: None,
+            failure_cause: None,
+            custody_state: "runner_owned".into(),
+            keep_source_on_failure: false,
+            source_cleanup_status: None,
+            publication_path: None,
+            source_artifact_id: None,
+            source_generation: None,
+        });
+        Ok(ManagedTorrentReservation {
+            id,
+            created: true,
+            pending: true,
+            source_ready: false,
+        })
+    }
+
+    pub(crate) fn commit_managed_torrent_admission(
+        &mut self,
+        id: JobId,
+        commit: TorrentAdmissionCommit,
+        submission_sha256: String,
+        descriptor: crate::torrent_acquisitions::NativeDescriptorRef,
+        _instance: &str,
+    ) -> Result<crate::torrent_acquisitions::ManagedTorrentAdmission, crate::EngineError> {
+        use crate::torrent_acquisitions::{
+            ManagedTorrentAdmission, DONOR_PARAM, INFO_HASH_PARAM, OWNED_SEED_PARAM,
+        };
+        let token = crate::torrent_acquisitions::managed_token(&commit.params)?
+            .ok_or_else(|| {
+                crate::EngineError::RequestConflict(
+                    "managed torrent request has no Delivery intent".into(),
+                )
+            })?
+            .to_string();
+        if let Some(receipt) = self
+            .url_admission_receipts
+            .iter()
+            .find(|receipt| receipt.request_token == token)
+        {
+            if receipt.submission_sha256 != submission_sha256 {
+                return Err(crate::EngineError::RequestConflict(
+                    "transfer token was already used for a different submission".into(),
+                ));
+            }
+            if receipt.job_id != id.0 {
+                return Err(crate::EngineError::RequestConflict(
+                    "native reservation identity changed".into(),
+                ));
+            }
+        } else {
+            return Err(crate::EngineError::RequestConflict(
+                "native reservation missing".into(),
+            ));
+        }
+        if !self
+            .pending_admissions
+            .iter()
+            .any(|pending| pending.job_id == id)
+        {
+            let donor_id = self
+                .job(id)
+                .and_then(crate::torrent_acquisitions::donor)
+                .ok_or_else(|| {
+                    crate::EngineError::RequestConflict(
+                        "native acquisition is terminal or retired".into(),
+                    )
+                })?;
+            return Ok(ManagedTorrentAdmission {
+                id,
+                donor_id,
+                created: false,
+                seed_created: false,
+            });
+        }
+        let original = self
+            .job(id)
+            .filter(|job| crate::torrent_acquisitions::is_acquisition(job))
+            .cloned()
+            .ok_or_else(|| {
+                crate::EngineError::RequestConflict("native acquisition disappeared".into())
+            })?;
+        if descriptor.job != id
+            || descriptor.queued_at_unix != original.queued_at_unix
+            || descriptor.generation
+                != original
+                    .params
+                    .iter()
+                    .find(|(key, _)| key == crate::torrent_acquisitions::ADMISSION_GENERATION_PARAM)
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default()
+            || descriptor.request_token != token
+            || descriptor.origin(&original).is_err()
+        {
+            return Err(crate::EngineError::RequestConflict(
+                "native descriptor reservation changed".into(),
+            ));
+        }
+        let TorrentAdmissionCommit {
+            name,
+            category,
+            priority: _,
+            paused: _,
+            params: _,
+            mut record,
+        } = commit;
+        let existing = self
+            .jobs
+            .iter()
+            .find(|job| {
+                !job.held()
+                    && crate::torrent_acquisitions::seed_retirement(job).is_none()
+                    && job.torrent.as_ref().is_some_and(|torrent| {
+                        torrent.info_hash_v1 == record.info_hash_v1
+                            && torrent.removal_intent.is_none()
+                    })
+                    && !matches!(job.status, JobStatus::Deleted | JobStatus::Failed)
+            })
+            .map(|job| job.id);
+        let seed_created = existing.is_none();
+        let donor_id = match existing {
+            Some(id) => id,
+            None => {
+                self.next_job_id = self.next_job_id.checked_add(1).ok_or_else(|| {
+                    crate::EngineError::RequestConflict("job identifiers exhausted".into())
+                })?;
+                let donor_id = JobId(self.next_job_id);
+                record.payload_root = record
+                    .payload_root
+                    .join(format!(".runner-seed-{}", donor_id.0));
+                let gated = original.status == JobStatus::Paused || original.held();
+                if gated {
+                    record.control_intent = nzbd_types::TorrentControlIntent::Paused;
+                }
+                let mut seed_params = if gated {
+                    vec![
+                        (OWNED_SEED_PARAM.into(), "1".into()),
+                        (
+                            crate::torrent_acquisitions::SEED_GATE_PARAM.into(),
+                            id.0.to_string(),
+                        ),
+                    ]
+                } else {
+                    vec![(OWNED_SEED_PARAM.into(), "1".into())]
+                };
+                seed_params.push((
+                    crate::torrent_acquisitions::DESCRIPTOR_PARAM.into(),
+                    serde_json::to_string(&descriptor).map_err(|_| {
+                        crate::EngineError::RequestConflict(
+                            "invalid native descriptor reference".into(),
+                        )
+                    })?,
+                ));
+                self.jobs.push(Job {
+                    id: donor_id,
+                    kind: JobKind::Torrent,
+                    name: name.clone(),
+                    dir_name: format!("seed-{}", donor_id.0),
+                    name_provisional: false,
+                    delivery_lifecycle: false,
+                    queued_at_unix: unix_now(),
+                    original_name: String::new(),
+                    category: category.clone(),
+                    priority: original.priority,
+                    dupe: DupeInfo::default(),
+                    params: seed_params,
+                    files: Vec::new(),
+                    totals: nzbd_types::JobTotals {
+                        size: record.total_bytes,
+                        ..Default::default()
+                    },
+                    status: if gated {
+                        JobStatus::Paused
+                    } else {
+                        JobStatus::Queued
+                    },
+                    torrent: Some(record.clone()),
+                    stages: Vec::new(),
+                });
+                donor_id
+            }
+        };
+        let mut child = original;
+        child
+            .params
+            .retain(|(key, _)| key != DONOR_PARAM && key != INFO_HASH_PARAM);
+        child
+            .params
+            .push((DONOR_PARAM.into(), donor_id.0.to_string()));
+        child
+            .params
+            .push((INFO_HASH_PARAM.into(), record.info_hash_v1));
+        if child.name_provisional {
+            child.name = name;
+            child.name_provisional = false;
+        }
+        child.totals.size = record.selected_bytes;
+        if !child.held() && child.status != JobStatus::Paused {
+            child.status = JobStatus::Queued;
+        }
+        *self.job_mut(id).unwrap() = child;
+        self.cancel_torrent_admission(id);
+        Ok(ManagedTorrentAdmission {
+            id,
+            donor_id,
+            created: true,
+            seed_created,
+        })
     }
 
     /// Add a parsed NZB as a job. `pause_extra_pars` queues `*.volNNN+MM.par2`
@@ -1272,6 +1586,11 @@ pub fn next_for_server(
 /// Does this job have at least one segment that could be handed out?
 /// Short-circuits on the first hit, so the common "yes" case is cheap.
 fn has_backend_work(job: &Job, now_unix: i64, allowed_files: Option<&HashSet<FileId>>) -> bool {
+    if crate::automatic_control::pending(job)
+        && nzbd_state::artifacts::WorkerControlContext::for_job(job).is_none()
+    {
+        return false;
+    }
     match job.kind {
         JobKind::Torrent => job.torrent.as_ref().is_some_and(|torrent| {
             torrent_wants_download_slot(torrent, job.queued_at_unix, now_unix)
@@ -1671,8 +1990,9 @@ mod tests {
             .push(("Delivery:SourceGeneration".into(), "new-source-gen".into()));
         state.sync_url_admission_receipts();
         let receipt = &state.url_admission_receipts[0];
-        assert_eq!(receipt.source_artifact_id.as_deref(), Some("new-source"));
-        assert_eq!(receipt.source_generation.as_deref(), Some("new-source-gen"));
+        assert_eq!(receipt.source_artifact_id.as_deref(), Some("pinned-source"));
+        assert_eq!(receipt.source_generation.as_deref(), Some("pinned-gen"));
+        assert_eq!(receipt.custody_state, "curator");
         assert!(
             !receipt.keep_source_on_failure,
             "a historical queue param cannot overwrite the pinned source preference"

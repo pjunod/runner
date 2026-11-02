@@ -402,7 +402,20 @@ async fn writer_task(
                 }
                 if !duplicate {
                     if reservation.is_none() && file_size > 0 {
-                        match nzbd_state::capacity::reserve(&dir, file_size) {
+                        let done = ranges
+                            .iter()
+                            .map(|range| u64::from(range.len))
+                            .fold(0u64, u64::saturating_add)
+                            .min(file_size);
+                        let end = ranges
+                            .iter()
+                            .filter_map(ProvenRange::end)
+                            .max()
+                            .unwrap_or(0);
+                        let credit =
+                            crate::download_capacity::persisted_credit(&part_path, done, end);
+                        match nzbd_state::capacity::reserve(&dir, file_size.saturating_sub(credit))
+                        {
                             Ok(claim) => reservation = Some(claim),
                             Err(error) => {
                                 report
@@ -669,6 +682,53 @@ async fn finalize(
     let identity = file_identity(out.as_ref().unwrap()).await?;
     drop(out.take());
     Ok(identity)
+}
+
+#[cfg(test)]
+pub(crate) fn validate_range(path: &std::path::Path, offset: u64, len: u64, crc: u32) -> bool {
+    validate_range_checked(path, offset, len, crc, &|| true)
+}
+pub(crate) fn validate_range_checked(
+    path: &std::path::Path,
+    offset: u64,
+    len: u64,
+    crc: u32,
+    checkpoint: &dyn Fn() -> bool,
+) -> bool {
+    use std::io::{Read, Seek};
+    if !checkpoint() {
+        return false;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_file()
+        || meta.file_type().is_symlink()
+        || offset.checked_add(len).is_none_or(|end| end > meta.len())
+    {
+        return false;
+    }
+    let Ok(mut file) = nzbd_state::fileops::open(path) else {
+        return false;
+    };
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return false;
+    }
+    let mut digest = crc32fast::Hasher::new();
+    let mut remaining = len;
+    let mut data = [0; 65536];
+    while remaining > 0 {
+        if !checkpoint() {
+            return false;
+        }
+        let amount = remaining.min(data.len() as u64) as usize;
+        if file.read_exact(&mut data[..amount]).is_err() {
+            return false;
+        }
+        digest.update(&data[..amount]);
+        remaining -= amount as u64;
+    }
+    digest.finalize() == crc
 }
 
 #[cfg(test)]

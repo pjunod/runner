@@ -3,7 +3,7 @@
 //! string/int/i4/boolean/double/base64 scalars plus arrays and structs;
 //! responses mirror JSON values back into XML-RPC types.
 
-use crate::{dispatch, CompatState};
+use crate::{dispatch_cluster, CompatState};
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use quick_xml::events::Event;
@@ -262,6 +262,7 @@ fn response_fault(code: i64, message: &str) -> String {
 pub async fn handle(
     State(state): State<CompatState>,
     headers: axum::http::HeaderMap,
+    cluster_removal: Option<axum::Extension<nzbd_api::cluster_removal::ClusterRemovalContext>>,
     body: String,
 ) -> Response {
     let Some(call) = parse_call(&body) else {
@@ -281,7 +282,14 @@ pub async fn handle(
         for c in calls {
             let name = c["methodName"].as_str().unwrap_or_default().to_string();
             let params = c.get("params").cloned().unwrap_or(Value::Array(vec![]));
-            match dispatch(&state, &name, &params).await {
+            match dispatch_cluster(
+                &state,
+                &name,
+                &params,
+                cluster_removal.as_ref().map(|context| &context.0),
+            )
+            .await
+            {
                 // Per the multicall spec, each success is a 1-element array.
                 Ok(v) => results.push(Value::Array(vec![v])),
                 Err((code, msg)) => results.push(json!({ "faultCode": code, "faultString": msg })),
@@ -290,7 +298,14 @@ pub async fn handle(
         return xml_response(response_ok(&Value::Array(results)));
     }
 
-    match dispatch(&state, &call.name, &call.params).await {
+    match dispatch_cluster(
+        &state,
+        &call.name,
+        &call.params,
+        cluster_removal.as_ref().map(|context| &context.0),
+    )
+    .await
+    {
         Ok(v) => xml_response(response_ok(&v)),
         Err((code, msg)) => xml_response(response_fault(code, msg)),
     }

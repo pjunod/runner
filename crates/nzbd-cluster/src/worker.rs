@@ -41,7 +41,48 @@ pub struct LeaseState {
 }
 
 /// Lease-id → state map, shared with the demotion path (`retain_jobs`).
-pub type ActiveLeases = Arc<Mutex<HashMap<String, LeaseState>>>;
+#[derive(Clone, Default)]
+pub struct ActiveLeases {
+    states: Arc<Mutex<HashMap<String, LeaseState>>>,
+    admissions: Arc<Mutex<HashMap<String, watch::Receiver<bool>>>>,
+    operations: Arc<Mutex<HashMap<String, watch::Receiver<bool>>>>,
+}
+impl std::ops::Deref for ActiveLeases {
+    type Target = Mutex<HashMap<String, LeaseState>>;
+    fn deref(&self) -> &Self::Target {
+        &self.states
+    }
+}
+impl ActiveLeases {
+    pub(crate) fn spawn_operation<F>(&self, tracker: &TaskTracker, id: String, work: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (done, joined) = watch::channel(false);
+        self.operations.lock().unwrap().insert(id, joined);
+        tracker.spawn(async move {
+            work.await;
+            let _ = done.send(true);
+        });
+    }
+    pub(crate) async fn join_execution(&self, id: &str) -> Result<bool, String> {
+        let admission = self.admissions.lock().unwrap().get(id).cloned();
+        let operation = self.operations.lock().unwrap().get(id).cloned();
+        let observed = admission.is_some() || operation.is_some();
+        for mut joined in admission.into_iter().chain(operation) {
+            if !*joined.borrow() {
+                joined.wait_for(|done| *done).await.map_err(|_| {
+                    "execution stop acknowledgment lost; retain for review".to_owned()
+                })?;
+            }
+        }
+        Ok(observed)
+    }
+    pub(crate) fn forget_joined(&self, id: &str) {
+        self.admissions.lock().unwrap().remove(id);
+        self.operations.lock().unwrap().remove(id);
+    }
+}
 type BudgetReceipt = Arc<Mutex<Option<BudgetAck>>>;
 
 #[allow(clippy::too_many_arguments)]
@@ -59,84 +100,202 @@ pub fn spawn_worker(
     tracker: &TaskTracker,
 ) {
     let budget_receipt = Arc::new(Mutex::new(None));
-    let t2 = tracker.clone();
-    tracker.spawn(worker_task(
-        cfg,
-        servers,
-        engine,
-        view,
-        client,
-        active,
-        pp,
-        dest_dir,
-        owner_incarnation,
-        budget_receipt,
-        cancel,
-        t2,
-    ));
+    {
+        let cfg = cfg.clone();
+        let engine = engine.clone();
+        let client = client.clone();
+        let active = active.clone();
+        let pp = pp.clone();
+        let dest_dir = dest_dir.clone();
+        let view = view.clone();
+        let cancel = cancel.clone();
+        tracker.spawn(async move {
+            loop {
+                if cancel.is_cancelled(){break;}
+                let current=view.borrow().clone();
+                if !current.is_me {
+                    if let Some(url)=current.leader_url().map(str::to_owned) {
+                        replay_completion_outbox(&cfg,&engine,&client,&active,&pp,&url).await;
+                        report_completions(&cfg,&engine,&client,&active,&pp,&url,&dest_dir).await;
+                    }
+                }
+                tokio::select!{ _=cancel.cancelled()=>break,_=tokio::time::sleep(cfg.lease_interval)=>{} }
+            }
+        });
+    }
+    {
+        let cfg = cfg.clone();
+        let servers = servers.clone();
+        let engine = engine.clone();
+        let view = view.clone();
+        let client = client.clone();
+        let active = active.clone();
+        let receipt = budget_receipt.clone();
+        let cancel = cancel.clone();
+        tracker.spawn(async move {
+            loop {
+                if cancel.is_cancelled(){break;}
+                expire_local_leases(&engine,&servers,&active,&receipt).await;
+                let current=view.borrow().clone();
+                if current.is_me {
+                    let cancelled:Vec<_>=active.lock().unwrap().drain().map(|(_,state)|state).collect();
+                    for state in cancelled {state.cancel.cancel();}
+                }else if let Some(url)=current.leader_url().map(str::to_owned) {
+                    heartbeat_and_cancel(&cfg,&servers,&engine,&client,&active,&receipt,&url).await;
+                }
+                tokio::select!{_=cancel.cancelled()=>break,_=tokio::time::sleep(cfg.lease_interval)=>{}}
+            }
+            // Pending CRC preparation and held PP are also owned work. Joiners
+            // can finish only after their exact authority is visibly revoked.
+            let cancelled:Vec<_>=active.lock().unwrap().drain().map(|(_,state)|state).collect();
+            for state in cancelled {state.cancel.cancel();let _=engine.remove_job_silent(state.job).await;}
+        });
+    }
+    // Recovery probes can touch slow storage. They never occupy heartbeat or
+    // completion lanes, and each release carries current in-memory grant proof.
+    {
+        let engine = engine.clone();
+        let active = active.clone();
+        let cancel = cancel.clone();
+        let interval = cfg.lease_interval.max(std::time::Duration::from_secs(5));
+        tracker.spawn(async move {
+            let mut cursor = 0;
+            let mut passes = 0u64;
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                passes = passes.wrapping_add(1);
+                recover_download_holds(&engine, &active, &mut cursor, passes.is_multiple_of(6))
+                    .await;
+                tokio::select! {_=cancel.cancelled()=>break,_=tokio::time::sleep(interval)=>{}}
+            }
+        });
+    }
+    let work_tracker = tracker.clone();
+    tracker.spawn(async move {
+        loop {
+            if cancel.is_cancelled(){break;}
+            let current=view.borrow().clone();
+            if !current.is_me {
+                if let Some(url)=current.leader_url().map(str::to_owned) {
+                    poll_for_work(&cfg,&servers,&engine,&client,&active,&pp,&dest_dir,&work_tracker,&url,&owner_incarnation,&budget_receipt).await;
+                }
+            }
+            tokio::select!{_=cancel.cancelled()=>break,_=tokio::time::sleep(cfg.lease_interval)=>{}}
+        }
+    });
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn worker_task(
-    cfg: ClusterConfig,
-    servers: Vec<ServerDef>,
-    engine: EngineHandle,
-    view: watch::Receiver<LeaderView>,
-    client: ClusterClient,
-    active: ActiveLeases,
-    pp: Option<PpSetup>,
-    dest_dir: PathBuf,
-    owner_incarnation: String,
-    budget_receipt: BudgetReceipt,
-    cancel: CancellationToken,
-    tracker: TaskTracker,
+fn lease_authority(
+    active: &ActiveLeases,
+    lease_id: &str,
+    expected: &LeaseState,
+) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    let active = active.clone();
+    let lease_id = lease_id.to_owned();
+    let expected = expected.clone();
+    Arc::new(move || {
+        active.lock().unwrap().get(&lease_id).is_some_and(|state| {
+            state.job == expected.job
+                && state.kind == expected.kind
+                && state.job_incarnation == expected.job_incarnation
+                && state.job_revision == expected.job_revision
+                && state.control_revision == expected.control_revision
+                && state.token.resource == expected.token.resource
+                && state.token.owner_node_id == expected.token.owner_node_id
+                && state.token.owner_incarnation == expected.token.owner_incarnation
+                && state.token.fence == expected.token.fence
+                && state.token.revision >= expected.token.revision
+                && state.deadline > Instant::now()
+                && !state.cancel.is_cancelled()
+        })
+    })
+}
+async fn recover_download_holds(
+    engine: &EngineHandle,
+    active: &ActiveLeases,
+    cursor: &mut usize,
+    reobserve: bool,
 ) {
-    loop {
-        if cancel.is_cancelled() {
-            break;
-        }
-        let v = view.borrow().clone();
+    let mut leases: Vec<_> = active
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, state)| state.kind == LeaseKind::Download)
+        .map(|(id, state)| (id.clone(), state.clone()))
+        .collect();
+    leases.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    let count = leases.len();
+    if count == 0 {
+        return;
+    }
+    let start = *cursor % count;
+    leases.rotate_left(start);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    for (offset, (lease_id, state)) in leases.into_iter().enumerate() {
+        let Some(control) = engine
+            .export_job(state.job)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|job| job.control())
+            .filter(|control| {
+                control.lifecycle == "held"
+                    && !control.manual_pause
+                    && control.hold_cause().policy().automatic()
+                    && (control
+                        .next_retry_at_unix
+                        .is_some_and(|deadline| deadline <= now)
+                        || (reobserve
+                            && control.hold_cause().policy()
+                                == nzbd_types::HoldPolicy::ReobserveMount))
+            })
+        else {
+            continue;
+        };
+        *cursor = (start + offset + 1) % count;
+        release_worker_hold(
+            engine,
+            state.job,
+            control,
+            lease_authority(active, &lease_id, &state),
+        )
+        .await;
+        break;
+    }
+}
 
-        expire_local_leases(&engine, &servers, &active, &budget_receipt).await;
-
-        if v.is_me {
-            // We are the leader: granted leases dissolve into local jobs
-            // (adopt_authority kept them); the scheduler takes over.
-            for state in active.lock().unwrap().values() {
-                state.cancel.cancel();
+async fn release_worker_hold(
+    engine: &EngineHandle,
+    job: JobId,
+    control: nzbd_types::JobControl,
+    authority: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> bool {
+    match engine
+        .release_hold_checked(
+            job,
+            control.revision.clone(),
+            nzbd_engine::RetryBy::Recovery,
+            authority.clone(),
+        )
+        .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(reason)) => {
+            if authority() {
+                let _ = engine
+                    .reschedule_hold_checked(job, control.revision, reason, authority)
+                    .await;
             }
-            active.lock().unwrap().clear();
-        } else if let Some(url) = v.leader_url().map(|s| s.to_string()) {
-            heartbeat_and_cancel(
-                &cfg,
-                &servers,
-                &engine,
-                &client,
-                &active,
-                &budget_receipt,
-                &url,
-            )
-            .await;
-            report_completions(&cfg, &engine, &client, &active, &pp, &url, &dest_dir).await;
-            poll_for_work(
-                &cfg,
-                &servers,
-                &engine,
-                &client,
-                &active,
-                &pp,
-                &dest_dir,
-                &tracker,
-                &url,
-                &owner_incarnation,
-                &budget_receipt,
-            )
-            .await;
+            false
         }
-
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(cfg.lease_interval) => {}
+        Err(error) => {
+            tracing::warn!(job=job.0,%error,"worker hold retry remains pending");
+            false
         }
     }
 }
@@ -203,8 +362,16 @@ async fn accept_worker_retirement(
         accepted_at_ms,
     };
     let inventory = engine.artifacts();
+    let context = nzbd_state::artifacts::WorkerControlContext::for_job(&request.job);
+    let job = request.job.id.0;
     tokio::task::spawn_blocking(move || {
-        inventory.accept_cluster_completion(&source, &outcome, proof)
+        inventory.accept_cluster_completion(&source, &outcome, proof.clone())?;
+        if let Some(context)=context {
+            if !inventory.acknowledge_worker_completion(job,&context,&source,&proof)? {
+                return Err(nzbd_state::artifacts::Error::Conflict("accepted worker completion checkpoint changed; retain outbox for reconciliation".into()));
+            }
+        }
+        Ok(())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -336,6 +503,7 @@ async fn report_completions(
 
     for (lease_id, lease) in finished {
         let job_id = lease.job;
+        tracing::debug!(node=%cfg.node_name,job=job_id.0,%lease_id,"sealing durable completion");
         let job = if let Some(job) = lease.ready_job.as_deref().cloned() {
             job
         } else {
@@ -357,11 +525,19 @@ async fn report_completions(
                 continue;
             }
         };
+        let job = match std::fs::read(sealed.path.join("job.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        {
+            Some(job) => job,
+            None => continue,
+        };
         let receipt_id = format!(
             "complete:{}:{}:{}",
             lease.token.resource, lease.token.fence, sealed.result_id
         );
         let req = CompleteRequest {
+            lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
             node: cfg.node_name.clone(),
             lease_id: lease_id.clone(),
             token: lease.token.clone(),
@@ -371,59 +547,408 @@ async fn report_completions(
             receipt_id,
             job,
         };
-        match client
-            .post_json::<_, CompleteResponse>(leader_url, "/cluster/v1/work/complete", &req)
-            .await
+        if let Err(error) = persist_completion(cfg, lease.kind, &req) {
+            tracing::warn!(job=job_id.0,%error,"completion outbox commit failed");
+            continue;
+        }
+        let req = std::fs::read(completion_path(cfg, &req))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PendingCompletion>(&bytes).ok())
+            .map(|pending| pending.request)
+            .unwrap_or(req);
+        if submit_completion(
+            cfg,
+            engine,
+            client,
+            active,
+            pp,
+            leader_url,
+            (lease.kind, &req),
+        )
+        .await
         {
-            Ok(resp) if resp.ok => {
-                if lease.kind == LeaseKind::Post && !resp.history_recorded_by_authority {
-                    // Older authorities omit the concrete path. Their selected
-                    // immutable generation stores payloads under files/.
-                    let final_dir = resp.final_dir.clone().unwrap_or_else(|| {
-                        std::path::Path::new(&req.result_ref)
-                            .join("files")
-                            .to_string_lossy()
-                            .into_owned()
-                    });
-                    let history_result = match (pp, resp.accepted_at_unix_ms) {
-                        (Some(setup), Some(accepted_at_ms)) => {
-                            record_published_pp_history(
-                                setup.history.clone(),
-                                &req.job,
-                                &final_dir,
-                                accepted_at_ms,
-                            )
-                            .await
-                        }
-                        _ => Err("durable PP history target or timestamp unavailable".into()),
-                    };
-                    if let Err(error) = history_result {
-                        tracing::warn!(job = job_id.0, %error, "PP completion awaits durable history");
-                        continue;
-                    }
+            let _ = remove_completion(cfg, &req);
+        }
+        // One completion/copy/hash at a time; heartbeat and admission run on
+        // their independent bounded control lane.
+        break;
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingCompletion {
+    kind: LeaseKind,
+    request: CompleteRequest,
+}
+fn completion_path(cfg: &ClusterConfig, request: &CompleteRequest) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    cfg.control_dir.join("completion-outbox").join(format!(
+        "{:x}.json",
+        Sha256::digest(request.receipt_id.as_bytes())
+    ))
+}
+fn persist_completion(
+    cfg: &ClusterConfig,
+    kind: LeaseKind,
+    request: &CompleteRequest,
+) -> Result<(), String> {
+    let path = completion_path(cfg, request);
+    let parent = path.parent().unwrap();
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    if path.exists() {
+        return Ok(());
+    }
+    replace_completion(cfg, kind, request)
+}
+fn replace_completion(
+    cfg: &ClusterConfig,
+    kind: LeaseKind,
+    request: &CompleteRequest,
+) -> Result<(), String> {
+    let path = completion_path(cfg, request);
+    let parent = path.parent().unwrap();
+    let bytes = serde_json::to_vec(&serde_json::json!({"kind":kind,"request":request}))
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_RPC_BYTES {
+        return Err("completion descriptor exceeds durable outbox limit; reduce metadata".into());
+    }
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, bytes).map_err(|e| e.to_string())?;
+    std::fs::File::open(&temporary)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    std::fs::rename(&temporary, &path).map_err(|e| e.to_string())?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| e.to_string())
+}
+fn remove_completion(cfg: &ClusterConfig, request: &CompleteRequest) -> Result<(), String> {
+    let path = completion_path(cfg, request);
+    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    std::fs::File::open(path.parent().unwrap())
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| e.to_string())
+}
+async fn replay_completion_outbox(
+    cfg: &ClusterConfig,
+    engine: &EngineHandle,
+    client: &ClusterClient,
+    active: &ActiveLeases,
+    pp: &Option<PpSetup>,
+    leader_url: &str,
+) {
+    let Ok(entries) = std::fs::read_dir(cfg.control_dir.join("completion-outbox")) else {
+        return;
+    };
+    for entry in entries.flatten().take(32) {
+        if entry
+            .path()
+            .extension()
+            .is_none_or(|extension| extension != "json")
+        {
+            continue;
+        }
+        if entry
+            .metadata()
+            .map_or(true, |metadata| metadata.len() > MAX_RPC_BYTES as u64)
+        {
+            continue;
+        }
+        let Some(pending) = std::fs::read(entry.path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PendingCompletion>(&bytes).ok())
+        else {
+            continue;
+        };
+        if pending.request.node != cfg.node_name {
+            continue;
+        }
+        if submit_completion(
+            cfg,
+            engine,
+            client,
+            active,
+            pp,
+            leader_url,
+            (pending.kind, &pending.request),
+        )
+        .await
+        {
+            let _ = remove_completion(cfg, &pending.request);
+        }
+        break;
+    }
+}
+async fn submit_completion(
+    cfg: &ClusterConfig,
+    engine: &EngineHandle,
+    client: &ClusterClient,
+    active: &ActiveLeases,
+    pp: &Option<PpSetup>,
+    leader_url: &str,
+    completion: (LeaseKind, &CompleteRequest),
+) -> bool {
+    let (kind, req) = completion;
+    let job_id = req.job.id;
+    let lease_id = req.lease_id.clone();
+    match client
+        .post_json::<_, CompleteResponse>(leader_url, "/cluster/v1/work/complete", &req)
+        .await
+    {
+        Ok(resp) if resp.ok => {
+            if let Some(context) = nzbd_state::artifacts::WorkerControlContext::for_job(&req.job) {
+                if let Err(error) = compact_joined_grant(engine, active, job_id, &context).await {
+                    tracing::warn!(job=job_id.0,%error,"accepted completion awaits actual writer/execution join");
+                    return false;
                 }
-                if lease.kind == LeaseKind::Post {
-                    if let Err(error) = accept_worker_retirement(engine, &req, &resp).await {
-                        tracing::warn!(job=job_id.0,%error,"remote workspace retirement awaits durable acceptance recording");
-                        continue;
-                    }
-                }
-                tracing::info!(job = job_id.0, %lease_id, "completion handed to leader");
-                active.lock().unwrap().remove(&lease_id);
-                let _ = engine.remove_job_silent(job_id).await;
             }
-            Ok(_) | Err(_) => {
-                // Leader unreachable or refused: retry next tick; a
-                // reclaimed lease resolves via the journals either way.
+            if kind == LeaseKind::Post && !resp.history_recorded_by_authority {
+                // Older authorities omit the concrete path. Their selected
+                // immutable generation stores payloads under files/.
+                let final_dir = resp.final_dir.clone().unwrap_or_else(|| {
+                    std::path::Path::new(&req.result_ref)
+                        .join("files")
+                        .to_string_lossy()
+                        .into_owned()
+                });
+                let mut history_job = req.job.clone();
+                if resp.cleanup_only {
+                    history_job.params.push((
+                        "Cluster:CleanupId".into(),
+                        format!("cluster-delivery:{}", req.result_id),
+                    ));
+                }
+                let history_result = match (pp, resp.accepted_at_unix_ms) {
+                    (Some(setup), Some(accepted_at_ms)) => {
+                        record_published_pp_history(
+                            setup.history.clone(),
+                            &history_job,
+                            (!resp.cleanup_only).then_some(final_dir.as_str()),
+                            accepted_at_ms,
+                        )
+                        .await
+                    }
+                    _ => Err("durable PP history target or timestamp unavailable".into()),
+                };
+                if let Err(error) = history_result {
+                    tracing::warn!(job = job_id.0, %error, "PP completion awaits durable history");
+                    return false;
+                }
+            }
+            if kind == LeaseKind::Post {
+                if let Err(error) = accept_worker_retirement(engine, req, &resp).await {
+                    tracing::warn!(job=job_id.0,%error,"remote workspace retirement awaits durable acceptance recording");
+                    return false;
+                }
+            }
+            tracing::info!(job = job_id.0, %lease_id, "completion handed to leader");
+            let removed = {
+                let mut leases = active.lock().unwrap();
+                if leases.get(&lease_id).is_some_and(|state| {
+                    state.token.fence == req.token.fence
+                        && state.token.owner_incarnation == req.token.owner_incarnation
+                }) {
+                    leases.remove(&lease_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if removed {
+                if let Some(context) =
+                    nzbd_state::artifacts::WorkerControlContext::for_job(&req.job)
+                {
+                    let _ = engine.remove_accepted_worker_job(job_id, context).await;
+                } else {
+                    let _ = engine.remove_job_silent(job_id).await;
+                }
+            }
+            return true;
+        }
+        Ok(_) => tracing::debug!(
+            job = job_id.0,
+            "completion authority returned a negative receipt"
+        ),
+        Err(error) => {
+            if error.contains("stale lease token or job revision") {
+                let successor = active
+                    .lock()
+                    .unwrap()
+                    .get(&lease_id)
+                    .filter(|state| {
+                        state.job_revision == req.expected_job_revision
+                            && state.token.resource == req.token.resource
+                            && state.token.fence == req.token.fence
+                            && state.token.owner_incarnation == req.token.owner_incarnation
+                            && state.token != req.token
+                    })
+                    .map(|state| state.token.clone());
+                if let Some(token) = successor {
+                    // A definite stale-token refusal proves this predecessor
+                    // was not committed. Persist its exact renewed successor
+                    // before retrying the unchanged completion receipt.
+                    let mut renewed = req.clone();
+                    renewed.token = token;
+                    if let Err(error) = replace_completion(cfg, kind, &renewed) {
+                        tracing::warn!(job=job_id.0,%error,"completion token refresh was not persisted");
+                    }
+                }
+            }
+            tracing::debug!(job=job_id.0,%error,"durable completion awaits authority acceptance");
+        }
+    }
+    // A rejected publication remains in the outbox unless the authority has
+    // durably recorded an exact removal disposition for this same result.
+    let Some(context) = nzbd_state::artifacts::WorkerControlContext::for_job(&req.job) else {
+        return false;
+    };
+    let cancellation = crate::cancellation::CancellationRequest {
+        lifecycle_protocol: req.lifecycle_protocol,
+        node: req.node.clone(),
+        job_id: job_id.0,
+        job_incarnation: context.job_incarnation.clone(),
+        lease_id: req.lease_id.clone(),
+        token: req.token.clone(),
+        expected_job_revision: req.expected_job_revision,
+        result_id: req.result_id.clone(),
+        result_ref: req.result_ref.clone(),
+        receipt_id: req.receipt_id.clone(),
+    };
+    let Ok(decision) = client
+        .post_json::<_, crate::cancellation::CancellationDecision>(
+            leader_url,
+            "/cluster/v1/work/cancelled-completion",
+            &cancellation,
+        )
+        .await
+    else {
+        return false;
+    };
+    if decision.receipt_id != req.receipt_id {
+        return false;
+    }
+    if let Some(setup) = pp {
+        let mut retired = req.job.clone();
+        retired
+            .params
+            .retain(|(key, _)| key != nzbd_types::PP_DONE_PARAM);
+        retired
+            .params
+            .push((nzbd_types::PP_DONE_PARAM.into(), "CANCELLED".into()));
+        retired
+            .params
+            .push(("Cluster:CleanupId".into(), decision.cleanup_id.clone()));
+        retired
+            .params
+            .push(("Cluster:RemovalReason".into(), decision.reason.clone()));
+        if record_published_pp_history(
+            setup.history.clone(),
+            &retired,
+            Some(req.job.dir_name.as_str()),
+            decision.accepted_at_ms,
+        )
+        .await
+        .is_err()
+        {
+            return false;
+        }
+    }
+    let source = req
+        .job
+        .params
+        .iter()
+        .find(|(key, _)| key == "Artifact:Id")
+        .map(|(_, id)| id.clone())
+        .zip(
+            req.job
+                .params
+                .iter()
+                .find(|(key, _)| key == "Artifact:Generation")
+                .map(|(_, generation)| generation.clone()),
+        );
+    if kind == LeaseKind::Post {
+        if let Some((artifact, generation)) = source {
+            let inventory = engine.artifacts();
+            let proof = nzbd_state::artifacts::FinalizationProof::Cluster {
+                receipt: req.receipt_id.clone(),
+                accepted_at_ms: decision.accepted_at_ms,
+            };
+            let source = nzbd_state::artifacts::SourceGeneration {
+                artifact,
+                generation,
+            };
+            if !tokio::task::spawn_blocking(move || {
+                inventory.acknowledge_worker_completion(job_id.0, &context, &source, &proof)
+            })
+            .await
+            .is_ok_and(|result| result.is_ok_and(|accepted| accepted))
+            {
+                return false;
             }
         }
     }
+    // The private ledger now preserves either exact cleanup obligations or
+    // visible keep-files custody. Never activate generic workspace GC here.
+    active.lock().unwrap().remove(&lease_id);
+    let _ = engine.remove_job_silent(job_id).await;
+    true
+}
+
+pub(crate) async fn cancel_and_join_execution(
+    shared: &crate::leader::LeaderShared,
+    context: &nzbd_state::artifacts::WorkerControlContext,
+) -> Result<bool, String> {
+    let active = shared
+        .worker_leases
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("worker execution registry unavailable")?;
+    {
+        let states = active.lock().unwrap();
+        if let Some(state) = states.get(&context.lease_id) {
+            if state.job_incarnation != context.job_incarnation
+                || state.job_revision != context.job_revision
+                || state.control_revision != context.control_revision
+            {
+                return Err("worker grant intent changed before cancellation".into());
+            }
+            state.cancel.cancel();
+        }
+    }
+    active.join_execution(&context.lease_id).await
+}
+
+pub(crate) async fn compact_joined_grant(
+    engine: &EngineHandle,
+    active: &ActiveLeases,
+    job: JobId,
+    context: &nzbd_state::artifacts::WorkerControlContext,
+) -> Result<(), String> {
+    let inventory = engine.artifacts();
+    let context = context.clone();
+    let request =
+        tokio::task::spawn_blocking(move || inventory.worker_grant_request(job.0, &context))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+    let Some(request) = request else {
+        return Ok(());
+    }; // legacy never gains a stop proof
+    let id = request.context.lease_id.clone();
+    let execution_joined = active.join_execution(&id).await?;
+    engine
+        .join_cluster_writers(request, execution_joined)
+        .await
+        .map_err(|e| e.to_string())?;
+    active.forget_joined(&id);
+    Ok(())
 }
 
 async fn record_published_pp_history(
     history: Arc<nzbd_state::history::HistoryDb>,
     job: &nzbd_types::Job,
-    result_ref: &str,
+    result_ref: Option<&str>,
     accepted_at_ms: i64,
 ) -> Result<(), String> {
     let status = job
@@ -436,7 +961,7 @@ async fn record_published_pp_history(
         job: job.id,
         name: job.name.clone(),
         category: job.category.clone(),
-        final_dir: Some(result_ref.to_owned()),
+        final_dir: result_ref.map(str::to_owned),
         status,
         size: job.totals.size,
         health: nzbd_types::Health::calc(&job.totals).0,
@@ -509,8 +1034,11 @@ async fn poll_for_work(
         return;
     }
     let req = PollRequest {
+        lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
         node: cfg.node_name.clone(),
         owner_incarnation: owner_incarnation.to_owned(),
+        storage_instance_id: engine.artifacts().installation.clone(),
+        start_ordering: 1,
         free_download_slots: free_dl,
         free_pp_slots: free_pp,
     };
@@ -525,10 +1053,93 @@ async fn poll_for_work(
         }
     };
     for mut grant in resp.grants {
+        let (admission_done, admission_joined) = watch::channel(false);
+        active
+            .admissions
+            .lock()
+            .unwrap()
+            .insert(grant.lease_id.clone(), admission_joined);
+        async {
+
         let job_id = grant.job.id;
+        if grant.job.delivery_lifecycle && grant.lifecycle_protocol < LIFECYCLE_PROTOCOL {
+            tracing::warn!(
+                job = job_id.0,
+                "leader requires cluster lifecycle protocol 2; grant refused before payload mutation"
+            );
+            reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token).await;
+            return;
+        }
         if engine.snapshot().disk_low {
             reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token).await;
-            continue;
+            return;
+        }
+        {
+            let context = nzbd_state::artifacts::WorkerControlContext {
+                lease_id: grant.lease_id.clone(),
+                job_incarnation: grant.job_incarnation.clone(),
+                job_revision: grant.job_revision,
+                control_revision: grant.control_revision,
+                epoch: grant.epoch,
+            };
+            grant
+                .job
+                .params
+                .retain(|(key, _)| key != nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM);
+            grant.job.params.push((
+                nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+                serde_json::to_string(&context).expect("grant context serializes"),
+            ));
+            if grant.token.owner_node_id!=cfg.node_name || grant.token.owner_incarnation!=owner_incarnation
+                || grant.scope.get("_startOrdered").and_then(serde_json::Value::as_u64)!=Some(1)
+                || grant.scope.get("_workerStorage").and_then(serde_json::Value::as_str)!=Some(engine.artifacts().installation.as_str()) {
+                tracing::warn!(job=job_id.0,"grant lacks exact receiver/start ordering; refuse before payload mutation");
+                reject_remote_grant(cfg,client,leader_url,&grant.lease_id,&grant.token).await;return;
+            }
+            let request=nzbd_state::artifacts::WorkerStopRequest{
+                job:job_id.0,context:context.clone(),owner_incarnation:owner_incarnation.to_owned(),
+                storage_instance_id:engine.artifacts().installation.clone(),removal_revision:None,
+                authority_source_json:grant.job.params.iter().find(|(key,_)|key==crate::delivery::AUTHORITY_COPY_PARAM).map(|(_,value)|value.clone()),start_ordered:true,
+            };
+            let inventory=engine.artifacts();
+            if let Err(error)=tokio::task::spawn_blocking(move||inventory.begin_worker_grant(&request)).await.map_err(|error|error.to_string()).and_then(|result|result.map_err(|error|error.to_string())) {
+                tracing::warn!(job=job_id.0,%error,"durable grant start refused");reject_remote_grant(cfg,client,leader_url,&grant.lease_id,&grant.token).await;return;
+            }
+            if grant.kind == LeaseKind::Download
+                && grant
+                    .job
+                    .params
+                    .iter()
+                    .any(|(key, _)| key == crate::delivery::AUTHORITY_COPY_PARAM)
+            {
+                let inventory = engine.artifacts();
+                let incoming = grant.job.clone();
+                match tokio::task::spawn_blocking(move || {
+                    inventory.adopt_worker_retry_for_job(&incoming, &context)
+                })
+                .await
+                {
+                    Ok(Ok(Some(adoption))) => {
+                        grant.job.set_control(&adoption.control);
+                        grant.job.status = JobStatus::Paused;
+                        for (key, value) in adoption.probe_params {
+                            grant.job.params.retain(|(existing, _)| existing != &key);
+                            grant.job.params.push((key, value));
+                        }
+                    }
+                    Ok(Ok(None)) => {}
+                    error => {
+                        tracing::warn!(
+                            job = job_id.0,
+                            ?error,
+                            "delegated retry checkpoint refused"
+                        );
+                        reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
+                            .await;
+                        return;
+                    }
+                }
+            }
         }
         match grant.kind {
             LeaseKind::Download => {
@@ -541,33 +1152,76 @@ async fn poll_for_work(
                     budget_receipt,
                 )
                 .await;
-                // Fold shared journals on import: resume work another node did.
-                if engine.import_job(grant.job, true, false).await.is_ok() {
-                    if engine.snapshot().disk_low {
+                // Register before the off-actor CRC preparation so the
+                // independent control lane renews/cancels this exact grant.
+                let lease_id = grant.lease_id.clone();
+                let original_token = grant.token.clone();
+                let expected_job = grant.job_revision;
+                let expected_control = grant.control_revision;
+                active.lock().unwrap().insert(
+                    lease_id.clone(),
+                    LeaseState {
+                        job: job_id,
+                        kind: LeaseKind::Download,
+                        token: grant.token.clone(),
+                        job_incarnation: grant.job_incarnation,
+                        job_revision: expected_job,
+                        control_revision: expected_control,
+                        deadline: conservative_deadline(cfg),
+                        cancel: CancellationToken::new(),
+                        pp_ready: false,
+                        ready_job: None,
+                    },
+                );
+                let checkpoint = {
+                    let active = active.clone();
+                    let lease_id = lease_id.clone();
+                    let token = original_token.clone();
+                    #[cfg(test)]
+                    let test_node = cfg.node_name.clone();
+                    Arc::new(move || {
+                        #[cfg(test)]
+                        crc_tests::checkpoint(&test_node, job_id);
+                        active.lock().unwrap().get(&lease_id).is_some_and(|state| {
+                            state.job == job_id
+                                && state.job_revision == expected_job
+                                && state.control_revision == expected_control
+                                && state.token.resource == token.resource
+                                && state.token.owner_node_id == token.owner_node_id
+                                && state.token.owner_incarnation == token.owner_incarnation
+                                && state.token.fence == token.fence
+                                && state.token.revision >= token.revision
+                                && state.deadline > Instant::now()
+                                && !state.cancel.is_cancelled()
+                        })
+                    })
+                };
+                let imported = engine
+                    .import_job_checked(grant.job, true, false, checkpoint)
+                    .await;
+                #[cfg(test)]
+                crc_tests::record_result(&cfg.node_name, job_id, imported.is_ok());
+                if imported.is_err() || engine.snapshot().disk_low {
+                    let removed = {
+                        let mut leases = active.lock().unwrap();
+                        if leases.get(&lease_id).is_some_and(|state| {
+                            state.token.fence == original_token.fence
+                                && state.token.owner_incarnation == original_token.owner_incarnation
+                        }) {
+                            leases.remove(&lease_id)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(state) = removed {
+                        state.cancel.cancel();
                         let _ = engine.remove_job_silent(job_id).await;
-                        reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
-                            .await;
-                        continue;
+                        reject_remote_grant(cfg, client, leader_url, &lease_id, &state.token).await;
                     }
-                    active.lock().unwrap().insert(
-                        grant.lease_id,
-                        LeaseState {
-                            job: job_id,
-                            kind: LeaseKind::Download,
-                            token: grant.token,
-                            job_incarnation: grant.job_incarnation,
-                            job_revision: grant.job_revision,
-                            control_revision: grant.control_revision,
-                            deadline: conservative_deadline(cfg),
-                            cancel: CancellationToken::new(),
-                            pp_ready: false,
-                            ready_job: None,
-                        },
-                    );
                 }
             }
             LeaseKind::Post => {
-                let Some(setup) = pp else { continue };
+                let Some(setup) = pp else { return };
                 tracing::info!(job = job_id.0, lease = %grant.lease_id, "pp lease received");
                 if grant.post_fetch_budgeted {
                     apply_budgets(
@@ -608,14 +1262,19 @@ async fn poll_for_work(
                     tracing::warn!(job = job_id.0, %error, "private PP attempt could not be prepared");
                     reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
                         .await;
-                    continue;
+                    return;
                 }
+                let restored_ready = grant
+                    .job
+                    .params
+                    .iter()
+                    .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM);
                 if engine.import_job(grant.job, false, false).await.is_ok() {
                     if engine.snapshot().disk_low {
                         let _ = engine.remove_job_silent(job_id).await;
                         reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
                             .await;
-                        continue;
+                        return;
                     }
                     active.lock().unwrap().insert(
                         grant.lease_id.clone(),
@@ -628,22 +1287,24 @@ async fn poll_for_work(
                             control_revision: grant.control_revision,
                             deadline: conservative_deadline(cfg),
                             cancel: CancellationToken::new(),
-                            pp_ready: false,
+                            pp_ready: restored_ready,
                             ready_job: None,
                         },
                     );
-                    run_pp_lease(
-                        engine.clone(),
-                        setup.clone(),
-                        dest_dir.to_path_buf(),
-                        active.clone(),
-                        grant.lease_id,
-                        job_id,
-                        tracker,
-                        cfg.node_name.clone(),
-                        client.clone(),
-                        leader_url.to_string(),
-                    );
+                    if !restored_ready {
+                        run_pp_lease(
+                            engine.clone(),
+                            setup.clone(),
+                            dest_dir.to_path_buf(),
+                            active.clone(),
+                            grant.lease_id,
+                            job_id,
+                            tracker,
+                            cfg.node_name.clone(),
+                            client.clone(),
+                            leader_url.to_string(),
+                        );
+                    }
                 }
             }
             LeaseKind::Segment => {
@@ -679,7 +1340,7 @@ async fn poll_for_work(
                 else {
                     reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
                         .await;
-                    continue;
+                    return;
                 };
                 let lease_id = grant.lease_id.clone();
                 let token = grant.token.clone();
@@ -710,6 +1371,8 @@ async fn poll_for_work(
                 );
             }
         }
+        }.await;
+        let _ = admission_done.send(true);
     }
 }
 
@@ -803,7 +1466,7 @@ fn run_pp_lease(
     for rule in &mut setup.post.categories {
         rule.dest_dir = None;
     }
-    tracker.spawn(async move {
+    active.clone().spawn_operation(tracker,lease_id.clone(),async move {
         let Some(initial) = active.lock().unwrap().get(&lease_id).cloned() else {
             return;
         };
@@ -901,57 +1564,79 @@ fn run_pp_lease(
                 ("NZBCLUSTER_LEASE_REVISION".into(), initial.token.revision.to_string()),
             ],
             script_receipt_prefix: Some(format!("script:{}:", initial.job_incarnation)),
-            commit_ok: Arc::new({
-                let active = active.clone();
-                let lease_id = lease_id.clone();
-                let admission_cancel = admission_cancel.clone();
-                move || {
-                    !admission_cancel.is_cancelled() && active
-                        .lock()
-                        .unwrap()
-                        .get(&lease_id)
-                        .is_some_and(|state| state.deadline > Instant::now())
+            commit_ok: {let live=lease_authority(&active,&lease_id,&initial);let cancel=admission_cancel.clone();Arc::new(move||!cancel.is_cancelled() && live())},
+        };
+        loop {
+            if initial.cancel.is_cancelled(){break;}
+            // Restored checkpoints keep their original absolute deadline and
+            // first blocked time. Heartbeats run independently while waiting.
+            if let Some(control)=engine.export_job(job_id).await.ok().flatten().and_then(|job|job.control()).filter(|control|control.lifecycle=="held") {
+                if !control.hold_cause().policy().automatic() || control.manual_pause {
+                    tokio::select!{_=initial.cancel.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_secs(1))=>{}}
+                    continue;
                 }
-            }),
-        };
-        let pp_cancel = initial.cancel.clone();
-        let processing = process_job_ctx(&admitted_engine, &setup.post, &setup.history, &dest_dir, job_id, &ctx);
-        tokio::pin!(processing);
-        let outcome = tokio::select! {
-            _ = pp_cancel.cancelled() => None,
-            _ = admission_cancel.cancelled() => None,
-            result = &mut processing => Some(result),
-        };
-        ctx.cancel.cancel();
-        let result = match outcome {
-            Some(result) => result,
-            None => {
-                // Keep custody through every already-started blocking worker,
-                // including recovery/finalization outside the attempt tracker.
-                let _ = processing.await;
-                Err(nzbd_post::PostError::Subprocess("PP lease authority expired".into()))
+                let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+                if control.next_retry_at_unix.is_some_and(|deadline|deadline>now) {
+                    tokio::select!{_=initial.cancel.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_millis(250))=>{}}
+                    continue;
+                }
+                if !release_worker_hold(&engine,job_id,control,lease_authority(&active,&lease_id,&initial)).await {
+                    tokio::select!{_=initial.cancel.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_secs(1))=>{}}
+                    continue;
+
+                }
             }
-        };
-        ctx.workers.close();
-        ctx.workers.wait().await;
-        if let Err(error) = engine.end_post_admission(admission).await {
-            tracing::warn!(job=job_id.0, lease=%lease_id, %error, "PP owner custody release remains unresolved");
+            let mut attempt=ctx.clone();attempt.cancel=initial.cancel.child_token();attempt.workers=TaskTracker::new();
+            let processing=process_job_ctx(&admitted_engine,&setup.post,&setup.history,&dest_dir,job_id,&attempt);
+            tokio::pin!(processing);
+            let outcome=tokio::select!{
+                _=initial.cancel.cancelled()=>None,
+                _=admission_cancel.cancelled()=>None,
+                result=&mut processing=>Some(result),
+            };
+            attempt.cancel.cancel();
+            let result=match outcome{Some(result)=>result,None=>{let _=processing.await;Err(nzbd_post::PostError::Subprocess("PP lease authority expired".into()))}};
+            attempt.cancel.cancel();attempt.workers.close();attempt.workers.wait().await;
+            match result {
+                Ok(outcome)=>{
+                    tracing::info!(job=job_id.0,%lease_id,outcome=outcome.as_str(),"pp lease finished");
+                    // Ending main's owner admission retires its queue row.
+                    // Preserve the exact completed descriptor for sealing before
+                    // that retirement; its worker checkpoint already persists
+                    // restart recovery under this same grant/source context.
+                    let ready=match admitted_engine.export_job(job_id).await {
+                        Ok(Some(job)) if lease_authority(&active,&lease_id,&initial)()
+                            && job.params.iter().any(|(key,_)|key==nzbd_types::PP_DONE_PARAM)
+                            && nzbd_state::artifacts::WorkerControlContext::for_job(&job).is_some_and(|context|
+                                context.lease_id==lease_id && context.job_incarnation==initial.job_incarnation
+                                && context.job_revision==initial.job_revision && context.control_revision==initial.control_revision)=>job,
+                        result=>{tracing::warn!(job=job_id.0,%lease_id,?result,"completed PP descriptor awaits exact owner/grant custody");break;}
+                    };
+                    if let Some(state)=active.lock().unwrap().get_mut(&lease_id){state.ready_job=Some(Box::new(ready));}
+                    if let Err(error)=engine.end_post_admission(admission).await{tracing::warn!(job=job_id.0,%error,"PP custody release remains pending");return;}
+                    if lease_authority(&active,&lease_id,&initial)(){
+                        if let Some(state)=active.lock().unwrap().get_mut(&lease_id){state.pp_ready=true;}
+                    }
+                    return;
+                },
+                Err(error)=>{
+                    if !initial.cancel.is_cancelled() && nzbd_post::manager::retain_worker_post_retry(&engine,job_id,&error).await {
+                        tracing::warn!(job=job_id.0,%lease_id,%error,"leased post attempt retained for scheduled retry");
+                        continue;
+                    }
+                    if !initial.cancel.is_cancelled() {
+                        // Review/Keep holds retain the owned attempt and remain
+                        // visible; operator action or lease revocation decides.
+                        tokio::select!{_=initial.cancel.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_secs(1))=>{}}
+                        continue;
+                    }
+                    break;
+                }
+            }
         }
-        match result {
-            Ok(outcome) => {
-                tracing::info!(job = job_id.0, lease = %lease_id, outcome = outcome.as_str(), "pp lease finished");
-                if let Some(st) = active.lock().unwrap().get_mut(&lease_id) {
-                    st.pp_ready = true;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(job = job_id.0, lease = %lease_id, error = %e, "pp lease aborted");
-                // Drop the local copy; the leader reclaims and reschedules.
-                if active.lock().unwrap().remove(&lease_id).is_some() {
-                    let _ = engine.remove_job_silent(job_id).await;
-                }
-            }
-        }
+        if let Err(error)=engine.end_post_admission(admission).await{tracing::warn!(job=job_id.0,%error,"PP custody release remains pending");}
+        if active.lock().unwrap().remove(&lease_id).is_some(){let _=engine.remove_job_silent(job_id).await;}
+
     });
 }
 
@@ -968,6 +1653,46 @@ async fn prepare_pp_attempt(
         job.id.0
     ));
     let target = dest_dir.join(&relative);
+    if let Some(context) = nzbd_state::artifacts::WorkerControlContext::for_job(job) {
+        if let Some(adoption) = inventory
+            .adopt_worker_retry(job.id.0, &context)
+            .map_err(|error| error.to_string())?
+        {
+            if let Some(mut completed) = adoption.completed_job {
+                completed
+                    .params
+                    .retain(|(key, _)| key != nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM);
+                completed.params.push((
+                    nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+                    serde_json::to_string(&context).map_err(|error| error.to_string())?,
+                ));
+                *job = completed;
+                return Ok(());
+            }
+            let private = adoption
+                .source
+                .path
+                .strip_prefix(dest_dir)
+                .map_err(|_| "retry source is outside configured processing root")?;
+            if private
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                || !private.starts_with(".nzbd-cluster/pp-work")
+            {
+                return Err("retry source is not a safe private cluster attempt".into());
+            }
+            job.dir_name = private.to_string_lossy().into_owned();
+            job.set_control(&adoption.control);
+            job.status = JobStatus::Paused;
+            for (key, value) in adoption.probe_params {
+                job.params.retain(|(existing, _)| existing != &key);
+                job.params.push((key, value));
+            }
+            job.params
+                .push(("*Cluster:original-dir".into(), original_dir));
+            return Ok(());
+        }
+    }
     let limit = job
         .totals
         .size
@@ -1033,43 +1758,79 @@ fn run_assembly(
     lease_id: String,
     tracker: &TaskTracker,
 ) {
-    tracker.spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            crate::range::assemble(job, &scope, &dest_dir, fence)
-        })
-        .await;
-        match result {
-            Ok(Ok(job)) => {
-                if let Some(state) = active.lock().unwrap().get_mut(&lease_id) {
-                    if state.deadline > Instant::now() {
-                        state.ready_job = Some(Box::new(job));
+    active
+        .clone()
+        .spawn_operation(tracker, lease_id.clone(), async move {
+            let result = tokio::task::spawn_blocking(move || {
+                crate::range::assemble(job, &scope, &dest_dir, fence)
+            })
+            .await;
+            match result {
+                Ok(Ok(job)) => {
+                    if let Some(state) = active.lock().unwrap().get_mut(&lease_id) {
+                        if state.deadline > Instant::now() {
+                            state.ready_job = Some(Box::new(job));
+                        }
                     }
                 }
+                Ok(Err(error)) => tracing::warn!(%lease_id, %error, "range assembly failed"),
+                Err(error) => tracing::warn!(%lease_id, %error, "range assembly task failed"),
             }
-            Ok(Err(error)) => tracing::warn!(%lease_id, %error, "range assembly failed"),
-            Err(error) => tracing::warn!(%lease_id, %error, "range assembly task failed"),
-        }
-    });
+        });
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct GenerationManifest {
-    job_id: u32,
-    job_incarnation: String,
-    owner_node_id: String,
-    fence: u64,
-    result_id: String,
-    job_sha256: String,
-    files: Vec<GenerationFile>,
-    total_bytes: u64,
-    sealed_at_unix_ms: i64,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GenerationManifest {
+    pub(crate) job_id: u32,
+    pub(crate) job_incarnation: String,
+    pub(crate) owner_node_id: String,
+    pub(crate) fence: u64,
+    pub(crate) result_id: String,
+    pub(crate) job_sha256: String,
+    pub(crate) files: Vec<GenerationFile>,
+    pub(crate) total_bytes: u64,
+    pub(crate) sealed_at_unix_ms: i64,
+    #[serde(default)]
+    pub(crate) artifact_copy: Option<nzbd_state::artifacts::ClusterArtifactCopy>,
+    #[serde(default)]
+    pub(crate) directory_identity: Option<(u64, u64)>,
+    #[serde(default)]
+    pub(crate) file_outcomes: Vec<nzbd_state::artifacts::DeliveryFileOutcome>,
+    #[serde(default)]
+    pub(crate) identity_version: u8,
+    #[serde(default)]
+    pub(crate) source_disposition: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct GenerationFile {
-    path: String,
-    bytes: u64,
-    sha256: String,
+impl GenerationManifest {
+    fn computed_identity(&self) -> Result<String, String> {
+        nzbd_state::artifacts::external_generation_identity(
+            self.identity_version,
+            self.job_id,
+            &self.job_incarnation,
+            &self.owner_node_id,
+            self.fence,
+            &self.job_sha256,
+            &self.files,
+            &self.artifact_copy,
+            &self.directory_identity,
+            &self.file_outcomes,
+            &self.source_disposition,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn identity_matches(&self) -> bool {
+        self.computed_identity()
+            .is_ok_and(|computed| computed == self.result_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GenerationFile {
+    pub(crate) path: String,
+    pub(crate) bytes: u64,
+    pub(crate) sha256: String,
 }
 
 struct SealedGeneration {
@@ -1100,9 +1861,27 @@ fn resolve_post_seal_source(
     job: &nzbd_types::Job,
 ) -> Result<Option<SealSource>, String> {
     let expected_source = dest_dir.join(nzbd_engine::queue::job_dir_name(job));
-    if let Some(publication) = inventory
-        .selected_publication_for_source(job.id.0, &expected_source)
-        .map_err(|error| format!("read selected PP publication journal: {error}"))?
+    let source = job
+        .params
+        .iter()
+        .find(|(key, _)| key == "Artifact:Id")
+        .zip(
+            job.params
+                .iter()
+                .find(|(key, _)| key == "Artifact:Generation"),
+        )
+        .map(
+            |((_, artifact), (_, generation))| nzbd_state::artifacts::SourceGeneration {
+                artifact: artifact.clone(),
+                generation: generation.clone(),
+            },
+        );
+    let publication = match &source {
+        Some(source) => inventory.selected_publication_for_generation(source, &expected_source),
+        None => inventory.selected_publication_for_source(job.id.0, &expected_source),
+    };
+    if let Some(publication) =
+        publication.map_err(|error| format!("read selected PP publication journal: {error}"))?
     {
         if !publication.path.is_dir() {
             return Err(format!(
@@ -1139,7 +1918,17 @@ fn resolve_post_seal_source(
     if matches!(job.status, JobStatus::Failed | JobStatus::Deleted) {
         return Ok(None);
     }
-    Err("completed PP lease has no selected publication for its private attempt".into())
+    Err(format!(
+        "completed PP lease has no selected publication for private attempt {}; exact source {:?}; current {:?}",
+        expected_source.display(),
+        source,
+        inventory.for_job(job.id.0).ok().flatten().map(|artifact| (
+            artifact.id,
+            artifact.generation,
+            artifact.path,
+            artifact.state
+        ))
+    ))
 }
 
 async fn seal_generation(
@@ -1164,11 +1953,9 @@ async fn seal_generation(
         let final_dir = root.join(format!("fence-{}", lease.token.fence));
         let manifest_path = final_dir.join("manifest.json");
         if manifest_path.exists() {
-            let manifest: GenerationManifest = serde_json::from_slice(
-                &std::fs::read(&manifest_path)
-                    .map_err(|error| format!("read sealed manifest: {error}"))?,
-            )
-            .map_err(|error| format!("decode sealed manifest: {error}"))?;
+            let manifest: GenerationManifest =
+                serde_json::from_slice(&read_bounded_file(&manifest_path, MAX_DESCRIPTOR_BYTES)?)
+                    .map_err(|error| format!("decode sealed manifest: {error}"))?;
             return Ok(SealedGeneration {
                 result_id: manifest.result_id,
                 path: final_dir,
@@ -1255,21 +2042,54 @@ async fn seal_generation(
         let job_bytes = serde_json::to_vec_pretty(&job)
             .map_err(|error| format!("encode generation job: {error}"))?;
         let job_sha256 = format!("{:x}", Sha256::digest(&job_bytes));
-        let identity = serde_json::to_vec(&(
-            job.id.0,
-            &lease.job_incarnation,
-            lease.token.fence,
-            &job_sha256,
-            &files,
-        ))
-        .map_err(|error| format!("encode generation identity: {error}"))?;
-        let result_id = format!("sha256:{:x}", Sha256::digest(identity));
-        let manifest = GenerationManifest {
+        let exact = job
+            .params
+            .iter()
+            .find(|(key, _)| key == "Artifact:Id")
+            .zip(
+                job.params
+                    .iter()
+                    .find(|(key, _)| key == "Artifact:Generation"),
+            )
+            .map(
+                |((_, artifact), (_, generation))| nzbd_state::artifacts::SourceGeneration {
+                    artifact: artifact.clone(),
+                    generation: generation.clone(),
+                },
+            );
+        let selected_copy = matches!(source.as_ref(), Some(SealSource::Selected(_)));
+        let artifact_copy = match exact.filter(|_| lease.kind == LeaseKind::Post) {
+            Some(source) => {
+                inventory.cluster_artifact_copy_for_generation(job.id.0, selected_copy, &source)
+            }
+            None => inventory.cluster_artifact_copy(job.id.0, selected_copy),
+        }
+        .map_err(|error| format!("capture cluster copy custody: {error}"))?;
+        let file_outcomes = match &artifact_copy {
+            Some(copy) if copy.selected => inventory
+                .delivery_file_outcomes(&copy.publication.artifact, &copy.publication.generation)
+                .map_err(|error| format!("capture cluster file outcomes: {error}"))?,
+            _ => Vec::new(),
+        };
+        let directory_identity = Some(generation_directory_identity(&building)?);
+        let mut manifest = GenerationManifest {
+            identity_version: 3,
+            source_disposition: inventory
+                .for_job(job.id.0)
+                .map_err(|error| error.to_string())?
+                .and_then(|artifact| {
+                    artifact
+                        .failure_assessment
+                        .map(|assessment| assessment.disposition)
+                }),
+            artifact_copy,
+            directory_identity,
+            file_outcomes,
             job_id: job.id.0,
             job_incarnation: lease.job_incarnation,
             owner_node_id: lease.token.owner_node_id,
             fence: lease.token.fence,
-            result_id: result_id.clone(),
+            result_id: String::new(),
             job_sha256,
             files,
             total_bytes: total,
@@ -1280,6 +2100,8 @@ async fn seal_generation(
                 .try_into()
                 .unwrap_or(i64::MAX),
         };
+        manifest.result_id = manifest.computed_identity()?;
+        let result_id = manifest.result_id.clone();
         let job_tmp = building.join("job.json.tmp");
         std::fs::write(&job_tmp, &job_bytes)
             .map_err(|error| format!("write generation job: {error}"))?;
@@ -1366,13 +2188,23 @@ fn copy_generation_tree(
         }
         std::fs::copy(&from, &to)
             .map_err(|error| format!("copy generation input {}: {error}", from.display()))?;
-        let bytes = std::fs::read(&to)
-            .map_err(|error| format!("hash generation file {}: {error}", to.display()))?;
         use sha2::{Digest, Sha256};
+        use std::io::Read;
+        let mut input =
+            std::fs::File::open(&to).map_err(|error| format!("open generation file: {error}"))?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0u8; 65536];
+        loop {
+            let count = input.read(&mut buffer).map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
         files.push(GenerationFile {
             path: rel.to_string_lossy().into_owned(),
             bytes: metadata.len(),
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: format!("{:x}", digest.finalize()),
         });
         std::fs::File::open(&to)
             .and_then(|file| file.sync_all())
@@ -1382,6 +2214,43 @@ fn copy_generation_tree(
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("flush generation directory {}: {error}", target.display()))?;
     Ok(())
+}
+
+pub(crate) fn read_bounded_file(path: &std::path::Path, limit: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    if file.metadata().map_err(|error| error.to_string())?.len() > limit as u64 {
+        return Err(
+            "cluster descriptor file exceeds supported bound; source retained for review".into(),
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > limit {
+        return Err(
+            "cluster descriptor grew past supported bound; source retained for review".into(),
+        );
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn generation_directory_identity(path: &std::path::Path) -> Result<(u64, u64), String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("generation directory changed type".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Err("generation cleanup identity unsupported on this platform".into())
+    }
 }
 
 fn conservative_deadline(cfg: &ClusterConfig) -> Instant {
@@ -1500,6 +2369,7 @@ mod tests {
         let _ = state.release_response.acquire().await;
         Json(PollResponse {
             grants: vec![Grant {
+                lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
                 lease_id: "transition-lease".into(),
                 token: test_token(),
                 job_incarnation: "test-job".into(),
@@ -1548,6 +2418,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn post_commit_authority_accepts_renewal_but_refuses_same_id_new_intent() {
+        let active: ActiveLeases = Default::default();
+        let state = LeaseState {
+            job: JobId(77),
+            kind: LeaseKind::Post,
+            token: test_token(),
+            job_incarnation: "original-job".into(),
+            job_revision: 4,
+            control_revision: 4,
+            deadline: Instant::now() + std::time::Duration::from_secs(30),
+            cancel: CancellationToken::new(),
+            pp_ready: false,
+            ready_job: None,
+        };
+        active
+            .lock()
+            .unwrap()
+            .insert("same-id".into(), state.clone());
+        let commit = lease_authority(&active, "same-id", &state);
+        assert!(commit());
+        active
+            .lock()
+            .unwrap()
+            .get_mut("same-id")
+            .unwrap()
+            .token
+            .revision += 1;
+        assert!(commit(), "same operation heartbeat renewal remains valid");
+        active
+            .lock()
+            .unwrap()
+            .get_mut("same-id")
+            .unwrap()
+            .control_revision += 1;
+        assert!(
+            !commit(),
+            "future deadline cannot authorize old PP after newer control intent"
+        );
+        active
+            .lock()
+            .unwrap()
+            .insert("same-id".into(), state.clone());
+        active
+            .lock()
+            .unwrap()
+            .get_mut("same-id")
+            .unwrap()
+            .job_incarnation = "replacement-job".into();
+        assert!(!commit());
+        active.lock().unwrap().insert("same-id".into(), state);
+        active
+            .lock()
+            .unwrap()
+            .get_mut("same-id")
+            .unwrap()
+            .token
+            .fence += 1;
+        assert!(!commit());
+    }
     #[test]
     fn failed_generation_build_releases_private_staging_tree() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1890,6 +2820,7 @@ mod tests {
             (nzbd_types::PP_DONE_PARAM.into(), "SUCCESS".into()),
         ]);
         let request = CompleteRequest {
+            lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
             node: "worker".into(),
             lease_id: "transition-lease".into(),
             token: test_token(),
@@ -1905,6 +2836,7 @@ mod tests {
             durable_receipt: None,
             accepted_at_unix_ms: Some(10),
             history_recorded_by_authority: true,
+            cleanup_only: false,
         };
         assert!(accept_worker_retirement(&engine, &request, &response)
             .await
@@ -1922,3 +2854,7 @@ mod tests {
         engine.shutdown().await;
     }
 }
+
+#[cfg(test)]
+#[path = "worker_crc_tests.rs"]
+mod crc_tests;

@@ -9,7 +9,7 @@ use crate::http::secret_matches;
 use crate::proto::*;
 use crate::registry::read_nodes;
 use crate::{ClusterConfig, SharedLayout};
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -49,6 +49,79 @@ struct BudgetHandoff {
     awaiting_shrink: HashSet<String>,
 }
 
+type CompletionReply = (StatusCode, Vec<u8>);
+#[derive(Default)]
+pub(crate) struct CompletionOperations {
+    entries: Mutex<HashMap<String, watch::Receiver<Option<CompletionReply>>>>,
+}
+impl CompletionOperations {
+    /// Own the whole verified completion through its durable receipt and
+    /// publication, independently of a caller's shorter network deadline.
+    pub(crate) async fn run<F>(&self, key: String, work: F) -> Result<CompletionReply, String>
+    where
+        F: std::future::Future<Output = Response> + Send + 'static,
+    {
+        let mut receiver = {
+            let mut entries = self.entries.lock().unwrap();
+            if entries.get(&key).is_some_and(|receiver| {
+                receiver
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|(status, _)| !status.is_success())
+            }) {
+                entries.remove(&key);
+            }
+            if let Some(receiver) = entries.get(&key) {
+                receiver.clone()
+            } else {
+                while entries.len() >= 32 {
+                    let finished = entries
+                        .iter()
+                        .find(|(_, receiver)| receiver.borrow().is_some())
+                        .map(|(key, _)| key.clone());
+                    match finished {
+                        Some(key) => {
+                            entries.remove(&key);
+                        }
+                        None => {
+                            return Err(
+                                "32 completion operations are active; retry after one finishes"
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                let (sender, receiver) = watch::channel(None);
+                entries.insert(key, receiver.clone());
+                tokio::spawn(async move {
+                    let response = work.await;
+                    let status = response.status();
+                    let reply = match axum::body::to_bytes(response.into_body(), MAX_RPC_BYTES)
+                        .await
+                    {
+                        Ok(body) => (status, body.to_vec()),
+                        Err(error) => (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("completion reply could not be retained: {error}").into_bytes(),
+                        ),
+                    };
+                    let _ = sender.send(Some(reply));
+                });
+                receiver
+            }
+        };
+        loop {
+            if let Some(reply) = receiver.borrow().clone() {
+                return Ok(reply);
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| "completion operation ended without a durable result".to_owned())?;
+        }
+    }
+}
+
 pub struct LeaderShared {
     pub engine: EngineHandle,
     pub layout: SharedLayout,
@@ -68,7 +141,27 @@ pub struct LeaderShared {
     /// commits. The engine is speculative until replicated control accepts
     /// the exact request-local delta.
     pub(crate) mutation_serial: tokio::sync::Mutex<()>,
+    pub(crate) delivery_serial: tokio::sync::Mutex<()>,
     authority_ready: AtomicBool,
+    /// With one descriptor per poll, alternate the first lane so a stream of
+    /// downloads cannot starve a worker's free post-processing capacity.
+    post_poll_turn: Mutex<HashSet<String>>,
+    completion_operations: CompletionOperations,
+    pub(crate) copy_operations: CompletionOperations,
+    pub(crate) copy_guards: crate::cluster_keep::CopyGuards,
+    pub(crate) control_proofs: crate::control_proofs::ControlProofs,
+    pub(crate) worker_leases: Mutex<Option<crate::worker::ActiveLeases>>,
+    #[cfg(test)]
+    verification_gate: Mutex<Option<Arc<VerificationGate>>>,
+    #[cfg(test)]
+    projection_gate: Mutex<Option<Arc<VerificationGate>>>,
+    #[cfg(test)]
+    grant_gate: Mutex<Option<Arc<VerificationGate>>>,
+}
+#[cfg(test)]
+struct VerificationGate {
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
 }
 
 pub(crate) struct LeaderDurability {
@@ -122,7 +215,20 @@ impl LeaderShared {
             node_seen: Mutex::new(HashMap::new()),
             budgets: Mutex::new(BudgetHandoff::default()),
             mutation_serial: tokio::sync::Mutex::new(()),
+            delivery_serial: tokio::sync::Mutex::new(()),
             authority_ready: AtomicBool::new(false),
+            post_poll_turn: Mutex::new(HashSet::new()),
+            completion_operations: CompletionOperations::default(),
+            copy_operations: CompletionOperations::default(),
+            copy_guards: Default::default(),
+            control_proofs: Default::default(),
+            worker_leases: Mutex::new(None),
+            #[cfg(test)]
+            verification_gate: Mutex::new(None),
+            #[cfg(test)]
+            projection_gate: Mutex::new(None),
+            #[cfg(test)]
+            grant_gate: Mutex::new(None),
         })
     }
 
@@ -165,20 +271,13 @@ impl LeaderShared {
     }
 
     pub(crate) async fn restore_control_projection(&self) -> Result<(), String> {
-        let control = self
-            .control
-            .as_ref()
-            .ok_or_else(|| "replicated control unavailable".to_owned())?;
-        let jobs = control
-            .load_jobs()
-            .await?
-            .into_iter()
-            .map(|(job, _, _)| job)
-            .collect();
+        crate::control_recovery::reconcile(self).await?;
+        let jobs = crate::control_recovery::projection(self).await?;
         self.engine
             .adopt_replicated_authority(jobs)
             .await
-            .map_err(|error| format!("replace local control projection: {error}"))
+            .map_err(|error| format!("replace local control projection: {error}"))?;
+        crate::admissions::adopt_counters(self).await
     }
 
     /// Commit only rows changed by one serialized HTTP request. This avoids
@@ -187,12 +286,56 @@ impl LeaderShared {
     pub(crate) async fn commit_mutation_delta(
         &self,
         before: &HashMap<u64, nzbd_types::Job>,
+        fences: &HashMap<u64, u64>,
+        removals: &std::collections::BTreeMap<u32, bool>,
     ) -> Result<(), String> {
         let control = self
             .control
             .as_ref()
             .ok_or_else(|| "replicated control unavailable".to_owned())?;
-        let after = self.engine_projection().await?;
+        let mut after = self.engine_projection().await?;
+        for job in after.values_mut() {
+            if let Some(marker) = nzbd_engine::automatic_control::transition(job) {
+                let old = before.get(&u64::from(job.id.0));
+                let same_business = match old {
+                    Some(old) => {
+                        crate::control_recovery::business_intent(old)?
+                            == crate::control_recovery::business_intent(job)?
+                    }
+                    None => false,
+                };
+                if let Some(old) = old.filter(|_| same_business) {
+                    // Automatic/progress changes on another job belong to
+                    // reconciliation, never this request's whole-job delta.
+                    *job = old.clone();
+                    continue;
+                }
+                if old
+                    .and_then(nzbd_engine::automatic_control::transition)
+                    .is_some_and(|prior| prior.identity == marker.identity)
+                {
+                    // Explicit Keep/name/source edits replace a pending result
+                    // without accepting an unproved automatic release.
+                    let (durable, _, _) = control
+                        .current_job_intent(job.id.0)
+                        .await?
+                        .ok_or("pending job was removed by another authority")?;
+                    job.params.retain(|(key, _)| {
+                        key != nzbd_engine::automatic_control::AUTOMATIC_CONTROL_PARAM
+                            && key != nzbd_types::CONTROL_PARAM
+                    });
+                    if let Some(current) = durable.control() {
+                        job.set_control(&current);
+                    }
+                    job.status = durable.status;
+                } else {
+                    return Err("automatic recovery changed this job during the request; retry against current control".into());
+                }
+            }
+            if !before.contains_key(&u64::from(job.id.0)) {
+                crate::source_facts::bind_owned(self, job)?;
+            }
+        }
         let mut ids: HashSet<u64> = before.keys().copied().collect();
         ids.extend(after.keys().copied());
         let mut changes = Vec::new();
@@ -211,8 +354,47 @@ impl LeaderShared {
                 changes.push((job_id, after.get(&job_id).cloned()));
             }
         }
-        control.commit_job_delta(&changes).await?;
+        let receipts = crate::admissions::pending_receipts(self).await?;
+        control
+            .commit_job_delta_guarded_with_removals(
+                &changes,
+                fences,
+                &receipts,
+                Some((&self.cfg.node_name, &self.owner_incarnation, self.epoch())),
+                &removals
+                    .iter()
+                    .map(|(job, files)| {
+                        (
+                            *job,
+                            if *files {
+                                crate::cancellation::RemovalMode::DeleteFiles
+                            } else {
+                                crate::cancellation::RemovalMode::KeepFiles
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+            .await?;
+        if !receipts.is_empty()
+            && !self
+                .engine
+                .adopt_url_admissions(receipts)
+                .await
+                .map_err(|error| error.to_string())?
+        {
+            self.fence_authority();
+            return Err("engine refused committed admission projection".into());
+        }
         self.restore_control_projection().await
+    }
+
+    pub(crate) fn authority_identity(&self) -> (&str, &str, u64) {
+        (&self.cfg.node_name, &self.owner_incarnation, self.epoch())
+    }
+
+    pub(crate) fn fence_authority(&self) {
+        self.authority_ready.store(false, Ordering::Release);
     }
 
     fn is_leader(&self) -> bool {
@@ -259,6 +441,7 @@ impl LeaderShared {
         }
         serde_json::json!({
             "leases": leases,
+            "controlProofs":self.control_proofs.snapshot(),
             "provider_budgets": {
                 "generation": budget.generation,
                 "desired": budget.pending_target.as_ref().unwrap_or(&budget.grants),
@@ -466,11 +649,66 @@ impl LeaderShared {
         owner_incarnation: &str,
         kind: LeaseKind,
         mut job: nzbd_types::Job,
-        scope: serde_json::Value,
+        mut scope: serde_json::Value,
     ) -> Option<Grant> {
+        let (issuer_node, issuer_incarnation, issuer_fence) = self.authority_identity();
+        scope.as_object_mut()?.insert("_authority".into(),serde_json::json!({"node":issuer_node,"incarnation":issuer_incarnation,"fence":issuer_fence}));
         let control = self.control.as_ref()?;
-        let (job_incarnation, job_revision) =
-            control.job_identity(job.id.0.into()).await.ok().flatten()?;
+        let (durable, job_revision, job_incarnation) = match control
+            .current_job_intent(job.id.0)
+            .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(job=job.id.0,%error,"grant paused until current durable intent is available");
+                return None;
+            }
+        };
+        if !crate::control_recovery::grant_intent_matches(&job, &durable).ok()? {
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let differences = grant_intent_differences(&job, &durable);
+                tracing::debug!(job=job.id.0,%node,?kind,?differences,"grant awaits exact replicated intent");
+            }
+            return None;
+        }
+        if serde_json::to_vec(&(&job, &scope)).ok()?.len() > MAX_DESCRIPTOR_BYTES {
+            let message = format!(
+                "job descriptor exceeds the {} MiB cluster limit; split the NZB or reduce its metadata before retrying",
+                MAX_DESCRIPTOR_BYTES / 1024 / 1024
+            );
+            let _serial = self.mutation_serial.lock().await;
+            // The descriptor was measured before acquiring the mutation lane.
+            // A newer operator edit must be re-measured on its own request.
+            if control
+                .current_job_intent(job.id.0)
+                .await
+                .ok()
+                .flatten()
+                .is_none_or(|(_, revision, incarnation)| {
+                    revision != job_revision || incarnation != job_incarnation
+                })
+            {
+                return None;
+            }
+            if self
+                .engine
+                .hold_job(
+                    job.id,
+                    nzbd_types::HoldCause::parse("descriptor_oversize"),
+                    "cluster",
+                    &message,
+                )
+                .await
+                .is_ok_and(|held| held)
+            {
+                if let Err(error) = crate::control_recovery::reconcile(self).await {
+                    tracing::warn!(%error, job=job.id.0, "descriptor hold awaits replicated control");
+                }
+            }
+            tracing::warn!(job=job.id.0, %message, "cluster work descriptor refused");
+            return None;
+        }
         let kind_name = match kind {
             LeaseKind::Download => "download",
             LeaseKind::Post => "post",
@@ -492,6 +730,14 @@ impl LeaderShared {
             _ => format!("work/job/{}/{kind_name}", job.id.0),
         };
         let scope_json = serde_json::to_string(&scope).ok()?;
+        #[cfg(test)]
+        {
+            let gate = self.grant_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.entered.add_permits(1);
+                gate.release.acquire().await.unwrap().forget();
+            }
+        }
         let token = match control
             .acquire(
                 &resource,
@@ -534,13 +780,14 @@ impl LeaderShared {
         let (budget_generation, server_budgets) = self.budget_command(node, None);
         self.persist_budget_state().await;
         Some(Grant {
+            lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
             lease_id,
             token,
             job_incarnation,
             job_revision,
             control_revision: job_revision,
             scope,
-            epoch: self.epoch(),
+            epoch: issuer_fence,
             kind,
             job,
             server_budgets,
@@ -582,6 +829,46 @@ pub fn router(shared: Arc<LeaderShared>) -> Router {
         .route("/cluster/v1/work/heartbeat", post(work_heartbeat))
         .route("/cluster/v1/work/complete", post(work_complete))
         .route("/cluster/v1/work/reject", post(work_reject))
+        .route(
+            "/cluster/v1/keep/apply",
+            post(crate::cluster_keep::apply_owner),
+        )
+        .route(
+            "/cluster/v1/work/cancellation-seal",
+            post(crate::cancellation_routes::seal),
+        )
+        .route(
+            "/cluster/v1/work/cancellation-stop-authority",
+            post(crate::cancellation_routes::stop_authority),
+        )
+        .route(
+            "/cluster/v1/work/cancellation-seal-authority",
+            post(crate::cancellation_routes::seal_authority),
+        )
+        .route(
+            "/cluster/v1/work/cancelled-completion",
+            post(crate::cancellation_routes::completed),
+        )
+        .route(
+            "/cluster/v1/work/cancellation-stop",
+            post(crate::cancellation_routes::stop),
+        )
+        .route(
+            "/cluster/v1/work/relocation-proof",
+            post(crate::control_recovery::relocation_proof).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/cluster/v1/deliveries/migrate-page",
+            post(crate::delivery::local_delivery_page),
+        )
+        .route(
+            "/cluster/v1/deliveries/copy-authority",
+            post(crate::delivery::copy_authority),
+        )
+        .route(
+            "/cluster/v1/deliveries/cleanup-copy",
+            post(crate::delivery::cleanup_copy),
+        )
         .route("/cluster/v1/work/script-receipt", post(work_script_receipt))
         // Authenticate the peer namespace before extractors parse a request
         // body. Otherwise an unauthenticated malformed request can reveal
@@ -590,6 +877,7 @@ pub fn router(shared: Arc<LeaderShared>) -> Router {
             shared.clone(),
             require_cluster_secret,
         ))
+        .layer(DefaultBodyLimit::max(MAX_RPC_BYTES))
         .with_state(shared)
 }
 
@@ -715,6 +1003,12 @@ async fn leader_info(State(s): State<Arc<LeaderShared>>, headers: HeaderMap) -> 
     .into_response()
 }
 
+fn poll_scope(request: &PollRequest, mut scope: serde_json::Value) -> serde_json::Value {
+    scope["_workerStorage"] = serde_json::Value::String(request.storage_instance_id.clone());
+    scope["_startOrdered"] = serde_json::json!(request.start_ordering);
+    scope
+}
+
 async fn work_poll(
     State(s): State<Arc<LeaderShared>>,
     headers: HeaderMap,
@@ -729,13 +1023,26 @@ async fn work_poll(
     if !s.authority_ready() {
         return authority_not_ready();
     }
+    if req.start_ordering != 1
+        || req.storage_instance_id.is_empty()
+        || req.storage_instance_id.len() > 128
+        || req.storage_instance_id.chars().any(char::is_control)
+    {
+        return (StatusCode::UPGRADE_REQUIRED,Json(serde_json::json!({"error":"worker requires durable start/stop ordering and receiver storage identity; upgrade before accepting work"}))).into_response();
+    }
+    if req.lifecycle_protocol < LIFECYCLE_PROTOCOL {
+        return (StatusCode::UPGRADE_REQUIRED,Json(serde_json::json!({"error":"worker requires cluster lifecycle protocol 2 (durable completion outbox and exact copy cleanup); upgrade this worker"}))).into_response();
+    }
     // The registry is the leader's independent admission fact. Do not trust
     // slot counts from a poll whose node is already known to be held.
-    if read_nodes(&s.layout)
+    let registered = read_nodes(&s.layout)
         .into_iter()
-        .find(|node| node.name == req.node)
-        .is_none_or(|node| !worker_admits_new_work(&node))
+        .find(|node| node.name == req.node);
+    if registered
+        .as_ref()
+        .is_none_or(|node| !worker_admits_new_work(node))
     {
+        tracing::debug!(node=%req.node,free_pp=req.free_pp_slots,registered=registered.is_some(),disk_low=?registered.as_ref().map(|node|node.disk_low),disk_guard=?registered.as_ref().map(|node|node.disk_guard_capable),"worker poll awaits registry admission");
         return Json(PollResponse::default()).into_response();
     }
 
@@ -744,6 +1051,15 @@ async fn work_poll(
     // only one bounded article view.
     let snap = s.engine.snapshot();
     let mut grants = Vec::new();
+    let post_first =
+        req.free_pp_slots > 0 && post_lane_first(&mut s.post_poll_turn.lock().unwrap(), &req.node);
+    if post_first {
+        if let Some(grant) = grant_post_candidate(&s, &req, &snap).await {
+            grants.push(grant);
+            s.apply_local_budgets().await;
+            return Json(PollResponse { grants }).into_response();
+        }
+    }
     if req.free_download_slots > 0 {
         let range_jobs: Vec<JobId> = snap
             .jobs
@@ -799,13 +1115,14 @@ async fn work_poll(
                         &req.owner_incarnation,
                         LeaseKind::Segment,
                         job.clone(),
-                        serde_json::to_value(scope).unwrap(),
+                        poll_scope(&req, serde_json::to_value(scope).unwrap()),
                     )
                     .await
                 {
                     tracing::info!(job = job_id.0, file = scope.file_id, first = scope.first_article, last = scope.last_article, node = %req.node, "article range granted");
                     grants.push(grant);
-                    break 'jobs;
+                    s.apply_local_budgets().await;
+                    return Json(PollResponse { grants }).into_response();
                 }
             }
             if accepted.len() == scopes.len() {
@@ -838,13 +1155,14 @@ async fn work_poll(
                             &req.owner_incarnation,
                             LeaseKind::Assemble,
                             job,
-                            serde_json::to_value(scope).unwrap(),
+                            poll_scope(&req, serde_json::to_value(scope).unwrap()),
                         )
                         .await
                     {
                         tracing::info!(job = job_id.0, node = %req.node, "assembly lease granted");
                         grants.push(grant);
-                        break 'jobs;
+                        s.apply_local_budgets().await;
+                        return Json(PollResponse { grants }).into_response();
                     }
                 }
             }
@@ -883,18 +1201,34 @@ async fn work_poll(
                 &req.owner_incarnation,
                 LeaseKind::Download,
                 job,
-                serde_json::json!({"whole_job": true}),
+                poll_scope(&req, serde_json::json!({"whole_job": true})),
             )
             .await
         {
             tracing::info!(job = job_id.0, node = %req.node, lease = %grant.lease_id, "download lease granted");
             grants.push(grant);
+            s.apply_local_budgets().await;
+            return Json(PollResponse { grants }).into_response();
         }
     }
 
+    if let Some(grant) = grant_post_candidate(&s, &req, &snap).await {
+        grants.push(grant);
+    }
+
+    if !grants.is_empty() {
+        s.apply_local_budgets().await;
+    }
+    Json(PollResponse { grants }).into_response()
+}
+
+async fn grant_post_candidate(
+    s: &LeaderShared,
+    req: &PollRequest,
+    snap: &nzbd_engine::QueueSnapshot,
+) -> Option<Grant> {
     // PP grants (C2): completed jobs the scheduler assigned to this node
     // for post-processing, not yet leased, PP not yet done.
-    let mut pp_granted = 0u32;
     let pp_candidates: Vec<JobId> = snap
         .jobs
         .iter()
@@ -906,15 +1240,21 @@ async fn work_poll(
         .map(|j| j.id)
         .collect();
     for job_id in pp_candidates {
-        if pp_granted >= req.free_pp_slots {
+        if req.free_pp_slots == 0 {
+            tracing::debug!(job=job_id.0,node=%req.node,"POST grant awaits free worker slot");
             break;
         }
         let already = s.leases.lock().unwrap().values().any(|l| l.job == job_id);
         if already {
+            tracing::debug!(job=job_id.0,node=%req.node,"POST grant awaits existing lease retirement");
             continue;
         }
-        let Ok(Some(job)) = s.engine.export_job(job_id).await else {
-            continue;
+        let job = match s.engine.export_job(job_id).await {
+            Ok(Some(job)) => job,
+            result => {
+                tracing::debug!(job=job_id.0,node=%req.node,error=?result.err(),"POST grant awaits export readiness");
+                continue;
+            }
         };
         if let Some(grant) = s
             .grant_job(
@@ -922,20 +1262,109 @@ async fn work_poll(
                 &req.owner_incarnation,
                 LeaseKind::Post,
                 job,
-                serde_json::json!({"whole_job": true}),
+                poll_scope(req, serde_json::json!({"whole_job": true})),
             )
             .await
         {
-            tracing::info!(job = job_id.0, node = %req.node, lease = %grant.lease_id, "pp lease granted");
-            pp_granted += 1;
-            grants.push(grant);
+            return Some(grant);
         }
     }
+    None
+}
 
-    if !grants.is_empty() {
-        s.apply_local_budgets().await;
+/// Field names only: never log a URL, descriptor or parameter value.
+fn grant_intent_differences(local: &nzbd_types::Job, durable: &nzbd_types::Job) -> Vec<String> {
+    let mut differences = Vec::new();
+    if local.status != durable.status {
+        differences.push("status".into());
     }
-    Json(PollResponse { grants }).into_response()
+    if local.control() != durable.control() {
+        differences.push("control".into());
+    }
+    if durable.held() {
+        differences.push("durable-held".into());
+    }
+    if nzbd_engine::automatic_control::transition(local).is_some() {
+        differences.push("local-automatic-transition".into());
+    }
+    let pair = crate::control_recovery::business_intent(local).and_then(|local| {
+        crate::control_recovery::business_intent(durable).map(|durable| (local, durable))
+    });
+    let Ok((local, durable)) = pair else {
+        differences.push("intent-serialization".into());
+        return differences;
+    };
+    let pair = serde_json::from_slice::<serde_json::Value>(&local).and_then(|local| {
+        serde_json::from_slice::<serde_json::Value>(&durable).map(|durable| (local, durable))
+    });
+    let Ok((local, durable)) = pair else {
+        differences.push("intent-decoding".into());
+        return differences;
+    };
+    for (index, name) in [
+        "id",
+        "kind",
+        "name",
+        "dir_name",
+        "name_provisional",
+        "queued_at_unix",
+        "original_name",
+        "category",
+        "priority",
+        "dupe",
+        "delivery_lifecycle",
+        "params",
+        "files",
+    ]
+    .iter()
+    .enumerate()
+    {
+        if local[index] == durable[index] {
+            continue;
+        }
+        differences.push((*name).into());
+        if *name == "params" {
+            let map =
+                |value: &serde_json::Value| -> std::collections::BTreeMap<String, Vec<String>> {
+                    let mut map = std::collections::BTreeMap::new();
+                    for pair in value.as_array().into_iter().flatten() {
+                        if let (Some(key), Some(value)) = (pair[0].as_str(), pair[1].as_str()) {
+                            map.entry(key.to_owned())
+                                .or_insert_with(Vec::new)
+                                .push(value.to_owned());
+                        }
+                    }
+                    map
+                };
+            let left = map(&local[index]);
+            let right = map(&durable[index]);
+            for key in left
+                .keys()
+                .chain(right.keys())
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                if left.get(key) != right.get(key) {
+                    differences.push(format!(
+                        "param:{}",
+                        key.chars().take(96).collect::<String>()
+                    ));
+                    if differences.len() >= 48 {
+                        return differences;
+                    }
+                }
+            }
+        }
+    }
+    differences
+}
+
+fn post_lane_first(turns: &mut HashSet<String>, node: &str) -> bool {
+    if turns.remove(node) {
+        false
+    } else {
+        turns.insert(node.to_owned());
+        true
+    }
 }
 
 fn range_owner(workers: &[NodeRecord], index: u32) -> Option<&str> {
@@ -1169,14 +1598,51 @@ async fn work_complete(
     if !authed(&s, &headers) {
         return denied();
     }
+    if !s.is_leader() || !s.authority_ready() {
+        return authority_not_ready();
+    }
+    use sha2::{Digest, Sha256};
+    let key = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&req).expect("completion serializes"))
+    );
+    let operation_owner = s.clone();
+    match s
+        .completion_operations
+        .run(key, async move {
+            complete_operation(operation_owner, req).await
+        })
+        .await
+    {
+        Ok((status, body)) => (
+            status,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":error})),
+        )
+            .into_response(),
+    }
+}
+
+async fn complete_operation(s: Arc<LeaderShared>, req: CompleteRequest) -> Response {
     if !s.is_leader() {
         return not_leader();
     }
     if !s.authority_ready() {
         return authority_not_ready();
     }
-    let _serial = s.mutation_serial.lock().await;
     let job_id = req.job.id;
+    if req.job.delivery_lifecycle && req.lifecycle_protocol < LIFECYCLE_PROTOCOL {
+        return (StatusCode::UPGRADE_REQUIRED,Json(serde_json::json!({"error":"lifecycle completion requires protocol 2 copy custody/outbox metadata"}))).into_response();
+    }
+    if serde_json::to_vec(&req.job).map_or(true, |bytes| bytes.len() > MAX_DESCRIPTOR_BYTES) {
+        return (StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "completed job descriptor exceeds 16 MiB; reduce metadata before retrying"}))).into_response();
+    }
     let durable_receipt = match &s.control {
         Some(control) => control
             .publication_record(&req.receipt_id)
@@ -1245,6 +1711,20 @@ async fn work_complete(
         )
             .into_response();
     }
+    let ready_delivery_id = cluster_delivery_id(&req.result_id);
+    let already_ready = match &s.control {
+        Some(control) => match control.cluster_delivery(&ready_delivery_id).await {
+            Ok(record) => record,
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error":error})),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
     let verify_root = s.cfg.shared_dir.clone();
     let verify_ref = req.result_ref.clone();
     let verify_id = req.result_id.clone();
@@ -1261,8 +1741,26 @@ async fn work_complete(
     };
     let verify_job = req.job.clone();
     let verify_fence = req.token.fence;
-    let verified = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
+    #[cfg(test)]
+    {
+        let gate = s.verification_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.entered.add_permits(1);
+            gate.release.acquire().await.unwrap().forget();
+        }
+    }
+    let verified = if let Some(record) = &already_ready {
+        Ok(Ok(record
+            .delivery
+            .files
+            .iter()
+            .map(|file| nzbd_state::artifacts::ExternalGenerationFile {
+                path: file.path.clone(),
+                bytes: file.size_bytes,
+                sha256: file.sha256.clone(),
+            })
+            .collect()))
+    } else {
         tokio::task::spawn_blocking(move || {
             verify_generation(
                 &verify_root,
@@ -1272,20 +1770,21 @@ async fn work_complete(
                 verify_fence,
                 &verify_job,
             )
-        }),
-    )
-    .await;
+        })
+        .await
+    };
     let verified_files = match verified {
-        Ok(Ok(Ok(files))) => files,
+        Ok(Ok(value)) => value,
         _ => {
-            tracing::warn!(job = job_id.0, owner_incarnation = %verify_incarnation, "completion generation validation failed or timed out");
+            tracing::warn!(job=job_id.0,owner_incarnation=%verify_incarnation,"completion generation validation failed");
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({"error": "invalid completion generation"})),
+                Json(serde_json::json!({"error":"invalid completion generation"})),
             )
                 .into_response();
         }
     };
+    let has_payload = !verified_files.is_empty();
     let outcome = match &s.control {
         Some(control) => {
             let result_job_json =
@@ -1300,7 +1799,7 @@ async fn work_complete(
                     }
                 };
             control
-                .publish_result(
+                .publish_result_renewable(
                     &req.receipt_id,
                     &req.token,
                     req.expected_job_revision,
@@ -1362,6 +1861,7 @@ async fn work_complete(
             durable_receipt: Some(req.receipt_id),
             accepted_at_unix_ms: Some(accepted_at_ms),
             history_recorded_by_authority: false,
+            cleanup_only: false,
         })
         .into_response();
     }
@@ -1389,8 +1889,13 @@ async fn work_complete(
             )
                 .into_response();
         };
-        let final_path = dest_dir.join(&original_dir);
-        published_job.dir_name = original_dir;
+        let publish_dir = cluster_publication_name(
+            &original_dir,
+            &req.result_id,
+            info.kind == LeaseKind::Post && published_job.delivery_lifecycle,
+        );
+        let final_path = dest_dir.join(&publish_dir);
+        published_job.dir_name = publish_dir;
         published_job
             .params
             .retain(|(key, _)| key != "*Cluster:final-dir");
@@ -1406,36 +1911,151 @@ async fn work_complete(
         };
         let history = (info.kind == LeaseKind::Post && s.history.is_some())
             .then(|| pp_history_entry(&published_job, accepted_at_ms, &final_path));
-        if let Err(error) = s
-            .engine
-            .materialize_generation(
-                published_job.clone(),
-                dest_dir,
-                final_path.clone(),
-                publication,
-                history,
-                true,
-            )
-            .await
-        {
-            tracing::warn!(job=job_id.0, %error, "accepted generation materialization remains pending");
-            return (
+        if already_ready.is_none() && has_payload {
+            if let Err(error) = s
+                .engine
+                .materialize_generation(
+                    published_job.clone(),
+                    dest_dir,
+                    final_path.clone(),
+                    publication,
+                    history,
+                    true,
+                )
+                .await
+            {
+                tracing::warn!(job=job_id.0, %error, "accepted generation materialization remains pending");
+                return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error": "generation selected but final directory publication is incomplete"})),
             ).into_response();
+            }
         }
         final_publication = Some(final_path);
     }
-    let history_recorded_by_authority = info.kind == LeaseKind::Post && s.history.is_some();
-    tracing::info!(job = job_id.0, node = %req.node, "job completed remotely");
-    if !matches!(info.kind, LeaseKind::Post | LeaseKind::Assemble) {
-        if let Err(error) = s.engine.import_job(published_job, false, true).await {
-            tracing::error!(job = job_id.0, %error, "durable result accepted but local projection failed");
+    if !has_payload {
+        published_job
+            .params
+            .push(("*Cluster:cleanup-only".into(), "1".into()));
+        published_job.params.push((
+            "Cluster:CleanupId".into(),
+            cluster_delivery_id(&req.result_id),
+        ));
+    }
+    #[cfg(test)]
+    {
+        let gate = s.projection_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.entered.add_permits(1);
+            gate.release.acquire().await.unwrap().forget();
         }
     }
-    if info.kind == LeaseKind::Assemble {
-        let _ = s.engine.set_delegated(job_id, None).await;
+    // Bulk verification/publication never holds the queue control mutex.
+    // Rebase only completion metadata onto the current durable intent here.
+    let _projection = s.mutation_serial.lock().await;
+    let selected = match s
+        .control
+        .as_ref()
+        .unwrap()
+        .selected_publication_job(job_id.0, &req.result_id)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error":error})),
+            )
+                .into_response();
+        }
+    };
+    let Some((mut current_job, current_revision)) = selected else {
+        let _ = s.restore_control_projection().await;
+        if already_ready.is_none() {
+            return (StatusCode::CONFLICT,Json(serde_json::json!({"error":"selected completion was superseded by durable cancellation before handoff"}))).into_response();
+        }
+        return Json(CompleteResponse {
+            final_dir: final_publication.map(|path| path.to_string_lossy().into_owned()),
+            ok: true,
+            durable_receipt: Some(req.receipt_id),
+            accepted_at_unix_ms: Some(accepted_at_ms),
+            history_recorded_by_authority: true,
+            cleanup_only: !has_payload,
+        })
+        .into_response();
+    };
+    for (key, value) in published_job.params.iter().filter(|(key, _)| {
+        matches!(
+            key.as_str(),
+            "*Cluster:result-ref"
+                | "*Cluster:final-dir"
+                | "*Cluster:cleanup-only"
+                | "Cluster:CleanupId"
+        )
+    }) {
+        current_job.params.retain(|(existing, _)| existing != key);
+        current_job.params.push((key.clone(), value.clone()));
     }
+    published_job = current_job;
+    if info.kind == LeaseKind::Post && published_job.delivery_lifecycle {
+        match ensure_cluster_delivery(&s, &published_job, &req.result_id, &req.result_ref, &req.receipt_id,
+            accepted_at_ms, final_publication.as_deref().expect("post path")).await {
+            Ok(Some(delivery))=>attach_delivery_params(&mut published_job,&delivery),
+            Ok(None)=>{},
+            Err(error)=>return (StatusCode::SERVICE_UNAVAILABLE,Json(serde_json::json!({"error":format!("published result awaits durable Delivery: {error}")}))).into_response(),
+        }
+    }
+    if info.kind == LeaseKind::Post {
+        if let Some(path) = final_publication.as_deref() {
+            if let Err(error) = record_pp_history(&s, &published_job, accepted_at_ms, path).await {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error":error})),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let history_recorded_by_authority = info.kind == LeaseKind::Post && s.history.is_some();
+    tracing::info!(job = job_id.0, node = %req.node, "job completed remotely");
+    let next = serde_json::to_string(&published_job).expect("publication job serializes");
+    let key = format!(
+        "publication-projection:{}:{current_revision}",
+        req.result_id
+    );
+    match s
+        .control
+        .as_ref()
+        .unwrap()
+        .apply_command(
+            &key,
+            u64::from(job_id.0),
+            current_revision,
+            r#"{"op":"publication_projection"}"#,
+            &next,
+            false,
+        )
+        .await
+    {
+        Ok(MutationOutcome::Applied { .. } | MutationOutcome::Duplicate { .. }) => {}
+        Ok(MutationOutcome::Conflict) => {
+            let _ = s.restore_control_projection().await;
+            return (StatusCode::CONFLICT,Json(serde_json::json!({"error":"current intent changed while finalizing publication"}))).into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error":error})),
+            )
+                .into_response();
+        }
+    }
+    if let Err(error) = s.restore_control_projection().await {
+        tracing::error!(job=job_id.0,%error,"durable completion projection awaits replay");
+    }
+    // Delegation is a local scheduler projection, not durable intent. Its
+    // completed lease must release this slot after reloading current control.
+    let _ = s.engine.set_delegated(job_id, None).await;
     s.leases.lock().unwrap().remove(&req.lease_id);
     s.apply_local_budgets().await;
     Json(CompleteResponse {
@@ -1444,6 +2064,7 @@ async fn work_complete(
         durable_receipt: Some(req.receipt_id),
         accepted_at_unix_ms: Some(accepted_at_ms),
         history_recorded_by_authority,
+        cleanup_only: !has_payload,
     })
     .into_response()
 }
@@ -1483,8 +2104,8 @@ fn publication_retry_matches(
         && receipt.owner_node_id == request.token.owner_node_id
         && receipt.owner_incarnation == request.token.owner_incarnation
         && receipt.fence == request.token.fence
-        && receipt.lease_revision == request.token.revision
-        && receipt.lease_expiry_ms == request.token.expires_at_unix_ms
+        && receipt.lease_revision >= request.token.revision
+        && receipt.lease_expiry_ms >= request.token.expires_at_unix_ms
         && receipt.expected_job_revision == request.expected_job_revision
         && receipt.result_id == request.result_id
         && receipt.result_ref == request.result_ref
@@ -1514,16 +2135,6 @@ fn segment_completion_is_exact(job: &nzbd_types::Job, resource: &str) -> bool {
             .all(|segment| matches!(segment.state, nzbd_types::SegmentState::Done { .. }))
 }
 
-#[derive(serde::Deserialize)]
-struct VerifyGenerationManifest {
-    job_incarnation: String,
-    fence: u64,
-    result_id: String,
-    job_sha256: String,
-    files: Vec<nzbd_state::artifacts::ExternalGenerationFile>,
-    total_bytes: u64,
-}
-
 fn verify_generation(
     shared_dir: &Path,
     result_ref: &str,
@@ -1539,19 +2150,19 @@ fn verify_generation(
     if !selected.starts_with(&allowed) {
         return Err("generation escaped shared namespace".into());
     }
-    let manifest: VerifyGenerationManifest = serde_json::from_slice(
-        &std::fs::read(selected.join("manifest.json"))
-            .map_err(|error| format!("read generation manifest: {error}"))?,
+    let manifest: crate::worker::GenerationManifest = serde_json::from_slice(
+        &crate::worker::read_bounded_file(&selected.join("manifest.json"), MAX_DESCRIPTOR_BYTES)?,
     )
     .map_err(|error| format!("decode generation manifest: {error}"))?;
     if manifest.result_id != result_id
+        || !manifest.identity_matches()
         || manifest.fence != fence
         || job_incarnation.is_some_and(|expected| expected != manifest.job_incarnation)
     {
         return Err("generation identity mismatch".into());
     }
-    let job_bytes = std::fs::read(selected.join("job.json"))
-        .map_err(|error| format!("read generation job: {error}"))?;
+    let job_bytes =
+        crate::worker::read_bounded_file(&selected.join("job.json"), MAX_DESCRIPTOR_BYTES)?;
     use sha2::Digest;
     if format!("{:x}", sha2::Sha256::digest(&job_bytes)) != manifest.job_sha256 {
         return Err("generation job hash mismatch".into());
@@ -1563,6 +2174,7 @@ fn verify_generation(
     if sealed_job != expected_job {
         return Err("generation job does not match completion request".into());
     }
+
     let mut total = 0u64;
     for expected in &manifest.files {
         let relative = PathBuf::from(&expected.path);
@@ -1615,12 +2227,30 @@ fn verify_generation(
     if total != manifest.total_bytes {
         return Err("generation total byte count mismatch".into());
     }
-    Ok(manifest.files)
+    Ok(manifest
+        .files
+        .into_iter()
+        .map(|file| nzbd_state::artifacts::ExternalGenerationFile {
+            path: file.path,
+            bytes: file.bytes,
+            sha256: file.sha256,
+        })
+        .collect())
 }
 
-// ---------------------------------------------------------------------------
-// Sweeper + scheduler task
-// ---------------------------------------------------------------------------
+/// Materialize a selected immutable generation. Existing output is moved to
+/// a uniquely named recoverable sibling and is never deleted here. A marker
+/// makes retries idempotent without repeatedly moving the selected output.
+fn cluster_publication_name(original: &str, result_id: &str, lifecycle: bool) -> String {
+    if lifecycle {
+        format!(
+            "{original}.runner-{}",
+            result_id.strip_prefix("sha256:").unwrap_or(result_id)
+        )
+    } else {
+        original.to_owned()
+    }
+}
 
 pub fn spawn_leader_task(
     shared: Arc<LeaderShared>,
@@ -1635,6 +2265,7 @@ pub fn spawn_leader_task(
                 break;
             }
             let is_leader = shared.is_leader();
+            if is_leader && authority_ready && !shared.authority_ready(){authority_ready=false;}
             if is_leader && !was_leader {
                 // Taking office: discard leases inherited from the old view.
                 // New leases arrive via worker heartbeats or fresh grants.
@@ -1649,8 +2280,12 @@ pub fn spawn_leader_task(
                 // without restarting the daemon or forcing an election flap.
                 match shared.engine.adopt_authority().await {
                     Ok(()) => {
+                        // Preserve pending actor transitions before replacing the local projection.
+                        let _serial = shared.mutation_serial.lock().await;
+                        if let Err(error)=crate::control_recovery::reconcile(&shared).await {tracing::error!(%error,"automatic control adoption incomplete");continue;}
+                        if let Err(error)=crate::admissions::initialize(&shared).await {tracing::error!(%error,"admission authority adoption incomplete");tokio::time::sleep(shared.cfg.lease_interval).await;continue;}
                         let replicated = match &shared.control {
-                            Some(control) => control.load_jobs().await,
+                            Some(_) => crate::control_recovery::projection(&shared).await.map(|jobs|jobs.into_iter().map(|job|(job,0,String::new())).collect::<Vec<_>>()),
                             None => Err("replicated control unavailable".into()),
                         };
                         match replicated {
@@ -1658,6 +2293,7 @@ pub fn spawn_leader_task(
                                 let jobs = rows.into_iter().map(|(job, _, _)| job).collect();
                                 match shared.engine.adopt_replicated_authority(jobs).await {
                                     Ok(()) => {
+                                        if let Err(error)=crate::admissions::adopt(&shared).await {tracing::error!(%error,"admission catalog projection incomplete");continue;}
                                         if let Err(error) = shared.engine.resume_url_fetches().await {
                                             tracing::warn!(%error, "durable URL fetches could not resume");
                                         }
@@ -1697,6 +2333,7 @@ pub fn spawn_leader_task(
                     }
                 }
             } else if !is_leader {
+                shared.control_proofs.invalidate();
                 authority_ready = false;
                 shared.authority_ready.store(false, Ordering::Release);
             }
@@ -1719,42 +2356,446 @@ async fn recover_selected_publications(s: &LeaderShared) -> Result<(), String> {
     let Some(control) = &s.control else {
         return Ok(());
     };
-    for (result_id, result_ref, job, fence, accepted_at_ms, kind) in
-        control.published_results().await?
-    {
-        let Some((_, original_dir)) = job
-            .params
-            .iter()
-            .find(|(key, _)| key == "*Cluster:original-dir")
-        else {
-            continue;
-        };
-        let dest_dir = s.publication_root(&job, kind == "post");
-        let original_dir = original_dir.clone();
-        let final_path = dest_dir.join(&original_dir);
-        let publication = nzbd_state::artifacts::ExternalGeneration {
-            result_id,
-            fence,
-            source: PathBuf::from(result_ref).join("files"),
-            // The bounded payload worker reloads and authenticates the sealed
-            // manifest against the accepted content ID before any namespace edit.
-            files: Vec::new(),
-        };
-        let history = (kind == "post" && s.history.is_some())
-            .then(|| pp_history_entry(&job, accepted_at_ms, &final_path));
-        s.engine
-            .materialize_generation(
-                job.clone(),
-                dest_dir,
-                final_path,
-                publication,
-                history,
-                false,
-            )
-            .await
-            .map_err(|error| format!("publication recovery remains pending: {error}"))?;
+    control
+        .initialize_delivery_identity(&s.engine.artifacts().installation, &s.cfg.node_name)
+        .await?;
+    // A single bounded page per pass; interrupted adoption resumes its trusted cursor.
+    if let Err(error) = crate::delivery::migrate_local_deliveries(s).await {
+        tracing::warn!(%error,"legacy Delivery catalog adoption awaits original owner");
+    }
+    let mut cursor = 0;
+    loop {
+        let (rows, next) = control.publication_results_page(None, cursor, 16).await?;
+        if next == cursor {
+            break;
+        }
+        cursor = next;
+        for (result_id, result_ref, job, fence, accepted_at_ms, kind) in rows {
+            let ready = control
+                .cluster_delivery(&cluster_delivery_id(&result_id))
+                .await?;
+            if ready.is_none()
+                && control
+                    .selected_publication_job(job.id.0, &result_id)
+                    .await?
+                    .is_none()
+            {
+                // Selection receipts remain cleanup evidence. A cancelled or
+                // superseded result cannot regain publication after restart.
+                continue;
+            }
+            let Some((_, original_dir)) = job
+                .params
+                .iter()
+                .find(|(key, _)| key == "*Cluster:original-dir")
+            else {
+                continue;
+            };
+            let dest_dir = s.publication_root(&job, kind == "post");
+            let original_dir = cluster_publication_name(
+                original_dir,
+                &result_id,
+                kind == "post" && job.delivery_lifecycle,
+            );
+            let final_path = dest_dir.join(&original_dir);
+            let ready = control
+                .cluster_delivery(&cluster_delivery_id(&result_id))
+                .await?;
+            let cleanup_only = if let Some(record) = &ready {
+                record.cleanup_only
+            } else {
+                let manifest_path = Path::new(&result_ref).join("manifest.json");
+                tokio::task::spawn_blocking(move || -> Result<bool, String> {
+                    let manifest: crate::worker::GenerationManifest = serde_json::from_slice(
+                        &crate::worker::read_bounded_file(&manifest_path, MAX_DESCRIPTOR_BYTES)?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    Ok(manifest.files.is_empty())
+                })
+                .await
+                .map_err(|error| error.to_string())??
+            };
+            if ready.is_none() && !cleanup_only {
+                let publication = nzbd_state::artifacts::ExternalGeneration {
+                    result_id: result_id.clone(),
+                    fence,
+                    source: PathBuf::from(&result_ref).join("files"),
+                    files: Vec::new(),
+                };
+                let mut selected = job.clone();
+                selected.dir_name = original_dir.clone();
+                let history = (kind == "post" && s.history.is_some())
+                    .then(|| pp_history_entry(&selected, accepted_at_ms, &final_path));
+                s.engine
+                    .materialize_generation(
+                        selected,
+                        dest_dir,
+                        final_path.clone(),
+                        publication,
+                        history,
+                        false,
+                    )
+                    .await
+                    .map_err(|error| format!("publication recovery remains pending: {error}"))?;
+            }
+            if kind == "post" {
+                let mut job = job;
+                if cleanup_only {
+                    job.params
+                        .push(("*Cluster:cleanup-only".into(), "1".into()));
+                }
+                let receipt_id = format!("complete:work/job/{}/post:{fence}:{result_id}", job.id.0);
+                if let Some(delivery) = ensure_cluster_delivery(
+                    s,
+                    &job,
+                    &result_id,
+                    &result_ref,
+                    &receipt_id,
+                    accepted_at_ms,
+                    &final_path,
+                )
+                .await?
+                {
+                    attach_delivery_params(&mut job, &delivery);
+                }
+                record_pp_history(s, &job, accepted_at_ms, &final_path).await?;
+            }
+        }
     }
     Ok(())
+}
+
+fn cluster_delivery_id(result_id: &str) -> String {
+    format!("cluster-delivery:{result_id}")
+}
+
+fn attach_delivery_params(job: &mut nzbd_types::Job, delivery: &nzbd_state::artifacts::Delivery) {
+    for (key, value) in [
+        ("Delivery:Id", delivery.delivery_id.clone()),
+        ("Delivery:Path", delivery.publication_path.clone()),
+        (
+            "Delivery:Generation",
+            delivery.publication_generation.clone(),
+        ),
+        ("Delivery:ManifestDigest", delivery.manifest_digest.clone()),
+        ("Delivery:Custody", "curator".into()),
+        (
+            "Delivery:SourceArtifactId",
+            delivery.source_artifact_id.clone(),
+        ),
+        (
+            "Delivery:SourceGeneration",
+            delivery.source_generation.clone(),
+        ),
+        (
+            "Delivery:SourceCleanup",
+            delivery.source_cleanup.status.clone(),
+        ),
+    ] {
+        job.params.retain(|(existing, _)| existing != key);
+        job.params.push((key.into(), value));
+    }
+}
+
+async fn ensure_cluster_delivery(
+    s: &LeaderShared,
+    job: &nzbd_types::Job,
+    result_id: &str,
+    result_ref: &str,
+    receipt_id: &str,
+    accepted_at_ms: i64,
+    final_path: &Path,
+) -> Result<Option<nzbd_state::artifacts::Delivery>, String> {
+    if !job.delivery_lifecycle {
+        return Ok(None);
+    }
+    let control = s.control.as_ref().ok_or("replicated control unavailable")?;
+    let _serial = s.delivery_serial.lock().await;
+    let id = cluster_delivery_id(result_id);
+    if let Some(record) = control.cluster_delivery(&id).await? {
+        return Ok((!record.cleanup_only).then_some(record.delivery));
+    }
+    if control.delivery_meta("local_imported").await?.is_none() {
+        return Err("legacy Delivery cursor adoption is still pending; retry publication after catalog recovery".into());
+    }
+    let manifest: crate::worker::GenerationManifest =
+        serde_json::from_slice(&crate::worker::read_bounded_file(
+            &Path::new(result_ref).join("manifest.json"),
+            MAX_DESCRIPTOR_BYTES,
+        )?)
+        .map_err(|e| e.to_string())?;
+    if manifest.result_id != result_id || !manifest.identity_matches() {
+        return Err("sealed copy metadata changed after selection".into());
+    }
+    let cleanup_only = manifest.files.is_empty();
+    let sealed_job = {
+        let path = Path::new(result_ref).join("job.json");
+        let expected = manifest.job_sha256.clone();
+        tokio::task::spawn_blocking(move || -> Result<nzbd_types::Job, String> {
+            use sha2::{Digest, Sha256};
+            let bytes = crate::worker::read_bounded_file(&path, MAX_DESCRIPTOR_BYTES)?;
+            if format!("{:x}", Sha256::digest(&bytes)) != expected {
+                return Err("sealed timing source changed".into());
+            }
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())??
+    };
+    let (_, selected_revision) = control
+        .selected_publication_job(job.id.0, result_id)
+        .await?
+        .ok_or("selected publication was cancelled before READY")?;
+    // New main materialization commits an exact Inventory operation and
+    // selected owned artifact, rather than writing a legacy payload marker.
+    if !cleanup_only {
+        let inventory = s.engine.artifacts();
+        let target = final_path.to_path_buf();
+        let root = target
+            .parent()
+            .ok_or("materialized publication has no root")?
+            .to_path_buf();
+        let generation = nzbd_state::artifacts::ExternalGeneration {
+            result_id: result_id.to_owned(),
+            fence: manifest.fence,
+            source: Path::new(result_ref).join("files"),
+            files: manifest
+                .files
+                .iter()
+                .map(|file| nzbd_state::artifacts::ExternalGenerationFile {
+                    path: file.path.clone(),
+                    bytes: file.bytes,
+                    sha256: file.sha256.clone(),
+                })
+                .collect(),
+        };
+        let job_id = job.id.0;
+        let matched = tokio::task::spawn_blocking(move || {
+            inventory.materialized_generation_matches(job_id, &root, &target, &generation)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+        if !matched {
+            return Err("exact durable materialization receipt or selected publication identity is unavailable".into());
+        }
+    }
+    let mut copies = Vec::new();
+    let mut copy_cursor = 0;
+    loop {
+        let (rows, next) = control
+            .publication_results_page(Some(job.id.0), copy_cursor, 16)
+            .await?;
+        if next == copy_cursor {
+            break;
+        }
+        copy_cursor = next;
+        for (copy_result, copy_ref, _copy_job, _, _, _) in rows {
+            let copy_manifest_bytes = crate::worker::read_bounded_file(
+                &Path::new(&copy_ref).join("manifest.json"),
+                MAX_DESCRIPTOR_BYTES,
+            )?;
+            let copy_manifest: crate::worker::GenerationManifest =
+                serde_json::from_slice(&copy_manifest_bytes).map_err(|error| error.to_string())?;
+            if copy_manifest.result_id != copy_result || !copy_manifest.identity_matches() {
+                return Err("accepted copy metadata changed".into());
+            }
+            if copy_manifest.job_incarnation != manifest.job_incarnation {
+                continue;
+            }
+            if let Some(copy) = copy_manifest.artifact_copy {
+                let raw_files = (!copy.selected).then(|| {
+                    copy_manifest
+                        .files
+                        .iter()
+                        .map(|file| nzbd_state::artifacts::DeliveryFile {
+                            path: file.path.clone(),
+                            size_bytes: file.bytes,
+                            sha256: file.sha256.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let copy_key = format!(
+                    "artifact:{}:{}:{}",
+                    copy.storage_instance_id,
+                    copy.publication.artifact,
+                    copy.publication.generation
+                );
+                if !copies
+                    .iter()
+                    .any(|existing: &crate::delivery::CopyObligation| existing.id == copy_key)
+                {
+                    copies.push(crate::delivery::CopyObligation {
+                        id: copy_key,
+                        owner_node: copy_manifest.owner_node_id.clone(),
+                        artifact: Some(copy),
+                        local_delivery_id: None,
+                        result_ref: None,
+                        result_id: None,
+                        directory_identity: None,
+                        deletion_files: raw_files,
+                        claim_id: None,
+                        attempts: 0,
+                        next_retry_at: None,
+                        status: "pending".into(),
+                        error: None,
+                    });
+                }
+            }
+            let mut deletion_files = copy_manifest
+                .files
+                .iter()
+                .map(|file| nzbd_state::artifacts::DeliveryFile {
+                    path: format!("files/{}", file.path),
+                    size_bytes: file.bytes,
+                    sha256: file.sha256.clone(),
+                })
+                .collect::<Vec<_>>();
+            use sha2::{Digest, Sha256};
+            deletion_files.push(nzbd_state::artifacts::DeliveryFile {
+                path: "manifest.json".into(),
+                size_bytes: copy_manifest_bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(&copy_manifest_bytes)),
+            });
+            let copy_job_bytes = crate::worker::read_bounded_file(
+                &Path::new(&copy_ref).join("job.json"),
+                MAX_DESCRIPTOR_BYTES,
+            )?;
+            if format!("{:x}", Sha256::digest(&copy_job_bytes)) != copy_manifest.job_sha256 {
+                return Err("accepted copy job changed before Delivery".into());
+            }
+            let sealed_job: nzbd_types::Job =
+                serde_json::from_slice(&copy_job_bytes).map_err(|error| error.to_string())?;
+            if let Some((_, value)) = sealed_job
+                .params
+                .iter()
+                .find(|(key, _)| key == crate::delivery::AUTHORITY_COPY_PARAM)
+            {
+                let authority: crate::delivery::AuthoritySourceCopy =
+                    serde_json::from_str(value).map_err(|error| error.to_string())?;
+                if authority.copy.job_id != job.id.0
+                    || authority.copy.selected
+                    || authority.owner_node.is_empty()
+                {
+                    return Err("sealed admission copy identity is invalid".into());
+                }
+                let key = format!(
+                    "artifact:{}:{}:{}",
+                    authority.copy.storage_instance_id,
+                    authority.copy.publication.artifact,
+                    authority.copy.publication.generation
+                );
+                if !copies.iter().any(|copy| copy.id == key) {
+                    copies.push(crate::delivery::CopyObligation {
+                        id: key,
+                        owner_node: authority.owner_node,
+                        artifact: Some(authority.copy),
+                        local_delivery_id: None,
+                        result_ref: None,
+                        result_id: None,
+                        directory_identity: None,
+                        deletion_files: Some(
+                            copy_manifest
+                                .files
+                                .iter()
+                                .map(|file| nzbd_state::artifacts::DeliveryFile {
+                                    path: file.path.clone(),
+                                    size_bytes: file.bytes,
+                                    sha256: file.sha256.clone(),
+                                })
+                                .collect(),
+                        ),
+                        claim_id: None,
+                        attempts: 0,
+                        next_retry_at: None,
+                        status: "pending".into(),
+                        error: None,
+                    });
+                }
+            }
+            deletion_files.push(nzbd_state::artifacts::DeliveryFile {
+                path: "job.json".into(),
+                size_bytes: copy_job_bytes.len() as u64,
+                sha256: copy_manifest.job_sha256.clone(),
+            });
+            copies.push(crate::delivery::CopyObligation {
+            id:format!("generation:{copy_result}"),owner_node:copy_manifest.owner_node_id,
+            artifact:None,local_delivery_id:None,result_ref:Some(copy_ref),result_id:Some(copy_result),directory_identity:copy_manifest.directory_identity,deletion_files:Some(deletion_files),claim_id:None,attempts:0,next_retry_at:None,
+            status:if copy_manifest.directory_identity.is_some(){"pending"}else{"review_required"}.into(),
+            error:copy_manifest.directory_identity.is_none().then(||"legacy generation lacks owned directory identity; inspect this exact copy before cleanup".into()),
+        });
+        }
+    }
+    copies.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut files = manifest
+        .files
+        .iter()
+        .map(|file| nzbd_state::artifacts::DeliveryFile {
+            path: file.path.clone(),
+            size_bytes: file.bytes,
+            sha256: file.sha256.clone(),
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    use sha2::{Digest, Sha256};
+    let mut canonical = b"runner-manifest-v1\n".to_vec();
+    for file in &files {
+        canonical.extend_from_slice(
+            format!(
+                "{}:{}\n{}\n{}\n",
+                file.path.len(),
+                file.path,
+                file.size_bytes,
+                file.sha256
+            )
+            .as_bytes(),
+        );
+    }
+    let outcome = job
+        .params
+        .iter()
+        .find(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+        .map(|(_, value)| value.as_str())
+        .unwrap_or("SUCCESS");
+    let source = manifest
+        .artifact_copy
+        .as_ref()
+        .map(|copy| copy.source.clone());
+    let keep = job
+        .params
+        .iter()
+        .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
+    let delivery:nzbd_state::artifacts::Delivery=serde_json::from_value(serde_json::json!({
+        "protocolVersion":1,"sequence":0,"status":"ready","deliveryId":id,"publicationGeneration":result_id,
+        "artifactId":format!("cluster-publication:{result_id}"),"sourceArtifactId":source.as_ref().map(|source|source.artifact.as_str()).unwrap_or(""),
+        "sourceGeneration":source.as_ref().map(|source|source.generation.as_str()).unwrap_or(""),"jobId":job.id.0,
+        "runnerInstanceId":control.delivery_instance().await?,
+        "requestToken":job.params.iter().find(|(key,_)|key=="monarr-transfer").map(|(_,value)|value),
+        "keepSourceOnFailure":keep,"terminalOutcome":outcome,
+        "failureStage":job.params.iter().find(|(key,_)|key=="Failure:Stage").map(|(_,value)|value),
+        "failureCause":job.params.iter().find(|(key,_)|key=="Failure:Reason"||key=="Failure:Files").map(|(_,value)|value),
+        "publicationPath":final_path.to_string_lossy(),"manifestDigest":format!("{:x}",Sha256::digest(canonical)),
+        "files":files,"fileOutcomes":manifest.file_outcomes,"readyAt":accepted_at_ms/1000,
+        "acceptedAt":null,"consumerReceiptId":null,
+        "runnerStages":{"nodeId":"unrecorded","clockDomain":"unrecorded","spans":sealed_job.stages.iter().take(128).collect::<Vec<_>>()},
+        "lifecycleTiming":nzbd_engine::frozen_lifecycle_timing(&sealed_job),
+        "sourceCleanup":{"status":"pending","error":null,"attempts":0,"nextRetryAt":null,"blockedSince":null,"warning":null}
+    })).map_err(|e|e.to_string())?;
+    let record = control
+        .commit_delivery_selected(
+            &crate::delivery::ClusterDelivery {
+                revision: 0,
+                delivery,
+                receipt_id: receipt_id.into(),
+                result_id: result_id.into(),
+                copies,
+                cleanup_only,
+                source_disposition: manifest.source_disposition,
+            },
+            Some((job.id.0, selected_revision)),
+        )
+        .await?;
+    Ok((!record.cleanup_only).then_some(record.delivery))
 }
 
 fn pp_history_entry(
@@ -1772,7 +2813,11 @@ fn pp_history_entry(
         job: job.id,
         name: job.name.clone(),
         category: job.category.clone(),
-        final_dir: Some(final_path.to_string_lossy().into_owned()),
+        final_dir: (!job
+            .params
+            .iter()
+            .any(|(key, value)| key == "*Cluster:cleanup-only" && value == "1"))
+        .then(|| final_path.to_string_lossy().into_owned()),
         status,
         size: job.totals.size,
         health: nzbd_types::Health::calc(&job.totals).0,
@@ -1797,7 +2842,6 @@ fn pp_history_entry(
     }
 }
 
-#[cfg(test)]
 async fn record_pp_history(
     s: &LeaderShared,
     job: &nzbd_types::Job,
@@ -1841,13 +2885,43 @@ async fn sweep_expired(s: &Arc<LeaderShared>) {
     s.apply_local_budgets().await;
 }
 
+struct SelectedDeliveryReady(bool);
+impl From<&mut hiqlite::Row<'_>> for SelectedDeliveryReady {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self(row.get::<i64>("ready") != 0)
+    }
+}
+async fn selected_result_has_delivery(control: &ControlStore, job: JobId) -> Result<bool, String> {
+    // The exact selected result's immutable ledger is sufficient for both a
+    // public READY and terminal empty-payload private cleanup; never demand
+    // a public empty manifest. Primary-key lookup avoids historical scans.
+    control.client.query_consistent_map::<SelectedDeliveryReady,_>(
+        "SELECT EXISTS(SELECT 1 FROM control_jobs j JOIN cluster_deliveries d ON d.id='cluster-delivery:'||j.result_id WHERE j.job_id=?1 AND j.deleted=0) AS ready",
+        hiqlite::params!(i64::from(job.0)),
+    ).await.map(|rows|rows.into_iter().next().is_some_and(|row|row.0)).map_err(|error|error.to_string())
+}
+
 async fn schedule(s: &Arc<LeaderShared>) {
     let _serial = s.mutation_serial.lock().await;
+    if let Err(error) = crate::control_recovery::reconcile(s).await {
+        tracing::warn!(%error,"scheduler awaits automatic control replication");
+        return;
+    }
+    if let Err(error) = crate::source_facts::reconcile(s).await {
+        tracing::warn!(%error,"scheduler awaits durable source custody");
+        return;
+    }
+    let mut requires_delivery = HashSet::new();
     let durable_status: HashMap<JobId, JobStatus> = match &s.control {
         Some(control) => match control.load_jobs().await {
             Ok(rows) => rows
                 .into_iter()
-                .map(|(job, _, _)| (job.id, job.status))
+                .map(|(job, _, _)| {
+                    if job.delivery_lifecycle {
+                        requires_delivery.insert(job.id);
+                    }
+                    (job.id, job.status)
+                })
                 .collect(),
             Err(error) => {
                 tracing::warn!(%error, "scheduler paused: replicated queue unavailable");
@@ -1896,11 +2970,38 @@ async fn schedule(s: &Arc<LeaderShared>) {
             && matches!(j.status, JobStatus::Completed | JobStatus::Failed)
             && durable_status.get(&j.id) == Some(&j.status)
         {
+            // Main's durable materialization can expose PP_DONE locally
+            // before complete_operation commits its Delivery. Retirement must
+            // not tombstone that still-selected result in the intervening gap.
+            if requires_delivery.contains(&j.id) {
+                let ready = match &s.control {
+                    Some(control) => selected_result_has_delivery(control, j.id).await,
+                    None => Ok(false),
+                };
+                if !matches!(ready, Ok(true)) {
+                    tracing::debug!(job=j.id.0,error=?ready.err(),"finished lifecycle job awaits selected-result Delivery before retirement");
+                    continue;
+                }
+            }
             let committed = match &s.control {
-                Some(control) => control
-                    .commit_job_delta(&[(u64::from(j.id.0), None)])
-                    .await
-                    .is_ok(),
+                Some(control) => {
+                    match control.job_revision_fences_for(&[u64::from(j.id.0)]).await {
+                        Ok(fences) => control
+                            .commit_job_delta_guarded_with_removals(
+                                &[(u64::from(j.id.0), None)],
+                                &fences,
+                                &[],
+                                Some(s.authority_identity()),
+                                &std::collections::BTreeMap::from([(
+                                    j.id.0,
+                                    crate::cancellation::RemovalMode::CompletedRetirement,
+                                )]),
+                            )
+                            .await
+                            .is_ok(),
+                        Err(_) => false,
+                    }
+                }
                 None => false,
             };
             if committed {
@@ -2126,10 +3227,467 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn completion_request_timeout_joins_one_whole_operation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let operations = Arc::new(CompletionOperations::default());
+        let count = Arc::new(AtomicUsize::new(0));
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        let first = operations.clone();
+        let runs = count.clone();
+        let caller = tokio::spawn(async move {
+            first
+                .run("exact-receipt-and-token".into(), async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    entered.send(()).unwrap();
+                    blocked.await.unwrap();
+                    // This represents the final durable receipt/publication response,
+                    // never a cached standalone hash verdict.
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({"durableReceipt":"committed"})),
+                    )
+                        .into_response()
+                })
+                .await
+        });
+        started.await.unwrap();
+        caller.abort(); // Network deadline expires while verification owns work.
+        let second = operations.clone();
+        let runs = count.clone();
+        let retry = tokio::spawn(async move {
+            second
+                .run("exact-receipt-and-token".into(), async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    panic!("retry must join the active completion instead of hashing again")
+                })
+                .await
+        });
+        release.send(()).unwrap();
+        let (status, body) = retry.await.unwrap().unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert!(String::from_utf8(body).unwrap().contains("committed"));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn slow_actual_completion_survives_caller_drop_and_lease_renewal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = SharedLayout::new(tmp.path(), "leader").unwrap();
+        let mut cfg = ClusterConfig {
+            cluster_id: "test".into(),
+            node_name: "leader".into(),
+            shared_dir: tmp.path().to_path_buf(),
+            advertise_url: "http://leader.invalid".into(),
+            secret: "secret".into(),
+            coordinator: true,
+            priority: 0,
+            download: true,
+            max_download_jobs: 1,
+            post_process: true,
+            pp_slots: 1,
+            lease_interval: std::time::Duration::from_secs(1),
+            takeover_after: std::time::Duration::from_secs(2),
+            worker_ttl: std::time::Duration::from_secs(3),
+            control_dir: tmp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: "127.0.0.1:38110".into(),
+            control_api_bind: "127.0.0.1:38210".into(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
+            disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
+        };
+        let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        cfg.control_raft_bind = raft.local_addr().unwrap().to_string();
+        cfg.control_api_bind = api.local_addr().unwrap().to_string();
+        cfg.control_dir = tmp.path().join("control");
+        drop(raft);
+        drop(api);
+        let control = ControlStore::start(&cfg).await.unwrap();
+        let engine = Engine::spawn(EngineConfig::single_node(
+            Vec::new(),
+            tmp.path().join("engine"),
+            tmp.path().join("dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let (_view_tx, view) = watch::channel(LeaderView {
+            record: Some(LeaderRecord {
+                epoch: 1,
+                node: "leader".into(),
+                api_url: "http://leader.invalid".into(),
+                seq: 1,
+            }),
+            is_me: true,
+        });
+        let shared = LeaderShared::new(
+            engine.clone(),
+            layout,
+            tmp.path().join("dest"),
+            cfg,
+            Vec::new(),
+            view,
+            LeaderDurability::new(Some(control.clone()), None, "leader-boot".into()),
+        );
+        shared.authority_ready.store(true, Ordering::Release);
+        let mut job = test_job(7);
+        job.status = JobStatus::Completed;
+        job.params
+            .push(("large-metadata".into(), "x".repeat(2 * 1024 * 1024)));
+        control
+            .seed_job(
+                7,
+                "exact-job-incarnation",
+                &serde_json::to_string(&job).unwrap(),
+            )
+            .await
+            .unwrap();
+        let claim = control
+            .acquire(
+                "work/job/7/download",
+                "test",
+                7,
+                "exact-job-incarnation",
+                "worker",
+                "worker-boot",
+                "download",
+                "{}",
+                1,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let LeaseClaim::Acquired(token) = claim else {
+            panic!("fresh lease")
+        };
+        let generation = tmp.path().join(".nzbd-cluster/generations/slow");
+        std::fs::create_dir_all(generation.join("files")).unwrap();
+        let payload = b"durable payload";
+        std::fs::write(generation.join("files/payload.mkv"), payload).unwrap();
+        let bytes = serde_json::to_vec(&job).unwrap();
+        std::fs::write(generation.join("job.json"), &bytes).unwrap();
+        use sha2::{Digest, Sha256};
+        let files = vec![crate::worker::GenerationFile {
+            path: "payload.mkv".into(),
+            bytes: payload.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(payload)),
+        }];
+        let job_sha = format!("{:x}", Sha256::digest(&bytes));
+        let id = format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(7u32, "exact-job-incarnation", token.fence, &job_sha, &files))
+                    .unwrap()
+            )
+        );
+        let manifest = crate::worker::GenerationManifest {
+            job_id: 7,
+            job_incarnation: "exact-job-incarnation".into(),
+            owner_node_id: "worker".into(),
+            fence: token.fence,
+            result_id: id.clone(),
+            job_sha256: job_sha,
+            files,
+            total_bytes: payload.len() as u64,
+            sealed_at_unix_ms: 1,
+            artifact_copy: None,
+            directory_identity: None,
+            file_outcomes: Vec::new(),
+            identity_version: 0,
+            source_disposition: None,
+        };
+        std::fs::write(
+            generation.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let lease_id = "work/job/7/download@1".to_owned();
+        shared.leases.lock().unwrap().insert(
+            lease_id.clone(),
+            LeaseInfo {
+                job: job.id,
+                node: "worker".into(),
+                kind: LeaseKind::Download,
+                token: token.clone(),
+                job_revision: 1,
+                control_revision: 1,
+                last_hb: Instant::now(),
+            },
+        );
+        let gate = Arc::new(VerificationGate {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        *shared.verification_gate.lock().unwrap() = Some(gate.clone());
+        let request = CompleteRequest {
+            lifecycle_protocol: LIFECYCLE_PROTOCOL,
+            node: "worker".into(),
+            lease_id,
+            token: token.clone(),
+            expected_job_revision: 1,
+            result_id: id.clone(),
+            result_ref: generation.to_string_lossy().into_owned(),
+            receipt_id: "slow-receipt".into(),
+            job,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(SECRET_HEADER, "secret".parse().unwrap());
+        let first = tokio::spawn(work_complete(
+            State(shared.clone()),
+            headers.clone(),
+            Json(request.clone()),
+        ));
+        gate.entered.acquire().await.unwrap().forget();
+        let other = tmp.path().join(".nzbd-cluster/generations/conflicting");
+        std::fs::create_dir_all(other.join("files")).unwrap();
+        let other_payload = b"conflicting payload";
+        std::fs::write(other.join("files/payload.mkv"), other_payload).unwrap();
+        std::fs::write(other.join("job.json"), &bytes).unwrap();
+        let mut other_manifest = manifest.clone();
+        other_manifest.files[0].bytes = other_payload.len() as u64;
+        other_manifest.files[0].sha256 = format!("{:x}", Sha256::digest(other_payload));
+        other_manifest.total_bytes = other_payload.len() as u64;
+        other_manifest.result_id = format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(
+                    7u32,
+                    "exact-job-incarnation",
+                    token.fence,
+                    &other_manifest.job_sha256,
+                    &other_manifest.files
+                ))
+                .unwrap()
+            )
+        );
+        std::fs::write(
+            other.join("manifest.json"),
+            serde_json::to_vec(&other_manifest).unwrap(),
+        )
+        .unwrap();
+        let mut competing = request.clone();
+        competing.result_id = other_manifest.result_id;
+        competing.result_ref = other.to_string_lossy().into_owned();
+        let competitor = tokio::spawn(work_complete(
+            State(shared.clone()),
+            headers.clone(),
+            Json(competing),
+        ));
+        gate.entered.acquire().await.unwrap().forget();
+        first.abort(); // Simulate network deadline while bulk verification owns work.
+        let renewed = control
+            .renew(&token, std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        let renewed = control
+            .renew(&renewed, std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        shared
+            .leases
+            .lock()
+            .unwrap()
+            .get_mut(&request.lease_id)
+            .unwrap()
+            .token = renewed.clone();
+        let retry = tokio::spawn(work_complete(
+            State(shared.clone()),
+            headers,
+            Json(request.clone()),
+        ));
+        gate.release.add_permits(1);
+        let response = retry.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        gate.release.add_permits(1);
+        assert_eq!(
+            competitor.await.unwrap().status(),
+            StatusCode::CONFLICT,
+            "different completion sharing receipt ID cannot reuse the first receipt"
+        );
+        assert_eq!(
+            gate.entered.available_permits(),
+            0,
+            "retry did not start another verification"
+        );
+        let receipt = control
+            .publication_record("slow-receipt")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.lease_revision, renewed.revision);
+        assert!(publication_retry_matches(
+            &receipt,
+            &request,
+            LeaseKind::Download
+        ));
+        let mut stale = request.clone();
+        stale.token.owner_incarnation.push_str("-different");
+        assert!(!publication_retry_matches(
+            &receipt,
+            &stale,
+            LeaseKind::Download
+        ));
+        // A newer Delete wins after durable selection and materialization,
+        // before READY/current queue projection, including restart recovery.
+        *shared.verification_gate.lock().unwrap() = None;
+        let projection = Arc::new(VerificationGate {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        *shared.projection_gate.lock().unwrap() = Some(projection.clone());
+        let mut cancelled = request.clone();
+        cancelled.job.id = JobId(8);
+        cancelled.job.delivery_lifecycle = true;
+        cancelled.job.queued_at_unix = 1;
+        cancelled
+            .job
+            .params
+            .push(("*Cluster:original-dir".into(), "cancelled-job".into()));
+        cancelled
+            .job
+            .params
+            .push((nzbd_types::PP_DONE_PARAM.into(), "SUCCESS".into()));
+        control
+            .seed_job(
+                8,
+                "cancelled-incarnation",
+                &serde_json::to_string(&cancelled.job).unwrap(),
+            )
+            .await
+            .unwrap();
+        let claim = control
+            .acquire(
+                "work/job/8/post",
+                "test",
+                8,
+                "cancelled-incarnation",
+                "worker",
+                "worker-boot",
+                "post",
+                "{}",
+                1,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let LeaseClaim::Acquired(cancel_token) = claim else {
+            panic!("fresh cancel lease")
+        };
+        cancelled.token = cancel_token.clone();
+        cancelled.lease_id = "work/job/8/post@1".into();
+        cancelled.receipt_id = "cancel-receipt".into();
+        let cancel_root = tmp.path().join(".nzbd-cluster/generations/cancelled");
+        std::fs::create_dir_all(cancel_root.join("files")).unwrap();
+        let cancel_bytes = serde_json::to_vec(&cancelled.job).unwrap();
+        std::fs::write(cancel_root.join("job.json"), &cancel_bytes).unwrap();
+        std::fs::write(cancel_root.join("files/payload.mkv"), payload).unwrap();
+        let mut cancel_manifest = manifest.clone();
+        cancel_manifest.job_id = 8;
+        cancel_manifest.job_incarnation = "cancelled-incarnation".into();
+        cancel_manifest.job_sha256 = format!("{:x}", Sha256::digest(&cancel_bytes));
+        cancel_manifest.fence = cancel_token.fence;
+        cancel_manifest.result_id = format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(
+                    8u32,
+                    "cancelled-incarnation",
+                    cancel_token.fence,
+                    &cancel_manifest.job_sha256,
+                    &cancel_manifest.files
+                ))
+                .unwrap()
+            )
+        );
+        std::fs::write(
+            cancel_root.join("manifest.json"),
+            serde_json::to_vec(&cancel_manifest).unwrap(),
+        )
+        .unwrap();
+        cancelled.result_id = cancel_manifest.result_id.clone();
+        cancelled.result_ref = cancel_root.to_string_lossy().into_owned();
+        shared.leases.lock().unwrap().insert(
+            cancelled.lease_id.clone(),
+            LeaseInfo {
+                job: JobId(8),
+                node: "worker".into(),
+                kind: LeaseKind::Post,
+                token: cancel_token,
+                job_revision: 1,
+                control_revision: 1,
+                last_hb: Instant::now(),
+            },
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(SECRET_HEADER, "secret".parse().unwrap());
+        let finishing = tokio::spawn(work_complete(
+            State(shared.clone()),
+            headers,
+            Json(cancelled.clone()),
+        ));
+        projection.entered.acquire().await.unwrap().forget();
+        let (current, revision) = control
+            .selected_publication_job(8, &cancelled.result_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            control
+                .apply_command(
+                    "newer-delete",
+                    8,
+                    revision,
+                    r#"{"op":"delete"}"#,
+                    &serde_json::to_string(&current).unwrap(),
+                    true
+                )
+                .await
+                .unwrap(),
+            MutationOutcome::Applied { .. }
+        ));
+        projection.release.add_permits(1);
+        assert_eq!(finishing.await.unwrap().status(), StatusCode::CONFLICT);
+        assert!(
+            engine.export_job(JobId(8)).await.unwrap().is_none(),
+            "late completion must not resurrect the deleted queue row"
+        );
+        assert!(
+            control
+                .cluster_delivery(&cluster_delivery_id(&cancelled.result_id))
+                .await
+                .unwrap()
+                .is_none(),
+            "newer cancellation prevents late READY"
+        );
+        let materialized = shared.dest_dir.join(cluster_publication_name(
+            "cancelled-job",
+            &cancelled.result_id,
+            true,
+        ));
+        assert!(materialized.is_dir());
+        std::fs::remove_dir_all(&materialized).unwrap();
+        recover_selected_publications(&shared).await.unwrap();
+        assert!(
+            !materialized.exists(),
+            "historical selection cannot undo cancellation on restart"
+        );
+        engine.shutdown().await;
+        control.shutdown().await.unwrap();
+    }
+
     #[test]
     fn lost_completion_response_replays_only_the_exact_durable_receipt() {
         let token = test_token("work/job/7/download");
         let request = CompleteRequest {
+            lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
             node: "worker".into(),
             lease_id: "work/job/7/download@1".into(),
             token: token.clone(),
@@ -2312,6 +3870,41 @@ mod tests {
         let entries = hist.list(10).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].final_dir.as_deref(), category.to_str());
+        shared.authority_ready.store(true, Ordering::Release);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = router(shared);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut large_job = test_job(7);
+        large_job
+            .params
+            .push(("large-metadata".into(), "x".repeat(2 * 1024 * 1024)));
+        let request = CompleteRequest {
+            lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
+            node: "worker".into(),
+            lease_id: "unknown".into(),
+            token: test_token("work/job/7/post"),
+            expected_job_revision: 1,
+            result_id: "result".into(),
+            result_ref: "/missing".into(),
+            receipt_id: "receipt".into(),
+            job: large_job,
+        };
+        let error = crate::http::ClusterClient::new("secret".into())
+            .post_json::<_, serde_json::Value>(
+                &format!("http://{address}"),
+                "/cluster/v1/work/complete",
+                &request,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("409") && error.contains("unknown lease"),
+            "real cluster completion route must parse >1MiB before checking lease: {error}"
+        );
+        server.abort();
         engine.shutdown().await;
     }
 
@@ -2541,5 +4134,625 @@ mod tests {
             None
         );
         engine.shutdown().await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn work_grant_uses_compared_intent_and_refuses_intervening_pause() {
+        let temp = tempfile::tempdir().unwrap();
+        let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ClusterConfig {
+            cluster_id: "grant-cas".into(),
+            node_name: "authority".into(),
+            shared_dir: temp.path().join("shared"),
+            advertise_url: "http://127.0.0.1:1".into(),
+            secret: "secret".into(),
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            pp_slots: 0,
+            lease_interval: std::time::Duration::from_millis(100),
+            takeover_after: std::time::Duration::from_secs(1),
+            worker_ttl: std::time::Duration::from_secs(3),
+            control_dir: temp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: raft.local_addr().unwrap().to_string(),
+            control_api_bind: api.local_addr().unwrap().to_string(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
+            disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
+        };
+        drop(raft);
+        drop(api);
+        let runtime = crate::ClusterRuntime::start(
+            cfg,
+            Vec::new(),
+            Tuning {
+                min_free_disk_bytes: 0,
+                ..Default::default()
+            },
+            temp.path().join("dest"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !runtime.leader_shared.authority_ready() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let shared = &runtime.leader_shared;
+        let control = runtime.control.as_ref().unwrap();
+        let _serial = shared.mutation_serial.lock().await;
+        let mut job = test_job(91);
+        job.status = JobStatus::Queued;
+        // Actual owned legacy writer source: provenance must not opt it into
+        // automatic cleanup or consumer delivery.
+        let inventory = runtime.engine.artifacts();
+        let source = inventory
+            .allocate_for_delivery(
+                91,
+                &temp.path().join("dest"),
+                &temp.path().join("dest/job"),
+                false,
+                false,
+            )
+            .unwrap();
+        runtime.engine.import_job(job, false, false).await.unwrap();
+        let stale = runtime.engine.export_job(JobId(91)).await.unwrap().unwrap();
+        control
+            .commit_job_delta(&[(91, Some(stale.clone()))])
+            .await
+            .unwrap();
+        crate::source_facts::reconcile(shared).await.unwrap();
+        let stale = runtime.engine.export_job(JobId(91)).await.unwrap().unwrap();
+        assert!(
+            !inventory
+                .get(&source.id)
+                .unwrap()
+                .automatic_cleanup_eligible
+        );
+        assert!(!inventory.get(&source.id).unwrap().delivery_lifecycle);
+        let mut current = stale.clone();
+        current.name = "renamed by operator".into();
+        current
+            .params
+            .push(("Failure:KeepOnFailure".into(), "true".into()));
+        control
+            .commit_job_delta(&[(91, Some(current.clone()))])
+            .await
+            .unwrap();
+        assert!(
+            shared
+                .grant_job(
+                    "worker",
+                    "worker-process",
+                    LeaseKind::Download,
+                    stale,
+                    serde_json::json!({"whole_job":true})
+                )
+                .await
+                .is_none(),
+            "stale export cannot borrow the newer name/Keep revision"
+        );
+        assert!(control
+            .current_lease("work/job/91/download")
+            .await
+            .unwrap()
+            .is_none());
+        shared.restore_control_projection().await.unwrap();
+        let current = runtime.engine.export_job(JobId(91)).await.unwrap().unwrap();
+        let gate = Arc::new(VerificationGate {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        *shared.grant_gate.lock().unwrap() = Some(gate.clone());
+        let attempt = tokio::spawn({
+            let shared = shared.clone();
+            let job = current.clone();
+            async move {
+                shared
+                    .grant_job(
+                        "worker",
+                        "worker-process",
+                        LeaseKind::Download,
+                        job,
+                        serde_json::json!({"whole_job":true}),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let mut paused = current.clone();
+        paused.status = JobStatus::Paused;
+        control
+            .commit_job_delta(&[(91, Some(paused))])
+            .await
+            .unwrap();
+        gate.release.add_permits(1);
+        assert!(
+            attempt.await.unwrap().is_none(),
+            "pause committed after compare must defeat lease insertion CAS"
+        );
+        assert!(control
+            .current_lease("work/job/91/download")
+            .await
+            .unwrap()
+            .is_none());
+        *shared.grant_gate.lock().unwrap() = None;
+        current_job_resume(control, shared, &current).await;
+        let current = runtime.engine.export_job(JobId(91)).await.unwrap().unwrap();
+        let grant = shared
+            .grant_job(
+                "worker",
+                "worker-process",
+                LeaseKind::Download,
+                current,
+                serde_json::json!({"whole_job":true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant.job.name, "renamed by operator");
+        assert!(grant
+            .job
+            .params
+            .iter()
+            .any(|(key, value)| key == "Failure:KeepOnFailure" && value == "true"));
+        assert_eq!(
+            grant.job_revision,
+            control.job_identity(91).await.unwrap().unwrap().1
+        );
+        let historical = control
+            .historical_grant(&grant.token.resource, grant.token.fence)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(historical.initial_token, grant.token);
+        let fact: crate::delivery::AuthoritySourceCopy =
+            serde_json::from_str(historical.source_binding_json.as_ref().unwrap()).unwrap();
+        assert_eq!(fact.owner_node, "authority");
+        assert_eq!(fact.copy.source.artifact, source.id);
+        assert!(control.release(&grant.token).await.unwrap());
+        let current = runtime.engine.export_job(JobId(91)).await.unwrap().unwrap();
+        let next = shared
+            .grant_job(
+                "worker2",
+                "worker-process2",
+                LeaseKind::Download,
+                current,
+                serde_json::json!({"whole_job":true}),
+            )
+            .await
+            .unwrap();
+        assert!(next.token.fence > grant.token.fence);
+        assert_eq!(
+            control
+                .historical_grant(&grant.token.resource, grant.token.fence)
+                .await
+                .unwrap()
+                .unwrap(),
+            historical,
+            "regrant must preserve historical owner proof"
+        );
+        assert_eq!(
+            control
+                .historical_grant(&next.token.resource, next.token.fence)
+                .await
+                .unwrap()
+                .unwrap()
+                .initial_token,
+            next.token
+        );
+        assert!(control.acquire("job/91/stale-issuer","grant-cas",91,&next.job_incarnation,"worker","process","download",&serde_json::json!({"_authority":{"node":"authority","incarnation":"stale-process","fence":shared.epoch()}}).to_string(),next.job_revision,std::time::Duration::from_secs(1)).await.is_err());
+        drop(_serial);
+        runtime.shutdown().await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn automatic_control_reconciliation_replays_ack_and_preserves_newer_pause() {
+        let temp = tempfile::tempdir().unwrap();
+        let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ClusterConfig {
+            cluster_id: "grant-cas".into(),
+            node_name: "authority".into(),
+            shared_dir: temp.path().join("shared"),
+            advertise_url: "http://127.0.0.1:1".into(),
+            secret: "secret".into(),
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            pp_slots: 0,
+            lease_interval: std::time::Duration::from_millis(100),
+            takeover_after: std::time::Duration::from_secs(1),
+            worker_ttl: std::time::Duration::from_secs(3),
+            control_dir: temp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: raft.local_addr().unwrap().to_string(),
+            control_api_bind: api.local_addr().unwrap().to_string(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
+            disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
+        };
+        drop(raft);
+        drop(api);
+        let runtime = crate::ClusterRuntime::start(
+            cfg,
+            Vec::new(),
+            Tuning {
+                min_free_disk_bytes: 0,
+                ..Default::default()
+            },
+            temp.path().join("dest"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !runtime.leader_shared.authority_ready() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let shared = &runtime.leader_shared;
+        let control = runtime.control.as_ref().unwrap();
+        let _serial = shared.mutation_serial.lock().await;
+        let mut base = test_job(92);
+        base.status = JobStatus::Queued;
+        base.dir_name = "automatic".into();
+        let inventory = runtime.engine.artifacts();
+        inventory
+            .allocate_for_delivery(
+                92,
+                &temp.path().join("dest"),
+                &temp.path().join("dest/automatic"),
+                true,
+                false,
+            )
+            .unwrap();
+        runtime.engine.import_job(base, false, false).await.unwrap();
+        let base = runtime.engine.export_job(JobId(92)).await.unwrap().unwrap();
+        control.commit_job_delta(&[(92, Some(base))]).await.unwrap();
+        crate::source_facts::reconcile(shared).await.unwrap();
+        assert!(runtime
+            .engine
+            .hold_job(
+                JobId(92),
+                nzbd_types::HoldCause::Allocation,
+                "download",
+                "allocation temporarily unavailable"
+            )
+            .await
+            .unwrap());
+        let held = runtime.engine.export_job(JobId(92)).await.unwrap().unwrap();
+        let marker = nzbd_engine::automatic_control::transition(&held)
+            .expect("real actor hold has provenance");
+        settle_automatic_control(shared, JobId(92)).await;
+        let (durable, revision, _) = control.current_job_intent(92).await.unwrap().unwrap();
+        assert_eq!(durable.control().as_ref(), Some(&marker.result_control));
+        assert!(!durable
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_engine::automatic_control::AUTOMATIC_CONTROL_PARAM));
+        assert!(nzbd_engine::automatic_control::transition(
+            &runtime.engine.export_job(JobId(92)).await.unwrap().unwrap()
+        )
+        .is_none());
+        // Simulate a lost local ACK by restoring its exact persisted marker.
+        runtime.engine.import_job(held, false, false).await.unwrap();
+        assert!(nzbd_engine::automatic_control::transition(
+            &runtime.engine.export_job(JobId(92)).await.unwrap().unwrap()
+        )
+        .is_some());
+        settle_automatic_control(shared, JobId(92)).await;
+        assert_eq!(
+            control.current_job_intent(92).await.unwrap().unwrap().1,
+            revision,
+            "ACK replay must not add another durable transition"
+        );
+        // Advance only this fixture's persisted retry clock; the following
+        // release still runs the production Recovery actor path.
+        let mut due = durable.clone();
+        let mut due_control = due.control().unwrap();
+        due_control.next_retry_at_unix = Some(0);
+        due.set_control(&due_control);
+        control.commit_job_delta(&[(92, Some(due))]).await.unwrap();
+        shared.restore_control_projection().await.unwrap();
+        let recovery = runtime
+            .engine
+            .release_hold(
+                JobId(92),
+                marker.result_control.revision,
+                nzbd_engine::RetryBy::Recovery,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovery, Ok(()));
+        let released = runtime.engine.export_job(JobId(92)).await.unwrap().unwrap();
+        assert!(nzbd_engine::automatic_control::transition(&released).is_some());
+        let mut paused = durable;
+        let mut paused_control = paused.control().unwrap();
+        paused_control.manual_pause = true;
+        paused_control.revision = (paused_control.revision.parse::<u64>().unwrap() + 1).to_string();
+        paused.set_control(&paused_control);
+        paused.status = JobStatus::Paused;
+        control
+            .commit_job_delta(&[(92, Some(paused))])
+            .await
+            .unwrap();
+        settle_automatic_control(shared, JobId(92)).await;
+        let current = runtime.engine.export_job(JobId(92)).await.unwrap().unwrap();
+        assert_eq!(current.status, JobStatus::Paused);
+        assert!(current.control().unwrap().manual_pause);
+        assert!(nzbd_engine::automatic_control::transition(&current).is_none());
+        assert_eq!(
+            control
+                .current_job_intent(92)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .control(),
+            Some(paused_control)
+        );
+        drop(_serial);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocked_source_proof_preserves_pending_job_but_allows_other_controls_and_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ClusterConfig {
+            cluster_id: "grant-cas".into(),
+            node_name: "authority".into(),
+            shared_dir: temp.path().join("shared"),
+            advertise_url: "http://127.0.0.1:1".into(),
+            secret: "secret".into(),
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            pp_slots: 0,
+            lease_interval: std::time::Duration::from_millis(100),
+            takeover_after: std::time::Duration::from_secs(1),
+            worker_ttl: std::time::Duration::from_secs(3),
+            control_dir: temp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: raft.local_addr().unwrap().to_string(),
+            control_api_bind: api.local_addr().unwrap().to_string(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
+            disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
+        };
+        drop(raft);
+        drop(api);
+        let runtime = crate::ClusterRuntime::start(
+            cfg,
+            Vec::new(),
+            Tuning {
+                min_free_disk_bytes: 0,
+                ..Default::default()
+            },
+            temp.path().join("dest"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !runtime.leader_shared.authority_ready() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let shared = &runtime.leader_shared;
+        let control = runtime.control.as_ref().unwrap();
+        let serial = shared.mutation_serial.lock().await;
+        let mut blocked = test_job(92);
+        blocked.status = JobStatus::Queued;
+        blocked.dir_name = "proof-pending".into();
+        let inventory = runtime.engine.artifacts();
+        let source = inventory
+            .allocate_for_delivery(
+                92,
+                &temp.path().join("dest"),
+                &temp.path().join("dest/proof-pending"),
+                true,
+                false,
+            )
+            .unwrap();
+        let mut other = test_job(93);
+        other.status = JobStatus::Queued;
+        other.dir_name = "other".into();
+        runtime
+            .engine
+            .import_job(blocked, false, false)
+            .await
+            .unwrap();
+        runtime
+            .engine
+            .import_job(other, false, false)
+            .await
+            .unwrap();
+        let blocked = runtime.engine.export_job(JobId(92)).await.unwrap().unwrap();
+        let other = runtime.engine.export_job(JobId(93)).await.unwrap().unwrap();
+        control
+            .commit_job_delta(&[(92, Some(blocked)), (93, Some(other))])
+            .await
+            .unwrap();
+        crate::source_facts::reconcile(shared).await.unwrap();
+        let gate = Arc::new((
+            tokio::sync::Semaphore::new(0),
+            tokio::sync::Semaphore::new(0),
+        ));
+        *shared.control_proofs.gate.lock().unwrap() = Some(gate.clone());
+        assert!(runtime
+            .engine
+            .hold_job(
+                JobId(92),
+                nzbd_types::HoldCause::Allocation,
+                "download",
+                "source proof delayed"
+            )
+            .await
+            .unwrap());
+        crate::control_recovery::reconcile(shared).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), gate.0.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        shared.restore_control_projection().await.unwrap();
+        assert!(
+            nzbd_engine::automatic_control::transition(
+                &runtime.engine.export_job(JobId(92)).await.unwrap().unwrap()
+            )
+            .is_some(),
+            "unrelated projection rebuild cannot erase pending provenance"
+        );
+        drop(serial);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = runtime.router("test", Vec::new());
+        let serve = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = crate::http::ClusterClient::new("secret".into());
+        use http_body_util::BodyExt;
+        let detail = client
+            .forward(
+                &format!("http://{address}"),
+                hyper::Request::get("/api/v1/jobs/92")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail: serde_json::Value =
+            serde_json::from_slice(&detail.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(detail["controlPending"]["state"], "pending");
+        assert_eq!(detail["controlPending"]["owner"], "authority");
+        for (job, action) in [(93, "pause"), (92, "delete"), (93, "resume")] {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                client.forward(
+                    &format!("http://{address}"),
+                    hyper::Request::post(format!("/api/v1/jobs/{job}/actions/{action}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .expect("a slow source proof must not monopolize mutation_serial")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{job}/{action}");
+            if job == 93 && action == "pause" {
+                assert!(nzbd_engine::automatic_control::transition(
+                    &runtime.engine.export_job(JobId(92)).await.unwrap().unwrap()
+                )
+                .is_some());
+                assert_eq!(
+                    control
+                        .current_job_intent(93)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .0
+                        .status,
+                    JobStatus::Paused
+                );
+            }
+        }
+        assert!(runtime
+            .engine
+            .export_job(JobId(92))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(control.current_job_intent(92).await.unwrap().is_none());
+        assert!(
+            source.path.exists(),
+            "ordinary removal keeps the blocked job's bytes"
+        );
+        crate::control_recovery::reconcile(shared).await.unwrap();
+        gate.1.add_permits(1);
+        tokio::task::yield_now().await;
+        assert!(shared
+            .control_proofs
+            .snapshot()
+            .iter()
+            .all(|value| value["jobId"] != 92));
+        assert!(
+            runtime
+                .engine
+                .export_job(JobId(92))
+                .await
+                .unwrap()
+                .is_none(),
+            "late proof cannot resurrect explicit removal"
+        );
+        serve.abort();
+        let _ = serve.await;
+        runtime.shutdown().await;
+    }
+
+    async fn settle_automatic_control(shared: &LeaderShared, job: JobId) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            crate::control_recovery::reconcile(shared).await.unwrap();
+            if shared
+                .engine
+                .export_job(job)
+                .await
+                .unwrap()
+                .is_none_or(|job| nzbd_engine::automatic_control::transition(&job).is_none())
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "automatic proof/commit did not settle"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn current_job_resume(control: &ControlStore, shared: &LeaderShared, current: &Job) {
+        control
+            .commit_job_delta(&[(u64::from(current.id.0), Some(current.clone()))])
+            .await
+            .unwrap();
+        shared.restore_control_projection().await.unwrap();
+    }
+
+    #[test]
+    fn bounded_poll_alternates_download_and_post_backlogs() {
+        let mut turns = HashSet::new();
+        let lanes = (0..10)
+            .map(|_| post_lane_first(&mut turns, "busy-worker"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lanes,
+            vec![true, false, true, false, true, false, true, false, true, false]
+        );
+        assert!(post_lane_first(&mut turns, "independent-worker"));
     }
 }

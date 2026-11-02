@@ -903,6 +903,33 @@ impl Inventory {
                 }
             }
         }
+        // Native acquisitions have no NZB segments/CRC. Their completed
+        // piece-verified copy journal carries independent content proof, with
+        // the same fresh identity/digest and rename checks as repaired output.
+        for proof in self.torrent_copy_integrity_files(job, &source)? {
+            let Some(expected_digest) = proof.digest.as_deref() else {
+                continue;
+            };
+            if observed
+                .iter()
+                .any(|entry| entry.path == proof.path && entry.identity == proof.identity)
+            {
+                checkpoint()?;
+                if digest_file_with_checkpoint(
+                    &root,
+                    &proof.path,
+                    &proof.identity,
+                    &mut checkpoint,
+                )? == expected_digest
+                {
+                    outputs.insert(proof.path.clone());
+                }
+            } else if let Some(rename) = renamed.get(&proof.path) {
+                if rename.before == proof.identity && rename.digest == expected_digest {
+                    outputs.insert(rename.current.clone());
+                }
+            }
+        }
         let _coordinator = self.mutation_guard()?;
         self.check_payload_capture(&source)?;
         Ok(CustodyEvidence {
@@ -1585,6 +1612,34 @@ impl Inventory {
     /// guard. The guarded re-check afterwards proves the row it verified is
     /// still the row (same id, generation and revision).
     pub fn validate_post_retry(&self, job: u32) -> Result<()> {
+        self.prepare_post_retry(job).map(|_| ())
+    }
+
+    /// Return the exact version whose physical custody was checked. A caller
+    /// can carry this version to a short actor CAS without rereading paths.
+    pub fn prepare_post_retry(&self, job: u32) -> Result<Artifact> {
+        self.prepare_post_retry_inner(job, &|| Ok(()), true)
+    }
+
+    pub fn prepare_post_retry_checked(
+        &self,
+        job: u32,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> Result<Artifact> {
+        self.prepare_post_retry_inner(job, checkpoint, false)
+    }
+
+    fn prepare_post_retry_inner(
+        &self,
+        job: u32,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+        retire_sources: bool,
+    ) -> Result<Artifact> {
+        checkpoint()?;
+        // A journaled rename may already have moved the old source path.
+        // Resume only its exact retryable operation before checking the new
+        // committed source; review and deletion operations remain fenced.
+        self.resume_post_relocation_checked(job, checkpoint, retire_sources)?;
         let source = {
             let _guard = self.mutation_guard()?;
             let source = self.for_job(job)?.ok_or(Error::NotFound)?;
@@ -1593,6 +1648,7 @@ impl Inventory {
         };
         let root = self.verify(&source)?;
         for entry in source.files.iter().filter(|e| !e.identity.directory) {
+            checkpoint()?;
             let file = fs::open_relative(&root, &entry.path)?;
             if fs::identity_for_file(&file)? != entry.identity {
                 return Err(Error::Conflict(
@@ -1600,6 +1656,7 @@ impl Inventory {
                 ));
             }
         }
+        checkpoint()?;
         let _guard = self.mutation_guard()?;
         let current = self.for_job(job)?.ok_or(Error::NotFound)?;
         if (&current.id, &current.generation, current.revision)
@@ -1611,15 +1668,17 @@ impl Inventory {
         }
         self.post_retry_custody(&current)?;
         let pending: i64 = self.db.lock().unwrap().query_row(
-            "SELECT COUNT(*) FROM operations WHERE artifact=?1 AND state IN ('running','review','queued','retry') AND json_extract(data,'$.kind') IN ('relocate','delete')",
+            "SELECT COUNT(*) FROM operations WHERE artifact=?1 AND state IN ('running','review','queued','retry') AND (json_extract(data,'$.kind')='delete' OR (json_extract(data,'$.kind')='relocate' AND state!='retry'))",
             [&current.id], |r| r.get(0),
         )?;
-        if pending != 0 {
+        let retry_relocations:bool=self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state='retry' AND json_extract(data,'$.kind')='relocate')",[&current.id],|row|row.get(0))?;
+        if pending != 0 || (retry_relocations && !self.recoverable_post_relocation(&current)?) {
             return Err(Error::Conflict(
                 "resolve pending relocation or deletion before retrying post-processing".into(),
             ));
         }
-        Ok(())
+        Ok(current)
     }
 
     /// The custody facts a post retry needs, read from the row alone.
@@ -1633,7 +1692,9 @@ impl Inventory {
             ));
         }
         if !source.owned
-            || source.hold.is_some()
+            || (source.hold.is_some()
+                && !(source.hold.as_deref() == Some("review: interrupted move")
+                    && self.recoverable_post_relocation(source)?))
             || !matches!(
                 source.state.as_str(),
                 "active" | "transitioning" | "retained"

@@ -10,3 +10,4 @@
 0019-disable-peer-exchange.patch
 0020-expose-test-only-dht-bootstrap.patch
 0021-configurable-client-identity-and-announce-lifecycle.patch
+0022-read-only-piece-verifier.patch

@@ -2,21 +2,41 @@
 //!
 //! SQLite owns intent and policy; external sidecars own allocation identity.
 //! Nothing in a media payload is a marker or grants permission to remove it.
+mod cluster;
+mod cluster_keep;
+pub use cluster::{remove_cluster_generation_copy, ClusterArtifactCopy, ClusterCopyCleanup};
+pub use cluster_keep::{ClusterFailureKeepStatus, ClusterFailureKeepTarget};
 pub(crate) mod fs;
 mod policy;
 mod publication;
 pub use policy::{RetentionChange, RetentionPreview};
 mod delivery;
 mod materialization;
-pub use materialization::{ExternalGeneration, ExternalGenerationFile};
+pub use materialization::{
+    external_generation_identity, ExternalGeneration, ExternalGenerationFile,
+};
 mod recovery;
 mod relocation;
-pub use delivery::{Delivery, DeliveryFile, DeliveryFileOutcome};
+pub use delivery::{Delivery, DeliveryFile, DeliveryFileOutcome, DeliveryRunnerStages};
 pub use relocation::{RelocationResult, SelectedPublication};
 mod startup;
 pub use startup::StartupReconciliation;
 mod tasks;
+mod torrent;
+pub use torrent::TorrentSourceReader;
+mod torrent_seed;
+pub use torrent_seed::{TorrentSeedRetirementIntent, TorrentSeedRetirementReason};
 mod transforms;
+mod url_resolutions;
+mod worker_controls;
+mod worker_stops;
+pub use url_resolutions::{
+    url_source_identity, url_storage_retry_deadline, UrlFileReservation, UrlResolutionFault,
+    UrlResolutionRecord, UrlResolutionStore, UrlStorageRetry,
+};
+pub use worker_stops::{
+    same_worker_operation, WorkerStopRequest, WorkerStopTicket, WorkerStoppedReceipt,
+};
 mod workspace_lifecycle;
 pub use recovery::{Receipt, ReceiptFile, Recovery, RecoveryFile};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -29,10 +49,16 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 pub use transforms::{CustodyEvidence, Workspace};
+pub use worker_controls::{
+    WorkerCompletionProof, WorkerControlCheckpoint, WorkerControlContext, WorkerRetryAdoption,
+    WORKER_CONTROL_CONTEXT_PARAM,
+};
 pub use workspace_lifecycle::{
     AttemptUse, FinalizationProof, SourceGeneration, StagedCompletion, WorkspaceAssessment,
 };
 
+#[cfg(test)]
+thread_local! {static DELETE_FAIL_AFTER:std::cell::Cell<Option<usize>>=const{std::cell::Cell::new(None)};}
 pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -204,12 +230,30 @@ pub struct Operation {
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum DeleteRequest {
+    ManagedSeed(torrent_seed::ManagedSeedDeleteRequest),
+    // Exact cancellation receipt and immutable owned selection binding keep
+    // explicit byte authority separate from mutable Keep/revision changes.
+    ClusterCancellation((String, u64, u64, bool, String, bool, String, String)),
+    Cluster((String, u64, u64, bool, String, bool)),
     Scoped((String, u64, u64, bool, String)),
     Legacy((String, u64, u64, bool)),
 }
 impl DeleteRequest {
     fn fields(&self) -> (&str, u64, u64, bool, Option<&str>) {
         match self {
+            Self::ManagedSeed(request) => (
+                &request.artifact,
+                request.revision,
+                0,
+                false,
+                Some(&request.generation),
+            ),
+            Self::ClusterCancellation((id, rev, undo, auto, generation, _, _, _)) => {
+                (id, *rev, *undo, *auto, Some(generation))
+            }
+            Self::Cluster((id, rev, undo, auto, generation, _)) => {
+                (id, *rev, *undo, *auto, Some(generation))
+            }
             Self::Scoped((id, rev, undo, auto, generation)) => {
                 (id, *rev, *undo, *auto, Some(generation))
             }
@@ -315,6 +359,7 @@ pub struct Inventory {
     workspace_uses: Mutex<std::collections::HashMap<(String, String), usize>>,
     workspace_cursor: Mutex<String>,
     _process_lock: File,
+    worker_session: String,
     closed: std::sync::atomic::AtomicBool,
     state_dir: PathBuf,
     pub installation: String,
@@ -324,6 +369,7 @@ pub struct Inventory {
     // but a competing reconciler must never overwrite this operation's newer
     // publication checkpoint.
     publication_active: Mutex<std::collections::HashSet<String>>,
+    relocation_active: Mutex<std::collections::HashSet<String>>,
     clocks: Mutex<std::collections::HashMap<String, (u64, Instant)>>,
     reconcile_cursor: Mutex<String>,
     // One task runner at a time: the maintenance tick and an API kick can
@@ -585,7 +631,15 @@ impl Inventory {
           CREATE INDEX IF NOT EXISTS artifacts_path ON artifacts(path);
           CREATE INDEX IF NOT EXISTS artifacts_state ON artifacts(state,updated_at);
           CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,artifact TEXT NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS worker_controls(job INTEGER PRIMARY KEY,data TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS worker_authority(job INTEGER PRIMARY KEY,data TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS worker_grant_stops(id TEXT PRIMARY KEY,job INTEGER NOT NULL,incarnation TEXT NOT NULL,lease TEXT NOT NULL,revision INTEGER NOT NULL,control_revision INTEGER NOT NULL,phase TEXT NOT NULL,data TEXT NOT NULL CHECK(length(CAST(data AS BLOB))<=16384));
+          CREATE INDEX IF NOT EXISTS worker_grant_stops_job ON worker_grant_stops(job,incarnation,lease);
+          CREATE TABLE IF NOT EXISTS worker_removal_fences(job INTEGER NOT NULL,incarnation TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(job,incarnation));
+          CREATE TABLE IF NOT EXISTS worker_completions(job INTEGER PRIMARY KEY,data TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS worker_completion_receipts(id TEXT PRIMARY KEY,job INTEGER NOT NULL,data TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS operations_state ON operations(state);
+          CREATE INDEX IF NOT EXISTS operations_artifact ON operations(artifact);
           CREATE TABLE IF NOT EXISTS recoveries(id TEXT PRIMARY KEY,artifact TEXT NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS workspace_finalizations(source TEXT NOT NULL,generation TEXT NOT NULL,outcome TEXT NOT NULL,proof TEXT NOT NULL,job INTEGER,activated INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(source,generation));
           CREATE TABLE IF NOT EXISTS deliveries(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,artifact TEXT NOT NULL,generation TEXT NOT NULL,data TEXT NOT NULL,accepted_at INTEGER,consumer_receipt_id TEXT,cleanup_status TEXT NOT NULL DEFAULT 'pending',cleanup_error TEXT,cleanup_attempts INTEGER NOT NULL DEFAULT 0,cleanup_next_retry_at INTEGER,cleanup_blocked_since INTEGER,cleanup_started_at INTEGER,cleanup_last_attempt_at INTEGER,cleanup_completed_at INTEGER,UNIQUE(artifact,generation));
@@ -700,6 +754,7 @@ impl Inventory {
             )?;
         }
         fs::sync_directory(&fs::open_dir(state_dir)?)?;
+        let worker_session = id(&db)?;
         Ok(Self {
             db: Mutex::new(db),
             allocation_uses: Mutex::new(std::collections::HashSet::new()),
@@ -707,11 +762,13 @@ impl Inventory {
             workspace_uses: Mutex::new(std::collections::HashMap::new()),
             workspace_cursor: Mutex::new(String::new()),
             _process_lock: process_lock,
+            worker_session,
             closed: std::sync::atomic::AtomicBool::new(false),
             state_dir: state_dir.into(),
             installation,
             mutation: Mutex::new(()),
             publication_active: Mutex::new(std::collections::HashSet::new()),
+            relocation_active: Mutex::new(std::collections::HashSet::new()),
             clocks: Mutex::new(std::collections::HashMap::new()),
             reconcile_cursor: Mutex::new(String::new()),
             tasks: Mutex::new(()),
@@ -1272,6 +1329,8 @@ impl Inventory {
     /// Compatibility entry point for callers without a payload scheduler.
     /// Engine startup dispatches these roots independently instead.
     pub fn reconcile_startup(&self, live_jobs: &[u32]) -> Result<()> {
+        self.reconcile_torrent_stage_cleanups(&|| Ok(()))?;
+        self.reconcile_torrent_copy_compaction(&|| Ok(()))?;
         for root in self.startup_reconciliation_roots()? {
             self.reconcile_startup_root(&root, live_jobs)?;
         }
@@ -1644,10 +1703,20 @@ impl Inventory {
         // Reserve this exact metadata generation briefly, then inspect the
         // payload without either the mutation coordinator or SQLite held.
         // The final revision check below rejects an obsolete observation.
-        let Some(_lease) = self.reserve_reconciliation(std::slice::from_ref(&original))? else {
-            return Err(Error::Conflict(
-                "artifact changed or is in use; retry inspection".into(),
-            ));
+        // A background metadata probe can briefly own this same lease.
+        // Wait off-actor without holding the coordinator, always reserving
+        // the original revision so changed policy or custody cannot slip in.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let _lease = loop {
+            if let Some(lease) = self.reserve_reconciliation(std::slice::from_ref(&original))? {
+                break lease;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Conflict(
+                    "artifact changed or is in use; retry inspection".into(),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         };
         let dir = self.verify(&original)?;
         let files = fs::manifest(&dir, 100_000)?;
@@ -1781,6 +1850,13 @@ impl Inventory {
             drop(stmt);
             for raw in ops {
                 let mut op: Operation = serde_json::from_str(&raw)?;
+                if op.kind == "delete"
+                    && matches!(serde_json::from_str::<DeleteRequest>(&op.request),Ok(DeleteRequest::ClusterCancellation((_,_,_,false,ref generation,false,ref receipt,_))) if generation==&a.generation && !receipt.is_empty())
+                {
+                    // The executor still rechecks its independent receipt and
+                    // exact owned manifest after any Keep-only revision change.
+                    continue;
+                }
                 op.state = "cancelled".into();
                 save_operation(&tx, &op)?;
             }
@@ -1800,11 +1876,8 @@ impl Inventory {
         Ok(a)
     }
 
-    /// Persist the per-job failed-source choice in the same inventory journal
-    /// consulted at the physical-delete boundary. Explicit artifact deletion
-    /// remains a separate user action and is not blocked by this preference.
-    pub fn set_keep_on_failure(&self, job: u32, keep: bool) -> Result<bool> {
-        let guard = self.mutation_guard()?;
+    /// Current exact Runner-owned source; Delivery's admission Keep is immutable.
+    pub fn failure_keep_source(&self, job: u32) -> Result<Option<Artifact>> {
         let mut artifact = self.for_job(job)?;
         // After publication, the job handle resolves to the transferred
         // publication artifact. Keep governs the separate Runner-owned
@@ -1829,9 +1902,30 @@ impl Inventory {
                 }
             }
         }
-        let Some(mut artifact) = artifact else {
+        Ok(artifact.filter(|artifact| artifact.owned && !artifact.terminal()))
+    }
+
+    /// Persist the per-job failed-source choice in the same inventory journal
+    /// consulted at the physical-delete boundary. Explicit artifact deletion
+    /// remains a separate user action and is not blocked by this preference.
+    pub fn set_keep_on_failure(&self, job: u32, keep: bool) -> Result<bool> {
+        let guard = self.mutation_guard()?;
+        let artifact = self.failure_keep_source(job)?;
+        let Some(artifact) = artifact else {
             return Ok(false);
         };
+        let result = self.set_failure_keep_artifact_locked(job, artifact, keep, false);
+        drop(guard);
+        result
+    }
+
+    fn set_failure_keep_artifact_locked(
+        &self,
+        job: u32,
+        mut artifact: Artifact,
+        keep: bool,
+        existing_only: bool,
+    ) -> Result<bool> {
         if self.reconciliation_in_use(&artifact) {
             return Err(Error::Conflict(
                 "payload lifecycle custody is active".into(),
@@ -1942,10 +2036,11 @@ impl Inventory {
                     // New authorization requires a persisted assessment for
                     // this generation. A failed/in-flight deletion without
                     // its journal cannot be reconstructed from Keep-off.
-                    if artifact
-                        .failure_assessment
-                        .as_ref()
-                        .is_some_and(|assessment| assessment.disposition == "unusable")
+                    if !existing_only
+                        && artifact
+                            .failure_assessment
+                            .as_ref()
+                            .is_some_and(|assessment| assessment.disposition == "unusable")
                         && matches!(artifact.state.as_str(), "retained" | "completed")
                     {
                         Some(Operation {
@@ -1986,10 +2081,16 @@ impl Inventory {
                     .optional()?;
                 if let Some((delivery_id, cleanup_status)) = delivery {
                     if matches!(cleanup_status.as_str(), "pending" | "retry" | "blocked") {
-                        tx.execute(
-                            "UPDATE deliveries SET cleanup_status='retry',cleanup_error=NULL,cleanup_next_retry_at=0 WHERE id=?1 AND cleanup_status IN ('pending','retry','blocked')",
-                            [&delivery_id],
-                        )?;
+                        if existing_only {
+                            // Retry the existing obligation without erasing a
+                            // review/identity reason or creating byte authority.
+                            tx.execute("UPDATE deliveries SET cleanup_next_retry_at=0 WHERE id=?1 AND cleanup_status IN ('pending','retry','blocked')", [&delivery_id])?;
+                        } else {
+                            tx.execute(
+                                "UPDATE deliveries SET cleanup_status='retry',cleanup_error=NULL,cleanup_next_retry_at=0 WHERE id=?1 AND cleanup_status IN ('pending','retry','blocked')",
+                                [&delivery_id],
+                            )?;
+                        }
                     }
                 }
             }
@@ -2001,7 +2102,6 @@ impl Inventory {
             )?;
             tx.commit()?;
         }
-        drop(guard);
         Ok(true)
     }
 
@@ -2125,6 +2225,29 @@ impl Inventory {
         automatic: bool,
         authority: Option<(&AttemptUse, &dyn Fn() -> std::io::Result<()>)>,
     ) -> Result<Operation> {
+        self.request_delete_with_policy(
+            key,
+            revision,
+            request_id,
+            undo_seconds,
+            automatic,
+            authority,
+            false,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn request_delete_with_policy(
+        &self,
+        key: &str,
+        revision: u64,
+        request_id: &str,
+        undo_seconds: u64,
+        automatic: bool,
+        authority: Option<(&AttemptUse, &dyn Fn() -> std::io::Result<()>)>,
+        failure_keep_guard: bool,
+        cancellation_receipt: Option<&str>,
+    ) -> Result<Operation> {
         let _guard = self.mutation_guard()?;
         if let Some((_, checkpoint)) = authority {
             checkpoint()?;
@@ -2136,8 +2259,40 @@ impl Inventory {
             ));
         }
         let a = self.get(key)?;
-        let request =
-            serde_json::to_string(&(key, revision, undo_seconds, automatic, &a.generation))?;
+        let explicit_cancellation = cancellation_receipt
+            .map(|receipt| self.cluster_cancellation_delete_accepted(&a.id, &a.generation, receipt))
+            .transpose()?
+            .unwrap_or(false);
+        if cancellation_receipt.is_some()
+            && (!explicit_cancellation || automatic || failure_keep_guard)
+        {
+            return Err(Error::Conflict(
+                "explicit cancellation lacks its exact durable receipt".into(),
+            ));
+        }
+        let request = if let Some(receipt) = cancellation_receipt {
+            serde_json::to_string(&(
+                key,
+                revision,
+                undo_seconds,
+                automatic,
+                &a.generation,
+                false,
+                receipt,
+                self.cluster_cancellation_delete_binding(&a)?,
+            ))?
+        } else if request_id.starts_with("cluster-copy-") {
+            serde_json::to_string(&(
+                key,
+                revision,
+                undo_seconds,
+                automatic,
+                &a.generation,
+                failure_keep_guard,
+            ))?
+        } else {
+            serde_json::to_string(&(key, revision, undo_seconds, automatic, &a.generation))?
+        };
         match self.operation(request_id) {
             Ok(op) => {
                 let previous: DeleteRequest = serde_json::from_str(&op.request)?;
@@ -2158,7 +2313,7 @@ impl Inventory {
         if a.revision != revision
             || (self.artifact_in_use(&a)? && !self.authorized_processing_use(&a, use_guard))
             || !a.owned
-            || a.keep
+            || (a.keep && !explicit_cancellation)
             || a.hold.is_some()
             || !matches!(
                 a.state.as_str(),
@@ -2228,6 +2383,14 @@ impl Inventory {
         if op.kind != "delete" {
             return Err(Error::Conflict("not a deletion operation".into()));
         }
+        if torrent_seed::is_seed_delete_key(&op.id)
+            && authority.is_none()
+            && !matches!(op.state.as_str(), "succeeded" | "cancelled" | "review")
+        {
+            return Err(Error::Conflict(
+                "managed seed deletion requires fresh backend-stop and dependency proof".into(),
+            ));
+        }
         // A deferred move may have a stale/legacy retirement operation in the
         // journal. Its task row is not authority: require the durable delivery
         // bound to the exact source generation at execution time as well.
@@ -2254,6 +2417,54 @@ impl Inventory {
         }
         let request: DeleteRequest = serde_json::from_str(&op.request)?;
         let (_, revision, _, automatic, generation) = request.fields();
+        let explicit_cancellation = if let DeleteRequest::ClusterCancellation((
+            _,
+            _,
+            _,
+            _,
+            _,
+            failure_guard,
+            receipt,
+            binding,
+        )) = &request
+        {
+            if automatic
+                || *failure_guard
+                || !self.cluster_cancellation_delete_accepted(&a.id, &a.generation, receipt)?
+                || self.cluster_cancellation_delete_binding(&a)? != *binding
+            {
+                op.state = "review".into();
+                op.error = Some(
+                    "explicit cancellation receipt changed; review this exact source generation"
+                        .into(),
+                );
+                save_operation(&self.db.lock().unwrap(), &op)?;
+                return Ok(op);
+            }
+            true
+        } else {
+            false
+        };
+        let failure_guard = match &request {
+            DeleteRequest::ManagedSeed(request) => {
+                request.intent.reason == TorrentSeedRetirementReason::Failure
+            }
+            DeleteRequest::ClusterCancellation(_) => false,
+            DeleteRequest::Cluster((_, _, _, _, _, guard)) => *guard,
+            _ => {
+                op.id.starts_with("cluster-copy-")
+                    && !self.cluster_retirement_success(&a.id, &a.generation)?
+            }
+        };
+        if failure_guard && a.keep_on_failure {
+            op.state = "retry".into();
+            op.error = Some(
+                "per-download Keep on failure is enabled; exact cluster source retained".into(),
+            );
+            op.next_retry = now().saturating_add(30);
+            save_operation(&self.db.lock().unwrap(), &op)?;
+            return Ok(op);
+        }
         if automatic && !a.automatic_cleanup_eligible {
             op.state = "review".into();
             op.error = Some("pre-existing artifact is exempt from automatic deletion pending reviewed migration".into());
@@ -2267,7 +2478,7 @@ impl Inventory {
             return Ok(op);
         }
         if op.attempts == 0
-            && (a.revision != revision
+            && ((a.revision != revision && !explicit_cancellation)
                 || (automatic
                     && (!self.settings()?.enabled
                         || !a.eligible()
@@ -2280,7 +2491,7 @@ impl Inventory {
             return Ok(op);
         }
         if (self.artifact_in_use(&a)? && !self.authorized_processing_use(&a, use_guard))
-            || a.keep
+            || (a.keep && !explicit_cancellation)
             || a.hold.is_some()
             || !a.owned
         {
@@ -2373,10 +2584,19 @@ impl Inventory {
         let observed = fs::manifest(&dir, 100_000)?;
         // A restarted partial deletion may have fewer entries, never more
         // or different ones. Every surviving regular file is revalidated.
+        let owned: std::collections::HashMap<_, _> = a
+            .files
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect();
+        if owned.len() != a.files.len() {
+            return Err(Error::Conflict(
+                "deletion manifest has duplicate paths".into(),
+            ));
+        }
         for f in &observed {
-            if !a.files.iter().any(|owned| {
-                owned.path == f.path
-                    && owned.identity.same_object(&f.identity)
+            if !owned.get(f.path.as_str()).is_some_and(|owned| {
+                owned.identity.same_object(&f.identity)
                     && (f.identity.directory || owned.identity == f.identity)
             }) {
                 return Err(Error::Conflict(format!(
@@ -2390,6 +2610,17 @@ impl Inventory {
         for f in &files {
             if !f.identity.directory {
                 fs::remove_entry(&dir, f)?;
+                #[cfg(test)]
+                DELETE_FAIL_AFTER.with(|counter| {
+                    if let Some(remaining) = counter.get() {
+                        if remaining <= 1 {
+                            counter.set(None);
+                            return Err(Error::Io(std::io::Error::from_raw_os_error(libc::EIO)));
+                        }
+                        counter.set(Some(remaining - 1));
+                    }
+                    Ok(())
+                })?;
             }
         }
         for f in &files {
@@ -2479,6 +2710,7 @@ impl Inventory {
             }
         }
         self.run_due_deletes()?;
+        self.reconcile_due_relocations()?;
         self.reconcile_workspace_retirements()?;
         self.run_workspace_retirements()?;
         self.reconcile_recoveries()?;
@@ -2497,7 +2729,7 @@ impl Inventory {
         let pending = {
             let db = self.db.lock().unwrap();
             let mut stmt = db.prepare(
-                "SELECT id FROM operations WHERE state IN ('queued','running','retry') AND json_extract(data,'$.kind')='delete' AND json_extract(data,'$.not_before')<=unixepoch() AND json_extract(data,'$.next_retry')<=unixepoch() ORDER BY json_extract(data,'$.next_retry'),json_extract(data,'$.created_at') LIMIT 25",
+                "SELECT id FROM operations WHERE state IN ('queued','running','retry') AND id NOT LIKE 'failed-delete-torrent-seed-%' AND id NOT LIKE 'managed-delete-torrent-seed-%' AND json_extract(data,'$.kind')='delete' AND json_extract(data,'$.not_before')<=unixepoch() AND json_extract(data,'$.next_retry')<=unixepoch() ORDER BY json_extract(data,'$.next_retry'),json_extract(data,'$.created_at') LIMIT 25",
             )?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -2507,6 +2739,8 @@ impl Inventory {
                 tracing::warn!(operation=%key,error=%e,"artifact deletion remains pending");
             }
         }
+        self.reconcile_torrent_stage_cleanups(&|| Ok(()))?;
+        self.reconcile_torrent_copy_compaction(&|| Ok(()))?;
         Ok(())
     }
     pub fn compact(&self) -> Result<usize> {
@@ -2692,6 +2926,9 @@ mod tests;
 
 #[cfg(test)]
 mod relocation_failure_tests;
+
+#[cfg(feature = "test-support")]
+pub use relocation::RelocationTestFault;
 
 #[cfg(test)]
 mod identity_preflight_tests {

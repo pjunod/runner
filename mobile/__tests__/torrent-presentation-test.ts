@@ -50,3 +50,12 @@ test('thresholds, empty selection, and stale-ready missing-file recovery', () =>
   expect(seedLimitReached({ ...seed, ratio: 0, size_bytes: 0, seeding_seconds: 10, seed_policy: { ...p, time_limit_secs: 10 } })).toBe(true);
   expect(seedLimitReached({ ...seed, torrent_phase: 'missing_files', seed_policy: { ...p, stop_on_complete: true } })).toBe(false);
 });
+
+test('managed acquisition ignores donor seed state and enters ordinary processing sections', () => {
+  const seed = fixtures.find((f) => f.name === 'stopped seed')!.job as JobSummary;
+  const child = { ...seed, torrent_role: 'acquisition', seed_donor_job_id: seed.id, status: { post: { stage: 'unpack' } }, ready: false } as JobSummary;
+  expect(torrentDisplayPhase(child)).toBeNull();
+  expect(torrentPrimaryAction(child)).toBeNull();
+  expect(seedLimitReached(child)).toBe(false);
+  expect(queueSectionKey(child)).toBe('extracting');
+});

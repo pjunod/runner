@@ -7,8 +7,16 @@
 //! Phase C1 distributes whole-job downloads; PP leases (C2) reuse the same
 //! protocol when phase 2 lands.
 
+mod admissions;
+mod cancellation;
+mod cancellation_routes;
+mod cluster_keep;
 pub mod control;
+mod control_proofs;
+mod control_recovery;
+mod delivery;
 pub mod election;
+mod grant_receipts;
 pub mod http;
 pub mod layout;
 pub mod leader;
@@ -16,6 +24,7 @@ pub mod proto;
 pub mod proxy;
 pub mod range;
 pub mod registry;
+mod source_facts;
 pub mod worker;
 
 use axum::routing::get;
@@ -105,6 +114,40 @@ pub struct ClusterRuntime {
     diagnostics: watch::Receiver<serde_json::Value>,
     cancel: CancellationToken,
     tracker: TaskTracker,
+}
+
+async fn drain_url_outbox(shared: &Arc<leader::LeaderShared>) -> Result<(), String> {
+    let records = shared
+        .engine
+        .url_resolution_outbox(8)
+        .await
+        .map_err(|error| error.to_string())?;
+    for record in records {
+        let _serial = shared.mutation_serial.lock().await;
+        if !shared.view.borrow().is_me || !shared.authority_ready() {
+            return Ok(());
+        }
+        let control = shared
+            .control
+            .as_ref()
+            .ok_or("replicated control unavailable")?;
+        let source = crate::source_facts::for_resolved(shared, &record.resolved)?;
+        if control
+            .commit_url_outbox_with_source(&record, source.as_ref())
+            .await?
+        {
+            // Queue projection is rebuilt only from the just-committed/current
+            // intent. A retry never imports a stale resolved Job over user edits.
+            shared.restore_control_projection().await?;
+            drop(_serial);
+            shared
+                .engine
+                .ack_url_resolution(&record.resolution_id)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 impl ClusterRuntime {
@@ -253,6 +296,22 @@ impl ClusterRuntime {
             .with_post(pp.as_ref().map(|setup| setup.post.clone())),
         );
         spawn_leader_task(leader_shared.clone(), cancel.clone(), &tracker);
+        {
+            let shared = leader_shared.clone();
+            let cancel = cancel.clone();
+            tracker.spawn(async move {
+                let mut cleanup_cursor=0;
+                loop {
+                    if cancel.is_cancelled(){break;}
+                    if shared.view.borrow().is_me && shared.authority_ready() {
+                        if let Err(error)=delivery::migrate_local_deliveries(&shared).await {tracing::warn!(%error,"cluster Delivery catalog adoption remains pending");}
+                        if let Err(error)=cluster_keep::reconcile_one(&shared).await {tracing::warn!(%error,"cluster Keep owner application remains pending");}
+                        if let Err(error)=delivery::cleanup_one_copy(&shared,&mut cleanup_cursor).await {tracing::warn!(%error,"cluster source-copy cleanup remains pending");}
+                    }
+                    tokio::select!{_=cancel.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_secs(1))=>{}}
+                }
+            });
+        }
         registry::spawn_registry(
             layout.clone(),
             cfg.clone(),
@@ -260,37 +319,22 @@ impl ClusterRuntime {
             cancel.clone(),
             &tracker,
         );
-        // URL fetch is the one queue transition that completes after its API
-        // request. Its placeholder is already durable; resolve only that
-        // exact row, under the same revision and serialization rules.
+        // A URL event is only a wake hint. The shared durable outbox survives
+        // missed broadcasts, failed snapshots and authority process loss.
         {
             let mut events = engine.subscribe();
-            let event_engine = engine.clone();
             let event_shared = leader_shared.clone();
             let event_cancel = cancel.clone();
             tracker.spawn(async move {
                 loop {
-                    let job = tokio::select! {
-                        _ = event_cancel.cancelled() => break,
-                        event = events.recv() => match event {
-                            Ok(nzbd_engine::Event::UrlFetchResolved { job }) => job,
-                            Ok(_) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        }
-                    };
-                    if !event_shared.view.borrow().is_me {
-                        continue;
+                    if event_cancel.is_cancelled(){break;}
+                    if event_shared.view.borrow().is_me && event_shared.authority_ready() {
+                        if let Err(error)=drain_url_outbox(&event_shared).await {tracing::warn!(%error,"URL resolution awaits durable cluster acceptance");}
                     }
-                    let _serial = event_shared.mutation_serial.lock().await;
-                    let desired = event_engine.export_job(job).await.ok().flatten();
-                    let result = match (&event_shared.control, desired) {
-                        (Some(control), Some(job)) => control.commit_url_resolution(&job).await,
-                        _ => Err("resolved URL job disappeared".into()),
-                    };
-                    if let Err(error) = result {
-                        tracing::error!(job = job.0, %error, "URL resolution rolled back");
-                        let _ = event_shared.restore_control_projection().await;
+                    tokio::select! {
+                        _=event_cancel.cancelled()=>break,
+                        _=tokio::time::sleep(Duration::from_secs(1))=>{},
+                        event=events.recv()=>if let Err(tokio::sync::broadcast::error::RecvError::Closed)=event {break}
                     }
                 }
             });
@@ -343,6 +387,7 @@ impl ClusterRuntime {
         }
 
         let active: ActiveLeases = Default::default();
+        *leader_shared.worker_leases.lock().unwrap() = Some(active.clone());
         spawn_worker(
             cfg.clone(),
             servers.clone(),
@@ -499,7 +544,15 @@ impl ClusterRuntime {
                 pp_manager: self.pp_manager.clone(),
                 events: None, // router_with starts the hub
             })
-            .merge(nzbd_compat::router(compat_state)),
+            .merge(nzbd_compat::router(compat_state))
+            .layer(middleware::from_fn_with_state(
+                self.leader_shared.clone(),
+                delivery::serve_cluster_delivery,
+            ))
+            .layer(middleware::from_fn_with_state(
+                self.leader_shared.clone(),
+                cluster_keep::serve,
+            )),
             auth.clone(),
         )
         .layer(middleware::from_fn_with_state(
@@ -535,7 +588,9 @@ impl ClusterRuntime {
         }
         self.cancel.cancel();
         self.tracker.wait().await;
+        self.leader_shared.control_proofs.shutdown().await;
         let mut complete = self.engine.shutdown().await;
+
         if let Some(control) = &self.control {
             if let Err(error) = control.shutdown().await {
                 tracing::warn!(%error, "replicated control shutdown did not complete cleanly");
@@ -548,22 +603,59 @@ impl ClusterRuntime {
 
 async fn commit_control_mutation(
     axum::extract::State(shared): axum::extract::State<Arc<LeaderShared>>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    if cluster_keep::serves(&request) {
+        return next.run(request).await;
+    }
+    let observations = shared
+        .control_proofs
+        .snapshot()
+        .into_iter()
+        .filter_map(|value| {
+            value["jobId"]
+                .as_u64()
+                .and_then(|id| u32::try_from(id).ok())
+                .map(|id| (id, value))
+        })
+        .collect();
+    request
+        .extensions_mut()
+        .insert(nzbd_api::control_pending::ControlPendingObservations(
+            observations,
+        ));
+    let compat_mutation = request.method() == axum::http::Method::GET
+        && matches!(request.uri().path(), "/jsonrpc" | "/jsonprpc")
+        && axum::extract::Query::<std::collections::HashMap<String, String>>::try_from_uri(
+            request.uri(),
+        )
+        .ok()
+        .is_some_and(|q| {
+            q.get("method")
+                .is_some_and(|method| method.eq_ignore_ascii_case("editqueue"))
+        });
     let safe = matches!(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
     );
-    if safe || !shared.view.borrow().is_me {
+    if (safe && !compat_mutation) || !shared.view.borrow().is_me {
         return next.run(request).await;
     }
     let _serial = shared.mutation_serial.lock().await;
     if !shared.authority_ready() {
+        let review = match &shared.control {
+            Some(control) => control
+                .delivery_meta("admission_migration_review")
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error": "queue authority is still being adopted; retry"
+                "error": review.unwrap_or_else(||"queue authority is still being adopted; retry".into())
             })),
         )
             .into_response();
@@ -581,6 +673,13 @@ async fn commit_control_mutation(
         )
             .into_response();
     }
+    if let Err(error) = crate::control_recovery::reconcile(&shared).await {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":error})),
+        )
+            .into_response();
+    }
     let before = match shared.engine_projection().await {
         Ok(jobs) => jobs,
         Err(error) => {
@@ -588,21 +687,70 @@ async fn commit_control_mutation(
             return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    let response = next.run(request).await;
+    let mut affected_ids: Vec<u64> = before.keys().copied().collect();
+    // Explicit history/Undo restoration may re-enter a known tombstone. Its
+    // ID is observed before execution; fresh admissions remain INSERT-only.
+    if let Some(raw) = request
+        .uri()
+        .path()
+        .strip_prefix("/api/v1/history/")
+        .and_then(|rest| rest.split('/').next())
+    {
+        if let Ok(id) = raw.parse::<u64>() {
+            affected_ids.push(id);
+        }
+    }
+    let fences = match shared
+        .control
+        .as_ref()
+        .unwrap()
+        .job_revision_fences_for(&affected_ids)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error":error})),
+            )
+                .into_response();
+        }
+    };
+    let removals = nzbd_api::cluster_removal::ClusterRemovalContext::default();
+    request.extensions_mut().insert(removals.clone());
+    let mut response = next.run(request).await;
     if !response.status().is_success() {
-        let _ = shared.restore_control_projection().await;
+        if admissions::rollback_pending(&shared).await.is_err() {
+            shared.fence_authority();
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        if shared.restore_control_projection().await.is_err() {
+            shared.fence_authority();
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         return response;
     }
-    if let Err(error) = shared.commit_mutation_delta(&before).await {
+    if let Err(error) = shared
+        .commit_mutation_delta(&before, &fences, &removals.confirmed())
+        .await
+    {
         tracing::error!(%error, "queue mutation was rolled back after replicated commit failed");
-        let _ = shared.restore_control_projection().await;
+        if admissions::rollback_pending(&shared).await.is_err()
+            || shared.restore_control_projection().await.is_err()
+        {
+            shared.fence_authority();
+        }
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error": "replicated control did not commit the mutation; local projection rolled back"
+                "error": "replicated control did not confirm the mutation; retry after authoritative reconciliation"
             })),
         )
             .into_response();
+    }
+    if removals.confirmed().values().any(|files| *files) {
+        // Queue removal is committed; exact source cleanup is asynchronous.
+        *response.status_mut() = axum::http::StatusCode::ACCEPTED;
     }
     response
 }

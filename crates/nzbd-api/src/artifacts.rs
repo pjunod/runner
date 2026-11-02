@@ -15,6 +15,7 @@ use std::{path::PathBuf, sync::Arc};
 pub fn router() -> Router<ApiState> {
     Router::new()
         .route("/api/v1/deliveries", get(deliveries))
+        .route("/api/v1/url-resolution-faults", get(url_resolution_faults))
         .route("/api/v1/deliveries/{id}", get(delivery))
         .route("/api/v1/deliveries/{id}/accept", post(accept_delivery))
         .route(
@@ -90,13 +91,23 @@ mod delivery_query_tests {
     }
 }
 
+async fn url_resolution_faults(State(st): State<ApiState>) -> Response {
+    match st.engine.url_resolution_faults(100).await {
+        Ok(faults) => Json(json!({"faults": faults})).into_response(),
+        Err(failure) => error(StatusCode::SERVICE_UNAVAILABLE, &failure.to_string()),
+    }
+}
+
 async fn deliveries(State(st): State<ApiState>, Query(page): Query<DeliveryPage>) -> Response {
+    if page.after < 0 || page.limit.is_some_and(|limit| !(1..=100).contains(&limit)) {
+        return error(StatusCode::BAD_REQUEST, "invalid delivery cursor or limit");
+    }
     let db = st.engine.artifacts();
     let limit = page.limit.unwrap_or(50);
     let include_accepted = page.include_accepted;
     work(move || {
         let (deliveries, next_cursor) =
-            db.deliveries_page(page.after, limit, include_accepted)?;
+            db.deliveries_discovery_page(page.after, limit, include_accepted)?;
         Ok(json!({
             "protocolVersion": 1,
             "deliveries": deliveries,

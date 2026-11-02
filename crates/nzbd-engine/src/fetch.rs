@@ -460,7 +460,9 @@ mod tests {
             ("503 Service Unavailable", "1", [30, 60, 120]),
             ("503 Service Unavailable", "90", [90, 90, 120]),
         ] {
-            let response = format!("HTTP/1.1 {status}\r\nRetry-After: {retry_after}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let response = format!(
+                "HTTP/1.1 {status}\r\nRetry-After: {retry_after}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
             let (url, server) = serve_responses(vec![
                 response.clone(),
                 response.clone(),

@@ -52,33 +52,50 @@ pub(crate) async fn pass(
     handle: &EngineHandle,
     reobserve: bool,
 ) -> Result<usize, crate::EngineError> {
+    handle.reconcile_native_seed_retirements().await?;
     let snapshot = handle.snapshot();
     if !snapshot.queue_authority {
         return Ok(0);
     }
     let now = crate::owner::unix_now();
     let mut releases = tokio::task::JoinSet::new();
-    for job in snapshot.jobs.iter() {
-        if job.kind == JobKind::Torrent {
-            continue;
-        }
-        let Some(control) = job
-            .control
-            .as_ref()
-            .filter(|c| c.lifecycle == "held" && !c.manual_pause)
-        else {
-            continue;
-        };
-        let due = match control.hold_cause().policy() {
-            HoldPolicy::Review => false,
-            HoldPolicy::ReobserveMount => reobserve,
-            HoldPolicy::ScheduledRetry | HoldPolicy::ResumeSameJob => {
-                control.next_retry_at_unix.is_some_and(|at| at <= now)
-            }
-        };
-        if !due {
-            continue;
-        }
+    let eligible = snapshot
+        .jobs
+        .iter()
+        .filter(|job| !snapshot.pending_automatic_controls.contains(&job.id))
+        .filter(|job| job.assigned_node.is_none())
+        .filter(|job| {
+            job.kind != JobKind::Torrent
+                || job.torrent_role == Some("acquisition")
+                || snapshot
+                    .native_seed_retirements
+                    .get(&job.id)
+                    .is_some_and(|marker| marker.phase == "detached")
+        })
+        .filter_map(|job| {
+            let control = job
+                .control
+                .as_ref()
+                .filter(|c| c.lifecycle == "held" && !c.manual_pause)?;
+            let due = match control.hold_cause().policy() {
+                HoldPolicy::Review => false,
+                HoldPolicy::ReobserveMount => reobserve,
+                HoldPolicy::ScheduledRetry | HoldPolicy::ResumeSameJob => {
+                    control.next_retry_at_unix.is_some_and(|at| at <= now)
+                }
+            };
+            due.then_some((job, control))
+        })
+        .collect::<Vec<_>>();
+    if eligible.is_empty() {
+        return Ok(0);
+    }
+    let start = handle
+        .recovery_cursor
+        .fetch_add(8, std::sync::atomic::Ordering::Relaxed)
+        % eligible.len();
+    for offset in 0..eligible.len().min(8) {
+        let (job, control) = eligible[(start + offset) % eligible.len()];
         let handle = handle.clone();
         let (id, revision, cause) = (job.id, control.revision.clone(), control.cause.clone());
         releases.spawn(async move {

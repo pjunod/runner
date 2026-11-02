@@ -37,11 +37,12 @@ opening History does not claim that the app imported a job or replace its
 ## Queue activity and torrent seeding
 
 The native queue uses the same lifecycle rules as the web: Downloading,
-Fetching NZB, Fetching torrent metadata, Checking torrent files, the NZB
-post-processing stages, Seeding, Completed, and Waiting. Completed means a
-verified torrent is retained with seeding stopped; it does not mean an import
-into a library or a move to History. Checking, missing files, and failures take
-precedence over stale readiness.
+Fetching NZB, Fetching torrent metadata, Checking torrent files,
+post-processing stages, Seeding, Completed, and Waiting. For an ordinary seed
+source, Completed means its verified payload is retained with seeding stopped;
+it does not mean a library import or a move to History. An acquisition child
+completes through publication and handoff instead of this seed-retention rule.
+Checking, missing files, and failures take precedence over stale readiness.
 
 Tap Seeding, Completed, or Waiting to collapse it. Counts and transfer totals
 continue updating while cards are hidden. The device remembers these display
@@ -64,6 +65,31 @@ The new sections do not expose NZB stage timers or health for torrents, nor
 queue-move and priority controls for seeds. Older daemons can omit lifecycle
 fields; the app falls back to generic status. Unknown states remain visible,
 and an unsupported policy endpoint reports an error without breaking the queue.
+
+A managed torrent acquisition is labeled **Torrent acquisition** and names its
+separate seed source. It uses ordinary post-processing, scoped **Keep on
+failure**, pause, retry and removal controls. It has no seed options, upload or
+peer counters, donor-file deletion choice, or seed-resume fallback. Removing
+the child leaves the seed source and its seeding policy unchanged. A held child
+keeps the same **Retry** or **Pause retries** action as any other processing job.
+Before copying, it says **Waiting for seed source**; while making its private
+copy it says **Copying seed files**. Network transfer and seeding belong to the
+separate source, not the child copy interval.
+
+A pending cluster source check is shown on the job card and detail panel,
+including its owner, reason and next check when known. **Source needs review**
+means the exact source proof changed; it does not mean recovery succeeded.
+While a marker remains, one bounded observation refresh runs every five
+seconds even on a healthy live stream. Generic ticks retain the last detailed
+observation; a newer control or acknowledged result clears it. Late detail
+responses cannot revive cleared markers. Existing pause, removal and Keep controls
+remain available according to the job's current state.
+
+When a cross-node Keep change is durably requested but an exact source owner
+has not acknowledged it, the control says **Requested Keep** and **Waiting for
+source owners**. Desired Keep is not confirmation that protection was applied;
+this pending state survives refresh and reconnect. An already absent source
+remains unavailable: requesting Keep cannot restore deleted bytes.
 
 [The parity status page](MOBILE_QUEUE_PARITY_STATUS.md) separates implementation
 and test evidence from iOS/Android distribution evidence.
