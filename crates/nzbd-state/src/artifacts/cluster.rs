@@ -221,8 +221,9 @@ impl Inventory {
         let artifact = self.get(&copy.publication.artifact)?;
         if artifact.generation != copy.publication.generation
             || artifact.job != Some(copy.job_id)
+            || !artifact.owned
             || !artifact.automatic_cleanup_eligible
-            || !artifact.delivery_lifecycle
+            || (!artifact.delivery_lifecycle && !explicit_cancellation)
         {
             return Err(Error::Conflict(
                 "cluster cleanup copy generation or admission changed".into(),
@@ -789,6 +790,61 @@ mod tests {
                 .delete_cancelled_cluster_artifact_copy(&copy, proof(), &raw_seal())
                 .is_err()
         );
+    }
+    #[test]
+    fn explicit_cancel_supports_new_nonconsumer_copies_but_not_legacy_or_unowned() {
+        for cohort in ["new", "legacy", "unowned"] {
+            let temp = tempfile::tempdir().unwrap();
+            let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+            let root = temp.path().join("processing");
+            std::fs::create_dir(&root).unwrap();
+            let path = root.join("nonconsumer");
+            inventory
+                .allocate_for_delivery(9, &root, &path, cohort != "legacy", false)
+                .unwrap();
+            std::fs::write(path.join("raw.bin"), b"nonconsumer bytes").unwrap();
+            inventory.finish(9, &path, &root, "completed").unwrap();
+            let copy = inventory
+                .cluster_download_authority_source(9)
+                .unwrap()
+                .unwrap();
+            let artifact = inventory.get(&copy.publication.artifact).unwrap();
+            inventory
+                .retention(&artifact.id, artifact.revision, true, None)
+                .unwrap();
+            if cohort == "unowned" {
+                let mut artifact = inventory.get(&copy.publication.artifact).unwrap();
+                artifact.owned = false;
+                save_artifact(&inventory.db.lock().unwrap(), &artifact).unwrap();
+            }
+            let files = vec![DeliveryFile {
+                path: "raw.bin".into(),
+                size_bytes: 17,
+                sha256: format!("{:x}", Sha256::digest(b"nonconsumer bytes")),
+            }];
+            assert!(
+                inventory
+                    .retire_cluster_artifact_copy_with_disposition(
+                        &copy,
+                        "SUCCESS",
+                        proof(),
+                        false,
+                        Some(&files)
+                    )
+                    .is_err()
+            );
+            let result = inventory.delete_cancelled_cluster_artifact_copy(&copy, proof(), &files);
+            if cohort == "new" {
+                assert_eq!(result.unwrap().status, "removed");
+                assert!(!path.exists());
+            } else {
+                assert!(result.is_err());
+                assert_eq!(
+                    std::fs::read(path.join("raw.bin")).unwrap(),
+                    b"nonconsumer bytes"
+                );
+            }
+        }
     }
     #[test]
     fn accepted_selected_cluster_copy_drains_and_replays_without_payload() {
