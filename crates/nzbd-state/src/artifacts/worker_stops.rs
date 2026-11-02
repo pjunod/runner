@@ -113,6 +113,30 @@ fn save(db: &Connection, id: &str, record: &GrantJournal) -> Result<()> {
     Ok(())
 }
 impl Inventory {
+    /// Resolve a previously journaled exact lease without reconstructing its
+    /// renewed epoch from a caller. Missing means never-started only when the
+    /// immutable authority grant advertised start ordering.
+    pub fn worker_grant_request_by_lease(
+        &self,
+        job: u32,
+        incarnation: &str,
+        lease: &str,
+    ) -> Result<Option<WorkerStopRequest>> {
+        let db = self.db.lock().unwrap();
+        let raw: Option<String> = db
+            .query_row(
+                "SELECT data FROM worker_grant_stops WHERE job=?1 AND incarnation=?2 AND lease=?3",
+                params![job, incarnation, lease],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.map(|raw| {
+            serde_json::from_str::<GrantJournal>(&raw)
+                .map(|record| record.request)
+                .map_err(Into::into)
+        })
+        .transpose()
+    }
     /// This commit precedes private allocation/copy/import/writer creation.
     /// A removal fence and a late grant start serialize on the same guard.
     pub fn begin_worker_grant(&self, request: &WorkerStopRequest) -> Result<()> {

@@ -1009,6 +1009,22 @@ pub(crate) async fn cleanup_copy(
                         });
                     }
                     if let Some(artifact) = copy.artifact {
+                        if authority.source_disposition.as_deref()
+                            == Some("cancellation_delete_files")
+                        {
+                            return inventory
+                                .delete_cancelled_cluster_artifact_copy(
+                                    &artifact,
+                                    nzbd_state::artifacts::FinalizationProof::Cluster {
+                                        receipt: authority.receipt,
+                                        accepted_at_ms: authority.accepted_at_ms,
+                                    },
+                                    copy.deletion_files
+                                        .as_deref()
+                                        .ok_or("cancelled copy awaits exact owner byte seal")?,
+                                )
+                                .map_err(|e| e.to_string());
+                        }
                         return inventory
                             .retire_cluster_artifact_copy_with_disposition(
                                 &artifact,
@@ -1064,10 +1080,7 @@ pub(crate) async fn cleanup_copy(
             };
             (
                 code,
-                axum::Json(nzbd_state::artifacts::ClusterCopyCleanup {
-                    status,
-                    error,
-                }),
+                axum::Json(nzbd_state::artifacts::ClusterCopyCleanup { status, error }),
             )
                 .into_response()
         })
@@ -1923,7 +1936,7 @@ mod tests {
             assert!(
                 runtime
                     .leader_shared
-                    .commit_mutation_delta(&before, &fences,&Default::default())
+                    .commit_mutation_delta(&before, &fences, &Default::default())
                     .await
                     .is_err(),
                 "fresh admission cannot overwrite later occupied ID"

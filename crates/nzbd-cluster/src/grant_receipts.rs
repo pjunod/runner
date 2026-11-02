@@ -63,6 +63,38 @@ impl From<&mut Row<'_>> for GrantRow {
     }
 }
 impl ControlStore {
+    pub(crate) async fn historical_grants_for_removal(
+        &self,
+        job: u32,
+        incarnation: &str,
+    ) -> Result<Vec<HistoricalGrant>, String> {
+        #[derive(Debug)]
+        struct Key {
+            resource: String,
+            fence: i64,
+        }
+        impl From<&mut Row<'_>> for Key {
+            fn from(row: &mut Row<'_>) -> Self {
+                Self {
+                    resource: row.get("resource"),
+                    fence: row.get("fence"),
+                }
+            }
+        }
+        let keys=self.client.query_consistent_map::<Key,_>("SELECT resource,fence FROM work_grant_receipts WHERE job_id=?1 AND job_incarnation=?2 ORDER BY issued_at_ms,resource,fence LIMIT 257",params!(i64::from(job),incarnation)).await.map_err(|e|e.to_string())?;
+        if keys.len() > 256 {
+            return Err("job has more than256 historical grants; retain for operator review".into());
+        }
+        let mut grants = Vec::with_capacity(keys.len());
+        for key in keys {
+            grants.push(
+                self.historical_grant(&key.resource, key.fence as u64)
+                    .await?
+                    .ok_or("historical grant disappeared")?,
+            );
+        }
+        Ok(grants)
+    }
     pub(crate) async fn historical_grant(
         &self,
         resource: &str,

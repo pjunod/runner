@@ -824,6 +824,14 @@ pub fn router(shared: Arc<LeaderShared>) -> Router {
         .route("/cluster/v1/work/complete", post(work_complete))
         .route("/cluster/v1/work/reject", post(work_reject))
         .route(
+            "/cluster/v1/work/cancelled-completion",
+            post(crate::cancellation_routes::completed),
+        )
+        .route(
+            "/cluster/v1/work/cancellation-stop",
+            post(crate::cancellation_routes::stop),
+        )
+        .route(
             "/cluster/v1/work/relocation-proof",
             post(crate::control_recovery::relocation_proof).layer(DefaultBodyLimit::max(16 * 1024)),
         )

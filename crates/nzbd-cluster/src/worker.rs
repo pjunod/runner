@@ -41,32 +41,46 @@ pub struct LeaseState {
 }
 
 /// Lease-id → state map, shared with the demotion path (`retain_jobs`).
-#[derive(Clone,Default)]
+#[derive(Clone, Default)]
 pub struct ActiveLeases {
-    states:Arc<Mutex<HashMap<String,LeaseState>>>,
-    admissions:Arc<Mutex<HashMap<String,watch::Receiver<bool>>>>,
-    operations:Arc<Mutex<HashMap<String,watch::Receiver<bool>>>>,
+    states: Arc<Mutex<HashMap<String, LeaseState>>>,
+    admissions: Arc<Mutex<HashMap<String, watch::Receiver<bool>>>>,
+    operations: Arc<Mutex<HashMap<String, watch::Receiver<bool>>>>,
 }
-impl std::ops::Deref for ActiveLeases{
-    type Target=Mutex<HashMap<String,LeaseState>>;
-    fn deref(&self)->&Self::Target{&self.states}
+impl std::ops::Deref for ActiveLeases {
+    type Target = Mutex<HashMap<String, LeaseState>>;
+    fn deref(&self) -> &Self::Target {
+        &self.states
+    }
 }
 impl ActiveLeases {
-    fn spawn_operation<F>(&self,tracker:&TaskTracker,id:String,work:F) where F:std::future::Future<Output=()>+Send+'static{
-        let (done,joined)=watch::channel(false);self.operations.lock().unwrap().insert(id,joined);
-        tracker.spawn(async move{work.await;let _=done.send(true);});
+    fn spawn_operation<F>(&self, tracker: &TaskTracker, id: String, work: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (done, joined) = watch::channel(false);
+        self.operations.lock().unwrap().insert(id, joined);
+        tracker.spawn(async move {
+            work.await;
+            let _ = done.send(true);
+        });
     }
-    pub(crate) async fn join_execution(&self,id:&str)->Result<bool,String>{
-        let admission=self.admissions.lock().unwrap().get(id).cloned();
-        let operation=self.operations.lock().unwrap().get(id).cloned();
-        let observed=admission.is_some() || operation.is_some();
-        for mut joined in admission.into_iter().chain(operation){
-            if !*joined.borrow(){joined.wait_for(|done|*done).await.map_err(|_|"execution stop acknowledgment lost; retain for review".to_owned())?;}
+    pub(crate) async fn join_execution(&self, id: &str) -> Result<bool, String> {
+        let admission = self.admissions.lock().unwrap().get(id).cloned();
+        let operation = self.operations.lock().unwrap().get(id).cloned();
+        let observed = admission.is_some() || operation.is_some();
+        for mut joined in admission.into_iter().chain(operation) {
+            if !*joined.borrow() {
+                joined.wait_for(|done| *done).await.map_err(|_| {
+                    "execution stop acknowledgment lost; retain for review".to_owned()
+                })?;
+            }
         }
         Ok(observed)
     }
-    pub(crate) fn forget_joined(&self,id:&str){
-        self.admissions.lock().unwrap().remove(id);self.operations.lock().unwrap().remove(id);
+    pub(crate) fn forget_joined(&self, id: &str) {
+        self.admissions.lock().unwrap().remove(id);
+        self.operations.lock().unwrap().remove(id);
     }
 }
 type BudgetReceipt = Arc<Mutex<Option<BudgetAck>>>;
@@ -682,9 +696,10 @@ async fn submit_completion(
         .await
     {
         Ok(resp) if resp.ok => {
-            if let Some(context)=nzbd_state::artifacts::WorkerControlContext::for_job(&req.job){
-                if let Err(error)=compact_joined_grant(engine,active,job_id,&context).await{
-                    tracing::warn!(job=job_id.0,%error,"accepted completion awaits actual writer/execution join");return false;
+            if let Some(context) = nzbd_state::artifacts::WorkerControlContext::for_job(&req.job) {
+                if let Err(error) = compact_joined_grant(engine, active, job_id, &context).await {
+                    tracing::warn!(job=job_id.0,%error,"accepted completion awaits actual writer/execution join");
+                    return false;
                 }
             }
             if kind == LeaseKind::Post && !resp.history_recorded_by_authority {
@@ -776,15 +791,120 @@ async fn submit_completion(
             tracing::debug!(job=job_id.0,%error,"durable completion awaits authority acceptance");
         }
     }
-    false
+    // A rejected publication remains in the outbox unless the authority has
+    // durably recorded an exact removal disposition for this same result.
+    let Some(context) = nzbd_state::artifacts::WorkerControlContext::for_job(&req.job) else {
+        return false;
+    };
+    let cancellation = crate::cancellation::CancellationRequest {
+        lifecycle_protocol: req.lifecycle_protocol,
+        node: req.node.clone(),
+        job_id: job_id.0,
+        job_incarnation: context.job_incarnation.clone(),
+        lease_id: req.lease_id.clone(),
+        token: req.token.clone(),
+        expected_job_revision: req.expected_job_revision,
+        result_id: req.result_id.clone(),
+        result_ref: req.result_ref.clone(),
+        receipt_id: req.receipt_id.clone(),
+    };
+    let Ok(decision) = client
+        .post_json::<_, crate::cancellation::CancellationDecision>(
+            leader_url,
+            "/cluster/v1/work/cancelled-completion",
+            &cancellation,
+        )
+        .await
+    else {
+        return false;
+    };
+    if decision.receipt_id != req.receipt_id {
+        return false;
+    }
+    if let Some(setup) = pp {
+        let mut retired = req.job.clone();
+        retired
+            .params
+            .retain(|(key, _)| key != nzbd_types::PP_DONE_PARAM);
+        retired
+            .params
+            .push((nzbd_types::PP_DONE_PARAM.into(), "CANCELLED".into()));
+        retired
+            .params
+            .push(("Cluster:CleanupId".into(), decision.cleanup_id.clone()));
+        retired
+            .params
+            .push(("Cluster:RemovalReason".into(), decision.reason.clone()));
+        if record_published_pp_history(
+            setup.history.clone(),
+            &retired,
+            Some(req.job.dir_name.as_str()),
+            decision.accepted_at_ms,
+        )
+        .await
+        .is_err()
+        {
+            return false;
+        }
+    }
+    let source = req
+        .job
+        .params
+        .iter()
+        .find(|(key, _)| key == "Artifact:Id")
+        .map(|(_, id)| id.clone())
+        .zip(
+            req.job
+                .params
+                .iter()
+                .find(|(key, _)| key == "Artifact:Generation")
+                .map(|(_, generation)| generation.clone()),
+        );
+    if kind == LeaseKind::Post {
+        if let Some((artifact, generation)) = source {
+            let inventory = engine.artifacts();
+            let proof = nzbd_state::artifacts::FinalizationProof::Cluster {
+                receipt: req.receipt_id.clone(),
+                accepted_at_ms: decision.accepted_at_ms,
+            };
+            let source = nzbd_state::artifacts::SourceGeneration {
+                artifact,
+                generation,
+            };
+            if !tokio::task::spawn_blocking(move || {
+                inventory.acknowledge_worker_completion(job_id.0, &context, &source, &proof)
+            })
+            .await
+            .is_ok_and(|result| result.is_ok_and(|accepted| accepted))
+            {
+                return false;
+            }
+        }
+    }
+    // The private ledger now preserves either exact cleanup obligations or
+    // visible keep-files custody. Never activate generic workspace GC here.
+    active.lock().unwrap().remove(&lease_id);
+    let _ = engine.remove_job_silent(job_id).await;
+    true
 }
 
-pub(crate) async fn cancel_and_join_execution(shared:&crate::leader::LeaderShared,context:&nzbd_state::artifacts::WorkerControlContext)->Result<bool,String>{
-    let active=shared.worker_leases.lock().unwrap().clone().ok_or("worker execution registry unavailable")?;
+pub(crate) async fn cancel_and_join_execution(
+    shared: &crate::leader::LeaderShared,
+    context: &nzbd_state::artifacts::WorkerControlContext,
+) -> Result<bool, String> {
+    let active = shared
+        .worker_leases
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("worker execution registry unavailable")?;
     {
-        let states=active.lock().unwrap();
-        if let Some(state)=states.get(&context.lease_id){
-            if state.job_incarnation!=context.job_incarnation || state.job_revision!=context.job_revision || state.control_revision!=context.control_revision {
+        let states = active.lock().unwrap();
+        if let Some(state) = states.get(&context.lease_id) {
+            if state.job_incarnation != context.job_incarnation
+                || state.job_revision != context.job_revision
+                || state.control_revision != context.control_revision
+            {
                 return Err("worker grant intent changed before cancellation".into());
             }
             state.cancel.cancel();
@@ -793,14 +913,30 @@ pub(crate) async fn cancel_and_join_execution(shared:&crate::leader::LeaderShare
     active.join_execution(&context.lease_id).await
 }
 
-pub(crate) async fn compact_joined_grant(engine:&EngineHandle,active:&ActiveLeases,job:JobId,context:&nzbd_state::artifacts::WorkerControlContext)->Result<(),String>{
-    let inventory=engine.artifacts();let context=context.clone();
-    let request=tokio::task::spawn_blocking(move||inventory.worker_grant_request(job.0,&context)).await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
-    let Some(request)=request else{return Ok(())}; // legacy never gains a stop proof
-    let id=request.context.lease_id.clone();
-    let execution_joined=active.join_execution(&id).await?;
-    engine.join_cluster_writers(request,execution_joined).await.map_err(|e|e.to_string())?;
-    active.forget_joined(&id);Ok(())
+pub(crate) async fn compact_joined_grant(
+    engine: &EngineHandle,
+    active: &ActiveLeases,
+    job: JobId,
+    context: &nzbd_state::artifacts::WorkerControlContext,
+) -> Result<(), String> {
+    let inventory = engine.artifacts();
+    let context = context.clone();
+    let request =
+        tokio::task::spawn_blocking(move || inventory.worker_grant_request(job.0, &context))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+    let Some(request) = request else {
+        return Ok(());
+    }; // legacy never gains a stop proof
+    let id = request.context.lease_id.clone();
+    let execution_joined = active.join_execution(&id).await?;
+    engine
+        .join_cluster_writers(request, execution_joined)
+        .await
+        .map_err(|e| e.to_string())?;
+    active.forget_joined(&id);
+    Ok(())
 }
 
 async fn record_published_pp_history(
@@ -895,8 +1031,8 @@ async fn poll_for_work(
         lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
         node: cfg.node_name.clone(),
         owner_incarnation: owner_incarnation.to_owned(),
-        storage_instance_id:engine.artifacts().installation.clone(),
-        start_ordering:1,
+        storage_instance_id: engine.artifacts().installation.clone(),
+        start_ordering: 1,
         free_download_slots: free_dl,
         free_pp_slots: free_pp,
     };
@@ -911,8 +1047,12 @@ async fn poll_for_work(
         }
     };
     for mut grant in resp.grants {
-        let (admission_done,admission_joined)=watch::channel(false);
-        active.admissions.lock().unwrap().insert(grant.lease_id.clone(),admission_joined);
+        let (admission_done, admission_joined) = watch::channel(false);
+        active
+            .admissions
+            .lock()
+            .unwrap()
+            .insert(grant.lease_id.clone(), admission_joined);
         async {
 
         let job_id = grant.job.id;
@@ -1226,9 +1366,8 @@ async fn poll_for_work(
             }
         }
         }.await;
-        let _=admission_done.send(true);
+        let _ = admission_done.send(true);
     }
-
 }
 
 async fn reject_remote_grant(
@@ -1598,23 +1737,25 @@ fn run_assembly(
     lease_id: String,
     tracker: &TaskTracker,
 ) {
-    active.clone().spawn_operation(tracker,lease_id.clone(),async move {
-        let result = tokio::task::spawn_blocking(move || {
-            crate::range::assemble(job, &scope, &dest_dir, fence)
-        })
-        .await;
-        match result {
-            Ok(Ok(job)) => {
-                if let Some(state) = active.lock().unwrap().get_mut(&lease_id) {
-                    if state.deadline > Instant::now() {
-                        state.ready_job = Some(Box::new(job));
+    active
+        .clone()
+        .spawn_operation(tracker, lease_id.clone(), async move {
+            let result = tokio::task::spawn_blocking(move || {
+                crate::range::assemble(job, &scope, &dest_dir, fence)
+            })
+            .await;
+            match result {
+                Ok(Ok(job)) => {
+                    if let Some(state) = active.lock().unwrap().get_mut(&lease_id) {
+                        if state.deadline > Instant::now() {
+                            state.ready_job = Some(Box::new(job));
+                        }
                     }
                 }
+                Ok(Err(error)) => tracing::warn!(%lease_id, %error, "range assembly failed"),
+                Err(error) => tracing::warn!(%lease_id, %error, "range assembly task failed"),
             }
-            Ok(Err(error)) => tracing::warn!(%lease_id, %error, "range assembly failed"),
-            Err(error) => tracing::warn!(%lease_id, %error, "range assembly task failed"),
-        }
-    });
+        });
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

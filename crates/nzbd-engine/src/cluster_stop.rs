@@ -71,7 +71,11 @@ impl WriterStops {
     pub(crate) fn known(&self, context: &WorkerControlContext) -> bool {
         self.work.contains_key(&key(context))
     }
-    pub(crate) fn prepare(&mut self, ticket: &WorkerStopTicket) -> Result<StopPreparation, String> {
+    pub(crate) fn prepare(
+        &mut self,
+        ticket: &WorkerStopTicket,
+        execution_joined: bool,
+    ) -> Result<StopPreparation, String> {
         let Some(work) = self.work.get_mut(&key(&ticket.request.context)) else {
             return if ticket.never_started
                 || ticket.recovered_session

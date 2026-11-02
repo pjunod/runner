@@ -9,6 +9,7 @@
 
 mod admissions;
 mod cancellation;
+mod cancellation_routes;
 pub mod control;
 mod control_proofs;
 mod control_recovery;

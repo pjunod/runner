@@ -1,5 +1,7 @@
 use super::*;
+use crate::cancellation::*;
 use crate::control::{LeaseClaim, LeaseToken};
+use hiqlite::params;
 use nzbd_state::artifacts::{
     ClusterArtifactCopy, DeliveryFile, FinalizationProof, Inventory, WorkerControlContext,
 };
@@ -518,11 +520,9 @@ async fn explicit_delete_drains_exact_sealed_and_owned_raw_copies_and_replay_nev
         assert_eq!(decision, f.decide().await.unwrap());
         let mut changed = f.request.clone();
         changed.result_id.push('x');
-        assert!(
-            decide(&f.control, &f.root, &changed, f.issuer())
-                .await
-                .is_err()
-        );
+        assert!(decide(&f.control, &f.root, &changed, f.issuer())
+            .await
+            .is_err());
         f.close().await;
     }
 }
@@ -532,12 +532,11 @@ async fn remove_keep_and_completed_retirement_never_authorize_cleanup() {
         let f = Fixture::new().await;
         f.remove(mode).await;
         if mode == RemovalMode::CompletedRetirement {
-            assert!(
-                f.decide()
-                    .await
-                    .unwrap_err()
-                    .contains("no cancellation cleanup")
-            );
+            assert!(f
+                .decide()
+                .await
+                .unwrap_err()
+                .contains("no cancellation cleanup"));
         } else {
             let decision = f.decide().await.unwrap();
             assert_eq!(decision.disposition, "retained");
@@ -547,17 +546,18 @@ async fn remove_keep_and_completed_retirement_never_authorize_cleanup() {
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(
-                record
-                    .copies
-                    .iter()
-                    .all(|copy| copy.status == "review_required")
-            );
-            assert!(
-                acknowledge_owner_stop(&f.control, &f.ack(&decision), "source-owner", f.issuer())
-                    .await
-                    .is_err()
-            );
+            assert!(record
+                .copies
+                .iter()
+                .all(|copy| copy.status == "review_required"));
+            assert!(acknowledge_owner_stop(
+                &f.control,
+                &f.ack(&decision),
+                "source-owner",
+                f.issuer()
+            )
+            .await
+            .is_err());
             assert_eq!(decision, f.decide().await.unwrap());
         }
         assert!(Path::new(&f.request.result_ref).exists());
@@ -568,12 +568,11 @@ async fn remove_keep_and_completed_retirement_never_authorize_cleanup() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn timeout_or_missing_historical_grant_is_retained_without_a_decision() {
     let f = Fixture::new().await;
-    assert!(
-        f.decide()
-            .await
-            .unwrap_err()
-            .contains("durable user removal")
-    );
+    assert!(f
+        .decide()
+        .await
+        .unwrap_err()
+        .contains("durable user removal"));
     f.remove(RemovalMode::DeleteFiles).await;
     f.control
         .client
@@ -584,12 +583,10 @@ async fn timeout_or_missing_historical_grant_is_retained_without_a_decision() {
         .await
         .unwrap();
     assert!(f.decide().await.unwrap_err().contains("historical grant"));
-    assert!(
-        existing_decision(&f.control, &f.request)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(existing_decision(&f.control, &f.request)
+        .await
+        .unwrap()
+        .is_none());
     assert!(Path::new(&f.request.result_ref).exists());
     assert!(f.raw_path().exists());
     f.close().await;
@@ -615,12 +612,10 @@ async fn changed_seal_wrong_context_outside_path_and_stale_authority_refuse() {
             decide(&f.control, &f.root, &req, issuer).await.is_err(),
             "accepted {field}"
         );
-        assert!(
-            existing_decision(&f.control, &f.request)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(existing_decision(&f.control, &f.request)
+            .await
+            .unwrap()
+            .is_none());
     }
     std::fs::write(
         Path::new(&f.request.result_ref).join("job.json"),
@@ -699,18 +694,15 @@ async fn existing_consumer_publication_is_never_replaced_by_cancellation() {
     record.delivery.status = "accepted".into();
     record.delivery.consumer_receipt_id = Some("actual-consumer-receipt".into());
     f.control.commit_delivery(&record).await.unwrap();
-    assert!(
-        f.decide()
-            .await
-            .unwrap_err()
-            .contains("consumer publication custody")
-    );
-    assert!(
-        existing_decision(&f.control, &f.request)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(f
+        .decide()
+        .await
+        .unwrap_err()
+        .contains("consumer publication custody"));
+    assert!(existing_decision(&f.control, &f.request)
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(
         f.control
             .cluster_delivery(&d.cleanup_id)

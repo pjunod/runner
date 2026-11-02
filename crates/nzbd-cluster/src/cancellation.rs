@@ -1,7 +1,7 @@
 //! Exact, replicated disposition of a sealed result rejected after removal.
 //! A timeout, expired lease or peer-supplied path creates no byte authority.
 use crate::control::ControlStore;
-use hiqlite::{Row, macros::params};
+use hiqlite::{macros::params, Row};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +129,12 @@ struct SealedProof {
     job: nzbd_types::Job,
     manifest_bytes: Vec<u8>,
     job_bytes: Vec<u8>,
+}
+pub(crate) fn sealed_operation_finished(
+    root: &std::path::Path,
+    request: &CancellationRequest,
+) -> Result<(), String> {
+    sealed_proof(root, request).map(|_| ())
 }
 fn bounded_identity(value: &str, max: usize) -> bool {
     !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
