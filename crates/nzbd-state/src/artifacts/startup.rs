@@ -521,7 +521,7 @@ mod snapshot_tests {
             .allocate(77, &root, &root.join("runtime"))
             .unwrap();
         std::fs::write(source.path.join("payload"), b"owned").unwrap();
-        let workspace = inventory.workspace(77, "par_repair", "runtime").unwrap();
+        let workspace = inventory.workspace(77, "par_repair", "abc").unwrap();
         std::fs::write(workspace.scratch.path.join("temporary"), b"scratch").unwrap();
         inventory.finish_workspace(&workspace).unwrap();
         let source_before = inventory.get(&source.id).unwrap();
@@ -556,9 +556,7 @@ mod snapshot_tests {
             .unwrap();
         std::fs::write(source.path.join("payload"), b"owned").unwrap();
         let snapshot = inventory.capture_startup_reconciliation().unwrap();
-        let workspace = inventory
-            .workspace(78, "par_repair", "new-runtime-operation")
-            .unwrap();
+        let workspace = inventory.workspace(78, "par_repair", "def").unwrap();
         let source_before = inventory.get(&source.id).unwrap();
         let operation_before = inventory.operation(&workspace.operation_id).unwrap();
 

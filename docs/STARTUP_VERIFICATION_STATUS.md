@@ -47,7 +47,7 @@ Checks tab and owner-maintained body record actual results and merge status.
 - One combined PR with substantive commits, owned by Codex.
 - Source and receipts live in an independently registered clone under
   `~/.codex/agent-workspaces/`; no task artifacts in `/tmp` or personal repos.
-- Draft PR #262 is based on `368b500`, newer than reviewed baseline `a253562`;
+- PR #262 is based on `368b500`, newer than reviewed baseline `a253562`;
   preserve held-job fixes and adapt the reviewed contracts to those interfaces.
 - Feature behavior is enabled normally; no feature flags are introduced.
 - Correctness admission based on evidence is intrinsic runtime behavior,

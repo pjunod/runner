@@ -2494,8 +2494,26 @@ mod admission_tests {
         };
         engine.import_job(job, false, false).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while engine.export_job(JobId(41)).await.unwrap().is_none() {
-                tokio::task::yield_now().await;
+            loop {
+                match engine.export_job(JobId(41)).await {
+                    Ok(Some(job)) => {
+                        assert_eq!(job.status, JobStatus::Completed);
+                        assert!(engine
+                            .snapshot()
+                            .jobs
+                            .iter()
+                            .find(|summary| summary.id == JobId(41))
+                            .is_some_and(|summary| summary.verification.is_none()));
+                        break;
+                    }
+                    Err(nzbd_engine::EngineError::Lifecycle(message))
+                        if message
+                            .contains("verification or writer retirement is still in progress") =>
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                    other => panic!("imported legacy job did not become post-ready: {other:?}"),
+                }
             }
         })
         .await
@@ -2538,11 +2556,8 @@ mod admission_tests {
         assert!(row
             .params
             .iter()
-            .any(|(key, value)| key == PP_DONE_PARAM && value == "SUCCESS/ALL"));
-        assert_eq!(
-            history.get(JobId(41)).unwrap().unwrap().status,
-            "SUCCESS/ALL"
-        );
+            .any(|(key, value)| key == PP_DONE_PARAM && value == "SUCCESS"));
+        assert_eq!(history.get(JobId(41)).unwrap().unwrap().status, "SUCCESS");
         let durable = engine.recovery_document().await.unwrap();
         assert!(durable.jobs[0]
             .params
@@ -2900,12 +2915,41 @@ async fn process_job_ctx_from(
     drop(control);
     if let Some(completion) = completion {
         let inventory = engine.artifacts();
-        if let Ok(Err(error)) = tokio::task::spawn_blocking(move || {
-            inventory.finalize_workspaces(&completion.source, &completion.outcome, completion.proof)
+        let local_completion = matches!(
+            &completion.proof,
+            nzbd_state::artifacts::FinalizationProof::Local { .. }
+        );
+        // Actual tools/readers have stopped and their AttemptUse is gone.
+        // A selected publication may have deferred duplicate-source retirement
+        // while that same generation's processing custody was still active.
+        // Retry only its succeeded journals after the local terminal stamp was
+        // confirmed, retaining every existing identity, Keep and hold check.
+        match tokio::task::spawn_blocking(move || {
+            let workspace = inventory.finalize_workspaces(
+                &completion.source,
+                &completion.outcome,
+                completion.proof,
+            );
+            let relocation = if local_completion {
+                inventory.retire_completed_relocations(&completion.source)
+            } else {
+                Ok(())
+            };
+            (workspace, relocation)
         })
         .await
         {
-            tracing::warn!(job = job_id.0, %error, "workspace finalization remains pending");
+            Ok((workspace, relocation)) => {
+                if let Err(error) = workspace {
+                    tracing::warn!(job = job_id.0, %error, "workspace finalization remains pending");
+                }
+                if let Err(error) = relocation {
+                    tracing::warn!(job = job_id.0, %error, "publication is committed; generation source cleanup remains pending");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(job = job_id.0, %error, "post-processing finalization worker failed; workspace and source cleanup remain pending");
+            }
         }
     }
     result

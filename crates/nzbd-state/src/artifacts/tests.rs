@@ -2076,8 +2076,21 @@ fn scan_reports_a_folder_it_cannot_measure_without_failing_the_scan() {
     std::fs::write(good.join("a.mkv"), b"media").unwrap();
     let odd = root.join("odd");
     std::fs::create_dir(&odd).unwrap();
-    // A socket is a special file: the manifest walk refuses it.
-    let _sock = std::os::unix::net::UnixListener::bind(odd.join("ctl.sock")).unwrap();
+    // A FIFO is a special file: the manifest walk refuses it. Unlike a Unix
+    // socket, its pathname also works beneath long managed workspace roots.
+    use std::os::unix::ffi::OsStrExt;
+    let fifo_path = odd.join("ctl.fifo");
+    let fifo_name = std::ffi::CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: fifo_name is a live NUL-terminated pathname; mkfifo retains no
+    // pointer after returning. The fixture owns its containing directory.
+    let created = unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) };
+    assert_eq!(
+        created,
+        0,
+        "{}: {}",
+        fifo_path.display(),
+        std::io::Error::last_os_error()
+    );
     let op = db
         .submit_task(
             "scan",
@@ -2090,8 +2103,8 @@ fn scan_reports_a_folder_it_cannot_measure_without_failing_the_scan() {
     assert_eq!(db.operation(&op.id).unwrap().state, "succeeded");
     let odd_row = db.for_path(&odd).unwrap().unwrap();
     assert!(!odd_row.measured());
-    // open(2) refuses a socket (ENXIO) before the walk can even classify it;
-    // whichever layer objects, the reason lands on the record.
+    // The descriptor opens without blocking, then the manifest rejects its
+    // nonregular file type. The actionable reason lands on the record.
     assert!(
         !odd_row.error.as_deref().unwrap_or("").is_empty(),
         "{:?}",
@@ -2654,4 +2667,65 @@ fn unavailable_legacy_enrollment_preserves_existing_association_and_controls() {
     assert_eq!(after.path, before.path);
     assert_eq!(after.hold, before.hold);
     assert_eq!(after.job, Some(802));
+}
+
+#[test]
+fn completed_relocation_retirement_requires_released_exact_generation() {
+    let (_temporary, inventory, root) = fixture();
+    let inventory = Arc::new(inventory);
+    let source_path = root.join("generation-retirement-source");
+    inventory
+        .allocate_for_delivery(84, &root, &source_path, true, false)
+        .unwrap();
+    std::fs::write(source_path.join("episode.mkv"), b"verified publication").unwrap();
+    let source = inventory.finish(84, &source_path, &root, "active").unwrap();
+    let use_guard = inventory.acquire_attempt_use(84).unwrap().unwrap();
+    let generation = use_guard.source().clone();
+    let published_root = root
+        .parent()
+        .unwrap()
+        .join("completed-generation-retirement");
+    std::fs::create_dir(&published_root).unwrap();
+    let published_path = published_root.join("published");
+    let publication = inventory
+        .publish_selected_checked(
+            84,
+            &published_path,
+            source.files.clone(),
+            vec![DeliveryFileOutcome {
+                source_path: "episode.mkv".into(),
+                publication_path: Some("episode.mkv".into()),
+                classification: "video".into(),
+                outcome: "published".into(),
+                reason: None,
+                repair_dependency: false,
+                source_cleanup_status: "pending".into(),
+            }],
+            &|| Ok(()),
+        )
+        .unwrap();
+    let retired_source_id = format!("source-{}", publication.operation_id);
+    assert!(inventory.retire_completed_relocations(&generation).is_err());
+    assert!(source_path.join("episode.mkv").exists());
+
+    drop(use_guard);
+    inventory
+        .retire_completed_relocations(&SourceGeneration {
+            artifact: generation.artifact.clone(),
+            generation: "another-generation".into(),
+        })
+        .unwrap();
+    assert!(source_path.join("episode.mkv").exists());
+    assert_ne!(inventory.get(&retired_source_id).unwrap().state, "deleted");
+
+    inventory.retire_completed_relocations(&generation).unwrap();
+    assert!(!source_path.exists());
+    assert_eq!(inventory.get(&retired_source_id).unwrap().state, "deleted");
+    let published = inventory.for_job(84).unwrap().unwrap();
+    let descriptor = inventory.verify(&published).unwrap();
+    assert_eq!(fs::manifest(&descriptor, 100_000).unwrap(), published.files);
+    assert_eq!(
+        std::fs::read(published_path.join("episode.mkv")).unwrap(),
+        b"verified publication"
+    );
 }

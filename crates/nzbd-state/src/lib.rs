@@ -252,14 +252,7 @@ impl JobJournals {
             let path = dir.join(format!("journal.{}", self.suffix));
             // Each incarnation owns an exclusive journal inode. Compaction can
             // remove only that inode; a foreign append descriptor is never unlinked.
-            let file = fsx::ctx(
-                std::fs::OpenOptions::new()
-                    .create_new(true)
-                    .append(true)
-                    .open(&path),
-                "create incarnation journal",
-                &path,
-            )?;
+            let file = fsx::create_append_exclusive(&path)?;
             self.open.insert(job.0, OpenJournal { path, file });
         }
         Ok(self.open.get_mut(&job.0).unwrap())
@@ -1480,7 +1473,7 @@ mod tests {
             .append_with_provenance(&rec(0), &serde_json::json!({"durable": true}))
             .unwrap();
         first.sync().unwrap();
-        let first_path = dir.path().join("jobs/1/journal.first");
+        let first_path = first.open.get(&1).unwrap().path.clone();
         drop(first);
         let mut tail = OpenOptions::new().append(true).open(first_path).unwrap();
         tail.write_all(b"{\"job\":").unwrap();
@@ -1490,7 +1483,9 @@ mod tests {
         second.append(&rec(2)).unwrap();
         second.sync().unwrap();
 
-        let records = JobJournals::replay_job_with_provenance(dir.path(), JobId(1)).unwrap();
+        let mut records = JobJournals::replay_job_with_provenance(dir.path(), JobId(1)).unwrap();
+        // Cross-writer replay is a union; directory enumeration has no ordering contract.
+        records.sort_by_key(|entry| entry.record.segment_number);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].record, rec(0));
         assert_eq!(

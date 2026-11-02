@@ -1160,6 +1160,43 @@ impl Inventory {
         tx.commit()?;
         Ok(())
     }
+    /// Retry committed publication retirement after the actual processing
+    /// attempt has released its generation custody. The journal's immutable
+    /// source identity, rather than a reusable job ID, bounds this cleanup.
+    pub fn retire_completed_relocations(&self, source: &SourceGeneration) -> Result<()> {
+        {
+            let _coordinator = self.mutation_guard()?;
+            if self.source_in_use(source) {
+                return Err(Error::Conflict(
+                    "processing source workers have not quiesced".into(),
+                ));
+            }
+        }
+        let ids = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare("SELECT id FROM operations WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.id')=?1 AND json_extract(json_extract(data,'$.request'),'$.source.generation')=?2 AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup_done'),0)=0 ORDER BY rowid")?;
+            let rows = statement.query_map(params![source.artifact, source.generation], |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        // No database or global mutation guard spans payload retirement.
+        for id in ids {
+            let operation = self.operation(&id)?;
+            let movement: Relocation = serde_json::from_str(&operation.request)?;
+            if operation.kind != "relocate"
+                || operation.state != "succeeded"
+                || movement.cleanup_done
+                || movement.source.id != source.artifact
+                || movement.source.generation != source.generation
+            {
+                continue;
+            }
+            self.retire_relocation_source(&id)?;
+        }
+        Ok(())
+    }
+
     fn retire_relocation_source(&self, key: &str) -> Result<()> {
         let mut op = self.operation(key)?;
         let mut movement: Relocation = serde_json::from_str(&op.request)?;

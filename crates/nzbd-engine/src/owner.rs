@@ -2807,6 +2807,15 @@ impl Owner {
                     });
                     return;
                 }
+                let prior = self.state.job(job).map(|record| {
+                    (
+                        record.status,
+                        record
+                            .torrent
+                            .as_ref()
+                            .map(|torrent| (torrent.control_intent, torrent.stop_reason)),
+                    )
+                });
                 let torrent = match self.state.job_mut(job) {
                     Some(j)
                         if j.kind == JobKind::Torrent
@@ -2868,12 +2877,30 @@ impl Owner {
                         owner.pending_control_revisions.remove(&job);
                         if lifecycle_current {
                             owner.dirty = true;
-                            owner.hold_job(
-                                job,
-                                nzbd_types::HoldCause::StorageUnavailable,
-                                "snapshot",
-                                "Pause intent could not be persisted",
-                            );
+                            if let (Some(record), Some((status, prior_torrent))) =
+                                (owner.state.job_mut(job), prior)
+                            {
+                                // Restore only this request's provisional fields;
+                                // a newer hold or backend fact remains authoritative.
+                                if !record.held() {
+                                    if record.status == JobStatus::Paused {
+                                        record.status = status;
+                                    }
+                                    if let (Some(torrent), Some((intent, reason))) =
+                                        (record.torrent.as_mut(), prior_torrent)
+                                    {
+                                        if torrent.control_intent == TorrentControlIntent::Paused
+                                            && torrent.stop_reason
+                                                == Some(nzbd_types::TorrentStopReason::Manual)
+                                        {
+                                            torrent.control_intent = intent;
+                                            torrent.stop_reason = reason;
+                                        }
+                                    }
+                                }
+                            }
+                            owner.bump_epoch();
+                            owner.publish_now();
                         }
                     }
                     let _ = reply.send(ok);
@@ -3201,6 +3228,14 @@ impl Owner {
                 let generation = fresh_epoch();
                 self.control_epochs.insert(job, generation);
                 let artifacts = self.artifacts.clone();
+                let receipts_before = self
+                    .state
+                    .url_admission_receipts
+                    .iter()
+                    .filter(|receipt| receipt.job_id == job.0)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut refreshed_receipts = receipts_before.clone();
                 let early_queue_job = before.as_ref().is_some_and(|record| {
                     matches!(
                         record.status,
@@ -3211,15 +3246,20 @@ impl Owner {
                     move || {
                         let existing = artifacts.for_job(job.0).map_err(|e| nzbd_state::StateError::Corrupt(format!("artifact inventory: {e}")))?;
                         match existing {
-                            Some(_) => artifacts.set_keep_on_failure(job.0, keep)
-                                .map(|updated| (true, updated))
-                                .map_err(|e| nzbd_state::StateError::Corrupt(format!("artifact inventory: {e}"))),
-                            None if early_queue_job => Ok((true, false)),
-                            None => Ok((false, false)),
+                            Some(_) => {
+                                let updated = artifacts.set_keep_on_failure(job.0, keep)
+                                    .map_err(|e| nzbd_state::StateError::Corrupt(format!("artifact inventory: {e}")))?;
+                                if updated {
+                                    for receipt in &mut refreshed_receipts { refresh_url_admission_custody(receipt, &artifacts); }
+                                }
+                                Ok((updated, updated, refreshed_receipts))
+                            },
+                            None if early_queue_job => Ok((true, false, refreshed_receipts)),
+                            None => Ok((false, false, refreshed_receipts)),
                         }
                     },
                     move |owner, inventory_result| {
-                        let (valid, inventory_updated) = match inventory_result {
+                        let (valid, inventory_updated, refreshed_receipts) = match inventory_result {
                             Ok(value) => value,
                             Err(error) => {
                                 tracing::warn!(job = job.0, %error, "could not update source Keep intent");
@@ -3261,6 +3301,16 @@ impl Owner {
                         if keep {
                             record.params.push(("*Runner:KeepOnFailure".into(), "1".into()));
                         }
+                        for refreshed in refreshed_receipts {
+                            if let Some(receipt) = owner.state.url_admission_receipts.iter_mut().find(|receipt|
+                                receipt.request_token == refreshed.request_token
+                                    && receipt.source_artifact_id == refreshed.source_artifact_id
+                                    && receipt.source_generation == refreshed.source_generation) {
+                                receipt.keep_source_on_failure = refreshed.keep_source_on_failure;
+                                receipt.custody_state = refreshed.custody_state;
+                                receipt.source_cleanup_status = refreshed.source_cleanup_status;
+                            }
+                        }
                         owner.dirty = true;
                         owner.persist_then(move |owner, committed| {
                             let current = owner.control_epochs.get(&job) == Some(&generation) && owner.job_epochs.get(&job) == Some(&scope_generation);
@@ -3275,6 +3325,16 @@ impl Owner {
                                         record.params.retain(|(key, _)| key != "*Runner:KeepOnFailure");
                                         if prior_keep {
                                             record.params.push(("*Runner:KeepOnFailure".into(), "1".into()));
+                                        }
+                                    }
+                                    for before in &receipts_before {
+                                        if let Some(receipt) = owner.state.url_admission_receipts.iter_mut().find(|receipt|
+                                            receipt.request_token == before.request_token
+                                                && receipt.source_artifact_id == before.source_artifact_id
+                                                && receipt.source_generation == before.source_generation) {
+                                            receipt.keep_source_on_failure = before.keep_source_on_failure;
+                                            receipt.custody_state = before.custody_state.clone();
+                                            receipt.source_cleanup_status = before.source_cleanup_status.clone();
                                         }
                                     }
                                     owner.dirty = true;
@@ -6031,9 +6091,27 @@ impl Owner {
                 let allocation = inventory
                     .for_job(job.0)
                     .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
-                let allocation = transitions::allocate_imported_payload(
-                    &inventory, &record, &root, &plan, allocation,
-                )?;
+                let allocation = if allocation.is_none() && !plan.private_range {
+                    prepare_unenrolled_payload_root(&inventory, &plan.root)?;
+                    let keep = record
+                        .params
+                        .iter()
+                        .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
+                    inventory
+                        .allocate_for_delivery_with_keep(
+                            record.id.0,
+                            &plan.root,
+                            &plan.path,
+                            record.lifecycle_eligible(),
+                            record.delivery_lifecycle,
+                            keep,
+                        )
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
+                } else {
+                    transitions::allocate_imported_payload(
+                        &inventory, &record, &root, &plan, allocation,
+                    )?
+                };
                 if allocation.state != "active" {
                     return Err(nzbd_state::StateError::Corrupt(
                         "download allocation is retained or retiring".into(),
@@ -9887,7 +9965,7 @@ mod tests {
         allocate_for_test(&mut owner, &mut messages, JobId(2), false).await;
         owner.allocating_jobs.insert(JobId(1));
 
-        let leases = owner.grant_work(ServerId(1), 1);
+        let leases = grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1).await;
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].r.job, JobId(2));
         assert!(matches!(
@@ -10008,6 +10086,15 @@ mod tests {
         assert!(paused.await.unwrap());
         assert!(!owner.pending_control_revisions.contains_key(&JobId(1)));
         assert_eq!(owner.state.job(JobId(1)).unwrap().status, JobStatus::Paused);
+        assert!(
+            matches!(
+                tokio::time::timeout(Duration::from_secs(1), adapter.next_command())
+                    .await
+                    .expect("durable Pause reaches the backend"),
+                Some(BackendCommand::Pause { job: JobId(1) })
+            ),
+            "only the newer durable Pause may reach the backend"
+        );
         owner.schedule_torrent_starts();
         assert!(
             tokio::time::timeout(Duration::from_millis(20), adapter.next_command())
@@ -10983,12 +11070,13 @@ mod tests {
             reply,
         });
         pump(&mut owner, &mut messages).await;
-        assert!(received.blocking_recv().unwrap().is_empty());
+        assert!(received.await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn failed_fenced_replace_restores_delegation_and_mirror_overlay() {
-        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+        let (_tmp, mut owner, _adapter, mut messages) =
+            control_test_owner_with_persistence(true, Some(Arc::new(|| false)));
         pump(&mut owner, &mut messages).await;
         let original = pending_job(3);
         owner.state.jobs.push(original.clone());

@@ -322,8 +322,66 @@ fn daemon_stderr(dir: &Path) -> (Stdio, PathBuf) {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = dir.join(format!("nzbd-stderr-{n}.log"));
-    let file = std::fs::File::create(&path).expect("create daemon stderr log");
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .append(true)
+        .open(&path)
+        .expect("create daemon stderr log");
     (Stdio::from(file), path)
+}
+
+fn daemon_output(dir: &Path) -> (Stdio, Stdio, PathBuf) {
+    let (stderr, path) = daemon_stderr(dir);
+    let stdout = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("capture daemon tracing output");
+    (Stdio::from(stdout), stderr, path)
+}
+
+fn wait_monitor_ready(daemon: &KillOnDrop, monitor: &str, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    loop {
+        assert!(daemon.died().is_none(), "{}", daemon.stderr_tail());
+        if probe_within(
+            monitor,
+            "/readyz",
+            PROBE_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())),
+        )
+        .is_some_and(|response| response.0 == 200)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "control listener never became ready: {}",
+            daemon.stderr_tail()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_service_reason(daemon: &KillOnDrop, public: &str, expected: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(daemon.died().is_none(), "{}", daemon.stderr_tail());
+        if let Some((200, body)) = probe(public, "/api/v1/service") {
+            let service: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if let Some(reason) = service["reason"]
+                .as_str()
+                .filter(|reason| reason.contains(expected))
+            {
+                assert_eq!(service["components"]["backend"], "loading");
+                return reason.to_owned();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "backend failure was not actionable: {}",
+            daemon.stderr_tail()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// Like `http`, but tolerates a dead/bouncing listener (returns None) and
@@ -1052,7 +1110,7 @@ fn restart_completes_with_an_open_sse_stream() {
     // response head, then keep the socket alive across the restart.
     let mut sse = TcpStream::connect(&addr).unwrap();
     sse.write_all(
-        format!("GET /api/v1/events HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\n\r\n")
+        format!("GET /api/v1/events HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n")
             .as_bytes(),
     )
     .unwrap();
@@ -1068,33 +1126,39 @@ fn restart_completes_with_an_open_sse_stream() {
     let (code, _) = http(&addr, "POST", "/api/v1/restart", b"");
     assert_eq!(code, 200);
 
-    // The daemon must CLOSE our SSE stream so graceful shutdown can drain
-    // and the process can re-serve. If the stream blocked shutdown (the
-    // bug), the socket stays open — only keep-alive pings arrive, never
-    // EOF — and this times out. `up_since_unix` can't be used here: the
-    // restart is sub-second, so it lands in the same whole second.
-    sse.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut buf = [0u8; 256];
+    // Connection: close takes effect only after the streaming response body
+    // finishes. Hold it across restart, then require backend shutdown to end
+    // that body and close this connection; the control listener stays up.
+    let mut buf = [0u8; 4096];
     let deadline = Instant::now() + Duration::from_secs(12);
     let mut closed = false;
     while Instant::now() < deadline {
+        sse.set_read_timeout(Some(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(2)),
+        ))
+        .unwrap();
         match sse.read(&mut buf) {
             Ok(0) => {
-                closed = true; // server closed the stream — restart proceeded
+                closed = true;
                 break;
             }
-            Ok(_) => continue, // keep-alive ping; keep waiting for the close
-            Err(_) => break,   // read timeout
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => panic!("SSE response was truncated during restart: {error}"),
         }
     }
     assert!(
         closed,
-        "SSE stream was not closed on restart — it blocked graceful shutdown (the daemon hung)"
+        "SSE response body did not finish during backend restart"
     );
-    drop(sse);
-
-    // And the daemon is serving again.
     wait_healthy(&daemon, &addr, Duration::from_secs(10)).unwrap_or_else(|cause| panic!("{cause}"));
+    drop(sse);
 }
 
 /// Regression (field report 2026-07-25, #2 of the day): a restart clicked
@@ -1386,11 +1450,21 @@ fn settings_live_apply_restart_flow_keeps_secrets() {
 #[test]
 fn setup_unwritable_config_offers_copyable_toml() {
     let tmp = tempfile::tempdir().unwrap();
-    // A regular FILE where the config's parent dir should be:
-    // create_dir_all fails for everyone (root included, ENOTDIR) — a
-    // portable stand-in for a read-only mount.
+    use std::os::unix::fs::PermissionsExt;
     let blocker = tmp.path().join("blocked");
-    std::fs::write(&blocker, b"i am a file").unwrap();
+    std::fs::create_dir(&blocker).unwrap();
+    std::fs::set_permissions(&blocker, std::fs::Permissions::from_mode(0o500)).unwrap();
+    struct RestorePermissions(PathBuf);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _restore = RestorePermissions(blocker.clone());
+    if std::fs::write(blocker.join(".probe"), b"").is_ok() {
+        eprintln!("SKIP setup_unwritable_config_offers_copyable_toml: running privileged");
+        return;
+    }
     let cfg_path = blocker.join("nzbd.toml");
 
     let port = free_port();
@@ -2193,117 +2267,116 @@ bind = "{api_addr}"
     assert_eq!(got, data);
 }
 
-/// Regression (reported 2026-07-24): a state directory the daemon could
-/// not write killed startup with a bare
-/// `state: io: Permission denied (os error 13)` — no path, so an operator
-/// had no way to tell which directory to fix.
-///
-/// Portable half: a regular FILE where the state dir belongs fails with
-/// ENOTDIR for everyone, root included, so this always runs.
+/// Backend storage errors remain actionable while the process-lifetime
+/// control listener and authenticated service diagnostics remain available.
 #[test]
 fn unwritable_state_dir_names_the_path_at_startup() {
     let tmp = tempfile::tempdir().unwrap();
     let main_dir = tmp.path().join("data");
     std::fs::write(&main_dir, b"i am a file").unwrap();
-    // The state dir defaults to `<main_dir>/queue`, which cannot be made.
     let queue_dir = main_dir.join("queue");
-
-    let cfg_path = tmp.path().join("nzbd.toml");
+    let config = tmp.path().join("nzbd.toml");
     std::fs::write(
-        &cfg_path,
+        &config,
         format!(
-            "[paths]\nmain_dir = \"{}\"\ndest_dir = \"{}\"\n",
-            main_dir.display(),
-            main_dir.join("complete").display()
+            "[paths]\nmain_dir = {:?}\ndest_dir = {:?}\n",
+            main_dir,
+            main_dir.join("complete")
         ),
     )
     .unwrap();
-
-    let out = child_output(
+    let public = format!("127.0.0.1:{}", free_port());
+    let monitor = format!("127.0.0.1:{}", free_port());
+    let (stdout, stderr, path) = daemon_output(tmp.path());
+    let child = spawn_child(
         Command::new(env!("CARGO_BIN_EXE_nzbd"))
-            .args(["run", "--monitor-bind", "127.0.0.1:0", "--config"])
-            .arg(&cfg_path)
-            .args(["--bind", &format!("127.0.0.1:{}", free_port())])
-            .env("RUST_LOG", "info"),
+            .args(["run", "--monitor-bind", &monitor, "--config"])
+            .arg(&config)
+            .args(["--bind", &public])
+            .env("RUST_LOG", "info")
+            .stdout(stdout)
+            .stderr(stderr),
     )
-    .expect("spawn nzbd");
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    .unwrap();
+    let daemon = KillOnDrop::new(child, path);
+    let reason = wait_service_reason(&daemon, &public, &queue_dir.display().to_string());
     assert!(
-        !out.status.success(),
-        "daemon should refuse to start:\n{stderr}"
+        !reason.contains("\\n"),
+        "error should print readably: {reason}"
     );
+    wait_monitor_ready(&daemon, &monitor, Duration::from_secs(5));
+    assert_eq!(probe(&monitor, "/healthz").unwrap().0, 200);
+    assert_eq!(http(&public, "GET", "/api/v1/jobs", b"").0, 503);
+    let logs = daemon.stderr_tail();
     assert!(
-        stderr.contains(&queue_dir.display().to_string()),
-        "startup error must name the directory it failed on:\n{stderr}"
+        logs.contains("resolved data directories")
+            && logs.contains(&queue_dir.display().to_string()),
+        "startup should name resolved paths: {logs}"
     );
-    // The resolved dirs are logged before anything touches them (the fmt
-    // layer writes to stdout; the fatal error goes to stderr).
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("resolved data directories")
-            && stdout.contains(&queue_dir.display().to_string()),
-        "startup should log the resolved paths:\n{stdout}"
-    );
-    // `main` prints the error with Debug; it must not escape to one line.
-    assert!(
-        !stderr.contains("\\n"),
-        "error should print readably, not Debug-escaped:\n{stderr}"
+    assert_eq!(std::fs::read(&main_dir).unwrap(), b"i am a file");
+    assert_eq!(
+        http(&public, "POST", "/api/v1/service/shutdown", b"").0,
+        202
     );
 }
 
-/// EACCES half: the exact reported case — a state dir owned by someone
-/// else. Mode bits mean nothing to root, so this self-skips there.
 #[test]
 fn permission_denied_state_dir_suggests_the_fix() {
     use std::os::unix::fs::PermissionsExt;
-
     let tmp = tempfile::tempdir().unwrap();
     let main_dir = tmp.path().join("data");
     let queue_dir = main_dir.join("queue");
     std::fs::create_dir_all(&queue_dir).unwrap();
     std::fs::set_permissions(&queue_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-
+    struct RestorePermissions(PathBuf);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _restore = RestorePermissions(queue_dir.clone());
     if std::fs::write(queue_dir.join(".probe"), b"").is_ok() {
         eprintln!("SKIP permission_denied_state_dir_suggests_the_fix: running privileged");
         return;
     }
-
-    let cfg_path = tmp.path().join("nzbd.toml");
+    let config = tmp.path().join("nzbd.toml");
     std::fs::write(
-        &cfg_path,
+        &config,
         format!(
-            "[paths]\nmain_dir = \"{}\"\ndest_dir = \"{}\"\n",
-            main_dir.display(),
-            main_dir.join("complete").display()
+            "[paths]\nmain_dir = {:?}\ndest_dir = {:?}\n",
+            main_dir,
+            main_dir.join("complete")
         ),
     )
     .unwrap();
-
-    let out = child_output(
+    let public = format!("127.0.0.1:{}", free_port());
+    let monitor = format!("127.0.0.1:{}", free_port());
+    let (stdout, stderr, path) = daemon_output(tmp.path());
+    let child = spawn_child(
         Command::new(env!("CARGO_BIN_EXE_nzbd"))
-            .args(["run", "--monitor-bind", "127.0.0.1:0", "--config"])
-            .arg(&cfg_path)
-            .args(["--bind", &format!("127.0.0.1:{}", free_port())]),
+            .args(["run", "--monitor-bind", &monitor, "--config"])
+            .arg(&config)
+            .args(["--bind", &public])
+            .stdout(stdout)
+            .stderr(stderr),
     )
-    .expect("spawn nzbd");
-
-    // Restore before asserting so tempdir cleanup always succeeds.
-    std::fs::set_permissions(&queue_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "daemon should refuse to start");
+    .unwrap();
+    let daemon = KillOnDrop::new(child, path);
+    let reason = wait_service_reason(&daemon, &public, "Permission denied");
     assert!(
-        stderr.contains(&queue_dir.display().to_string()),
-        "must name the unwritable directory:\n{stderr}"
+        reason.contains(&queue_dir.display().to_string()),
+        "must name unwritable path: {reason}"
     );
     assert!(
-        stderr.contains("Permission denied"),
-        "must still report the errno:\n{stderr}"
+        reason.contains("hint:") && reason.contains("paths.queue_dir"),
+        "must explain the fix: {reason}"
     );
-    assert!(
-        stderr.contains("hint:") && stderr.contains("paths.queue_dir"),
-        "must tell the operator how to fix it:\n{stderr}"
+    wait_monitor_ready(&daemon, &monitor, Duration::from_secs(5));
+    assert_eq!(probe(&monitor, "/healthz").unwrap().0, 200);
+    assert_eq!(http(&public, "GET", "/api/v1/jobs", b"").0, 503);
+    assert_eq!(
+        http(&public, "POST", "/api/v1/service/shutdown", b"").0,
+        202
     );
 }
 
@@ -2545,6 +2618,7 @@ fn reload_keeps_secure_control_listener_while_next_config_read_is_blocked() {
     let daemon = KillOnDrop::new(child, path);
     let auth = Some("nzbd:persistent-secret");
     wait_healthy_authenticated(&daemon, &public, Duration::from_secs(15), auth).unwrap();
+    wait_monitor_ready(&daemon, &monitor, Duration::from_secs(5));
     std::fs::remove_file(&config).unwrap();
     assert!(child_status(Command::new("mkfifo").arg(&config))
         .unwrap()
@@ -2606,7 +2680,7 @@ fn wrong_enrolled_mount_stays_unmodified_before_history_and_tls_initialization()
         let monitor = format!("127.0.0.1:{}", free_port());
         let config = tmp.path().join("nzbd.toml");
         std::fs::write(&config, format!("[paths]\nmain_dir = {wrong_mount:?}\ndest_dir = {:?}\n[api]\nbind = {public:?}\ntls = {auto_tls}\ndiscovery = false\n", wrong_mount.join("complete"))).unwrap();
-        let (stderr, path) = daemon_stderr(tmp.path());
+        let (stdout, stderr, path) = daemon_output(tmp.path());
         let child = spawn_child(
             Command::new(env!("CARGO_BIN_EXE_nzbd"))
                 .args(["run", "--config"])
@@ -2616,7 +2690,7 @@ fn wrong_enrolled_mount_stays_unmodified_before_history_and_tls_initialization()
                     "NZBD_EXPECTED_INSTALLATION_ID",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 )
-                .stdout(Stdio::null())
+                .stdout(stdout)
                 .stderr(stderr),
         )
         .unwrap();
@@ -2664,7 +2738,7 @@ fn missing_config_with_retained_enrollment_never_exposes_setup_defaults() {
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
     )
     .unwrap();
-    let (stderr, path) = daemon_stderr(tmp.path());
+    let (stdout, stderr, path) = daemon_output(tmp.path());
     let child = spawn_child(
         Command::new(env!("CARGO_BIN_EXE_nzbd"))
             .args(["run", "--config"])
@@ -2673,7 +2747,7 @@ fn missing_config_with_retained_enrollment_never_exposes_setup_defaults() {
             .env("NZBD_MONITOR_BIND", &monitor)
             .env("NZBD_MAIN_DIR", tmp.path().join("absent-data"))
             .env_remove("NZBD_EXPECTED_INSTALLATION_ID")
-            .stdout(Stdio::null())
+            .stdout(stdout)
             .stderr(stderr),
     )
     .unwrap();
@@ -2723,6 +2797,7 @@ fn reload_missing_primary_and_mirror_preserves_known_authentication_with_cli_bin
     let daemon = KillOnDrop::new(child, path);
     let auth = Some("nzbd:retained-secret");
     wait_healthy_authenticated(&daemon, &public, Duration::from_secs(15), auth).unwrap();
+    wait_monitor_ready(&daemon, &monitor, Duration::from_secs(5));
     assert!(tmp
         .path()
         .join(".nzbd-security-established")

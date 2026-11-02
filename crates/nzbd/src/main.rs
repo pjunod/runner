@@ -1960,7 +1960,7 @@ mod tests {
             let allocation = engine.artifacts().for_job(job.0).unwrap().unwrap();
             assert_eq!(allocation.root, cfg.paths.main_dir);
             assert!(!cfg.dest_dir().join("storage-contract").exists());
-            tokio::time::timeout(Duration::from_secs(10), async {
+            if tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     if let Event::JobFinished {
                         job: finished,
@@ -1976,7 +1976,16 @@ mod tests {
                 }
             })
             .await
-            .expect("download must finish");
+            .is_err()
+            {
+                eprintln!("download timeout snapshot: {:#?}", engine.snapshot());
+                eprintln!("download timeout job: {:?}", engine.export_job(job).await);
+                eprintln!(
+                    "download timeout allocation: {:?}",
+                    engine.artifacts().for_job(job.0)
+                );
+                panic!("download must finish");
+            }
             assert_eq!(
                 std::fs::read(allocation.path.join("payload.mkv")).unwrap(),
                 data
@@ -1997,6 +2006,7 @@ mod tests {
                 nzbd_state::history::HistoryDb::open(&cfg.state_dir().join("history.sqlite"), None)
                     .unwrap(),
             );
+            let mut pp_events = engine.subscribe();
             let result = nzbd_post::manager::process_job(
                 &engine,
                 &post_config(&cfg, 1, None),
@@ -2015,6 +2025,27 @@ mod tests {
                 assert!(!published_dir.join("payload.mkv").exists());
             } else {
                 assert_eq!(result.unwrap(), nzbd_post::manager::PpFinal::Success);
+                let (pp_status, final_dir) = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match pp_events
+                            .recv()
+                            .await
+                            .expect("post-processing event stream")
+                        {
+                            Event::JobPpFinished {
+                                job: finished,
+                                pp_status,
+                                final_dir,
+                                ..
+                            } if finished == job => break (pp_status, final_dir),
+                            _ => continue,
+                        }
+                    }
+                })
+                .await
+                .expect("durable post-processing completion event");
+                assert_eq!(pp_status, "SUCCESS");
+                assert_eq!(final_dir.as_deref(), Some(published_dir.to_str().unwrap()));
                 assert!(engine.export_job(job).await.unwrap().unwrap().ready());
                 assert_eq!(
                     std::fs::read(published_dir.join("payload.mkv")).unwrap(),

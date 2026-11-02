@@ -210,6 +210,51 @@ fn preserve_user_intent(old: &mut Job, current: &Job) {
         }
     }
 }
+/// Rollback starts from the last durable row. Only intent changed after the
+/// provisional row was installed belongs to a concurrent operator command;
+/// unchanged candidate fields must not leak back into the restored record.
+fn preserve_intent_changes(restored: &mut Job, current: &Job, provisional: &Job) {
+    if current.category != provisional.category {
+        restored.category = current.category.clone();
+    }
+    if current.priority != provisional.priority {
+        restored.priority = current.priority;
+    }
+    if current.control() != provisional.control() {
+        restored
+            .params
+            .retain(|(key, _)| key != nzbd_types::CONTROL_PARAM);
+        if let Some(control) = current.control() {
+            restored.set_control(&control);
+        }
+    }
+    if current.status != provisional.status
+        && matches!(current.status, JobStatus::Paused | JobStatus::Queued)
+    {
+        restored.status = current.status;
+    }
+    if restored.held() {
+        restored.status = JobStatus::Paused;
+    }
+    for file in &mut restored.files {
+        if let Some((current, provisional)) = current
+            .files
+            .iter()
+            .find(|candidate| candidate.id == file.id)
+            .zip(
+                provisional
+                    .files
+                    .iter()
+                    .find(|candidate| candidate.id == file.id),
+            )
+        {
+            if current.paused != provisional.paused {
+                file.paused = current.paused;
+            }
+        }
+    }
+}
+
 fn normalize(job: &mut Job) {
     for file in &mut job.files {
         for segment in &mut file.segments {
@@ -222,6 +267,13 @@ fn normalize(job: &mut Job) {
         job.status = JobStatus::Queued;
     }
     recompute_job_totals(job);
+    if let Some(control) = job
+        .control()
+        .filter(|control| control.version == 1 && control.lifecycle == "held")
+        .and_then(|control| rearmed_hold(control, unix_now()))
+    {
+        job.set_control(&control);
+    }
     if needs_payload(job) {
         set_owner_param(&mut job.params, "*Recovery:pending", Some("1".into()));
         set_owner_param(
@@ -466,6 +518,7 @@ impl Owner {
         let revision = fresh_epoch();
         self.control_epochs.insert(job, revision);
         let lifetime = admission.generation;
+        let provisional = candidate.clone();
         *self.state.job_mut(job).unwrap() = candidate;
         self.pending_control_commits.insert(job);
         self.record_transitions.insert(job);
@@ -484,7 +537,7 @@ impl Owner {
             if owner.job_epochs.get(&job) == Some(&lifetime) {
                 if let Some(current) = owner.state.job(job).cloned() {
                     let mut restore = previous;
-                    preserve_user_intent(&mut restore, &current);
+                    preserve_intent_changes(&mut restore, &current, &provisional);
                     *owner.state.job_mut(job).unwrap() = restore;
                 }
                 owner.dirty = true;
@@ -633,7 +686,7 @@ impl Owner {
                 match previous {
                     Some(mut previous) => {
                         if let Some(current) = &current {
-                            preserve_user_intent(&mut previous, current);
+                            preserve_intent_changes(&mut previous, current, &candidate);
                         }
                         if let Some(index) = owner
                             .state
@@ -777,6 +830,7 @@ impl Owner {
                 .max()
                 .unwrap_or(0),
         );
+        let provisional = jobs.clone();
         self.state.jobs = jobs;
         let fence = self
             .state
@@ -811,8 +865,12 @@ impl Owner {
             if !committed {
                 let mut restored = previous;
                 for old in &mut restored {
-                    if let Some(current) = owner.state.job(old.id) {
-                        preserve_user_intent(old, current);
+                    if let Some((current, provisional)) = owner
+                        .state
+                        .job(old.id)
+                        .zip(provisional.iter().find(|candidate| candidate.id == old.id))
+                    {
+                        preserve_intent_changes(old, current, provisional);
                     }
                 }
                 owner.state.jobs = restored;
@@ -1189,6 +1247,27 @@ mod tests {
         )
     }
 
+    #[test]
+    fn rollback_keeps_concurrent_intent_without_leaking_provisional_fields() {
+        let mut previous = record("previous", JobStatus::Queued);
+        previous.priority = 1;
+        previous.category = Some("original".into());
+        let mut provisional = previous.clone();
+        provisional.priority = 99;
+        provisional.category = Some("incoming".into());
+        let mut unchanged = previous.clone();
+        preserve_intent_changes(&mut unchanged, &provisional, &provisional);
+        assert_eq!(unchanged.priority, 1);
+        assert_eq!(unchanged.category.as_deref(), Some("original"));
+        let mut current = provisional.clone();
+        current.priority = 7;
+        current.status = JobStatus::Paused;
+        preserve_intent_changes(&mut previous, &current, &provisional);
+        assert_eq!(previous.priority, 7);
+        assert_eq!(previous.category.as_deref(), Some("original"));
+        assert_eq!(previous.status, JobStatus::Paused);
+    }
+
     #[tokio::test]
     async fn admitted_post_stamp_keeps_its_lifetime_and_does_not_wait_for_itself() {
         let temp = tempfile::tempdir().unwrap();
@@ -1427,16 +1506,33 @@ mod tests {
     }
 
     async fn await_export(engine: &crate::EngineHandle, job: JobId) -> Job {
+        let mut changes = engine.queue_changes.clone();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let Some(job) = engine.export_job(job).await.unwrap() {
-                    return job;
+                let _ = changes.borrow_and_update();
+                match engine.export_job(job).await {
+                    Ok(Some(job)) => return job,
+                    Ok(None) => panic!("recovered job disappeared before becoming exportable"),
+                    Err(crate::EngineError::Lifecycle(_)) => {
+                        // A pending recovery ticket is an explicit retryable
+                        // refusal. Wait for owner evidence to change before
+                        // requiring the full recovered record below.
+                    }
+                    Err(error) => panic!("recovered job export failed: {error}"),
                 }
-                tokio::task::yield_now().await;
+                changes
+                    .changed()
+                    .await
+                    .expect("owner stopped during recovery");
             }
         })
         .await
-        .expect("recovered job should become exportable")
+        .unwrap_or_else(|_| {
+            panic!(
+                "recovered job should become exportable: {:?}",
+                engine.snapshot().jobs
+            )
+        })
     }
 
     #[tokio::test]
@@ -1708,7 +1804,10 @@ mod tests {
         })
         .await
         .expect("unsafe private parent must remain visibly blocked");
-        assert!(engine.export_job(JobId(1)).await.unwrap().is_none());
+        assert!(matches!(
+            engine.export_job(JobId(1)).await,
+            Err(crate::EngineError::Lifecycle(_))
+        ));
         assert!(engine.artifacts().for_job(1).unwrap().is_none());
         assert!(!outside.join("range-work").exists());
         engine.shutdown().await;

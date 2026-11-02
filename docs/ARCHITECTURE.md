@@ -301,7 +301,12 @@ global mutation coordinator, then recheck revision before committing.
 Runtime transforms, relocation, deletion and interrupted-operation replay use
 this same boundary. Their generation reservations retain namespace custody
 until actual worker completion; new scratch joins that reservation in the
-transaction that records it. Accepted cluster publications use the same owner
+transaction that records it. After a local completion is durably stamped,
+post-processing joins its workers and releases the source reservation before
+retrying that exact generation's journaled publication cleanup. Ownership,
+identity, retention and delivery guards still decide whether deletion may
+proceed. A failed snapshot restores prior values while preserving only operator
+intent changed after the provisional record was installed. Accepted cluster publications use the same owner
 payload lane: a durable intent binds the verified sealed result, old directory,
 building directory and backup identities. Selection commits a fresh inventory
 generation while retaining prior custody. History and the canonical queue
