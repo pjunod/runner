@@ -188,7 +188,7 @@ impl crate::EngineHandle {
     }
 
     pub fn native_torrent_delivery_supported(&self) -> bool {
-        !self.url_outbox_external && self.snapshot().queue_authority
+        cfg!(unix) && !self.url_outbox_external && self.snapshot().queue_authority
     }
     pub async fn native_torrent_pending(
         &self,
@@ -280,9 +280,14 @@ impl crate::EngineHandle {
         let source = blob_origin(job, false)?;
         let metadata = blob_origin(job, true)?;
         let store = self.url_resolutions.clone();
-        tokio::task::spawn_blocking(move || {
-            store.cancel(&source)?;
-            store.cancel(&metadata)
+        let pinned = self.snapshot().native_descriptor_references.clone();
+        tokio::task::spawn_blocking(move || -> nzbd_state::artifacts::Result<()> {
+            for origin in [source, metadata] {
+                if !pinned.contains(&nzbd_state::artifacts::url_source_identity(&origin)?) {
+                    store.cancel(&origin)?;
+                }
+            }
+            Ok(())
         })
         .await
         .map_err(|_| crate::EngineError::Closed)?
@@ -295,6 +300,11 @@ pub const SEED_RETIREMENT_PARAM: &str = "*Torrent:SeedRetirement";
 #[serde(rename_all = "camelCase")]
 pub struct ManagedSeedRetirement {
     pub identity: String,
+    pub storage_instance_id: String,
+    pub reason: nzbd_state::artifacts::TorrentSeedRetirementReason,
+    pub retry_revision: String,
+    pub keep_blocked_revision: Option<u64>,
+    pub keep_blocked_control_revision: Option<String>,
     pub source: nzbd_state::artifacts::SourceGeneration,
     pub payload_root: std::path::PathBuf,
     pub phase: String,
@@ -309,8 +319,42 @@ pub fn seed_retirement(job: &Job) -> Option<ManagedSeedRetirement> {
     if raw.len() > 16 * 1024 {
         return None;
     }
-    serde_json::from_str(raw).ok()
+    let marker: ManagedSeedRetirement = serde_json::from_str(raw).ok()?;
+    (marker.identity == marker.expected_identity(job.id)?
+        && marker.storage_instance_id.len() <= 128
+        && marker.retry_revision.len() <= 20
+        && marker.retry_revision.parse::<u64>().is_ok()
+        && matches!(marker.phase.as_str(), "requested" | "detached" | "deleted"))
+    .then_some(marker)
 }
+impl ManagedSeedRetirement {
+    pub fn expected_identity(&self, job: JobId) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        Some(format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(
+                    1u8,
+                    job,
+                    &self.storage_instance_id,
+                    &self.source,
+                    &self.payload_root,
+                    &self.reason
+                ))
+                .ok()?
+            )
+        ))
+    }
+    pub fn intent(&self) -> nzbd_state::artifacts::TorrentSeedRetirementIntent {
+        nzbd_state::artifacts::TorrentSeedRetirementIntent {
+            identity: self.identity.clone(),
+            reason: self.reason.clone(),
+            retry_revision: self.retry_revision.clone(),
+            source_path: self.payload_root.clone(),
+        }
+    }
+}
+
 pub fn is_managed_seed(job: &Job) -> bool {
     job.torrent.is_some()
         && job
@@ -320,9 +364,20 @@ pub fn is_managed_seed(job: &Job) -> bool {
 }
 pub fn preparation_hold(job: &Job, control: &nzbd_types::JobControl) -> bool {
     (is_acquisition(job) && matches!(control.stage.as_str(), "torrent_copy" | "torrent_metadata"))
-        || (is_managed_seed(job) && control.stage == "torrent_attach")
+        || (is_managed_seed(job)
+            && matches!(
+                control.stage.as_str(),
+                "torrent_attach" | "torrent_seed_retire" | "torrent_seed_forget"
+            ))
 }
 impl crate::EngineHandle {
+    pub async fn sync_managed_seed_keep(&self, donor: JobId) -> Result<bool, crate::EngineError> {
+        self.roundtrip_bool(|reply| crate::owner::QueueCommand::SyncManagedSeedKeep {
+            donor,
+            reply,
+        })
+        .await
+    }
     pub async fn begin_managed_seed_retirement(
         &self,
         job: JobId,
@@ -345,5 +400,320 @@ impl crate::EngineHandle {
             },
         )
         .await
+    }
+}
+
+pub(crate) fn source_dependency(job: &Job) -> Option<JobId> {
+    let donor = donor(job)?;
+    if job
+        .params
+        .iter()
+        .any(|(key, value)| key == COPY_COMPLETE_PARAM && value == "1")
+    {
+        return None;
+    }
+    let failed = job
+        .params
+        .iter()
+        .any(|(key, value)| key == "*Torrent:SourceFailed" && value == "1");
+    let keep = job
+        .params
+        .iter()
+        .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
+    (!failed || keep).then_some(donor)
+}
+
+pub const DESCRIPTOR_PARAM: &str = "*Torrent:Descriptor";
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeDescriptorRef {
+    pub job: JobId,
+    pub queued_at_unix: i64,
+    pub request_token: String,
+    pub generation: String,
+    pub metadata: bool,
+    pub metadata_attempt: u32,
+    pub sha256: String,
+}
+impl NativeDescriptorRef {
+    pub fn prepare(job: &Job, metadata: bool, bytes: &[u8]) -> Result<Self, crate::EngineError> {
+        use sha2::{Digest, Sha256};
+        let origin = blob_origin(job, metadata)?;
+        Ok(Self {
+            job: job.id,
+            queued_at_unix: job.queued_at_unix,
+            request_token: managed_token(&job.params)?
+                .ok_or_else(|| {
+                    crate::EngineError::RequestConflict(
+                        "native descriptor has no request token".into(),
+                    )
+                })?
+                .into(),
+            generation: origin
+                .params
+                .iter()
+                .find(|(key, _)| key == "*URL:AdmissionGeneration")
+                .unwrap()
+                .1
+                .clone(),
+            metadata,
+            metadata_attempt: metadata_attempt(job),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        })
+    }
+    pub fn origin(&self, template: &Job) -> Result<Job, crate::EngineError> {
+        if self.job.0 == 0
+            || self.generation.is_empty()
+            || self.generation.len() > 256
+            || self.request_token.is_empty()
+            || self.request_token.len() > 128
+            || self.sha256.len() != 64
+            || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(crate::EngineError::RequestConflict(
+                "invalid native descriptor reference".into(),
+            ));
+        }
+        let mut origin = template.clone();
+        origin.id = self.job;
+        origin.queued_at_unix = self.queued_at_unix;
+        origin.kind = nzbd_types::JobKind::Torrent;
+        origin.files.clear();
+        origin.torrent = None;
+        origin.params = vec![
+            ("monarr-transfer".into(), self.request_token.clone()),
+            ("*URL:AdmissionGeneration".into(), self.generation.clone()),
+            (
+                "*URL".into(),
+                if self.metadata {
+                    format!("native-torrent-metadata-{}", self.metadata_attempt)
+                } else {
+                    "native-torrent-submission".into()
+                },
+            ),
+        ];
+        Ok(origin)
+    }
+    pub fn source_identity(&self, template: &Job) -> Result<String, crate::EngineError> {
+        nzbd_state::artifacts::url_source_identity(&self.origin(template)?)
+            .map_err(|error| crate::EngineError::Lifecycle(error.to_string()))
+    }
+}
+pub fn descriptor_reference(job: &Job) -> Option<NativeDescriptorRef> {
+    let raw = job
+        .params
+        .iter()
+        .find(|(key, _)| key == DESCRIPTOR_PARAM)?
+        .1
+        .as_str();
+    if raw.len() > 4096 {
+        return None;
+    }
+    let reference: NativeDescriptorRef = serde_json::from_str(raw).ok()?;
+    if job.torrent.as_ref()?.metadata_file
+        != std::path::PathBuf::from(format!(
+            "torrents/native-cache/admission-{}.torrent",
+            reference.job.0
+        ))
+    {
+        return None;
+    }
+    reference.origin(job).ok()?;
+    Some(reference)
+}
+impl crate::EngineHandle {
+    pub async fn native_torrent_descriptor(
+        &self,
+        job: &Job,
+    ) -> Result<Option<Vec<u8>>, crate::EngineError> {
+        use sha2::{Digest, Sha256};
+        let Some(reference) = descriptor_reference(job) else {
+            return Ok(None);
+        };
+        let origin = reference.origin(job)?;
+        let store = self.url_resolutions.clone();
+        tokio::task::spawn_blocking(move || {
+            let bytes = store
+                .source(&origin)?
+                .ok_or(nzbd_state::artifacts::Error::NotFound)?;
+            if format!("{:x}", Sha256::digest(&bytes)) != reference.sha256 {
+                return Err(nzbd_state::artifacts::Error::Conflict(
+                    "native descriptor identity changed".into(),
+                ));
+            }
+            Ok(Some(bytes))
+        })
+        .await
+        .map_err(|_| crate::EngineError::Closed)?
+        .map_err(|error| crate::EngineError::Lifecycle(error.to_string()))
+    }
+}
+
+impl crate::EngineHandle {
+    pub(crate) async fn reconcile_native_seed_retirements(&self) -> Result<(), crate::EngineError> {
+        let snapshot = self.snapshot();
+        if !snapshot.queue_authority {
+            return Ok(());
+        }
+        let cursor = *self.native_seed_recovery_cursor.lock().unwrap();
+        let mut ids = snapshot
+            .native_seed_retirements
+            .iter()
+            .filter(|(_, marker)| marker.phase == "detached")
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        ids.sort_by_key(|id| (id.0 <= cursor, id.0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for id in ids.into_iter().take(8) {
+            *self.native_seed_recovery_cursor.lock().unwrap() = id.0;
+            let engine = self.clone();
+            tasks.spawn(async move { engine.retire_native_seed_once(id).await });
+        }
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(crate::EngineError::Closed)) => return Err(crate::EngineError::Closed),
+                Ok(Err(error)) => tracing::warn!(%error,"native seed retirement remains pending"),
+                Err(error) => {
+                    tracing::warn!(%error,"native seed retirement worker did not complete")
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn retire_native_seed_once(&self, id: JobId) -> Result<(), crate::EngineError> {
+        let Some(job) = self.export_job(id).await? else {
+            return Ok(());
+        };
+        let Some(marker) = seed_retirement(&job).filter(|marker| marker.phase == "detached") else {
+            return Ok(());
+        };
+        if marker.keep_blocked_revision.is_some() {
+            self.roundtrip_bool(|reply| crate::owner::QueueCommand::RearmSeedKeepCleared {
+                job: id,
+                reply,
+            })
+            .await?;
+        }
+        if marker.storage_instance_id != self.artifacts().installation
+            || job.held()
+            || self.snapshot().native_seed_dependencies.contains(&id)
+        {
+            return Ok(());
+        }
+        let Some(record) = job.torrent.as_ref() else {
+            return Ok(());
+        };
+        let expected = record
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let inventory = self.artifacts();
+        let engine = self.clone();
+        let proof = marker.clone();
+        let result = crate::bounded_probe(self.hold_probes.clone(), id, move || {
+            inventory.retire_managed_torrent_seed(
+                id.0,
+                &proof.source,
+                &expected,
+                &proof.intent(),
+                &|| {
+                    let current = engine.snapshot();
+                    if current.queue_authority
+                        && !current.native_seed_dependencies.contains(&id)
+                        && current.native_seed_retirements.get(&id) == Some(&proof)
+                    {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "native seed retirement intent or source dependency changed",
+                        ))
+                    }
+                },
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(operation)) if operation.state == "succeeded" => {
+                self.complete_managed_seed_retirement(id, marker.identity)
+                    .await?;
+            }
+            Ok(Ok(operation)) => {
+                if operation.state == "cancelled"
+                    && operation.error.as_deref() == Some("per-download Keep on failure is enabled")
+                {
+                    self.roundtrip_bool(|reply| crate::owner::QueueCommand::NoteSeedKeepBlock {
+                        job: id,
+                        marker: Box::new(marker.clone()),
+                        operation: Some(operation.id.clone()),
+                        reply,
+                    })
+                    .await?;
+                    return Ok(());
+                }
+                let message = operation.error.unwrap_or_else(|| {
+                    format!(
+                        "seed retirement {}; Retry to authorize another attempt",
+                        operation.state
+                    )
+                });
+                let cause = if operation.state == "retry" {
+                    crate::io_hold_cause(&message)
+                } else {
+                    nzbd_types::HoldCause::Io
+                };
+                self.hold_job_until(
+                    id,
+                    cause,
+                    "torrent_seed_retire",
+                    &message,
+                    Some(operation.next_retry),
+                )
+                .await?;
+            }
+            Ok(Err(nzbd_state::artifacts::Error::Io(error)))
+                if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Ok(Err(nzbd_state::artifacts::Error::Io(error))) => {
+                let cause = if error.kind() == std::io::ErrorKind::WouldBlock {
+                    nzbd_types::HoldCause::StorageUnavailable
+                } else {
+                    crate::io_hold_cause(&error.to_string())
+                };
+                self.hold_job(id, cause, "torrent_seed_retire", &error.to_string())
+                    .await?;
+            }
+            Ok(Err(nzbd_state::artifacts::Error::Conflict(message)))
+                if message == "current Keep retains the managed seed source" =>
+            {
+                self.roundtrip_bool(|reply| crate::owner::QueueCommand::NoteSeedKeepBlock {
+                    job: id,
+                    marker: Box::new(marker.clone()),
+                    operation: None,
+                    reply,
+                })
+                .await?;
+            }
+            Ok(Err(error)) => {
+                self.hold_job(
+                    id,
+                    nzbd_types::HoldCause::IdentityConflict,
+                    "torrent_seed_retire",
+                    &error.to_string(),
+                )
+                .await?;
+            }
+            Err(message) => {
+                self.hold_job(
+                    id,
+                    nzbd_types::HoldCause::StorageUnavailable,
+                    "torrent_seed_retire",
+                    &message,
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 }

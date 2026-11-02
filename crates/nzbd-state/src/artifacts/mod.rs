@@ -3,7 +3,7 @@
 //! SQLite owns intent and policy; external sidecars own allocation identity.
 //! Nothing in a media payload is a marker or grants permission to remove it.
 mod cluster;
-pub use cluster::{ClusterArtifactCopy, ClusterCopyCleanup, remove_cluster_generation_copy};
+pub use cluster::{remove_cluster_generation_copy, ClusterArtifactCopy, ClusterCopyCleanup};
 pub(crate) mod fs;
 mod policy;
 mod publication;
@@ -15,17 +15,19 @@ pub use delivery::{Delivery, DeliveryFile, DeliveryFileOutcome, DeliveryRunnerSt
 pub use relocation::{RelocationResult, SelectedPublication};
 mod tasks;
 mod torrent;
+pub use torrent::TorrentSourceReader;
 mod torrent_seed;
+pub use torrent_seed::{TorrentSeedRetirementIntent, TorrentSeedRetirementReason};
 mod transforms;
 mod url_resolutions;
 mod worker_controls;
 pub use url_resolutions::{
-    UrlFileReservation, UrlResolutionFault, UrlResolutionRecord, UrlResolutionStore,
-    UrlStorageRetry, url_source_identity, url_storage_retry_deadline,
+    url_source_identity, url_storage_retry_deadline, UrlFileReservation, UrlResolutionFault,
+    UrlResolutionRecord, UrlResolutionStore, UrlStorageRetry,
 };
 mod workspace_lifecycle;
 pub use recovery::{Receipt, ReceiptFile, Recovery, RecoveryFile};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -36,8 +38,8 @@ use std::{
 };
 pub use transforms::{CustodyEvidence, Workspace};
 pub use worker_controls::{
-    WORKER_CONTROL_CONTEXT_PARAM, WorkerCompletionProof, WorkerControlCheckpoint,
-    WorkerControlContext, WorkerRetryAdoption,
+    WorkerCompletionProof, WorkerControlCheckpoint, WorkerControlContext, WorkerRetryAdoption,
+    WORKER_CONTROL_CONTEXT_PARAM,
 };
 pub use workspace_lifecycle::{
     AttemptUse, FinalizationProof, SourceGeneration, StagedCompletion, WorkspaceAssessment,
@@ -216,6 +218,7 @@ pub struct Operation {
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum DeleteRequest {
+    ManagedSeed(torrent_seed::ManagedSeedDeleteRequest),
     // Exact cancellation receipt and immutable owned selection binding keep
     // explicit byte authority separate from mutable Keep/revision changes.
     ClusterCancellation((String, u64, u64, bool, String, bool, String, String)),
@@ -226,6 +229,13 @@ enum DeleteRequest {
 impl DeleteRequest {
     fn fields(&self) -> (&str, u64, u64, bool, Option<&str>) {
         match self {
+            Self::ManagedSeed(request) => (
+                &request.artifact,
+                request.revision,
+                0,
+                false,
+                Some(&request.generation),
+            ),
             Self::ClusterCancellation((id, rev, undo, auto, generation, _, _, _)) => {
                 (id, *rev, *undo, *auto, Some(generation))
             }
@@ -1968,7 +1978,7 @@ impl Inventory {
         if op.kind != "delete" {
             return Err(Error::Conflict("not a deletion operation".into()));
         }
-        if op.id.starts_with("failed-delete-torrent-seed-")
+        if torrent_seed::is_seed_delete_key(&op.id)
             && authority.is_none()
             && !matches!(op.state.as_str(), "succeeded" | "cancelled" | "review")
         {
@@ -2031,6 +2041,9 @@ impl Inventory {
             false
         };
         let failure_guard = match &request {
+            DeleteRequest::ManagedSeed(request) => {
+                request.intent.reason == TorrentSeedRetirementReason::Failure
+            }
             DeleteRequest::ClusterCancellation(_) => false,
             DeleteRequest::Cluster((_, _, _, _, _, guard)) => *guard,
             _ => {
@@ -2294,7 +2307,7 @@ impl Inventory {
         let pending = {
             let db = self.db.lock().unwrap();
             let mut stmt = db.prepare(
-                "SELECT id FROM operations WHERE state IN ('queued','running','retry') AND id NOT LIKE 'failed-delete-torrent-seed-%' AND json_extract(data,'$.kind')='delete' AND json_extract(data,'$.not_before')<=unixepoch() AND json_extract(data,'$.next_retry')<=unixepoch() ORDER BY json_extract(data,'$.next_retry'),json_extract(data,'$.created_at') LIMIT 25",
+                "SELECT id FROM operations WHERE state IN ('queued','running','retry') AND id NOT LIKE 'failed-delete-torrent-seed-%' AND id NOT LIKE 'managed-delete-torrent-seed-%' AND json_extract(data,'$.kind')='delete' AND json_extract(data,'$.not_before')<=unixepoch() AND json_extract(data,'$.next_retry')<=unixepoch() ORDER BY json_extract(data,'$.next_retry'),json_extract(data,'$.created_at') LIMIT 25",
             )?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?

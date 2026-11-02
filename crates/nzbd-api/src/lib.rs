@@ -590,7 +590,11 @@ fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -
 }
 
 async fn get_status(State(st): State<ApiState>) -> Json<StatusDto> {
-    Json(status_dto(&st.engine.snapshot()))
+    let mut status = status_dto(&st.engine.snapshot());
+    if st.torrent.is_some() && st.engine.native_torrent_delivery_supported() {
+        status.capabilities.push("native-torrent-deliveries-v1");
+    }
+    Json(status)
 }
 
 async fn healthz() -> &'static str {

@@ -250,6 +250,13 @@ pub struct QueueSnapshot {
     pub queue_authority: bool,
     #[serde(skip)]
     pub pending_automatic_controls: std::collections::HashSet<JobId>,
+    #[serde(skip)]
+    pub native_seed_dependencies: std::collections::HashSet<JobId>,
+    #[serde(skip)]
+    pub native_descriptor_references: std::collections::HashSet<String>,
+    #[serde(skip)]
+    pub native_seed_retirements:
+        std::collections::HashMap<JobId, crate::torrent_acquisitions::ManagedSeedRetirement>,
     pub download_paused: bool,
     /// Daily/monthly quota exhausted (force-priority jobs still run).
     pub quota_reached: bool,

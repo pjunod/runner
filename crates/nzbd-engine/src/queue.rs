@@ -545,6 +545,7 @@ impl QueueState {
         id: JobId,
         commit: TorrentAdmissionCommit,
         submission_sha256: String,
+        descriptor: crate::torrent_acquisitions::NativeDescriptorRef,
         _instance: &str,
     ) -> Result<crate::torrent_acquisitions::ManagedTorrentAdmission, crate::EngineError> {
         use crate::torrent_acquisitions::{
@@ -604,6 +605,22 @@ impl QueueState {
             .ok_or_else(|| {
                 crate::EngineError::RequestConflict("native acquisition disappeared".into())
             })?;
+        if descriptor.job != id
+            || descriptor.queued_at_unix != original.queued_at_unix
+            || descriptor.generation
+                != original
+                    .params
+                    .iter()
+                    .find(|(key, _)| key == crate::torrent_acquisitions::ADMISSION_GENERATION_PARAM)
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default()
+            || descriptor.request_token != token
+            || descriptor.origin(&original).is_err()
+        {
+            return Err(crate::EngineError::RequestConflict(
+                "native descriptor reservation changed".into(),
+            ));
+        }
         let TorrentAdmissionCommit {
             name,
             category,
@@ -640,6 +657,25 @@ impl QueueState {
                 if gated {
                     record.control_intent = nzbd_types::TorrentControlIntent::Paused;
                 }
+                let mut seed_params = if gated {
+                    vec![
+                        (OWNED_SEED_PARAM.into(), "1".into()),
+                        (
+                            crate::torrent_acquisitions::SEED_GATE_PARAM.into(),
+                            id.0.to_string(),
+                        ),
+                    ]
+                } else {
+                    vec![(OWNED_SEED_PARAM.into(), "1".into())]
+                };
+                seed_params.push((
+                    crate::torrent_acquisitions::DESCRIPTOR_PARAM.into(),
+                    serde_json::to_string(&descriptor).map_err(|_| {
+                        crate::EngineError::RequestConflict(
+                            "invalid native descriptor reference".into(),
+                        )
+                    })?,
+                ));
                 self.jobs.push(Job {
                     id: donor_id,
                     kind: JobKind::Torrent,
@@ -652,17 +688,7 @@ impl QueueState {
                     category: category.clone(),
                     priority: original.priority,
                     dupe: DupeInfo::default(),
-                    params: if gated {
-                        vec![
-                            (OWNED_SEED_PARAM.into(), "1".into()),
-                            (
-                                crate::torrent_acquisitions::SEED_GATE_PARAM.into(),
-                                id.0.to_string(),
-                            ),
-                        ]
-                    } else {
-                        vec![(OWNED_SEED_PARAM.into(), "1".into())]
-                    },
+                    params: seed_params,
                     files: Vec::new(),
                     totals: nzbd_types::JobTotals {
                         size: record.total_bytes,

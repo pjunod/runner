@@ -579,6 +579,7 @@ impl Engine {
             url_history: cfg.history.clone(),
             url_outbox_external: cfg.persist_guard.is_some(),
             owner_persist_guard: cfg.persist_guard.clone(),
+            native_seed_recovery_cursor: Default::default(),
             cmd_tx: engine_tx,
             shared,
             events,
@@ -691,6 +692,7 @@ pub struct EngineHandle {
     url_history: Option<Arc<nzbd_state::history::HistoryDb>>,
     url_outbox_external: bool,
     owner_persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    native_seed_recovery_cursor: Arc<std::sync::Mutex<u32>>,
     cmd_tx: mpsc::Sender<EngineMsg>,
     shared: SharedSnapshot,
     events: broadcast::Sender<Event>,
@@ -823,6 +825,7 @@ impl EngineHandle {
         opts: AddOpts,
         record: nzbd_types::TorrentRecord,
         submission_sha256: String,
+        descriptor: torrent_acquisitions::NativeDescriptorRef,
     ) -> Result<torrent_acquisitions::ManagedTorrentAdmission, EngineError> {
         validate_external_params(&opts.params)?;
         torrent_acquisitions::managed_token(&opts.params)?;
@@ -838,6 +841,7 @@ impl EngineHandle {
                 record,
             }),
             submission_sha256,
+            descriptor,
             reply: tx,
         })
         .await?;

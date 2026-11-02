@@ -4,6 +4,85 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 
+/// FD-anchored read-only snapshot used by the native metainfo piece verifier.
+/// Selected identities are frozen before verification and reused by copying.
+pub struct TorrentSourceReader<'a> {
+    root: &'a File,
+    seen: std::sync::Mutex<std::collections::HashMap<String, Identity>>,
+}
+impl TorrentSourceReader<'_> {
+    pub fn read_exact_at(
+        &self,
+        path: &Path,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> std::io::Result<()> {
+        let mut run = || -> Result<()> {
+            let name = path
+                .to_str()
+                .filter(|name| !name.is_empty() && name.len() <= 4096)
+                .ok_or_else(|| Error::Conflict("invalid verification source path".into()))?;
+            if !path
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err(Error::Conflict("unsafe verification source path".into()));
+            }
+            let mut input = fs::open_relative(self.root, name)?;
+            let observed = fs::identity_for_file(&input)?;
+            if !input.metadata()?.is_file() {
+                return Err(Error::Conflict(
+                    "verification source is not a regular file".into(),
+                ));
+            }
+            {
+                let mut seen = self.seen.lock().unwrap();
+                if seen.get(name).is_some_and(|expected| expected != &observed) {
+                    return Err(Error::Conflict(
+                        "torrent source changed before piece verification".into(),
+                    ));
+                }
+                seen.entry(name.into()).or_insert_with(|| observed.clone());
+            }
+            input.seek(std::io::SeekFrom::Start(offset))?;
+            input.read_exact(buffer)?;
+            if fs::identity_for_file(&input)? != observed {
+                return Err(Error::Conflict(
+                    "torrent source changed during piece verification".into(),
+                ));
+            }
+            Ok(())
+        };
+        run().map_err(|error| match error {
+            Error::Io(error) => error,
+            other => std::io::Error::new(std::io::ErrorKind::InvalidData, other.to_string()),
+        })
+    }
+}
+type SourceVerifier<'a> = Option<&'a dyn Fn(&TorrentSourceReader<'_>) -> Result<()>>;
+fn verify_copy_files(
+    source: &File,
+    files: &[CopyFile],
+    verifier: SourceVerifier<'_>,
+) -> Result<()> {
+    if let Some(verify) = verifier {
+        let reader = TorrentSourceReader {
+            root: source,
+            seen: std::sync::Mutex::new(
+                files
+                    .iter()
+                    .map(|file| (file.path.clone(), file.source.clone()))
+                    .collect(),
+            ),
+        };
+        verify(&reader)?;
+        for entry in files {
+            checked_source(source, entry)?;
+        }
+    }
+    Ok(())
+}
+
 const MAX_PLAN: usize = 16 * 1024 * 1024;
 const MAX_ORPHANS: usize = 16;
 const MAX_PROGRESS_ROW: usize = 16 * 1024;
@@ -625,6 +704,60 @@ impl Inventory {
         keep_on_failure: bool,
         checkpoint: &dyn Fn() -> std::io::Result<()>,
     ) -> Result<Artifact> {
+        self.copy_torrent_acquisition_with_verifier(
+            job,
+            donor,
+            info_hash,
+            source_root,
+            selected,
+            destination_root,
+            destination,
+            keep_on_failure,
+            None,
+            checkpoint,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_torrent_acquisition_verified(
+        self: &Arc<Self>,
+        job: u32,
+        donor: u32,
+        info_hash: &str,
+        source_root: &Path,
+        selected: &[(PathBuf, u64)],
+        destination_root: &Path,
+        destination: &Path,
+        keep_on_failure: bool,
+        verifier: &dyn Fn(&TorrentSourceReader<'_>) -> Result<()>,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> Result<Artifact> {
+        self.copy_torrent_acquisition_with_verifier(
+            job,
+            donor,
+            info_hash,
+            source_root,
+            selected,
+            destination_root,
+            destination,
+            keep_on_failure,
+            Some(verifier),
+            checkpoint,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn copy_torrent_acquisition_with_verifier(
+        self: &Arc<Self>,
+        job: u32,
+        donor: u32,
+        info_hash: &str,
+        source_root: &Path,
+        selected: &[(PathBuf, u64)],
+        destination_root: &Path,
+        destination: &Path,
+        keep_on_failure: bool,
+        verifier: SourceVerifier<'_>,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> Result<Artifact> {
         checkpoint()?;
         safe_selection(selected)?;
         fs::absolute(source_root)?;
@@ -734,6 +867,7 @@ impl Inventory {
             .ok_or(Error::NotFound)?;
         let target = self.verify(&artifact)?;
         let root = self.verify_root(&artifact)?;
+        let replaying = existing.is_some();
         let mut op = if let Some(op) = existing {
             op
         } else {
@@ -760,6 +894,7 @@ impl Inventory {
                     digest: None,
                 });
             }
+            verify_copy_files(&source, &files, verifier)?;
             let mut directories: Vec<_> = directories
                 .into_iter()
                 .map(|path| CopyDirectory {
@@ -806,6 +941,9 @@ impl Inventory {
             op
         };
         let mut plan = load_plan(self, &op)?;
+        if replaying {
+            verify_copy_files(&source, &plan.files, verifier)?;
+        }
         if plan.generation != artifact.generation
             || op.artifact != artifact.id
             || !plan.source_identity.same_object(&source_identity)
@@ -2012,11 +2150,10 @@ mod tests {
                 status.request = serde_json::to_string(&details).unwrap();
                 save_operation(&f.inventory.db.lock().unwrap(), &status).unwrap();
                 for base in [60, 120, 300] {
-                    assert!(
-                        f.inventory
-                            .cleanup_torrent_copy_stages(2, &|| Ok(()))
-                            .is_err()
-                    );
+                    assert!(f
+                        .inventory
+                        .cleanup_torrent_copy_stages(2, &|| Ok(()))
+                        .is_err());
                     let status = f.inventory.operation("torrent-stage-status-job-2").unwrap();
                     assert!((base..=base + base / 10 + 1).contains(&(status.next_retry - now())));
                     let details: StageCleanupStatus =
@@ -2190,14 +2327,13 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert!(
-            f.inventory
-                .operation("torrent-copy-job-2")
-                .unwrap()
-                .error
-                .unwrap()
-                .contains("compaction requires review")
-        );
+        assert!(f
+            .inventory
+            .operation("torrent-copy-job-2")
+            .unwrap()
+            .error
+            .unwrap()
+            .contains("compaction requires review"));
         let plan: TorrentCopy =
             serde_json::from_str(&f.inventory.operation("torrent-copy-job-3").unwrap().request)
                 .unwrap();
@@ -2439,11 +2575,10 @@ mod tests {
                     artifact: source.id.clone(),
                     generation: source.generation.clone()
                 }));
-                assert!(
-                    f.inventory
-                        .request_delete(&source.id, source.revision, "during-copy", 0)
-                        .is_err()
-                );
+                assert!(f
+                    .inventory
+                    .request_delete(&source.id, source.revision, "during-copy", 0)
+                    .is_err());
                 let current = f.inventory.get(&source.id).unwrap();
                 assert_eq!(current.state, "completed");
                 assert_eq!(current.revision, source.revision);
@@ -2498,21 +2633,20 @@ mod tests {
             }
             Ok(())
         };
-        assert!(
-            f.inventory
-                .copy_torrent_acquisition(
-                    2,
-                    1,
-                    HASH,
-                    &f.donor,
-                    &f.selected,
-                    &f.root,
-                    &f.target,
-                    false,
-                    &checkpoint
-                )
-                .is_err()
-        );
+        assert!(f
+            .inventory
+            .copy_torrent_acquisition(
+                2,
+                1,
+                HASH,
+                &f.donor,
+                &f.selected,
+                &f.root,
+                &f.target,
+                false,
+                &checkpoint
+            )
+            .is_err());
         assert!(interrupted.get());
         assert!(!f.target.join(&f.selected[0].0).exists());
         f.run().unwrap();
@@ -2524,11 +2658,10 @@ mod tests {
         let copied = f.run().unwrap();
         let before:i64=f.inventory.db.lock().unwrap().query_row("SELECT length(data) FROM torrent_copy_manifests WHERE operation_id='torrent-copy-job-2'",[],|row|row.get(0)).unwrap();
         assert!(before > 16 * 1024);
-        assert!(
-            f.inventory
-                .compact_torrent_copy_for_delivery("missing")
-                .is_err()
-        );
+        assert!(f
+            .inventory
+            .compact_torrent_copy_for_delivery("missing")
+            .is_err());
         let receipt = f
             .inventory
             .create_delivery_with_outcome_and_keep(
@@ -2541,11 +2674,10 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert!(
-            f.inventory
-                .compact_torrent_copy_for_delivery(&receipt.delivery_id)
-                .unwrap()
-        );
+        assert!(f
+            .inventory
+            .compact_torrent_copy_for_delivery(&receipt.delivery_id)
+            .unwrap());
         let compact = f.inventory.operation("torrent-copy-job-2").unwrap().request;
         assert!(
             compact.len() < 4096,
@@ -2754,11 +2886,10 @@ mod tests {
             let stage = f.root.join(&f.plan().files[0].stage.as_ref().unwrap().name);
             delete_child(&f, false);
             FAULT.with(|fault| *fault.borrow_mut() = Some(("stage_unlinked", 0)));
-            assert!(
-                f.inventory
-                    .cleanup_torrent_copy_stages(2, &|| Ok(()))
-                    .is_err()
-            );
+            assert!(f
+                .inventory
+                .cleanup_torrent_copy_stages(2, &|| Ok(()))
+                .is_err());
             assert!(!stage.exists());
             if replaced {
                 std::fs::write(&stage, b"new unrelated file").unwrap();
@@ -2808,11 +2939,10 @@ mod tests {
         f.inventory
             .finish(2, &f.target, &f.root, "retained")
             .unwrap();
-        assert!(
-            f.inventory
-                .cleanup_torrent_copy_stages(2, &|| Ok(()))
-                .is_err()
-        );
+        assert!(f
+            .inventory
+            .cleanup_torrent_copy_stages(2, &|| Ok(()))
+            .is_err());
         assert!(unknown.exists());
         delete_child(&f, false);
         let result = f

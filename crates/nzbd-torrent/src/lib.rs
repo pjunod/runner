@@ -1054,6 +1054,19 @@ pub struct MetainfoDescriptor {
     pub total_bytes: u64,
 }
 
+/// Validate current selected payload bytes with the backend's existing piece
+/// verifier, using a read-only caller snapshot and bounded cancellation points.
+pub fn verify_selected_payload(
+    metainfo: &[u8],
+    selected: &[PathBuf],
+    read: &(dyn Fn(&Path, u64, &mut [u8]) -> std::io::Result<()> + Send + Sync),
+    checkpoint: &(dyn Fn() -> std::io::Result<()> + Send + Sync),
+) -> Result<(), TorrentError> {
+    validate_metainfo_admission(metainfo, false, false)?;
+    librqbit::verify_selected_piece_ranges(metainfo, selected, read, checkpoint)
+        .map_err(engine_error)
+}
+
 /// Validate and project durable descriptor facts without creating storage.
 pub fn inspect_metainfo(
     bytes: &[u8],
@@ -1176,6 +1189,13 @@ impl TorrentRegistry {
         Ok(identity)
     }
 
+    pub fn has_session_identity(&self, identity: &EngineIdentity) -> bool {
+        self.session
+            .inner
+            .get(TorrentIdOrHash::Id(identity.id))
+            .is_some_and(|handle| handle.info_hash().as_string() == identity.info_hash_v1)
+    }
+
     /// Recover a lost add response only for the exact durable payload root.
     /// Hash equality alone never binds another seed's backend handle.
     pub fn recover_committed(
@@ -1185,6 +1205,9 @@ impl TorrentRegistry {
     ) -> Result<Option<EngineIdentity>, TorrentError> {
         let id = TorrentIdOrHash::try_from(hash).map_err(engine_error)?;
         let Some(handle) = self.session.inner.get(id) else {
+            if let Some(stale) = self.by_hash.remove(hash) {
+                self.id_to_hash.remove(&stale.id());
+            }
             return Ok(None);
         };
         let details = librqbit::Api::new(self.session.inner.clone(), None)
@@ -2532,6 +2555,45 @@ mod preflight_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_piece_verification_checks_neighbor_boundary_and_changed_payload() {
+        use sha1::{Digest, Sha1};
+        let payload = b"abcdefgh";
+        let mut meta=b"d4:infod5:filesld6:lengthi3e4:pathl5:a.bineed6:lengthi5e4:pathl5:b.bineee4:name4:root12:piece lengthi4e6:pieces40:".to_vec();
+        meta.extend_from_slice(&Sha1::digest(&payload[..4]));
+        meta.extend_from_slice(&Sha1::digest(&payload[4..]));
+        meta.extend_from_slice(b"ee");
+        let changed = std::sync::atomic::AtomicBool::new(false);
+        let reads = std::sync::Mutex::new(Vec::new());
+        let read = |path: &Path, offset: u64, out: &mut [u8]| {
+            reads.lock().unwrap().push(path.to_path_buf());
+            let bytes = if path.ends_with("a.bin") {
+                &payload[..3]
+            } else {
+                &payload[3..]
+            };
+            out.copy_from_slice(&bytes[offset as usize..offset as usize + out.len()]);
+            if path.ends_with("b.bin") && changed.load(std::sync::atomic::Ordering::SeqCst) {
+                out[0] ^= 1;
+            }
+            Ok(())
+        };
+        verify_selected_payload(&meta, &["a.bin".into()], &read, &|| Ok(())).unwrap();
+        assert!(reads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.ends_with("b.bin")));
+        changed.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(verify_selected_payload(&meta, &["a.bin".into()], &read, &|| Ok(())).is_err());
+        assert!(
+            verify_selected_payload(&meta, &["a.bin".into()], &read, &|| Err(
+                std::io::ErrorKind::Interrupted.into()
+            ))
+            .is_err()
+        );
+    }
 
     #[test]
     fn public_adapter_boundary_cannot_import_or_own_job_ids() {

@@ -189,7 +189,13 @@ impl<'a> FileOps<'a> {
 
         let mut piece_remaining_bytes = piece_length as usize;
 
-        for (file_idx, fi) in self.file_infos.iter().enumerate() {
+        let first = self.file_infos.partition_point(|file| {
+            file.offset_in_torrent.saturating_add(file.len) <= absolute_offset
+        });
+        if let Some(file) = self.file_infos.get(first) {
+            absolute_offset -= file.offset_in_torrent;
+        }
+        for (file_idx, fi) in self.file_infos.iter().enumerate().skip(first) {
             let file_len = fi.len;
             if absolute_offset > file_len {
                 absolute_offset -= file_len;
@@ -350,4 +356,102 @@ impl<'a> FileOps<'a> {
 
         Ok(())
     }
+}
+
+/// Reuse the engine's piece verifier against a caller-owned read-only snapshot.
+/// Only pieces intersecting selected files are read, including boundary bytes
+/// from neighboring files. This does not create storage or a session handle.
+pub fn verify_selected_piece_ranges(
+    metainfo: &[u8],
+    selected: &[std::path::PathBuf],
+    read: &(dyn Fn(&std::path::Path, u64, &mut [u8]) -> std::io::Result<()> + Send + Sync),
+    checkpoint: &(dyn Fn() -> std::io::Result<()> + Send + Sync),
+) -> anyhow::Result<()> {
+    let parsed = librqbit_core::torrent_metainfo::torrent_from_bytes_ext::<ByteBufOwned>(metainfo)?;
+    anyhow::ensure!(
+        parsed.meta.info.piece_length > 0,
+        "invalid zero piece length"
+    );
+    let metadata = crate::torrent_state::TorrentMetadata::new(
+        parsed.meta.info,
+        bytes::Bytes::copy_from_slice(metainfo),
+        bytes::Bytes::copy_from_slice(parsed.info_bytes.as_ref()),
+    )?;
+    struct ReadOnly<'a> {
+        files: &'a FileInfos,
+        read: &'a (dyn Fn(&std::path::Path, u64, &mut [u8]) -> std::io::Result<()> + Send + Sync),
+        checkpoint: &'a (dyn Fn() -> std::io::Result<()> + Send + Sync),
+    }
+    impl TorrentStorage for ReadOnly<'_> {
+        fn init(
+            &mut self,
+            _: &crate::ManagedTorrentShared,
+            _: &crate::TorrentMetadata,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("read-only verification snapshot")
+        }
+        fn pread_exact(&self, file: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+            (self.checkpoint)()?;
+            let info = self.files.get(file).context("invalid verification file")?;
+            (self.read)(&info.relative_filename, offset, buf)?;
+            Ok(())
+        }
+        fn pwrite_all(&self, _: usize, _: u64, _: &[u8]) -> anyhow::Result<()> {
+            anyhow::bail!("read-only verification snapshot")
+        }
+        fn remove_file(&self, _: usize, _: &std::path::Path) -> anyhow::Result<()> {
+            anyhow::bail!("read-only verification snapshot")
+        }
+        fn remove_directory_if_empty(&self, _: &std::path::Path) -> anyhow::Result<()> {
+            anyhow::bail!("read-only verification snapshot")
+        }
+        fn ensure_file_length(&self, _: usize, _: u64) -> anyhow::Result<()> {
+            anyhow::bail!("read-only verification snapshot")
+        }
+        fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+            anyhow::bail!("read-only verification snapshot")
+        }
+    }
+    let wanted = selected.iter().collect::<std::collections::HashSet<_>>();
+    let mut found = std::collections::HashSet::new();
+    let mut ranges = Vec::new();
+    for file in metadata.file_infos.iter() {
+        if wanted.contains(&file.relative_filename) {
+            found.insert(&file.relative_filename);
+            ranges.push(file.piece_range.clone());
+        }
+    }
+    anyhow::ensure!(
+        !wanted.is_empty() && found.len() == wanted.len(),
+        "selected file is absent from metainfo"
+    );
+    ranges.sort_by_key(|range| range.start);
+    let mut merged: Vec<std::ops::Range<u32>> = Vec::new();
+    for range in ranges {
+        if let Some(last) = merged.last_mut().filter(|last| range.start <= last.end) {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    let storage = ReadOnly {
+        files: &metadata.file_infos,
+        read,
+        checkpoint,
+    };
+    let verifier = FileOps::new(
+        &metadata.info,
+        &storage,
+        &metadata.file_infos,
+        &metadata.lengths,
+    );
+    for piece in merged.into_iter().flatten() {
+        checkpoint()?;
+        anyhow::ensure!(
+            verifier.check_piece(metadata.lengths.try_validate_piece_index(piece)?)?,
+            "torrent source piece verification failed"
+        );
+    }
+    checkpoint()?;
+    Ok(())
 }

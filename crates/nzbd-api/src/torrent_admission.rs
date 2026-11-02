@@ -37,6 +37,7 @@ pub struct TorrentAdmissionService {
     source_fetch_limits: TorrentSourceFetchLimits,
     stopped: Arc<std::sync::atomic::AtomicBool>,
     seed_reconcile: Arc<tokio::sync::Mutex<()>>,
+    forgotten: Arc<tokio::sync::Mutex<std::collections::HashSet<JobId>>>,
     metadata_tasks: Arc<tokio::sync::Mutex<HashMap<JobId, tokio::task::JoinHandle<()>>>>,
     acquisition_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     #[cfg(test)]
@@ -112,6 +113,7 @@ impl TorrentAdmissionService {
             source_fetch_limits: TorrentSourceFetchLimits::default(),
             stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             seed_reconcile: Default::default(),
+            forgotten: Default::default(),
             metadata_tasks: Default::default(),
             acquisition_task: Default::default(),
             #[cfg(test)]
@@ -467,6 +469,9 @@ impl TorrentAdmissionService {
         else {
             return;
         };
+        if !matches!(stage.as_str(), "torrent_metadata" | "torrent_source") {
+            return;
+        }
         let donor = nzbd_engine::torrent_acquisitions::donor(&row);
         let keep = row
             .params
@@ -688,13 +693,7 @@ impl TorrentAdmissionService {
                 );
                 continue;
             }
-            let descriptor_path = self.state_dir.join(&request.metadata_file);
-            let bytes =
-                std::fs::read(&descriptor_path).map_err(|error| nzbd_state::StateError::Io {
-                    op: "read torrent descriptor",
-                    path: descriptor_path,
-                    source: error,
-                })?;
+            let bytes = self.read_seed_descriptor(job).await?;
             let descriptor = inspect_metainfo(&bytes, self.proxy_enabled, self.dht_enabled)?;
             let content_path = payload_root.join(&descriptor.name);
             let files = descriptor
@@ -839,12 +838,23 @@ impl TorrentAdmissionService {
         let associations = self.associations.clone();
         let upload_limit_bps = self.upload_limit_bps;
         let engine = self.engine.clone();
+        let seed_reconcile = self.seed_reconcile.clone();
+        let forgotten = self.forgotten.clone();
         let acquisition_service = self.clone();
         *self.acquisition_task.lock().unwrap() = Some(tokio::spawn(async move {
             acquisition_service.run_acquisitions().await;
         }));
         Ok(tokio::spawn(async move {
-            run_backend_executor(adapter, registry, associations, upload_limit_bps, engine).await;
+            run_backend_executor(
+                adapter,
+                registry,
+                associations,
+                upload_limit_bps,
+                engine,
+                seed_reconcile,
+                forgotten,
+            )
+            .await;
         }))
     }
 
@@ -871,19 +881,28 @@ impl TorrentAdmissionService {
         let Some(job) = self.engine.export_job(job).await? else {
             return Ok(None);
         };
-        let Some(torrent) = job.torrent else {
+        if job.torrent.is_none() {
             return Ok(None);
-        };
-        if torrent.metadata_file.is_absolute()
-            || torrent
+        }
+        Ok(Some(self.read_seed_descriptor(&job).await?))
+    }
+    async fn read_seed_descriptor(&self, job: &nzbd_types::Job) -> Result<Vec<u8>, AdmissionError> {
+        if let Some(bytes) = self.engine.native_torrent_descriptor(job).await? {
+            return Ok(bytes);
+        }
+        let record = job.torrent.as_ref().ok_or(AdmissionError::MissingPending)?;
+        if record.metadata_file.is_absolute()
+            || record
                 .metadata_file
                 .components()
                 .any(|component| !matches!(component, std::path::Component::Normal(_)))
         {
             return Err(AdmissionError::Encoding);
         }
-        let bytes = std::fs::read(self.state_dir.join(torrent.metadata_file))?;
-        Ok(Some(bytes))
+        let path = self.state_dir.join(&record.metadata_file);
+        Ok(tokio::task::spawn_blocking(move || std::fs::read(path))
+            .await
+            .map_err(|_| AdmissionError::Encoding)??)
     }
 
     async fn finish(
@@ -982,14 +1001,35 @@ impl TorrentAdmissionService {
                     .await?
             }
         };
-        // Admission-owned immutable descriptor: a duplicate hash cannot
-        // overwrite an existing donor's trackers or restart metadata.
-        let relative = PathBuf::from(format!("torrents/sources/admission-{}.torrent", job.0));
-        let destination = self.state_dir.join(&relative);
-        let persisted = bytes.clone();
-        tokio::task::spawn_blocking(move || persist_descriptor(&destination, &persisted))
-            .await
-            .map_err(|_| AdmissionError::Encoding)??;
+        let native_descriptor = if let Some(origin) = reserved.as_ref() {
+            let metadata = source != TorrentSource::Metainfo;
+            let bytes = self
+                .engine
+                .cache_native_torrent_blob(origin, metadata, bytes.clone())
+                .await?;
+            Some(
+                nzbd_engine::torrent_acquisitions::NativeDescriptorRef::prepare(
+                    origin, metadata, &bytes,
+                )?,
+            )
+        } else {
+            None
+        };
+        let relative = if managed {
+            PathBuf::from(format!("torrents/native-cache/admission-{}.torrent", job.0))
+        } else {
+            PathBuf::from(format!(
+                "torrents/sources/{}.torrent",
+                descriptor.info_hash_v1
+            ))
+        };
+        if !managed {
+            let destination = self.state_dir.join(&relative);
+            let persisted = bytes.clone();
+            tokio::task::spawn_blocking(move || persist_descriptor(&destination, &persisted))
+                .await
+                .map_err(|_| AdmissionError::Encoding)??;
+        }
         let record = TorrentRecord {
             info_hash_v1: descriptor.info_hash_v1.clone(),
             source,
@@ -1033,15 +1073,10 @@ impl TorrentAdmissionService {
                     opts,
                     record,
                     fingerprint,
+                    native_descriptor.ok_or(AdmissionError::MissingPending)?,
                 )
                 .await?;
             if !accepted.seed_created {
-                let unused = self.state_dir.join(&record_metadata_path(job));
-                tokio::task::spawn_blocking(move || {
-                    let _ = std::fs::remove_file(unused);
-                })
-                .await
-                .map_err(|_| AdmissionError::Encoding)?;
                 if let Some(row) = reserved.as_ref() {
                     self.engine.retire_native_torrent_blobs(row).await?;
                 }
@@ -1051,19 +1086,6 @@ impl TorrentAdmissionService {
                     info_hash: descriptor.info_hash_v1,
                 });
             }
-            let donor = self
-                .engine
-                .export_job(accepted.donor_id)
-                .await?
-                .ok_or(AdmissionError::MissingPending)?;
-            let root = donor
-                .torrent
-                .as_ref()
-                .ok_or(AdmissionError::MissingPending)?
-                .payload_root
-                .clone();
-            self.ensure_owned_seed_root(accepted.donor_id, &root)
-                .await?;
             (accepted.id, accepted.donor_id, accepted.created)
         } else {
             match self
@@ -1073,12 +1095,6 @@ impl TorrentAdmissionService {
                 .ok_or(AdmissionError::MissingPending)?
             {
                 Err(existing) => {
-                    let unused = self.state_dir.join(record_metadata_path(job));
-                    tokio::task::spawn_blocking(move || {
-                        let _ = std::fs::remove_file(unused);
-                    })
-                    .await
-                    .map_err(|_| AdmissionError::Encoding)?;
                     return Ok(AdmissionResult {
                         id: existing,
                         created: false,
@@ -1095,7 +1111,8 @@ impl TorrentAdmissionService {
             if !managed {
                 return Err(error);
             }
-            tracing::warn!(job=backend_job.0,%error,"durable native seed awaits backend association reconciliation");
+            self.handle_seed_association_failure(backend_job, &error, "torrent_attach")
+                .await;
         }
         Ok(AdmissionResult {
             id,
@@ -1106,8 +1123,20 @@ impl TorrentAdmissionService {
 
     async fn attach_seed(&self, id: JobId) -> Result<(), AdmissionError> {
         let _serial = self.seed_reconcile.lock().await;
-        if self.associations.lock().await.contains_key(&id) {
+        if self.forgotten.lock().await.contains(&id) {
             return Ok(());
+        }
+        let associated = self.associations.lock().await.get(&id).cloned();
+        if let Some(association) = associated {
+            if self
+                .registry
+                .lock()
+                .await
+                .has_session_identity(&association.identity)
+            {
+                return Ok(());
+            }
+            self.associations.lock().await.remove(&id);
         }
         let job = self
             .engine
@@ -1148,10 +1177,7 @@ impl TorrentAdmissionService {
                     .await?;
             }
         }
-        let path = self.state_dir.join(&record.metadata_file);
-        let bytes = tokio::task::spawn_blocking(move || std::fs::read(path))
-            .await
-            .map_err(|_| AdmissionError::Encoding)??;
+        let bytes = self.read_seed_descriptor(&job).await?;
         let descriptor = inspect_metainfo(&bytes, self.proxy_enabled, self.dht_enabled)?;
         if descriptor.info_hash_v1 != record.info_hash_v1 {
             return Err(AdmissionError::Encoding);
@@ -1159,6 +1185,23 @@ impl TorrentAdmissionService {
         #[cfg(test)]
         if let Some(hook) = &self.before_managed_add {
             hook()?;
+        }
+        let current = self
+            .engine
+            .export_job(id)
+            .await?
+            .ok_or(AdmissionError::MissingPending)?;
+        let exact = current.torrent.as_ref().is_some_and(|now| {
+            now.info_hash_v1 == record.info_hash_v1
+                && now.payload_root == record.payload_root
+                && now.metadata_file == record.metadata_file
+                && (now.removal_intent.is_none()
+                    || (retiring
+                        && nzbd_engine::torrent_acquisitions::seed_retirement(&current)
+                            .is_some_and(|marker| marker.phase == "requested")))
+        });
+        if !exact {
+            return Err(AdmissionError::MissingPending);
         }
         let mut registry = self.registry.lock().await;
         let identity = if let Some(identity) =
@@ -1195,10 +1238,143 @@ impl TorrentAdmissionService {
         Ok(())
     }
 
+    async fn handle_seed_association_failure(
+        &self,
+        id: JobId,
+        error: &AdmissionError,
+        stage: &str,
+    ) {
+        let Ok(Some(job)) = self.engine.export_job(id).await else {
+            return;
+        };
+        if !nzbd_engine::torrent_acquisitions::is_managed_seed(&job) {
+            return;
+        }
+        let mut cause = match error {
+            AdmissionError::Io(error) => nzbd_engine::io_hold_cause(&error.to_string()),
+            AdmissionError::Engine(nzbd_engine::EngineError::Lifecycle(message))
+                if nzbd_engine::io_hold_cause(message).policy().automatic() =>
+            {
+                nzbd_engine::io_hold_cause(message)
+            }
+            _ => nzbd_types::HoldCause::IdentityConflict,
+        };
+        if matches!(
+            error,
+            AdmissionError::Torrent(nzbd_torrent::TorrentError::DuplicateEngineIdentity)
+        ) {
+            if let Some(record) = job.torrent.as_ref() {
+                let older = self
+                    .associations
+                    .lock()
+                    .await
+                    .iter()
+                    .find(|(other, association)| {
+                        **other != id && association.identity.info_hash_v1 == record.info_hash_v1
+                    })
+                    .map(|(other, _)| *other);
+                if let Some(older) = older {
+                    if let Ok(Some(old)) = self.engine.export_job(older).await {
+                        if nzbd_engine::torrent_acquisitions::is_managed_seed(&old)
+                            && !old.held()
+                            && (nzbd_engine::torrent_acquisitions::seed_retirement(&old).is_some()
+                                || old
+                                    .torrent
+                                    .as_ref()
+                                    .is_some_and(|record| record.phase == TorrentPhase::Failed))
+                        {
+                            cause = nzbd_types::HoldCause::StorageUnavailable;
+                        }
+                    }
+                }
+            }
+        }
+        if self
+            .engine
+            .hold_job(
+                id,
+                cause.clone(),
+                stage,
+                "Native seed association or retirement requires recovery; payload source retained",
+            )
+            .await
+            .unwrap_or(false)
+            && !cause.policy().automatic()
+        {
+            for child in &self.engine.snapshot().jobs {
+                if child.seed_donor_job_id == Some(id) && !child.pp_done {
+                    if let Ok(Some(row)) = self.engine.export_job(child.id).await {
+                        if !row.params.iter().any(|(key, value)| {
+                            key == nzbd_engine::torrent_acquisitions::COPY_COMPLETE_PARAM
+                                && value == "1"
+                        }) {
+                            let _ = self.engine.hold_job(row.id,cause.clone(),"torrent_source","The seed source requires review; retry the seed donor before this acquisition").await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn advance_seed_retirement(&self, seed: &nzbd_types::Job) -> Result<(), AdmissionError> {
+        if !nzbd_engine::torrent_acquisitions::is_managed_seed(seed) {
+            return Ok(());
+        }
+        let record = seed
+            .torrent
+            .as_ref()
+            .ok_or(AdmissionError::MissingPending)?;
+        if record.phase == TorrentPhase::Failed
+            && !record.files.iter().any(|file| {
+                file.selected && file.length > 0 && file.downloaded_bytes >= file.length
+            })
+        {
+            for child in &self.engine.snapshot().jobs {
+                if child.seed_donor_job_id == Some(seed.id)
+                    && !child.pp_done
+                    && child.status != nzbd_types::JobStatus::Failed
+                {
+                    self.engine.fail_native_torrent(child.id,Some(seed.id),"torrent_source".into(),"Torrent seed failed before any selected file was completely hash-verified; start a fresh Grab".into(),false).await?;
+                }
+            }
+        }
+        if record.phase == TorrentPhase::Failed
+            && !record.files.iter().any(|file| {
+                file.selected && file.length > 0 && file.downloaded_bytes >= file.length
+            })
+        {
+            self.engine.hold_job(seed.id,nzbd_types::HoldCause::PostFailure,"torrent_attach","Failed seed source has no current verified-file proof; retained for review or explicit removal").await?;
+            return Ok(());
+        }
+        if nzbd_engine::torrent_acquisitions::seed_retirement(seed).is_none() {
+            self.engine.begin_managed_seed_retirement(seed.id).await?;
+        }
+        let Some(current) = self.engine.export_job(seed.id).await? else {
+            return Ok(());
+        };
+        if nzbd_engine::torrent_acquisitions::seed_retirement(&current)
+            .is_some_and(|marker| marker.phase == "requested")
+        {
+            // Restart/regrant restores the exact existing source paused, then
+            // the existing ordered removal command supplies a real forget ACK.
+            self.attach_seed(seed.id).await?;
+        }
+        Ok(())
+    }
+
     async fn run_acquisitions(self) {
         let mut cursor = 0u32;
         while !self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
             let snapshot = self.engine.snapshot();
+            self.forgotten.lock().await.retain(|id| {
+                snapshot.jobs.iter().any(|job| job.id == *id)
+                    && !snapshot
+                        .native_seed_retirements
+                        .get(id)
+                        .is_some_and(|marker| {
+                            matches!(marker.phase.as_str(), "detached" | "deleted")
+                        })
+            });
             for summary in &snapshot.jobs {
                 if summary.torrent_role == Some("acquisition")
                     && summary.status == nzbd_types::JobStatus::Failed
@@ -1218,13 +1394,58 @@ impl TorrentAdmissionService {
                         .is_none_or(|control| control.lifecycle != "held")
                 {
                     self.start_managed_metadata(summary.id).await;
-                } else if summary.torrent_role == Some("seed")
-                    && !matches!(
-                        summary.status,
+                } else if summary.torrent_role == Some("seed") {
+                    let Ok(Some(seed)) = self.engine.export_job(summary.id).await else {
+                        continue;
+                    };
+                    if !nzbd_engine::torrent_acquisitions::is_managed_seed(&seed) {
+                        continue;
+                    }
+                    if let Some(control) =
+                        seed.control().filter(|control| control.lifecycle == "held")
+                    {
+                        if matches!(
+                            control.stage.as_str(),
+                            "torrent_attach" | "torrent_seed_forget"
+                        ) && !control.manual_pause
+                            && control.hold_cause().policy().automatic()
+                            && control
+                                .next_retry_at_unix
+                                .is_some_and(|at| at <= unix_now())
+                        {
+                            let _ = self
+                                .engine
+                                .release_hold(
+                                    seed.id,
+                                    control.revision,
+                                    nzbd_engine::RetryBy::Recovery,
+                                )
+                                .await;
+                        }
+                        continue;
+                    }
+                    if !matches!(
+                        seed.status,
                         nzbd_types::JobStatus::Failed | nzbd_types::JobStatus::Deleted
-                    )
-                {
-                    let _ = self.attach_seed(summary.id).await;
+                    ) && nzbd_engine::torrent_acquisitions::seed_retirement(&seed).is_none()
+                    {
+                        if let Err(error) = self.attach_seed(summary.id).await {
+                            self.handle_seed_association_failure(
+                                summary.id,
+                                &error,
+                                "torrent_attach",
+                            )
+                            .await;
+                        }
+                    }
+                    if let Err(error) = self.advance_seed_retirement(&seed).await {
+                        self.handle_seed_association_failure(
+                            seed.id,
+                            &error,
+                            "torrent_seed_retire",
+                        )
+                        .await;
+                    }
                 }
             }
             let mut rows = snapshot
@@ -1254,10 +1475,15 @@ impl TorrentAdmissionService {
                     continue;
                 };
                 let Some(record) = donor.torrent.as_ref().filter(|record| {
-                    record.ready_at_unix.is_some()
-                        && record.downloaded_bytes >= record.selected_bytes
-                        && record.selected_bytes > 0
-                        && record.phase != TorrentPhase::Failed
+                    record.selected_bytes > 0
+                        && ((record.ready_at_unix.is_some()
+                            && record.downloaded_bytes >= record.selected_bytes)
+                            || (record.phase == TorrentPhase::Failed
+                                && record.files.iter().any(|file| {
+                                    file.selected
+                                        && file.length > 0
+                                        && file.downloaded_bytes >= file.length
+                                })))
                 }) else {
                     continue;
                 };
@@ -1269,11 +1495,35 @@ impl TorrentAdmissionService {
                 {
                     continue;
                 }
+                if record.phase == TorrentPhase::Failed
+                    && !nzbd_engine::torrent_acquisitions::seed_retirement(&donor)
+                        .is_some_and(|marker| marker.phase == "detached")
+                {
+                    continue;
+                }
+                let metainfo = match self.read_seed_descriptor(&donor).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.engine
+                            .hold_torrent_acquisition(
+                                job.id,
+                                nzbd_types::HoldCause::IdentityConflict,
+                                error.to_string(),
+                            )
+                            .await
+                            .ok();
+                        continue;
+                    }
+                };
                 let source_root = record.payload_root.clone();
                 let selected = record
                     .files
                     .iter()
-                    .filter(|file| file.selected)
+                    .filter(|file| {
+                        file.selected
+                            && (record.phase != TorrentPhase::Failed
+                                || (file.length > 0 && file.downloaded_bytes >= file.length))
+                    })
                     .map(|file| (file.path.clone(), file.length))
                     .collect::<Vec<_>>();
                 let hash = record.info_hash_v1.clone();
@@ -1288,7 +1538,29 @@ impl TorrentAdmissionService {
                 let id = job.id;
                 let stopped = self.stopped.clone();
                 let copied = tokio::task::spawn_blocking(move || {
-                    inventory.copy_torrent_acquisition(
+                    let selected_paths = selected
+                        .iter()
+                        .map(|(path, _)| path.clone())
+                        .collect::<Vec<_>>();
+                    let live = || {
+                        if !stopped.load(std::sync::atomic::Ordering::SeqCst)
+                            && engine.snapshot().jobs.iter().any(|row| {
+                                row.id == id
+                                    && row.status == nzbd_types::JobStatus::Downloading
+                                    && row.control.as_ref().is_none_or(|control| {
+                                        control.lifecycle != "held" && !control.manual_pause
+                                    })
+                            })
+                        {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "torrent acquisition control changed",
+                            ))
+                        }
+                    };
+                    inventory.copy_torrent_acquisition_verified(
                         id.0,
                         donor_id.0,
                         &hash,
@@ -1297,25 +1569,21 @@ impl TorrentAdmissionService {
                         &target_root,
                         &target,
                         keep,
-                        &|| {
-                            if !stopped.load(std::sync::atomic::Ordering::SeqCst)
-                                && engine.snapshot().jobs.iter().any(|row| {
-                                    row.id == id
-                                        && row.torrent_role == Some("acquisition")
-                                        && row.status == nzbd_types::JobStatus::Downloading
-                                        && row.control.as_ref().is_none_or(|control| {
-                                            control.lifecycle != "held" && !control.manual_pause
-                                        })
-                                })
-                            {
-                                Ok(())
-                            } else {
-                                Err(std::io::Error::new(
-                                    std::io::ErrorKind::Interrupted,
-                                    "torrent acquisition control changed",
+                        &|reader| {
+                            nzbd_torrent::verify_selected_payload(
+                                &metainfo,
+                                &selected_paths,
+                                &|path, offset, buffer| reader.read_exact_at(path, offset, buffer),
+                                &live,
+                            )
+                            .map_err(|error| {
+                                nzbd_state::artifacts::Error::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    error.to_string(),
                                 ))
-                            }
+                            })
                         },
+                        &live,
                     )
                 })
                 .await;
@@ -1387,6 +1655,9 @@ impl TorrentAdmissionService {
         .map_err(|error| {
             AdmissionError::Engine(nzbd_engine::EngineError::Lifecycle(error.to_string()))
         })?;
+        if !self.engine.sync_managed_seed_keep(job).await? {
+            return Err(AdmissionError::MissingPending);
+        }
         Ok(())
     }
 
@@ -1452,6 +1723,8 @@ async fn run_backend_executor(
     associations: Arc<tokio::sync::Mutex<HashMap<JobId, Association>>>,
     upload_limit_bps: Option<u64>,
     engine: EngineHandle,
+    seed_reconcile: Arc<tokio::sync::Mutex<()>>,
+    forgotten: Arc<tokio::sync::Mutex<std::collections::HashSet<JobId>>>,
 ) {
     enum Wake {
         Command(Option<BackendCommand>),
@@ -1518,7 +1791,8 @@ async fn run_backend_executor(
                 files,
                 allowed_roots,
             } => {
-                apply_remove(
+                let _serial = seed_reconcile.lock().await;
+                let fact = apply_remove(
                     job,
                     delete_data,
                     content_path,
@@ -1527,7 +1801,22 @@ async fn run_backend_executor(
                     &registry,
                     &associations,
                 )
-                .await
+                .await;
+                if matches!(
+                    &fact,
+                    Some(BackendFact::Removed {
+                        outcome: RemovalOutcome::DataDeleted | RemovalOutcome::DataKept,
+                        ..
+                    })
+                ) {
+                    forgotten.lock().await.insert(job);
+                }
+                if let Some(fact) = fact {
+                    if adapter.structural(fact).await.is_err() {
+                        break;
+                    }
+                }
+                continue;
             }
             // Transfer limits are session-global; pause, resume, and removal
             // retain per-job ownership through the association table.
@@ -1548,6 +1837,17 @@ async fn run_backend_executor(
             BackendCommand::SetPriority { .. } => None,
         };
         if let Some(fact) = fact {
+            if let BackendFact::Failed { job, error } = &fact {
+                if error.as_str() == "torrent control target is unavailable" {
+                    if let Ok(Some(row)) = engine.export_job(*job).await {
+                        if nzbd_engine::torrent_acquisitions::is_managed_seed(&row) {
+                            associations.lock().await.remove(job);
+                            let _=engine.hold_job(*job,nzbd_types::HoldCause::StorageUnavailable,"torrent_attach","Backend handle was lost; reattach and verify the retained source").await;
+                            continue;
+                        }
+                    }
+                }
+            }
             if adapter.structural(fact).await.is_err() {
                 break;
             }
@@ -1885,10 +2185,6 @@ pub fn router(service: TorrentAdmissionService) -> Router {
             axum::routing::post(post_job).layer(axum::extract::DefaultBodyLimit::max(body_limit)),
         )
         .with_state(service)
-}
-
-fn record_metadata_path(job: JobId) -> PathBuf {
-    PathBuf::from(format!("torrents/sources/admission-{}.torrent", job.0))
 }
 
 fn native_submission(job: &nzbd_types::Job) -> Result<String, AdmissionError> {
@@ -2402,9 +2698,10 @@ mod tests {
         assert_eq!(child.torrent_role(), Some("acquisition"));
         let donor_id = child.seed_donor_job_id().unwrap();
         let before = engine.export_job(donor_id).await.unwrap().unwrap();
-        let record = before.torrent.as_ref().unwrap();
-        let descriptor = service.state_dir.join(&record.metadata_file);
-        assert_eq!(std::fs::read(&descriptor).unwrap(), original);
+        assert_eq!(
+            service.export_metainfo(donor_id).await.unwrap().unwrap(),
+            original
+        );
         let mut changed = b"d7:comment3:new".to_vec();
         changed.extend_from_slice(&original[1..]);
         let second = service
@@ -2427,10 +2724,16 @@ mod tests {
         assert_eq!(before.control(), after.control());
         assert_eq!(before.params, after.params);
         assert_eq!(before.torrent, after.torrent);
-        assert_eq!(std::fs::read(&descriptor).unwrap(), original);
+        assert_eq!(
+            service.export_metainfo(donor_id).await.unwrap().unwrap(),
+            original
+        );
         assert!(!service
             .state_dir
-            .join(record_metadata_path(second.id))
+            .join(format!(
+                "torrents/native-cache/admission-{}.torrent",
+                second.id.0
+            ))
             .exists());
         let mut changed_defaults = service.clone();
         changed_defaults.default_seed_policy.stop_on_complete = true;
@@ -2453,6 +2756,31 @@ mod tests {
                 nzbd_engine::EngineError::RequestConflict(_)
             ))
         ));
+        service.shutdown().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn managed_descriptor_survives_child_blob_retirement_until_seed_finalization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, engine) = service(&tmp).await;
+        let bytes = metainfo(b"pinned.mkv");
+        let accepted = service
+            .admit_raw(bytes.clone(), managed_options("descriptor-pinned"))
+            .await
+            .unwrap();
+        let child = engine.export_job(accepted.id).await.unwrap().unwrap();
+        let donor = child.seed_donor_job_id().unwrap();
+        engine.retire_native_torrent_blobs(&child).await.unwrap();
+        assert_eq!(
+            service.export_metainfo(donor).await.unwrap().unwrap(),
+            bytes
+        );
+        assert!(engine.delete_job(child.id, false).await.unwrap());
+        assert_eq!(
+            service.export_metainfo(donor).await.unwrap().unwrap(),
+            bytes
+        );
         service.shutdown().await;
         engine.shutdown().await;
     }
@@ -2766,6 +3094,8 @@ mod tests {
             associations,
             None,
             engine.clone(),
+            Default::default(),
+            Default::default(),
         ));
 
         owner

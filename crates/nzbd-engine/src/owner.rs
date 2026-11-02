@@ -111,6 +111,20 @@ pub(crate) enum QueueCommand {
         commit: Box<crate::queue::TorrentAdmissionCommit>,
         reply: oneshot::Sender<Result<Option<Result<JobId, JobId>>, crate::EngineError>>,
     },
+    NoteSeedKeepBlock {
+        job: JobId,
+        marker: Box<crate::torrent_acquisitions::ManagedSeedRetirement>,
+        operation: Option<String>,
+        reply: oneshot::Sender<bool>,
+    },
+    RearmSeedKeepCleared {
+        job: JobId,
+        reply: oneshot::Sender<bool>,
+    },
+    SyncManagedSeedKeep {
+        donor: JobId,
+        reply: oneshot::Sender<bool>,
+    },
     BeginManagedSeedRetirement {
         job: JobId,
         reply: oneshot::Sender<bool>,
@@ -154,6 +168,7 @@ pub(crate) enum QueueCommand {
         job: JobId,
         commit: Box<crate::queue::TorrentAdmissionCommit>,
         submission_sha256: String,
+        descriptor: crate::torrent_acquisitions::NativeDescriptorRef,
         reply: oneshot::Sender<
             Result<crate::torrent_acquisitions::ManagedTorrentAdmission, crate::EngineError>,
         >,
@@ -1560,6 +1575,20 @@ impl Owner {
                 }
                 let _ = reply.send(Ok(result));
             }
+            QueueCommand::NoteSeedKeepBlock {
+                job,
+                marker,
+                operation,
+                reply,
+            } => {
+                let _ = reply.send(self.note_seed_keep_block(job, &marker, operation.as_deref()));
+            }
+            QueueCommand::RearmSeedKeepCleared { job, reply } => {
+                let _ = reply.send(self.rearm_seed_keep_cleared(job));
+            }
+            QueueCommand::SyncManagedSeedKeep { donor, reply } => {
+                let _ = reply.send(self.sync_managed_seed_keep(donor));
+            }
             QueueCommand::BeginManagedSeedRetirement { job, reply } => {
                 let _ = reply.send(self.begin_managed_seed_retirement(job));
             }
@@ -1576,6 +1605,7 @@ impl Owner {
                     && self.persist
                     && retirement.as_ref().is_some_and(|retirement| {
                         retirement.identity == identity
+                            && retirement.storage_instance_id == self.artifacts.installation
                             && retirement.phase == "detached"
                             && self
                                 .artifacts
@@ -1750,6 +1780,7 @@ impl Owner {
                 job,
                 commit,
                 submission_sha256,
+                descriptor,
                 reply,
             } => {
                 if self.persistence_fenced || !self.persist {
@@ -1765,6 +1796,7 @@ impl Owner {
                     job,
                     *commit,
                     submission_sha256,
+                    descriptor,
                     &self.artifacts.installation,
                 );
                 if result.is_ok() {
@@ -1907,7 +1939,27 @@ impl Owner {
                 );
                 row.files = files;
                 row.totals.success_size = source.summary().1;
-                row.status = JobStatus::Completed;
+                let donor_failed = self
+                    .state
+                    .job(donor)
+                    .and_then(|row| row.torrent.as_ref())
+                    .is_some_and(|record| record.phase == TorrentPhase::Failed);
+                let row = self.state.job_mut(job).unwrap();
+                row.status = if donor_failed {
+                    JobStatus::Failed
+                } else {
+                    JobStatus::Completed
+                };
+                if donor_failed {
+                    row.totals.failed_size =
+                        row.totals.size.saturating_sub(row.totals.success_size);
+                    set_owner_param(
+                        &mut row.params,
+                        "Failure:Stage",
+                        Some("torrent_download".into()),
+                    );
+                    set_owner_param(&mut row.params,"Failure:Reason",Some("Torrent failed; hash-verified files were preserved for post-processing".into()));
+                }
                 self.dirty = true;
                 if !self.save_snapshot() {
                     *self.state.job_mut(job).unwrap() = before.unwrap();
@@ -1917,14 +1969,20 @@ impl Owner {
                     return;
                 }
                 self.file_sizes.extend(file_sizes);
+                let _ = self.sync_managed_seed_keep(donor);
                 self.publish_now();
                 self.bump_epoch();
                 let row = self.state.job(job).unwrap();
                 self.emit(Event::JobFinished {
                     job,
-                    status: JobStatus::Completed,
+                    status: row.status,
                     name: row.name.clone(),
-                    health: 1000,
+                    health: if row.totals.size == 0 {
+                        0
+                    } else {
+                        ((row.totals.success_size as u128 * 1000) / row.totals.size as u128)
+                            .min(1000) as u16
+                    },
                 });
                 let _ = reply.send(true);
             }
@@ -2586,6 +2644,14 @@ impl Owner {
                     let _ = reply.send(false);
                     return;
                 }
+                if self
+                    .state
+                    .job(job)
+                    .is_some_and(|row| crate::torrent_acquisitions::seed_retirement(row).is_some())
+                {
+                    let _ = reply.send(false);
+                    return;
+                }
                 if self.retiring_writers.contains_key(&job) {
                     let _ = reply.send(false);
                     return;
@@ -2700,18 +2766,12 @@ impl Owner {
                 reply,
             } => {
                 let before = self.state.job(job).cloned();
-                if delete_files
-                    && self.state.jobs.iter().any(|row| {
-                        crate::torrent_acquisitions::donor(row) == Some(job)
-                            && !row
-                                .params
-                                .iter()
-                                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
-                            && !row.params.iter().any(|(key, value)| {
-                                key == crate::torrent_acquisitions::COPY_COMPLETE_PARAM
-                                    && value == "1"
-                            })
-                    })
+                if self.state.job(job).is_some_and(|row| row.torrent.is_some())
+                    && self
+                        .state
+                        .jobs
+                        .iter()
+                        .any(|row| crate::torrent_acquisitions::source_dependency(row) == Some(job))
                 {
                     let _ = reply.send(false);
                     return;
@@ -2721,6 +2781,8 @@ impl Owner {
                     torrent.removal_intent = Some(TorrentRemovalIntent {
                         delete_data: delete_files,
                     });
+                    torrent.removal_outcome = None;
+                    torrent.removal_confirmed_at_unix = None;
                     Some(BackendCommand::Remove {
                         job,
                         delete_data: delete_files,
@@ -2898,7 +2960,22 @@ impl Owner {
                         }
                     }
                 }
-                let ok = if changed && inventory_ok {
+                let donor = before
+                    .as_ref()
+                    .and_then(crate::torrent_acquisitions::donor)
+                    .or_else(|| {
+                        before
+                            .as_ref()
+                            .filter(|job| crate::torrent_acquisitions::is_managed_seed(job))
+                            .map(|job| job.id)
+                    });
+                let shared_ok = donor.is_none_or(|donor| self.sync_managed_seed_keep(donor));
+                if !shared_ok {
+                    if let Some(before) = before.clone() {
+                        *self.state.job_mut(job).unwrap() = before;
+                    }
+                }
+                let ok = if changed && inventory_ok && shared_ok {
                     if self.save_snapshot() {
                         self.dirty = false;
                         self.bump_epoch();
@@ -2913,11 +2990,19 @@ impl Owner {
                         if inventory_updated {
                             let _ = self.artifacts.set_keep_on_failure(job.0, prior_keep);
                         }
+                        if let Some(donor) = donor {
+                            let _ = self.sync_managed_seed_keep(donor);
+                        }
                         false
                     }
                 } else {
                     false
                 };
+                if ok && !keep {
+                    if let Some(donor) = donor {
+                        let _ = self.rearm_seed_keep_cleared(donor);
+                    }
+                }
                 let _ = reply.send(ok);
             }
             QueueCommand::SetCategory {
@@ -2941,6 +3026,14 @@ impl Owner {
                     .ratio_limit
                     .is_some_and(|v| !v.is_finite() || v <= 0.0)
                     || policy.time_limit_secs == Some(0)
+                {
+                    let _ = reply.send(false);
+                    return;
+                }
+                if self
+                    .state
+                    .job(job)
+                    .is_some_and(|row| crate::torrent_acquisitions::seed_retirement(row).is_some())
                 {
                     let _ = reply.send(false);
                     return;
@@ -5081,7 +5174,15 @@ impl Owner {
             previous_status: prior_held
                 .and_then(|c| c.previous_status)
                 .or(Some(j.status)),
-            manual_pause: prior_held.map_or(j.status == JobStatus::Paused, |c| c.manual_pause),
+            manual_pause: prior_held.map_or(
+                j.status == JobStatus::Paused
+                    && !(matches!(stage, "torrent_seed_retire" | "torrent_seed_forget")
+                        && crate::torrent_acquisitions::is_managed_seed(j)
+                        && j.torrent.as_ref().is_some_and(|torrent| {
+                            torrent.stop_reason != Some(nzbd_types::TorrentStopReason::Manual)
+                        })),
+                |c| c.manual_pause,
+            ),
             retry_attempt: if timed {
                 attempts_made.saturating_add(1)
             } else {
@@ -5105,6 +5206,21 @@ impl Owner {
             );
         }
         j.set_control(&control);
+        if stage == "torrent_seed_retire" {
+            if let Some(mut marker) =
+                crate::torrent_acquisitions::seed_retirement(j).filter(|marker| {
+                    marker.keep_blocked_revision.is_some()
+                        && marker.keep_blocked_control_revision.is_none()
+                })
+            {
+                marker.keep_blocked_control_revision = Some(control.revision.clone());
+                set_owner_param(
+                    &mut j.params,
+                    crate::torrent_acquisitions::SEED_RETIREMENT_PARAM,
+                    Some(serde_json::to_string(&marker).unwrap()),
+                );
+            }
+        }
         j.status = JobStatus::Paused;
         for f in &mut j.files {
             for s in &mut f.segments {
@@ -5258,6 +5374,18 @@ impl Owner {
                 JobStatus::Queued
             };
             j.set_control(&control);
+            if by == RetryBy::Operator && control.stage == "torrent_seed_retire" {
+                if let Some(mut marker) = crate::torrent_acquisitions::seed_retirement(j) {
+                    marker.retry_revision = control.revision.clone();
+                    marker.keep_blocked_revision = None;
+                    marker.keep_blocked_control_revision = None;
+                    set_owner_param(
+                        &mut j.params,
+                        crate::torrent_acquisitions::SEED_RETIREMENT_PARAM,
+                        Some(serde_json::to_string(&marker).unwrap()),
+                    );
+                }
+            }
         }
         self.dirty = true;
         let committed = if by == RetryBy::Recovery {
@@ -6092,6 +6220,161 @@ impl Owner {
         freed
     }
 
+    fn note_seed_keep_block(
+        &mut self,
+        id: JobId,
+        expected: &crate::torrent_acquisitions::ManagedSeedRetirement,
+        operation: Option<&str>,
+    ) -> bool {
+        use crate::torrent_acquisitions::*;
+        if self.persistence_fenced || !self.persist {
+            return false;
+        }
+        let Some(before) = self.state.job(id).cloned() else {
+            return false;
+        };
+        let Some(mut marker) = seed_retirement(&before)
+            .filter(|marker| marker == expected && marker.phase == "detached")
+        else {
+            return false;
+        };
+        let Ok(source) = self.artifacts.get(&marker.source.artifact) else {
+            return false;
+        };
+        if source.generation != marker.source.generation
+            || source.job != Some(id.0)
+            || !source.owned
+        {
+            return false;
+        }
+        let blocked_revision = if let Some(operation) = operation {
+            let Ok(op) = self.artifacts.operation(operation) else {
+                return false;
+            };
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&op.request) else {
+                return false;
+            };
+            if op.state != "cancelled"
+                || op.error.as_deref() != Some("per-download Keep on failure is enabled")
+                || op.artifact != source.id
+                || request["generation"].as_str() != Some(source.generation.as_str())
+                || request["intent"]["identity"].as_str() != Some(marker.identity.as_str())
+            {
+                return false;
+            }
+            let Some(revision) = request["revision"].as_u64() else {
+                return false;
+            };
+            revision
+        } else {
+            if !(source.keep
+                || (marker.reason == nzbd_state::artifacts::TorrentSeedRetirementReason::Failure
+                    && source.keep_on_failure))
+            {
+                return false;
+            }
+            source.revision
+        };
+        marker.keep_blocked_revision = Some(blocked_revision);
+        marker.keep_blocked_control_revision = before
+            .control()
+            .filter(|control| control.lifecycle == "held" && control.stage == "torrent_seed_retire")
+            .map(|control| control.revision);
+        set_owner_param(
+            &mut self.state.job_mut(id).unwrap().params,
+            SEED_RETIREMENT_PARAM,
+            Some(serde_json::to_string(&marker).unwrap()),
+        );
+        if marker.keep_blocked_control_revision.is_some() {
+            let committed = self.save_snapshot();
+            if !committed {
+                *self.state.job_mut(id).unwrap() = before;
+            } else {
+                self.publish_now();
+            }
+            return committed;
+        }
+        self.hold_job(
+            id,
+            nzbd_types::HoldCause::Io,
+            "torrent_seed_retire",
+            "Current Keep retains this seed source; clearing Keep will requeue eligible cleanup",
+        )
+    }
+    fn rearm_seed_keep_cleared(&mut self, id: JobId) -> bool {
+        use crate::torrent_acquisitions::*;
+        let Some(row) = self.state.job(id).cloned() else {
+            return false;
+        };
+        let Some(marker) = seed_retirement(&row).filter(|marker| marker.phase == "detached") else {
+            return false;
+        };
+        let Some(blocked) = marker.keep_blocked_revision else {
+            return false;
+        };
+        let Some(control) = row.control().filter(|control| {
+            control.lifecycle == "held"
+                && control.stage == "torrent_seed_retire"
+                && !control.manual_pause
+                && Some(&control.revision) == marker.keep_blocked_control_revision.as_ref()
+        }) else {
+            return false;
+        };
+        if self
+            .state
+            .jobs
+            .iter()
+            .any(|child| source_dependency(child) == Some(id))
+        {
+            return false;
+        }
+        let Ok(source) = self.artifacts.get(&marker.source.artifact) else {
+            return false;
+        };
+        if source.generation != marker.source.generation
+            || source.revision <= blocked
+            || source.keep
+            || (marker.reason == nzbd_state::artifacts::TorrentSeedRetirementReason::Failure
+                && source.keep_on_failure)
+        {
+            return false;
+        }
+        let guard =
+            crate::hold_release::HoldReleaseGuard::prepare_queue_owner(&row, Some(&source), None);
+        self.retry_hold_proven(id, &control.revision, RetryBy::Operator, false, &guard)
+            .is_ok()
+    }
+
+    fn sync_managed_seed_keep(&self, donor: JobId) -> bool {
+        let Some(seed) = self
+            .state
+            .job(donor)
+            .filter(|row| crate::torrent_acquisitions::is_managed_seed(row))
+        else {
+            return true;
+        };
+        let desired = seed
+            .params
+            .iter()
+            .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1")
+            || self.state.jobs.iter().any(|row| {
+                crate::torrent_acquisitions::source_dependency(row) == Some(donor)
+                    && row
+                        .params
+                        .iter()
+                        .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1")
+            });
+        match self.artifacts.for_job(donor.0) {
+            Ok(Some(source)) if source.owned && !source.terminal() => self
+                .artifacts
+                .set_keep_on_failure(donor.0, desired)
+                .unwrap_or(false),
+            Ok(Some(source)) if source.terminal() => !desired,
+            Ok(_) => true,
+            Err(_) => false,
+        }
+    }
+
     fn begin_managed_seed_retirement(&mut self, id: JobId) -> bool {
         use crate::torrent_acquisitions::*;
         if self.persistence_fenced || !self.persist {
@@ -6105,8 +6388,27 @@ impl Owner {
         else {
             return false;
         };
-        if seed_retirement(&before).is_some() {
-            return true;
+        if let Some(marker) = seed_retirement(&before) {
+            if marker.phase != "requested" || before.held() {
+                return true;
+            }
+            let record = before.torrent.as_ref().unwrap();
+            let command = BackendCommand::Remove {
+                job: id,
+                delete_data: false,
+                content_path: record.content_path.clone(),
+                files: record.files.clone(),
+                allowed_roots: self.torrent_payload_roots.clone(),
+            };
+            if !self.hold_job(
+                id,
+                nzbd_types::HoldCause::StorageUnavailable,
+                "torrent_seed_forget",
+                "Waiting for backend stop and forget acknowledgment",
+            ) {
+                return false;
+            }
+            return self.enqueue_backend_command(command);
         }
         let torrent = before.torrent.as_ref().unwrap();
         if before.held()
@@ -6133,18 +6435,17 @@ impl Owner {
         {
             return false;
         }
-        let identity = format!(
-            "{:x}",
-            Sha256::digest(
-                format!(
-                    "{}:{}:{}:{}",
-                    self.artifacts.installation, id.0, source.id, source.generation
-                )
-                .as_bytes()
-            )
-        );
-        let marker = ManagedSeedRetirement {
-            identity,
+        let mut marker = ManagedSeedRetirement {
+            identity: String::new(),
+            storage_instance_id: self.artifacts.installation.clone(),
+            reason: if torrent.phase == TorrentPhase::Failed {
+                nzbd_state::artifacts::TorrentSeedRetirementReason::Failure
+            } else {
+                nzbd_state::artifacts::TorrentSeedRetirementReason::SuccessfulPolicy
+            },
+            retry_revision: "0".into(),
+            keep_blocked_revision: None,
+            keep_blocked_control_revision: None,
             source: nzbd_state::artifacts::SourceGeneration {
                 artifact: source.id,
                 generation: source.generation,
@@ -6152,6 +6453,10 @@ impl Owner {
             payload_root: source.path,
             phase: "requested".into(),
         };
+        let Some(identity) = marker.expected_identity(id) else {
+            return false;
+        };
+        marker.identity = identity;
         let row = self.state.job_mut(id).unwrap();
         set_owner_param(
             &mut row.params,
@@ -6160,19 +6465,28 @@ impl Owner {
         );
         row.torrent.as_mut().unwrap().removal_intent =
             Some(TorrentRemovalIntent { delete_data: false });
-        if !self.persist_then_command(BackendCommand::Remove {
+        row.torrent.as_mut().unwrap().removal_outcome = None;
+        row.torrent.as_mut().unwrap().removal_confirmed_at_unix = None;
+        let command = BackendCommand::Remove {
             job: id,
             delete_data: false,
             content_path: torrent.content_path.clone(),
             files: torrent.files.clone(),
             allowed_roots: self.torrent_payload_roots.clone(),
-        }) {
+        };
+        if !self.hold_job(
+            id,
+            nzbd_types::HoldCause::StorageUnavailable,
+            "torrent_seed_forget",
+            "Waiting for backend stop and forget acknowledgment",
+        ) {
             *self.state.job_mut(id).unwrap() = before;
             return false;
         }
+        let queued = self.enqueue_backend_command(command);
         self.publish_now();
         self.bump_epoch();
-        true
+        queued
     }
 
     fn fail_native_torrent(
@@ -6387,7 +6701,8 @@ impl Owner {
         if !self.save_snapshot() {
             *self.state.job_mut(id).unwrap() = child;
             if let Some(before) = donor_before {
-                *self.state.job_mut(before.id).unwrap() = before;
+                let donor_id = before.id;
+                *self.state.job_mut(donor_id).unwrap() = before;
             }
             return Some(false);
         }
@@ -6424,13 +6739,39 @@ impl Owner {
                 else {
                     return false;
                 };
-                if self.url_resolutions.retire_job(&origin).is_err() {
+                let identity = nzbd_state::artifacts::url_source_identity(&origin).ok();
+                let pinned = identity.as_ref().is_some_and(|identity| {
+                    self.state
+                        .jobs
+                        .iter()
+                        .filter_map(crate::torrent_acquisitions::descriptor_reference)
+                        .any(|reference| {
+                            reference
+                                .source_identity(&self.state.jobs[idx])
+                                .ok()
+                                .as_ref()
+                                == Some(identity)
+                        })
+                });
+                if !pinned && self.url_resolutions.cancel(&origin).is_err() {
                     return false;
                 }
             }
             self.state
                 .pending_admissions
                 .retain(|pending| pending.job_id != job_id);
+        }
+        if let Some(reference) =
+            crate::torrent_acquisitions::descriptor_reference(&self.state.jobs[idx])
+        {
+            // Only the acknowledged backend removal finalizer reaches this
+            // branch for a seed. A pending/new child cannot reuse removing seeds.
+            let Ok(origin) = reference.origin(&self.state.jobs[idx]) else {
+                return false;
+            };
+            if self.url_resolutions.cancel(&origin).is_err() {
+                return false;
+            }
         }
         let mut stopping = self.retiring_writers.remove(&job_id).unwrap_or_default();
         self.allocated_jobs.remove(&job_id);
@@ -7052,6 +7393,22 @@ impl Owner {
 
     fn fold_backend_structural(&mut self) {
         while let Ok(fact) = self.backend.try_structural() {
+            let fact_job = match &fact {
+                BackendFact::MetadataReady { job, .. }
+                | BackendFact::Ready { job, .. }
+                | BackendFact::Stopped { job, .. }
+                | BackendFact::Resumed { job }
+                | BackendFact::Removed { job, .. }
+                | BackendFact::Failed { job, .. } => *job,
+            };
+            if self
+                .state
+                .job(fact_job)
+                .and_then(crate::torrent_acquisitions::seed_retirement)
+                .is_some_and(|marker| matches!(marker.phase.as_str(), "detached" | "deleted"))
+            {
+                continue;
+            }
             match &fact {
                 BackendFact::Resumed { job } => {
                     self.backend_started.insert(*job);
@@ -7089,6 +7446,23 @@ impl Owner {
                                         .filter(|marker| marker.phase == "requested")
                                 {
                                     marker.phase = "detached".into();
+                                    if let Some(mut control) = row.control().filter(|control| {
+                                        control.lifecycle == "held"
+                                            && control.stage == "torrent_seed_forget"
+                                            && !control.manual_pause
+                                    }) {
+                                        if let Some(next) = control
+                                            .revision
+                                            .parse::<u64>()
+                                            .ok()
+                                            .and_then(|value| value.checked_add(1))
+                                        {
+                                            control.revision = next.to_string();
+                                            control.lifecycle = "running".into();
+                                            control.next_retry_at_unix = None;
+                                            row.set_control(&control);
+                                        }
+                                    }
                                     set_owner_param(
                                         &mut row.params,
                                         crate::torrent_acquisitions::SEED_RETIREMENT_PARAM,
@@ -7124,7 +7498,7 @@ impl Owner {
                     &self.torrent_payload_roots,
                 );
                 self.dirty |= outcome.durable_changed;
-                if terminal_failure {
+                if terminal_failure && !crate::torrent_acquisitions::is_managed_seed(job) {
                     if let Some(torrent) = job.torrent.as_mut() {
                         torrent.removal_outcome = Some(TorrentPayloadDisposition::Retained);
                         torrent.removal_confirmed_at_unix = Some(unix_now());
@@ -7158,9 +7532,8 @@ impl Owner {
                 job.torrent
                     .as_ref()
                     .is_some_and(|torrent| torrent.removal_outcome.is_some())
-                    && (!crate::torrent_acquisitions::is_managed_seed(job)
-                        || crate::torrent_acquisitions::seed_retirement(job)
-                            .is_some_and(|marker| marker.phase == "deleted"))
+                    && crate::torrent_acquisitions::seed_retirement(job)
+                        .is_none_or(|marker| marker.phase == "deleted")
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -7611,6 +7984,29 @@ impl Owner {
                 .iter()
                 .filter(|job| self.automatic_control_pending(job.id))
                 .map(|job| job.id)
+                .collect(),
+            native_descriptor_references: self
+                .state
+                .jobs
+                .iter()
+                .filter_map(|job| {
+                    crate::torrent_acquisitions::descriptor_reference(job)
+                        .and_then(|reference| reference.source_identity(job).ok())
+                })
+                .collect(),
+            native_seed_dependencies: self
+                .state
+                .jobs
+                .iter()
+                .filter_map(crate::torrent_acquisitions::source_dependency)
+                .collect(),
+            native_seed_retirements: self
+                .state
+                .jobs
+                .iter()
+                .filter_map(|job| {
+                    crate::torrent_acquisitions::seed_retirement(job).map(|marker| (job.id, marker))
+                })
                 .collect(),
             download_paused: self.state.download_paused,
             quota_reached: self.quota_reached,

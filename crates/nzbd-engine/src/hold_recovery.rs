@@ -52,6 +52,7 @@ pub(crate) async fn pass(
     handle: &EngineHandle,
     reobserve: bool,
 ) -> Result<usize, crate::EngineError> {
+    handle.reconcile_native_seed_retirements().await?;
     let snapshot = handle.snapshot();
     if !snapshot.queue_authority {
         return Ok(0);
@@ -63,7 +64,14 @@ pub(crate) async fn pass(
         .iter()
         .filter(|job| !snapshot.pending_automatic_controls.contains(&job.id))
         .filter(|job| job.assigned_node.is_none())
-        .filter(|job| job.kind != JobKind::Torrent || job.torrent_role == Some("acquisition"))
+        .filter(|job| {
+            job.kind != JobKind::Torrent
+                || job.torrent_role == Some("acquisition")
+                || snapshot
+                    .native_seed_retirements
+                    .get(&job.id)
+                    .is_some_and(|marker| marker.phase == "detached")
+        })
         .filter_map(|job| {
             let control = job
                 .control
