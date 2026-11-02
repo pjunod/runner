@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 const MAX_PLAN: usize = 16 * 1024 * 1024;
 const MAX_ORPHANS: usize = 16;
+const MAX_PROGRESS_ROW: usize = 16 * 1024;
+const MAX_PROGRESS_TOTAL: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Stage {
@@ -39,15 +41,80 @@ struct TorrentCopy {
     info_hash: String,
     source_root: PathBuf,
     source_identity: Identity,
+    target_root_identity: Identity,
     destination: PathBuf,
+    #[serde(skip)]
     files: Vec<CopyFile>,
+    #[serde(skip)]
     directories: Vec<CopyDirectory>,
+    file_count: usize,
+    directory_count: usize,
+    selection_digest: String,
     // These names have no ownership receipt. Never adopt, move or delete them.
     // They live outside the final payload; bounded retention need not strand it.
     uncommitted_stages: Vec<UncommittedStage>,
     compacted_delivery: Option<String>,
     compacted_source: Option<SourceGeneration>,
+    compacted_delete: Option<String>,
+    compacted_stage_cleanup: Option<String>,
     stage_cleanup_complete: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SelectionManifest {
+    files: Vec<CopyFile>,
+    directories: Vec<CopyDirectory>,
+}
+#[derive(Serialize, Deserialize)]
+struct FileProgress {
+    binding: String,
+    stage: Option<Stage>,
+    target: Option<Identity>,
+    digest: Option<String>,
+}
+#[derive(Serialize, Deserialize)]
+struct DirectoryProgress {
+    binding: String,
+    identity: Option<Identity>,
+}
+fn file_binding(file: &CopyFile) -> Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(&file.path, &file.source))?)
+    ))
+}
+fn directory_binding(directory: &CopyDirectory) -> String {
+    format!("{:x}", Sha256::digest(directory.path.as_bytes()))
+}
+fn strip_mount(identity: &mut Option<Identity>, root: &Identity) -> Result<()> {
+    if let Some(identity) = identity {
+        if identity.mount_id != root.mount_id {
+            return Err(Error::Conflict(
+                "torrent checkpoint moved outside its recorded destination mount".into(),
+            ));
+        }
+        identity.mount_id.clear();
+    }
+    Ok(())
+}
+fn restore_mount(identity: &mut Option<Identity>, root: &Identity) -> Result<()> {
+    if let Some(identity) = identity {
+        if !identity.mount_id.is_empty() {
+            return Err(Error::Conflict(
+                "torrent checkpoint mount binding changed".into(),
+            ));
+        }
+        identity.mount_id = root.mount_id.clone();
+    }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct StageCleanupStatus {
+    job: u32,
+    source: SourceGeneration,
+    blocked_since: Option<i64>,
+    warning: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -77,9 +144,14 @@ fn retain_unknown(plan: &mut TorrentCopy, name: String, observed: Option<Identit
         return Ok(());
     }
     if plan.uncommitted_stages.len() >= MAX_ORPHANS {
-        return Err(Error::Conflict(
-            "too many uncommitted torrent staging objects; retained for review".into(),
-        ));
+        return Err(Error::Conflict(format!(
+            "too many uncommitted torrent staging objects; additional unowned path retained for review: {}",
+            plan.destination
+                .parent()
+                .unwrap_or(Path::new("/"))
+                .join(&name)
+                .display()
+        )));
     }
     plan.uncommitted_stages
         .push(UncommittedStage { name, observed });
@@ -111,14 +183,270 @@ fn boundary(stage: &str, index: usize) -> Result<()> {
     let _ = (stage, index);
     Ok(())
 }
-fn persist(inventory: &Inventory, op: &mut Operation, plan: &TorrentCopy) -> Result<()> {
+fn encode_receipt(op: &mut Operation, plan: &TorrentCopy) -> Result<()> {
     op.request = serde_json::to_string(plan)?;
-    if op.request.len() > MAX_PLAN {
+    if op.request.len() > 64 * 1024 {
         return Err(Error::Conflict(
-            "torrent copy manifest exceeds supported size; retained for review".into(),
+            "torrent copy receipt exceeds bounded size; retained for review".into(),
         ));
     }
-    save_operation(&inventory.db.lock().unwrap(), op)
+    Ok(())
+}
+fn persist(inventory: &Inventory, op: &mut Operation, plan: &TorrentCopy) -> Result<()> {
+    encode_receipt(op, plan)?;
+    let mut db = inventory.db.lock().unwrap();
+    let tx = db.transaction()?;
+    let previous: Option<String> = tx
+        .query_row(
+            "SELECT json_extract(data,'$.request') FROM operations WHERE id=?1",
+            [&op.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let previous_count = previous
+        .and_then(|raw| serde_json::from_str::<TorrentCopy>(&raw).ok())
+        .map_or(0, |plan| plan.uncommitted_stages.len());
+    if plan.uncommitted_stages.len() > previous_count {
+        event(
+            &tx,
+            &op.artifact,
+            "torrent_stage_review",
+            &unknown_stage_warning(plan).unwrap(),
+        )?;
+    }
+    save_operation(&tx, op)?;
+    tx.commit()?;
+    Ok(())
+}
+fn unknown_stage_warning(plan: &TorrentCopy) -> Option<String> {
+    if plan.uncommitted_stages.is_empty() {
+        return None;
+    }
+    let root = plan.destination.parent().unwrap_or(Path::new("/"));
+    Some(format!(
+        "Uncommitted staging objects retained for review because their creation had no durable inode receipt. Ownership and deletion are not authorized. Exact paths: {}",
+        plan.uncommitted_stages
+            .iter()
+            .map(|stage| root.join(&stage.name).display().to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    ))
+}
+fn ensure_tables(inventory: &Inventory) -> Result<()> {
+    inventory.db.lock().unwrap().execute_batch("CREATE TABLE IF NOT EXISTS torrent_copy_manifests(operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE CASCADE,generation TEXT NOT NULL,data TEXT NOT NULL,progress_bytes INTEGER NOT NULL DEFAULT 0,progress_rows INTEGER NOT NULL DEFAULT 0) STRICT; CREATE TABLE IF NOT EXISTS torrent_copy_progress(operation_id TEXT NOT NULL REFERENCES operations(id) ON DELETE CASCADE,generation TEXT NOT NULL,kind TEXT NOT NULL,ordinal INTEGER NOT NULL,data TEXT NOT NULL,PRIMARY KEY(operation_id,generation,kind,ordinal)) STRICT;")?;
+    Ok(())
+}
+fn persist_initial(
+    inventory: &Inventory,
+    op: &mut Operation,
+    plan: &mut TorrentCopy,
+) -> Result<()> {
+    ensure_tables(inventory)?;
+    let manifest = serde_json::to_string(&SelectionManifest {
+        files: plan.files.clone(),
+        directories: plan.directories.clone(),
+    })?;
+    if manifest.len() > MAX_PLAN || plan.files.len() + plan.directories.len() > 100_000 {
+        return Err(Error::Conflict(
+            "torrent selection manifest exceeds supported size; retained for review".into(),
+        ));
+    }
+    plan.file_count = plan.files.len();
+    plan.directory_count = plan.directories.len();
+    plan.selection_digest = format!("{:x}", Sha256::digest(manifest.as_bytes()));
+    encode_receipt(op, plan)?;
+    let mut db = inventory.db.lock().unwrap();
+    let tx = db.transaction()?;
+    save_operation(&tx, op)?;
+    tx.execute(
+        "INSERT INTO torrent_copy_manifests(operation_id,generation,data) VALUES(?1,?2,?3)",
+        params![op.id, plan.generation, manifest],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+fn persist_progress(
+    inventory: &Inventory,
+    op: &Operation,
+    plan: &TorrentCopy,
+    index: usize,
+    directory: bool,
+) -> Result<()> {
+    let (kind, data) = if directory {
+        let entry = &plan.directories[index];
+        let mut identity = entry.identity.clone();
+        strip_mount(&mut identity, &plan.target_root_identity)?;
+        (
+            "directory",
+            serde_json::to_string(&DirectoryProgress {
+                binding: directory_binding(entry),
+                identity,
+            })?,
+        )
+    } else {
+        let entry = &plan.files[index];
+        let mut stage = entry.stage.clone();
+        let mut target = entry.target.clone();
+        if let Some(stage) = &mut stage {
+            strip_mount(&mut stage.identity, &plan.target_root_identity)?;
+        }
+        strip_mount(&mut target, &plan.target_root_identity)?;
+        (
+            "file",
+            serde_json::to_string(&FileProgress {
+                binding: file_binding(entry)?,
+                stage,
+                target,
+                digest: entry.digest.clone(),
+            })?,
+        )
+    };
+    if data.len() > MAX_PROGRESS_ROW {
+        return Err(Error::Conflict(
+            "torrent file checkpoint exceeds bounded size".into(),
+        ));
+    }
+    let mut db = inventory.db.lock().unwrap();
+    let tx = db.transaction()?;
+    let (total,rows):(i64,i64)=tx.query_row("SELECT progress_bytes,progress_rows FROM torrent_copy_manifests WHERE operation_id=?1 AND generation=?2",params![op.id,plan.generation],|row|Ok((row.get(0)?,row.get(1)?)))?;
+    let prior:Option<i64>=tx.query_row("SELECT length(CAST(data AS BLOB)) FROM torrent_copy_progress WHERE operation_id=?1 AND generation=?2 AND kind=?3 AND ordinal=?4",params![op.id,plan.generation,kind,index as i64],|row|row.get(0)).optional()?;
+    let next = total
+        .checked_sub(prior.unwrap_or(0))
+        .and_then(|bytes| bytes.checked_add(data.len() as i64))
+        .ok_or_else(|| Error::Conflict("torrent checkpoint byte accounting changed".into()))?;
+    let next_rows = rows
+        .checked_add(i64::from(prior.is_none()))
+        .ok_or_else(|| Error::Conflict("torrent checkpoint row accounting changed".into()))?;
+    if next < 0
+        || next_rows < 0
+        || next > MAX_PROGRESS_TOTAL as i64
+        || next_rows > (plan.file_count + plan.directory_count) as i64
+    {
+        return Err(Error::Conflict(
+            "torrent checkpoint aggregate exceeds supported size; retained for review".into(),
+        ));
+    }
+    tx.execute("INSERT INTO torrent_copy_progress(operation_id,generation,kind,ordinal,data) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(operation_id,generation,kind,ordinal) DO UPDATE SET data=excluded.data",params![op.id,plan.generation,kind,index as i64,data])?;
+    tx.execute("UPDATE torrent_copy_manifests SET progress_bytes=?3,progress_rows=?4 WHERE operation_id=?1 AND generation=?2",params![op.id,plan.generation,next,next_rows])?;
+    tx.commit()?;
+    Ok(())
+}
+fn load_plan(inventory: &Inventory, op: &Operation) -> Result<TorrentCopy> {
+    let mut plan: TorrentCopy = serde_json::from_str(&op.request)?;
+    if plan.compacted_delivery.is_some() || plan.compacted_delete.is_some() {
+        return Ok(plan);
+    }
+    ensure_tables(inventory)?;
+    let expected_count = plan
+        .file_count
+        .checked_add(plan.directory_count)
+        .filter(|count| *count <= 100_000)
+        .ok_or_else(|| {
+            Error::Conflict("torrent selection count exceeds supported bounds".into())
+        })?;
+    let (manifest, progress) = {
+        let db = inventory.db.lock().unwrap();
+        let bounds:Option<(i64,i64,i64)>=db.query_row("SELECT length(CAST(data AS BLOB)),progress_bytes,progress_rows FROM torrent_copy_manifests WHERE operation_id=?1 AND generation=?2",params![op.id,plan.generation],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+        let (manifest_bytes, stored_bytes, stored_rows) = bounds.ok_or_else(|| {
+            Error::Conflict("torrent immutable selection manifest is missing".into())
+        })?;
+        if manifest_bytes < 0
+            || stored_bytes < 0
+            || stored_rows < 0
+            || manifest_bytes > MAX_PLAN as i64
+            || stored_bytes > MAX_PROGRESS_TOTAL as i64
+            || stored_rows > expected_count as i64
+        {
+            return Err(Error::Conflict("torrent selection/progress metadata exceeds supported aggregate bounds; retained for review".into()));
+        }
+        let (rows,largest,total):(i64,i64,i64)=db.query_row("SELECT count(*),COALESCE(max(length(CAST(data AS BLOB))),0),COALESCE(sum(length(CAST(data AS BLOB))),0) FROM torrent_copy_progress WHERE operation_id=?1 AND generation=?2",params![op.id,plan.generation],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+        if rows < 0
+            || largest < 0
+            || total < 0
+            || rows > expected_count as i64
+            || largest > MAX_PROGRESS_ROW as i64
+            || total > MAX_PROGRESS_TOTAL as i64
+            || total != stored_bytes
+            || rows != stored_rows
+        {
+            return Err(Error::Conflict("torrent progress metadata exceeds supported row/aggregate bounds; retained for review".into()));
+        }
+        let manifest: String = db.query_row(
+            "SELECT data FROM torrent_copy_manifests WHERE operation_id=?1 AND generation=?2",
+            params![op.id, plan.generation],
+            |row| row.get(0),
+        )?;
+        let mut query=db.prepare("SELECT kind,ordinal,data FROM torrent_copy_progress WHERE operation_id=?1 AND generation=?2 ORDER BY kind,ordinal LIMIT 100001")?;
+        let rows = query.query_map(params![op.id, plan.generation], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let progress = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        (manifest, progress)
+    };
+    // Parsing/hashing the bounded bulk state does not hold the actor's DB
+    // mutex. The actor completion path reads only the small main receipt.
+    if format!("{:x}", Sha256::digest(manifest.as_bytes())) != plan.selection_digest {
+        return Err(Error::Conflict(
+            "torrent immutable selection manifest changed".into(),
+        ));
+    }
+    let selection: SelectionManifest = serde_json::from_str(&manifest)?;
+    if selection.files.len() != plan.file_count
+        || selection.directories.len() != plan.directory_count
+    {
+        return Err(Error::Conflict(
+            "torrent immutable selection count changed".into(),
+        ));
+    }
+    plan.files = selection.files;
+    plan.directories = selection.directories;
+    for (kind, index, raw) in progress {
+        if index < 0 {
+            return Err(Error::Conflict(
+                "torrent checkpoint index is negative".into(),
+            ));
+        }
+        let index = index as usize;
+        match kind.as_str() {
+            "file" => {
+                let mut progress: FileProgress = serde_json::from_str(&raw)?;
+                let expected = plan.files.get_mut(index).ok_or_else(|| {
+                    Error::Conflict("torrent file checkpoint index changed".into())
+                })?;
+                if progress.binding != file_binding(expected)? {
+                    return Err(Error::Conflict(
+                        "torrent file checkpoint differs from immutable selection".into(),
+                    ));
+                }
+                if let Some(stage) = &mut progress.stage {
+                    restore_mount(&mut stage.identity, &plan.target_root_identity)?;
+                }
+                restore_mount(&mut progress.target, &plan.target_root_identity)?;
+                expected.stage = progress.stage;
+                expected.target = progress.target;
+                expected.digest = progress.digest;
+            }
+            "directory" => {
+                let mut progress: DirectoryProgress = serde_json::from_str(&raw)?;
+                let expected = plan.directories.get_mut(index).ok_or_else(|| {
+                    Error::Conflict("torrent directory checkpoint index changed".into())
+                })?;
+                if progress.binding != directory_binding(expected) {
+                    return Err(Error::Conflict(
+                        "torrent directory checkpoint differs from immutable selection".into(),
+                    ));
+                }
+                restore_mount(&mut progress.identity, &plan.target_root_identity)?;
+                expected.identity = progress.identity;
+            }
+            _ => return Err(Error::Conflict("unknown torrent checkpoint kind".into())),
+        }
+    }
+    Ok(plan)
 }
 fn safe_selection(selected: &[(PathBuf, u64)]) -> Result<()> {
     if selected.is_empty() || selected.len() > 100_000 {
@@ -227,6 +555,19 @@ fn verified_prefix(
 }
 
 impl Inventory {
+    pub fn torrent_copy_ready(&self, job: u32, source: &SourceGeneration) -> Result<bool> {
+        let raw:Option<String>=self.db.lock().unwrap().query_row("SELECT data FROM operations WHERE id=?1 AND state='succeeded' AND artifact=?2 AND EXISTS(SELECT 1 FROM artifacts a WHERE a.id=operations.artifact AND a.state NOT IN ('deleted','source_gone')) AND length(CAST(data AS BLOB))<=262144",params![format!("torrent-copy-job-{job}"),source.artifact],|row|row.get(0)).optional()?;
+        let Some(raw) = raw else { return Ok(false) };
+        let operation: Operation = serde_json::from_str(&raw)?;
+        if operation.kind != "torrent-copy" {
+            return Ok(false);
+        }
+        let receipt: TorrentCopy = serde_json::from_str(&operation.request)?;
+        Ok(receipt.job == job
+            && receipt.generation == source.generation
+            && receipt.compacted_delete.is_none())
+    }
+
     /// Reading a legacy/unowned donor creates no deletion authority. A known
     /// owned donor is pinned by the existing exact-generation use registry.
     fn pin_torrent_donor(
@@ -319,6 +660,11 @@ impl Inventory {
             if plan.fingerprint != fingerprint || plan.job != job {
                 return Err(Error::Conflict("torrent copy replay inputs changed".into()));
             }
+            if plan.compacted_delete.is_some() {
+                return Err(Error::Conflict(
+                    "torrent acquisition was deleted; use a fresh request".into(),
+                ));
+            }
             if let Some(delivery_id) = &plan.compacted_delivery {
                 let delivery = self.delivery(delivery_id)?;
                 if op.state != "succeeded"
@@ -339,6 +685,15 @@ impl Inventory {
                 if artifact.generation != plan.generation {
                     return Err(Error::Conflict(
                         "torrent compact replay generation changed".into(),
+                    ));
+                }
+                return Ok(artifact);
+            }
+            if op.state == "succeeded" {
+                let artifact = self.get(&op.artifact)?;
+                if artifact.generation != plan.generation || artifact.terminal() {
+                    return Err(Error::Conflict(
+                        "completed torrent copy source generation is unavailable".into(),
                     ));
                 }
                 return Ok(artifact);
@@ -413,7 +768,7 @@ impl Inventory {
                 })
                 .collect();
             directories.sort_by_key(|dir| Path::new(&dir.path).components().count());
-            let plan = TorrentCopy {
+            let mut plan = TorrentCopy {
                 job,
                 fingerprint: fingerprint.clone(),
                 generation: artifact.generation.clone(),
@@ -421,12 +776,18 @@ impl Inventory {
                 info_hash: info_hash.into(),
                 source_root: source_root.into(),
                 source_identity: source_identity.clone(),
+                target_root_identity: artifact.root_identity.clone(),
                 destination: destination.into(),
                 files,
                 directories,
+                file_count: 0,
+                directory_count: 0,
+                selection_digest: String::new(),
                 uncommitted_stages: Vec::new(),
                 compacted_delivery: None,
                 compacted_source: None,
+                compacted_delete: None,
+                compacted_stage_cleanup: None,
                 stage_cleanup_complete: false,
             };
             let mut op = Operation {
@@ -441,10 +802,10 @@ impl Inventory {
                 next_retry: 0,
                 error: None,
             };
-            persist(self, &mut op, &plan)?;
+            persist_initial(self, &mut op, &mut plan)?;
             op
         };
-        let mut plan: TorrentCopy = serde_json::from_str(&op.request)?;
+        let mut plan = load_plan(self, &op)?;
         if plan.generation != artifact.generation
             || op.artifact != artifact.id
             || !plan.source_identity.same_object(&source_identity)
@@ -517,8 +878,13 @@ impl Inventory {
                                 .ok()
                                 .and_then(|file| fs::identity_for_file(&file).ok()),
                         )?;
-                        plan.files[index].stage = None;
+                        // Retain the exact unknown path durably before clearing
+                        // its per-file pointer. Either crash order keeps a
+                        // visible review route; replay never adopts the inode.
                         persist(self, op, plan)?;
+                        boundary("unknown_retained", index)?;
+                        plan.files[index].stage = None;
+                        persist_progress(self, op, plan, index, false)?;
                     }
                 }
             }
@@ -599,13 +965,40 @@ impl Inventory {
                         "torrent staging identity changed; retained for review".into(),
                     ));
                 }
-                let digest = verified_prefix(&mut input, &mut output, identity.bytes, checkpoint)?;
-                if entry.digest.as_ref().is_some_and(|saved| saved != &digest) {
-                    return Err(Error::Conflict(
-                        "finished torrent staging bytes changed".into(),
-                    ));
+                match verified_prefix(&mut input, &mut output, identity.bytes, checkpoint) {
+                    Ok(digest) => {
+                        if entry.digest.as_ref().is_some_and(|saved| saved != &digest) {
+                            return Err(Error::Conflict(
+                                "finished torrent staging bytes changed".into(),
+                            ));
+                        }
+                        identity.bytes
+                    }
+                    Err(Error::Conflict(_)) if entry.digest.is_none() => {
+                        // No completed-byte proof exists. An exact journal-owned
+                        // partial inode can contain a torn write after a crash.
+                        // Restart only this inode, under the exclusive copy lease.
+                        if fs::identity_for_file(&input)? != entry.source
+                            || fs::identity_for_file(&output)? != identity
+                        {
+                            return Err(Error::Conflict(
+                                "torrent donor or partial stage changed during recovery".into(),
+                            ));
+                        }
+                        checkpoint()?;
+                        let writable =
+                            crate::fileops::writer(&artifact.root.join(&stage.name), false)?;
+                        if fs::identity_for_file(&writable)? != identity {
+                            return Err(Error::Conflict(
+                                "torrent partial stage writer changed".into(),
+                            ));
+                        }
+                        writable.set_len(0)?;
+                        writable.sync_all()?;
+                        0
+                    }
+                    Err(error) => return Err(error),
                 }
-                identity.bytes
             } else {
                 0
             };
@@ -646,7 +1039,7 @@ impl Inventory {
                 crate::fileops::parents(&artifact.path, Path::new(&entry.path))?;
                 let directory = fs::open_relative(target, &entry.path)?;
                 plan.directories[index].identity = Some(fs::identity_for_file(&directory)?);
-                persist(self, op, plan)?;
+                persist_progress(self, op, plan, index, true)?;
             }
         }
         for index in 0..plan.files.len() {
@@ -660,7 +1053,7 @@ impl Inventory {
                     name: format!(".torrent-copy-{}-{nonce}.part", artifact.generation),
                     identity: None,
                 });
-                persist(self, op, plan)?;
+                persist_progress(self, op, plan, index, false)?;
                 boundary("stage_intent", index)?;
             }
             if plan.files[index].stage.as_ref().unwrap().identity.is_none() {
@@ -671,7 +1064,7 @@ impl Inventory {
                 boundary("stage_created", index)?;
                 plan.files[index].stage.as_mut().unwrap().identity =
                     Some(fs::identity_for_file(&output)?);
-                persist(self, op, plan)?;
+                persist_progress(self, op, plan, index, false)?;
                 boundary("stage_identity", index)?;
             }
             let entry = plan.files[index].clone();
@@ -722,7 +1115,7 @@ impl Inventory {
                 }
                 plan.files[index].digest = Some(digest);
                 plan.files[index].stage.as_mut().unwrap().identity = Some(current);
-                persist(self, op, plan)?;
+                persist_progress(self, op, plan, index, false)?;
                 boundary("stage_complete", index)?;
                 checkpoint()?;
                 crate::fileops::rename_exclusive(&stage_path, &artifact.path.join(&entry.path))?;
@@ -758,7 +1151,7 @@ impl Inventory {
                 return Err(Error::Conflict("torrent final target changed".into()));
             }
             plan.files[index].target = Some(current);
-            persist(self, op, plan)?;
+            persist_progress(self, op, plan, index, false)?;
             boundary("target_identity", index)?;
         }
         let manifest = fs::manifest(target, 100_000)?;
@@ -803,12 +1196,7 @@ impl Inventory {
         }
         let finished = self.finish(plan.job, &artifact.path, &artifact.root, "active")?;
         op.state = "succeeded".into();
-        op.error = (!plan.uncommitted_stages.is_empty()).then(|| {
-            format!(
-                "{} uncommitted staging objects retained for review; no deletion authority",
-                plan.uncommitted_stages.len()
-            )
-        });
+        op.error = unknown_stage_warning(plan);
         persist(self, op, plan)?;
         Ok(finished)
     }
@@ -823,13 +1211,82 @@ impl Inventory {
         checkpoint: &dyn Fn() -> std::io::Result<()>,
     ) -> Result<Operation> {
         let result = self.cleanup_torrent_copy_stages_inner(job, checkpoint);
-        if let Err(error) = &result {
-            if let Ok(mut copy) = self.operation(&format!("torrent-copy-job-{job}")) {
-                copy.error = Some(format!("Staging cleanup pending: {error}"));
-                copy.attempts = copy.attempts.saturating_add(1);
-                copy.next_retry = now() + 60;
-                save_operation(&self.db.lock().unwrap(), &copy)?;
+        // A failed/live copy is never rewritten to record cleanup status. In
+        // particular WouldBlock cannot roll back a newer per-file checkpoint.
+        let _guard = self.mutation_guard()?;
+        if let Ok(copy) = self.operation(&format!("torrent-copy-job-{job}")) {
+            let receipt: TorrentCopy = serde_json::from_str(&copy.request)?;
+            let id = format!("torrent-stage-status-job-{job}");
+            let mut status = match self.operation(&id) {
+                Ok(op) => op,
+                Err(Error::NotFound) => Operation {
+                    id,
+                    artifact: copy.artifact.clone(),
+                    kind: "torrent-stage-cleanup-status".into(),
+                    state: "pending".into(),
+                    request: serde_json::to_string(&StageCleanupStatus {
+                        job,
+                        source: SourceGeneration {
+                            artifact: copy.artifact.clone(),
+                            generation: receipt.generation.clone(),
+                        },
+                        blocked_since: None,
+                        warning: None,
+                    })?,
+                    created_at: now(),
+                    not_before: now(),
+                    attempts: 0,
+                    next_retry: 0,
+                    error: None,
+                },
+                Err(error) => return Err(error),
+            };
+            let mut details: StageCleanupStatus = serde_json::from_str(&status.request)?;
+            if details.job != job
+                || details.source.artifact != copy.artifact
+                || details.source.generation != receipt.generation
+            {
+                return Err(Error::Conflict(
+                    "torrent staging status generation changed".into(),
+                ));
             }
+            match &result {
+                Ok(op) => {
+                    status.state = op.state.clone();
+                    status.error = op.error.clone();
+                    status.next_retry = 0;
+                    if op.state == "succeeded" {
+                        details.blocked_since = None;
+                        details.warning = None;
+                    }
+                }
+                Err(error) => {
+                    status.attempts = status.attempts.saturating_add(1);
+                    let blocked = *details.blocked_since.get_or_insert_with(now);
+                    status.state = if matches!(error, Error::Conflict(_)) {
+                        "review"
+                    } else {
+                        "retry"
+                    }
+                    .into();
+                    status.error = Some(format!("Staging cleanup pending: {error}"));
+                    let jitter_key = format!("{:x}", Sha256::digest(status.id.as_bytes()));
+                    status.next_retry = if status.state == "review" {
+                        0
+                    } else {
+                        url_storage_retry_deadline(
+                            &jitter_key,
+                            status.attempts.saturating_sub(1),
+                            now(),
+                            status.next_retry,
+                            None,
+                        )
+                    };
+                    details.warning=(now().saturating_sub(blocked)>=30*60).then(||"Staging cleanup has been blocked for at least 30 minutes; review the recorded cause.".into());
+                }
+            }
+            status.request = serde_json::to_string(&details)?;
+            save_operation(&self.db.lock().unwrap(), &status)?;
         }
         result
     }
@@ -842,14 +1299,13 @@ impl Inventory {
         checkpoint()?;
         let mut copy = self.operation(&format!("torrent-copy-job-{job}"))?;
         let mut plan: TorrentCopy = serde_json::from_str(&copy.request)?;
+        if let Some(id) = &plan.compacted_stage_cleanup {
+            return self.operation(id);
+        }
         let source = self.get(&copy.artifact)?;
-        if source.generation != plan.generation
-            || source.state != "deleted"
-            || !source.owned
-            || source.hold.is_some()
-        {
+        if source.generation != plan.generation || !source.owned {
             return Err(Error::Conflict(
-                "torrent stage cleanup requires an exact deleted owned source generation".into(),
+                "torrent staging source generation changed".into(),
             ));
         }
         if self.artifact_in_use(&source)? {
@@ -858,6 +1314,11 @@ impl Inventory {
                 "torrent copy workers have not quiesced",
             )
             .into());
+        }
+        if source.state != "deleted" || source.hold.is_some() {
+            return Err(Error::Conflict(
+                "torrent stage cleanup requires an exact deleted owned source generation".into(),
+            ));
         }
         let candidates = {
             let db = self.db.lock().unwrap();
@@ -885,6 +1346,7 @@ impl Inventory {
                 "current Keep protects automatic torrent staging cleanup".into(),
             ));
         }
+        plan = load_plan(self, &copy)?;
         let root = self.verify_root(&source)?;
         let cleanup_id = format!("torrent-stage-cleanup-{}-{}", source.id, source.generation);
         let mut op = match self.operation(&cleanup_id) {
@@ -1021,20 +1483,28 @@ impl Inventory {
             "review"
         }
         .into();
-        op.error = (!plan.uncommitted_stages.is_empty()).then(|| {
-            format!(
-                "{} uncommitted staging objects retained for review; no deletion authority",
-                plan.uncommitted_stages.len()
-            )
-        });
+        op.error = unknown_stage_warning(&plan);
         plan.stage_cleanup_complete = true;
+        plan.compacted_delete = Some(deletion.clone());
+        plan.compacted_stage_cleanup = Some(op.id.clone());
+        plan.files.clear();
+        plan.directories.clear();
+        copy.state = "cancelled".into();
         copy.next_retry = 0;
         if op.error.is_some() {
             copy.error = op.error.clone();
         }
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
-        copy.request = serde_json::to_string(&plan)?;
+        encode_receipt(&mut copy, &plan)?;
+        tx.execute(
+            "DELETE FROM torrent_copy_progress WHERE operation_id=?1 AND generation=?2",
+            params![copy.id, plan.generation],
+        )?;
+        tx.execute(
+            "DELETE FROM torrent_copy_manifests WHERE operation_id=?1 AND generation=?2",
+            params![copy.id, plan.generation],
+        )?;
         save_operation(&tx, &copy)?;
         save_operation(&tx, &op)?;
         tx.commit()?;
@@ -1059,7 +1529,7 @@ impl Inventory {
                 .and_then(|value| value.parse::<i64>().ok())
                 .unwrap_or(0);
             let query_page = |after: i64| -> Result<Vec<(i64, u32)>> {
-                let mut query=db.prepare("SELECT o.rowid,json_extract(json_extract(o.data,'$.request'),'$.job') FROM operations o JOIN artifacts a ON a.id=o.artifact WHERE o.rowid>?1 AND json_extract(o.data,'$.kind')='torrent-copy' AND a.state='deleted' AND COALESCE(json_extract(json_extract(o.data,'$.request'),'$.stage_cleanup_complete'),0)=0 AND COALESCE(json_extract(o.data,'$.next_retry'),0)<=?2 ORDER BY o.rowid LIMIT 64")?;
+                let mut query=db.prepare("SELECT o.rowid,json_extract(json_extract(o.data,'$.request'),'$.job') FROM operations o JOIN artifacts a ON a.id=o.artifact LEFT JOIN operations s ON s.id='torrent-stage-status-job-'||json_extract(json_extract(o.data,'$.request'),'$.job') WHERE o.rowid>?1 AND json_extract(o.data,'$.kind')='torrent-copy' AND a.state='deleted' AND COALESCE(json_extract(json_extract(o.data,'$.request'),'$.stage_cleanup_complete'),0)=0 AND (s.id IS NULL OR (s.state!='review' AND COALESCE(json_extract(s.data,'$.next_retry'),0)<=?2)) ORDER BY o.rowid LIMIT 64")?;
                 let rows =
                     query.query_map(params![after, now()], |row| Ok((row.get(0)?, row.get(1)?)))?;
                 Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1083,6 +1553,80 @@ impl Inventory {
         Ok(completed)
     }
 
+    /// Inventory maintenance finds durable publications even after the child
+    /// has left queue/history or the native torrent service has been disabled.
+    pub fn reconcile_torrent_copy_compaction(
+        &self,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> Result<usize> {
+        let key = "torrent_copy_compaction_cursor";
+        let rows = {
+            let db = self.db.lock().unwrap();
+            let cursor: Option<String> = db
+                .query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            let cursor = cursor
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0);
+            let page = |after: i64| -> Result<Vec<(i64, String, String)>> {
+                let mut query=db.prepare("SELECT rowid,id,artifact FROM operations WHERE rowid>?1 AND state='succeeded' AND json_extract(data,'$.kind')='torrent-copy' AND json_extract(json_extract(data,'$.request'),'$.compacted_delivery') IS NULL ORDER BY rowid LIMIT 64")?;
+                let rows =
+                    query.query_map([after], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+                Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+            };
+            let rows = page(cursor)?;
+            if rows.is_empty() && cursor > 0 {
+                page(0)?
+            } else {
+                rows
+            }
+        };
+        let mut compacted = 0;
+        for (row, id, artifact) in rows {
+            checkpoint()?;
+            let op = self.operation(&id)?;
+            let plan: TorrentCopy = serde_json::from_str(&op.request)?;
+            let deliveries = {
+                let db = self.db.lock().unwrap();
+                // Both direct publication and PP relocation preserve the
+                // indexed original artifact/generation. A PP scratch has an
+                // exact succeeded transformation linking its source generation.
+                let mut query=db.prepare("SELECT id FROM deliveries WHERE artifact=?1 AND generation=?2 UNION SELECT d.id FROM operations t JOIN deliveries d ON d.artifact=json_extract(json_extract(t.data,'$.request'),'$.scratch.id') AND d.generation=json_extract(json_extract(t.data,'$.request'),'$.scratch.generation') WHERE t.artifact=?1 AND t.state='succeeded' AND json_extract(t.data,'$.kind') IN ('extract','par_repair') AND json_extract(json_extract(t.data,'$.request'),'$.source.generation')=?2 LIMIT 2")?;
+                let rows = query.query_map(params![artifact, plan.generation], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            if deliveries.len() == 1 {
+                match self.compact_torrent_copy_for_delivery(&deliveries[0]) {
+                    Ok(true) => compacted += 1,
+                    Ok(false) => {}
+                    Err(error) => {
+                        // A retained/review row cannot starve subsequent jobs.
+                        // Reload the small receipt under serialization; never
+                        // overwrite bulk progress or a concurrently compacted proof.
+                        let _guard = self.mutation_guard()?;
+                        let mut current = self.operation(&id)?;
+                        let receipt: TorrentCopy = serde_json::from_str(&current.request)?;
+                        if current.state == "succeeded"
+                            && receipt.compacted_delivery.is_none()
+                            && receipt.compacted_delete.is_none()
+                        {
+                            current.error = Some(format!(
+                                "Torrent copy metadata compaction requires review: {error}"
+                            ));
+                            save_operation(&self.db.lock().unwrap(), &current)?;
+                        }
+                    }
+                }
+            }
+            self.db.lock().unwrap().execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,row.to_string()])?;
+        }
+        Ok(compacted)
+    }
+
     /// Compact only after a real immutable Delivery has durably sealed this
     /// exact copy (possibly through a recorded PP scratch/relocation). No
     /// caller-supplied acceptance flag can authorize it.
@@ -1098,7 +1642,7 @@ impl Inventory {
         if op.kind != "torrent-copy" || op.state != "succeeded" {
             return Ok(false);
         }
-        let mut plan: TorrentCopy = serde_json::from_str(&op.request)?;
+        let mut plan = load_plan(self, &op)?;
         if plan.job != delivery.job_id {
             return Err(Error::Conflict(
                 "torrent delivery job differs from copy receipt".into(),
@@ -1180,12 +1724,7 @@ impl Inventory {
         plan.files.clear();
         plan.directories.clear();
         plan.compacted_delivery = Some(delivery_id.into());
-        op.error = (!plan.uncommitted_stages.is_empty()).then(|| {
-            format!(
-                "{} uncommitted staging objects retained for review; no deletion authority",
-                plan.uncommitted_stages.len()
-            )
-        });
+        op.error = unknown_stage_warning(&plan);
         plan.compacted_source = Some(SourceGeneration {
             artifact: delivery.source_artifact_id.clone(),
             generation: delivery.source_generation.clone(),
@@ -1195,7 +1734,19 @@ impl Inventory {
                 "torrent terminal proof exceeds bounded size; retained for review".into(),
             ));
         }
-        persist(self, &mut op, &plan)?;
+        encode_receipt(&mut op, &plan)?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
+            "DELETE FROM torrent_copy_progress WHERE operation_id=?1 AND generation=?2",
+            params![op.id, plan.generation],
+        )?;
+        tx.execute(
+            "DELETE FROM torrent_copy_manifests WHERE operation_id=?1 AND generation=?2",
+            params![op.id, plan.generation],
+        )?;
+        save_operation(&tx, &op)?;
+        tx.commit()?;
         Ok(true)
     }
 }
@@ -1290,12 +1841,9 @@ mod tests {
             }
         }
         fn plan(&self) -> TorrentCopy {
-            serde_json::from_str(
-                &self
-                    .inventory
-                    .operation("torrent-copy-job-2")
-                    .unwrap()
-                    .request,
+            load_plan(
+                &self.inventory,
+                &self.inventory.operation("torrent-copy-job-2").unwrap(),
             )
             .unwrap()
         }
@@ -1317,6 +1865,382 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn torn_owned_partial_restarts_but_completed_digest_mismatch_is_reviewed() {
+        for completed in [false, true] {
+            let mut f = Fixture::new(true, 1);
+            FAULT.with(|fault| {
+                *fault.borrow_mut() = Some((
+                    if completed {
+                        "stage_complete"
+                    } else {
+                        "copy_chunk"
+                    },
+                    0,
+                ))
+            });
+            assert!(f.run().is_err());
+            let stage = f.root.join(&f.plan().files[0].stage.as_ref().unwrap().name);
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&stage)
+                .unwrap();
+            file.seek(std::io::SeekFrom::Start(17)).unwrap();
+            file.write_all(b"torn suffix").unwrap();
+            file.sync_all().unwrap();
+            f = f.restart();
+            if completed {
+                assert!(f.run().is_err());
+                assert!(stage.exists());
+            } else {
+                f.run().unwrap();
+                f.assert_bytes();
+            }
+            assert_eq!(
+                std::fs::read(f.donor.join(&f.selected[0].0)).unwrap(),
+                vec![42; 131073]
+            );
+        }
+    }
+    #[test]
+    fn checkpoint_rows_are_small_and_immutable_selection_is_not_rewritten() {
+        let f = Fixture::new(true, 100);
+        FAULT.with(|fault| *fault.borrow_mut() = Some(("stage_complete", 0)));
+        assert!(f.run().is_err());
+        let manifest: String = f
+            .inventory
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT data FROM torrent_copy_manifests", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        f.run().unwrap();
+        let db = f.inventory.db.lock().unwrap();
+        assert_eq!(
+            manifest,
+            db.query_row::<String, _, _>("SELECT data FROM torrent_copy_manifests", [], |row| row
+                .get(0))
+                .unwrap()
+        );
+        let (count, max, total): (i64, i64, i64) = db
+            .query_row(
+                "SELECT count(*),max(length(data)),sum(length(data)) FROM torrent_copy_progress",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 100);
+        assert!(max < 2048);
+        assert!(total < 200000);
+        drop(db);
+        assert!(
+            f.inventory
+                .operation("torrent-copy-job-2")
+                .unwrap()
+                .request
+                .len()
+                < 4096
+        );
+    }
+    #[test]
+    fn oversized_progress_metadata_refuses_before_json_materialization() {
+        for corruption in ["row", "counter", "manifest"] {
+            let f = Fixture::new(true, 1);
+            FAULT.with(|fault| *fault.borrow_mut() = Some(("stage_identity", 0)));
+            assert!(f.run().is_err());
+            let db = f.inventory.db.lock().unwrap();
+            match corruption {
+                "row" => {
+                    db.execute(
+                        "UPDATE torrent_copy_progress SET data=CAST(zeroblob(?1) AS TEXT)",
+                        [(MAX_PROGRESS_ROW + 1) as i64],
+                    )
+                    .unwrap();
+                }
+                "counter" => {
+                    db.execute(
+                        "UPDATE torrent_copy_manifests SET progress_bytes=?1",
+                        [(MAX_PROGRESS_TOTAL + 1) as i64],
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    db.execute(
+                        "UPDATE torrent_copy_manifests SET data=CAST(zeroblob(?1) AS TEXT)",
+                        [(MAX_PLAN + 1) as i64],
+                    )
+                    .unwrap();
+                }
+            }
+            drop(db);
+            assert!(matches!(
+                load_plan(
+                    &f.inventory,
+                    &f.inventory.operation("torrent-copy-job-2").unwrap()
+                ),
+                Err(Error::Conflict(_))
+            ));
+        }
+    }
+    #[test]
+    fn cleanup_during_copy_records_separate_retry_without_overwriting_progress() {
+        let f = Fixture::new(true, 1);
+        let checked = Cell::new(false);
+        let checkpoint = || {
+            if !checked.get() && f.inventory.operation("torrent-copy-job-2").is_ok() {
+                checked.set(true);
+                let before = f.inventory.operation("torrent-copy-job-2").unwrap().request;
+                assert!(
+                    matches!(f.inventory.cleanup_torrent_copy_stages(2,&||Ok(())),Err(Error::Io(ref error)) if error.kind()==std::io::ErrorKind::WouldBlock)
+                );
+                assert_eq!(
+                    before,
+                    f.inventory.operation("torrent-copy-job-2").unwrap().request
+                );
+                let status = f.inventory.operation("torrent-stage-status-job-2").unwrap();
+                assert_eq!(status.state, "retry");
+                assert_eq!(status.attempts, 1);
+                assert!((30..=35).contains(&(status.next_retry - now())));
+                let mut status = status;
+                let mut details: StageCleanupStatus =
+                    serde_json::from_str(&status.request).unwrap();
+                let first_blocked = now() - 1801;
+                details.blocked_since = Some(first_blocked);
+                status.request = serde_json::to_string(&details).unwrap();
+                save_operation(&f.inventory.db.lock().unwrap(), &status).unwrap();
+                for base in [60, 120, 300] {
+                    assert!(
+                        f.inventory
+                            .cleanup_torrent_copy_stages(2, &|| Ok(()))
+                            .is_err()
+                    );
+                    let status = f.inventory.operation("torrent-stage-status-job-2").unwrap();
+                    assert!((base..=base + base / 10 + 1).contains(&(status.next_retry - now())));
+                    let details: StageCleanupStatus =
+                        serde_json::from_str(&status.request).unwrap();
+                    assert_eq!(details.blocked_since, Some(first_blocked));
+                    assert!(details.warning.is_some());
+                    assert_eq!(
+                        before,
+                        f.inventory.operation("torrent-copy-job-2").unwrap().request
+                    );
+                }
+            }
+            Ok(())
+        };
+        f.inventory
+            .copy_torrent_acquisition(
+                2,
+                1,
+                HASH,
+                &f.donor,
+                &f.selected,
+                &f.root,
+                &f.target,
+                false,
+                &checkpoint,
+            )
+            .unwrap();
+        assert!(checked.get());
+        f.assert_bytes();
+    }
+    #[test]
+    fn deleted_child_compacts_bulk_and_refuses_reconstruction_without_delivery() {
+        let mut f = Fixture::new(true, 100);
+        FAULT.with(|fault| *fault.borrow_mut() = Some(("copy_chunk", 50)));
+        assert!(f.run().is_err());
+        delete_child(&f, false);
+        f.inventory
+            .cleanup_torrent_copy_stages(2, &|| Ok(()))
+            .unwrap();
+        let receipt = f.inventory.operation("torrent-copy-job-2").unwrap().request;
+        assert!(receipt.len() < 4096);
+        let db = f.inventory.db.lock().unwrap();
+        assert_eq!(
+            db.query_row::<i64, _, _>("SELECT count(*) FROM torrent_copy_progress", [], |row| row
+                .get(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row::<i64, _, _>("SELECT count(*) FROM torrent_copy_manifests", [], |row| row
+                .get(0))
+                .unwrap(),
+            0
+        );
+        drop(db);
+        f = f.restart();
+        assert!(f.run().is_err());
+        assert_eq!(
+            receipt,
+            f.inventory.operation("torrent-copy-job-2").unwrap().request
+        );
+    }
+    #[test]
+    fn auxiliary_rows_cascade_with_parent_and_ready_check_uses_only_bounded_receipt() {
+        let f = Fixture::new(true, 2);
+        let artifact = f.run().unwrap();
+        let source = SourceGeneration {
+            artifact: artifact.id,
+            generation: artifact.generation,
+        };
+        assert!(f.inventory.torrent_copy_ready(2, &source).unwrap());
+        let db = f.inventory.db.lock().unwrap();
+        db.execute("UPDATE torrent_copy_manifests SET data='corrupt'", [])
+            .unwrap();
+        drop(db);
+        assert!(f.inventory.torrent_copy_ready(2, &source).unwrap());
+        let db = f.inventory.db.lock().unwrap();
+        db.execute("DELETE FROM operations WHERE id='torrent-copy-job-2'", [])
+            .unwrap();
+        assert_eq!(
+            db.query_row::<i64, _, _>("SELECT count(*) FROM torrent_copy_progress", [], |row| row
+                .get(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row::<i64, _, _>("SELECT count(*) FROM torrent_copy_manifests", [], |row| row
+                .get(0))
+                .unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn inventory_maintenance_compacts_delivery_without_live_job_or_service() {
+        let f = Fixture::new(true, 2);
+        f.run().unwrap();
+        let delivery = f
+            .inventory
+            .create_delivery_with_outcome_and_keep(
+                2,
+                true,
+                Some("retired-child"),
+                "SUCCESS",
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            f.inventory
+                .reconcile_torrent_copy_compaction(&|| Ok(()))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            f.plan().compacted_delivery.as_deref(),
+            Some(delivery.delivery_id.as_str())
+        );
+        assert_eq!(
+            f.inventory
+                .reconcile_torrent_copy_compaction(&|| Ok(()))
+                .unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn compaction_review_does_not_starve_a_later_durable_delivery() {
+        let f = Fixture::new(true, 2);
+        f.run().unwrap();
+        f.inventory
+            .create_delivery_with_outcome_and_keep(
+                2,
+                true,
+                Some("review-child"),
+                "SUCCESS",
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let second = f.root.join("second-child");
+        f.inventory
+            .copy_torrent_acquisition(
+                3,
+                1,
+                HASH,
+                &f.donor,
+                &f.selected,
+                &f.root,
+                &second,
+                false,
+                &|| Ok(()),
+            )
+            .unwrap();
+        let receipt = f
+            .inventory
+            .create_delivery_with_outcome_and_keep(
+                3,
+                true,
+                Some("later-child"),
+                "SUCCESS",
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        f.inventory.db.lock().unwrap().execute("UPDATE torrent_copy_manifests SET data='corrupt' WHERE operation_id='torrent-copy-job-2'",[]).unwrap();
+        assert_eq!(
+            f.inventory
+                .reconcile_torrent_copy_compaction(&|| Ok(()))
+                .unwrap(),
+            1
+        );
+        assert!(
+            f.inventory
+                .operation("torrent-copy-job-2")
+                .unwrap()
+                .error
+                .unwrap()
+                .contains("compaction requires review")
+        );
+        let plan: TorrentCopy =
+            serde_json::from_str(&f.inventory.operation("torrent-copy-job-3").unwrap().request)
+                .unwrap();
+        assert_eq!(
+            plan.compacted_delivery.as_deref(),
+            Some(receipt.delivery_id.as_str())
+        );
+    }
+    #[test]
+    fn unknown_path_retention_commits_before_per_file_pointer_is_cleared() {
+        let mut f = Fixture::new(true, 1);
+        FAULT.with(|fault| *fault.borrow_mut() = Some(("stage_created", 0)));
+        assert!(f.run().is_err());
+        let path = f.root.join(&f.plan().files[0].stage.as_ref().unwrap().name);
+        FAULT.with(|fault| *fault.borrow_mut() = Some(("unknown_retained", 0)));
+        assert!(f.run().is_err());
+        f = f.restart();
+        assert_eq!(f.plan().uncommitted_stages.len(), 1);
+        f.run().unwrap();
+        f.assert_bytes();
+        assert!(path.exists());
+        let events = serde_json::to_string(
+            &f.inventory
+                .events(&f.inventory.for_job(2).unwrap().unwrap().id, 0)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(events.matches("torrent_stage_review").count(), 1);
+        assert!(events.contains(path.to_str().unwrap()));
+    }
+    #[test]
+    fn unknown_staging_paths_and_reason_are_in_existing_artifact_events_and_receipt() {
+        let f = Fixture::new(true, 1);
+        FAULT.with(|fault| *fault.borrow_mut() = Some(("stage_created", 0)));
+        assert!(f.run().is_err());
+        let path = f.root.join(&f.plan().files[0].stage.as_ref().unwrap().name);
+        f.run().unwrap();
+        let op = f.inventory.operation("torrent-copy-job-2").unwrap();
+        assert!(op.error.unwrap().contains(path.to_str().unwrap()));
+        let events = f.inventory.events(&op.artifact, 0).unwrap();
+        let events = serde_json::to_string(&events).unwrap();
+        assert!(events.contains(path.to_str().unwrap()));
+        assert!(events.contains("no durable inode receipt"));
     }
     #[test]
     fn owned_donor_copy_is_independent_and_preserves_seed_policy() {
@@ -1429,7 +2353,7 @@ mod tests {
                 let saved = f.root.join("retained-original-stage");
                 std::fs::rename(&stage, &saved).unwrap();
                 if mutation == "symlink-stage" {
-                    std::os::unix::fs::symlink(&f.donor.join(&f.selected[0].0), &stage).unwrap();
+                    std::os::unix::fs::symlink(f.donor.join(&f.selected[0].0), &stage).unwrap();
                     saved
                 } else {
                     std::fs::write(&stage, b"operator staging bytes").unwrap();
@@ -1560,9 +2484,7 @@ mod tests {
                 .operation("torrent-copy-job-2")
                 .ok()
                 .is_some_and(|op| {
-                    serde_json::from_str::<TorrentCopy>(&op.request)
-                        .unwrap()
-                        .files[0]
+                    load_plan(&f.inventory, &op).unwrap().files[0]
                         .stage
                         .as_ref()
                         .is_some_and(|stage| stage.identity.is_some())
@@ -1600,13 +2522,8 @@ mod tests {
     fn immutable_delivery_compacts_large_plan_and_replay_never_regrows_or_reads_retired_donor() {
         let mut f = Fixture::new(true, 100);
         let copied = f.run().unwrap();
-        let before = f
-            .inventory
-            .operation("torrent-copy-job-2")
-            .unwrap()
-            .request
-            .len();
-        assert!(before > 32 * 1024);
+        let before:i64=f.inventory.db.lock().unwrap().query_row("SELECT length(data) FROM torrent_copy_manifests WHERE operation_id='torrent-copy-job-2'",[],|row|row.get(0)).unwrap();
+        assert!(before > 16 * 1024);
         assert!(
             f.inventory
                 .compact_torrent_copy_for_delivery("missing")
@@ -1903,7 +2820,7 @@ mod tests {
             .cleanup_torrent_copy_stages(2, &|| Ok(()))
             .unwrap();
         assert_eq!(result.state, "review");
-        assert!(result.error.unwrap().contains("uncommitted"));
+        assert!(result.error.unwrap().contains("no durable inode receipt"));
         assert!(unknown.exists());
     }
     #[test]
@@ -1926,12 +2843,18 @@ mod tests {
                 info_hash: HASH.into(),
                 source_root: f.donor.clone(),
                 source_identity: template.identity.clone().unwrap(),
+                target_root_identity: template.root_identity.clone(),
                 destination: f.root.join(format!("review-{index}")),
                 files: Vec::new(),
                 directories: Vec::new(),
+                file_count: 0,
+                directory_count: 0,
+                selection_digest: String::new(),
                 uncommitted_stages: Vec::new(),
                 compacted_delivery: None,
                 compacted_source: None,
+                compacted_delete: None,
+                compacted_stage_cleanup: None,
                 stage_cleanup_complete: false,
             };
             let op = Operation {
@@ -1959,9 +2882,13 @@ mod tests {
             0
         );
         assert!(stage.exists());
-        let review = f.inventory.operation("torrent-copy-job-1000").unwrap();
+        let review = f
+            .inventory
+            .operation("torrent-stage-status-job-1000")
+            .unwrap();
         assert!(review.error.unwrap().contains("Staging cleanup pending"));
-        assert!(review.next_retry > now());
+        assert_eq!(review.state, "review");
+        assert_eq!(review.next_retry, 0);
         f = f.restart();
         assert_eq!(
             f.inventory
