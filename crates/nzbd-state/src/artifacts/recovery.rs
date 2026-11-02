@@ -223,7 +223,8 @@ impl Inventory {
         paths: &[String],
         root: &Path,
     ) -> Result<Recovery> {
-        let _guard = self.mutation_guard()?;
+        let source_lease;
+        let mut guard = Some(self.mutation_guard()?);
         if paths.is_empty() || paths.len() > 1000 || request_id.is_empty() || request_id.len() > 128
         {
             return Err(Error::Conflict(
@@ -241,6 +242,7 @@ impl Inventory {
                 let existing: Recovery = serde_json::from_str(&raw)?;
                 drop(stmt);
                 drop(db);
+                drop(guard.take());
                 return if existing.request == request {
                     self.resume_publication(existing)
                 } else {
@@ -268,6 +270,10 @@ impl Inventory {
                 "recovery root overlaps source or state".into(),
             ));
         }
+        source_lease = self
+            .reserve_reconciliation_locked(std::slice::from_ref(&a), None, guard.as_ref().unwrap())?
+            .ok_or_else(|| Error::Conflict("recovery source remains in use".into()))?;
+        drop(guard.take());
         let source = self.verify(&a)?;
         let observed = fs::manifest(&source, 100_000)?;
         if observed != a.files {
@@ -299,6 +305,10 @@ impl Inventory {
             }
             selected.push(f.clone());
         }
+        // Payload inspection cannot pin the global coordinator. The exact
+        // source generation remains reserved until the whole worker exits.
+        guard = Some(self.mutation_guard()?);
+        self.check_payload_capture(&a)?;
         // Persist both hold and intention atomically before making scratch.
         let mut r = {
             let mut db = self.db.lock().unwrap();
@@ -333,7 +343,7 @@ impl Inventory {
             tx.commit()?;
             r
         };
-        drop(_guard); // The durable hold protects this source while other jobs keep admitting.
+        drop(guard.take());
         let result = (|| {
             let required: u64 = selected.iter().map(|f| f.identity.bytes).sum();
             let mut volume = root;
@@ -348,7 +358,9 @@ impl Inventory {
                 volume,
             )?;
             if available < required.saturating_add(1024 * 1024 * 1024) {
-                return Err(Error::Conflict(format!("recovery staging needs {required} bytes plus 1 GiB reserve; {available} available")));
+                return Err(Error::Conflict(format!(
+                    "recovery staging needs {required} bytes plus 1 GiB reserve; {available} available"
+                )));
             }
             at(std::fs::create_dir_all(root), "create recovery root", root)?;
             at_dir(fs::open_dir(root), "open recovery root", root)?;
@@ -437,7 +449,7 @@ impl Inventory {
             sync_dir_lenient(&staging)?;
             // Journal the complete manifest before publication. Crash recovery
             // may validate it and finish the acknowledgement without recopying.
-            let mut publication_guard = Some(self.mutation_guard()?);
+            let mut publication_guard = None;
             if self.recovery(&r.id)?.state == "cancel_pending" {
                 return Err(Error::Conflict("staging cancelled".into()));
             }
@@ -468,17 +480,26 @@ impl Inventory {
             }
             Ok(())
         })();
-        let _guard = self.mutation_guard()?;
+        if result.is_err() {
+            let scratch = root.join(".staging").join(&r.id);
+            if scratch.try_exists().unwrap_or(false) {
+                self.discover_unlocked(scratch.parent().unwrap(), &scratch)?;
+            }
+        }
+        guard = Some(self.mutation_guard()?);
+        let current_source = self.get(&a.id)?;
+        if current_source.generation != a.generation
+            || current_source.path != a.path
+            || current_source.root != a.root
+        {
+            return Err(Error::Conflict("recovery source generation changed".into()));
+        }
         let cancelled = self.recovery(&r.id)?.state == "cancel_pending";
         match result {
             Ok(()) => r.state = "published".into(),
             Err(e) => {
                 r.state = "failed".into();
                 r.error = Some(e.to_string());
-                let scratch = root.join(".staging").join(&r.id);
-                if scratch.try_exists().unwrap_or(false) {
-                    self.discover_unlocked(scratch.parent().unwrap(), &scratch)?;
-                }
             }
         }
         if cancelled {
@@ -495,12 +516,37 @@ impl Inventory {
         }
         r.updated_at = now();
         save(&self.db.lock().unwrap(), &r)?;
+        drop(guard.take());
+        drop(source_lease);
         Ok(r)
     }
     /// Resolve publication from its durable manifest. Incomplete copying is
     /// retained for explicit review; it is never recursively erased on restart.
     fn resume_publication(&self, mut r: Recovery) -> Result<Recovery> {
+        let lease;
+        let coordinator = self.mutation_guard()?;
+        let current = self.recovery(&r.id)?;
+        if current.generation != r.generation || current.request != r.request {
+            return Err(Error::Conflict("recovery generation changed".into()));
+        }
+        r = current;
+        if !matches!(
+            r.state.as_str(),
+            "staging" | "publishing" | "cancel_pending"
+        ) {
+            return Ok(r);
+        }
+        let mut participants = vec![self.get(&r.artifact)?];
+        if let Ok(staged) = self.get(&format!("recovery-{}", r.id)) {
+            participants.push(staged);
+        }
+        lease = match self.reserve_reconciliation_locked(&participants, None, &coordinator)? {
+            Some(lease) => lease,
+            None => return Ok(r),
+        };
+        drop(coordinator);
         if r.state == "cancel_pending" && r.consumer.is_none() {
+            let coordinator = self.mutation_guard()?;
             r.state = "cancelled".into();
             r.updated_at = now();
             let mut source = self.get(&r.artifact)?;
@@ -508,6 +554,7 @@ impl Inventory {
             source.revision += 1;
             save_artifact(&self.db.lock().unwrap(), &source)?;
             save(&self.db.lock().unwrap(), &r)?;
+            drop(coordinator);
             if let Some(root) = r.published.parent().and_then(Path::parent) {
                 let scratch = root.join(".staging").join(&r.id);
                 if scratch.try_exists().unwrap_or(false) {
@@ -526,7 +573,7 @@ impl Inventory {
             .ok_or_else(|| Error::Conflict("invalid recovery root".into()))?;
         let scratch = root.join(".staging").join(&r.id);
         let result = (|| {
-            let mut publication_guard = Some(self.mutation_guard()?);
+            let mut publication_guard = None;
             if r.state != "publishing" {
                 return Err(Error::Conflict("copy interrupted before its complete manifest was durable; inspect retained staging".into()));
             }
@@ -615,11 +662,42 @@ impl Inventory {
             }
         }
         r.updated_at = now();
+        let coordinator = self.mutation_guard()?;
+        let current = self.recovery(&r.id)?;
+        if current.generation != r.generation || current.request != r.request {
+            return Err(Error::Conflict(
+                "recovery generation changed before acknowledgement".into(),
+            ));
+        }
+        for original in &participants {
+            let observed = self.get(&original.id)?;
+            if observed.generation != original.generation
+                || observed.path != original.path
+                || observed.root != original.root
+            {
+                return Err(Error::Conflict(
+                    "recovery participant generation changed".into(),
+                ));
+            }
+        }
+        if current.state == "cancel_pending" {
+            r.state = "cancelled".into();
+            let mut source = self.get(&r.artifact)?;
+            source.hold = Some("review: cancelled recovery".into());
+            source.revision += 1;
+            save_artifact(&self.db.lock().unwrap(), &source)?;
+            if let Ok(mut staged) = self.get(&format!("recovery-{}", r.id)) {
+                staged.hold = Some("review: cancelled recovery staging".into());
+                staged.revision += 1;
+                save_artifact(&self.db.lock().unwrap(), &staged)?;
+            }
+        }
         save(&self.db.lock().unwrap(), &r)?;
+        drop(coordinator);
+        drop(lease);
         Ok(r)
     }
     pub fn reconcile_recoveries(&self) -> Result<()> {
-        let mut guard = Some(self.mutation_guard()?);
         let pending = {
             let db = self.db.lock().unwrap();
             let mut stmt = db.prepare(
@@ -628,7 +706,6 @@ impl Inventory {
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        drop(guard.take());
         for raw in pending {
             self.resume_publication(serde_json::from_str(&raw)?)?;
         }
@@ -641,6 +718,14 @@ impl Inventory {
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         for id in pending_cleanup {
+            let recovery = self.recovery(&id)?;
+            let mut participants = vec![self.get(&recovery.artifact)?];
+            if let Ok(staged) = self.get(&format!("recovery-{id}")) {
+                participants.push(staged);
+            }
+            let Some(_lease) = self.reserve_reconciliation(&participants)? else {
+                continue;
+            };
             if let Err(e) = self.retire_publication_source_unlocked(&format!("recovery-{id}")) {
                 tracing::warn!(recovery=%id, error=%e, "recovery scratch cleanup remains pending");
             }
@@ -793,6 +878,11 @@ impl Inventory {
             }
             r.state = "cancelled".into();
             let mut a = self.get(&r.artifact)?;
+            if self.reconciliation_in_use(&a) {
+                return Err(Error::Conflict(
+                    "recovery source cleanup or reconciliation is active".into(),
+                ));
+            }
             if let Ok(mut staged) = self.get(&format!("recovery-{}", r.id)) {
                 staged.hold = Some("review: cancelled recovery staging".into());
                 staged.revision += 1;
@@ -812,7 +902,8 @@ impl Inventory {
     /// Explicit, receipt-scoped source cleanup. Other source files and partial
     /// failures remain held; a receipt never authorizes deleting a whole tree.
     pub fn prune_receipted_source(&self, key: &str) -> Result<()> {
-        let _guard = self.mutation_guard()?;
+        let lease;
+        let coordinator = self.mutation_guard()?;
         let r = self.recovery(key)?;
         if !matches!(r.state.as_str(), "imported" | "partial") {
             return Err(Error::Conflict(
@@ -837,13 +928,22 @@ impl Inventory {
         }) {
             return Err(Error::Conflict("source has an unrelated hold".into()));
         }
+        lease = self
+            .reserve_reconciliation_locked(std::slice::from_ref(&a), None, &coordinator)?
+            .ok_or_else(|| Error::Conflict("receipt source remains in use".into()))?;
+        drop(coordinator);
+        let original = a.clone();
         self.verify_root(&a)?;
         if !a.path.try_exists()? {
             a.state = "source_gone".into();
             a.hold = None;
             a.updated_at = now();
             a.revision += 1;
+            let coordinator = self.mutation_guard()?;
+            self.check_payload_capture(&original)?;
             save_artifact(&self.db.lock().unwrap(), &a)?;
+            drop(coordinator);
+            drop(lease);
             return Ok(());
         }
         let dir = self.verify(&a)?;
@@ -933,6 +1033,14 @@ impl Inventory {
         a.files = remaining;
         a.revision += 1;
         a.updated_at = now();
+        let coordinator = self.mutation_guard()?;
+        self.check_payload_capture(&original)?;
+        let current = self.recovery(key)?;
+        if current.generation != r.generation || current.receipt != r.receipt {
+            return Err(Error::Conflict(
+                "receipt changed during source cleanup".into(),
+            ));
+        }
         save_artifact(&self.db.lock().unwrap(), &a)?;
         event(
             &self.db.lock().unwrap(),
@@ -940,6 +1048,8 @@ impl Inventory {
             "receipt_source_cleanup",
             key,
         )?;
+        drop(coordinator);
+        drop(lease);
         Ok(())
     }
 }

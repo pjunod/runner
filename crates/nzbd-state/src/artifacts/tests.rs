@@ -1893,7 +1893,14 @@ fn lifecycle_scale_one_million_tombstones() {
     let bytes = std::fs::metadata(tmp.path().join("state/artifacts.sqlite"))
         .unwrap()
         .len();
-    eprintln!("lifecycle rows=1000001 list_p95_ms={:.3} database_bytes={} preparation_seconds={:.1} os={} arch={}",times[94],bytes,started.elapsed().as_secs_f64(),std::env::consts::OS,std::env::consts::ARCH);
+    eprintln!(
+        "lifecycle rows=1000001 list_p95_ms={:.3} database_bytes={} preparation_seconds={:.1} os={} arch={}",
+        times[94],
+        bytes,
+        started.elapsed().as_secs_f64(),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
     assert!(
         times[94] < 200.0,
         "cached first-page latency exceeded design target"
@@ -1931,7 +1938,7 @@ fn queued_expiry_is_invalidated_by_a_fresh_policy_or_disabled_automation() {
     }
 }
 #[test]
-fn startup_orphaned_active_allocation_is_reviewable_and_detached_from_job_id() {
+fn startup_orphaned_active_allocation_preserves_binding_until_explicit_successor() {
     let (_tmp, db, root) = fixture();
     let a = db.allocate(42, &root, &root.join("orphan")).unwrap();
     std::fs::write(a.path.join("media.mkv"), b"keep").unwrap();
@@ -1939,9 +1946,11 @@ fn startup_orphaned_active_allocation_is_reviewable_and_detached_from_job_id() {
     let orphan = db.get(&a.id).unwrap();
     assert_eq!(orphan.state, "retained");
     assert!(orphan.keep && orphan.hold.is_some());
-    assert!(db.for_job(42).unwrap().is_none());
+    assert_eq!(db.for_job(42).unwrap().unwrap().id, a.id);
     assert!(db.inspect(&a.id).is_ok());
-    assert!(db.allocate(42, &root, &root.join("new-job")).is_ok());
+    assert!(db
+        .allocate_processing_successor(42, &root, &root.join("new-job"))
+        .is_ok());
 }
 #[test]
 fn enabled_discovery_coalesces_and_scans_explicit_nested_category_roots() {
@@ -2067,8 +2076,21 @@ fn scan_reports_a_folder_it_cannot_measure_without_failing_the_scan() {
     std::fs::write(good.join("a.mkv"), b"media").unwrap();
     let odd = root.join("odd");
     std::fs::create_dir(&odd).unwrap();
-    // A socket is a special file: the manifest walk refuses it.
-    let _sock = std::os::unix::net::UnixListener::bind(odd.join("ctl.sock")).unwrap();
+    // A FIFO is a special file: the manifest walk refuses it. Unlike a Unix
+    // socket, its pathname also works beneath long managed workspace roots.
+    use std::os::unix::ffi::OsStrExt;
+    let fifo_path = odd.join("ctl.fifo");
+    let fifo_name = std::ffi::CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: fifo_name is a live NUL-terminated pathname; mkfifo retains no
+    // pointer after returning. The fixture owns its containing directory.
+    let created = unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) };
+    assert_eq!(
+        created,
+        0,
+        "{}: {}",
+        fifo_path.display(),
+        std::io::Error::last_os_error()
+    );
     let op = db
         .submit_task(
             "scan",
@@ -2081,8 +2103,8 @@ fn scan_reports_a_folder_it_cannot_measure_without_failing_the_scan() {
     assert_eq!(db.operation(&op.id).unwrap().state, "succeeded");
     let odd_row = db.for_path(&odd).unwrap().unwrap();
     assert!(!odd_row.measured());
-    // open(2) refuses a socket (ENXIO) before the walk can even classify it;
-    // whichever layer objects, the reason lands on the record.
+    // The descriptor opens without blocking, then the manifest rejects its
+    // nonregular file type. The actionable reason lands on the record.
     assert!(
         !odd_row.error.as_deref().unwrap_or("").is_empty(),
         "{:?}",
@@ -2523,4 +2545,187 @@ fn recovery_cleanup_failure_keeps_publication_claimable_and_retries_after_restar
         assert!(!scratch.exists());
         assert!(r.published.join("payload/episode.mkv").is_file());
     }
+}
+
+#[test]
+fn blocked_startup_root_does_not_block_other_root_or_durable_metadata() {
+    use std::sync::{mpsc, Condvar};
+    let (_tmp, inventory, root_a) = fixture();
+    let root_b = root_a.parent().unwrap().join("other-root");
+    std::fs::create_dir(&root_b).unwrap();
+    inventory
+        .allocate(81, &root_a, &root_a.join("retiring"))
+        .unwrap();
+    inventory.prepare_forget(81).unwrap();
+    let inventory = Arc::new(inventory);
+    let (arrive, arrival) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    *startup::ROOT_OPEN_GATE.lock().unwrap() = Some((root_a.clone(), arrive, release.clone()));
+    let recovering = inventory.clone();
+    let recovery = std::thread::spawn(move || recovering.reconcile_startup_root(&root_a, &[81]));
+    if arrival.recv_timeout(Duration::from_secs(2)).is_err() {
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        *startup::ROOT_OPEN_GATE.lock().unwrap() = None;
+        panic!("root recovery did not reach the payload-open boundary");
+    }
+    let healthy = inventory.clone();
+    let (send, receive) = mpsc::channel();
+    let admission = std::thread::spawn(move || {
+        let result = (|| {
+            let mut settings = healthy.settings()?;
+            settings.failed_retention_days = 3;
+            healthy.set_settings(&settings)?;
+            healthy.allocate(82, &root_b, &root_b.join("new-job"))?;
+            Ok::<_, Error>(())
+        })();
+        send.send(result).unwrap();
+    });
+    let result = receive.recv_timeout(Duration::from_secs(2));
+    // Always release the worker before asserting, even on regression.
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    recovery.join().unwrap().unwrap();
+    admission.join().unwrap();
+    result
+        .expect("healthy root and durable metadata waited for the blocked payload root")
+        .unwrap();
+    assert_eq!(inventory.settings().unwrap().failed_retention_days, 3);
+    assert!(inventory.for_job(82).unwrap().is_some());
+}
+
+#[test]
+fn adopted_startup_orphan_restores_only_automatic_keep_and_hold() {
+    let (_tmp, inventory, root) = fixture();
+    let artifact = inventory
+        .allocate(83, &root, &root.join("adopted"))
+        .unwrap();
+    inventory.reconcile_startup_root(&root, &[]).unwrap();
+    let recovered = inventory.reclaim_recovered_orphan(83).unwrap().unwrap();
+    assert_eq!(recovered.id, artifact.id);
+    assert_eq!(recovered.state, "active");
+    assert_eq!(recovered.keep, artifact.keep);
+    assert_eq!(recovered.hold, artifact.hold);
+    let kept = inventory
+        .retention(&recovered.id, recovered.revision, true, None)
+        .unwrap();
+    inventory.reconcile_startup_root(&root, &[]).unwrap();
+    let recovered = inventory.reclaim_recovered_orphan(83).unwrap().unwrap();
+    assert!(recovered.keep && kept.keep);
+}
+
+#[test]
+fn legacy_worker_enrollment_allows_operational_custody_without_cleanup_ownership() {
+    let (_tmp, inventory, root) = fixture();
+    let inventory = Arc::new(inventory);
+    let path = root.join("shared-worker-input");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("payload.bin"), b"shared bytes").unwrap();
+    inventory.register_legacy_active(801, &root, &path).unwrap();
+    let admitted = inventory.for_job(801).unwrap().unwrap();
+    assert_eq!(admitted.state, "active");
+    assert!(!admitted.owned);
+    assert!(admitted.keep);
+    assert!(admitted.hold.is_none());
+    assert_eq!(
+        inventory.allocate(801, &root, &path).unwrap().id,
+        admitted.id
+    );
+    let custody = inventory
+        .acquire_terminal_use(801, &|| Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(custody.source().artifact, admitted.id);
+    assert!(inventory
+        .request_delete(&admitted.id, admitted.revision, "must-not-delete", 0)
+        .is_err());
+    drop(custody);
+
+    let mut held = inventory.for_job(801).unwrap().unwrap();
+    held.hold = Some("review: operator blocked this source".into());
+    held.revision += 1;
+    save_artifact(&inventory.db.lock().unwrap(), &held).unwrap();
+    inventory.register_legacy_active(801, &root, &path).unwrap();
+    let preserved = inventory.for_job(801).unwrap().unwrap();
+    assert_eq!(preserved.hold, held.hold);
+    assert_eq!(preserved.revision, held.revision);
+}
+
+#[test]
+fn unavailable_legacy_enrollment_preserves_existing_association_and_controls() {
+    let (temp, inventory, root) = fixture();
+    let path = root.join("shared-worker-input");
+    std::fs::create_dir(&path).unwrap();
+    inventory.register_legacy_active(802, &root, &path).unwrap();
+    let before = inventory.for_job(802).unwrap().unwrap();
+    std::fs::rename(&root, temp.path().join("offline-root")).unwrap();
+    assert!(inventory.register_legacy_active(802, &root, &path).is_err());
+    let after = inventory.for_job(802).unwrap().unwrap();
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.path, before.path);
+    assert_eq!(after.hold, before.hold);
+    assert_eq!(after.job, Some(802));
+}
+
+#[test]
+fn completed_relocation_retirement_requires_released_exact_generation() {
+    let (_temporary, inventory, root) = fixture();
+    let inventory = Arc::new(inventory);
+    let source_path = root.join("generation-retirement-source");
+    inventory
+        .allocate_for_delivery(84, &root, &source_path, true, false)
+        .unwrap();
+    std::fs::write(source_path.join("episode.mkv"), b"verified publication").unwrap();
+    let source = inventory.finish(84, &source_path, &root, "active").unwrap();
+    let use_guard = inventory.acquire_attempt_use(84).unwrap().unwrap();
+    let generation = use_guard.source().clone();
+    let published_root = root
+        .parent()
+        .unwrap()
+        .join("completed-generation-retirement");
+    std::fs::create_dir(&published_root).unwrap();
+    let published_path = published_root.join("published");
+    let publication = inventory
+        .publish_selected_checked(
+            84,
+            &published_path,
+            source.files.clone(),
+            vec![DeliveryFileOutcome {
+                source_path: "episode.mkv".into(),
+                publication_path: Some("episode.mkv".into()),
+                classification: "video".into(),
+                outcome: "published".into(),
+                reason: None,
+                repair_dependency: false,
+                source_cleanup_status: "pending".into(),
+            }],
+            &|| Ok(()),
+        )
+        .unwrap();
+    let retired_source_id = format!("source-{}", publication.operation_id);
+    assert!(inventory.retire_completed_relocations(&generation).is_err());
+    assert!(source_path.join("episode.mkv").exists());
+
+    drop(use_guard);
+    inventory
+        .retire_completed_relocations(&SourceGeneration {
+            artifact: generation.artifact.clone(),
+            generation: "another-generation".into(),
+        })
+        .unwrap();
+    assert!(source_path.join("episode.mkv").exists());
+    assert_ne!(inventory.get(&retired_source_id).unwrap().state, "deleted");
+
+    inventory.retire_completed_relocations(&generation).unwrap();
+    assert!(!source_path.exists());
+    assert_eq!(inventory.get(&retired_source_id).unwrap().state, "deleted");
+    let published = inventory.for_job(84).unwrap().unwrap();
+    let descriptor = inventory.verify(&published).unwrap();
+    assert_eq!(fs::manifest(&descriptor, 100_000).unwrap(), published.files);
+    assert_eq!(
+        std::fs::read(published_path.join("episode.mkv")).unwrap(),
+        b"verified publication"
+    );
 }

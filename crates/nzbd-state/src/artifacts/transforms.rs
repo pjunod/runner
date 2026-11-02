@@ -121,8 +121,50 @@ pub struct WorkspaceAttempt {
     pub identity: Option<Identity>,
 }
 impl Inventory {
+    fn runtime_workspace_captures(&self, workspace: &Workspace) -> Result<[Artifact; 2]> {
+        let source = self.get(&workspace.source.id)?;
+        let scratch = self.get(&workspace.scratch.id)?;
+        if source.generation != workspace.source.generation
+            || source.path != workspace.source.path
+            || source.root != workspace.source.root
+            || source.terminal()
+            || source.hold.is_some()
+            || scratch.generation != workspace.scratch.generation
+            || scratch.path != workspace.scratch.path
+            || scratch.root != workspace.scratch.root
+            || scratch.terminal()
+        {
+            return Err(Error::Conflict(
+                "transform participant generation or custody changed".into(),
+            ));
+        }
+        Ok([source, scratch])
+    }
+
+    fn save_transform_progress(
+        &self,
+        operation: &Operation,
+        previous: &Operation,
+        captures: &[Artifact],
+    ) -> Result<()> {
+        let _coordinator = self.mutation_guard()?;
+        for capture in captures {
+            self.check_payload_capture(capture)?;
+        }
+        let current = self.operation(&previous.id)?;
+        if current.request != previous.request
+            || current.state != previous.state
+            || current.kind != previous.kind
+            || current.artifact != previous.artifact
+        {
+            return Err(Error::Conflict(
+                "transform journal changed during payload work".into(),
+            ));
+        }
+        save_operation(&self.db.lock().unwrap(), operation)
+    }
+
     pub fn workspace(&self, job: u32, kind: &str, token: &str) -> Result<Workspace> {
-        let _guard = self.mutation_guard()?;
         if !matches!(kind, "extract" | "par_repair")
             || token.len() > 128
             || !token.bytes().all(|c| c.is_ascii_hexdigit())
@@ -133,6 +175,10 @@ impl Inventory {
         if source.hold.is_some() || !matches!(source.state.as_str(), "active" | "transitioning") {
             return Err(Error::Conflict("transform source is held".into()));
         }
+        let mut lease = self
+            .reserve_processing_mutation(std::slice::from_ref(&source))?
+            .ok_or_else(|| Error::Conflict("transform namespace remains in use".into()))?;
+        let source_before = source.clone();
         let logical_key = format!("{kind}-{}-{}-{token}", source.id, source.generation);
         let raw: Option<String> = self.db.lock().unwrap().query_row(
             "SELECT data FROM operations WHERE (id=?1 OR json_extract(json_extract(data,'$.request'),'$.logical_key')=?1) ORDER BY rowid DESC LIMIT 1",
@@ -162,8 +208,21 @@ impl Inventory {
                 {
                     return Err(Error::Conflict("workspace requires review".into()));
                 }
+                {
+                    let coordinator = self.mutation_guard()?;
+                    self.check_payload_capture(&source_before)?;
+                    lease.extend_locked(&scratch, &coordinator)?;
+                }
                 self.verify(&scratch)?;
                 self.verify_workspace_attempts(&workspace)?;
+                let _coordinator = self.mutation_guard()?;
+                self.check_payload_capture(&source_before)?;
+                self.check_payload_capture(&scratch)?;
+                if self.operation(&op.id)?.request != op.request {
+                    return Err(Error::Conflict(
+                        "transform journal changed while reopening workspace".into(),
+                    ));
+                }
                 return Ok(workspace);
             }
         }
@@ -218,12 +277,19 @@ impl Inventory {
         source.state = "transitioning".into();
         source.revision += 1;
         {
+            let coordinator = self.mutation_guard()?;
+            self.check_payload_capture(&source_before)?;
             let mut db = self.db.lock().unwrap();
             let tx = db.transaction()?;
             save_operation(&tx, &op)?;
             save_artifact(&tx, &source)?;
+            save_artifact(&tx, &workspace.scratch)?;
             tx.commit()?;
+            drop(db);
+            lease.extend_locked(&workspace.scratch, &coordinator)?;
         }
+        let pending_scratch = workspace.scratch.clone();
+        let pending_operation = op.clone();
         // A crash before identity commit leaves an unowned allocation for review.
         std::fs::create_dir(&path)?;
         fs::sync_directory(&workspace_dir)?;
@@ -232,6 +298,14 @@ impl Inventory {
         workspace.scratch.state = "active".into();
         self.sidecar(&workspace.scratch)?;
         op.request = serde_json::to_string(&workspace)?;
+        let _coordinator = self.mutation_guard()?;
+        self.check_payload_capture(&source)?;
+        self.check_payload_capture(&pending_scratch)?;
+        if self.operation(&op.id)?.request != pending_operation.request {
+            return Err(Error::Conflict(
+                "transform allocation journal changed".into(),
+            ));
+        }
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         save_artifact(&tx, &workspace.scratch)?;
@@ -281,6 +355,15 @@ impl Inventory {
         let relative = relatives[0].clone();
         let _guard = self.mutation_guard()?;
         let mut op = self.operation(&workspace.operation_id)?;
+        let [current_source, current_scratch] = self.runtime_workspace_captures(workspace)?;
+        if self.reconciliation_in_use(&current_source)
+            || self.reconciliation_in_use(&current_scratch)
+            || op.request != serde_json::to_string(workspace)?
+        {
+            return Err(Error::Conflict(
+                "extraction journal is busy or changed".into(),
+            ));
+        }
         if workspace.input_paths == relatives && workspace.input_path.as_deref() == Some(&relative)
         {
             return Ok(());
@@ -361,9 +444,13 @@ impl Inventory {
 
     /// Journal a new extraction generation; prior bytes are never reused or deleted.
     pub fn begin_workspace_attempt(&self, workspace: &mut Workspace) -> Result<PathBuf> {
-        let _guard = self.mutation_guard()?;
         let mut op = self.operation(&workspace.operation_id)?;
         let mut current: Workspace = serde_json::from_str(&op.request)?;
+        let captures = self.runtime_workspace_captures(&current)?;
+        let _lease = self
+            .reserve_processing_mutation(&captures)?
+            .ok_or_else(|| Error::Conflict("workspace attempt remains in use".into()))?;
+        let mut previous = op.clone();
         self.verify_workspace_attempts(&current)?;
         if !matches!(op.kind.as_str(), "extract" | "par_repair")
             || !(op.state == "running"
@@ -379,7 +466,8 @@ impl Inventory {
             identity: None,
         });
         op.request = serde_json::to_string(&current)?;
-        save_operation(&self.db.lock().unwrap(), &op)?;
+        self.save_transform_progress(&op, &previous, &captures)?;
+        previous = op.clone();
         let path = current.scratch.path.join(&directory);
         std::fs::create_dir(&path)?;
         fs::sync_directory(&self.verify(&current.scratch)?)?;
@@ -387,14 +475,13 @@ impl Inventory {
             Some(fs::identity_for_file(&fs::open_dir(&path)?)?);
         op.request = serde_json::to_string(&current)?;
         op.attempts = current.attempts.len() as u32;
-        save_operation(&self.db.lock().unwrap(), &op)?;
+        self.save_transform_progress(&op, &previous, &captures)?;
         *workspace = current;
         Ok(path)
     }
 
     /// Revalidate the captured source generation and root before transform work.
     pub fn validate_workspace_source(&self, workspace: &Workspace) -> Result<()> {
-        let _guard = self.mutation_guard()?;
         let source = self.get(&workspace.source.id)?;
         if source.generation != workspace.source.generation
             || source.path != workspace.source.path
@@ -405,7 +492,12 @@ impl Inventory {
                 "transform source generation or authority changed".into(),
             ));
         }
+        let _lease = self
+            .reserve_processing_mutation(std::slice::from_ref(&source))?
+            .ok_or_else(|| Error::Conflict("transform source is busy".into()))?;
         self.verify(&source)?;
+        let _coordinator = self.mutation_guard()?;
+        self.check_payload_capture(&source)?;
         Ok(())
     }
 
@@ -419,7 +511,12 @@ impl Inventory {
             .files
             .iter()
             .find(|f| f.path == relative)
-            .ok_or_else(|| Error::Conflict("original is outside captured manifest".into()))?;
+            .ok_or_else(|| Error::Conflict("original is outside captured manifest".into()))?
+            .clone();
+        let captures = self.runtime_workspace_captures(workspace)?;
+        let _lease = self
+            .reserve_processing_mutation(&captures)?
+            .ok_or_else(|| Error::Conflict("transform original remains in use".into()))?;
         let parent = Path::new(relative).parent().unwrap_or(Path::new(""));
         use sha2::{Digest, Sha256};
         let backup = parent.join(format!(
@@ -436,7 +533,6 @@ impl Inventory {
         // Hash through a stable descriptor before taking the global mutation
         // guard. Large media files must not block unrelated custody controls.
         let digest = digest_open(&mut original.try_clone()?)?;
-        let _guard = self.mutation_guard()?;
         let current = self.get(&workspace.source.id)?;
         if current.generation != workspace.source.generation
             || current.path != workspace.source.path
@@ -447,6 +543,12 @@ impl Inventory {
             ));
         }
         let mut op = self.operation(&workspace.operation_id)?;
+        let mut previous = op.clone();
+        if op.request != serde_json::to_string(workspace)? {
+            return Err(Error::Conflict(
+                "transform journal changed before retaining original".into(),
+            ));
+        }
         let latest_workspace: Workspace = serde_json::from_str(&op.request)?;
         if latest_workspace.source.generation != workspace.source.generation
             || latest_workspace.operation_id != workspace.operation_id
@@ -475,7 +577,7 @@ impl Inventory {
                 }
                 workspace.retained.insert(relative.into(), backup);
                 op.request = serde_json::to_string(workspace)?;
-                save_operation(&self.db.lock().unwrap(), &op)?;
+                self.save_transform_progress(&op, &previous, &captures)?;
                 return Ok(());
             }
             return Err(Error::Conflict("retained original identity changed".into()));
@@ -483,7 +585,8 @@ impl Inventory {
         workspace.retained.insert(relative.into(), backup.clone());
         workspace.retained_digests.insert(relative.into(), digest);
         op.request = serde_json::to_string(workspace)?;
-        save_operation(&self.db.lock().unwrap(), &op)?;
+        self.save_transform_progress(&op, &previous, &captures)?;
+        previous = op.clone();
         fs::rename_exclusive(
             &workspace.source.path.join(relative),
             &workspace.source.path.join(&backup),
@@ -504,7 +607,7 @@ impl Inventory {
             captured.identity = observed;
         }
         op.request = serde_json::to_string(workspace)?;
-        save_operation(&self.db.lock().unwrap(), &op)?;
+        self.save_transform_progress(&op, &previous, &captures)?;
         Ok(())
     }
 
@@ -586,7 +689,6 @@ impl Inventory {
     /// may have been journal-renamed, but every output must retain its complete
     /// identity in the current owned manifest AND on disk.
     pub fn extraction_published(&self, workspace: &Workspace) -> Result<bool> {
-        let _guard = self.mutation_guard()?;
         let op = self.operation(&workspace.operation_id)?;
         if op.kind != "extract" || op.state != "succeeded" {
             return Ok(false);
@@ -603,6 +705,9 @@ impl Inventory {
                 "extraction no longer owns this generation".into(),
             ));
         }
+        let _lease = self
+            .reserve_processing_mutation(std::slice::from_ref(&source))?
+            .ok_or_else(|| Error::Conflict("extraction source remains in use".into()))?;
         let root = self.verify(&source)?;
         for expected in outputs {
             let entry = source
@@ -616,6 +721,13 @@ impl Inventory {
                     "published extraction output changed".into(),
                 ));
             }
+        }
+        let _coordinator = self.mutation_guard()?;
+        self.check_payload_capture(&source)?;
+        if self.operation(&op.id)?.request != op.request {
+            return Err(Error::Conflict(
+                "extraction journal changed during validation".into(),
+            ));
         }
         Ok(true)
     }
@@ -659,6 +771,9 @@ impl Inventory {
         let Some(source) = self.for_job(job)? else {
             return Ok(Default::default());
         };
+        let _lease = self
+            .reserve_processing_mutation(std::slice::from_ref(&source))?
+            .ok_or_else(|| Error::Conflict("custody evidence source remains in use".into()))?;
         let root = self.verify(&source)?;
         let renamed = self.verified_renames(&source, &root, &mut checkpoint)?;
         let raws = {
@@ -788,6 +903,8 @@ impl Inventory {
                 }
             }
         }
+        let _coordinator = self.mutation_guard()?;
+        self.check_payload_capture(&source)?;
         Ok(CustodyEvidence {
             restored: renamed
                 .into_iter()
@@ -818,12 +935,18 @@ impl Inventory {
         let Some(source) = self.for_job(job)? else {
             return Ok(Default::default());
         };
+        let _lease = self
+            .reserve_processing_mutation(std::slice::from_ref(&source))?
+            .ok_or_else(|| Error::Conflict("custody evidence source remains in use".into()))?;
         let root = self.verify(&source)?;
-        Ok(self
+        let result = self
             .verified_renames(&source, &root, &mut checkpoint)?
             .into_iter()
             .map(|(old, rename)| (old, rename.current))
-            .collect())
+            .collect();
+        let _coordinator = self.mutation_guard()?;
+        self.check_payload_capture(&source)?;
+        Ok(result)
     }
 
     /// Every former path of a file whose owned-rename chain still verifies,
@@ -940,11 +1063,19 @@ impl Inventory {
         output: Option<&Path>,
         succeeded: bool,
     ) -> Result<()> {
-        let _guard = self.mutation_guard()?;
-        let mut source = self.get(&workspace.source.id)?;
-        if source.generation != workspace.source.generation {
+        let captures = self.runtime_workspace_captures(workspace)?;
+        let mut source = captures[0].clone();
+        let mut scratch = captures[1].clone();
+        let _lease = self
+            .reserve_processing_mutation(&captures)?
+            .ok_or_else(|| Error::Conflict("transform output remains in use".into()))?;
+        let previous = self.operation(&workspace.operation_id)?;
+        let mut journal_workspace: Workspace = serde_json::from_str(&previous.request)?;
+        journal_workspace.published_files = workspace.published_files.clone();
+        journal_workspace.verified_output_paths = workspace.verified_output_paths.clone();
+        if serde_json::to_string(&journal_workspace)? != serde_json::to_string(workspace)? {
             return Err(Error::Conflict(
-                "transform source generation changed".into(),
+                "transform completion uses a stale workspace journal".into(),
             ));
         }
         let dir = self.verify(&source)?;
@@ -962,14 +1093,14 @@ impl Inventory {
                 return Err(Error::Conflict("transform input changed".into()));
             }
         }
-        let mut scratch = self.get(&workspace.scratch.id)?;
         let stage = self.verify(&scratch)?;
         scratch.files = fs::manifest(&stage, 100_000)?;
         scratch.state = "retained".into();
+        scratch.revision += 1;
         source.state = "active".into();
         source.revision += 1;
         source.files = fs::manifest(&dir, 100_000)?;
-        let mut op = self.operation(&workspace.operation_id)?;
+        let mut op = previous.clone();
         if let Some(output) = output {
             let output_root = fs::open_dir(output)?;
             let mut finished = workspace.clone();
@@ -1010,6 +1141,16 @@ impl Inventory {
             op.request = serde_json::to_string(&finished)?;
         }
         op.state = if succeeded { "succeeded" } else { "failed" }.into();
+        let _coordinator = self.mutation_guard()?;
+        for capture in &captures {
+            self.check_payload_capture(capture)?;
+        }
+        let current = self.operation(&previous.id)?;
+        if current.request != previous.request || current.state != previous.state {
+            return Err(Error::Conflict(
+                "transform completion journal changed".into(),
+            ));
+        }
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         save_artifact(&tx, &source)?;
@@ -1035,6 +1176,10 @@ impl Inventory {
     pub fn restore_file(&self, job: u32, from: &Path, to: &Path) -> Result<()> {
         use sha2::{Digest, Sha256};
         let mut source = self.for_job(job)?.ok_or(Error::NotFound)?;
+        let original = source.clone();
+        let _lease = self
+            .reserve_processing_mutation(std::slice::from_ref(&source))?
+            .ok_or_else(|| Error::Conflict("restore namespace remains in use".into()))?;
         let old = from
             .strip_prefix(&source.path)
             .map_err(|_| Error::Conflict("restore source outside payload".into()))?;
@@ -1053,7 +1198,6 @@ impl Inventory {
         // Keep the potentially large content pass outside the global mutation
         // lock, then revalidate the exact source generation and identity.
         let digest = digest_open(&mut file.try_clone()?)?;
-        let _guard = self.mutation_guard()?;
         let current = self.for_job(job)?.ok_or(Error::NotFound)?;
         if current.id != source.id
             || current.generation != source.generation
@@ -1092,7 +1236,22 @@ impl Inventory {
             next_retry: 0,
             error: None,
         };
-        save_operation(&self.db.lock().unwrap(), &op)?;
+        {
+            let _coordinator = self.mutation_guard()?;
+            self.check_payload_capture(&original)?;
+            match self.operation(&op.id) {
+                Err(Error::NotFound) => (),
+                Ok(previous) if previous.request == op.request && previous.state == "running" => (),
+                Ok(_) => {
+                    return Err(Error::Conflict(
+                        "restore journal already belongs to another transition".into(),
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+            save_operation(&self.db.lock().unwrap(), &op)?;
+        }
+        let previous = op.clone();
         if let Some(parent) = new.parent() {
             crate::fileops::parents(&source.path, parent)?;
         }
@@ -1105,6 +1264,14 @@ impl Inventory {
         source.files = fs::manifest(&root, 100_000)?;
         source.revision += 1;
         op.state = "succeeded".into();
+        let _coordinator = self.mutation_guard()?;
+        self.check_payload_capture(&original)?;
+        let current = self.operation(&previous.id)?;
+        if current.request != previous.request || current.state != previous.state {
+            return Err(Error::Conflict(
+                "restore journal changed during rename".into(),
+            ));
+        }
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         save_artifact(&tx, &source)?;
@@ -1116,19 +1283,76 @@ impl Inventory {
 
 impl Inventory {
     /// Reconcile journaled mappings before new queue or PP operations start.
+    #[cfg(test)]
     pub(super) fn reconcile_transforms(&self) -> Result<()> {
-        let mut guard = Some(self.mutation_guard()?);
+        for root in self.startup_reconciliation_roots()? {
+            self.reconcile_transforms_root(&root)?;
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(super) fn reconcile_transforms_root(&self, root: &Path) -> Result<()> {
+        self.reconcile_transforms_root_snapshot(root, None)
+    }
+    pub(super) fn reconcile_transforms_root_snapshot(
+        &self,
+        root: &Path,
+        snapshot: Option<&StartupReconciliation>,
+    ) -> Result<()> {
         let raws = {
             let db = self.db.lock().unwrap();
-            let mut statement=db.prepare("SELECT data FROM operations WHERE (state='running' OR (state='retry' AND COALESCE(json_extract(data,'$.next_retry'),0)<=?1)) AND json_extract(data,'$.kind') IN ('par_restore','par_repair','extract')")?;
-            let rows = statement.query_map([now()], |r| r.get::<_, String>(0))?;
+            let mut statement=db.prepare("SELECT o.data FROM operations o JOIN artifacts a ON a.id=o.artifact WHERE json_extract(a.data,'$.root')=?2 AND (o.state='running' OR (o.state='retry' AND COALESCE(json_extract(o.data,'$.next_retry'),0)<=?1)) AND json_extract(o.data,'$.kind') IN ('par_restore','par_repair','extract')")?;
+            let rows = statement
+                .query_map(params![now(), root.to_string_lossy().as_ref()], |r| {
+                    r.get::<_, String>(0)
+                })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         for raw in raws {
             let mut op: Operation = serde_json::from_str(&raw)?;
+            let source = self.get(&op.artifact)?;
+            if let Some(snapshot) = snapshot {
+                if !snapshot.contains_operation(&op)? || !snapshot.allows_artifact(self, &source)? {
+                    continue;
+                }
+            }
+            let mut participants = vec![source.clone()];
+            let mut obsolete = source.terminal() || source.state == "deleting";
+            if op.kind != "par_restore" {
+                let workspace: Workspace = serde_json::from_str(&op.request)?;
+                obsolete |= source.generation != workspace.source.generation;
+                if !obsolete {
+                    participants.push(self.get(&workspace.scratch.id)?);
+                }
+            }
+            if obsolete {
+                let _coordinator = self.mutation_guard()?;
+                self.check_reconciliation_source(&op, &source)?;
+                op.state = "cancelled".into();
+                op.error = Some("transform no longer owns the source generation".into());
+                save_operation(&self.db.lock().unwrap(), &op)?;
+                continue;
+            }
+            let Some(_lease) = self.reserve_reconciliation(&participants)? else {
+                continue;
+            };
+            if let Some(snapshot) = snapshot {
+                let mut allowed = true;
+                for participant in &participants {
+                    allowed &= snapshot.allows_artifact(self, participant)?;
+                }
+                if !allowed {
+                    continue;
+                }
+            }
+            let baseline = self.operation(&op.id)?;
+            if baseline.request != op.request || baseline.state != op.state {
+                continue;
+            }
             if op.state == "retry" {
                 op.state = "running".into();
                 op.next_retry = 0;
+                let _coordinator = self.mutation_guard()?;
                 save_operation(&self.db.lock().unwrap(), &op)?;
             }
             let current = self.get(&op.artifact)?;
@@ -1141,6 +1365,7 @@ impl Inventory {
                     // or inventing authority from today's bytes.
                     op.state = "review".into();
                     op.error = Some("legacy restore journal lacks rename content proof".into());
+                    let _coordinator = self.mutation_guard()?;
                     save_operation(&self.db.lock().unwrap(), &op)?;
                     continue;
                 }
@@ -1157,6 +1382,7 @@ impl Inventory {
             {
                 op.state = "cancelled".into();
                 op.error = Some("transform no longer owns the source generation".into());
+                let _coordinator = self.mutation_guard()?;
                 save_operation(&self.db.lock().unwrap(), &op)?;
                 continue;
             }
@@ -1185,7 +1411,6 @@ impl Inventory {
                         (Ok(_), Ok(_)) | (Ok(_), Err(_)) | (Err(_), Ok(_))
                     );
                     let (before_digest, after_digest) = if needs_hash {
-                        drop(guard.take());
                         let before_digest = before
                             .as_ref()
                             .ok()
@@ -1196,7 +1421,6 @@ impl Inventory {
                             .ok()
                             .map(|file| digest_open(&mut file.try_clone()?))
                             .transpose()?;
-                        guard = Some(self.mutation_guard()?);
                         let current_op = self.operation(&op.id)?;
                         let current_source = self.get(&op.artifact)?;
                         let before_rechecked = match &before {
@@ -1250,10 +1474,14 @@ impl Inventory {
                         _ => {
                             return Err(Error::Conflict(
                                 "interrupted restore has ambiguous identities".into(),
-                            ))
+                            ));
                         }
                     }
-                    source.files = fs::manifest(&root, 100_000)?;
+                    let files = fs::manifest(&root, 100_000)?;
+                    let _coordinator = self.mutation_guard()?;
+                    self.check_reconciliation_source(&op, &current)?;
+                    source = self.get(&source.id)?;
+                    source.files = files;
                     source.revision += 1;
                     op.state = "succeeded".into();
                     let mut db = self.db.lock().unwrap();
@@ -1282,9 +1510,7 @@ impl Inventory {
                         if observed != entry.identity {
                             let proof = workspace.retained_digests.get(&entry.path);
                             let digest_matches = if let Some(digest) = proof {
-                                drop(guard.take());
                                 let actual = digest_open(&mut file.try_clone()?)?;
-                                guard = Some(self.mutation_guard()?);
                                 let current_op = self.operation(&op.id)?;
                                 let current_source = self.get(&op.artifact)?;
                                 if current_op.state != "running"
@@ -1311,14 +1537,18 @@ impl Inventory {
                             entry.identity = observed;
                         }
                     }
+                    let _coordinator = self.mutation_guard()?;
+                    self.check_reconciliation_source(&op, &current)?;
                     op.request = serde_json::to_string(&workspace)?;
                     save_operation(&self.db.lock().unwrap(), &op)?;
                 }
                 Ok(())
             })();
             if let Err(error) = result {
-                if guard.is_none() {
-                    guard = Some(self.mutation_guard()?);
+                let _coordinator = self.mutation_guard()?;
+                // A concurrent metadata transition wins over this worker.
+                if self.check_reconciliation_source(&op, &current).is_err() {
+                    continue;
                 }
                 op.error = Some(error.to_string());
                 if matches!(error, Error::Io(_)) {

@@ -295,6 +295,9 @@ try {
      column's width. The other columns keep short metrics and controls intact. */
   #tab-queue { container-type: inline-size; }
   .queue-table { table-layout: fixed; }
+  .queue-loading { margin: 8px 0; padding: 9px 12px; border-radius: 6px;
+    color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+  .queue-loading[hidden] { display: none; }
   .queue-table .col-status { width: 120px; }
   .queue-table .col-progress { width: 26%; }
   .queue-table .col-size { width: 78px; }
@@ -1156,6 +1159,7 @@ try {
   </nav>
 
   <section id="tab-queue">
+    <div id="queue-loading" class="queue-loading" role="status" hidden></div>
     <table class="queue-table">
       <colgroup><col><col class="col-status"><col class="col-progress">
         <col class="col-size"><col class="col-health"><col class="col-actions"></colgroup>
@@ -1776,7 +1780,7 @@ const SECTIONS = [
     tip: "Retrieving the NZB from the indexer — the job has no files yet." },
   { key: "torrent_metadata", label: "Fetching torrent metadata", ordered: true,
     tip: "Retrieving the torrent source or metadata from peers." },
-  { key: "checking", label: "Checking torrent files",
+  { key: "checking", label: "Checking files",
     tip: "Verifying selected files against torrent piece hashes." },
   { key: "post_queued", label: "Waiting to post-process",
     tip: "Downloaded, waiting for a post-processing slot. Raise [post] strategy to run more at once." },
@@ -1903,6 +1907,7 @@ function sectionOf(j) {
   }
   const st = j.status;
   if (st === "paused") return "paused";
+  if (j.verification) return j.verification.state === "blocked" ? "attention" : "checking";
   if (j.pp_done || j.ready) return "completed";
   const stage = currentPostStage(j);
   if (stage) return STAGE_SECTION[stage] || "post_queued";
@@ -1957,6 +1962,15 @@ function healthTip(health, critical, estimated) {
 /// Pure: JobSummary + context -> a FLAT view model (strings and flags only,
 /// no DOM). Flat on purpose — `applyRow` diffs it field by field against the
 /// row's cached previous model, and nested objects would never compare equal.
+function recoveryVerificationText(j) {
+  const verification = j.verification;
+  if (!verification) return "";
+  const progress = verification.total_bytes > 0
+    ? " · " + fmtBytes(verification.checked_bytes || 0) + " / " + fmtBytes(verification.total_bytes) : "";
+  return "Recovery verification: " + verification.state + progress +
+    (verification.reason ? " · " + verification.reason : "");
+}
+
 function rowModel(j, ctx) {
   ctx = ctx || {};
   const total = j.size_bytes || 0;
@@ -2051,7 +2065,8 @@ function rowModel(j, ctx) {
         rest.push(" · next retry in " + fmtDur(Math.max(0, hold.next_retry_at_unix * 1000 - (ctx.nowMs || Date.now()))));
     }
   }
-  const shownSt = over || (hold ? "held" : st);
+  if (j.verification) rest.push(" · " + recoveryVerificationText(j));
+  const shownSt = over || (hold ? "held" : j.verification && st !== "paused" ? "verifying" : st);
   const shownCls = over ? (STATUS_CLASS[over] || "dim") : cls;
   return {
     key: "j" + j.id,
@@ -2608,7 +2623,7 @@ function detailModel(j, nowMs) {
   const cleanupRetry = j.failedCleanup;
   const urlRetry = j.urlFetch;
   const heldControl = j.control && j.control.lifecycle === "held" ? j.control : null;
-  const lifecycleStatus = postTiming
+  const lifecycleStatus = j.verification ? recoveryVerificationText(j) : postTiming
     ? "Post-processing: " + fmtDur(postTiming.elapsedMs) + " elapsed · " + fmtDur(postTiming.workMs) + " work · " + fmtDur(postTiming.waitMs) + " waiting · " + postTiming.attempts + " retries"
     : cleanupRetry
       ? "Source cleanup retry " + cleanupRetry.attempts + (cleanupRetry.blockedSinceUnix ? " · blocked " + fmtDur(Math.max(0, nowMs - cleanupRetry.blockedSinceUnix * 1000)) : "") + (cleanupRetry.lastError ? " · " + cleanupRetry.lastError : "")
@@ -3886,13 +3901,24 @@ async function refreshQueue() {
   // than flashing an empty state. The daemon seeds its snapshot before
   // serving, so a successful read is authoritative: empty means empty.
   const r = await jfetch("/api/v1/jobs");
-  if (!r.ok) throw new Error("jobs " + r.status);
+  if (!r.ok) {
+    if (r.status === 503) {
+      const loading = $("queue-loading");
+      loading.textContent = "Queue metadata is loading or recovering. " +
+        (store.jobsLoaded
+          ? "Showing the last available queue snapshot; retrying automatically."
+          : "The queue is not available yet; retrying automatically.");
+      loading.hidden = false;
+    }
+    throw new Error("jobs " + r.status);
+  }
   const { jobs } = await r.json();
   // A body without `jobs` is a truncated or wrong response, not an empty
   // queue: keep what we have rather than blanking the page over it.
   if (!Array.isArray(jobs)) throw new Error("jobs: malformed response");
   store.jobs = jobs;
   store.jobsLoaded = true;
+  $("queue-loading").hidden = true;
   pending.reconcile(jobs);
   renderQueue();
 }
@@ -6237,7 +6263,7 @@ $("btn-restart").onclick = async () => {
   try { await jfetch("/api/v1/restart", { method: "POST" }); } catch { /* listener bouncing */ }
   for (let i = 0; i < 60; i++) {
     await new Promise(res => setTimeout(res, 500));
-    try { const h = await jfetch("/healthz"); if (h.ok && i > 1) break; } catch { /* down */ }
+    try { const status = await jfetch("/api/v1/status"); if (status.ok && i > 1) break; } catch { /* loading or unavailable */ }
   }
   $("btn-restart").disabled = false;
   msg.className = "ok"; msg.textContent = "restarted";

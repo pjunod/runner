@@ -73,6 +73,8 @@ jobs:
       - name: Torrent transfer and recovery regressions
         if: needs.scope.outputs.torrent == 'true'
         run: make fast-check-torrent
+      - name: Startup recovery and enrollment regressions
+        run: make fast-check-startup
 
   mobile:
     name: Mobile compile and unit lane

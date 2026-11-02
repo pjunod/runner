@@ -268,6 +268,29 @@ username = "nzbd"           # HTTP Basic user (compat ControlUsername)
 allow_legacy_default_credentials = false   # opt-in nzbget/tegbzn migration aid
 ```
 
+## Bootstrap monitor — container health without configuration I/O
+
+The process-local monitor is not an `nzbd.toml` setting. It starts before
+the daemon reads configuration or opens storage, so a slow or unavailable
+volume does not hide local health. Its plaintext listener accepts only a
+numeric loopback bind address and serves nonsecret `/healthz` and `/readyz`
+summaries; it does not expose queue data, settings, logs, or controls.
+
+The default bind is `127.0.0.1:6790`. Set `NZBD_MONITOR_BIND` in the
+container environment to choose another loopback address. The daemon and
+separate `nzbd health` probe process use the same default and environment
+resolution; `--monitor-bind` is the CLI override and wins for that process.
+If the daemon uses a CLI-only custom bind, pass the same flag to every
+separate probe command. A port conflict or invalid bind fails startup
+clearly before storage access.
+
+`nzbd health` checks monitor liveness; `nzbd health --ready` checks whether
+the configured secure public control listener is responding. Readiness
+does not wait for queue loading, owner recovery, or storage roots, because
+those conditions must not withdraw the UI from deployment routing. Use
+application status for those component states. The command has a 2-second
+total deadline.
+
 With no password set the API is open (bind to localhost!). With one set,
 every endpoint except `/healthz` requires HTTP Basic (or the Bearer
 token). The *arr apps pass username/password in their NZBGet client

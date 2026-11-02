@@ -84,6 +84,15 @@ pub(super) fn open_append(p: &Path) -> Result<File, StateError> {
     )
 }
 
+/// Create this incarnation's journal without opening another writer's inode.
+pub(super) fn create_append_exclusive(p: &Path) -> Result<File, StateError> {
+    ctx(
+        OpenOptions::new().create_new(true).append(true).open(p),
+        "create incarnation journal",
+        p,
+    )
+}
+
 pub(super) fn read(p: &Path) -> Result<Vec<u8>, StateError> {
     ctx(std::fs::read(p), "read", p)
 }

@@ -1,0 +1,30 @@
+# Independent Astra implementation review
+
+Source: Hermes card `t_6c60a23f`, delivered by `hdr-astra` (gpt-6-astra).
+The exact reviewer handoff follows; fixes and validation are tracked in [STARTUP_VERIFICATION_STATUS.md](STARTUP_VERIFICATION_STATUS.md).
+
+Delivery is complete: Codex preserved the authorized task-comment handoff below after the reviewer’s file write was denied. Hermes marked the review task done, with changes required. Statements about a pending artifact in the verbatim handoff describe the earlier delivery attempt, not the current review status.
+
+Durable review handoff pending artifact-path authorization. Candidate 5c7b80bd0cb12411fbc5dc5dd1ec2d5966db88e6 / base 368b5001404ff90efe1b6378a4a776d022d8bc29, independently rechecked; clone clean before attempted report write. Verdict: changes required. Static findings (not executed reproductions):
+
+R1 P1 — main.rs:847-881 chooses default config after missing config/mirrors without checking established enrollment/security; run calls control.public at1044 before identity preflight1045. Default TLS/auth disabled (config lib.rs:559-574). A reload/custom missing mirror with persistent CLI bind can replace known-secure service with HTTP/no auth. Public logs and shutdown are actual routes (control.rs:520-543). Preserve secure identity, distinguish proven first install; test missing config with retained anchor and reload.
+
+R2 P1 — admitted PP's own ImportJobIfPresent is deferred behind its admission (owner.rs:1481-1488,1591-1628,3985-3994); manager awaits terminal stamp4217 before releasing admission2274. Deferred command is bare/unscoped. Separate same-lifetime admitted updates from replacement; carry scope through deferral and cancel external replacement before awaiting custody. Test common spawn success and stale deferred updates. Failed cleanup is separate handle_failed_job path, NOT claimed blocked by BeginPostAdmission filter.
+
+R3 P1 — owner.rs:3302-3350 treats self.persist && import_job as committed and replies before durable replacement. Import removes existing row (4024-4025), remove_job_silent enqueues snapshot without row (4156-4200), then replacement only dirty (4108-4130, emit_finished=false). Crash between deletion snapshot and later save loses row. Implement one acknowledged replacement document, not remove/insert. Test delayed/failed save and each crash cut.
+
+R4 P1 — owner_persistence.rs:91-100 compacts whole job directory using captured delegated set201-221. SetDelegated can occur while old snapshot queued (owner.rs:3378-3417); foreign process appends after capture; remove_job recursively deletes all suffixes (state lib.rs:340-349). Local FIFO cannot order foreign writes. Use exact covered journal generation/cutoff and fenced delegation transition. Test foreign append while old snapshot blocked, including open descriptor after unlink.
+
+R5 P1 — Owner::recover synchronously validates active payload allocations before returning owner (owner.rs:1063-1081; allocate -> verify at artifacts/mod.rs:1040-1043/1271-1298), plus download-root creation926. One payload root stall/error with healthy metadata blocks engine construction, all queue metadata/actions. Move payload checks to per-root capability workers; test stalled one active allocation with healthy state and unrelated job.
+
+R6 P1 — verifier's acquire_terminal_use (owner_recovery.rs:932) holds global Inventory mutation guard across root/payload opens and sidecar reads (workspace_lifecycle.rs:105-151; mod.rs:1271-1298). Another allocation then waits on that guard in the single general Io/persistence lane (owner.rs:6092-6119; owner_persistence.rs:68-81), blocking healthy-state durable commands too. Short scoped reservations, I/O outside global lock, separate bounded payload workers from ordered state commits. Test stalled root A while root B admission and durable Pause proceed.
+
+R7 P2 — grant_work excludes verification/retirement/pending-control but not allocating_jobs (owner.rs:4458-4466), and breaks entire selection on pending allocation4511-4517. Same job can win every request before rotation4547, starving another already admitted eligible writer. Exclude pending allocation and continue selection; test two eligible jobs with cap allowing both.
+
+R8 P1 — AdoptReplicatedAuthority replaces state but doesn't acquire new allocation_cache entries; only nonterminal Done jobs queued for verification (owner.rs:3479-3537). Replicated-only partial job can remain unavailable forever at owner_recovery.rs:390-396; export/delegation refuses pending verification. Completed/no-PP_DONE is skipped entirely, permitting PP without recovery validation. Save failure still replies unit success3536; leader.rs:1762-1772 can mark authority ready. Unify metadata recovery/classification, prune/rebuild caches, typed save failure. Test replicated-only partial, bad Completed legacy range, failed adoption save.
+
+R9 P1 — Resume sets Queued/Running immediately before async persist (owner.rs:2739-2800), without pending_control_commits fence. WorkRequest/periodic tick can dispatch on live writer or torrent before save (4458-4474,6155-6164,7008-7023). Fence operational eligibility by exact pending revision; test held Resume save, no leases/Start, failure and overlapping intents.
+
+R10 P2 — whole-job verify_job worker reserves root until terminal completion (owner_recovery.rs:353-460), loops every Done range through path-based validate_range (1061-1104), no bounded batch cursor/preemption/progress. A newly resumed urgent job waits behind full paused-job scan, contrary plan290-294. Implement bounded identity-bound batches and scheduler yield; test same-root priority change and intermediate progress.
+
+Full prepared report also records positive monitor/typed-evidence improvements, qualification limits, exact corrective approaches/regressions, and that no tests/builds/CI ran. No merge approval; parent owns fixes then one affected fast-lane batch, PR/status update, artifact preservation and clone cleanup. Report file was NOT created (write policy denied bytes_written=0); this is not task completion.

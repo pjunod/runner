@@ -86,11 +86,13 @@ impl VolumeDoc {
 }
 
 /// This node's live counter book.
+#[derive(Clone)]
 pub struct VolumeBook {
     doc: VolumeDoc,
     path: PathBuf,
     dir: PathBuf,
     dirty: bool,
+    revision: u64,
 }
 
 impl VolumeBook {
@@ -106,6 +108,7 @@ impl VolumeBook {
             path,
             dir,
             dirty: false,
+            revision: 0,
         }
     }
 
@@ -125,6 +128,7 @@ impl VolumeBook {
         w.day_bytes += bytes;
         w.month_bytes += bytes;
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn doc(&self) -> &VolumeDoc {
@@ -134,8 +138,16 @@ impl VolumeBook {
     /// Cluster-aware totals: this node's counters plus every peer's
     /// `volumes.*.json` in the same state dir.
     pub fn cluster_totals(&self, now_unix: i64, start_day: u32) -> (u64, u64) {
-        let mut day = self.doc.day_total(now_unix);
-        let mut month = self.doc.month_total(now_unix, start_day);
+        let (day, month) = self.peer_totals(now_unix, start_day);
+        (
+            day.saturating_add(self.doc.day_total(now_unix)),
+            month.saturating_add(self.doc.month_total(now_unix, start_day)),
+        )
+    }
+
+    pub fn peer_totals(&self, now_unix: i64, start_day: u32) -> (u64, u64) {
+        let mut day = 0u64;
+        let mut month = 0u64;
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for e in entries.flatten() {
                 let p = e.path();
@@ -155,6 +167,37 @@ impl VolumeBook {
             }
         }
         (day, month)
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub(crate) fn acknowledge_save(&mut self, revision: u64) {
+        if self.revision == revision {
+            self.dirty = false;
+        }
+    }
+    pub(crate) fn save_result(&self) -> Result<(), nzbd_state::StateError> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(&self.doc)?;
+        let tmp = self.path.with_extension("tmp");
+        let write = (|| {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &self.path)?;
+            #[cfg(unix)]
+            std::fs::File::open(&self.dir)?.sync_all()?;
+            Ok::<(), std::io::Error>(())
+        })();
+        write.map_err(|source| nzbd_state::StateError::Io {
+            op: "save volume counters",
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub fn save_if_dirty(&mut self) {
