@@ -33,6 +33,13 @@ first class citizen between the two apps. time to act like it".
   `unknown` source — that bucket holds complete no-CRC episodes, which are
   salvageable. Live check: all eleven Dexter artifacts are `retained`, owned,
   cleanup-eligible, no Keep, no hold, zero files.
+- CI found `acknowledged_worker_api_import_is_noop_for_late_preterminal_descriptor`
+  failing under load (main 4/4 green, branch 1 in 2–3 red). Cause: the sweep ran
+  ahead of the ordered tick steps, shifting their timing into a window where
+  that test publishes while the engine's first maintenance tick runs. The sweep
+  now runs last in the tick (its deletes run on the next tick): 6/6 green.
+  The underlying exposure — that test racing the engine's immediate first
+  tick — predates this change and is left for a separate fix.
 
 ## Held jobs with no way out — 2026-11-01
 

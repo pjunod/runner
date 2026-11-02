@@ -2800,9 +2800,6 @@ impl Inventory {
                 tracing::warn!(artifact=%key,error=%e,"expiry changed before admission");
             }
         }
-        if let Err(error) = self.reconcile_empty_failed_sources() {
-            tracing::warn!(%error, "empty failed-source reconciliation did not complete");
-        }
         self.run_due_deletes()?;
         self.reconcile_due_relocations()?;
         self.reconcile_workspace_retirements()?;
@@ -2812,6 +2809,12 @@ impl Inventory {
         self.run_tasks()?;
         self.reconcile_missing()?;
         self.compact()?;
+        // Last, so it never delays the ordered retention, relocation and
+        // recovery steps above. Its failed-delete operations run on the next
+        // tick's run_due_deletes.
+        if let Err(error) = self.reconcile_empty_failed_sources() {
+            tracing::warn!(%error, "empty failed-source reconciliation did not complete");
+        }
         Ok(())
     }
     /// Execute every delete whose undo window has closed. Part of the
