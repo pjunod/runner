@@ -2,16 +2,23 @@ export interface NetworkService {
   readonly name: string;
   readonly type: string;
   readonly domain: string;
-  readonly hostName: string;
+  readonly hostName: string | null;
   readonly addresses: string[];
   readonly port: number;
   readonly txt: Record<string, string>;
+}
+
+export interface DiscoveredAddress {
+  host: string;
+  baseUrl: string;
+  kind: 'IPv4' | 'IPv6' | 'Hostname';
 }
 
 export interface DiscoveredNzbd {
   key: string;
   name: string;
   baseUrl: string;
+  addresses: DiscoveredAddress[];
   host: string;
   port: number;
   auth: string;
@@ -32,17 +39,23 @@ export function toDiscoveredNzbd(service: NetworkService): DiscoveredNzbd | null
     return null;
   }
 
-  const host = selectHost(service);
+  const hosts = selectHosts(service);
+  const host = hosts[0];
   if (!host) {
     return null;
   }
   const tls = ['1', 'true', 'yes'].includes((service.txt.tls ?? '').toLowerCase());
-  const urlHost = host.includes(':') ? `[${host.replace('%', '%25')}]` : host;
+  const addresses = hosts.map((host): DiscoveredAddress => ({
+    host,
+    baseUrl: `${tls ? 'https' : 'http'}://${host.includes(':') ? `[${host}]` : host}:${service.port}`,
+    kind: host.includes(':') ? 'IPv6' : /^\d+\.\d+\.\d+\.\d+$/.test(host) ? 'IPv4' : 'Hostname',
+  }));
 
   return {
     key: serviceKey(service),
     name: service.name || 'Runner',
-    baseUrl: `${tls ? 'https' : 'http'}://${urlHost}:${service.port}`,
+    baseUrl: addresses[0].baseUrl,
+    addresses,
     host,
     port: service.port,
     auth: service.txt.auth || 'unknown',
@@ -50,32 +63,43 @@ export function toDiscoveredNzbd(service: NetworkService): DiscoveredNzbd | null
   };
 }
 
-function selectHost(service: NetworkService): string | null {
-  const addresses = service.addresses.map(cleanHost).filter(Boolean) as string[];
-  const ipv4 = addresses.find(
-    (address) =>
-      address.includes('.') &&
-      !address.startsWith('127.') &&
-      !address.startsWith('169.254.'),
-  );
-  if (ipv4) {
-    return ipv4;
-  }
-  const ipv6 = addresses.find(
-    (address) =>
-      address.includes(':') &&
-      address !== '::' &&
-      address !== '::1' &&
-      !address.toLowerCase().startsWith('fe80:'),
-  );
-  if (ipv6) {
-    return ipv6;
-  }
-  const hostname = cleanHost(service.hostName);
-  const fallbackAddress = addresses.find((address) => !address.startsWith('127.'));
-  return hostname || fallbackAddress || null;
+function selectHosts(service: NetworkService): string[] {
+  const addresses = [...new Set(service.addresses.map(usableHost).filter(Boolean) as string[])];
+  const ipv4 = addresses.filter((host) => !host.includes(':') && !host.startsWith('169.254.'));
+  const ipv6 = addresses.filter((host) => host.includes(':'));
+  const hostname = usableHost(service.hostName);
+  return [...new Set([...ipv4, ...ipv6, ...(hostname ? [hostname] : []), ...addresses])];
 }
 
-function cleanHost(host: string): string {
-  return host.trim().replace(/^\[/, '').replace(/\]$/, '').replace(/\.$/, '');
+function usableHost(value: string | null): string | null {
+  let host = (value ?? '').trim().replace(/^\[/, '').replace(/\]$/, '').replace(/\.$/, '');
+  if (!host) return null;
+
+  // Android can attach an interface scope even to a global IPv6 address.
+  // Link-local addresses require their scope, which URL/fetch cannot represent.
+  // Fall back to another advertised address rather than dropping that scope.
+  if (host.includes(':')) {
+    if (/^fe[89ab][0-9a-f]:/i.test(host)) return null;
+    host = host.split('%', 1)[0];
+  }
+  try {
+    const parsed = new URL(`http://${host.includes(':') ? `[${host}]` : host}`);
+    // Require a host only, even when it came from native discovery metadata.
+    if (
+      parsed.port || parsed.username || parsed.password ||
+      parsed.pathname !== '/' || parsed.search || parsed.hash
+    ) {
+      return null;
+    }
+    const canonical = parsed.hostname.replace(/^\[/, '').replace(/\]$/, '');
+    if (
+      canonical === '0.0.0.0' || canonical.startsWith('127.') || canonical === 'localhost' ||
+      canonical === '::' || canonical === '::1' || /^ff[0-9a-f]{2}:/i.test(canonical)
+    ) {
+      return null;
+    }
+    return canonical;
+  } catch {
+    return null;
+  }
 }

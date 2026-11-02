@@ -42,8 +42,10 @@ export function ConnectionScreen({ initial, onConnect, onCancel, onForget }: Pro
   const [message, setMessage] = useState<string | null>(null);
   const [messageKind, setMessageKind] = useState<'ok' | 'error'>('ok');
   const nearby = useNzbdDiscovery();
+  const [selectedNearby, setSelectedNearby] = useState<DiscoveredNzbd | null>(null);
 
   const selectNearby = (service: DiscoveredNzbd) => {
+    setSelectedNearby(service);
     setBaseUrl(service.baseUrl);
     setMessageKind('ok');
     setMessage(
@@ -136,6 +138,7 @@ export function ConnectionScreen({ initial, onConnect, onCancel, onForget }: Pro
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel={`Use ${service.name} at ${service.baseUrl}`}
+                  disabled={busy !== null}
                   key={service.key}
                   onPress={() => selectNearby(service)}
                   style={({ pressed }) => [styles.nearbyServer, pressed && styles.nearbyPressed]}
@@ -170,13 +173,44 @@ export function ConnectionScreen({ initial, onConnect, onCancel, onForget }: Pro
               ) : null}
             </View>
 
+            {selectedNearby && selectedNearby.addresses.length > 1 ? (
+              <View style={styles.addressChoices}>
+                <Text style={styles.label}>Addresses for {selectedNearby.name}</Text>
+                <Text style={styles.addressHint}>
+                  Choose an address, then test it from this device.
+                </Text>
+                {selectedNearby.addresses.map((address) => (
+                  <Pressable
+                    key={address.baseUrl}
+                    accessibilityRole="radio"
+                    accessibilityLabel={`Use ${address.kind} address ${address.baseUrl}`}
+                    accessibilityState={{ checked: baseUrl === address.baseUrl, disabled: busy !== null }}
+                    disabled={busy !== null}
+                    onPress={() => {
+                      setBaseUrl(address.baseUrl);
+                      setMessage(null);
+                    }}
+                    style={[
+                      styles.addressChoice,
+                      baseUrl === address.baseUrl && styles.addressSelected,
+                    ]}
+                  >
+                    <Text style={styles.addressKind}>{address.kind}</Text>
+                    <Text style={styles.addressValue}>{address.baseUrl}</Text>
+                    {baseUrl === address.baseUrl ? <Text style={styles.addressKind}>✓</Text> : null}
+                  </Pressable>
+                ))}
+              </View>
+            ) : null}
+
             <Text style={styles.label}>Server address</Text>
             <TextInput
               accessibilityLabel="Server address"
               autoCapitalize="none"
               autoCorrect={false}
               keyboardType="url"
-              onChangeText={setBaseUrl}
+              editable={busy === null}
+              onChangeText={(value) => { setBaseUrl(value); setMessage(null); }}
               placeholder="http://192.168.1.20:6789"
               placeholderTextColor={theme.textMuted}
               style={styles.input}
@@ -374,6 +408,21 @@ const makeStyles = (theme: Theme) =>
     discoveryEmpty: { flexDirection: 'row', alignItems: 'center', gap: 8, minHeight: 30 },
     discoveryEmptyText: { color: theme.textMuted, flex: 1, fontSize: 12, lineHeight: 16 },
     discoveryError: { color: theme.danger },
+    addressChoices: { gap: 8 },
+    addressHint: { color: theme.textMuted, fontSize: 12, lineHeight: 17 },
+    addressChoice: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+      padding: 12,
+      borderWidth: 1,
+      borderColor: theme.border,
+      borderRadius: 11,
+      backgroundColor: theme.panelAlt,
+    },
+    addressSelected: { borderColor: theme.accent, backgroundColor: theme.accentSoft },
+    addressKind: { color: theme.accent, fontSize: 12, fontWeight: '700' },
+    addressValue: { color: theme.text, flex: 1, fontSize: 12 },
     optional: { color: theme.textMuted, fontSize: 12 },
     authHeading: { flexDirection: 'row', alignItems: 'baseline', gap: 7, marginTop: 5 },
     hint: { color: theme.textMuted, fontSize: 13, lineHeight: 18, marginTop: -7 },
