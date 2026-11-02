@@ -1284,6 +1284,11 @@ pub fn next_for_server(
 /// Does this job have at least one segment that could be handed out?
 /// Short-circuits on the first hit, so the common "yes" case is cheap.
 fn has_backend_work(job: &Job, now_unix: i64, allowed_files: Option<&HashSet<FileId>>) -> bool {
+    if crate::automatic_control::pending(job)
+        && nzbd_state::artifacts::WorkerControlContext::for_job(job).is_none()
+    {
+        return false;
+    }
     match job.kind {
         JobKind::Torrent => job.torrent.as_ref().is_some_and(|torrent| {
             torrent_wants_download_slot(torrent, job.queued_at_unix, now_unix)

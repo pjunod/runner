@@ -12,6 +12,7 @@
 //! Public surface: [`Engine::spawn`] → [`EngineHandle`].
 
 mod admissions;
+pub mod automatic_control;
 pub mod backend;
 mod download_capacity;
 pub mod events;

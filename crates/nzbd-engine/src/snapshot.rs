@@ -245,6 +245,8 @@ pub struct QueueSnapshot {
     /// adopting authority). Automatic hold recovery runs only here.
     #[serde(skip)]
     pub queue_authority: bool,
+    #[serde(skip)]
+    pub pending_automatic_controls: std::collections::HashSet<JobId>,
     pub download_paused: bool,
     /// Daily/monthly quota exhausted (force-priority jobs still run).
     pub quota_reached: bool,

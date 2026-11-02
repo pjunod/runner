@@ -420,6 +420,11 @@ pub(crate) enum QueueCommand {
     },
     /// Move an automatic hold's next attempt out on its backoff, recording
     /// why the last one was refused.
+    AckAutomaticControl {
+        job: JobId,
+        identity: String,
+        reply: oneshot::Sender<bool>,
+    },
     RescheduleHold {
         job: JobId,
         revision: String,
@@ -2884,6 +2889,61 @@ impl Owner {
                 let _ =
                     reply.send(self.retry_hold_proven(job, &revision, by, custody_checked, &guard));
             }
+            QueueCommand::AckAutomaticControl {
+                job,
+                identity,
+                reply,
+            } => {
+                let before = self.state.job(job).cloned();
+                let marker = before
+                    .as_ref()
+                    .and_then(crate::automatic_control::transition);
+                let source = self.artifacts.for_job(job.0);
+                let exact_source = marker.as_ref().is_some_and(|marker| {
+                    source.as_ref().is_ok_and(|source| {
+                        marker.storage_instance_id == self.artifacts.installation
+                            && source.as_ref().map(|source| {
+                                nzbd_state::artifacts::SourceGeneration {
+                                    artifact: source.id.clone(),
+                                    generation: source.generation.clone(),
+                                }
+                            }) == marker.source
+                            && source.as_ref().map(|source| source.path.clone())
+                                == marker.source_path
+                    })
+                });
+                let eligible = self.automatic_control_scope(job)
+                    && !self.persistence_fenced
+                    && exact_source
+                    && marker
+                        .as_ref()
+                        .is_some_and(|marker| marker.identity == identity);
+                if eligible {
+                    self.state.job_mut(job).unwrap().params.retain(|(key, _)| {
+                        key != crate::automatic_control::AUTOMATIC_CONTROL_PARAM
+                    });
+                }
+                let committed = eligible && self.save_snapshot();
+                if !committed {
+                    if let Some(before) = before {
+                        if let Some(current) = self.state.job_mut(job) {
+                            *current = before;
+                        }
+                    }
+                } else {
+                    self.publish_now();
+                    self.bump_epoch();
+                    let files = self
+                        .state
+                        .job(job)
+                        .map(|job| job.files.iter().map(|file| file.id).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    for file in files {
+                        self.after_file_change(job, file);
+                    }
+                }
+                let _ = reply.send(committed);
+            }
             QueueCommand::RescheduleHold {
                 job,
                 revision,
@@ -2956,6 +3016,7 @@ impl Owner {
                 reply,
             } => {
                 if self.persistence_fenced
+                    || (by == RetryBy::Recovery && self.automatic_control_pending(job))
                     || (by == RetryBy::Recovery
                         && !guard.worker_checked()
                         && self.delegated.contains_key(&job))
@@ -3035,6 +3096,7 @@ impl Owner {
                 reply,
             } => {
                 if self.persistence_fenced
+                    || (by == RetryBy::Recovery && self.automatic_control_pending(job))
                     || (by == RetryBy::Recovery
                         && !guard.worker_checked()
                         && self.delegated.contains_key(&job))
@@ -3107,7 +3169,12 @@ impl Owner {
                     }
                 }
                 self.dirty |= changed.is_some();
-                let ok = changed.is_some() && self.commit_control_change(job, before.as_ref());
+                let ok = changed.is_some()
+                    && if by == RetryBy::Recovery {
+                        self.commit_automatic_control_change(job, before.as_ref())
+                    } else {
+                        self.commit_control_change(job, before.as_ref())
+                    };
                 if ok {
                     self.bump_epoch();
                     self.publish_now();
@@ -3125,7 +3192,9 @@ impl Owner {
                         .collect();
                     for file in files {
                         self.writers.remove(&file);
-                        self.after_file_change(job, file);
+                        if !self.automatic_control_pending(job) {
+                            self.after_file_change(job, file);
+                        }
                     }
                 } else if let Some(before) = before {
                     *self.state.job_mut(job).unwrap() = before;
@@ -3143,6 +3212,10 @@ impl Owner {
                 let _ = reply.send(committed);
             }
             QueueCommand::SetJobStatus { job, status, reply } => {
+                if self.automatic_control_pending(job) {
+                    let _ = reply.send(false);
+                    return;
+                }
                 if self.state.job(job).is_some_and(|j| j.held()) {
                     let _ = reply.send(false);
                     return;
@@ -3220,6 +3293,10 @@ impl Owner {
                 prev_ms,
                 reply,
             } => {
+                if self.automatic_control_pending(job) {
+                    let _ = reply.send(false);
+                    return;
+                }
                 let ok = match self.state.job_mut(job) {
                     Some(j) if !j.held() => {
                         close_span(j, prev_ms, at_unix);
@@ -3389,6 +3466,42 @@ impl Owner {
 
     /// A worker owns no shared queue snapshot. Its retry intent commits to
     /// the local inventory under the exact lease/source tuple instead.
+    fn automatic_control_scope(&self, job: JobId) -> bool {
+        self.persist
+            && self.persist_guard.is_some()
+            && !self.delegated.contains_key(&job)
+            && self.state.job(job).is_some_and(|job| {
+                nzbd_state::artifacts::WorkerControlContext::for_job(job).is_none()
+            })
+    }
+    fn automatic_control_pending(&self, job: JobId) -> bool {
+        self.automatic_control_scope(job)
+            && self
+                .state
+                .job(job)
+                .is_some_and(crate::automatic_control::pending)
+    }
+    fn commit_automatic_control_change(&mut self, job: JobId, before: Option<&Job>) -> bool {
+        if self.automatic_control_scope(job) {
+            let Some(before) = before else {
+                return false;
+            };
+            let Ok(source) = self.artifacts.for_job(job.0) else {
+                return false;
+            };
+            let installation = self.artifacts.installation.clone();
+            if let Some(current) = self.state.job_mut(job) {
+                if let Err(error) =
+                    crate::automatic_control::stamp(before, current, &installation, source.as_ref())
+                {
+                    tracing::warn!(job=job.0,%error,"automatic control awaits durable authority");
+                    return false;
+                }
+            }
+        }
+        self.commit_control_change(job, before)
+    }
+
     fn commit_control_change(&mut self, job: JobId, before: Option<&Job>) -> bool {
         if self.persistence_fenced {
             return false;
@@ -4377,7 +4490,7 @@ impl Owner {
         stage: &str,
         message: &str,
     ) -> bool {
-        if self.persistence_fenced {
+        if self.persistence_fenced || self.automatic_control_pending(job) {
             return false;
         }
         let before = self.state.job(job).cloned();
@@ -4491,7 +4604,7 @@ impl Owner {
         self.dirty = true;
         self.bump_epoch();
         // Failed persistence leaves the local fence in place, but emits no fact.
-        if !self.commit_control_change(job, before.as_ref()) {
+        if !self.commit_automatic_control_change(job, before.as_ref()) {
             return false;
         }
         self.publish_now();
@@ -4530,7 +4643,9 @@ impl Owner {
         custody_checked: bool,
         guard: &crate::hold_release::HoldReleaseGuard,
     ) -> Result<(), String> {
-        if self.persistence_fenced {
+        if self.persistence_fenced
+            || (by == RetryBy::Recovery && self.automatic_control_pending(job))
+        {
             return Err("durable queue ownership is fenced".into());
         }
         let before = self
@@ -4623,7 +4738,12 @@ impl Owner {
             j.set_control(&control);
         }
         self.dirty = true;
-        if !self.commit_control_change(job, Some(&before)) {
+        let committed = if by == RetryBy::Recovery {
+            self.commit_automatic_control_change(job, Some(&before))
+        } else {
+            self.commit_control_change(job, Some(&before))
+        };
+        if !committed {
             *self.state.job_mut(job).unwrap() = before;
             return Err("the retry could not be persisted; the state volume is unavailable".into());
         }
@@ -4631,7 +4751,7 @@ impl Owner {
         self.publish_now();
         tracing::info!(job = job.0, by = ?by, cause = %control.cause, stage = %control.stage, "hold released");
         self.emit(Event::JobControlChanged { job, control });
-        if !post_side {
+        if !post_side && !self.automatic_control_pending(job) {
             let files: Vec<_> = before.files.iter().map(|f| f.id).collect();
             for file in files {
                 self.writers.remove(&file);
@@ -4657,6 +4777,7 @@ impl Owner {
         guard: &crate::hold_release::HoldReleaseGuard,
     ) -> bool {
         if self.persistence_fenced
+            || self.automatic_control_pending(job)
             || (!guard.worker_checked() && self.delegated.contains_key(&job))
             || !self
                 .state
@@ -4717,7 +4838,7 @@ impl Owner {
         control.revision = next.to_string();
         j.set_control(&control);
         self.dirty = true;
-        if !self.commit_control_change(job, before.as_ref()) {
+        if !self.commit_automatic_control_change(job, before.as_ref()) {
             if let Some(before) = before {
                 *self.state.job_mut(job).unwrap() = before;
             }
@@ -6605,6 +6726,13 @@ impl Owner {
         let snap = QueueSnapshot {
             up_since_unix: self.up_since_unix,
             queue_authority: self.persist,
+            pending_automatic_controls: self
+                .state
+                .jobs
+                .iter()
+                .filter(|job| self.automatic_control_pending(job.id))
+                .map(|job| job.id)
+                .collect(),
             download_paused: self.state.download_paused,
             quota_reached: self.quota_reached,
             disk_low: self.disk_low,
@@ -6717,6 +6845,9 @@ impl Owner {
         if !self.persist {
             self.dirty = false;
             return Ok(false);
+        }
+        for job in &mut self.state.jobs {
+            crate::automatic_control::invalidate_changed(job);
         }
         self.state.sync_url_admission_receipts();
         for receipt in &mut self.state.url_admission_receipts {
@@ -10471,92 +10602,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checked_release_public_api_refuses_expiry_after_custody_probe() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let temporary = tempfile::tempdir().unwrap();
-        let destination = temporary.path().join("working");
-        let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
-            Vec::new(),
-            temporary.path().join("state"),
-            destination.clone(),
-            Tuning::default(),
-            None,
-        ))
-        .await
-        .unwrap();
-        let mut row = pending_job(94);
-        row.status = JobStatus::PostQueued;
-        mark_new_lifecycle_cohort(&mut row);
-        let path = destination.join(&row.dir_name);
-        let inventory = engine.artifacts();
-        inventory
-            .allocate_for_delivery(94, &destination, &path, true, true)
-            .unwrap();
-        std::fs::write(path.join("payload.bin"), b"retained processing source").unwrap();
-        inventory.finish(94, &path, &destination, "active").unwrap();
-        engine.import_job(row, false, false).await.unwrap();
-        engine
-            .hold_job(
-                JobId(94),
-                nzbd_types::HoldCause::MissingTool,
-                "unpack",
-                "7z unavailable",
-            )
-            .await
-            .unwrap();
-        let revision = engine
-            .export_job(JobId(94))
-            .await
-            .unwrap()
-            .unwrap()
-            .control()
-            .unwrap()
-            .revision;
-        let checks = Arc::new(AtomicUsize::new(0));
-        let observed = checks.clone();
-        let expired = engine
-            .release_hold_checked(
-                JobId(94),
-                revision.clone(),
-                RetryBy::Operator,
-                Arc::new(move || observed.fetch_add(1, Ordering::SeqCst) < 6),
-            )
-            .await
-            .unwrap();
-        assert!(expired.is_err());
-        assert_eq!(
-            checks.load(Ordering::SeqCst),
-            7,
-            "checked throughout custody preparation and again at actor commit"
-        );
-        assert_eq!(
-            engine
-                .export_job(JobId(94))
-                .await
-                .unwrap()
-                .unwrap()
-                .control()
-                .unwrap()
-                .lifecycle,
-            "held"
-        );
-        assert_eq!(
-            std::fs::read(path.join("payload.bin")).unwrap(),
-            b"retained processing source"
-        );
-        assert!(engine
-            .release_hold_checked(JobId(94), revision, RetryBy::Operator, Arc::new(|| true))
-            .await
-            .unwrap()
-            .is_ok());
-        assert_eq!(
-            engine.export_job(JobId(94)).await.unwrap().unwrap().status,
-            JobStatus::PostQueued
-        );
-        engine.shutdown().await;
-    }
-
-    #[tokio::test]
     async fn authority_fence_stops_relocation_midcopy_before_publication_and_recovers() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let temporary = tempfile::tempdir().unwrap();
@@ -10697,6 +10742,253 @@ mod tests {
             "succeeded"
         );
         engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn checked_release_public_api_refuses_expiry_after_custody_probe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("working");
+        let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
+            Vec::new(),
+            temporary.path().join("state"),
+            destination.clone(),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let mut row = pending_job(94);
+        row.status = JobStatus::PostQueued;
+        mark_new_lifecycle_cohort(&mut row);
+        let path = destination.join(&row.dir_name);
+        let inventory = engine.artifacts();
+        inventory
+            .allocate_for_delivery(94, &destination, &path, true, true)
+            .unwrap();
+        std::fs::write(path.join("payload.bin"), b"retained processing source").unwrap();
+        inventory.finish(94, &path, &destination, "active").unwrap();
+        engine.import_job(row, false, false).await.unwrap();
+        engine
+            .hold_job(
+                JobId(94),
+                nzbd_types::HoldCause::MissingTool,
+                "unpack",
+                "7z unavailable",
+            )
+            .await
+            .unwrap();
+        let revision = engine
+            .export_job(JobId(94))
+            .await
+            .unwrap()
+            .unwrap()
+            .control()
+            .unwrap()
+            .revision;
+        let checks = Arc::new(AtomicUsize::new(0));
+        let observed = checks.clone();
+        let expired = engine
+            .release_hold_checked(
+                JobId(94),
+                revision.clone(),
+                RetryBy::Operator,
+                Arc::new(move || observed.fetch_add(1, Ordering::SeqCst) < 6),
+            )
+            .await
+            .unwrap();
+        assert!(expired.is_err());
+        assert_eq!(
+            checks.load(Ordering::SeqCst),
+            7,
+            "checked throughout custody preparation and again at actor commit"
+        );
+        assert_eq!(
+            engine
+                .export_job(JobId(94))
+                .await
+                .unwrap()
+                .unwrap()
+                .control()
+                .unwrap()
+                .lifecycle,
+            "held"
+        );
+        assert_eq!(
+            std::fs::read(path.join("payload.bin")).unwrap(),
+            b"retained processing source"
+        );
+        assert!(engine
+            .release_hold_checked(JobId(94), revision, RetryBy::Operator, Arc::new(|| true))
+            .await
+            .unwrap()
+            .is_ok());
+        assert_eq!(
+            engine.export_job(JobId(94)).await.unwrap().unwrap().status,
+            JobStatus::PostQueued
+        );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cluster_automatic_control_waits_for_exact_ack_and_operator_intent_is_not_replayed() {
+        use crate::automatic_control::{transition, AUTOMATIC_CONTROL_PARAM};
+        let (_tmp, mut owner, _adapter) =
+            control_test_owner_with_persistence(true, Some(Arc::new(|| true)));
+        let mut base = pending_job(82);
+        base.status = JobStatus::PostQueued;
+        owner.state.jobs.push(base.clone());
+        assert!(owner.hold_job(
+            base.id,
+            nzbd_types::HoldCause::MissingTool,
+            "unpack",
+            "7z missing"
+        ));
+        // Represent a durable hold whose first deadline has elapsed. Its
+        // provenance and row remain one exact persisted result.
+        let mut held = owner.state.job(base.id).unwrap().control().unwrap();
+        held.next_retry_at_unix = Some(0);
+        owner.state.job_mut(base.id).unwrap().set_control(&held);
+        assert!(owner.commit_automatic_control_change(base.id, Some(&base)));
+        owner.publish_snapshot(0);
+        let first = transition(owner.state.job(base.id).unwrap()).unwrap();
+        assert_eq!(first.base_control, None);
+        assert_eq!(first.base_status, JobStatus::PostQueued);
+        assert!(owner
+            .shared
+            .load()
+            .pending_automatic_controls
+            .contains(&base.id));
+        assert!(!owner.reschedule_hold(base.id, &held.revision, "still unavailable"));
+        assert!(owner
+            .retry_hold(base.id, &held.revision, RetryBy::Recovery, true)
+            .is_err());
+        assert_eq!(
+            transition(owner.state.job(base.id).unwrap())
+                .unwrap()
+                .identity,
+            first.identity
+        );
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::AckAutomaticControl {
+            job: base.id,
+            identity: "0".repeat(64),
+            reply,
+        });
+        assert!(!result.await.unwrap());
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::AckAutomaticControl {
+            job: base.id,
+            identity: first.identity.clone(),
+            reply,
+        });
+        assert!(result.await.unwrap());
+        assert!(owner
+            .retry_hold(base.id, &held.revision, RetryBy::Recovery, true)
+            .is_ok());
+        let released = transition(owner.state.job(base.id).unwrap()).unwrap();
+        assert_eq!(released.base_control, Some(held.clone()));
+        assert_eq!(released.result_status, JobStatus::PostQueued);
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::SetJobStatus {
+            job: base.id,
+            status: JobStatus::Post {
+                stage: nzbd_types::PostStage::Unpack,
+            },
+            reply,
+        });
+        assert!(
+            !result.await.unwrap(),
+            "POST must not enter IO before Raft acknowledgment"
+        );
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::AckAutomaticControl {
+            job: base.id,
+            identity: first.identity,
+            reply,
+        });
+        assert!(
+            !result.await.unwrap(),
+            "old acknowledgment cannot clear the new release marker"
+        );
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::AckAutomaticControl {
+            job: base.id,
+            identity: released.identity.clone(),
+            reply,
+        });
+        assert!(result.await.unwrap());
+        let control = owner.state.job(base.id).unwrap().control().unwrap();
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::AckAutomaticControl {
+            job: base.id,
+            identity: released.identity,
+            reply,
+        });
+        assert!(
+            !result.await.unwrap(),
+            "lost local ACK may be ignored once marker is absent"
+        );
+        assert_eq!(owner.state.job(base.id).unwrap().control(), Some(control));
+        assert!(owner.hold_job(
+            base.id,
+            nzbd_types::HoldCause::MissingTool,
+            "unpack",
+            "missing again"
+        ));
+        let held = owner.state.job(base.id).unwrap().control().unwrap();
+        assert!(owner
+            .retry_hold(base.id, &held.revision, RetryBy::Operator, true)
+            .is_ok());
+        assert!(
+            transition(owner.state.job(base.id).unwrap()).is_none(),
+            "uncommitted operator resume must not acquire automatic provenance"
+        );
+        let durable = owner.snap_store.load().unwrap().unwrap();
+        assert!(!durable.jobs[0]
+            .params
+            .iter()
+            .any(|(key, _)| key == AUTOMATIC_CONTROL_PARAM));
+    }
+
+    #[tokio::test]
+    async fn automatic_control_ack_snapshot_failure_preserves_pending_transition_repeatedly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let allowed = Arc::new(AtomicBool::new(true));
+        let observed = allowed.clone();
+        let (_tmp, mut owner, _adapter) = control_test_owner_with_persistence(
+            true,
+            Some(Arc::new(move || observed.load(Ordering::SeqCst))),
+        );
+        let row = pending_job(83);
+        owner.state.jobs.push(row.clone());
+        assert!(owner.hold_job(
+            row.id,
+            nzbd_types::HoldCause::Allocation,
+            "download_write",
+            "allocation blocked"
+        ));
+        let marker =
+            crate::automatic_control::transition(owner.state.job(row.id).unwrap()).unwrap();
+        allowed.store(false, Ordering::SeqCst);
+        for _ in 0..2 {
+            let (reply, result) = oneshot::channel();
+            owner.on_command(QueueCommand::AckAutomaticControl {
+                job: row.id,
+                identity: marker.identity.clone(),
+                reply,
+            });
+            assert!(!result.await.unwrap());
+            assert_eq!(
+                crate::automatic_control::transition(owner.state.job(row.id).unwrap()).unwrap(),
+                marker
+            );
+        }
+        let saved = owner.snap_store.load().unwrap().unwrap();
+        assert_eq!(
+            crate::automatic_control::transition(&saved.jobs[0]).unwrap(),
+            marker
+        );
     }
 
     #[tokio::test]
