@@ -4,6 +4,184 @@ use super::*;
 fn failure(message: impl ToString) -> nzbd_state::StateError {
     nzbd_state::StateError::Corrupt(message.to_string())
 }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusterRangeScope {
+    job_id: u32,
+    file_id: u32,
+    first_article: u32,
+    last_article: u32,
+    range_index: u32,
+    range_count: u32,
+}
+
+pub(super) struct PayloadPlan {
+    pub(super) path: PathBuf,
+    pub(super) root: PathBuf,
+    pub(super) private_range: bool,
+}
+
+/// Only an exact typed article scope can select the nested private root.
+pub(super) fn imported_payload_plan(
+    job: &Job,
+    destination: &Path,
+) -> Result<PayloadPlan, nzbd_state::StateError> {
+    let relative = PathBuf::from(job_dir_name(job));
+    if relative
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(failure("unsafe payload storage namespace"));
+    }
+    let path = destination.join(&relative);
+    let mut ranges = job.params.iter().filter(|(key, _)| key == "*Cluster:range");
+    let Some((_, encoded)) = ranges.next() else {
+        return Ok(PayloadPlan {
+            path,
+            root: destination.to_path_buf(),
+            private_range: false,
+        });
+    };
+    if ranges.next().is_some() {
+        return Err(failure("duplicate cluster article scope"));
+    }
+    let scope: ClusterRangeScope = serde_json::from_str(encoded).map_err(failure)?;
+    let file = job
+        .files
+        .first()
+        .filter(|file| job.files.len() == 1 && file.id.0 == scope.file_id)
+        .ok_or_else(|| failure("cluster article scope names another file"))?;
+    let span = scope
+        .last_article
+        .checked_sub(scope.first_article)
+        .and_then(|span| span.checked_add(1));
+    let mut articles = file
+        .segments
+        .iter()
+        .map(|segment| segment.number)
+        .collect::<Vec<_>>();
+    articles.sort_unstable();
+    if scope.job_id != job.id.0
+        || scope.first_article == 0
+        || scope.range_count == 0
+        || scope.range_index >= scope.range_count
+        || span != u32::try_from(articles.len()).ok()
+        || articles.first() != Some(&scope.first_article)
+        || articles.last() != Some(&scope.last_article)
+        || articles
+            .windows(2)
+            .any(|pair| pair[0].checked_add(1) != Some(pair[1]))
+    {
+        return Err(failure(
+            "cluster article scope does not exactly cover its file",
+        ));
+    }
+    let prefix = format!(
+        ".nzbd-cluster/range-work/job-{}/file-{}/{}-{}-fence-",
+        scope.job_id, scope.file_id, scope.first_article, scope.last_article
+    );
+    let namespace = relative
+        .to_str()
+        .ok_or_else(|| failure("cluster article namespace is not UTF-8"))?;
+    let fence = namespace
+        .strip_prefix(&prefix)
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|fence| *fence > 0)
+        .ok_or_else(|| failure("cluster article namespace does not match its fenced scope"))?;
+    if namespace != format!("{prefix}{fence}") {
+        return Err(failure("noncanonical cluster article fence namespace"));
+    }
+    let root = path
+        .parent()
+        .ok_or_else(|| failure("cluster article namespace has no private parent"))?
+        .to_path_buf();
+    Ok(PayloadPlan {
+        path,
+        root,
+        private_range: true,
+    })
+}
+
+/// Called only on the Engine's bounded payload lane. Descriptor-relative
+/// parent creation preserves the immediate-child Inventory allocation rule.
+pub(super) fn allocate_imported_payload(
+    inventory: &Arc<nzbd_state::artifacts::Inventory>,
+    record: &Job,
+    destination: &Path,
+    plan: &PayloadPlan,
+    allocation: Option<nzbd_state::artifacts::Artifact>,
+) -> Result<nzbd_state::artifacts::Artifact, nzbd_state::StateError> {
+    if plan.private_range {
+        let enrolled = inventory.startup_reconciliation_roots().map_err(failure)?;
+        if !enrolled.iter().any(|root| root == &plan.root) {
+            prepare_unenrolled_payload_root(inventory, destination)?;
+            let parent = plan.root.strip_prefix(destination).map_err(failure)?;
+            nzbd_state::fileops::parents(destination, parent).map_err(failure)?;
+        }
+    }
+    let keep = record
+        .params
+        .iter()
+        .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
+    let allocation = match allocation {
+        Some(previous)
+            if plan.private_range && (previous.path != plan.path || previous.root != plan.root) =>
+        {
+            inventory
+                .allocate_processing_successor_with_policy(
+                    record.id.0,
+                    &plan.root,
+                    &plan.path,
+                    Some((record.lifecycle_eligible(), record.delivery_lifecycle, keep)),
+                )
+                .map_err(failure)?
+        }
+        Some(previous) => inventory
+            .reclaim_recovered_orphan(record.id.0)
+            .map_err(failure)?
+            .unwrap_or(previous),
+        None => {
+            if !plan.path.try_exists().map_err(failure)? {
+                if record.files.iter().any(|file| file.has_any_done()) {
+                    return Err(failure(
+                        "recovered payload directory is unavailable; completion evidence retained",
+                    ));
+                }
+                prepare_unenrolled_payload_root(inventory, &plan.root)?;
+                inventory
+                    .allocate_for_delivery_with_keep(
+                        record.id.0,
+                        &plan.root,
+                        &plan.path,
+                        record.lifecycle_eligible(),
+                        record.delivery_lifecycle,
+                        keep,
+                    )
+                    .map_err(failure)?
+            } else {
+                inventory
+                    .register_legacy_active(record.id.0, &plan.root, &plan.path)
+                    .map_err(failure)?;
+                inventory
+                    .for_job(record.id.0)
+                    .map_err(failure)?
+                    .ok_or_else(|| failure("legacy enrollment returned no allocation"))?
+            }
+        }
+    };
+    if allocation.state == "active" {
+        inventory
+            .allocate(record.id.0, &allocation.root, &allocation.path)
+            .map_err(failure)?;
+    } else {
+        let _custody = inventory
+            .acquire_terminal_use(record.id.0, &|| Ok(()))
+            .map_err(failure)?
+            .ok_or_else(|| failure("retained allocation has no custody evidence"))?;
+    }
+    Ok(allocation)
+}
+
 fn needs_payload(job: &Job) -> bool {
     job.torrent.is_none()
         && !job.files.is_empty()
@@ -623,9 +801,10 @@ impl Owner {
             .map(|job| job.id.0)
             .collect::<Vec<_>>();
         let worker_root = root.clone();
+        let default_root = self.dest_dir.clone();
         let snapshot = self.startup_snapshot.clone();
         self.payload_then(root.clone(), move || {
-            prepare_unenrolled_payload_root(&inventory, &worker_root)?;
+            if worker_root == default_root { prepare_unenrolled_payload_root(&inventory, &worker_root)?; }
             inventory.reconcile_startup_root_snapshot(&worker_root, &live, &snapshot).map_err(failure)
         }, move |owner, result| {
             let state = owner.startup_reconciliation.get_mut(&root).unwrap();
@@ -671,8 +850,15 @@ impl Owner {
         if self.allocating_jobs.contains(&job) {
             return;
         }
+        let plan = match imported_payload_plan(&record, &self.dest_dir) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.queue_verification(job);
+                self.payload_recovery_failed(job, error);
+                return;
+            }
+        };
         let inventory = self.artifacts.clone();
-        let path = self.dest_dir.join(job_dir_name(&record));
         let fallback_root = self.dest_dir.clone();
         let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
         self.allocation_cache.remove(&job);
@@ -685,55 +871,84 @@ impl Owner {
         // This first lane touches only local Inventory metadata. The payload
         // worker can then reserve the actual allocation root, including imports
         // whose root differs from the configured default.
-        self.io_then(move||inventory.for_job(job.0).map_err(failure),move|owner,metadata|{
-            if owner.job_epochs.get(&job)!=Some(&epoch){owner.allocating_jobs.remove(&job);return;}
-            let allocation=match metadata {Ok(allocation)=>allocation,Err(error)=>{owner.payload_recovery_failed(job,error);return;}};
-            let root=allocation.as_ref().map(|allocation|allocation.root.clone()).unwrap_or(fallback_root);
-            if !owner.startup_reconciliation.get(&root).is_some_and(|state| state.ready) {
-                owner.allocating_jobs.remove(&job);
-                if !owner.startup_reconciliation.contains_key(&root) {
-                    owner.reconcile_payload_root(root.clone());
+        self.io_then(
+            move || inventory.for_job(job.0).map_err(failure),
+            move |owner, metadata| {
+                if owner.job_epochs.get(&job) != Some(&epoch) {
+                    owner.allocating_jobs.remove(&job);
+                    return;
                 }
-                if let Some(state) = owner.startup_reconciliation.get(&root) {
-                    let reason = state.reason.clone();
-                    let running = state.running;
-                    if let Some(verification) = owner.verification.get_mut(&job) {
-                        verification.phase = if running { "loading" } else { "blocked" }.into();
-                        verification.reason = reason;
-                        verification.retry_at = state.retry_at;
-                    }
-                }
-                owner.publish_now();
-                owner.drain_replacements();
-                return;
-            }
-            let inventory=owner.artifacts.clone();
-            owner.payload_then(root.clone(),move||{
-                let allocation=match allocation {
-                    Some(allocation)=>inventory.reclaim_recovered_orphan(job.0).map_err(failure)?.unwrap_or(allocation),
-                    None=>{
-                        if !path.try_exists().map_err(failure)? {
-                            if record.files.iter().any(|file|file.has_any_done()){return Err(failure("recovered payload directory is unavailable; completion evidence retained"));}
-                            inventory.allocate_for_delivery(job.0,&root,&path,record.lifecycle_eligible(),record.delivery_lifecycle).map_err(failure)?
-                        }else{
-                            inventory.register_legacy_active(job.0,&root,&path).map_err(failure)?;
-                            inventory.for_job(job.0).map_err(failure)?.ok_or_else(||failure("legacy enrollment returned no allocation"))?
-                        }
+                let allocation = match metadata {
+                    Ok(allocation) => allocation,
+                    Err(error) => {
+                        owner.payload_recovery_failed(job, error);
+                        return;
                     }
                 };
-                if allocation.state=="active" {inventory.allocate(job.0,&allocation.root,&allocation.path).map_err(failure)?;}
-                else{let _guard=inventory.acquire_terminal_use(job.0,&||Ok(())).map_err(failure)?.ok_or_else(||failure("retained allocation has no custody evidence"))?;}
-                Ok(allocation)
-            },move|owner,result|{
-                owner.allocating_jobs.remove(&job);
-                if owner.job_epochs.get(&job)!=Some(&epoch){return;}
-                match result {
-                    Ok(allocation)=>{if allocation.state=="active"{owner.allocated_jobs.insert(job);}owner.allocation_cache.insert(job,allocation);owner.queue_verification(job);}
-                    Err(error)=>owner.payload_recovery_failed(job,error),
+                let root = if plan.private_range {
+                    plan.root.clone()
+                } else {
+                    allocation
+                        .as_ref()
+                        .map(|allocation| allocation.root.clone())
+                        .unwrap_or_else(|| fallback_root.clone())
+                };
+                if !owner
+                    .startup_reconciliation
+                    .get(&root)
+                    .is_some_and(|state| state.ready)
+                {
+                    owner.allocating_jobs.remove(&job);
+                    if !owner.startup_reconciliation.contains_key(&root) {
+                        owner.reconcile_payload_root(root.clone());
+                    }
+                    if let Some(state) = owner.startup_reconciliation.get(&root) {
+                        let reason = state.reason.clone();
+                        let running = state.running;
+                        if let Some(verification) = owner.verification.get_mut(&job) {
+                            verification.phase = if running { "loading" } else { "blocked" }.into();
+                            verification.reason = reason;
+                            verification.retry_at = state.retry_at;
+                        }
+                    }
+                    owner.publish_now();
+                    owner.drain_replacements();
+                    return;
                 }
-                owner.publish_now();owner.bump_epoch();owner.drain_replacements();
-            });
-        });
+                let inventory = owner.artifacts.clone();
+                owner.payload_then(
+                    root.clone(),
+                    move || {
+                        allocate_imported_payload(
+                            &inventory,
+                            &record,
+                            &fallback_root,
+                            &plan,
+                            allocation,
+                        )
+                    },
+                    move |owner, result| {
+                        owner.allocating_jobs.remove(&job);
+                        if owner.job_epochs.get(&job) != Some(&epoch) {
+                            return;
+                        }
+                        match result {
+                            Ok(allocation) => {
+                                if allocation.state == "active" {
+                                    owner.allocated_jobs.insert(job);
+                                }
+                                owner.allocation_cache.insert(job, allocation);
+                                owner.queue_verification(job);
+                            }
+                            Err(error) => owner.payload_recovery_failed(job, error),
+                        }
+                        owner.publish_now();
+                        owner.bump_epoch();
+                        owner.drain_replacements();
+                    },
+                );
+            },
+        );
     }
 
     fn payload_recovery_failed(&mut self, job: JobId, error: nzbd_state::StateError) {
@@ -1192,6 +1407,164 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(engine.export_job(JobId(1)).await.unwrap().is_some());
+        engine.shutdown().await;
+    }
+
+    fn article_range_record(first: u32, index: u32, fence: u64) -> Job {
+        let last = first + 31;
+        let mut job = payload_record(JobStatus::Queued, b"abc", false);
+        job.dir_name =
+            format!(".nzbd-cluster/range-work/job-1/file-1/{first}-{last}-fence-{fence}");
+        job.params.retain(|(key, _)| key != "*File:size:1");
+        job.params.push((
+            "*Cluster:range".into(),
+            serde_json::json!({
+                "job_id": 1, "file_id": 1, "first_article": first, "last_article": last,
+                "range_index": index, "range_count": 3,
+            })
+            .to_string(),
+        ));
+        job.files[0].segments = (first..=last)
+            .map(|number| nzbd_types::Segment {
+                message_id: format!("article-{number}").into_boxed_str(),
+                number,
+                size: 1,
+                state: SegmentState::Pending,
+            })
+            .collect();
+        job
+    }
+
+    #[test]
+    fn private_article_parent_requires_exact_typed_scope_and_fenced_namespace() {
+        let destination = Path::new("/configured/payload");
+        let valid = article_range_record(1, 0, 7);
+        let plan = imported_payload_plan(&valid, destination).unwrap();
+        assert!(plan.private_range);
+        assert_eq!(
+            plan.root,
+            destination.join(".nzbd-cluster/range-work/job-1/file-1")
+        );
+        assert_eq!(plan.path.parent(), Some(plan.root.as_path()));
+        let flat = record("ordinary", JobStatus::Queued);
+        assert_eq!(
+            imported_payload_plan(&flat, destination).unwrap().root,
+            destination
+        );
+        let mut untyped = valid.clone();
+        untyped.params.retain(|(key, _)| key != "*Cluster:range");
+        let ordinary = imported_payload_plan(&untyped, destination).unwrap();
+        assert!(!ordinary.private_range);
+        assert_eq!(ordinary.root, destination);
+        for namespace in [
+            ".nzbd-cluster/range-work/job-1/file-1/1-32-fence-0",
+            ".nzbd-cluster/range-work/job-2/file-1/1-32-fence-7",
+            ".nzbd-cluster/range-work/job-1/file-1/1-32-fence-07",
+            ".nzbd-cluster/range-work/job-1/file-1/../1-32-fence-7",
+        ] {
+            let mut malformed = valid.clone();
+            malformed.dir_name = namespace.into();
+            assert!(
+                imported_payload_plan(&malformed, destination).is_err(),
+                "{namespace}"
+            );
+        }
+        let mut missing = valid.clone();
+        missing.files[0].segments.pop();
+        assert!(imported_payload_plan(&missing, destination).is_err());
+        let mut duplicate = valid;
+        duplicate.files[0].segments[1].number = 1;
+        assert!(imported_payload_plan(&duplicate, destination).is_err());
+    }
+
+    #[tokio::test]
+    async fn sequential_private_ranges_rebuild_nested_allocations_without_reusing_old_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = config(&temp);
+        cfg.persist_queue = false;
+        let destination = cfg.dest_dir.clone();
+        let engine = crate::Engine::spawn(cfg).await.unwrap();
+        let mut first = article_range_record(1, 0, 7);
+        first.delivery_lifecycle = true;
+        first
+            .params
+            .push(("*Runner:KeepOnFailure".into(), "1".into()));
+        engine
+            .import_job(first.clone(), false, false)
+            .await
+            .unwrap();
+        let recovered = await_export(&engine, JobId(1)).await;
+        assert_eq!(recovered.dir_name, first.dir_name);
+        let inventory = engine.artifacts();
+        let old = inventory.for_job(1).unwrap().unwrap();
+        assert_eq!(
+            old.root,
+            destination.join(".nzbd-cluster/range-work/job-1/file-1")
+        );
+        assert_eq!(old.path, destination.join(&first.dir_name));
+        assert_eq!(old.state, "active");
+        assert!(old.owned && old.keep_on_failure && old.delivery_lifecycle);
+        let old_payload = old.path.join(".runner-file-1.part");
+        std::fs::write(&old_payload, b"first range bytes remain retained").unwrap();
+        assert!(engine.remove_job_silent(JobId(1)).await.unwrap());
+
+        let second = article_range_record(65, 2, 9);
+        engine
+            .import_job(second.clone(), false, false)
+            .await
+            .unwrap();
+        let recovered = await_export(&engine, JobId(1)).await;
+        assert_eq!(recovered.dir_name, second.dir_name);
+        let current = inventory.for_job(1).unwrap().unwrap();
+        assert_eq!(current.path, destination.join(&second.dir_name));
+        assert_eq!(current.path.parent(), Some(current.root.as_path()));
+        assert_ne!(current.id, old.id);
+        assert_ne!(current.generation, old.generation);
+        assert!(current.keep_on_failure && current.delivery_lifecycle);
+        assert!(!current.path.join(".runner-file-1.part").exists());
+        assert_eq!(
+            std::fs::read(old_payload).unwrap(),
+            b"first range bytes remain retained"
+        );
+        let retained = inventory.get(&old.id).unwrap();
+        assert_eq!(retained.state, "retained");
+        assert!(retained.job.is_none() && retained.hold.is_some());
+        engine.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_range_parent_creation_refuses_symlink_escape() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = config(&temp);
+        std::fs::create_dir_all(&cfg.dest_dir).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, cfg.dest_dir.join(".nzbd-cluster")).unwrap();
+        let engine = crate::Engine::spawn(cfg).await.unwrap();
+        engine
+            .import_job(article_range_record(1, 0, 7), false, false)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = engine.snapshot();
+                if snapshot
+                    .jobs
+                    .first()
+                    .and_then(|job| job.verification.as_ref())
+                    .is_some_and(|progress| progress.state == "blocked")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unsafe private parent must remain visibly blocked");
+        assert!(engine.export_job(JobId(1)).await.unwrap().is_none());
+        assert!(engine.artifacts().for_job(1).unwrap().is_none());
+        assert!(!outside.join("range-work").exists());
         engine.shutdown().await;
     }
 

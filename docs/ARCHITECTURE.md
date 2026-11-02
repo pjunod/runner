@@ -261,7 +261,11 @@ independently, so a blocked mount does not hold engine construction or another
 root's metadata progress. The owner captures startup artifact generations,
 revisions and existing journal fingerprints before admitting runtime work.
 Root replay is limited to that snapshot; delayed startup work cannot classify
-new runtime allocations or operations as crash leftovers. Verification uses bounded batches (up to 64 ranges,
+new runtime allocations or operations as crash leftovers. Typed article-range
+workspaces allocate below their fenced nested parent. A subsequent range uses
+a fresh allocation generation, preserving the previous workspace's bytes and
+custody; preparation remains inside the engine's bounded payload lane.
+Verification uses bounded batches (up to 64 ranges,
 32 MiB, or 250 ms), retaining a cursor bound to the observed file identity
 between batches. The owner publishes checked-byte progress and can admit newly
 eligible higher-priority work before a yielded job resumes; manual pauses

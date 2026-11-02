@@ -5388,8 +5388,8 @@ impl Owner {
             && all_done
             && file_size > 0
             && self.state.job(job).is_some_and(|j| {
-                j.dir_name.starts_with(".nzbd-cluster/range-work/")
-                    && j.params.iter().any(|(k, _)| k == "*Cluster:range")
+                transitions::imported_payload_plan(j, &self.dest_dir)
+                    .is_ok_and(|plan| plan.private_range)
             });
         if range_checkpoint {
             combined_crc = None;
@@ -5972,7 +5972,19 @@ impl Owner {
                 "writer retirement in progress".into(),
             ));
         }
-        if self.allocated_jobs.contains(&job) && self.allocation_cache.contains_key(&job) {
+        let record = self
+            .state
+            .job(job)
+            .cloned()
+            .ok_or(nzbd_state::artifacts::Error::NotFound)?;
+        let plan = transitions::imported_payload_plan(&record, &self.dest_dir)
+            .map_err(|error| nzbd_state::artifacts::Error::Conflict(error.to_string()))?;
+        if self.allocated_jobs.contains(&job)
+            && self.allocation_cache.get(&job).is_some_and(|allocation| {
+                !plan.private_range
+                    || (allocation.path == plan.path && allocation.root == plan.root)
+            })
+        {
             return Ok(());
         }
         if self.allocating_jobs.contains(&job) {
@@ -5980,50 +5992,33 @@ impl Owner {
                 "payload allocation pending".into(),
             ));
         }
-        let record = self
-            .state
-            .job(job)
-            .cloned()
-            .ok_or(nzbd_state::artifacts::Error::NotFound)?;
         let inventory = self.artifacts.clone();
         let root = self.dest_dir.clone();
         let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
         self.allocating_jobs.insert(job);
-        let lane_root = self
-            .allocation_cache
-            .get(&job)
-            .map(|allocation| allocation.root.clone())
-            .unwrap_or_else(|| root.clone());
+        let lane_root = if plan.private_range {
+            plan.root.clone()
+        } else {
+            self.allocation_cache
+                .get(&job)
+                .map(|allocation| allocation.root.clone())
+                .unwrap_or_else(|| root.clone())
+        };
         self.payload_then(
             lane_root,
             move || {
-                let result = if let Some(existing) = inventory
+                let allocation = inventory
                     .for_job(job.0)
-                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
-                {
-                    inventory.allocate_for_delivery(
-                        job.0,
-                        &existing.root,
-                        &existing.path,
-                        record.lifecycle_eligible(),
-                        record.delivery_lifecycle,
-                    )
-                } else {
-                    prepare_unenrolled_payload_root(&inventory, &root)?;
-                    let keep = record
-                        .params
-                        .iter()
-                        .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
-                    inventory.allocate_for_delivery_with_keep(
-                        job.0,
-                        &root,
-                        &root.join(job_dir_name(&record)),
-                        record.lifecycle_eligible(),
-                        record.delivery_lifecycle,
-                        keep,
-                    )
-                };
-                result.map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))
+                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                let allocation = transitions::allocate_imported_payload(
+                    &inventory, &record, &root, &plan, allocation,
+                )?;
+                if allocation.state != "active" {
+                    return Err(nzbd_state::StateError::Corrupt(
+                        "download allocation is retained or retiring".into(),
+                    ));
+                }
+                Ok(allocation)
             },
             move |owner, result| {
                 owner.allocating_jobs.remove(&job);
@@ -6060,6 +6055,7 @@ impl Owner {
             tx
         };
         if self.pending_control_commits.contains(&job)
+            || self.pending_control_revisions.contains_key(&job)
             || self.cancel.is_cancelled()
             || self.verification.contains_key(&job)
             || self.retiring_writers.contains_key(&job)
@@ -9906,6 +9902,10 @@ mod tests {
         });
         assert!(owner.pending_control_revisions.contains_key(&JobId(1)));
         assert!(owner.grant_work(ServerId(1), 1).is_empty());
+        assert!(
+            owner.writer_for(JobId(1), FileId(10)).is_closed(),
+            "direct writer acquisition must honor the same durable control fence"
+        );
         release.send(()).unwrap();
         pump(&mut owner, &mut messages).await;
         assert!(!resumed.await.unwrap());
