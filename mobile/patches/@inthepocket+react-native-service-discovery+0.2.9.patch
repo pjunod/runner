@@ -1,0 +1,44 @@
+diff --git a/node_modules/@inthepocket/react-native-service-discovery/android/src/main/java/com/servicediscovery/ServiceDiscoveryModule.kt b/node_modules/@inthepocket/react-native-service-discovery/android/src/main/java/com/servicediscovery/ServiceDiscoveryModule.kt
+index fc37d6c..0d3671f 100644
+--- a/node_modules/@inthepocket/react-native-service-discovery/android/src/main/java/com/servicediscovery/ServiceDiscoveryModule.kt
++++ b/node_modules/@inthepocket/react-native-service-discovery/android/src/main/java/com/servicediscovery/ServiceDiscoveryModule.kt
+@@ -3,6 +3,7 @@ package com.servicediscovery
+ import android.content.Context
+ import android.net.nsd.NsdManager
+ import android.net.nsd.NsdServiceInfo
++import android.os.Build
+ import android.os.Handler
+ import android.os.Looper
+ import android.util.Log
+@@ -252,16 +253,23 @@ class ServiceDiscoveryModule internal constructor(context: ReactApplicationConte
+       service.putString("domain", "local.")
+       service.putInt("port", serviceInfo.port)
+ 
+-      val host = serviceInfo.host
+-      if (host != null) {
+-        service.putString("hostName", host.canonicalHostName)
+-        service.putArray("addresses", WritableNativeArray().apply {
+-          pushString(host.hostAddress)
+-        })
++      // getHost() returns only one arbitrary address on dual-stack hosts.
++      // Pass every resolved address so clients can prefer a reachable IPv4 address.
++      val hosts = if (Build.VERSION.SDK_INT >= 34) {
++        serviceInfo.hostAddresses
+       } else {
+-        service.putString("hostName", null)
+-        service.putArray("addresses", WritableNativeArray())
++        listOfNotNull(serviceInfo.host)
+       }
++      // API 36 exposes the actual DNS-SD hostname without a reverse DNS lookup.
++      val hostname = if (Build.VERSION.SDK_INT >= 36) {
++        serviceInfo.hostname?.let { "${it.removeSuffix(".").removeSuffix(".local")}.local." }
++      } else {
++        hosts.firstOrNull()?.canonicalHostName
++      }
++      service.putString("hostName", hostname)
++      service.putArray("addresses", WritableNativeArray().apply {
++        hosts.mapNotNull { it.hostAddress }.distinct().forEach { pushString(it) }
++      })
+       val txt: WritableMap = WritableNativeMap()
+       for ((key, value) in serviceInfo.attributes ?: emptyMap()) {
+         if (value != null) {

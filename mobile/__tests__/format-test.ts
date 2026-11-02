@@ -114,6 +114,10 @@ describe('API presentation helpers', () => {
     expect(normalizeServerUrl('[2001:db8::7]')).toBe('http://[2001:db8::7]:6789');
   });
 
+  test('explains unsupported scoped IPv6 addresses', () => {
+    expect(() => normalizeServerUrl('http://[fe80::8%25wlan0]:6789')).toThrow('Choose another discovered address');
+  });
+
   test('preserves an explicitly selected port', () => {
     expect(normalizeServerUrl('nuc3:8080')).toBe('http://nuc3:8080');
     expect(normalizeServerUrl('https://nuc3:8443')).toBe('https://nuc3:8443');

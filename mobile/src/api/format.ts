@@ -139,12 +139,15 @@ export function isJobPaused(status: JobStatus): boolean {
 export function normalizeServerUrl(input: string): string {
   const trimmed = input.trim();
   if (!trimmed) throw new Error('Enter the address of your Runner server.');
+  if (/\[[^\]]*%[^\]]*\]/.test(trimmed)) {
+    throw new Error('This scoped IPv6 address is unsupported. Choose another discovered address or use the server’s .local hostname.');
+  }
   const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
   let parsed: URL;
   try {
     parsed = new URL(withScheme);
   } catch {
-    throw new Error('Use an address like http://192.168.1.20:6789.');
+    throw new Error('Use an address like http://192.168.1.20:6789 or http://[2001:db8::7]:6789.');
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new Error('The server address must use http:// or https://.');
