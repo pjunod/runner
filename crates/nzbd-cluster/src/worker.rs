@@ -10,7 +10,7 @@ use crate::http::ClusterClient;
 use crate::proto::*;
 use crate::{ClusterConfig, PpSetup};
 use nzbd_engine::{EngineHandle, MirrorStats};
-use nzbd_post::manager::{PpCtx, process_job_ctx};
+use nzbd_post::manager::{process_job_ctx, PpCtx};
 use nzbd_types::{JobId, JobStatus, ServerDef};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -741,10 +741,6 @@ async fn reject_remote_grant(
     }
 }
 
-/// Execute one PP lease: the stage pipeline fenced by the lease id, with a
-/// commit check against the live lease map (a cancelled/reclaimed lease
-/// must never publish results or stamp the job).
-#[allow(clippy::too_many_arguments)]
 /// Lease renewals can extend the deadline while owner recovery is pending.
 /// Recheck at the exact recorded deadline; never drop an issued owner request.
 async fn wait_pp_owner_admission(
@@ -785,6 +781,10 @@ async fn wait_pp_owner_admission(
     }
 }
 
+/// Execute one PP lease: the stage pipeline fenced by the lease id, with a
+/// commit check against the live lease map (a cancelled/reclaimed lease
+/// must never publish results or stamp the job).
+#[allow(clippy::too_many_arguments)]
 fn run_pp_lease(
     engine: EngineHandle,
     mut setup: PpSetup,
@@ -1655,12 +1655,10 @@ mod tests {
             .import_job(queued_test_job(), false, false)
             .await
             .unwrap();
-        assert!(
-            engine
-                .enter_post_stage(JobId(77), PostStage::ParVerify, 1_000, None)
-                .await
-                .unwrap()
-        );
+        assert!(engine
+            .enter_post_stage(JobId(77), PostStage::ParVerify, 1_000, None)
+            .await
+            .unwrap());
 
         engine
             .register_repair_attempt(JobId(77), "transition-lease:1".into())
@@ -1908,11 +1906,9 @@ mod tests {
             accepted_at_unix_ms: Some(10),
             history_recorded_by_authority: true,
         };
-        assert!(
-            accept_worker_retirement(&engine, &request, &response)
-                .await
-                .is_err()
-        );
+        assert!(accept_worker_retirement(&engine, &request, &response)
+            .await
+            .is_err());
         assert!(workspace.scratch.path.exists());
         response.ok = true;
         accept_worker_retirement(&engine, &request, &response)

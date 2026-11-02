@@ -652,7 +652,7 @@ impl EngineHandle {
             if cancellation.is_cancelled() || self.cancel.is_cancelled() {
                 return Ok(None);
             }
-            changes.borrow_and_update();
+            let _ = changes.borrow_and_update();
             // Receive every issued result even if cancellation wins during
             // persistence. An issued scope must be explicitly released.
             if let Some(admission) = self.begin_post_admission(job).await? {
