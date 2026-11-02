@@ -54,7 +54,7 @@ impl std::ops::Deref for ActiveLeases {
     }
 }
 impl ActiveLeases {
-    fn spawn_operation<F>(&self, tracker: &TaskTracker, id: String, work: F)
+    pub(crate) fn spawn_operation<F>(&self, tracker: &TaskTracker, id: String, work: F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {

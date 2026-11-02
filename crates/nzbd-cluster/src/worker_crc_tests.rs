@@ -286,7 +286,7 @@ async fn pending_worker_crc_accepts_real_renewal_and_refuses_expired_or_replaced
             job_incarnation: "crc-job-incarnation".into(),
             job_revision: 1,
             control_revision: 1,
-            scope: serde_json::json!({"whole_job":true}),
+            scope: serde_json::json!({"whole_job":true,"_startOrdered":1,"_workerStorage":engine.artifacts().installation}),
             epoch: 1,
             kind: LeaseKind::Download,
             job,

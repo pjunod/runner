@@ -489,3 +489,7 @@ async fn seal_authority_exact(
         revision: removal.applied_revision,
     })
 }
+
+#[cfg(test)]
+#[path="cancellation_route_tests.rs"]
+mod tests;
