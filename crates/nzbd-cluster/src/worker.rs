@@ -1279,17 +1279,7 @@ fn run_pp_lease(
                 ("NZBCLUSTER_LEASE_REVISION".into(), initial.token.revision.to_string()),
             ],
             script_receipt_prefix: Some(format!("script:{}:", initial.job_incarnation)),
-            commit_ok: Arc::new({
-                let active = active.clone();
-                let lease_id = lease_id.clone();
-                move || {
-                    active
-                        .lock()
-                        .unwrap()
-                        .get(&lease_id)
-                        .is_some_and(|state| state.deadline > Instant::now())
-                }
-            }),
+            commit_ok: lease_authority(&active,&lease_id,&initial),
         };
         loop {
             if initial.cancel.is_cancelled(){break;}
@@ -2131,6 +2121,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn post_commit_authority_accepts_renewal_but_refuses_same_id_new_intent() {
+        let active: ActiveLeases = Default::default();
+        let state = LeaseState {
+            job: JobId(77),
+            kind: LeaseKind::Post,
+            token: test_token(),
+            job_incarnation: "original-job".into(),
+            job_revision: 4,
+            control_revision: 4,
+            deadline: Instant::now() + std::time::Duration::from_secs(30),
+            cancel: CancellationToken::new(),
+            pp_ready: false,
+            ready_job: None,
+        };
+        active
+            .lock()
+            .unwrap()
+            .insert("same-id".into(), state.clone());
+        let commit = lease_authority(&active, "same-id", &state);
+        assert!(commit());
+        active
+            .lock()
+            .unwrap()
+            .get_mut("same-id")
+            .unwrap()
+            .token
+            .revision += 1;
+        assert!(commit(), "same operation heartbeat renewal remains valid");
+        active
+            .lock()
+            .unwrap()
+            .get_mut("same-id")
+            .unwrap()
+            .control_revision += 1;
+        assert!(
+            !commit(),
+            "future deadline cannot authorize old PP after newer control intent"
+        );
+        active
+            .lock()
+            .unwrap()
+            .insert("same-id".into(), state.clone());
+        active
+            .lock()
+            .unwrap()
+            .get_mut("same-id")
+            .unwrap()
+            .job_incarnation = "replacement-job".into();
+        assert!(!commit());
+        active.lock().unwrap().insert("same-id".into(), state);
+        active
+            .lock()
+            .unwrap()
+            .get_mut("same-id")
+            .unwrap()
+            .token
+            .fence += 1;
+        assert!(!commit());
+    }
     #[test]
     fn failed_generation_build_releases_private_staging_tree() {
         let tmp = tempfile::tempdir().unwrap();
