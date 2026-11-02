@@ -1,7 +1,14 @@
 # Lifecycle remediation — remaining fixes and delivery status
 
-**Status:** implementation and primary review active; final gates and merge pending.
+**Status:** completing remaining implementation and proceeding to merge.
 **Started:** 2026-11-01.
+
+**Latest owner direction:** stop repeated review rounds and do not rerun unit
+tests that already passed; merge completed fixes. This supersedes the earlier
+Astra/full-suite sequence recorded below. No final Astra review has run.
+New, unfinished Runner code still needs its first relevant checks; previously
+passing checks will not be repeated. Required repository merge rules still apply.
+Backlog cleanup remains separate and unapproved.
 
 Companion to the approved download lifecycle proposal and API documentation.
 This continuation starts from current merged code. It preserves the later
