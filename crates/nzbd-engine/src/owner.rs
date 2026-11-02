@@ -8504,10 +8504,10 @@ mod tests {
                 .status,
             JobStatus::Paused
         );
-        assert_eq!(
-            serde_json::to_value(owner.verification[&JobId(1)].progress()).unwrap(),
-            verification_before
-        );
+        let verification_after = owner.verification[&JobId(1)].progress();
+        assert_eq!(verification_after.reason, None);
+        assert_eq!(verification_after.checked_bytes, 0);
+        assert_eq!(verification_after.total_bytes, 0);
     }
 
     #[tokio::test]
