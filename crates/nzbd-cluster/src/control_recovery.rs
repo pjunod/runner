@@ -134,8 +134,12 @@ pub(crate) async fn reconcile(shared: &crate::leader::LeaderShared) -> Result<()
                 restore_current = true;
                 continue;
             }
-            if !source_valid(shared, &durable, &marker).await? {
-                return Err(format!("job {} automatic control source proof changed; retain pending retry for review",local.id.0));
+            match source_valid(shared,&durable,&marker).await {
+                Ok(true)=>{},
+                outcome=>{
+                    tracing::warn!(job=local.id.0,reason=?outcome,"automatic control remains pending on this job; source proof unavailable");
+                    continue;
+                }
             }
             durable.set_control(&marker.result_control);
             durable.status = marker.result_status;
@@ -193,12 +197,7 @@ pub(crate) async fn reconcile(shared: &crate::leader::LeaderShared) -> Result<()
     if restore_current {
         // Only after all valid markers were committed/ACKed may a current
         // operator/source projection replace stale local automatic intent.
-        let jobs = control
-            .load_jobs()
-            .await?
-            .into_iter()
-            .map(|(job, _, _)| job)
-            .collect();
+        let jobs=projection(shared).await?;
         shared
             .engine
             .adopt_replicated_authority(jobs)
@@ -335,4 +334,28 @@ pub(crate) async fn relocation_proof(
     .map_err(|e| (axum::http::StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?
     .map_err(|e| (axum::http::StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     Ok(axum::Json(RelocationProofReply { storage, valid }))
+}
+
+/// Preserve one exact locally pending automatic result in the local projection
+/// only. A newer durable operator/source edit or tombstone always replaces it.
+pub(crate) async fn projection(shared:&crate::leader::LeaderShared)->Result<Vec<Job>,String>{
+    let control=shared.control.as_ref().ok_or("replicated control unavailable")?;
+    let local=shared.engine_projection().await?;
+    let mut jobs=Vec::new();
+    for (mut durable,_,_) in control.load_jobs().await? {
+        if let Some(current)=local.get(&u64::from(durable.id.0)) {
+            if let Some(marker)=nzbd_engine::automatic_control::transition(current) {
+                if durable.control()==marker.base_control && durable.status==marker.base_status
+                    && business_intent(current)?==business_intent(&durable)? {
+                    durable.set_control(&marker.result_control);durable.status=marker.result_status;
+                    for key in [nzbd_engine::automatic_control::AUTOMATIC_CONTROL_PARAM,"*Control:attempts","*Control:probe_after"] {
+                        durable.params.retain(|(old,_)|old!=key);
+                        durable.params.extend(current.params.iter().filter(|(old,_)|old==key).cloned());
+                    }
+                }
+            }
+        }
+        jobs.push(durable);
+    }
+    Ok(jobs)
 }

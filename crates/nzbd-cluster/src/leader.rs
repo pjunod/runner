@@ -266,16 +266,7 @@ impl LeaderShared {
 
     pub(crate) async fn restore_control_projection(&self) -> Result<(), String> {
         crate::control_recovery::reconcile(self).await?;
-        let control = self
-            .control
-            .as_ref()
-            .ok_or_else(|| "replicated control unavailable".to_owned())?;
-        let jobs = control
-            .load_jobs()
-            .await?
-            .into_iter()
-            .map(|(job, _, _)| job)
-            .collect();
+        let jobs=crate::control_recovery::projection(self).await?;
         self.engine
             .adopt_replicated_authority(jobs)
             .await
@@ -297,8 +288,23 @@ impl LeaderShared {
             .ok_or_else(|| "replicated control unavailable".to_owned())?;
         let mut after = self.engine_projection().await?;
         for job in after.values_mut() {
-            if job.params.iter().any(|(key,_)|key==nzbd_engine::automatic_control::AUTOMATIC_CONTROL_PARAM) {
-                return Err("automatic recovery changed the queue during this request; retry against current control".into());
+            if let Some(marker)=nzbd_engine::automatic_control::transition(job) {
+                let old=before.get(&u64::from(job.id.0));
+                if let Some(old)=old.filter(|old|crate::control_recovery::business_intent(old).ok()==crate::control_recovery::business_intent(job).ok()) {
+                    // Automatic/progress changes on another job belong to
+                    // reconciliation, never this request's whole-job delta.
+                    *job=old.clone();continue;
+                }
+                if old.and_then(nzbd_engine::automatic_control::transition).is_some_and(|prior|prior.identity==marker.identity) {
+                    // Explicit Keep/name/source edits replace a pending result
+                    // without accepting an unproved automatic release.
+                    let (durable,_,_)=control.current_job_intent(job.id.0).await?.ok_or("pending job was removed by another authority")?;
+                    job.params.retain(|(key,_)|key!=nzbd_engine::automatic_control::AUTOMATIC_CONTROL_PARAM && key!=nzbd_types::CONTROL_PARAM);
+                    if let Some(current)=durable.control(){job.set_control(&current);}
+                    job.status=durable.status;
+                }else{
+                    return Err("automatic recovery changed this job during the request; retry against current control".into());
+                }
             }
             if !before.contains_key(&u64::from(job.id.0)) {crate::source_facts::bind_owned(self,job)?;}
         }
@@ -2165,7 +2171,7 @@ pub fn spawn_leader_task(
                         if let Err(error)=crate::control_recovery::reconcile(&shared).await {tracing::error!(%error,"automatic control adoption incomplete");continue;}
                         if let Err(error)=crate::admissions::initialize(&shared).await {tracing::error!(%error,"admission authority adoption incomplete");tokio::time::sleep(shared.cfg.lease_interval).await;continue;}
                         let replicated = match &shared.control {
-                            Some(control) => control.load_jobs().await,
+                            Some(_) => crate::control_recovery::projection(&shared).await.map(|jobs|jobs.into_iter().map(|job|(job,0,String::new())).collect::<Vec<_>>()),
                             None => Err("replicated control unavailable".into()),
                         };
                         match replicated {

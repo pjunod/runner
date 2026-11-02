@@ -580,12 +580,7 @@ pub(crate) async fn rollback_pending(shared: &LeaderShared) -> Result<(), String
         }
     }
     if !absent.is_empty() {
-        let jobs = control
-            .load_jobs()
-            .await?
-            .into_iter()
-            .map(|(job, _, _)| job)
-            .collect();
+        let jobs=crate::control_recovery::projection(shared).await?;
         shared
             .engine
             .adopt_replicated_authority(jobs)
