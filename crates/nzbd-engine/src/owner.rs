@@ -571,7 +571,7 @@ pub(crate) struct Lease {
 /// Everything that reaches the owner task.
 #[derive(Debug)]
 pub(crate) enum EngineMsg {
-    Command(QueueCommand),
+    Command(Box<QueueCommand>),
     WorkRequest {
         server: ServerId,
         max: usize,
@@ -1348,7 +1348,7 @@ impl Owner {
 
     fn on_msg(&mut self, msg: EngineMsg) {
         match msg {
-            EngineMsg::Command(cmd) => self.on_command(cmd),
+            EngineMsg::Command(cmd) => self.on_command(*cmd),
             EngineMsg::WorkRequest { server, max, reply } => {
                 let leases = self.grant_work(server, max.max(1));
                 let _ = reply.send(leases);
@@ -1834,15 +1834,15 @@ impl Owner {
                 count,
                 reply,
             } => {
-                let result = if self.persistence_fenced || !self.persist {
-                    Err(crate::EngineError::OwnershipLost)
-                } else if self
-                    .state
-                    .job(job)
-                    .filter(|row| row.status == JobStatus::Fetching)
-                    .and_then(|row| nzbd_state::artifacts::url_source_identity(row).ok())
-                    .as_deref()
-                    != Some(&source_identity)
+                let result = if self.persistence_fenced
+                    || !self.persist
+                    || self
+                        .state
+                        .job(job)
+                        .filter(|row| row.status == JobStatus::Fetching)
+                        .and_then(|row| nzbd_state::artifacts::url_source_identity(row).ok())
+                        .as_deref()
+                        != Some(&source_identity)
                 {
                     Err(crate::EngineError::OwnershipLost)
                 } else if let Some(maximum) = self.state.next_file_id.checked_add(count) {
@@ -3612,9 +3612,9 @@ impl Owner {
                     Ok(Some(checkpoint)) => {
                         worker_control_restored = true;
                         job.set_control(&checkpoint.control);
-                        job.status = if checkpoint.control.lifecycle == "held" {
-                            JobStatus::Paused
-                        } else if checkpoint.control.manual_pause {
+                        job.status = if checkpoint.control.lifecycle == "held"
+                            || checkpoint.control.manual_pause
+                        {
                             JobStatus::Paused
                         } else if matches!(
                             checkpoint.control.previous_status,
@@ -10080,7 +10080,7 @@ mod tests {
                 segment_number: 1,
                 offset: 0,
                 len: 100,
-                crc32: crc32fast::hash(&vec![7; 100]),
+                crc32: crc32fast::hash(&[7; 100]),
                 file_size: 100,
             })
             .unwrap();

@@ -24,7 +24,10 @@ impl From<&Artifact> for SourceVersion {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct HoldReleaseGuard {
+pub(crate) struct HoldReleaseGuard(Arc<HoldReleaseProof>);
+
+#[derive(Debug, Default)]
+struct HoldReleaseProof {
     authority: Option<ImportAuthority>,
     context: Option<WorkerControlContext>,
     source_bound: bool,
@@ -36,34 +39,37 @@ impl HoldReleaseGuard {
         source: Option<&Artifact>,
         authority: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     ) -> Self {
-        Self {
+        Self(Arc::new(HoldReleaseProof {
             authority: authority.map(ImportAuthority),
             context: WorkerControlContext::for_job(record),
             source_bound: true,
             source: source.map(SourceVersion::from),
-        }
+        }))
     }
     pub(crate) fn checked(&self) -> bool {
-        self.authority.is_some()
+        self.0.authority.is_some()
     }
     pub(crate) fn authority_callback(&self) -> Option<Arc<dyn Fn() -> bool + Send + Sync>> {
-        self.authority.as_ref().map(|authority| authority.0.clone())
+        self.0
+            .authority
+            .as_ref()
+            .map(|authority| authority.0.clone())
     }
     pub(crate) fn live(&self) -> bool {
-        self.authority.as_ref().is_none_or(ImportAuthority::valid)
+        self.0.authority.as_ref().is_none_or(ImportAuthority::valid)
     }
     pub(crate) fn matches(&self, inventory: &Inventory, current: &Job, persistent: bool) -> bool {
         if !self.live()
-            || ((self.source_bound || self.authority.is_some())
-                && self.context != WorkerControlContext::for_job(current))
+            || ((self.0.source_bound || self.0.authority.is_some())
+                && self.0.context != WorkerControlContext::for_job(current))
         {
             return false;
         }
-        if self.source_bound {
+        if self.0.source_bound {
             let Ok(source) = inventory.for_job(current.id.0) else {
                 return false;
             };
-            if source.as_ref().map(SourceVersion::from) != self.source {
+            if source.as_ref().map(SourceVersion::from) != self.0.source {
                 return false;
             }
         }
@@ -72,10 +78,10 @@ impl HoldReleaseGuard {
         }
         // A durable old context is a checkpoint, not evidence that its lease
         // is still live. The execution lane supplies the live grant check.
-        if self.authority.is_none() {
+        if self.0.authority.is_none() {
             return false;
         }
-        let Some(context) = &self.context else {
+        let Some(context) = &self.0.context else {
             return false;
         };
         inventory

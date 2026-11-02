@@ -97,9 +97,9 @@ pub(crate) fn intent(job: Option<&Job>) -> Option<String> {
 }
 
 #[cfg(test)]
-pub(crate) static PREPARATION_GATE: std::sync::Mutex<
-    Option<(PathBuf, Arc<(std::sync::Barrier, std::sync::Barrier)>)>,
-> = std::sync::Mutex::new(None);
+type PreparationGate = Option<(PathBuf, Arc<(std::sync::Barrier, std::sync::Barrier)>)>;
+#[cfg(test)]
+pub(crate) static PREPARATION_GATE: std::sync::Mutex<PreparationGate> = std::sync::Mutex::new(None);
 fn checkpoint(root: &Path) {
     #[cfg(test)]
     {

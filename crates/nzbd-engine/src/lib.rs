@@ -71,12 +71,13 @@ pub fn is_out_of_space(msg: &str) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) static URL_PREPARATION_GATE: std::sync::Mutex<
-    Option<(
-        String,
-        std::sync::Arc<(std::sync::Barrier, std::sync::Barrier)>,
-    )>,
-> = std::sync::Mutex::new(None);
+type UrlPreparationGate = Option<(
+    String,
+    std::sync::Arc<(std::sync::Barrier, std::sync::Barrier)>,
+)>;
+#[cfg(test)]
+pub(crate) static URL_PREPARATION_GATE: std::sync::Mutex<UrlPreparationGate> =
+    std::sync::Mutex::new(None);
 fn url_preparation_checkpoint(identity: &str) {
     #[cfg(test)]
     {
@@ -740,7 +741,8 @@ impl EngineHandle {
             .await;
     }
     pub fn close_repair_attempt(&self, job: JobId, attempt: String) {
-        let command = EngineMsg::Command(QueueCommand::CloseRepairAttempt { job, attempt });
+        let command =
+            EngineMsg::Command(Box::new(QueueCommand::CloseRepairAttempt { job, attempt }));
         if let Err(tokio::sync::mpsc::error::TrySendError::Full(command)) =
             self.cmd_tx.try_send(command)
         {
@@ -1950,11 +1952,11 @@ impl EngineHandle {
     pub fn close_post_stage_now(&self, job: JobId, at_unix: i64, ms: Option<u64>) {
         let _ = self
             .cmd_tx
-            .try_send(EngineMsg::Command(QueueCommand::ClosePostStage {
+            .try_send(EngineMsg::Command(Box::new(QueueCommand::ClosePostStage {
                 job,
                 at_unix,
                 ms,
-            }));
+            })));
     }
 
     pub async fn remove_job_silent(&self, job: JobId) -> Result<bool, EngineError> {
@@ -1975,21 +1977,21 @@ impl EngineHandle {
     pub fn mirror_progress(&self, job: JobId, stats: MirrorStats) {
         let _ = self
             .cmd_tx
-            .try_send(EngineMsg::Command(QueueCommand::MirrorProgress {
+            .try_send(EngineMsg::Command(Box::new(QueueCommand::MirrorProgress {
                 job,
                 node: None,
                 stats,
-            }));
+            })));
     }
 
     pub fn mirror_progress_from(&self, job: JobId, node: String, stats: MirrorStats) {
         let _ = self
             .cmd_tx
-            .try_send(EngineMsg::Command(QueueCommand::MirrorProgress {
+            .try_send(EngineMsg::Command(Box::new(QueueCommand::MirrorProgress {
                 job,
                 node: Some(node),
                 stats,
-            }));
+            })));
     }
 
     pub async fn fold_job_journals(&self, job: JobId) -> Result<(), EngineError> {
@@ -2231,7 +2233,7 @@ impl EngineHandle {
 
     async fn send(&self, cmd: QueueCommand) -> Result<(), EngineError> {
         self.cmd_tx
-            .send(EngineMsg::Command(cmd))
+            .send(EngineMsg::Command(Box::new(cmd)))
             .await
             .map_err(|_| EngineError::Closed)
     }
