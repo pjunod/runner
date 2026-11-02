@@ -23,6 +23,25 @@ pub(super) async fn pump(owner: &mut Owner, messages: &mut mpsc::Receiver<Engine
         }).await.expect("real persistence/IO worker did not reach an idle acknowledgement boundary");
 }
 
+/// Public export remains fenced until the real imported payload verification
+/// completes. Only its explicit busy result is retryable in these fixtures.
+async fn export_job_ready_for_test(
+    engine: &crate::EngineHandle,
+    job: JobId,
+) -> Result<Option<Job>, crate::EngineError> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match engine.export_job(job).await {
+                Err(crate::EngineError::Lifecycle(reason))
+                    if reason == "job verification or writer retirement is still in progress; retry later" => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                result => return result,
+            }
+        }
+    }).await.expect("actual imported job verification did not complete")
+}
+
 async fn persist_snapshot_for_test(owner: &mut Owner, messages: &mut mpsc::Receiver<EngineMsg>) {
     let (reply, result) = oneshot::channel();
     owner.persist_then(move |_, ok| {
@@ -33,6 +52,19 @@ async fn persist_snapshot_for_test(owner: &mut Owner, messages: &mut mpsc::Recei
         result.await.unwrap(),
         "fixture snapshot did not cross its durable acknowledgement"
     );
+}
+
+async fn import_job_for_test(
+    owner: &mut Owner,
+    messages: &mut mpsc::Receiver<EngineMsg>,
+    job: Job,
+) -> bool {
+    let (reply, result) = oneshot::channel();
+    owner.replace_job_then(job, false, false, false, false, move |_, outcome| {
+        let _ = reply.send(outcome.is_ok());
+    });
+    pump(owner, messages).await;
+    result.await.unwrap()
 }
 
 async fn allocate_for_test(
@@ -530,6 +562,7 @@ fn guard_test_owner_with_backend(
     mpsc::Receiver<EngineMsg>,
 ) {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("dest")).unwrap();
     let (budget_tx, _) = watch::channel(crate::pool::BudgetEnvelope::default());
     let (events, _) = broadcast::channel(1);
     let (epoch_tx, epoch_rx) = watch::channel(0);
@@ -637,6 +670,7 @@ fn control_test_owner_with_persistence(
     mpsc::Receiver<EngineMsg>,
 ) {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("dest")).unwrap();
     let (budget_tx, _) = watch::channel(crate::pool::BudgetEnvelope::default());
     let (events, _) = broadcast::channel(1);
     let (epoch_tx, _) = watch::channel(0);
@@ -1740,16 +1774,22 @@ async fn pending_payload_allocation_does_not_starve_an_allocated_job() {
 
 #[tokio::test]
 async fn resume_waits_for_durable_revision_and_failure_keeps_both_schedulers_fenced() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let allowed = Arc::new(AtomicBool::new(true));
+    let observed = allowed.clone();
     // NZB lease path: a queued in-memory Resume stays ineligible while its
     // exact control revision is waiting on the ordered IO/snapshot lane.
-    let (_tmp, mut owner, _adapter, mut messages) =
-        control_test_owner_with_persistence(true, Some(Arc::new(|| false)));
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner_with_persistence(
+        true,
+        Some(Arc::new(move || observed.load(Ordering::SeqCst))),
+    );
     pump(&mut owner, &mut messages).await;
     install_control_test_server(&mut owner);
     let mut job = pending_job(1);
     job.status = JobStatus::Paused;
     owner.state.jobs.push(job);
     allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
     let release = block_control_test_io(&mut owner).await;
     let (reply, resumed) = oneshot::channel();
     owner.on_command(QueueCommand::Resume {
@@ -1762,6 +1802,7 @@ async fn resume_waits_for_durable_revision_and_failure_keeps_both_schedulers_fen
         owner.writer_for(JobId(1), FileId(10)).is_closed(),
         "direct writer acquisition must honor the same durable control fence"
     );
+    allowed.store(false, Ordering::SeqCst);
     release.send(()).unwrap();
     pump(&mut owner, &mut messages).await;
     assert!(!resumed.await.unwrap());
@@ -1771,8 +1812,12 @@ async fn resume_waits_for_durable_revision_and_failure_keeps_both_schedulers_fen
 
     // Torrent Start follows the same fence and remains stopped on failed
     // persistence, even though the in-memory control intent is Running.
-    let (_tmp, mut owner, mut adapter, mut messages) =
-        control_test_owner_with_persistence(true, Some(Arc::new(|| false)));
+    let allowed = Arc::new(AtomicBool::new(true));
+    let observed = allowed.clone();
+    let (_tmp, mut owner, mut adapter, mut messages) = control_test_owner_with_persistence(
+        true,
+        Some(Arc::new(move || observed.load(Ordering::SeqCst))),
+    );
     pump(&mut owner, &mut messages).await;
     let mut torrent = control_torrent_job();
     torrent.status = JobStatus::Paused;
@@ -1780,6 +1825,7 @@ async fn resume_waits_for_durable_revision_and_failure_keeps_both_schedulers_fen
     control.phase = TorrentPhase::PausedDownload;
     control.control_intent = TorrentControlIntent::Paused;
     owner.state.jobs.push(torrent);
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
     let release = block_control_test_io(&mut owner).await;
     let (reply, resumed) = oneshot::channel();
     owner.on_command(QueueCommand::Resume {
@@ -1792,6 +1838,7 @@ async fn resume_waits_for_durable_revision_and_failure_keeps_both_schedulers_fen
             .await
             .is_err()
     );
+    allowed.store(false, Ordering::SeqCst);
     release.send(()).unwrap();
     pump(&mut owner, &mut messages).await;
     assert!(!resumed.await.unwrap());
@@ -2064,6 +2111,7 @@ async fn post_hold_retry_checks_revision_custody_and_stage_then_persists() {
     );
     pump(&mut owner, &mut messages).await;
     assert_eq!(owner.state.jobs[0].status, JobStatus::PostQueued);
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
     let persisted = SnapshotStore::open(&tmp.path().join("state"))
         .unwrap()
         .load()
@@ -2112,8 +2160,8 @@ async fn storage_errno_writer_error_schedules_itself() {
         .next_retry_at_unix
         .expect("scheduled in the hold itself");
     assert!(
-        at >= before + 30 && at <= unix_now() + 30,
-        "first retry after 30 s: {at}"
+        at >= before + 30 && at <= unix_now() + 33,
+        "first retry after 30 s plus at most 10% positive jitter: {at}"
     );
     let persisted = SnapshotStore::open(&tmp.path().join("state"))
         .unwrap()
@@ -2129,6 +2177,9 @@ async fn storage_errno_writer_error_schedules_itself() {
         "the schedule is durable with the hold, not a second write"
     );
 
+    let mut due = held.clone();
+    due.next_retry_at_unix = Some(0);
+    owner.state.jobs[0].set_control(&due);
     assert_eq!(
         owner.retry_hold(JobId(1), &held.revision, RetryBy::Recovery, false),
         Ok(())
@@ -2208,10 +2259,11 @@ async fn permanent_writer_error_waits_for_review() {
     assert!(
         owner
             .retry_hold(JobId(1), &held.revision, RetryBy::Recovery, false)
-            .is_ok(),
-        "the owner itself does not police policy; the recovery task never asks"
+            .is_err(),
+        "the actor independently refuses automatic retries of permanent failures"
     );
     pump(&mut owner, &mut messages).await;
+    assert!(owner.state.jobs[0].held());
 }
 
 #[tokio::test]
@@ -2384,6 +2436,9 @@ async fn rehold_after_release_routes_by_where_the_job_is_now() {
     pump(&mut owner, &mut messages).await;
     let first = owner.state.jobs[0].control().unwrap();
     assert!(!first.post_side());
+    let mut due = first.clone();
+    due.next_retry_at_unix = Some(0);
+    owner.state.jobs[0].set_control(&due);
     owner
         .retry_hold(JobId(1), &first.revision, RetryBy::Recovery, false)
         .unwrap();
@@ -3541,22 +3596,39 @@ async fn url_bulk_preparation_does_not_block_live_controls() {
     ))
     .await
     .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while crate::URL_PREPARATION_GATE.lock().unwrap().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("recovered URL must reach off-actor bulk preparation");
     let entered = gate.clone();
     tokio::task::spawn_blocking(move || entered.0.wait())
         .await
         .unwrap();
     let changed = tokio::time::timeout(Duration::from_secs(2), async {
-        assert!(engine.set_priority(id, 99).await.unwrap());
-        assert!(engine.set_category(id, None).await.unwrap());
-        assert!(engine.set_keep_on_failure(id, true).await.unwrap());
-        assert!(engine.pause_job(id).await.unwrap());
+        Ok::<_, crate::EngineError>([
+            engine.set_priority(id, 99).await?,
+            engine.set_category(id, None).await?,
+            engine.set_keep_on_failure(id, true).await?,
+            engine.pause_job(id).await?,
+            engine.resume_job(id).await?,
+            engine.pause_job(id).await?,
+        ])
     })
     .await;
     let release = gate.clone();
     tokio::task::spawn_blocking(move || release.1.wait())
         .await
         .unwrap();
-    changed.expect("bulk preparation must leave the queue actor responsive");
+    let changed = changed
+        .expect("bulk preparation must leave the queue actor responsive")
+        .unwrap();
+    assert_eq!(
+        changed, [true; 6],
+        "priority/category/Keep/pause/resume/pause must all succeed"
+    );
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if engine
@@ -4272,16 +4344,11 @@ async fn orphan_receipt_discard_never_restores_or_changes_an_authoritative_id_co
 
 #[tokio::test]
 async fn automatic_hold_recovery_bounds_each_pass_and_rotates_all_due_jobs() {
-    let temporary = tempfile::tempdir().unwrap();
-    let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
-        Vec::new(),
-        temporary.path().join("state"),
-        temporary.path().join("working"),
-        Tuning::default(),
-        None,
-    ))
-    .await
-    .unwrap();
+    // This test drives each bounded pass itself. Start the genuine owner
+    // after setup, without also starting Engine::spawn's periodic recovery
+    // task, which could otherwise release fixtures while they are imported.
+    let (_temporary, mut owner, adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
     for id in 101..122 {
         let mut row = pending_job(id);
         mark_new_lifecycle_cohort(&mut row);
@@ -4303,8 +4370,42 @@ async fn automatic_hold_recovery_bounds_each_pass_and_rotates_all_due_jobs() {
             blocked_since_unix: Some(0),
             released_at_unix: None,
         });
-        engine.import_job(row, false, false).await.unwrap();
+        let root = owner.dest_dir.clone();
+        owner
+            .artifacts
+            .allocate_for_delivery(id, &root, &root.join(&row.dir_name), true, false)
+            .unwrap();
+        owner.state.jobs.push(row);
     }
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    let tracker = owner.tracker.clone();
+    let engine = crate::EngineHandle {
+        artifacts: owner.artifacts.clone(),
+        url_resolutions: owner.url_resolutions.clone(),
+        url_dest_dir: owner.dest_dir.clone(),
+        import_state_dir: owner.state_dir.clone(),
+        url_history: owner.history.clone(),
+        url_outbox_external: owner.persist_guard.is_some(),
+        owner_persist_guard: owner.persist_guard.clone(),
+        native_seed_recovery_cursor: Default::default(),
+        hold_probes: Default::default(),
+        recovery_cursor: Default::default(),
+        cmd_tx: owner.engine_tx.clone(),
+        shared: owner.shared.clone(),
+        events: owner.events.clone(),
+        cancel: owner.cancel.clone(),
+        tracker: tracker.clone(),
+        backend_adapter: Arc::new(std::sync::Mutex::new(Some(adapter))),
+        budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
+        url_fetches: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        post_scope: None,
+        queue_changes: owner.epoch_tx.subscribe(),
+        owner_heartbeat: owner.owner_heartbeat.clone(),
+        shutdown_complete: owner.shutdown_complete.clone(),
+    };
+    tracker.spawn(owner.run(messages));
+    tracker.close();
     assert!(engine
         .set_delegated(JobId(121), Some("lease-worker".into()))
         .await
@@ -4325,8 +4426,7 @@ async fn automatic_hold_recovery_bounds_each_pass_and_rotates_all_due_jobs() {
             .as_ref()
             .is_none_or(|control| control.lifecycle != "held")));
     assert_eq!(
-        engine
-            .export_job(JobId(121))
+        export_job_ready_for_test(&engine, JobId(121))
             .await
             .unwrap()
             .unwrap()
@@ -4351,6 +4451,7 @@ async fn unified_post_release_recovers_exact_retry_and_moved_source_but_preserve
         let temporary = tempfile::tempdir().unwrap();
         let state = temporary.path().join("state");
         let destination = temporary.path().join("working");
+        std::fs::create_dir_all(destination.as_path()).unwrap();
         let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
             Vec::new(),
             state,
@@ -4375,6 +4476,10 @@ async fn unified_post_release_recovers_exact_retry_and_moved_source_but_preserve
             .finish(92, &source, &destination, "active")
             .unwrap();
         engine.import_job(row, false, false).await.unwrap();
+        export_job_ready_for_test(&engine, JobId(92))
+            .await
+            .unwrap()
+            .unwrap();
         let target_root = temporary.path().join("completed");
         std::fs::create_dir(&target_root).unwrap();
         let target = target_root.join("release");
@@ -4434,8 +4539,7 @@ async fn unified_post_release_recovers_exact_retry_and_moved_source_but_preserve
             )
             .await
             .unwrap();
-        let revision = engine
-            .export_job(JobId(92))
+        let revision = export_job_ready_for_test(&engine, JobId(92))
             .await
             .unwrap()
             .unwrap()
@@ -4452,7 +4556,11 @@ async fn unified_post_release_recovers_exact_retry_and_moved_source_but_preserve
                 .unwrap()
                 .is_err());
             assert!(inventory.for_job(92).unwrap().unwrap().hold.is_none());
-            assert!(engine.export_job(JobId(92)).await.unwrap().unwrap().held());
+            assert!(export_job_ready_for_test(&engine, JobId(92))
+                .await
+                .unwrap()
+                .unwrap()
+                .held());
         }
         if phase == "review" {
             std::fs::rename(&target_root, temporary.path().join("retained-old-volume")).unwrap();
@@ -4464,12 +4572,20 @@ async fn unified_post_release_recovers_exact_retry_and_moved_source_but_preserve
             .unwrap();
         if matches!(phase, "review" | "delete") {
             assert!(released.is_err(), "{phase} must remain fenced");
-            assert!(engine.export_job(JobId(92)).await.unwrap().unwrap().held());
+            assert!(export_job_ready_for_test(&engine, JobId(92))
+                .await
+                .unwrap()
+                .unwrap()
+                .held());
             assert!(source.join("episode.mkv").exists());
         } else {
             assert!(released.is_ok(), "{phase}: {released:?}");
             assert_eq!(
-                engine.export_job(JobId(92)).await.unwrap().unwrap().status,
+                export_job_ready_for_test(&engine, JobId(92))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
                 JobStatus::PostQueued
             );
             let delivery = inventory.create_delivery(92, true, Some(phase)).unwrap();
@@ -4488,6 +4604,7 @@ async fn foreign_journal_crc_preparation_keeps_actor_responsive_and_rejects_stal
     let temporary = tempfile::tempdir().unwrap();
     let state = temporary.path().join("state");
     let destination = temporary.path().join("dest");
+    std::fs::create_dir_all(destination.as_path()).unwrap();
     let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
         Vec::new(),
         state.clone(),
@@ -4511,6 +4628,10 @@ async fn foreign_journal_crc_preparation_keeps_actor_responsive_and_rejects_stal
         .finish(88, &source, &destination, "active")
         .unwrap();
     engine.import_job(job.clone(), false, false).await.unwrap();
+    export_job_ready_for_test(&engine, job.id)
+        .await
+        .unwrap()
+        .unwrap();
     let mut journal = JobJournals::open(&state, "foreign").unwrap();
     journal
         .append(&JournalRecord {
@@ -4529,21 +4650,37 @@ async fn foreign_journal_crc_preparation_keeps_actor_responsive_and_rejects_stal
     let importer = engine.clone();
     let incoming = job.clone();
     let pending = tokio::spawn(async move { importer.import_job(incoming, true, false).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while crate::imports::PREPARATION_GATE.lock().unwrap().is_some() {
+            assert!(
+                !pending.is_finished(),
+                "import returned before CRC preparation gate"
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("import must reach off-actor CRC preparation");
     let entered = gate.clone();
     tokio::task::spawn_blocking(move || entered.0.wait())
         .await
         .unwrap();
     let controls = tokio::time::timeout(Duration::from_secs(2), async {
-        assert!(engine.pause_job(job.id).await.unwrap());
-        assert!(engine.set_priority(job.id, 77).await.unwrap());
-        assert!(engine.set_keep_on_failure(job.id, true).await.unwrap());
+        Ok::<_, crate::EngineError>([
+            engine.pause_job(job.id).await?,
+            engine.set_priority(job.id, 77).await?,
+            engine.set_keep_on_failure(job.id, true).await?,
+        ])
     })
     .await;
     let release = gate.clone();
     tokio::task::spawn_blocking(move || release.1.wait())
         .await
         .unwrap();
-    controls.expect("CRC disk work must not block actor controls");
+    let controls = controls
+        .expect("CRC disk work must not block actor controls")
+        .unwrap();
+    assert_eq!(controls, [true; 3], "pause/priority/Keep must all succeed");
     assert!(matches!(
         pending.await.unwrap(),
         Err(crate::EngineError::StaleImport)
@@ -4572,7 +4709,10 @@ async fn foreign_journal_crc_preparation_keeps_actor_responsive_and_rejects_stal
         )
         .await
         .unwrap();
-    let committed = engine.export_job(job.id).await.unwrap().unwrap();
+    let committed = export_job_ready_for_test(&engine, job.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(matches!(
         committed.files[0].segments[0].state,
         SegmentState::Done { .. }
@@ -4622,6 +4762,7 @@ async fn terminal_or_stale_import_preparation_never_creates_an_absent_namespace(
     let temporary = tempfile::tempdir().unwrap();
     let state = temporary.path().join("state");
     let destination = temporary.path().join("dest");
+    std::fs::create_dir_all(destination.as_path()).unwrap();
     let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
         Vec::new(),
         state.clone(),
@@ -4670,8 +4811,7 @@ async fn terminal_or_stale_import_preparation_never_creates_an_absent_namespace(
     ));
     assert!(!destination.join("rejected-namespace").exists());
     assert_eq!(
-        engine
-            .export_job(JobId(90))
+        export_job_ready_for_test(&engine, JobId(90))
             .await
             .unwrap()
             .unwrap()
@@ -4689,6 +4829,7 @@ async fn acknowledged_worker_api_import_is_noop_for_late_preterminal_descriptor(
     let temporary = tempfile::tempdir().unwrap();
     let state = temporary.path().join("state");
     let root = temporary.path().join("private");
+    std::fs::create_dir_all(root.as_path()).unwrap();
     let mut config =
         crate::EngineConfig::single_node(Vec::new(), state, root.clone(), Tuning::default(), None);
     config.persist_queue = false;
@@ -4785,7 +4926,10 @@ async fn acknowledged_worker_api_import_is_noop_for_late_preterminal_descriptor(
         "actor must recheck acceptance committed after preparation"
     );
     assert!(engine.import_worker_job_if_present(marker).await.unwrap());
-    let job = engine.export_job(JobId(85)).await.unwrap().unwrap();
+    let job = export_job_ready_for_test(&engine, JobId(85))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(job.status, JobStatus::Completed);
     assert!(job
         .params
@@ -4881,6 +5025,7 @@ async fn authority_fence_stops_relocation_midcopy_before_publication_and_recover
     use std::sync::atomic::{AtomicBool, Ordering};
     let temporary = tempfile::tempdir().unwrap();
     let destination = temporary.path().join("working");
+    std::fs::create_dir_all(destination.as_path()).unwrap();
     let completed = temporary.path().join("completed");
     std::fs::create_dir(&completed).unwrap();
     let valid = Arc::new(AtomicBool::new(true));
@@ -4975,8 +5120,7 @@ async fn authority_fence_stops_relocation_midcopy_before_publication_and_recover
         .unwrap();
     let movement: serde_json::Value = serde_json::from_str(&operation.request).unwrap();
     *scope.lock().unwrap() = Some(PathBuf::from(movement["scratch"]["path"].as_str().unwrap()));
-    let revision = engine
-        .export_job(JobId(95))
+    let revision = export_job_ready_for_test(&engine, JobId(95))
         .await
         .unwrap()
         .unwrap()
@@ -4995,8 +5139,7 @@ async fn authority_fence_stops_relocation_midcopy_before_publication_and_recover
     *scope.lock().unwrap() = None;
     valid.store(true, Ordering::SeqCst);
     engine.adopt_authority().await.unwrap();
-    let revision = engine
-        .export_job(JobId(95))
+    let revision = export_job_ready_for_test(&engine, JobId(95))
         .await
         .unwrap()
         .unwrap()
@@ -5024,6 +5167,7 @@ async fn checked_release_public_api_refuses_expiry_after_custody_probe() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let temporary = tempfile::tempdir().unwrap();
     let destination = temporary.path().join("working");
+    std::fs::create_dir_all(destination.as_path()).unwrap();
     let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
         Vec::new(),
         temporary.path().join("state"),
@@ -5053,8 +5197,7 @@ async fn checked_release_public_api_refuses_expiry_after_custody_probe() {
         )
         .await
         .unwrap();
-    let revision = engine
-        .export_job(JobId(94))
+    let revision = export_job_ready_for_test(&engine, JobId(94))
         .await
         .unwrap()
         .unwrap()
@@ -5079,8 +5222,7 @@ async fn checked_release_public_api_refuses_expiry_after_custody_probe() {
         "checked throughout custody preparation and again at actor commit"
     );
     assert_eq!(
-        engine
-            .export_job(JobId(94))
+        export_job_ready_for_test(&engine, JobId(94))
             .await
             .unwrap()
             .unwrap()
@@ -5099,7 +5241,11 @@ async fn checked_release_public_api_refuses_expiry_after_custody_probe() {
         .unwrap()
         .is_ok());
     assert_eq!(
-        engine.export_job(JobId(94)).await.unwrap().unwrap().status,
+        export_job_ready_for_test(&engine, JobId(94))
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         JobStatus::PostQueued
     );
     engine.shutdown().await;
@@ -5232,6 +5378,7 @@ async fn cluster_automatic_control_waits_for_exact_ack_and_operator_intent_is_no
         "uncommitted operator resume must not acquire automatic provenance"
     );
     pump(&mut owner, &mut messages).await;
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
     let durable = SnapshotStore::open(&owner.state_dir)
         .unwrap()
         .load()
@@ -5261,6 +5408,7 @@ async fn automatic_control_ack_snapshot_failure_preserves_pending_transition_rep
         "allocation blocked"
     ));
     let marker = crate::automatic_control::transition(owner.state.job(row.id).unwrap()).unwrap();
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
     allowed.store(false, Ordering::SeqCst);
     for _ in 0..2 {
         let (reply, result) = oneshot::channel();
@@ -5319,6 +5467,7 @@ async fn worker_reschedule_refuses_expiry_and_same_revision_regrant() {
         "download_write",
         "destination full"
     ));
+    pump(&mut owner, &mut messages).await;
     let row = owner.state.job(JobId(77)).unwrap().clone();
     let source = owner.artifacts.for_job(77).unwrap().unwrap();
     let live = Arc::new(AtomicBool::new(true));
@@ -5483,6 +5632,7 @@ async fn worker_release_rechecks_live_grant_and_source_at_actor_commit() {
         "download_write",
         "destination full"
     ));
+    pump(&mut owner, &mut messages).await;
     let row = owner.state.job(JobId(77)).unwrap().clone();
     let source = owner.artifacts.for_job(77).unwrap().unwrap();
     let live = Arc::new(AtomicBool::new(true));
@@ -5639,7 +5789,7 @@ async fn worker_retry_schedule_survives_regrant_without_overriding_new_leader_in
     owner.state.jobs.clear();
     owner.artifacts.close().unwrap();
     owner.artifacts = Arc::new(nzbd_state::artifacts::Inventory::open(&owner.state_dir).unwrap());
-    assert!(owner.import_job(original.clone(), false, false));
+    assert!(import_job_for_test(&mut owner, &mut messages, original.clone()).await);
     assert_eq!(
         owner.state.jobs[0].control().unwrap().next_retry_at_unix,
         Some(deadline)
@@ -5655,13 +5805,13 @@ async fn worker_retry_schedule_survives_regrant_without_overriding_new_leader_in
         WORKER_CONTROL_CONTEXT_PARAM.into(),
         serde_json::to_string(&newer_context).unwrap(),
     ));
-    assert!(owner.import_job(newer, false, false));
+    assert!(import_job_for_test(&mut owner, &mut messages, newer).await);
     assert!(
         owner.state.jobs[0].control().is_none(),
         "new leader intent replaces the old local hold"
     );
     assert!(
-        !owner.import_job(original, false, false),
+        !import_job_for_test(&mut owner, &mut messages, original).await,
         "late old authority cannot overwrite the newer grant"
     );
 }
@@ -5794,9 +5944,7 @@ fn capacity_forecast_selects_finalized_and_repair_staging_paths() {
 #[tokio::test]
 async fn partial_download_capacity_and_restarted_writer_reserve_only_unwritten_bytes() {
     use std::io::{Read, Seek, SeekFrom, Write};
-    let (_tmp, mut owner, _adapter, _messages) = control_test_owner();
-    let (engine_tx, mut messages) = mpsc::channel(16);
-    owner.engine_tx = engine_tx;
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
     let mut row = pending_job(78);
     mark_new_lifecycle_cohort(&mut row);
     let file = row.files[0].id;
@@ -5808,7 +5956,7 @@ async fn partial_download_capacity_and_restarted_writer_reserve_only_unwritten_b
     row.files[0].segments.push(next);
     row.files[0].segments.push(last);
     owner.state.jobs.push(row);
-    owner.allocate_new_payload(JobId(78)).unwrap();
+    allocate_for_test(&mut owner, &mut messages, JobId(78), true).await;
     let source = owner.artifacts.for_job(78).unwrap().unwrap();
     let partial = source.path.join(format!(".runner-file-{}.part", file.0));
     let checkpoint = vec![7u8; 16 * 1024 * 1024];
@@ -5840,6 +5988,7 @@ async fn partial_download_capacity_and_restarted_writer_reserve_only_unwritten_b
         "download_write",
         "disk full"
     ));
+    pump(&mut owner, &mut messages).await;
     let row = owner.state.job(JobId(78)).unwrap().clone();
     let remaining = crate::download_capacity::remaining(&row, &source.path);
     assert!(remaining < declared);
@@ -5870,7 +6019,24 @@ async fn partial_download_capacity_and_restarted_writer_reserve_only_unwritten_b
     std::fs::create_dir(&unrelated).unwrap();
     let independent = nzbd_state::capacity::reserve(&unrelated, declared).unwrap();
     drop(independent);
-    let writer = owner.writer_for(JobId(78), file);
+    // The injected durable range must first cross real CRC verification;
+    // only its verified proof can admit the restarted writer's birth.
+    let writer = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let candidate = owner.writer_for(JobId(78), file);
+            if !candidate.is_closed() {
+                break candidate;
+            }
+            owner.start_verifications();
+            pump(&mut owner, &mut messages).await;
+            tokio::select! {
+                message = messages.recv() => owner.on_msg(message.unwrap()),
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {},
+            }
+        }
+    })
+    .await
+    .expect("verified partial range must admit a real restarted writer");
     let resumed = vec![13u8; 65536];
     writer
         .send(WriteCmd::Segment {
@@ -5883,13 +6049,37 @@ async fn partial_download_capacity_and_restarted_writer_reserve_only_unwritten_b
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5),async {
-            loop { let message=messages.recv().await.unwrap();
-                if let EngineMsg::WriterError { error,.. }=&message { panic!("resumed writer must use remaining-byte reservation: {error}"); }
-                let written=matches!(&message,EngineMsg::SegmentWritten { job,file:observed,seg_number:2,.. } if *job==JobId(78)&&*observed==file);
-                owner.on_msg(message); if written { break; }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let message = messages.recv().await.unwrap();
+            let event = match &message {
+                EngineMsg::ScopedOutcome { message, .. } => &**message,
+                event => event,
+            };
+            if let EngineMsg::WriterError { error, .. } = event {
+                panic!("resumed writer must use remaining-byte reservation: {error}");
             }
-        }).await.unwrap();
+            owner.on_msg(message);
+            let written = owner
+                .state
+                .job(JobId(78))
+                .unwrap()
+                .files
+                .iter()
+                .find(|entry| entry.id == file)
+                .unwrap()
+                .segments
+                .iter()
+                .any(|segment| {
+                    segment.number == 2 && matches!(segment.state, SegmentState::Done { .. })
+                });
+            if written {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
     let mut input = std::fs::File::open(&partial).unwrap();
     input
         .seek(SeekFrom::Start(checkpoint.len() as u64))
@@ -5904,13 +6094,15 @@ async fn partial_download_capacity_and_restarted_writer_reserve_only_unwritten_b
 
 #[tokio::test]
 async fn storage_recovery_recreates_stopped_writer_and_writes_pending_segment() {
-    let (_tmp, mut owner, _adapter, _messages) = control_test_owner();
-    let (engine_tx, mut messages) = mpsc::channel(16);
-    owner.engine_tx = engine_tx;
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
     let job = pending_job(79);
     let file = job.files[0].id;
     owner.state.jobs.push(job);
+    allocate_for_test(&mut owner, &mut messages, JobId(79), true).await;
+    let _ = owner.writer_for(JobId(79), file);
+    pump(&mut owner, &mut messages).await;
     let old_writer = owner.writer_for(JobId(79), file);
+    let mut old_stopped = owner.writers[&file].stopped.clone();
     old_writer
         .send(WriteCmd::InjectFailure("write", libc::ENOSPC))
         .await
@@ -5930,12 +6122,12 @@ async fn storage_recovery_recreates_stopped_writer_and_writes_pending_segment() 
         while !owner.state.jobs[0].held() {
             owner.on_msg(messages.recv().await.unwrap());
         }
-        let mut stopped = owner.writers[&file].stopped.clone();
-        stopped.wait_for(|stopped| *stopped).await.unwrap();
+        old_stopped.wait_for(|stopped| *stopped).await.unwrap();
     })
     .await
     .unwrap();
     assert!(old_writer.is_closed());
+    pump(&mut owner, &mut messages).await;
     let revision = owner.state.jobs[0].control().unwrap().revision;
     let (reply, result) = oneshot::channel();
     owner.on_command(QueueCommand::ReleaseResourceHold {
@@ -5947,6 +6139,8 @@ async fn storage_recovery_recreates_stopped_writer_and_writes_pending_segment() 
     });
     pump(&mut owner, &mut messages).await;
     assert!(result.await.unwrap());
+    let _ = owner.writer_for(JobId(79), file);
+    pump(&mut owner, &mut messages).await;
     let writer = owner.writer_for(JobId(79), file);
     writer
         .send(WriteCmd::Segment {
@@ -5960,13 +6154,29 @@ async fn storage_recovery_recreates_stopped_writer_and_writes_pending_segment() 
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                let message = messages.recv().await.unwrap();
-                let written = matches!(&message, EngineMsg::SegmentWritten { job, file: observed, .. } if *job == JobId(79) && *observed == file);
-                owner.on_msg(message);
-                if written { break; }
+        loop {
+            let message = messages.recv().await.unwrap();
+            owner.on_msg(message);
+            let written = owner
+                .state
+                .job(JobId(79))
+                .unwrap()
+                .files
+                .iter()
+                .find(|entry| entry.id == file)
+                .unwrap()
+                .segments
+                .iter()
+                .any(|segment| {
+                    segment.number == 1 && matches!(segment.state, SegmentState::Done { .. })
+                });
+            if written {
+                break;
             }
-        }).await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
     let source = owner.artifacts.for_job(79).unwrap().unwrap();
     assert_eq!(
         std::fs::read(source.path.join(format!(".runner-file-{}.part", file.0))).unwrap(),
@@ -5985,6 +6195,7 @@ async fn resource_probes_continue_after_eight_failures_and_explicit_retry_bypass
         "download_write",
         "disk full"
     ));
+    pump(&mut owner, &mut messages).await;
     let revision = owner.state.jobs[0].control().unwrap().revision;
     for attempt in 1..=12 {
         owner.state.jobs[0]

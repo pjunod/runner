@@ -613,13 +613,9 @@ impl Engine {
 
         for (job, url) in refetch {
             tracing::info!(job = job.0, %url, "re-spawning NZB fetch for job recovered mid-fetch");
-            let retry_state = handle
-                .export_job(job)
-                .await?
-                .as_ref()
-                .map(fetch_retry_state)
-                .unwrap_or_default();
-            handle.spawn_url_fetch(job, url, retry_state);
+            // Startup verification may still own this recovered row. The
+            // fetch task reads its durable retry state once that row is ready.
+            handle.spawn_url_fetch(job, url, crate::fetch::FetchRetryState::default());
         }
         for (job, original) in refetch_dupes {
             let h = handle.clone();
@@ -1083,7 +1079,7 @@ impl EngineHandle {
     /// Background NZB download for a URL job. Shutdown-aware: an in-flight
     /// fetch aborts on cancel instead of holding graceful shutdown open for
     /// up to the 60 s hop timeout.
-    fn spawn_url_fetch(&self, id: JobId, url: String, retry_state: crate::fetch::FetchRetryState) {
+    fn spawn_url_fetch(&self, id: JobId, url: String, _retry_state: crate::fetch::FetchRetryState) {
         if !self
             .url_fetches
             .lock()
@@ -1094,7 +1090,20 @@ impl EngineHandle {
         let handle = self.clone();
         self.tracker.spawn(async move {
             let _fetch_guard = UrlFetchGuard { jobs: handle.url_fetches.clone(), job: id };
-            let Some(origin) = handle.export_job(id).await.ok().flatten() else { return; };
+            let mut changes = handle.queue_changes.clone();
+            let origin = loop {
+                match handle.export_job(id).await {
+                    Ok(Some(origin)) => break origin,
+                    Err(EngineError::Lifecycle(message)) if message == "job verification or writer retirement is still in progress; retry later" => {
+                        tokio::select! {
+                            _ = handle.cancel.cancelled() => return,
+                            result = changes.changed() => if result.is_err() { return; },
+                        }
+                    }
+                    _ => return,
+                }
+            };
+            let retry_state = fetch_retry_state(&origin);
             let identity = match nzbd_state::artifacts::url_source_identity(&origin) { Ok(identity) => identity, Err(_) => return };
             let mut storage_retry = nzbd_state::artifacts::UrlStorageRetry::default();
             let retry_store = handle.url_resolutions.clone(); let retry_id = identity.clone();

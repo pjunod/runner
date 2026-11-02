@@ -3168,6 +3168,8 @@ impl Owner {
                 reply,
             } => {
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+                let before = self.state.job(job).cloned();
+                let timing_before = self.timing_cache.checkpoint(job);
                 let changed = if let Some(record) = self
                     .state
                     .job_mut(job)
@@ -3211,13 +3213,16 @@ impl Owner {
                     if durable {
                         owner.publish_now();
                     } else if current {
+                        // The URL fetcher owns its storage retry schedule.
+                        // A failed progress write must not replace Fetching
+                        // with a hold that prevents its next durable retry.
+                        if let Some(before) = before {
+                            if let Some(record) = owner.state.job_mut(job) {
+                                *record = before;
+                            }
+                        }
+                        owner.timing_cache.restore(job, timing_before);
                         owner.dirty = true;
-                        owner.hold_job(
-                            job,
-                            nzbd_types::HoldCause::StorageUnavailable,
-                            "snapshot",
-                            "URL fetch progress could not be persisted",
-                        );
                     }
                     let _ = reply.send(if durable {
                         Ok(true)
@@ -3333,6 +3338,10 @@ impl Owner {
                     });
                     return;
                 }
+                let prior_url_paused = self
+                    .state
+                    .job(job)
+                    .is_some_and(|record| record.params.iter().any(|(key, _)| key == "*AddPaused"));
                 let prior = self.state.job(job).map(|record| {
                     (
                         record.status,
@@ -3362,6 +3371,9 @@ impl Owner {
                     self.state.job_mut(job).is_some_and(|record| {
                         if matches!(record.status, JobStatus::Queued | JobStatus::Downloading) {
                             record.status = JobStatus::Paused;
+                            true
+                        } else if record.status == JobStatus::Fetching {
+                            set_owner_param(&mut record.params, "*AddPaused", Some("yes".into()));
                             true
                         } else {
                             false
@@ -3412,6 +3424,13 @@ impl Owner {
                                     if record.status == JobStatus::Paused {
                                         record.status = status;
                                     }
+                                    if record.status == JobStatus::Fetching {
+                                        set_owner_param(
+                                            &mut record.params,
+                                            "*AddPaused",
+                                            prior_url_paused.then(|| "yes".into()),
+                                        );
+                                    }
                                     if let (Some(torrent), Some((intent, reason))) =
                                         (record.torrent.as_mut(), prior_torrent)
                                     {
@@ -3434,6 +3453,53 @@ impl Owner {
             }
             QueueCommand::Resume { job, reply } => {
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+                if self
+                    .state
+                    .job(job)
+                    .is_some_and(|record| record.status == JobStatus::Fetching && !record.held())
+                {
+                    let changed = self.state.job_mut(job).is_some_and(|record| {
+                        let old = record.params.len();
+                        record.params.retain(|(key, _)| key != "*AddPaused");
+                        record.params.len() != old
+                    });
+                    if !changed {
+                        let _ = reply.send(false);
+                        return;
+                    }
+                    let generation = fresh_epoch();
+                    self.control_epochs.insert(job, generation);
+                    self.pending_control_revisions.insert(job, generation);
+                    self.dirty = true;
+                    let persistent = self.persist;
+                    self.persist_then(move |owner, committed| {
+                        let current = owner.control_epochs.get(&job) == Some(&generation)
+                            && owner.job_epochs.get(&job) == Some(&scope_generation);
+                        let ok = (!persistent || committed) && current;
+                        if owner.pending_control_revisions.get(&job) == Some(&generation) {
+                            owner.pending_control_revisions.remove(&job);
+                        }
+                        if current {
+                            if !ok {
+                                if let Some(record) = owner
+                                    .state
+                                    .job_mut(job)
+                                    .filter(|record| record.status == JobStatus::Fetching)
+                                {
+                                    set_owner_param(
+                                        &mut record.params,
+                                        "*AddPaused",
+                                        Some("yes".into()),
+                                    );
+                                }
+                            }
+                            owner.publish_now();
+                            owner.bump_epoch();
+                        }
+                        let _ = reply.send(ok);
+                    });
+                    return;
+                }
                 // Resource/custody release has its own admission protocol. Manual
                 // resume cannot erase a hold merely because statvfs looks healthy.
                 if self.state.job(job).is_some_and(|j| j.held()) {
@@ -3516,12 +3582,38 @@ impl Owner {
                         owner.pending_control_revisions.remove(&job);
                         if lifecycle_current {
                             owner.dirty = true;
-                            owner.hold_job(
+                            if !owner.hold_job(
                                 job,
                                 nzbd_types::HoldCause::StorageUnavailable,
                                 "snapshot",
                                 "Resume intent could not be persisted",
-                            );
+                            ) && owner.persistence_fenced {
+                                // The failed save has revoked persistence authority.
+                                // Expose the stopped state without claiming another
+                                // durable transition or clearing that fence.
+                                if let Some(record) = owner.state.job_mut(job) {
+                                    let prior = record.control();
+                                    let revision = prior.as_ref().and_then(|control| control.revision.parse::<u64>().ok()).unwrap_or(0).saturating_add(1);
+                                    record.set_control(&nzbd_types::JobControl {
+                                        version: 1,
+                                        revision: revision.to_string(),
+                                        lifecycle: "held".into(),
+                                        cause: "storage_unavailable".into(),
+                                        stage: "snapshot".into(),
+                                        retry_policy: "review".into(),
+                                        message: "Resume intent could not be persisted; queue ownership is fenced until recovery".into(),
+                                        instance: prior.as_ref().map(|control| control.instance.clone()).unwrap_or_else(|| format!("snapshot-{}", job.0)),
+                                        previous_status: Some(JobStatus::Paused),
+                                        manual_pause: true,
+                                        retry_attempt: prior.as_ref().map_or(0, |control| control.retry_attempt),
+                                        next_retry_at_unix: None,
+                                        blocked_since_unix: Some(unix_now()),
+                                        released_at_unix: None,
+                                    });
+                                    record.status = JobStatus::Paused;
+                                }
+                                owner.publish_now();
+                            }
                         }
                     }
                     let _ = reply.send(ok);
@@ -4766,6 +4858,10 @@ impl Owner {
                 });
             }
             QueueCommand::SetJobStatus { job, status, reply } => {
+                if self.automatic_control_pending(job) {
+                    let _ = reply.send(false);
+                    return;
+                }
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 if self.state.job(job).is_some_and(|j| j.held()) {
                     let _ = reply.send(false);

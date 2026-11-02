@@ -611,7 +611,9 @@ impl Owner {
         job: &mut Job,
         completion_proof: Option<&nzbd_state::artifacts::WorkerCompletionProof>,
     ) -> Result<(bool, bool), nzbd_state::StateError> {
-        if self.persistence_fenced {
+        if self.persistence_fenced
+            || (self.persist && self.persist_guard.as_ref().is_some_and(|guard| !guard()))
+        {
             return Err(failure(
                 "import authority, source generation, or worker control changed",
             ));
@@ -2013,7 +2015,7 @@ mod tests {
         stamp
             .params
             .push((nzbd_types::PP_DONE_PARAM.into(), "SUCCESS/ALL".into()));
-        assert!(scoped.import_worker_job_if_present(stamp).await.unwrap());
+        assert!(scoped.import_job_if_present(stamp).await.unwrap());
         engine.end_post_admission(admission).await.unwrap();
         engine.shutdown().await;
     }
