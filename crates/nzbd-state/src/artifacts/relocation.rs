@@ -432,6 +432,9 @@ impl Inventory {
             // this generation and predates even the deletion REQUEST. This is
             // stricter than comparing with success time (old operations do not
             // store that timestamp). Equal-second ordering is left for review.
+            // A permanently unsupported move never executed publication;
+            // changing it from retry to review must not turn it into legacy
+            // generation evidence for an unrelated four-field delete journal.
             let mut stmt = tx.prepare("SELECT DISTINCT a.data,d.data FROM artifacts a
                 JOIN operations d ON d.artifact=a.id
                 WHERE d.state='succeeded' AND json_extract(d.data,'$.kind')='delete'
@@ -440,6 +443,7 @@ impl Inventory {
                     OR (json_array_length(json_extract(d.data,'$.request'))=4 AND EXISTS (
                         SELECT 1 FROM operations proof WHERE proof.artifact=a.id
                         AND proof.state IN ('running','review')
+                        AND COALESCE(json_extract(proof.data,'$.error'),'') NOT LIKE 'unsupported publication requires review:%'
                         AND json_extract(proof.data,'$.kind')='relocate'
                         AND json_extract(proof.data,'$.created_at') < json_extract(d.data,'$.created_at')
                         AND json_extract(json_extract(proof.data,'$.request'),'$.source.generation')=json_extract(a.data,'$.generation')

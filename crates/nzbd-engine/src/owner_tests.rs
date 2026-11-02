@@ -325,6 +325,9 @@ async fn engine_shutdown_drains_real_writer_acknowledgement_behind_full_result_c
 async fn fresh_default_root_initializes_in_payload_worker_but_enrolled_missing_root_stays_missing()
 {
     let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    // Unlike the shared fixture's configured-root default, this case
+    // deliberately starts before any processing root has been created.
+    std::fs::remove_dir(&owner.dest_dir).unwrap();
     assert!(
         !owner.dest_dir.exists(),
         "metadata recovery must not create the payload root inline"
@@ -346,6 +349,9 @@ async fn fresh_default_root_initializes_in_payload_worker_but_enrolled_missing_r
 #[tokio::test]
 async fn fresh_admission_prepares_root_before_startup_callback_and_refuses_missing_enrolled_root() {
     let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    // Unlike the shared fixture's configured-root default, this case
+    // deliberately starts before any processing root has been created.
+    std::fs::remove_dir(&owner.dest_dir).unwrap();
     // Hold the completed state-lane enumeration before the owner can queue
     // root reconciliation. Immediate user admission must work in this order.
     let startup = tokio::time::timeout(Duration::from_secs(5), messages.recv())
@@ -5081,6 +5087,12 @@ async fn authority_fence_stops_relocation_midcopy_before_publication_and_recover
         .finish(95, &source, &destination, "active")
         .unwrap();
     engine.import_job(row, false, false).await.unwrap();
+    // Relocation deliberately mutates this namespace. Finish the imported
+    // source verification first so it cannot race that injected mutation.
+    export_job_ready_for_test(&engine, JobId(95))
+        .await
+        .unwrap()
+        .unwrap();
     let target = completed.join("episode");
     {
         let _fault = inventory

@@ -1703,10 +1703,20 @@ impl Inventory {
         // Reserve this exact metadata generation briefly, then inspect the
         // payload without either the mutation coordinator or SQLite held.
         // The final revision check below rejects an obsolete observation.
-        let Some(_lease) = self.reserve_reconciliation(std::slice::from_ref(&original))? else {
-            return Err(Error::Conflict(
-                "artifact changed or is in use; retry inspection".into(),
-            ));
+        // A background metadata probe can briefly own this same lease.
+        // Wait off-actor without holding the coordinator, always reserving
+        // the original revision so changed policy or custody cannot slip in.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let _lease = loop {
+            if let Some(lease) = self.reserve_reconciliation(std::slice::from_ref(&original))? {
+                break lease;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Conflict(
+                    "artifact changed or is in use; retry inspection".into(),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         };
         let dir = self.verify(&original)?;
         let files = fs::manifest(&dir, 100_000)?;
