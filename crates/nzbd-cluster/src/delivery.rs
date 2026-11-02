@@ -412,7 +412,7 @@ pub(crate) fn bounded_transaction(writes: &[(String, hiqlite::Params)]) -> Resul
     }
     Ok(())
 }
-fn encode_record(record: &ClusterDelivery) -> Result<(String, String), String> {
+pub(crate) fn encode_record(record: &ClusterDelivery) -> Result<(String, String), String> {
     let data = serde_json::to_string(record).map_err(|error| error.to_string())?;
     let public =
         serde_json::to_string(&discovery_value(record)).map_err(|error| error.to_string())?;
@@ -428,7 +428,7 @@ fn decode(row: DeliveryRow) -> Result<ClusterDelivery, String> {
     record.revision = row.revision;
     Ok(record)
 }
-fn immutable_delivery(record: &ClusterDelivery) -> Value {
+pub(crate) fn immutable_delivery(record: &ClusterDelivery) -> Value {
     let mut value = serde_json::to_value(&record.delivery).expect("Delivery serializes");
     for key in [
         "sequence",
@@ -1065,7 +1065,7 @@ pub(crate) async fn cleanup_copy(
             (
                 code,
                 axum::Json(nzbd_state::artifacts::ClusterCopyCleanup {
-                    status: status.into(),
+                    status,
                     error,
                 }),
             )

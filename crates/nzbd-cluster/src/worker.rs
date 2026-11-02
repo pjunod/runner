@@ -516,7 +516,7 @@ async fn report_completions(
             .map(|pending| pending.request)
             .unwrap_or(req);
         if submit_completion(
-            cfg, engine, client, active, pp, leader_url, lease.kind, &req,
+            cfg, engine, client, active, pp, leader_url, (lease.kind, &req),
         )
         .await
         {
@@ -623,8 +623,7 @@ async fn replay_completion_outbox(
             active,
             pp,
             leader_url,
-            pending.kind,
-            &pending.request,
+            (pending.kind,&pending.request),
         )
         .await
         {
@@ -640,9 +639,9 @@ async fn submit_completion(
     active: &ActiveLeases,
     pp: &Option<PpSetup>,
     leader_url: &str,
-    kind: LeaseKind,
-    req: &CompleteRequest,
+    completion: (LeaseKind,&CompleteRequest),
 ) -> bool {
+    let (kind,req)=completion;
     let job_id = req.job.id;
     let lease_id = req.lease_id.clone();
     match client

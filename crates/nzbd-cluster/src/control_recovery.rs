@@ -1,0 +1,338 @@
+//! Exact business/source intent shared by grant and automatic-control CAS.
+use crate::control::ControlStore;
+use hiqlite::{params, Row};
+use nzbd_types::{Job, JobStatus};
+
+/// Progress is not operator intent. Keep file identities/pauses/source params,
+/// while allowing validated segment completion and measured timing to advance.
+pub(crate) fn business_intent(job: &Job) -> Result<Vec<u8>, String> {
+    let mut params = job
+        .params
+        .iter()
+        .filter(|(key, _)| {
+            key != nzbd_types::CONTROL_PARAM
+                && !matches!(
+                    key.as_str(),
+                    "*Control:attempts"
+                        | "*Control:probe_after"
+                        | "*Cluster:AutomaticControl"
+                        | "*Runner:LifecycleTiming"
+                )
+        })
+        .collect::<Vec<_>>();
+    params.sort();
+    let files = job
+        .files
+        .iter()
+        .map(|file| {
+            (
+                file.id,
+                &file.subject,
+                &file.filename,
+                file.filename_confirmed,
+                file.is_par2,
+                file.paused,
+                &file.groups,
+                file.date,
+                file.segments
+                    .iter()
+                    .map(|segment| (segment.number, &segment.message_id, segment.size))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&(
+        job.id,
+        job.kind,
+        &job.name,
+        &job.dir_name,
+        job.name_provisional,
+        job.queued_at_unix,
+        &job.original_name,
+        &job.category,
+        job.priority,
+        &job.dupe,
+        job.delivery_lifecycle,
+        params,
+        files,
+    ))
+    .map_err(|e| e.to_string())
+}
+pub(crate) fn grant_intent_matches(local: &Job, durable: &Job) -> Result<bool, String> {
+    Ok(!local
+        .params
+        .iter()
+        .any(|(key, _)| key == nzbd_engine::automatic_control::AUTOMATIC_CONTROL_PARAM)
+        && !durable.held()
+        && !matches!(durable.status, JobStatus::Paused | JobStatus::Deleted)
+        && durable.status == local.status
+        && durable.control() == local.control()
+        && business_intent(local)? == business_intent(durable)?)
+}
+struct IntentRow {
+    data: String,
+    bytes: i64,
+    revision: i64,
+    incarnation: String,
+}
+impl From<&mut Row<'_>> for IntentRow {
+    fn from(row: &mut Row<'_>) -> Self {
+        Self {
+            data: row.get("data"),
+            bytes: row.get("bytes"),
+            revision: row.get("revision"),
+            incarnation: row.get("incarnation"),
+        }
+    }
+}
+impl ControlStore {
+    pub(crate) async fn job_has_work_grant(&self, job: u32) -> Result<bool, String> {
+        let rows=self.client.query_consistent_map::<IntentRow,_>("SELECT '' AS data,0 AS bytes,0 AS revision,'' AS incarnation FROM work_leases WHERE job_id=?1 AND resource<>'cluster/leader' LIMIT 1",params!(i64::from(job))).await.map_err(|e|e.to_string())?;
+        Ok(!rows.is_empty())
+    }
+    pub(crate) async fn current_job_intent(
+        &self,
+        job: u32,
+    ) -> Result<Option<(Job, u64, String)>, String> {
+        let limit = crate::proto::MAX_DESCRIPTOR_BYTES as i64;
+        let row=self.client.query_consistent_map::<IntentRow,_>("SELECT CASE WHEN length(CAST(intent_json AS BLOB))<=?2 THEN intent_json ELSE '' END AS data,length(CAST(intent_json AS BLOB)) AS bytes,revision,incarnation FROM control_jobs WHERE job_id=?1 AND deleted=0",params!(i64::from(job),limit)).await.map_err(|e|e.to_string())?.into_iter().next();
+        row.map(|row|{if row.bytes>limit{return Err("current job descriptor exceeds16MiB; source retained, reduce metadata before retrying".into());}Ok((serde_json::from_str(&row.data).map_err(|e|e.to_string())?,u64::try_from(row.revision).map_err(|e|e.to_string())?,row.incarnation))}).transpose()
+    }
+}
+
+/// Reconcile only actor-proven automatic controls; caller holds mutation_serial.
+/// A local queue snapshot is never a replacement for current replicated intent.
+pub(crate) async fn reconcile(shared: &crate::leader::LeaderShared) -> Result<(), String> {
+    use nzbd_engine::automatic_control::{transition, AUTOMATIC_CONTROL_PARAM};
+    use std::collections::HashMap;
+    let control = shared
+        .control
+        .as_ref()
+        .ok_or("replicated control unavailable")?;
+    let issuer = shared.authority_identity();
+    let mut restore_current = false;
+    for local in shared.engine_projection().await?.into_values() {
+        let Some(marker) = transition(&local) else {
+            continue;
+        };
+        let Some((mut durable, revision, _)) = control.current_job_intent(local.id.0).await? else {
+            // A committed tombstone wins. The caller's projection restore drops
+            // this local row; the marker cannot resurrect it.
+            restore_current = true;
+            continue;
+        };
+        if business_intent(&local)? != business_intent(&durable)? {
+            // New operator/source intent wins, including an uncommitted local
+            // operator edit. Never infer automatic authority from revisions.
+            restore_current = true;
+            continue;
+        }
+        let applied = durable.control().as_ref() == Some(&marker.result_control)
+            && durable.status == marker.result_status;
+        if !applied {
+            if durable.control() != marker.base_control || durable.status != marker.base_status {
+                restore_current = true;
+                continue;
+            }
+            if !source_valid(shared, &durable, &marker).await? {
+                return Err(format!("job {} automatic control source proof changed; retain pending retry for review",local.id.0));
+            }
+            durable.set_control(&marker.result_control);
+            durable.status = marker.result_status;
+            // These are recovery bookkeeping, never user/source parameters.
+            for key in ["*Control:attempts", "*Control:probe_after"] {
+                durable.params.retain(|(existing, _)| existing != key);
+                durable.params.extend(
+                    local
+                        .params
+                        .iter()
+                        .filter(|(existing, _)| existing == key)
+                        .cloned(),
+                );
+            }
+            durable
+                .params
+                .retain(|(key, _)| key != AUTOMATIC_CONTROL_PARAM);
+            control
+                .commit_job_delta_guarded(
+                    &[(u64::from(local.id.0), Some(durable.clone()))],
+                    &HashMap::from([(u64::from(local.id.0), revision)]),
+                    &[],
+                    Some(issuer),
+                )
+                .await?;
+        }
+        if applied
+            && durable
+                .params
+                .iter()
+                .any(|(key, _)| key == AUTOMATIC_CONTROL_PARAM)
+        {
+            // Upgrade cleanup of a previously copied private marker. Only
+            // metadata is removed; its exact accepted control is unchanged.
+            durable
+                .params
+                .retain(|(key, _)| key != AUTOMATIC_CONTROL_PARAM);
+            control
+                .commit_job_delta_guarded(
+                    &[(u64::from(local.id.0), Some(durable))],
+                    &HashMap::from([(u64::from(local.id.0), revision)]),
+                    &[],
+                    Some(issuer),
+                )
+                .await?;
+        }
+        // Lost ACK after a successful Raft commit is an exact replay, not a
+        // second transition. False means local intent changed meanwhile.
+        shared
+            .engine
+            .ack_automatic_control(local.id, marker.identity)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    if restore_current {
+        // Only after all valid markers were committed/ACKed may a current
+        // operator/source projection replace stale local automatic intent.
+        let jobs = control
+            .load_jobs()
+            .await?
+            .into_iter()
+            .map(|(job, _, _)| job)
+            .collect();
+        shared
+            .engine
+            .adopt_replicated_authority(jobs)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct RelocationProofRequest {
+    storage: String,
+    source: nzbd_state::artifacts::SourceGeneration,
+    from: std::path::PathBuf,
+    to: std::path::PathBuf,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct RelocationProofReply {
+    storage: String,
+    valid: bool,
+}
+
+async fn source_valid(
+    shared: &crate::leader::LeaderShared,
+    durable: &Job,
+    marker: &nzbd_engine::automatic_control::AutomaticControlTransition,
+) -> Result<bool, String> {
+    let inventory = shared.engine.artifacts();
+    let expected = shared
+        .dest_dir
+        .join(nzbd_engine::queue::job_dir_name(durable));
+    let source = marker.source.clone();
+    let result = marker.source_path.clone();
+    let job_id = durable.id.0;
+    if marker.storage_instance_id == inventory.installation {
+        return tokio::task::spawn_blocking(move || -> Result<bool, String> {
+            match (
+                source,
+                result,
+                inventory.for_job(job_id).map_err(|e| e.to_string())?,
+            ) {
+                (None, None, None) => Ok(true),
+                (Some(source), Some(path), Some(current)) => {
+                    if current.terminal()
+                        || current.id != source.artifact
+                        || current.generation != source.generation
+                        || current.path != path
+                    {
+                        return Ok(false);
+                    }
+                    if path == expected {
+                        return Ok(true);
+                    }
+                    inventory
+                        .has_succeeded_relocation(&source, &expected, &path)
+                        .map_err(|e| e.to_string())
+                }
+                _ => Ok(false),
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    let fact = durable
+        .params
+        .iter()
+        .find(|(key, _)| key == crate::delivery::AUTHORITY_COPY_PARAM)
+        .filter(|(_, value)| value.len() <= 8192)
+        .and_then(|(_, value)| {
+            serde_json::from_str::<crate::delivery::AuthoritySourceCopy>(value).ok()
+        });
+    let Some(fact) = fact else {
+        return Ok(source.is_none() && result.is_none());
+    };
+    let (Some(source), Some(path)) = (source, result) else {
+        return Ok(false);
+    };
+    if fact.copy.storage_instance_id != marker.storage_instance_id
+        || fact.copy.source != source
+        || fact.copy.job_id != durable.id.0
+    {
+        return Ok(false);
+    }
+    if path == expected {
+        return Ok(true);
+    }
+    // Only a journal on the original storage owner can attest relocation.
+    // Failure/offline is retried by the existing startup/scheduler loop.
+    let owner = crate::registry::read_nodes(&shared.layout)
+        .into_iter()
+        .find(|node| node.name == fact.owner_node)
+        .ok_or_else(|| {
+            format!(
+                "job {} awaits exact relocation proof from source owner {}",
+                durable.id.0, fact.owner_node
+            )
+        })?;
+    let reply = crate::http::ClusterClient::new(shared.cfg.secret.clone())
+        .post_json::<_, RelocationProofReply>(
+            &owner.api_url,
+            "/cluster/v1/work/relocation-proof",
+            &RelocationProofRequest {
+                storage: marker.storage_instance_id.clone(),
+                source,
+                from: expected,
+                to: path,
+            },
+        )
+        .await?;
+    Ok(reply.storage == marker.storage_instance_id && reply.valid)
+}
+
+pub(crate) async fn relocation_proof(
+    axum::extract::State(shared): axum::extract::State<std::sync::Arc<crate::leader::LeaderShared>>,
+    axum::Json(req): axum::Json<RelocationProofRequest>,
+) -> Result<axum::Json<RelocationProofReply>, (axum::http::StatusCode, String)> {
+    let inventory = shared.engine.artifacts();
+    let storage = inventory.installation.clone();
+    if req.storage != storage
+        || req.source.artifact.len() > 256
+        || req.source.generation.len() > 256
+        || req.from.as_os_str().len() > 4096
+        || req.to.as_os_str().len() > 4096
+    {
+        return Err((
+            axum::http::StatusCode::CONFLICT,
+            "relocation owner/source identity changed".into(),
+        ));
+    }
+    let valid = tokio::task::spawn_blocking(move || {
+        inventory.has_succeeded_relocation(&req.source, &req.from, &req.to)
+    })
+    .await
+    .map_err(|e| (axum::http::StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?
+    .map_err(|e| (axum::http::StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+    Ok(axum::Json(RelocationProofReply { storage, valid }))
+}

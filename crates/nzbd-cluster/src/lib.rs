@@ -9,8 +9,11 @@
 
 mod admissions;
 pub mod control;
+mod control_recovery;
+mod source_facts;
 mod delivery;
 pub mod election;
+mod grant_receipts;
 pub mod http;
 pub mod layout;
 pub mod leader;
@@ -124,7 +127,8 @@ async fn drain_url_outbox(shared: &Arc<leader::LeaderShared>) -> Result<(), Stri
             .control
             .as_ref()
             .ok_or("replicated control unavailable")?;
-        if control.commit_url_outbox(&record).await? {
+        let source=crate::source_facts::for_resolved(shared,&record.resolved)?;
+        if control.commit_url_outbox_with_source(&record,source.as_ref()).await? {
             // Queue projection is rebuilt only from the just-committed/current
             // intent. A retry never imports a stale resolved Job over user edits.
             shared.restore_control_projection().await?;
@@ -288,7 +292,7 @@ impl ClusterRuntime {
                     tokio::select! {
                         _=event_cancel.cancelled()=>break,
                         _=tokio::time::sleep(Duration::from_secs(1))=>{},
-                        event=events.recv()=>match event {Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,_=>{}}
+                        event=events.recv()=>if let Err(tokio::sync::broadcast::error::RecvError::Closed)=event {break}
                     }
                 }
             });
@@ -589,6 +593,9 @@ async fn commit_control_mutation(
         )
             .into_response();
     }
+    if let Err(error)=crate::control_recovery::reconcile(&shared).await {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE,Json(serde_json::json!({"error":error}))).into_response();
+    }
     let before = match shared.engine_projection().await {
         Ok(jobs) => jobs,
         Err(error) => {
@@ -639,9 +646,8 @@ async fn commit_control_mutation(
     }
     if let Err(error) = shared.commit_mutation_delta(&before, &fences).await {
         tracing::error!(%error, "queue mutation was rolled back after replicated commit failed");
-        if admissions::rollback_pending(&shared).await.is_err() {
-            shared.fence_authority();
-        } else if shared.restore_control_projection().await.is_err() {
+        if admissions::rollback_pending(&shared).await.is_err()
+            || shared.restore_control_projection().await.is_err() {
             shared.fence_authority();
         }
         return (

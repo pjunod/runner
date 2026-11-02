@@ -2726,3 +2726,57 @@ async fn completed_text_document_is_retained_with_visible_review_action() {
     worker.kill().await;
     authority.kill().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn automatic_hold_release_is_replicated_before_different_authority_adopts() {
+    let _=tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_test_writer().try_init();
+    let tmp=tempfile::tempdir().unwrap();
+    let topology=control_topology(3);
+    let opts=|priority|NodeOpts{coordinator:true,priority,download:false,max_download_jobs:0,post_process:false,min_free_disk_bytes:0};
+    let (a,b,c)=tokio::join!(
+        start_node_with_control(tmp.path(),"a",opts(0),9,0,nzbd_api::AuthConfig::default(),Some(topology[0].clone())),
+        start_node_with_control(tmp.path(),"b",opts(1),9,0,nzbd_api::AuthConfig::default(),Some(topology[1].clone())),
+        start_node_with_control(tmp.path(),"c",opts(2),9,0,nzbd_api::AuthConfig::default(),Some(topology[2].clone()))
+    );
+    let mut nodes=vec![a,b,c];
+    wait_for("initial coordinator ready",20,||nodes.iter().filter(|node|node.runtime.is_leader()).count()==1
+        && nodes.iter().find(|node|node.runtime.is_leader()).is_some_and(|node|http(&node.url,"GET","/api/v1/deliveries?after=0",b"").0==200)).await;
+    let initial=nodes.iter().position(|node|node.runtime.is_leader()).unwrap();
+    let a=&nodes[initial];
+    let post=build_post("automatic-recovery",&[("episode.mkv",prng_bytes(202,4096))],4096);
+    let body=post_until_created("automatic recovery admission",20,||http(&a.url,"POST","/api/v1/jobs?name=automatic-recovery",post.nzb.as_bytes())).await;
+    let id=nzbd_types::JobId(serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_u64().unwrap() as u32);
+    let job=a.runtime.engine.export_job(id).await.unwrap().unwrap();
+    let root=tmp.path().join("complete");std::fs::create_dir_all(&root).unwrap();
+    let path=root.join(nzbd_engine::queue::job_dir_name(&job));
+    let source=a.runtime.engine.artifacts().allocate_for_delivery(id.0,&root,&path,true,false).unwrap();
+    assert!(a.runtime.engine.hold_job(id,nzbd_types::HoldCause::Allocation,"download","test allocation retry").await.unwrap());
+    let held=a.runtime.engine.export_job(id).await.unwrap().unwrap().control().unwrap();
+    assert_eq!(held.lifecycle,"held");
+    let due=held.next_retry_at_unix.expect("automatic hold persists deadline");
+    let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    assert!(due-now<=65,"fixture must use bounded production retry schedule");
+    // The real authority-only recovery task releases it; scheduler must commit
+    // the proven transition before a successor can observe running work.
+    wait_for("automatic recovery and replicated projection",80,||{
+        let snap=a.runtime.engine.snapshot();
+        snap.jobs.iter().find(|job|job.id==id).is_some_and(|job|job.status==nzbd_types::JobStatus::Queued)
+            && !snap.pending_automatic_controls.contains(&id)
+    }).await;
+    let released=a.runtime.engine.export_job(id).await.unwrap().unwrap();
+    let control=released.control().unwrap();assert_eq!(control.lifecycle,"running");
+    assert_eq!(control.retry_attempt,held.retry_attempt);assert_eq!(control.blocked_since_unix,held.blocked_since_unix);
+    assert!(released.params.iter().any(|(key,value)|key=="*Cluster:AuthoritySourceCopy" && value.contains(&source.id)),"raw custody fact must be durable before grant eligibility");
+    let prior_name=a.name.clone();
+    nodes.remove(initial).kill().await;
+    wait_for("different coordinator adopts automatic result",25,||nodes.iter().any(|node|node.runtime.is_leader())).await;
+    let successor=nodes.iter().find(|node|node.runtime.is_leader()).unwrap();
+    assert_ne!(successor.name,prior_name);
+    wait_for("successor queue projection",20,||successor.runtime.engine.snapshot().jobs.iter().any(|job|job.id==id)).await;
+    let adopted=successor.runtime.engine.export_job(id).await.unwrap().unwrap();
+    assert_eq!(adopted.status,nzbd_types::JobStatus::Queued);
+    assert_eq!(adopted.control(),Some(control));
+    assert!(!adopted.params.iter().any(|(key,_)|key==nzbd_engine::automatic_control::AUTOMATIC_CONTROL_PARAM));
+    assert!(adopted.params.iter().any(|(key,value)|key=="*Cluster:AuthoritySourceCopy" && value.contains(&source.id)));
+    for node in nodes {node.kill().await;}
+}

@@ -69,6 +69,8 @@ const CONTROL_SCHEMA: &[&str] = &[
         terminal INTEGER NOT NULL DEFAULT 0,
         updated_at_ms INTEGER NOT NULL
     ) STRICT",
+    "CREATE INDEX IF NOT EXISTS work_leases_job ON work_leases(job_id)",
+    "CREATE TRIGGER IF NOT EXISTS work_job_intent_validate BEFORE INSERT ON work_leases WHEN NEW.resource<>'cluster/leader' BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM control_jobs WHERE job_id=NEW.job_id AND incarnation=NEW.job_incarnation AND revision=NEW.job_revision AND deleted=0) THEN RAISE(ABORT,'stale job intent at lease claim') END; SELECT CASE WHEN json_type(NEW.scope_json,'$._authority') IS NOT NULL AND NOT EXISTS(SELECT 1 FROM work_leases WHERE resource='cluster/leader' AND terminal=0 AND owner_node_id=json_extract(NEW.scope_json,'$._authority.node') AND owner_incarnation=json_extract(NEW.scope_json,'$._authority.incarnation') AND fence=json_extract(NEW.scope_json,'$._authority.fence') AND expires_at_ms>NEW.updated_at_ms) THEN RAISE(ABORT,'stale grant issuer authority') END; END",
     "CREATE TRIGGER IF NOT EXISTS coordinator_protocol_insert BEFORE INSERT ON work_leases WHEN NEW.resource='cluster/leader' AND (json_type(NEW.scope_json,'$.lifecycleProtocol') IS NOT 'integer' OR coalesce(json_extract(NEW.scope_json,'$.lifecycleProtocol'),0)<2) BEGIN SELECT RAISE(ABORT,'coordinator requires lifecycleProtocol 2; upgrade this node before claiming authority'); END",
     "CREATE TRIGGER IF NOT EXISTS coordinator_protocol_update BEFORE UPDATE ON work_leases WHEN NEW.resource='cluster/leader' AND NEW.terminal=0 AND (json_type(NEW.scope_json,'$.lifecycleProtocol') IS NOT 'integer' OR coalesce(json_extract(NEW.scope_json,'$.lifecycleProtocol'),0)<2) BEGIN SELECT RAISE(ABORT,'coordinator requires lifecycleProtocol 2; upgrade this node before renewing authority'); END",
     "CREATE TABLE IF NOT EXISTS request_authority(id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL,incarnation TEXT NOT NULL,fence INTEGER NOT NULL,checked_at_ms INTEGER NOT NULL) STRICT",
@@ -314,6 +316,7 @@ impl ControlStore {
             .txn(
                 CONTROL_SCHEMA
                     .iter()
+                    .chain(crate::grant_receipts::SCHEMA.iter())
                     .map(|statement| ((*statement).to_owned(), params!()))
                     .collect::<Vec<(String, hiqlite::Params)>>(),
             )
@@ -517,7 +520,26 @@ impl ControlStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("decode acquired lease: {error}"))?;
         if let Some(row) = rows.into_iter().next() {
-            return Ok(LeaseClaim::Acquired(row.try_into()?));
+            let token: LeaseToken = row.try_into()?;
+            if resource != "cluster/leader" {
+                let receipt = self.historical_grant(resource, token.fence).await?.ok_or(
+                    "new lease lacks immutable grant provenance; do not execute this attempt",
+                )?;
+                if receipt.initial_token != token
+                    || u64::from(receipt.job_id) != job_id
+                    || receipt.job_incarnation != job_incarnation
+                    || receipt.job_revision != job_revision
+                    || receipt.kind != kind
+                    || receipt.issued_at_unix_ms != now
+                    || receipt.source_binding_json.as_ref().is_some_and(|value| {
+                        value.len() > 8192
+                            || serde_json::from_str::<serde_json::Value>(value).is_err()
+                    })
+                {
+                    return Err("committed grant provenance differs from its claimed operation; retain and review".into());
+                }
+            }
+            return Ok(LeaseClaim::Acquired(token));
         }
         let held = self.current_lease(resource).await?.ok_or_else(|| {
             "lease acquire changed no row and the resource disappeared".to_owned()
@@ -938,10 +960,18 @@ impl ControlStore {
     /// Drain the durable URL outbox against current replicated intent. Events
     /// are wake hints only; the immutable resolution ID is the command key.
     /// True means durable acceptance/replay or a definite durable cancellation.
+    #[cfg(test)]
     pub(crate) async fn commit_url_outbox(
         &self,
         record: &nzbd_state::artifacts::UrlResolutionRecord,
     ) -> Result<bool, String> {
+        self.commit_url_outbox_with_source(record,None).await
+    }
+    pub(crate) async fn commit_url_outbox_with_source(
+        &self,
+        record:&nzbd_state::artifacts::UrlResolutionRecord,
+        source:Option<&crate::source_facts::OwnedSourceFact>,
+    )->Result<bool,String> {
         use nzbd_state::artifacts::url_source_identity;
         if record.resolution_id != record.source_identity
             || url_source_identity(&record.origin).map_err(|error| error.to_string())?
@@ -996,7 +1026,7 @@ impl ControlStore {
             next.dir_name = record.resolved.dir_name.clone();
         }
         next.files = record.resolved.files.clone();
-        next.totals = record.resolved.totals.clone();
+        next.totals = record.resolved.totals;
         next.status = if record.resolved.status == nzbd_types::JobStatus::Failed {
             nzbd_types::JobStatus::Failed
         } else if prior.status == nzbd_types::JobStatus::Paused
@@ -1018,6 +1048,11 @@ impl ControlStore {
         {
             next.params.retain(|(existing, _)| existing != key);
             next.params.push((key.clone(), value.clone()));
+        }
+        if let Some(source)=source {
+            if source.dirname==nzbd_engine::queue::job_dir_name(&next) && !next.params.iter().any(|(key,_)|key==crate::delivery::AUTHORITY_COPY_PARAM) {
+                next.params.push((crate::delivery::AUTHORITY_COPY_PARAM.into(),source.value.clone()));
+            }
         }
         let next = serde_json::to_string(&next).map_err(|error| error.to_string())?;
         if next.len() > crate::proto::MAX_DESCRIPTOR_BYTES {
@@ -1947,6 +1982,7 @@ mod coordinator_protocol_tests {
             .unwrap()
             .unwrap();
         assert!(renewed.revision > current.revision);
+        store.seed_job(2, "ordinary", "{}").await.unwrap();
         assert!(
             matches!(
                 store
