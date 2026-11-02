@@ -147,7 +147,7 @@ impl Inventory {
         generation: &str,
         receipt: &str,
     ) -> Result<bool> {
-        Ok(!receipt.is_empty() && self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM workspace_finalizations WHERE source=?1 AND generation=?2 AND activated=1 AND outcome='CANCELLED' AND json_extract(proof,'$.kind')='cluster' AND json_extract(proof,'$.receipt')=?3 AND EXISTS(SELECT 1 FROM artifacts a WHERE a.id=?1 AND a.state<>'transferred') AND NOT EXISTS(SELECT 1 FROM deliveries d WHERE d.artifact=?1 AND d.generation=?2 AND (d.accepted_at IS NOT NULL OR d.consumer_receipt_id IS NOT NULL)))",params![artifact,generation,receipt],|row|row.get(0))?)
+        Ok(!receipt.is_empty() && self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM workspace_finalizations WHERE source=?1 AND generation=?2 AND activated=1 AND outcome='CANCELLED' AND json_extract(proof,'$.kind')='cluster' AND json_extract(proof,'$.receipt')=?3 AND EXISTS(SELECT 1 FROM artifacts a WHERE a.id=?1 AND a.state<>'transferred') AND NOT EXISTS(SELECT 1 FROM deliveries d WHERE d.artifact=?1 AND d.generation=?2))",params![artifact,generation,receipt],|row|row.get(0))?)
     }
 
     /// The authenticated peer handler proves exact DeleteFiles cancellation
@@ -164,7 +164,11 @@ impl Inventory {
         if copy.selected || copy.publication != copy.source {
             return Err(Error::Conflict("selected publication needs separate exact custody review before cancellation deletion".into()));
         }
-        let accepted:bool=self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM deliveries WHERE artifact=?1 AND generation=?2 AND (accepted_at IS NOT NULL OR consumer_receipt_id IS NOT NULL))",params![copy.publication.artifact,copy.publication.generation],|row|row.get(0))?;
+        let accepted: bool = self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM deliveries WHERE artifact=?1 AND generation=?2)",
+            params![copy.publication.artifact, copy.publication.generation],
+            |row| row.get(0),
+        )?;
         if accepted || self.get(&copy.publication.artifact)?.state == "transferred" {
             return Err(Error::Conflict(
                 "consumer custody cannot be replaced by cancellation deletion".into(),
@@ -178,6 +182,30 @@ impl Inventory {
             Some(raw_files),
             true,
         )
+    }
+
+    /// DeleteFiles may dispose this exact selected generation only before any
+    /// local Delivery/handoff exists. Its predecessor is a separate obligation:
+    /// normal selected retirement would otherwise retire that source too.
+    pub fn delete_cancelled_cluster_unpublished_publication(
+        &self,
+        copy: &ClusterArtifactCopy,
+        proof: FinalizationProof,
+        files: &[DeliveryFile],
+    ) -> Result<ClusterCopyCleanup> {
+        if !copy.selected {
+            return Err(Error::Conflict(
+                "unpublished cancellation requires an exact selected generation".into(),
+            ));
+        }
+        let private = ClusterArtifactCopy {
+            storage_instance_id: copy.storage_instance_id.clone(),
+            publication: copy.publication.clone(),
+            source: copy.publication.clone(),
+            job_id: copy.job_id,
+            selected: false,
+        };
+        self.delete_cancelled_cluster_artifact_copy(&private, proof, files)
     }
 
     /// The peer handler first proves this exact copy is a replicated cleanup
@@ -845,6 +873,148 @@ mod tests {
                 );
             }
         }
+    }
+    fn unpublished_selected_fixture() -> (
+        tempfile::TempDir,
+        Inventory,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        ClusterArtifactCopy,
+        Vec<DeliveryFile>,
+    ) {
+        let (temp, inventory, source, _) = fixture();
+        let selected = inventory
+            .for_job(7)
+            .unwrap()
+            .unwrap()
+            .files
+            .into_iter()
+            .filter(|entry| entry.path == "episode.mkv")
+            .collect();
+        let completed = temp.path().join("completed");
+        std::fs::create_dir(&completed).unwrap();
+        let target = completed.join("private-selected");
+        let outcomes = raw_seal()
+            .iter()
+            .map(|file| DeliveryFileOutcome {
+                source_path: file.path.clone(),
+                publication_path: (file.path == "episode.mkv").then(|| file.path.clone()),
+                classification: "video".into(),
+                outcome: if file.path == "episode.mkv" {
+                    "published"
+                } else {
+                    "excluded_source_cleanup"
+                }
+                .into(),
+                reason: None,
+                repair_dependency: false,
+                source_cleanup_status: "pending".into(),
+            })
+            .collect();
+        inventory
+            .publish_selected_for_delivery_checked(7, &target, selected, outcomes, &|| Ok(()))
+            .unwrap();
+        let copy = inventory.cluster_artifact_copy(7, true).unwrap().unwrap();
+        let files = raw_seal()
+            .into_iter()
+            .filter(|file| file.path == "episode.mkv")
+            .collect();
+        (temp, inventory, source, target, copy, files)
+    }
+    #[test]
+    fn explicit_cancel_unpublished_selection_removes_only_private_generation_and_replays() {
+        let (temp, inventory, source, target, copy, files) = unpublished_selected_fixture();
+        let original = inventory.get(&copy.source.artifact).unwrap();
+        inventory
+            .retention(&original.id, original.revision, true, None)
+            .unwrap();
+        let selected = inventory.get(&copy.publication.artifact).unwrap();
+        inventory
+            .retention(&selected.id, selected.revision, true, None)
+            .unwrap();
+        inventory.set_keep_on_failure(7, true).unwrap();
+        assert_eq!(
+            inventory
+                .delete_cancelled_cluster_unpublished_publication(&copy, proof(), &files)
+                .unwrap()
+                .status,
+            "removed"
+        );
+        assert!(!target.exists());
+        assert_eq!(
+            std::fs::read(source.join("episode.mkv")).unwrap(),
+            b"verified payload"
+        );
+        assert_eq!(std::fs::read(source.join("readme.txt")).unwrap(), b"junk");
+        assert!(inventory.get(&copy.source.artifact).unwrap().keep);
+        drop(inventory);
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        assert_eq!(
+            inventory
+                .delete_cancelled_cluster_unpublished_publication(&copy, proof(), &files)
+                .unwrap()
+                .status,
+            "removed"
+        );
+        assert!(source.join("episode.mkv").exists());
+    }
+    #[test]
+    fn explicit_cancel_private_selection_refuses_any_durable_unaccepted_handoff() {
+        let (_temp, inventory, source, target, copy, files) = unpublished_selected_fixture();
+        inventory
+            .finish(7, &target, target.parent().unwrap(), "completed")
+            .unwrap();
+        inventory
+            .accept_cluster_completion(&copy.publication, "CANCELLED", proof())
+            .unwrap();
+        let artifact = inventory.get(&copy.publication.artifact).unwrap();
+        let operation = inventory
+            .request_delete_with_policy(
+                &artifact.id,
+                artifact.revision,
+                "cluster-cancel-copy-private-before-handoff",
+                0,
+                false,
+                None,
+                false,
+                Some("exact-replicated-ready"),
+            )
+            .unwrap();
+        let delivery = inventory
+            .create_delivery_with_outcome_and_keep(
+                7,
+                true,
+                Some("private-consumer"),
+                "SUCCESS",
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(delivery.accepted_at.is_none() && delivery.consumer_receipt_id.is_none());
+        // A historical partially-applied state update cannot erase the durable
+        // handoff. The executor must recheck the receipt, not only ownership.
+        let mut stale_owned = inventory.get(&artifact.id).unwrap();
+        stale_owned.owned = true;
+        stale_owned.state = "completed".into();
+        save_artifact(&inventory.db.lock().unwrap(), &stale_owned).unwrap();
+        assert_eq!(
+            inventory.execute_delete(&operation.id).unwrap().state,
+            "review"
+        );
+        assert!(
+            inventory
+                .delete_cancelled_cluster_unpublished_publication(&copy, proof(), &files)
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(target.join("episode.mkv")).unwrap(),
+            b"verified payload"
+        );
+        assert_eq!(
+            std::fs::read(source.join("episode.mkv")).unwrap(),
+            b"verified payload"
+        );
     }
     #[test]
     fn accepted_selected_cluster_copy_drains_and_replays_without_payload() {
