@@ -1718,6 +1718,24 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     const child = { ...seed, id: 900, torrent_role: "acquisition", seed_donor_job_id: seed.id,
       status: { post: { stage: "unpack" } }, ready: false, stages: [{ stage: "unpack", since: 1 }] };
     eq(T.torrentPhase(child), null, "managed child never derives a seed phase from donor counters");
+    eq(T.rowModel({ ...child, status: "queued" }).st, "WAITING FOR SEED SOURCE", "child queue waits for separate seed network acquisition");
+    eq(T.rowModel({ ...child, status: "downloading" }).st, "COPYING SEED FILES", "child download interval is a private copy");
+    const proof = { ...child, control: { revision: "7", instance: "authority" },
+      controlPending: { jobId: child.id, state: "review_required", owner: "worker-west", error: "Exact source identity changed", nextRetryAtMs: 1e300 } };
+    const pendingRow = T.rowModel(proof, { mixedSection: false });
+    eq(pendingRow.st, "SOURCE NEEDS REVIEW", "pending proof does not appear as ordinary queued work");
+    eq(pendingRow.stHidden, false, "pending state stays visible under processing headings");
+    ok(pendingRow.dRest.includes("worker-west") && pendingRow.dRest.includes("Exact source identity changed"), "pending reason and owner are visible");
+    ok(!pendingRow.pauseHidden, "pending proof does not remove existing pause control");
+    ok(!T.detailModel(proof).lifecycleHidden && T.detailModel(proof).lifecycleStatus.includes("Exact source identity changed"), "inspector shows review boundary");
+    const generic = { ...proof, controlPending: { jobId: child.id, state: "pending", owner: null, error: "Waiting for proof", nextRetryAtMs: null } };
+    T.store.jobs = [proof];
+    T.applyTick({ jobs: [generic], status: { download_rate_bps: 0 } });
+    eq(T.store.jobs[0].controlPending.owner, "worker-west", "generic SSE preserves detailed owner observation");
+    eq(T.store.jobs[0].controlPending.state, "review_required", "generic SSE cannot erase recorded review reason");
+    T.applyTick({ jobs: [{ ...generic, controlPending: undefined }], status: { download_rate_bps: 0 } });
+    ok(!T.store.jobs[0].controlPending, "ACK tick omission clears pending observation");
+    eq(T.mergePendingJobs([proof], [{ ...generic, control: { revision: "8", instance: "authority" } }])[0].controlPending.owner, null, "new control cannot inherit old proof detail");
     const childRow = T.rowModel(child);
     ok(childRow.sub.includes("TORRENT ACQUISITION") && childRow.sub.includes("#" + seed.id), "child identifies its separate seed source");
     ok(!childRow.sub.includes("USENET"), "child is never labeled Usenet");

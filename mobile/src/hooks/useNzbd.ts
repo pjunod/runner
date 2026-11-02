@@ -2,6 +2,7 @@ import { File } from 'expo-file-system';
 import { AppState } from 'react-native';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import { mergePendingJobs } from '../controlPending';
 import { JobActionResult, runJobAction } from '../api/jobActions';
 import { NzbdClient } from '../api/client';
 import { SseParser } from '../api/sse';
@@ -95,7 +96,8 @@ export function useNzbd(config: ConnectionConfig): HookResult {
       setError(null);
       if (event === 'tick') {
         try {
-          setSnapshot(JSON.parse(data) as QueueSnapshot);
+          const next = JSON.parse(data) as QueueSnapshot;
+          setSnapshot(previous => ({ ...next, jobs: mergePendingJobs(previous?.jobs ?? [], next.jobs) }));
           setLastUpdated(Date.now());
         } catch {
           setError('Runner sent a queue update the app could not read.');

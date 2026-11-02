@@ -72,6 +72,16 @@ failure**, pause, retry and removal controls. It has no seed options, upload or
 peer counters, donor-file deletion choice, or seed-resume fallback. Removing
 the child leaves the seed source and its seeding policy unchanged. A held child
 keeps the same **Retry** or **Pause retries** action as any other processing job.
+Before copying, it says **Waiting for seed source**; while making its private
+copy it says **Copying seed files**. Network transfer and seeding belong to the
+separate source, not the child copy interval.
+
+A pending cluster source check is shown on the job card and detail panel,
+including its owner, reason and next check when known. **Source needs review**
+means the exact source proof changed; it does not mean recovery succeeded.
+Generic live ticks retain the last detailed observation until a newer control
+or an acknowledged result clears it. Existing pause, removal and Keep controls
+remain available according to the job's current state.
 
 When a cross-node Keep change is durably requested but an exact source owner
 has not acknowledged it, the control says **Requested Keep** and **Waiting for

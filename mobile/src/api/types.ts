@@ -50,7 +50,16 @@ export interface JobControl {
   manual_pause?: boolean;
 }
 
+export interface ControlPending {
+  jobId: number;
+  owner: string | null;
+  state: 'pending' | 'verified' | 'retry' | 'review_required';
+  error: string | null;
+  nextRetryAtMs: number | null;
+}
+
 export interface JobSummary {
+  controlPending?: ControlPending | null;
   control?: JobControl | null;
   id: number;
   kind?: 'nzb' | 'torrent';

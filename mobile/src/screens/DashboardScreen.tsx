@@ -50,7 +50,8 @@ import { DOWNLOAD_PRIORITIES, downloadPriorityLabel } from '../priority';
 import { Theme, useDisplayPreferences, useTheme } from '../theme';
 import { useCollapsedSections } from '../storage/queuePreferences';
 import { SeedPolicyEditor } from '../components/SeedPolicyEditor';
-import { torrentDisplayPhase, torrentStatus, torrentPrimaryAction, seedPolicyText, seedStopText, isTorrentAcquisition, isSeedTorrent } from '../torrentPresentation';
+import { controlPendingLabel, controlPendingText } from '../controlPending';
+import { acquisitionStatus, torrentDisplayPhase, torrentStatus, torrentPrimaryAction, seedPolicyText, seedStopText, isTorrentAcquisition, isSeedTorrent } from '../torrentPresentation';
 import { urlFetchDetail, useNow } from '../urlFetchPresentation';
 import { HistoryView } from './HistoryView';
 import { LogsView } from './LogsView';
@@ -634,7 +635,9 @@ export function JobCard({
   const seed = phase === 'seeding' || phase === 'paused_seed';
   const acquisition = isTorrentAcquisition(job);
   const postProcessing = !isSeedTorrent(job) && isPostProcessingSection(sectionKey);
-  const showStatus = !!phase || ['waiting', 'attention', 'paused'].includes(sectionKey);
+  const pendingLabel = controlPendingLabel(job);
+  const acquisitionLabel = acquisitionStatus(job);
+  const showStatus = !!pendingLabel || !!acquisitionLabel || !!phase || ['waiting', 'attention', 'paused'].includes(sectionKey);
   // An NZB URL job has no bytes until its NZB arrives: no bar, and the card
   // says why it is waiting instead (urlFetchDetail).
   const fetchingNzb = statusKey === 'fetching' && !phase && !acquisition;
@@ -674,9 +677,10 @@ export function JobCard({
         <View style={styles.jobMeta}>
           {showStatus ? (
             <Text style={[styles.status, (statusKey === 'failed' || phase === 'missing_files' || phase === 'failed') && styles.statusFailed]}>
-              {hold ? 'held' : phase ? torrentStatus(job) : jobStatusLabel(job.status, job.ready)}
+              {pendingLabel ?? (hold ? 'held' : acquisitionLabel ?? (phase ? torrentStatus(job) : jobStatusLabel(job.status, job.ready)))}
             </Text>
           ) : null}
+          {pendingLabel ? <Text style={job.controlPending?.state === 'review_required' ? styles.statusFailed : styles.metaText}>{controlPendingText(job)}</Text> : null}
           {hold ? <Text style={styles.statusFailed}>{hold.message}</Text> : null}
           {fetchingNzb || fetchingAcquisition ? null : (
             <Text style={styles.metaText}>

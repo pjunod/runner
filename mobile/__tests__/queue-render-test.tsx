@@ -170,3 +170,18 @@ test('managed child shows POST and scoped Keep without donor seed controls', asy
   await act(async () => button('Pause retries').props.onPress());
   expect(action).toHaveBeenCalledWith('pause');
 });
+
+test('pending source review stays visible and leaves current controls usable', async () => {
+  const base = fixtures.find(f => f.name === 'stopped seed')!.job as JobSummary;
+  const job = { ...base, id: 901, torrent_role: 'acquisition', seed_donor_job_id: base.id, status: 'queued', ready: false,
+    controlPending: { jobId: 901, state: 'review_required', owner: 'worker-west', error: 'Exact source identity changed', nextRetryAtMs: 1e300 } } as JobSummary;
+  const onAction = jest.fn(); const onDelete = jest.fn();
+  await act(async () => { tree = create(<JobCard job={job} index={0} total={1} expanded busy={false}
+    onToggle={jest.fn()} onAction={onAction} onDelete={onDelete} onPriorityChange={jest.fn()} onSeedOptions={jest.fn()}
+    movable={false} sectionKey="waiting" sectionLabel="Waiting" styles={styles} tone={{ accent: theme.accent, background: theme.panel }} />); });
+  expect(text()).toContain('Source needs review');
+  expect(text()).toContain('worker-west'); expect(text()).toContain('Exact source identity changed');
+  expect(text()).not.toContain('Invalid Date');
+  await act(async () => button('Pause').props.onPress()); expect(onAction).toHaveBeenCalledWith('pause');
+  await act(async () => button('Remove').props.onPress()); expect(onDelete).toHaveBeenCalled();
+});

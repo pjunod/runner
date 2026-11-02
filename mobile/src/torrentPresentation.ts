@@ -11,6 +11,12 @@ const phases: readonly string[] = ['fetching_source', 'fetching_metadata', 'queu
 export function isTorrentAcquisition(job: JobSummary): boolean {
   return job.kind === 'torrent' && job.torrent_role === 'acquisition';
 }
+export function acquisitionStatus(job: JobSummary): string | undefined {
+  if (!isTorrentAcquisition(job)) return undefined;
+  if (job.status === 'queued' && job.seed_donor_job_id != null) return 'Waiting for seed source';
+  if (job.status === 'downloading') return 'Copying seed files';
+  return undefined;
+}
 export function isSeedTorrent(job: JobSummary): boolean {
   return job.kind === 'torrent' && !isTorrentAcquisition(job);
 }
