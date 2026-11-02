@@ -10994,12 +10994,12 @@ mod tests {
         let legacy_remaining = crate::download_capacity::remaining(&row, root);
         assert!(legacy_remaining < 128 * 1024);
         let output = std::fs::File::create(&stable).unwrap();
-        output.set_len(128 * 1024).unwrap();
+        output.set_len(1).unwrap();
         output.sync_all().unwrap();
         assert_eq!(
             crate::download_capacity::remaining(&row, root),
             128 * 1024,
-            "existing sparse stable path cannot borrow legacy allocation credit"
+            "truncated stable checkpoint cannot borrow verified legacy credit"
         );
         std::fs::remove_file(&stable).unwrap();
         std::fs::rename(&legacy, &stable).unwrap();
@@ -11057,10 +11057,13 @@ mod tests {
         output.write_all(&checkpoint).unwrap();
         output.sync_all().unwrap();
         drop(output);
-        let free = nzbd_state::capacity::available(&source.path).unwrap();
         let reserve_margin = 1024 * 1024 * 1024;
-        assert!(free > reserve_margin + 32 * 1024 * 1024);
-        let declared = free - reserve_margin + 8 * 1024 * 1024;
+        let _headroom = nzbd_state::capacity::inject_available_test_limit(
+            &source.path,
+            reserve_margin + 12 * 1024 * 1024,
+        )
+        .unwrap();
+        let declared = 24 * 1024 * 1024;
         owner.on_msg(EngineMsg::SegmentWritten {
             job: JobId(78),
             file,
@@ -11102,6 +11105,11 @@ mod tests {
             !partial.exists(),
             "health credited only the validated legacy staging path"
         );
+        // Simulated headroom/claims belong only to this exact fixture root.
+        let unrelated = owner.dest_dir.join("unrelated-capacity-context");
+        std::fs::create_dir(&unrelated).unwrap();
+        let independent = nzbd_state::capacity::reserve(&unrelated, declared).unwrap();
+        drop(independent);
         let writer = owner.writer_for(JobId(78), file);
         let resumed = vec![13u8; 65536];
         writer
