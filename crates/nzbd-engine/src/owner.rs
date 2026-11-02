@@ -109,7 +109,55 @@ pub(crate) enum QueueCommand {
     CommitTorrentAdmission {
         job: JobId,
         commit: Box<crate::queue::TorrentAdmissionCommit>,
-        reply: oneshot::Sender<Option<Result<JobId, JobId>>>,
+        reply: oneshot::Sender<Result<Option<Result<JobId, JobId>>, crate::EngineError>>,
+    },
+    NativeTorrentPending {
+        job: JobId,
+        reply: oneshot::Sender<Option<nzbd_state::PendingAdmission>>,
+    },
+    ReserveManagedTorrentAdmission {
+        source: nzbd_types::TorrentSource,
+        submission_sha256: String,
+        opts: AddOpts,
+        defaults: crate::torrent_acquisitions::ManagedTorrentDefaults,
+        reply: oneshot::Sender<
+            Result<crate::torrent_acquisitions::ManagedTorrentReservation, crate::EngineError>,
+        >,
+    },
+    ConfirmManagedTorrentSource {
+        job: JobId,
+        submission_sha256: String,
+        reply: oneshot::Sender<bool>,
+    },
+    CommitManagedTorrentAdmission {
+        job: JobId,
+        commit: Box<crate::queue::TorrentAdmissionCommit>,
+        submission_sha256: String,
+        reply: oneshot::Sender<
+            Result<crate::torrent_acquisitions::ManagedTorrentAdmission, crate::EngineError>,
+        >,
+    },
+    StartTorrentAcquisition {
+        job: JobId,
+        reply: oneshot::Sender<bool>,
+    },
+    RetryTorrentAcquisition {
+        job: JobId,
+        revision: String,
+        force: bool,
+        reply: oneshot::Sender<bool>,
+    },
+    CompleteTorrentAcquisition {
+        job: JobId,
+        donor: JobId,
+        source: Box<nzbd_state::artifacts::Artifact>,
+        reply: oneshot::Sender<bool>,
+    },
+    HoldTorrentAcquisition {
+        job: JobId,
+        cause: nzbd_types::HoldCause,
+        message: String,
+        reply: oneshot::Sender<bool>,
     },
     CancelTorrentAdmission {
         job: JobId,
@@ -1437,13 +1485,16 @@ impl Owner {
                 opts,
                 reply,
             } => {
-                // Reserve from the queue owner first: it alone allocates ids. The
-                // reservation is not durable until the protected sidecar exists.
+                if self.persistence_fenced || !self.persist {
+                    let _ = reply.send(Err(nzbd_state::StateError::Corrupt(
+                        "torrent admission requires durable queue ownership".into(),
+                    )));
+                    return;
+                }
+                let next_id = self.state.next_job_id;
                 let id = self.state.reserve_torrent_admission(source, opts);
                 let result = match self.pending_sources.write(id, &secret) {
                     Ok(secret_ref) => {
-                        // The reference is derived from the allocated id, never a
-                        // separately predicted identity.
                         if let Some(pending) = self
                             .state
                             .pending_admissions
@@ -1452,26 +1503,366 @@ impl Owner {
                         {
                             pending.secret_ref = secret_ref;
                         }
-                        self.save_snapshot();
-                        self.publish_now();
-                        Ok(id)
+                        if self.save_snapshot() {
+                            self.publish_now();
+                            Ok(id)
+                        } else {
+                            self.state.cancel_torrent_admission(id);
+                            self.state.next_job_id = next_id;
+                            let _ = self.pending_sources.remove(id);
+                            Err(nzbd_state::StateError::Corrupt(
+                                "torrent admission reservation did not commit".into(),
+                            ))
+                        }
                     }
                     Err(error) => {
                         self.state.cancel_torrent_admission(id);
+                        self.state.next_job_id = next_id;
                         Err(error)
                     }
                 };
                 let _ = reply.send(result);
             }
             QueueCommand::CommitTorrentAdmission { job, commit, reply } => {
+                if self.persistence_fenced || !self.persist {
+                    let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
+                    return;
+                }
+                let length = self.state.jobs.len();
+                let before_pending = self.state.pending_admissions.clone();
                 let result = self.state.commit_torrent_admission(job, *commit);
+                if result.is_some() && !self.save_snapshot() {
+                    self.state.jobs.truncate(length);
+                    self.state.pending_admissions = before_pending;
+                    let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
+                    return;
+                }
                 if result.is_some() {
-                    self.save_snapshot();
                     let _ = self.pending_sources.remove(job);
                     self.publish_now();
                     self.bump_epoch();
                 }
+                let _ = reply.send(Ok(result));
+            }
+            QueueCommand::NativeTorrentPending { job, reply } => {
+                let _ = reply.send(
+                    self.state
+                        .pending_admissions
+                        .iter()
+                        .find(|pending| pending.job_id == job)
+                        .cloned(),
+                );
+            }
+            QueueCommand::ReserveManagedTorrentAdmission {
+                source,
+                submission_sha256,
+                opts,
+                defaults,
+                reply,
+            } => {
+                if self.persistence_fenced || !self.persist {
+                    let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
+                    return;
+                }
+                let jobs = self.state.jobs.len();
+                let pending = self.state.pending_admissions.len();
+                let receipts = self.state.url_admission_receipts.len();
+                let next = self.state.next_job_id;
+                let result = self.state.reserve_managed_torrent_admission(
+                    source,
+                    submission_sha256,
+                    opts,
+                    defaults,
+                    &self.consumer_instance_id,
+                    &self.artifacts.installation,
+                );
+                let created = result.as_ref().is_ok_and(|result| result.created);
+                if created {
+                    mark_new_lifecycle_cohort(self.state.jobs.last_mut().unwrap());
+                }
+                if created && !self.save_snapshot() {
+                    self.state.jobs.truncate(jobs);
+                    self.state.pending_admissions.truncate(pending);
+                    self.state.url_admission_receipts.truncate(receipts);
+                    self.state.next_job_id = next;
+                    let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
+                    return;
+                }
+                if created {
+                    self.publish_now();
+                    self.bump_epoch();
+                }
                 let _ = reply.send(result);
+            }
+            QueueCommand::ConfirmManagedTorrentSource {
+                job,
+                submission_sha256,
+                reply,
+            } => {
+                let before = self.state.job(job).cloned();
+                let eligible = !self.persistence_fenced
+                    && self.persist
+                    && self
+                        .state
+                        .pending_admissions
+                        .iter()
+                        .any(|pending| pending.job_id == job)
+                    && before.as_ref().is_some_and(|row| {
+                        crate::torrent_acquisitions::is_acquisition(row)
+                            && row.params.iter().any(|(key, value)| {
+                                key == crate::torrent_acquisitions::SUBMISSION_PARAM
+                                    && value == &submission_sha256
+                            })
+                    });
+                if eligible {
+                    let row = self.state.job_mut(job).unwrap();
+                    row.params
+                        .retain(|(key, _)| key != crate::torrent_acquisitions::SOURCE_READY_PARAM);
+                    row.params.push((
+                        crate::torrent_acquisitions::SOURCE_READY_PARAM.into(),
+                        "1".into(),
+                    ));
+                }
+                let committed = eligible && self.save_snapshot();
+                if !committed {
+                    if let Some(before) = before {
+                        *self.state.job_mut(job).unwrap() = before;
+                    }
+                }
+                let _ = reply.send(committed);
+            }
+            QueueCommand::CommitManagedTorrentAdmission {
+                job,
+                commit,
+                submission_sha256,
+                reply,
+            } => {
+                if self.persistence_fenced || !self.persist {
+                    let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
+                    return;
+                }
+                let length = self.state.jobs.len();
+                let previous_child = self.state.job(job).cloned();
+                let next_id = self.state.next_job_id;
+                let before_pending = self.state.pending_admissions.clone();
+                let before_receipts = self.state.url_admission_receipts.clone();
+                let result = self.state.commit_managed_torrent_admission(
+                    job,
+                    *commit,
+                    submission_sha256,
+                    &self.artifacts.installation,
+                );
+                if result.is_ok() {
+                    for row in &mut self.state.jobs[length..] {
+                        mark_new_lifecycle_cohort(row);
+                    }
+                }
+                if result.is_err() || !self.save_snapshot() {
+                    self.state.jobs.truncate(length);
+                    if let Some(previous) = previous_child {
+                        if let Some(current) = self.state.job_mut(job) {
+                            *current = previous;
+                        }
+                    }
+                    self.state.next_job_id = next_id;
+                    self.state.pending_admissions = before_pending;
+                    self.state.url_admission_receipts = before_receipts;
+                    let _ = reply.send(match result {
+                        Err(error) => Err(error),
+                        Ok(_) => Err(crate::EngineError::AdmissionNotDurable),
+                    });
+                    return;
+                }
+                let _ = self.pending_sources.remove(job);
+                self.publish_now();
+                self.bump_epoch();
+                let _ = reply.send(result);
+            }
+            QueueCommand::StartTorrentAcquisition { job, reply } => {
+                let before = self.state.job(job).cloned();
+                let ok = !self.persistence_fenced
+                    && self.persist
+                    && before.as_ref().is_some_and(|row| {
+                        crate::torrent_acquisitions::donor(row).is_some()
+                            && !row.held()
+                            && matches!(row.status, JobStatus::Queued | JobStatus::Downloading)
+                    });
+                if ok {
+                    self.state.job_mut(job).unwrap().status = JobStatus::Downloading;
+                }
+                let committed = ok && self.save_snapshot();
+                if committed {
+                    self.publish_now();
+                } else if let Some(before) = before {
+                    *self.state.job_mut(job).unwrap() = before;
+                }
+                let _ = reply.send(committed);
+            }
+            QueueCommand::RetryTorrentAcquisition {
+                job,
+                revision,
+                force,
+                reply,
+            } => {
+                let before = self.state.job(job).cloned();
+                let mut changed = false;
+                if !self.persistence_fenced && self.persist {
+                    if let Some(row) = self
+                        .state
+                        .job_mut(job)
+                        .filter(|row| crate::torrent_acquisitions::donor(row).is_some())
+                    {
+                        if let Some(mut control) = row.control().filter(|control| {
+                            control.revision == revision
+                                && control.stage == "torrent_copy"
+                                && control.lifecycle == "held"
+                                && matches!(control.cause.as_str(), "io" | "capacity" | "quota")
+                                && (force
+                                    || (!control.manual_pause
+                                        && control
+                                            .next_retry_at_unix
+                                            .is_some_and(|deadline| deadline <= unix_now())))
+                        }) {
+                            if let Some(next) = control
+                                .revision
+                                .parse::<u64>()
+                                .ok()
+                                .and_then(|revision| revision.checked_add(1))
+                            {
+                                control.revision = next.to_string();
+                                control.lifecycle = "running".into();
+                                control.manual_pause = false;
+                                control.next_retry_at_unix = None;
+                                row.set_control(&control);
+                                row.status = JobStatus::Queued;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                let committed = changed && self.save_snapshot();
+                if committed {
+                    self.publish_now();
+                    self.bump_epoch();
+                } else if let Some(before) = before {
+                    *self.state.job_mut(job).unwrap() = before;
+                }
+                let _ = reply.send(committed);
+            }
+            QueueCommand::CompleteTorrentAcquisition {
+                job,
+                donor,
+                source,
+                reply,
+            } => {
+                let before = self.state.job(job).cloned();
+                let eligible = !self.persistence_fenced
+                    && self.persist
+                    && before.as_ref().is_some_and(|row| {
+                        crate::torrent_acquisitions::donor(row) == Some(donor)
+                            && !row.held()
+                            && matches!(row.status, JobStatus::Queued | JobStatus::Downloading)
+                            && !row
+                                .params
+                                .iter()
+                                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                    })
+                    && self.artifacts.for_job(job.0).is_ok_and(|current| {
+                        current.is_some_and(|current| {
+                            current.id == source.id
+                                && current.generation == source.generation
+                                && current.path == source.path
+                                && current.owned
+                                && current.state == "active"
+                        })
+                    })
+                    && self
+                        .artifacts
+                        .torrent_copy_ready(
+                            job.0,
+                            &nzbd_state::artifacts::SourceGeneration {
+                                artifact: source.id.clone(),
+                                generation: source.generation.clone(),
+                            },
+                        )
+                        .unwrap_or(false);
+                if !eligible {
+                    let _ = reply.send(false);
+                    return;
+                }
+                let previous_next_file = self.state.next_file_id;
+                let timing_checkpoint = self.timing_cache.checkpoint(job);
+                let mut file_params = Vec::new();
+                let mut files = Vec::new();
+                for entry in source
+                    .files
+                    .iter()
+                    .filter(|entry| !entry.identity.directory)
+                {
+                    self.state.next_file_id += 1;
+                    let id = FileId(self.state.next_file_id);
+                    file_params.push((
+                        format!("*File:size:{}", id.0),
+                        entry.identity.bytes.to_string(),
+                    ));
+                    files.push(nzbd_types::FileEntry {
+                        id,
+                        subject: entry.path.clone(),
+                        filename: entry.path.clone(),
+                        filename_confirmed: true,
+                        is_par2: entry.path.to_ascii_lowercase().ends_with(".par2"),
+                        paused: false,
+                        groups: Vec::new(),
+                        date: None,
+                        segments: Vec::new(),
+                        crc32: None,
+                        finalized: true,
+                    });
+                }
+                let row = self.state.job_mut(job).unwrap();
+                row.params.extend(file_params);
+                row.files = files;
+                row.totals.success_size = source.summary().1;
+                row.status = JobStatus::Completed;
+                self.dirty = true;
+                if !self.save_snapshot() {
+                    *self.state.job_mut(job).unwrap() = before.unwrap();
+                    self.state.next_file_id = previous_next_file;
+                    self.timing_cache.restore(job, timing_checkpoint);
+                    let _ = reply.send(false);
+                    return;
+                }
+                for file in &self.state.job(job).unwrap().files {
+                    if let Some(entry) = source
+                        .files
+                        .iter()
+                        .find(|entry| entry.path == file.filename)
+                    {
+                        self.file_sizes.insert(file.id, entry.identity.bytes);
+                    }
+                }
+                self.publish_now();
+                self.bump_epoch();
+                let row = self.state.job(job).unwrap();
+                self.emit(Event::JobFinished {
+                    job,
+                    status: JobStatus::Completed,
+                    name: row.name.clone(),
+                    health: 1000,
+                });
+                let _ = reply.send(true);
+            }
+            QueueCommand::HoldTorrentAcquisition {
+                job,
+                cause,
+                message,
+                reply,
+            } => {
+                let eligible = self.state.job(job).is_some_and(|row| {
+                    crate::torrent_acquisitions::donor(row).is_some()
+                        && matches!(row.status, JobStatus::Queued | JobStatus::Downloading)
+                });
+                let _ = reply.send(eligible && self.hold_job(job, cause, "torrent_copy", &message));
             }
             QueueCommand::CancelTorrentAdmission { job, reply } => {
                 let before = self.state.pending_admissions.clone();
@@ -2000,6 +2391,9 @@ impl Owner {
                         "*AddPaused",
                         Some("yes".into()),
                     );
+                    if crate::torrent_acquisitions::is_acquisition(&before) {
+                        self.state.job_mut(job).unwrap().status = JobStatus::Paused;
+                    }
                     let ok = self.persist && !self.persistence_fenced && self.save_snapshot();
                     if ok {
                         self.publish_now();
@@ -2222,6 +2616,22 @@ impl Owner {
                 reply,
             } => {
                 let before = self.state.job(job).cloned();
+                if delete_files
+                    && self.state.jobs.iter().any(|row| {
+                        crate::torrent_acquisitions::donor(row) == Some(job)
+                            && !row
+                                .params
+                                .iter()
+                                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                            && self
+                                .artifacts
+                                .for_job(row.id.0)
+                                .is_ok_and(|source| source.is_none())
+                    })
+                {
+                    let _ = reply.send(false);
+                    return;
+                }
                 let torrent_command = self.state.job_mut(job).and_then(|record| {
                     let torrent = record.torrent.as_mut()?;
                     torrent.removal_intent = Some(TorrentRemovalIntent {
@@ -4669,7 +5079,9 @@ impl Owner {
         if control.revision != revision {
             return Err("the hold changed since it was read; reload and retry".into());
         }
-        if control.hold_cause().is_storage() && !control.post_side() {
+        let native_preparation = crate::torrent_acquisitions::is_acquisition(&before)
+            && matches!(control.stage.as_str(), "torrent_copy" | "torrent_metadata");
+        if control.hold_cause().is_storage() && !control.post_side() && !native_preparation {
             return Err("storage holds are released by the capacity check".into());
         }
         if by == RetryBy::Recovery
@@ -4730,7 +5142,9 @@ impl Owner {
         }
         {
             let j = self.state.job_mut(job).unwrap();
-            j.status = if post_side {
+            j.status = if native_preparation && control.stage == "torrent_metadata" {
+                JobStatus::Fetching
+            } else if post_side {
                 JobStatus::PostQueued
             } else {
                 JobStatus::Queued
@@ -5590,6 +6004,21 @@ impl Owner {
         if let Err(error) = self.url_resolutions.retire_job(&self.state.jobs[idx]) {
             tracing::error!(job=job_id.0, %error, "queue retirement is not durable; source retained");
             return false;
+        }
+        if crate::torrent_acquisitions::is_acquisition(&self.state.jobs[idx]) {
+            for metadata in [false, true] {
+                let Ok(origin) =
+                    crate::torrent_acquisitions::blob_origin(&self.state.jobs[idx], metadata)
+                else {
+                    return false;
+                };
+                if self.url_resolutions.retire_job(&origin).is_err() {
+                    return false;
+                }
+            }
+            self.state
+                .pending_admissions
+                .retain(|pending| pending.job_id != job_id);
         }
         let mut stopping = self.retiring_writers.remove(&job_id).unwrap_or_default();
         self.allocated_jobs.remove(&job_id);
@@ -6565,6 +6994,14 @@ impl Owner {
                     pp_done: j.params.iter().any(|(k, _)| k == nzbd_types::PP_DONE_PARAM),
                     ready: j.ready(),
                     ready_at_unix: j.ready_at_unix(),
+                    torrent_role: if crate::torrent_acquisitions::is_acquisition(j) {
+                        Some("acquisition")
+                    } else if j.torrent.is_some() {
+                        Some("seed")
+                    } else {
+                        None
+                    },
+                    seed_donor_job_id: crate::torrent_acquisitions::donor(j),
                     torrent_phase: j.torrent.as_ref().map(|t| t.phase),
                     torrent_control_intent: j.torrent.as_ref().map(|t| t.control_intent),
                     seed_policy: j.torrent.as_ref().map(|t| t.seed_policy),

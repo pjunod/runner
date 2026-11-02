@@ -2118,6 +2118,20 @@ async fn get_history(
                             || e.params.iter().any(|(k, _)| k == "*URL"));
                     let mut v = serde_json::to_value(&e).unwrap_or_else(|_| json!({}));
                     if let Some(o) = v.as_object_mut() {
+                        o.insert(
+                            "torrent_role".into(),
+                            json!(e
+                                .record
+                                .as_ref()
+                                .and_then(|record| record.torrent_role.as_deref())),
+                        );
+                        o.insert(
+                            "seed_donor_job_id".into(),
+                            json!(e
+                                .record
+                                .as_ref()
+                                .and_then(|record| record.seed_donor_job_id)),
+                        );
                         o.insert("can_requeue".into(), json!(can));
                         o.insert("requeue_reason".into(), json!(reason));
                         o.insert(
@@ -3256,6 +3270,8 @@ mod tests {
             ratio: 0.0,
             seeding_seconds: 0,
             useful_peers: 0,
+            torrent_role: None,
+            seed_donor_job_id: None,
             torrent_phase: None,
             torrent_control_intent: None,
             seed_policy: None,

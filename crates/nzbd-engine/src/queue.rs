@@ -385,13 +385,6 @@ impl QueueState {
                 && !matches!(job.status, JobStatus::Failed | JobStatus::Deleted)
         }) {
             let existing_id = self.jobs[position].id;
-            let existing = &mut self.jobs[position];
-            for (key, value) in params {
-                match existing.params.iter_mut().find(|(k, _)| *k == key) {
-                    Some(slot) => slot.1 = value,
-                    None => existing.params.push((key, value)),
-                }
-            }
             self.cancel_torrent_admission(id);
             return Some(Err(existing_id));
         }
@@ -429,6 +422,267 @@ impl QueueState {
             stages: Vec::new(),
         });
         Some(Ok(id))
+    }
+
+    pub(crate) fn reserve_managed_torrent_admission(
+        &mut self,
+        source: TorrentSource,
+        submission_sha256: String,
+        opts: AddOpts,
+        defaults: crate::torrent_acquisitions::ManagedTorrentDefaults,
+        instance: &str,
+        storage_instance: &str,
+    ) -> Result<crate::torrent_acquisitions::ManagedTorrentReservation, crate::EngineError> {
+        use crate::torrent_acquisitions::*;
+        let token = managed_token(&opts.params)?
+            .ok_or_else(|| {
+                crate::EngineError::RequestConflict(
+                    "managed admission has no Delivery token".into(),
+                )
+            })?
+            .to_string();
+        if let Some(receipt) = self
+            .url_admission_receipts
+            .iter()
+            .find(|receipt| receipt.request_token == token)
+        {
+            if receipt.submission_sha256 != submission_sha256 {
+                return Err(crate::EngineError::RequestConflict(
+                    "transfer token was already used for a different submission".into(),
+                ));
+            }
+            let id = JobId(receipt.job_id);
+            let pending = self
+                .pending_admissions
+                .iter()
+                .any(|pending| pending.job_id == id);
+            return Ok(ManagedTorrentReservation {
+                id,
+                created: false,
+                pending,
+                source_ready: self.job(id).is_some_and(|job| {
+                    job.params
+                        .iter()
+                        .any(|(key, value)| key == SOURCE_READY_PARAM && value == "1")
+                }),
+            });
+        }
+        self.next_job_id.checked_add(1).ok_or_else(|| {
+            crate::EngineError::RequestConflict("job identifiers exhausted".into())
+        })?;
+        let encoded_defaults = serde_json::to_string(&defaults)
+            .map_err(|_| crate::EngineError::RequestConflict("invalid torrent defaults".into()))?;
+        if encoded_defaults.len() > 32 * 1024 {
+            return Err(crate::EngineError::RequestConflict(
+                "torrent defaults exceed supported bound".into(),
+            ));
+        }
+        let category = defaults.category.clone();
+        let priority = opts.priority;
+        let paused = opts.paused;
+        let mut params = crate::with_client(opts.params.clone(), opts.client.clone());
+        let id = self.reserve_torrent_admission(source, opts);
+        params.push((DEFAULTS_PARAM.into(), encoded_defaults));
+        params.push((ACQUISITION_PARAM.into(), "1".into()));
+        params.push((SUBMISSION_PARAM.into(), submission_sha256.clone()));
+        params.push((SOURCE_READY_PARAM.into(), "0".into()));
+        params.push((
+            ADMISSION_GENERATION_PARAM.into(),
+            format!("{storage_instance}-torrent-{}", id.0),
+        ));
+        params.push((METADATA_ATTEMPT_PARAM.into(), "0".into()));
+        self.jobs.push(Job {
+            id,
+            kind: JobKind::Torrent,
+            name: "Torrent metadata pending".into(),
+            dir_name: format!("torrent-acquisition-{}", id.0),
+            name_provisional: true,
+            delivery_lifecycle: true,
+            queued_at_unix: unix_now(),
+            original_name: String::new(),
+            category,
+            priority,
+            dupe: DupeInfo::default(),
+            params,
+            files: Vec::new(),
+            totals: Default::default(),
+            status: if paused {
+                JobStatus::Paused
+            } else {
+                JobStatus::Fetching
+            },
+            torrent: None,
+            stages: Vec::new(),
+        });
+        self.url_admission_receipts.push(UrlAdmissionReceipt {
+            protocol_version: 1,
+            request_token: token,
+            submission_sha256,
+            job_id: id.0,
+            generation: format!("{instance}-torrent-{}", id.0),
+            runner_instance_id: instance.into(),
+            terminal_outcome: None,
+            outcome: "fetching".into(),
+            failure_stage: None,
+            failure_cause: None,
+            custody_state: "runner_owned".into(),
+            keep_source_on_failure: false,
+            source_cleanup_status: None,
+            publication_path: None,
+            source_artifact_id: None,
+            source_generation: None,
+        });
+        Ok(ManagedTorrentReservation {
+            id,
+            created: true,
+            pending: true,
+            source_ready: false,
+        })
+    }
+
+    pub(crate) fn commit_managed_torrent_admission(
+        &mut self,
+        id: JobId,
+        commit: TorrentAdmissionCommit,
+        submission_sha256: String,
+        _instance: &str,
+    ) -> Result<crate::torrent_acquisitions::ManagedTorrentAdmission, crate::EngineError> {
+        use crate::torrent_acquisitions::{
+            ManagedTorrentAdmission, DONOR_PARAM, INFO_HASH_PARAM, OWNED_SEED_PARAM,
+        };
+        let token = crate::torrent_acquisitions::managed_token(&commit.params)?
+            .ok_or_else(|| {
+                crate::EngineError::RequestConflict(
+                    "managed torrent request has no Delivery intent".into(),
+                )
+            })?
+            .to_string();
+        if let Some(receipt) = self
+            .url_admission_receipts
+            .iter()
+            .find(|receipt| receipt.request_token == token)
+        {
+            if receipt.submission_sha256 != submission_sha256 {
+                return Err(crate::EngineError::RequestConflict(
+                    "transfer token was already used for a different submission".into(),
+                ));
+            }
+            if receipt.job_id != id.0 {
+                return Err(crate::EngineError::RequestConflict(
+                    "native reservation identity changed".into(),
+                ));
+            }
+        } else {
+            return Err(crate::EngineError::RequestConflict(
+                "native reservation missing".into(),
+            ));
+        }
+        if !self
+            .pending_admissions
+            .iter()
+            .any(|pending| pending.job_id == id)
+        {
+            let donor_id = self
+                .job(id)
+                .and_then(crate::torrent_acquisitions::donor)
+                .ok_or_else(|| {
+                    crate::EngineError::RequestConflict(
+                        "native acquisition is terminal or retired".into(),
+                    )
+                })?;
+            return Ok(ManagedTorrentAdmission {
+                id,
+                donor_id,
+                created: false,
+                seed_created: false,
+            });
+        }
+        let original = self
+            .job(id)
+            .filter(|job| crate::torrent_acquisitions::is_acquisition(job))
+            .cloned()
+            .ok_or_else(|| {
+                crate::EngineError::RequestConflict("native acquisition disappeared".into())
+            })?;
+        let TorrentAdmissionCommit {
+            name,
+            category,
+            priority,
+            paused: _,
+            params: _,
+            mut record,
+        } = commit;
+        let existing = self
+            .jobs
+            .iter()
+            .find(|job| {
+                job.torrent.as_ref().is_some_and(|torrent| {
+                    torrent.info_hash_v1 == record.info_hash_v1 && torrent.removal_intent.is_none()
+                }) && !matches!(job.status, JobStatus::Deleted | JobStatus::Failed)
+            })
+            .map(|job| job.id);
+        let seed_created = existing.is_none();
+        let donor_id = match existing {
+            Some(id) => id,
+            None => {
+                self.next_job_id = self.next_job_id.checked_add(1).ok_or_else(|| {
+                    crate::EngineError::RequestConflict("job identifiers exhausted".into())
+                })?;
+                let donor_id = JobId(self.next_job_id);
+                record.payload_root = record
+                    .payload_root
+                    .join(format!(".runner-seed-{}", donor_id.0));
+                self.jobs.push(Job {
+                    id: donor_id,
+                    kind: JobKind::Torrent,
+                    name: name.clone(),
+                    dir_name: format!("seed-{}", donor_id.0),
+                    name_provisional: false,
+                    delivery_lifecycle: false,
+                    queued_at_unix: unix_now(),
+                    original_name: String::new(),
+                    category: category.clone(),
+                    priority,
+                    dupe: DupeInfo::default(),
+                    params: vec![(OWNED_SEED_PARAM.into(), "1".into())],
+                    files: Vec::new(),
+                    totals: nzbd_types::JobTotals {
+                        size: record.total_bytes,
+                        ..Default::default()
+                    },
+                    status: JobStatus::Queued,
+                    torrent: Some(record.clone()),
+                    stages: Vec::new(),
+                });
+                donor_id
+            }
+        };
+        let mut child = original;
+        child
+            .params
+            .retain(|(key, _)| key != DONOR_PARAM && key != INFO_HASH_PARAM);
+        child
+            .params
+            .push((DONOR_PARAM.into(), donor_id.0.to_string()));
+        child
+            .params
+            .push((INFO_HASH_PARAM.into(), record.info_hash_v1));
+        if child.name_provisional {
+            child.name = name;
+            child.name_provisional = false;
+        }
+        child.totals.size = record.selected_bytes;
+        if !child.held() && child.status != JobStatus::Paused {
+            child.status = JobStatus::Queued;
+        }
+        *self.job_mut(id).unwrap() = child;
+        self.cancel_torrent_admission(id);
+        Ok(ManagedTorrentAdmission {
+            id,
+            donor_id,
+            created: true,
+            seed_created,
+        })
     }
 
     /// Add a parsed NZB as a job. `pause_extra_pars` queues `*.volNNN+MM.par2`

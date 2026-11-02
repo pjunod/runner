@@ -989,16 +989,20 @@ impl TorrentSession {
         bytes: bytes::Bytes,
         options: AddTorrentOptions,
     ) -> Result<TorrentHandle, TorrentError> {
-        let handle = self
+        let response = self
             .inner
-            // Keep rqbit's URL variant outside managed admission. Its stable
-            // HTTP client buffers the response before nzbd can enforce the
-            // metainfo limit and does not expose the proposal's fetch policy.
             .add_torrent(AddTorrent::from_bytes(bytes), Some(options))
             .await
-            .map_err(engine_error)?
-            .into_handle()
-            .ok_or(TorrentError::MissingHandle)?;
+            .map_err(engine_error)?;
+        let handle = match response {
+            AddTorrentResponse::Added(_, handle) => handle,
+            // Never bind a new durable donor/root to a previous session handle.
+            // In particular, do not delete that pre-existing handle on conflict.
+            AddTorrentResponse::AlreadyManaged(_, _) => {
+                return Err(TorrentError::DuplicateEngineIdentity)
+            }
+            _ => return Err(TorrentError::MissingHandle),
+        };
         Ok(TorrentHandle { inner: handle })
     }
 
@@ -1145,6 +1149,10 @@ impl TorrentRegistry {
         metainfo: Vec<u8>,
         config: TorrentAddConfig,
     ) -> Result<EngineIdentity, TorrentError> {
+        let hash = inspect_metainfo(&metainfo, false, true)?.info_hash_v1;
+        if self.by_hash.contains_key(&hash) {
+            return Err(TorrentError::DuplicateEngineIdentity);
+        }
         let handle = self.session.add_metainfo(metainfo, config).await?;
         let identity = EngineIdentity {
             id: handle.id(),

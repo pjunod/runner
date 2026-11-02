@@ -23,6 +23,7 @@ mod hold_release;
 pub mod queue;
 pub mod rate;
 pub mod snapshot;
+pub mod torrent_acquisitions;
 pub mod torrent_runtime;
 pub mod volumes;
 
@@ -812,7 +813,85 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        rx.await.map_err(|_| EngineError::Closed)
+        rx.await.map_err(|_| EngineError::Closed)?
+    }
+
+    pub async fn commit_managed_torrent_admission(
+        &self,
+        job: JobId,
+        name: String,
+        opts: AddOpts,
+        record: nzbd_types::TorrentRecord,
+        submission_sha256: String,
+    ) -> Result<torrent_acquisitions::ManagedTorrentAdmission, EngineError> {
+        validate_external_params(&opts.params)?;
+        torrent_acquisitions::managed_token(&opts.params)?;
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::CommitManagedTorrentAdmission {
+            job,
+            commit: Box::new(crate::queue::TorrentAdmissionCommit {
+                name,
+                category: opts.category,
+                priority: opts.priority,
+                paused: opts.paused,
+                params: with_client(opts.params, opts.client),
+                record,
+            }),
+            submission_sha256,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| EngineError::Closed)?
+    }
+
+    pub async fn start_torrent_acquisition(&self, job: JobId) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::StartTorrentAcquisition { job, reply })
+            .await
+    }
+    pub async fn retry_torrent_acquisition(
+        &self,
+        job: JobId,
+        revision: String,
+        force: bool,
+    ) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::RetryTorrentAcquisition {
+            job,
+            revision,
+            force,
+            reply,
+        })
+        .await
+    }
+    pub async fn complete_torrent_acquisition(
+        &self,
+        job: JobId,
+        donor: JobId,
+        source: nzbd_state::artifacts::Artifact,
+    ) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::CompleteTorrentAcquisition {
+            job,
+            donor,
+            source: Box::new(source),
+            reply,
+        })
+        .await
+    }
+    pub async fn hold_torrent_acquisition(
+        &self,
+        job: JobId,
+        cause: nzbd_types::HoldCause,
+        message: String,
+    ) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::HoldTorrentAcquisition {
+            job,
+            cause,
+            message,
+            reply,
+        })
+        .await
+    }
+    pub fn processing_root(&self) -> &std::path::Path {
+        &self.url_dest_dir
     }
 
     pub async fn cancel_torrent_admission(&self, job: JobId) -> Result<bool, EngineError> {
@@ -1423,6 +1502,21 @@ impl EngineHandle {
         if !self.snapshot().queue_authority && !guard.matches(&self.artifacts(), &record, false) {
             return Ok(Err("a live execution grant is required on this node".into()));
         }
+        if torrent_acquisitions::is_acquisition(&record)
+            && matches!(control.stage.as_str(), "torrent_copy" | "torrent_metadata")
+        {
+            let (reply, result) = oneshot::channel();
+            self.send(QueueCommand::RetryHold {
+                job,
+                revision,
+                by,
+                custody_checked: false,
+                guard,
+                reply,
+            })
+            .await?;
+            return result.await.map_err(|_| EngineError::Closed);
+        }
         let cause = control.hold_cause();
         if cause == nzbd_types::HoldCause::Allocation {
             // Allocation may have no owned payload yet: no capacity probe,
@@ -1631,7 +1725,26 @@ impl EngineHandle {
             .jobs
             .iter()
             .find(|j| j.id == job)
-            .is_some_and(|j| j.kind == nzbd_types::JobKind::Torrent);
+            .is_some_and(|j| j.torrent_role == Some("seed"));
+        let native = self
+            .export_job(job)
+            .await?
+            .filter(torrent_acquisitions::is_acquisition);
+        if native.is_some()
+            && self
+                .artifacts
+                .for_job(job.0)
+                .map_err(|e| EngineError::Lifecycle(e.to_string()))?
+                .is_none()
+        {
+            return self
+                .roundtrip_bool(|reply| QueueCommand::Delete {
+                    job,
+                    delete_files: false,
+                    reply,
+                })
+                .await;
+        }
         if delete_files && !torrent {
             let inventory = self.artifacts.clone();
             let artifact = inventory

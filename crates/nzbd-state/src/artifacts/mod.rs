@@ -1000,6 +1000,8 @@ impl Inventory {
     /// Called once before queue writers start, never from the periodic worker.
     pub fn reconcile_startup(&self, live_jobs: &[u32]) -> Result<()> {
         self.reconcile_deleted_artifacts()?;
+        self.reconcile_torrent_stage_cleanups(&|| Ok(()))?;
+        self.reconcile_torrent_copy_compaction(&|| Ok(()))?;
         self.reconcile_relocations()?;
         self.reconcile_transforms()?;
         let _guard = self.mutation_guard()?;
@@ -2293,6 +2295,8 @@ impl Inventory {
                 tracing::warn!(operation=%key,error=%e,"artifact deletion remains pending");
             }
         }
+        self.reconcile_torrent_stage_cleanups(&|| Ok(()))?;
+        self.reconcile_torrent_copy_compaction(&|| Ok(()))?;
         Ok(())
     }
     pub fn compact(&self) -> Result<usize> {

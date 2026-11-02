@@ -631,6 +631,10 @@ pub struct JobRecord {
     /// NZB so existing consumers retain their historical interpretation.
     #[serde(default = "default_history_job_kind")]
     pub kind: nzbd_types::JobKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torrent_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_donor_job_id: Option<JobId>,
     pub files: Vec<HistoryFile>,
     pub total_articles: u32,
     pub success_articles: u32,
@@ -690,6 +694,8 @@ impl JobRecord {
         };
         JobRecord {
             kind: job.kind,
+            torrent_role: job.torrent_role().map(str::to_string),
+            seed_donor_job_id: job.seed_donor_job_id(),
             files: job
                 .files
                 .iter()

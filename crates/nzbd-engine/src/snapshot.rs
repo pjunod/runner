@@ -93,6 +93,9 @@ pub struct JobSummary {
     pub ratio: f64,
     pub seeding_seconds: u64,
     pub useful_peers: u32,
+    /// A processing-only acquisition never owns a backend handle or seed controls.
+    pub torrent_role: Option<&'static str>,
+    pub seed_donor_job_id: Option<JobId>,
     pub torrent_phase: Option<nzbd_types::TorrentPhase>,
     pub torrent_control_intent: Option<nzbd_types::TorrentControlIntent>,
     pub seed_policy: Option<nzbd_types::SeedPolicy>,
@@ -365,6 +368,8 @@ mod mobile_queue_contract_tests {
                 ratio: serde_json::from_value(input["ratio"].clone()).unwrap(),
                 seeding_seconds: serde_json::from_value(input["seeding_seconds"].clone()).unwrap(),
                 useful_peers: serde_json::from_value(input["useful_peers"].clone()).unwrap(),
+                torrent_role: None,
+                seed_donor_job_id: None,
                 torrent_phase: serde_json::from_value(input["torrent_phase"].clone()).unwrap(),
                 torrent_control_intent: serde_json::from_value(
                     input["torrent_control_intent"].clone(),
