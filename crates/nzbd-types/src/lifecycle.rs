@@ -122,12 +122,10 @@ impl LifecycleLedger {
         }
         for new in &incoming.records {
             if let Some(old) = self.records.iter_mut().find(|old| old.id == new.id) {
-                if old.interval.state != LifecycleIntervalState::Completed
-                    && new.interval.state == LifecycleIntervalState::Completed
-                {
-                    *old = new.clone();
-                } else if old.interval.state == LifecycleIntervalState::Running
-                    && new.interval.state != LifecycleIntervalState::Running
+                if (old.interval.state != LifecycleIntervalState::Completed
+                    && new.interval.state == LifecycleIntervalState::Completed)
+                    || (old.interval.state == LifecycleIntervalState::Running
+                        && new.interval.state != LifecycleIntervalState::Running)
                 {
                     *old = new.clone();
                 }
@@ -258,8 +256,10 @@ mod tests {
     }
     #[test]
     fn malformed_or_unbounded_internal_timing_cannot_be_read_as_evidence() {
-        let mut ledger = LifecycleLedger::default();
-        ledger.version = 2;
+        let ledger = LifecycleLedger {
+            version: 2,
+            ..Default::default()
+        };
         assert!(!ledger.valid());
         let timing = LifecycleTiming {
             version: 1,
