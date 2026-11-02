@@ -20,6 +20,32 @@ pub struct ClusterCopyCleanup {
 }
 
 impl Inventory {
+    /// Grant provenance is separate from cleanup eligibility. Legacy/new
+    /// nonconsumer jobs keep their existing retention policy while a worker
+    /// can persist an exact unowned shadow retry under this owner generation.
+    pub fn cluster_download_authority_source(
+        &self,
+        job: u32,
+    ) -> Result<Option<ClusterArtifactCopy>> {
+        let Some(artifact) = self.for_job(job)? else {
+            return Ok(None);
+        };
+        if !artifact.owned || artifact.terminal() {
+            return Ok(None);
+        }
+        let source = SourceGeneration {
+            artifact: artifact.id,
+            generation: artifact.generation,
+        };
+        Ok(Some(ClusterArtifactCopy {
+            storage_instance_id: self.installation.clone(),
+            publication: source.clone(),
+            source,
+            job_id: job,
+            selected: false,
+        }))
+    }
+
     /// Capture existing custody only. A path supplied by a peer cannot create
     /// inventory ownership or upgrade legacy work into automatic retirement.
     pub fn cluster_artifact_copy(

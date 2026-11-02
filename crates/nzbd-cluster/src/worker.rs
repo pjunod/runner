@@ -110,6 +110,27 @@ pub fn spawn_worker(
             for state in cancelled {state.cancel.cancel();let _=engine.remove_job_silent(state.job).await;}
         });
     }
+    // Recovery probes can touch slow storage. They never occupy heartbeat or
+    // completion lanes, and each release carries current in-memory grant proof.
+    {
+        let engine = engine.clone();
+        let active = active.clone();
+        let cancel = cancel.clone();
+        let interval = cfg.lease_interval.max(std::time::Duration::from_secs(5));
+        tracker.spawn(async move {
+            let mut cursor = 0;
+            let mut passes = 0u64;
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                passes = passes.wrapping_add(1);
+                recover_download_holds(&engine, &active, &mut cursor, passes.is_multiple_of(6))
+                    .await;
+                tokio::select! {_=cancel.cancelled()=>break,_=tokio::time::sleep(interval)=>{}}
+            }
+        });
+    }
     let work_tracker = tracker.clone();
     tracker.spawn(async move {
         loop {
@@ -123,6 +144,119 @@ pub fn spawn_worker(
             tokio::select!{_=cancel.cancelled()=>break,_=tokio::time::sleep(cfg.lease_interval)=>{}}
         }
     });
+}
+
+fn lease_authority(
+    active: &ActiveLeases,
+    lease_id: &str,
+    expected: &LeaseState,
+) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    let active = active.clone();
+    let lease_id = lease_id.to_owned();
+    let expected = expected.clone();
+    Arc::new(move || {
+        active.lock().unwrap().get(&lease_id).is_some_and(|state| {
+            state.job == expected.job
+                && state.kind == expected.kind
+                && state.job_incarnation == expected.job_incarnation
+                && state.job_revision == expected.job_revision
+                && state.control_revision == expected.control_revision
+                && state.token.resource == expected.token.resource
+                && state.token.owner_node_id == expected.token.owner_node_id
+                && state.token.owner_incarnation == expected.token.owner_incarnation
+                && state.token.fence == expected.token.fence
+                && state.token.revision >= expected.token.revision
+                && state.deadline > Instant::now()
+                && !state.cancel.is_cancelled()
+        })
+    })
+}
+async fn recover_download_holds(
+    engine: &EngineHandle,
+    active: &ActiveLeases,
+    cursor: &mut usize,
+    reobserve: bool,
+) {
+    let mut leases: Vec<_> = active
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, state)| state.kind == LeaseKind::Download)
+        .map(|(id, state)| (id.clone(), state.clone()))
+        .collect();
+    leases.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    let count = leases.len();
+    if count == 0 {
+        return;
+    }
+    let start = *cursor % count;
+    leases.rotate_left(start);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    for (offset, (lease_id, state)) in leases.into_iter().enumerate() {
+        let Some(control) = engine
+            .export_job(state.job)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|job| job.control())
+            .filter(|control| {
+                control.lifecycle == "held"
+                    && !control.manual_pause
+                    && control.hold_cause().policy().automatic()
+                    && (control
+                        .next_retry_at_unix
+                        .is_some_and(|deadline| deadline <= now)
+                        || (reobserve
+                            && control.hold_cause().policy()
+                                == nzbd_types::HoldPolicy::ReobserveMount))
+            })
+        else {
+            continue;
+        };
+        *cursor = (start + offset + 1) % count;
+        release_worker_hold(
+            engine,
+            state.job,
+            control,
+            lease_authority(active, &lease_id, &state),
+        )
+        .await;
+        break;
+    }
+}
+
+async fn release_worker_hold(
+    engine: &EngineHandle,
+    job: JobId,
+    control: nzbd_types::JobControl,
+    authority: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> bool {
+    match engine
+        .release_hold_checked(
+            job,
+            control.revision.clone(),
+            nzbd_engine::RetryBy::Recovery,
+            authority.clone(),
+        )
+        .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(reason)) => {
+            if authority() {
+                let _ = engine
+                    .reschedule_hold_checked(job, control.revision, reason, authority)
+                    .await;
+            }
+            false
+        }
+        Err(error) => {
+            tracing::warn!(job=job.0,%error,"worker hold retry remains pending");
+            false
+        }
+    }
 }
 
 fn progress_of(engine: &EngineHandle, job: JobId) -> MirrorStats {
@@ -724,6 +858,58 @@ async fn poll_for_work(
             reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token).await;
             continue;
         }
+        if matches!(grant.kind, LeaseKind::Download | LeaseKind::Post) {
+            let context = nzbd_state::artifacts::WorkerControlContext {
+                lease_id: grant.lease_id.clone(),
+                job_incarnation: grant.job_incarnation.clone(),
+                job_revision: grant.job_revision,
+                control_revision: grant.control_revision,
+                epoch: grant.epoch,
+            };
+            grant
+                .job
+                .params
+                .retain(|(key, _)| key != nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM);
+            grant.job.params.push((
+                nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+                serde_json::to_string(&context).expect("grant context serializes"),
+            ));
+            if grant.kind == LeaseKind::Download
+                && grant
+                    .job
+                    .params
+                    .iter()
+                    .any(|(key, _)| key == crate::delivery::AUTHORITY_COPY_PARAM)
+            {
+                let inventory = engine.artifacts();
+                let incoming = grant.job.clone();
+                match tokio::task::spawn_blocking(move || {
+                    inventory.adopt_worker_retry_for_job(&incoming, &context)
+                })
+                .await
+                {
+                    Ok(Ok(Some(adoption))) => {
+                        grant.job.set_control(&adoption.control);
+                        grant.job.status = JobStatus::Paused;
+                        for (key, value) in adoption.probe_params {
+                            grant.job.params.retain(|(existing, _)| existing != &key);
+                            grant.job.params.push((key, value));
+                        }
+                    }
+                    Ok(Ok(None)) => {}
+                    error => {
+                        tracing::warn!(
+                            job = job_id.0,
+                            ?error,
+                            "delegated retry checkpoint refused"
+                        );
+                        reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
+                            .await;
+                        continue;
+                    }
+                }
+            }
+        }
         match grant.kind {
             LeaseKind::Download => {
                 tracing::info!(job = job_id.0, lease = %grant.lease_id, "download lease received");
@@ -760,7 +946,11 @@ async fn poll_for_work(
                     let active = active.clone();
                     let lease_id = lease_id.clone();
                     let token = original_token.clone();
+                    #[cfg(test)]
+                    let test_node = cfg.node_name.clone();
                     Arc::new(move || {
+                        #[cfg(test)]
+                        crc_tests::checkpoint(&test_node, job_id);
                         active.lock().unwrap().get(&lease_id).is_some_and(|state| {
                             state.job == job_id
                                 && state.job_revision == expected_job
@@ -775,12 +965,12 @@ async fn poll_for_work(
                         })
                     })
                 };
-                if engine
+                let imported = engine
                     .import_job_checked(grant.job, true, false, checkpoint)
-                    .await
-                    .is_err()
-                    || engine.snapshot().disk_low
-                {
+                    .await;
+                #[cfg(test)]
+                crc_tests::record_result(&cfg.node_name, job_id, imported.is_ok());
+                if imported.is_err() || engine.snapshot().disk_low {
                     let removed = {
                         let mut leases = active.lock().unwrap();
                         if leases.get(&lease_id).is_some_and(|state| {
@@ -830,21 +1020,6 @@ async fn poll_for_work(
                     )
                     .await;
                 }
-                grant
-                    .job
-                    .params
-                    .retain(|(key, _)| key != nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM);
-                let context = nzbd_state::artifacts::WorkerControlContext {
-                    lease_id: grant.lease_id.clone(),
-                    job_incarnation: grant.job_incarnation.clone(),
-                    job_revision: grant.job_revision,
-                    control_revision: grant.control_revision,
-                    epoch: grant.epoch,
-                };
-                grant.job.params.push((
-                    nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
-                    serde_json::to_string(&context).expect("worker context serializes"),
-                ));
                 if let Err(error) = prepare_pp_attempt(
                     engine.artifacts(),
                     dest_dir,
@@ -1121,7 +1296,7 @@ fn run_pp_lease(
             // Restored checkpoints keep their original absolute deadline and
             // first blocked time. Heartbeats run independently while waiting.
             if let Some(control)=engine.export_job(job_id).await.ok().flatten().and_then(|job|job.control()).filter(|control|control.lifecycle=="held") {
-                if control.retry_policy!="scheduled_retry" || control.manual_pause {
+                if !control.hold_cause().policy().automatic() || control.manual_pause {
                     tokio::select!{_=initial.cancel.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_secs(1))=>{}}
                     continue;
                 }
@@ -1130,7 +1305,7 @@ fn run_pp_lease(
                     tokio::select!{_=initial.cancel.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_millis(250))=>{}}
                     continue;
                 }
-                if !engine.retry_post_hold(job_id,control.revision).await.unwrap_or(false) {
+                if !release_worker_hold(&engine,job_id,control,lease_authority(&active,&lease_id,&initial)).await {
                     tokio::select!{_=initial.cancel.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_secs(1))=>{}}
                     continue;
                 }
@@ -2332,3 +2507,7 @@ mod tests {
         engine.shutdown().await;
     }
 }
+
+#[cfg(test)]
+#[path = "worker_crc_tests.rs"]
+mod crc_tests;

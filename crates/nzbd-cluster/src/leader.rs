@@ -594,7 +594,6 @@ impl LeaderShared {
     ) -> Option<Grant> {
         let control = self.control.as_ref()?;
         if kind == LeaseKind::Download
-            && job.delivery_lifecycle
             && !job
                 .params
                 .iter()
@@ -603,7 +602,7 @@ impl LeaderShared {
             if let Ok(Some(copy)) = self
                 .engine
                 .artifacts()
-                .cluster_artifact_copy(job.id.0, false)
+                .cluster_download_authority_source(job.id.0)
             {
                 let value = serde_json::to_string(&crate::delivery::AuthoritySourceCopy {
                     owner_node: self.cfg.node_name.clone(),
