@@ -16,7 +16,10 @@ outside compiler caches in the task's durable evidence directory.
 - Curator initially audited at dae7424; PR #76 (990e768) and PR #77 (17eb0f6)
   are preserved through merges 225cfd6 and 4935fab. PR #78 (ecee8fe) shutdown
   ownership is preserved in a916ded. PR #79 (74111769) is preserved in 640f799;
-  its iOS build 33 is retained.
+  its iOS build 33 is retained. PR #80 (2c367c5e) is preserved in 0d2a041:
+  sample handling, settled import retry pacing, exact-byte redundancy,
+  verification read budgeting and per-title publication locks. Both mobile
+  build numbers remain 33; Curator version is now 0.38.8.
 - Lower-model agents implement isolated slices; primary reviews integration.
 - Final Astra adversarial review precedes the full required test gates.
 - Merge only after findings are resolved and required tests/checks pass.
@@ -109,6 +112,20 @@ Host disk exhaustion interrupted construction builds. Source, Git checkpoints,
 stashes and evidence were preserved; only this task's inactive compiler cache
 was reclaimed. Source work and one reduced-debug build resumed after capacity
 recovered. This interruption does not waive final review, coverage or test gates.
+
+The PR #80 semantic merge passed 44 focused acquisition tests and five SQLite
+tests. Primary review checked that per-title publication authority, atomic
+placement provenance and backlog cleanup gates remain intact. These results
+cover the merge, not the complete final candidate.
+
+Cluster automatic-control proof work now runs outside the mutation lock,
+with bounded concurrency and pending owner/error information exposed in GET
+and SSE. Six focused regressions pass, including unrelated controls during a
+blocked proof, different-leader recovery and shutdown registration. The
+frontend presentation is being completed. The cancellation module also passes
+ten focused cases, but live route integration and actual remote-writer joins
+remain unfinished. Native torrent retirement and cross-owner Keep remain
+under construction; final Astra review, full gates and merge are still pending.
 
 ## 4. Durable work and recovery
 
