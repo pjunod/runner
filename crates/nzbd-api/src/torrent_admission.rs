@@ -2761,6 +2761,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paused_managed_seed_stays_attached_with_executor_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (service, engine) = service(&tmp).await;
+        let executor = service.spawn_backend_executor().unwrap();
+        let mut opts = managed_options("paused-executor");
+        opts.paused = true;
+        let accepted = service
+            .admit_raw(swarm_metainfo(b"verified-private-payload", true).0, opts)
+            .await
+            .unwrap();
+        let child = engine.export_job(accepted.id).await.unwrap().unwrap();
+        let donor = child.seed_donor_job_id().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let row = engine.export_job(donor).await.unwrap().unwrap();
+        assert!(!row.held(), "{:?}", row.control());
+        assert_eq!(row.status, nzbd_types::JobStatus::Paused);
+        assert!(service.associations.lock().await.contains_key(&donor));
+        service.shutdown().await;
+        engine.shutdown().await;
+        executor.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn managed_descriptor_survives_child_blob_retirement_until_seed_finalization() {
         let tmp = tempfile::tempdir().unwrap();
         let (service, engine) = service(&tmp).await;

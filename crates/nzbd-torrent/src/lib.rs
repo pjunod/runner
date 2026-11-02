@@ -1168,7 +1168,12 @@ impl TorrentRegistry {
         metainfo: Vec<u8>,
         config: TorrentAddConfig,
     ) -> Result<EngineIdentity, TorrentError> {
-        let hash = inspect_metainfo(&metainfo, false, true)?.info_hash_v1;
+        let hash = inspect_metainfo(
+            &metainfo,
+            self.session.proxy_enabled,
+            self.session.dht_enabled,
+        )?
+        .info_hash_v1;
         if self.by_hash.contains_key(&hash) {
             return Err(TorrentError::DuplicateEngineIdentity);
         }
