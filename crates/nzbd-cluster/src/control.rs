@@ -69,6 +69,8 @@ const CONTROL_SCHEMA: &[&str] = &[
         terminal INTEGER NOT NULL DEFAULT 0,
         updated_at_ms INTEGER NOT NULL
     ) STRICT",
+    "CREATE TRIGGER IF NOT EXISTS coordinator_protocol_insert BEFORE INSERT ON work_leases WHEN NEW.resource='cluster/leader' AND (json_type(NEW.scope_json,'$.lifecycleProtocol') IS NOT 'integer' OR coalesce(json_extract(NEW.scope_json,'$.lifecycleProtocol'),0)<2) BEGIN SELECT RAISE(ABORT,'coordinator requires lifecycleProtocol 2; upgrade this node before claiming authority'); END",
+    "CREATE TRIGGER IF NOT EXISTS coordinator_protocol_update BEFORE UPDATE ON work_leases WHEN NEW.resource='cluster/leader' AND NEW.terminal=0 AND (json_type(NEW.scope_json,'$.lifecycleProtocol') IS NOT 'integer' OR coalesce(json_extract(NEW.scope_json,'$.lifecycleProtocol'),0)<2) BEGIN SELECT RAISE(ABORT,'coordinator requires lifecycleProtocol 2; upgrade this node before renewing authority'); END",
     "CREATE TABLE IF NOT EXISTS request_authority(id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL,incarnation TEXT NOT NULL,fence INTEGER NOT NULL,checked_at_ms INTEGER NOT NULL) STRICT",
     "CREATE TRIGGER IF NOT EXISTS request_authority_validate BEFORE INSERT ON request_authority BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM work_leases WHERE resource='cluster/leader' AND owner_node_id=NEW.owner AND owner_incarnation=NEW.incarnation AND fence=NEW.fence AND expires_at_ms>NEW.checked_at_ms AND terminal=0) THEN RAISE(ABORT,'stale request authority') END; END",
     "CREATE TABLE IF NOT EXISTS command_receipts (
@@ -1811,4 +1813,161 @@ fn expiry(now: i64, ttl: Duration) -> Result<i64, String> {
 
 pub(crate) fn unix_ms_public() -> i64 {
     unix_ms().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod coordinator_protocol_tests {
+    use super::*;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_coordinator_scope_cannot_claim_or_renew_but_current_scope_takes_over() {
+        let temp = tempfile::tempdir().unwrap();
+        let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ClusterConfig {
+            cluster_id: "protocol-test".into(),
+            node_name: "new".into(),
+            shared_dir: temp.path().join("shared"),
+            advertise_url: "http://127.0.0.1:1".into(),
+            secret: "secret".into(),
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            pp_slots: 0,
+            lease_interval: Duration::from_millis(100),
+            takeover_after: Duration::from_secs(1),
+            worker_ttl: Duration::from_secs(2),
+            control_dir: temp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: raft.local_addr().unwrap().to_string(),
+            control_api_bind: api.local_addr().unwrap().to_string(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
+            disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
+        };
+        drop(raft);
+        drop(api);
+        let store = ControlStore::start(&cfg).await.unwrap();
+        for scope in [
+            "{}",
+            r#"{"lifecycleProtocol":1}"#,
+            r#"{"lifecycleProtocol":"2"}"#,
+        ] {
+            let error = store
+                .acquire(
+                    "cluster/leader",
+                    "protocol-test",
+                    1,
+                    "cluster-leader",
+                    "old",
+                    "old-process",
+                    "leader",
+                    scope,
+                    1,
+                    Duration::from_secs(10),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("coordinator requires lifecycleProtocol 2"),
+                "{error}"
+            );
+        }
+        // This exact row models a lease committed before the schema upgrade.
+        store
+            .client
+            .execute("DROP TRIGGER coordinator_protocol_insert", params!())
+            .await
+            .unwrap();
+        store
+            .client
+            .execute("DROP TRIGGER coordinator_protocol_update", params!())
+            .await
+            .unwrap();
+        let LeaseClaim::Acquired(old) = store
+            .acquire(
+                "cluster/leader",
+                "protocol-test",
+                1,
+                "cluster-leader",
+                "old",
+                "old-process",
+                "leader",
+                "{}",
+                1,
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("old fixture lease not committed")
+        };
+        for sql in CONTROL_SCHEMA
+            .iter()
+            .filter(|sql| sql.contains("CREATE TRIGGER IF NOT EXISTS coordinator_protocol_"))
+        {
+            store.client.execute(*sql, params!()).await.unwrap();
+        }
+        assert!(store
+            .renew(&old, Duration::from_secs(10))
+            .await
+            .unwrap_err()
+            .contains("coordinator requires lifecycleProtocol 2"));
+        // Safe relinquishment remains available to the old node; no timer is
+        // mistaken for worker cleanup or destructive-work quiescence.
+        assert!(store.release(&old).await.unwrap());
+        let scope =
+            serde_json::json!({"lifecycleProtocol":crate::proto::LIFECYCLE_PROTOCOL}).to_string();
+        let LeaseClaim::Acquired(current) = store
+            .acquire(
+                "cluster/leader",
+                "protocol-test",
+                1,
+                "cluster-leader",
+                "new",
+                "new-process",
+                "leader",
+                &scope,
+                1,
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("current coordinator did not take over")
+        };
+        assert!(current.fence > old.fence);
+        assert_eq!(current.owner_node_id, "new");
+        let renewed = store
+            .renew(&current, Duration::from_secs(10))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(renewed.revision > current.revision);
+        assert!(
+            matches!(
+                store
+                    .acquire(
+                        "job/ordinary",
+                        "protocol-test",
+                        2,
+                        "ordinary",
+                        "worker",
+                        "worker-process",
+                        "download",
+                        "{}",
+                        1,
+                        Duration::from_secs(10)
+                    )
+                    .await
+                    .unwrap(),
+                LeaseClaim::Acquired(_)
+            ),
+            "only coordinator authority requires the coordinator capability"
+        );
+        store.shutdown().await.unwrap();
+    }
 }

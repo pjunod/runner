@@ -84,9 +84,12 @@ heartbeat may resynchronize only to a newer durable token with the same
 resource, owner process, and fence; this covers a committed renewal whose
 response was lost with the old leader without crossing a takeover. Workers also
 keep a conservative monotonic deadline; failed or hung HTTP never extends it.
-Cluster JSON bodies are capped at 1 MiB and ordinary control calls have a
-3-second connect / 10-second total deadline. Streaming API proxy traffic keeps
-its separate streaming behavior.
+Cluster JSON request and response bodies are capped at 32 MiB; individual
+work descriptors have the tighter limits described below. Ordinary control
+calls have a 3-second connect / 10-second total deadline. Bulk completion and
+exact-copy cleanup are owned background operations: a client timeout does not
+cancel the operation or authorize a duplicate hash/deletion. Streaming API
+proxy traffic keeps its separate streaming behavior.
 
 ## Migration and rollback
 
@@ -101,6 +104,19 @@ The first start of the new control plane is a stopped-cluster conversion:
 4. Concurrent retries for the same cluster resolve idempotently. After the
    marker commits, later queue/history changes do not create another migration;
    a different `cluster_id` is rejected.
+
+Coordinator authority requires lifecycle protocol 2 in the replicated
+`cluster/leader` lease scope. The database rejects a missing, nonnumeric or
+older capability on both claim and renewal, including a lease committed by an
+older binary before the upgrade. Safe relinquishment remains available. Job
+execution leases keep their own worker admission checks; a coordinator
+capability never authorizes payload cleanup.
+
+Stop and upgrade every coordinator and worker together. Once the new schema
+is installed, an old coordinator cannot reclaim or renew authority. This is
+an intentional compatibility fence, not a rolling mixed-version mode. Preserve
+the control-store backup and exact owner storage identity; reverting only the
+executable does not undo the schema or pending lifecycle obligations.
 
 Do not run file-election and replicated-control binaries against the same
 state tree concurrently. Rollback means stopping the new cluster and restoring
