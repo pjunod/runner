@@ -424,6 +424,7 @@ pub(crate) enum QueueCommand {
         job: JobId,
         revision: String,
         reason: String,
+        guard: crate::hold_release::HoldReleaseGuard,
         reply: oneshot::Sender<bool>,
     },
     HoldJob {
@@ -2887,9 +2888,10 @@ impl Owner {
                 job,
                 revision,
                 reason,
+                guard,
                 reply,
             } => {
-                let _ = reply.send(self.reschedule_hold(job, &revision, &reason));
+                let _ = reply.send(self.reschedule_hold_proven(job, &revision, &reason, &guard));
             }
             QueueCommand::SchedulePostRetry {
                 job,
@@ -2954,6 +2956,9 @@ impl Owner {
                 reply,
             } => {
                 if self.persistence_fenced
+                    || (by == RetryBy::Recovery
+                        && !guard.checked()
+                        && self.delegated.contains_key(&job))
                     || !self.state.job(job).is_some_and(|current| {
                         guard.matches(&self.artifacts, current, self.persist)
                     })
@@ -3030,6 +3035,9 @@ impl Owner {
                 reply,
             } => {
                 if self.persistence_fenced
+                    || (by == RetryBy::Recovery
+                        && !guard.checked()
+                        && self.delegated.contains_key(&job))
                     || !self.state.job(job).is_some_and(|current| {
                         guard.matches(&self.artifacts, current, self.persist)
                     })
@@ -4530,6 +4538,9 @@ impl Owner {
             .job(job)
             .cloned()
             .ok_or_else(|| "job not found".to_string())?;
+        if by == RetryBy::Recovery && !guard.checked() && self.delegated.contains_key(&job) {
+            return Err("this job is assigned to its worker execution lane".into());
+        }
         if !self.persist && !guard.checked() {
             return Err("this node is not the queue authority".into());
         }
@@ -4633,8 +4644,25 @@ impl Owner {
     /// Push an automatic hold's next attempt out on the same backoff, keeping
     /// the original reason and recording the refusal beside it. The new time
     /// lives in memory even if this save fails; the next snapshot carries it.
+    #[cfg(test)]
     fn reschedule_hold(&mut self, job: JobId, revision: &str, reason: &str) -> bool {
-        if self.persistence_fenced {
+        self.reschedule_hold_proven(job, revision, reason, &Default::default())
+    }
+
+    fn reschedule_hold_proven(
+        &mut self,
+        job: JobId,
+        revision: &str,
+        reason: &str,
+        guard: &crate::hold_release::HoldReleaseGuard,
+    ) -> bool {
+        if self.persistence_fenced
+            || (!guard.checked() && self.delegated.contains_key(&job))
+            || !self
+                .state
+                .job(job)
+                .is_some_and(|current| guard.matches(&self.artifacts, current, self.persist))
+        {
             return false;
         }
         let before = self.state.job(job).cloned();
@@ -10526,6 +10554,149 @@ mod tests {
             JobStatus::PostQueued
         );
         engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn worker_reschedule_refuses_expiry_and_same_revision_regrant() {
+        use nzbd_state::artifacts::{WorkerControlContext, WORKER_CONTROL_CONTEXT_PARAM};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_tmp, mut owner, _adapter) = control_test_owner_with_persistence(false, None);
+        let mut row = pending_job(77);
+        mark_new_lifecycle_cohort(&mut row);
+        let context = WorkerControlContext {
+            lease_id: "live-77".into(),
+            job_incarnation: "incarnation-77".into(),
+            job_revision: 1,
+            control_revision: 1,
+            epoch: 1,
+        };
+        row.params.push((
+            WORKER_CONTROL_CONTEXT_PARAM.into(),
+            serde_json::to_string(&context).unwrap(),
+        ));
+        let path = owner.dest_dir.join(&row.dir_name);
+        owner
+            .artifacts
+            .allocate_for_delivery(77, &owner.dest_dir, &path, true, true)
+            .unwrap();
+        owner.artifacts.bind_worker_context(77, &context).unwrap();
+        owner.state.jobs.push(row);
+        assert!(owner.hold_job(
+            JobId(77),
+            nzbd_types::HoldCause::Capacity,
+            "download_write",
+            "destination full"
+        ));
+        let row = owner.state.job(JobId(77)).unwrap().clone();
+        let source = owner.artifacts.for_job(77).unwrap().unwrap();
+        let live = Arc::new(AtomicBool::new(true));
+        let observed = live.clone();
+        let guard = crate::hold_release::HoldReleaseGuard::prepare(
+            &row,
+            Some(&source),
+            Some(Arc::new(move || observed.load(Ordering::SeqCst))),
+        );
+        let original = row.control().unwrap();
+        assert!(!owner.reschedule_hold(
+            row.id,
+            &original.revision,
+            "unchecked worker cannot reschedule"
+        ));
+        live.store(false, Ordering::SeqCst);
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::RescheduleHold {
+            job: row.id,
+            revision: original.revision.clone(),
+            reason: "expired probe".into(),
+            guard: guard.clone(),
+            reply,
+        });
+        assert!(!result.await.unwrap());
+        live.store(true, Ordering::SeqCst);
+        let mut next = context.clone();
+        next.epoch += 1;
+        next.lease_id = "new-live-77".into();
+        owner.artifacts.bind_worker_context(77, &next).unwrap();
+        let current = owner.state.job_mut(row.id).unwrap();
+        current
+            .params
+            .retain(|(key, _)| key != WORKER_CONTROL_CONTEXT_PARAM);
+        current.params.push((
+            WORKER_CONTROL_CONTEXT_PARAM.into(),
+            serde_json::to_string(&next).unwrap(),
+        ));
+        owner
+            .artifacts
+            .checkpoint_worker_control(current, &original.revision)
+            .unwrap();
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::RescheduleHold {
+            job: row.id,
+            revision: original.revision.clone(),
+            reason: "late old probe".into(),
+            guard,
+            reply,
+        });
+        assert!(
+            !result.await.unwrap(),
+            "new lease retained the same control revision but replaced its authority"
+        );
+        assert_eq!(
+            owner
+                .state
+                .job(row.id)
+                .unwrap()
+                .control()
+                .unwrap()
+                .retry_attempt,
+            original.retry_attempt
+        );
+        let current = owner.state.job(row.id).unwrap().clone();
+        let guard = crate::hold_release::HoldReleaseGuard::prepare(
+            &current,
+            Some(&source),
+            Some(Arc::new(|| true)),
+        );
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::RescheduleHold {
+            job: row.id,
+            revision: original.revision.clone(),
+            reason: "current probe still blocked".into(),
+            guard,
+            reply,
+        });
+        assert!(result.await.unwrap());
+        let durable = owner
+            .artifacts
+            .worker_control_metadata(77, &next)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable.control.retry_attempt,
+            original.retry_attempt.saturating_add(1)
+        );
+        assert_ne!(durable.control.revision, original.revision);
+        assert_eq!(
+            durable.control.blocked_since_unix,
+            original.blocked_since_unix
+        );
+        // A recovery pass that started before delegation also refuses at
+        // actor apply, even after the engine became persistent authority.
+        owner.persist = true;
+        owner.delegated.insert(row.id, "new-worker".into());
+        let mut held = owner.state.job(row.id).unwrap().control().unwrap();
+        held.next_retry_at_unix = Some(0);
+        owner.state.job_mut(row.id).unwrap().set_control(&held);
+        assert!(!owner.reschedule_hold(row.id, &held.revision, "late authority pass"));
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::ReleaseResourceHold {
+            job: row.id,
+            revision: held.revision,
+            by: RetryBy::Recovery,
+            guard: Default::default(),
+            reply,
+        });
+        assert!(!result.await.unwrap());
     }
 
     #[tokio::test]

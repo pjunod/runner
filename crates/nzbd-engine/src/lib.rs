@@ -1567,10 +1567,44 @@ impl EngineHandle {
         revision: String,
         reason: String,
     ) -> Result<bool, EngineError> {
+        self.reschedule_hold_prepared(job, revision, reason, None)
+            .await
+    }
+
+    pub async fn reschedule_hold_checked(
+        &self,
+        job: JobId,
+        revision: String,
+        reason: String,
+        authority: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<bool, EngineError> {
+        self.reschedule_hold_prepared(job, revision, reason, Some(authority))
+            .await
+    }
+
+    async fn reschedule_hold_prepared(
+        &self,
+        job: JobId,
+        revision: String,
+        reason: String,
+        authority: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> Result<bool, EngineError> {
+        if authority.as_ref().is_some_and(|check| !check()) {
+            return Ok(false);
+        }
+        let Some(record) = self.export_job(job).await? else {
+            return Ok(false);
+        };
+        let source = self
+            .artifacts()
+            .for_job(job.0)
+            .map_err(|error| EngineError::Lifecycle(error.to_string()))?;
+        let guard = hold_release::HoldReleaseGuard::prepare(&record, source.as_ref(), authority);
         self.roundtrip_bool(|reply| QueueCommand::RescheduleHold {
             job,
             revision,
             reason,
+            guard,
             reply,
         })
         .await
