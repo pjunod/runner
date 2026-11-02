@@ -1005,7 +1005,7 @@ impl TorrentSession {
             // Never bind a new durable donor/root to a previous session handle.
             // In particular, do not delete that pre-existing handle on conflict.
             AddTorrentResponse::AlreadyManaged(_, _) => {
-                return Err(TorrentError::DuplicateEngineIdentity)
+                return Err(TorrentError::DuplicateEngineIdentity);
             }
             _ => return Err(TorrentError::MissingHandle),
         };
@@ -1054,12 +1054,15 @@ pub struct MetainfoDescriptor {
     pub total_bytes: u64,
 }
 
+pub type SelectedPayloadReader<'a> =
+    dyn Fn(&Path, u64, &mut [u8]) -> std::io::Result<()> + Send + Sync + 'a;
+
 /// Validate current selected payload bytes with the backend's existing piece
 /// verifier, using a read-only caller snapshot and bounded cancellation points.
 pub fn verify_selected_payload(
     metainfo: &[u8],
     selected: &[PathBuf],
-    read: &(dyn Fn(&Path, u64, &mut [u8]) -> std::io::Result<()> + Send + Sync),
+    read: &SelectedPayloadReader<'_>,
     checkpoint: &(dyn Fn() -> std::io::Result<()> + Send + Sync),
 ) -> Result<(), TorrentError> {
     validate_metainfo_admission(metainfo, false, false)?;

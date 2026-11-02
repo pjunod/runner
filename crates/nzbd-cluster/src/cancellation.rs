@@ -1,7 +1,7 @@
 //! Exact, replicated disposition of a sealed result rejected after removal.
 //! A timeout, expired lease or peer-supplied path creates no byte authority.
 use crate::control::ControlStore;
-use hiqlite::{Row, macros::params};
+use hiqlite::{macros::params, Row};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

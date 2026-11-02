@@ -1886,7 +1886,7 @@ fn salvage_failed_delivery(
                     Some(failure_stage),
                     Some(failure_cause),
                     job_keeps_failed_source(job),
-                    delivery_stage_snapshot(&inventory, job),
+                    delivery_stage_snapshot(inventory, job),
                     nzbd_engine::frozen_lifecycle_timing(job),
                 )
                 .map_err(|error| error.to_string())?,

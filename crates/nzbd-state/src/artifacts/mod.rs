@@ -4,7 +4,7 @@
 //! Nothing in a media payload is a marker or grants permission to remove it.
 mod cluster;
 mod cluster_keep;
-pub use cluster::{ClusterArtifactCopy, ClusterCopyCleanup, remove_cluster_generation_copy};
+pub use cluster::{remove_cluster_generation_copy, ClusterArtifactCopy, ClusterCopyCleanup};
 pub use cluster_keep::{ClusterFailureKeepStatus, ClusterFailureKeepTarget};
 pub(crate) mod fs;
 mod policy;
@@ -13,7 +13,7 @@ pub use policy::{RetentionChange, RetentionPreview};
 mod delivery;
 mod materialization;
 pub use materialization::{
-    ExternalGeneration, ExternalGenerationFile, external_generation_identity,
+    external_generation_identity, ExternalGeneration, ExternalGenerationFile,
 };
 mod recovery;
 mod relocation;
@@ -30,14 +30,16 @@ mod transforms;
 mod url_resolutions;
 mod worker_controls;
 mod worker_stops;
-pub use worker_stops::{WorkerStopRequest,WorkerStopTicket,WorkerStoppedReceipt,same_worker_operation};
 pub use url_resolutions::{
-    UrlFileReservation, UrlResolutionFault, UrlResolutionRecord, UrlResolutionStore,
-    UrlStorageRetry, url_source_identity, url_storage_retry_deadline,
+    url_source_identity, url_storage_retry_deadline, UrlFileReservation, UrlResolutionFault,
+    UrlResolutionRecord, UrlResolutionStore, UrlStorageRetry,
+};
+pub use worker_stops::{
+    same_worker_operation, WorkerStopRequest, WorkerStopTicket, WorkerStoppedReceipt,
 };
 mod workspace_lifecycle;
 pub use recovery::{Receipt, ReceiptFile, Recovery, RecoveryFile};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -48,8 +50,8 @@ use std::{
 };
 pub use transforms::{CustodyEvidence, Workspace};
 pub use worker_controls::{
-    WORKER_CONTROL_CONTEXT_PARAM, WorkerCompletionProof, WorkerControlCheckpoint,
-    WorkerControlContext, WorkerRetryAdoption,
+    WorkerCompletionProof, WorkerControlCheckpoint, WorkerControlContext, WorkerRetryAdoption,
+    WORKER_CONTROL_CONTEXT_PARAM,
 };
 pub use workspace_lifecycle::{
     AttemptUse, FinalizationProof, SourceGeneration, StagedCompletion, WorkspaceAssessment,
@@ -357,7 +359,7 @@ pub struct Inventory {
     workspace_uses: Mutex<std::collections::HashMap<(String, String), usize>>,
     workspace_cursor: Mutex<String>,
     _process_lock: File,
-    worker_session:String,
+    worker_session: String,
     closed: std::sync::atomic::AtomicBool,
     state_dir: PathBuf,
     pub installation: String,
@@ -751,7 +753,7 @@ impl Inventory {
             )?;
         }
         fs::sync_directory(&fs::open_dir(state_dir)?)?;
-        let worker_session=id(&db)?;
+        let worker_session = id(&db)?;
         Ok(Self {
             db: Mutex::new(db),
             allocation_uses: Mutex::new(std::collections::HashSet::new()),
@@ -2949,12 +2951,11 @@ mod identity_preflight_tests {
         if shm.try_exists().unwrap() {
             std::fs::remove_file(shm).unwrap();
         }
-        assert!(
-            tmp.path()
-                .join("artifacts.sqlite-wal")
-                .try_exists()
-                .unwrap()
-        );
+        assert!(tmp
+            .path()
+            .join("artifacts.sqlite-wal")
+            .try_exists()
+            .unwrap());
         let before = contents(tmp.path());
         Inventory::validate_expected(tmp.path(), Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")).unwrap();
         assert_eq!(

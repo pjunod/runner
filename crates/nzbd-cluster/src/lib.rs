@@ -28,22 +28,22 @@ mod source_facts;
 pub mod worker;
 
 use axum::routing::get;
-use axum::{Json, Router, middleware, response::IntoResponse};
+use axum::{middleware, response::IntoResponse, Json, Router};
 use control::ControlStore;
-use election::{ElectionCfg, LeaderView, persist_guard, spawn_election, spawn_replicated_election};
+use election::{persist_guard, spawn_election, spawn_replicated_election, ElectionCfg, LeaderView};
 use http::ClusterClient;
 use layout::SharedLayout;
-use leader::{LeaderDurability, LeaderShared, spawn_leader_task};
+use leader::{spawn_leader_task, LeaderDurability, LeaderShared};
 use nzbd_engine::{Engine, EngineConfig, EngineHandle, Tuning};
 use nzbd_types::ServerDef;
-use proxy::{ProxyState, proxy_to_leader};
+use proxy::{proxy_to_leader, ProxyState};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use worker::{ActiveLeases, spawn_worker};
+use worker::{spawn_worker, ActiveLeases};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterError {

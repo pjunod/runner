@@ -1,5 +1,5 @@
 //! Descriptor-anchored exclusive publication shared by PP and writers.
-use crate::artifacts::{Error, Result, fs};
+use crate::artifacts::{fs, Error, Result};
 use std::fs::File;
 #[cfg(unix)]
 use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};

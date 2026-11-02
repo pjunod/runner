@@ -20,9 +20,9 @@ use nzbd_types::{JobId, JobStatus, ServerDef};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -1249,7 +1249,7 @@ async fn grant_post_candidate(
                 &req.owner_incarnation,
                 LeaseKind::Post,
                 job,
-                poll_scope(&req, serde_json::json!({"whole_job": true})),
+                poll_scope(req, serde_json::json!({"whole_job": true})),
             )
             .await
         {
@@ -2151,6 +2151,106 @@ fn cluster_publication_name(original: &str, result_id: &str, lifecycle: bool) ->
     } else {
         original.to_owned()
     }
+}
+
+pub fn spawn_leader_task(
+    shared: Arc<LeaderShared>,
+    cancel: CancellationToken,
+    tracker: &TaskTracker,
+) {
+    tracker.spawn(async move {
+        let mut was_leader = false;
+        let mut authority_ready = false;
+        loop {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let is_leader = shared.is_leader();
+            if is_leader && authority_ready && !shared.authority_ready(){authority_ready=false;}
+            if is_leader && !was_leader {
+                // Taking office: discard leases inherited from the old view.
+                // New leases arrive via worker heartbeats or fresh grants.
+                shared.authority_ready.store(false, Ordering::Release);
+                shared.leases.lock().unwrap().clear();
+                shared.restore_budget_state().await;
+            }
+            if is_leader && !authority_ready {
+                // Retry a refused adoption while this node remains leader.
+                // The engine leaves both local and shared state unchanged on
+                // refusal, so an operator can repair the snapshot in place
+                // without restarting the daemon or forcing an election flap.
+                match shared.engine.adopt_authority().await {
+                    Ok(()) => {
+                        // Preserve pending actor transitions before replacing the local projection.
+                        let _serial = shared.mutation_serial.lock().await;
+                        if let Err(error)=crate::control_recovery::reconcile(&shared).await {tracing::error!(%error,"automatic control adoption incomplete");continue;}
+                        if let Err(error)=crate::admissions::initialize(&shared).await {tracing::error!(%error,"admission authority adoption incomplete");tokio::time::sleep(shared.cfg.lease_interval).await;continue;}
+                        let replicated = match &shared.control {
+                            Some(_) => crate::control_recovery::projection(&shared).await.map(|jobs|jobs.into_iter().map(|job|(job,0,String::new())).collect::<Vec<_>>()),
+                            None => Err("replicated control unavailable".into()),
+                        };
+                        match replicated {
+                            Ok(rows) => {
+                                let jobs = rows.into_iter().map(|(job, _, _)| job).collect();
+                                match shared.engine.adopt_replicated_authority(jobs).await {
+                                    Ok(()) => {
+                                        if let Err(error)=crate::admissions::adopt(&shared).await {tracing::error!(%error,"admission catalog projection incomplete");continue;}
+                                        if let Err(error) = shared.engine.resume_url_fetches().await {
+                                            tracing::warn!(%error, "durable URL fetches could not resume");
+                                        }
+                                        match recover_selected_publications(&shared).await {
+                                            Ok(()) => {
+                                                authority_ready = true;
+                                                shared
+                                                    .authority_ready
+                                                    .store(true, Ordering::Release);
+                                                tracing::info!(epoch = shared.epoch(), "leader task active");
+                                            }
+                                            Err(error) => {
+                                                authority_ready = false;
+                                                tracing::error!(%error, "selected generation recovery is incomplete");
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        authority_ready = false;
+                                        tracing::error!(%error, "replicated queue projection failed");
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                authority_ready = false;
+                                tracing::error!(%error, "replicated queue authority unavailable");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        authority_ready = false;
+                        tracing::error!(
+                            epoch = shared.epoch(),
+                            error = %error,
+                            "leader scheduling disabled because queue authority adoption failed"
+                        );
+                    }
+                }
+            } else if !is_leader {
+                shared.control_proofs.invalidate();
+                authority_ready = false;
+                shared.authority_ready.store(false, Ordering::Release);
+            }
+            was_leader = is_leader;
+
+            if is_leader && authority_ready {
+                sweep_expired(&shared).await;
+                schedule(&shared).await;
+            }
+
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(shared.cfg.lease_interval) => {}
+            }
+        }
+    });
 }
 
 async fn recover_selected_publications(s: &LeaderShared) -> Result<(), String> {
@@ -3790,12 +3890,10 @@ mod tests {
             stages: Vec::new(),
         };
         engine.import_job(job, false, false).await.unwrap();
-        assert!(
-            engine
-                .set_delegated(JobId(91), Some("worker".into()))
-                .await
-                .unwrap()
-        );
+        assert!(engine
+            .set_delegated(JobId(91), Some("worker".into()))
+            .await
+            .unwrap());
 
         let (_view_tx, view) = watch::channel(LeaderView {
             record: Some(LeaderRecord {
@@ -3984,13 +4082,11 @@ mod tests {
                 .is_none(),
             "stale export cannot borrow the newer name/Keep revision"
         );
-        assert!(
-            control
-                .current_lease("work/job/91/download")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(control
+            .current_lease("work/job/91/download")
+            .await
+            .unwrap()
+            .is_none());
         shared.restore_control_projection().await.unwrap();
         let current = runtime.engine.export_job(JobId(91)).await.unwrap().unwrap();
         let gate = Arc::new(VerificationGate {
@@ -4029,13 +4125,11 @@ mod tests {
             attempt.await.unwrap().is_none(),
             "pause committed after compare must defeat lease insertion CAS"
         );
-        assert!(
-            control
-                .current_lease("work/job/91/download")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(control
+            .current_lease("work/job/91/download")
+            .await
+            .unwrap()
+            .is_none());
         *shared.grant_gate.lock().unwrap() = None;
         current_job_resume(control, shared, &current).await;
         let current = runtime.engine.export_job(JobId(91)).await.unwrap().unwrap();
@@ -4050,13 +4144,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(grant.job.name, "renamed by operator");
-        assert!(
-            grant
-                .job
-                .params
-                .iter()
-                .any(|(key, value)| key == "Failure:KeepOnFailure" && value == "true")
-        );
+        assert!(grant
+            .job
+            .params
+            .iter()
+            .any(|(key, value)| key == "Failure:KeepOnFailure" && value == "true"));
         assert_eq!(
             grant.job_revision,
             control.job_identity(91).await.unwrap().unwrap().1
@@ -4177,44 +4269,36 @@ mod tests {
         let base = runtime.engine.export_job(JobId(92)).await.unwrap().unwrap();
         control.commit_job_delta(&[(92, Some(base))]).await.unwrap();
         crate::source_facts::reconcile(shared).await.unwrap();
-        assert!(
-            runtime
-                .engine
-                .hold_job(
-                    JobId(92),
-                    nzbd_types::HoldCause::Allocation,
-                    "download",
-                    "allocation temporarily unavailable"
-                )
-                .await
-                .unwrap()
-        );
+        assert!(runtime
+            .engine
+            .hold_job(
+                JobId(92),
+                nzbd_types::HoldCause::Allocation,
+                "download",
+                "allocation temporarily unavailable"
+            )
+            .await
+            .unwrap());
         let held = runtime.engine.export_job(JobId(92)).await.unwrap().unwrap();
         let marker = nzbd_engine::automatic_control::transition(&held)
             .expect("real actor hold has provenance");
         settle_automatic_control(shared, JobId(92)).await;
         let (durable, revision, _) = control.current_job_intent(92).await.unwrap().unwrap();
         assert_eq!(durable.control().as_ref(), Some(&marker.result_control));
-        assert!(
-            !durable
-                .params
-                .iter()
-                .any(|(key, _)| key == nzbd_engine::automatic_control::AUTOMATIC_CONTROL_PARAM)
-        );
-        assert!(
-            nzbd_engine::automatic_control::transition(
-                &runtime.engine.export_job(JobId(92)).await.unwrap().unwrap()
-            )
-            .is_none()
-        );
+        assert!(!durable
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_engine::automatic_control::AUTOMATIC_CONTROL_PARAM));
+        assert!(nzbd_engine::automatic_control::transition(
+            &runtime.engine.export_job(JobId(92)).await.unwrap().unwrap()
+        )
+        .is_none());
         // Simulate a lost local ACK by restoring its exact persisted marker.
         runtime.engine.import_job(held, false, false).await.unwrap();
-        assert!(
-            nzbd_engine::automatic_control::transition(
-                &runtime.engine.export_job(JobId(92)).await.unwrap().unwrap()
-            )
-            .is_some()
-        );
+        assert!(nzbd_engine::automatic_control::transition(
+            &runtime.engine.export_job(JobId(92)).await.unwrap().unwrap()
+        )
+        .is_some());
         settle_automatic_control(shared, JobId(92)).await;
         assert_eq!(
             control.current_job_intent(92).await.unwrap().unwrap().1,
@@ -4362,18 +4446,16 @@ mod tests {
             tokio::sync::Semaphore::new(0),
         ));
         *shared.control_proofs.gate.lock().unwrap() = Some(gate.clone());
-        assert!(
-            runtime
-                .engine
-                .hold_job(
-                    JobId(92),
-                    nzbd_types::HoldCause::Allocation,
-                    "download",
-                    "source proof delayed"
-                )
-                .await
-                .unwrap()
-        );
+        assert!(runtime
+            .engine
+            .hold_job(
+                JobId(92),
+                nzbd_types::HoldCause::Allocation,
+                "download",
+                "source proof delayed"
+            )
+            .await
+            .unwrap());
         crate::control_recovery::reconcile(shared).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), gate.0.acquire())
             .await
@@ -4425,12 +4507,10 @@ mod tests {
             .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{job}/{action}");
             if job == 93 && action == "pause" {
-                assert!(
-                    nzbd_engine::automatic_control::transition(
-                        &runtime.engine.export_job(JobId(92)).await.unwrap().unwrap()
-                    )
-                    .is_some()
-                );
+                assert!(nzbd_engine::automatic_control::transition(
+                    &runtime.engine.export_job(JobId(92)).await.unwrap().unwrap()
+                )
+                .is_some());
                 assert_eq!(
                     control
                         .current_job_intent(93)
@@ -4443,14 +4523,12 @@ mod tests {
                 );
             }
         }
-        assert!(
-            runtime
-                .engine
-                .export_job(JobId(92))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(runtime
+            .engine
+            .export_job(JobId(92))
+            .await
+            .unwrap()
+            .is_none());
         assert!(control.current_job_intent(92).await.unwrap().is_none());
         assert!(
             source.path.exists(),
@@ -4459,13 +4537,11 @@ mod tests {
         crate::control_recovery::reconcile(shared).await.unwrap();
         gate.1.add_permits(1);
         tokio::task::yield_now().await;
-        assert!(
-            shared
-                .control_proofs
-                .snapshot()
-                .iter()
-                .all(|value| value["jobId"] != 92)
-        );
+        assert!(shared
+            .control_proofs
+            .snapshot()
+            .iter()
+            .all(|value| value["jobId"] != 92));
         assert!(
             runtime
                 .engine
@@ -4517,9 +4593,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             lanes,
-            vec![
-                true, false, true, false, true, false, true, false, true, false
-            ]
+            vec![true, false, true, false, true, false, true, false, true, false]
         );
         assert!(post_lane_first(&mut turns, "independent-worker"));
     }

@@ -202,7 +202,7 @@ impl Inventory {
             desired
                 .map(|(_, keep)| keep)
                 .or(old)
-                .unwrap_or_else(|| match target {
+                .unwrap_or(match target {
                     ClusterFailureKeepTarget::Sealed { initial_keep, .. } => *initial_keep,
                     _ => false,
                 })

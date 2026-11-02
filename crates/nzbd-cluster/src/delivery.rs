@@ -1,10 +1,10 @@
 //! Cluster-visible Delivery receipts. Payload authority is the committed
 //! publication receipt; mutable per-copy cleanup never changes its identity.
 use crate::control::ControlStore;
-use hiqlite::{Row, macros::params};
+use hiqlite::{macros::params, Row};
 use nzbd_state::artifacts::{ClusterArtifactCopy, Delivery};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 pub(crate) const AUTHORITY_COPY_PARAM: &str = "*Cluster:AuthoritySourceCopy";
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -464,16 +464,14 @@ pub(crate) fn discovery_value(record: &ClusterDelivery) -> Value {
     } else {
         serde_json::to_value(&record.delivery).unwrap_or(Value::Null)
     };
-    value["sourceCopies"] = json!(
-        record
-            .copies
-            .iter()
-            .map(|copy| json!({
-                "id":copy.id,"ownerNode":copy.owner_node,"status":copy.status,
-                "error":copy.error,"attempts":copy.attempts,"nextRetryAt":copy.next_retry_at
-            }))
-            .collect::<Vec<_>>()
-    );
+    value["sourceCopies"] = json!(record
+        .copies
+        .iter()
+        .map(|copy| json!({
+            "id":copy.id,"ownerNode":copy.owner_node,"status":copy.status,
+            "error":copy.error,"attempts":copy.attempts,"nextRetryAt":copy.next_retry_at
+        }))
+        .collect::<Vec<_>>());
     if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > 8 * 1024 * 1024) {
         discovery_stub(
             record.delivery.sequence,
@@ -1516,27 +1514,23 @@ mod tests {
             60000
         );
         let escaped = params!("\n".repeat(33 * 1024 * 1024));
-        assert!(
-            bounded_statement(
-                "INSERT INTO cluster_delivery_meta(key,value) VALUES('oversize',?1)",
-                &escaped
-            )
-            .unwrap_err()
-            .contains("64 MiB")
-        );
+        assert!(bounded_statement(
+            "INSERT INTO cluster_delivery_meta(key,value) VALUES('oversize',?1)",
+            &escaped
+        )
+        .unwrap_err()
+        .contains("64 MiB"));
         let mut oversized = store
             .cluster_delivery("old-delivery")
             .await
             .unwrap()
             .unwrap();
         oversized.delivery.failure_cause = Some("x".repeat(crate::proto::MAX_RPC_BYTES));
-        assert!(
-            store
-                .update_cluster_delivery(&oversized)
-                .await
-                .unwrap_err()
-                .contains("32 MiB")
-        );
+        assert!(store
+            .update_cluster_delivery(&oversized)
+            .await
+            .unwrap_err()
+            .contains("32 MiB"));
         assert_eq!(
             store
                 .cluster_delivery("old-delivery")
@@ -1677,37 +1671,31 @@ mod tests {
         let mut orphan = admission.clone();
         orphan.request_token = "uncommitted-local-only".into();
         fresh.name = "stale request must not win".into();
-        assert!(
-            store
-                .commit_job_delta_guarded(
-                    &[(5000, Some(fresh.clone()))],
-                    &stale,
-                    std::slice::from_ref(&orphan),
-                    None
-                )
-                .await
-                .is_err()
-        );
-        assert!(
-            store
-                .admission(&orphan.request_token)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(store
+            .commit_job_delta_guarded(
+                &[(5000, Some(fresh.clone()))],
+                &stale,
+                std::slice::from_ref(&orphan),
+                None
+            )
+            .await
+            .is_err());
+        assert!(store
+            .admission(&orphan.request_token)
+            .await
+            .unwrap()
+            .is_none());
         // Absence in the caller's pre-request fence means INSERT-only, even
         // when a later owner has since occupied this same integer ID.
-        assert!(
-            store
-                .commit_job_delta_guarded(
-                    &[(5000, Some(fresh))],
-                    &std::collections::HashMap::new(),
-                    std::slice::from_ref(&orphan),
-                    None
-                )
-                .await
-                .is_err()
-        );
+        assert!(store
+            .commit_job_delta_guarded(
+                &[(5000, Some(fresh))],
+                &std::collections::HashMap::new(),
+                std::slice::from_ref(&orphan),
+                None
+            )
+            .await
+            .is_err());
         let (jobs, _) = store.highwater().await.unwrap();
         assert!(jobs >= 5000);
         let mut resolved = origin.clone();
@@ -1747,13 +1735,11 @@ mod tests {
             &runtime.leader_shared.layout.state_dir(),
         )
         .unwrap();
-        assert!(
-            reopened
-                .pending(8)
-                .unwrap()
-                .iter()
-                .any(|row| row.resolution_id == prepared.resolution_id)
-        );
+        assert!(reopened
+            .pending(8)
+            .unwrap()
+            .iter()
+            .any(|row| row.resolution_id == prepared.resolution_id));
         // Crash boundary: replicated commit won, old process died before ACK.
         assert!(store.commit_url_outbox(&prepared).await.unwrap());
         drop(serial);
@@ -1784,11 +1770,9 @@ mod tests {
         assert_eq!(selected.dir_name, "user-dir");
         assert_eq!(selected.category, None);
         assert_eq!(selected.priority, 9);
-        assert!(
-            selected
-                .params
-                .contains(&("*Runner:KeepOnFailure".into(), "1".into()))
-        );
+        assert!(selected
+            .params
+            .contains(&("*Runner:KeepOnFailure".into(), "1".into())));
         assert_eq!(selected.status, nzbd_types::JobStatus::Failed);
         let mut legacy = record(&instance, "accepted-local").delivery;
         legacy.sequence = 41;
@@ -1815,11 +1799,9 @@ mod tests {
             Some("41")
         );
         let (pending, _) = store.cluster_discovery_page(0, 100, false).await.unwrap();
-        assert!(
-            !pending
-                .iter()
-                .any(|row| row["deliveryId"] == "accepted-local")
-        );
+        assert!(!pending
+            .iter()
+            .any(|row| row["deliveryId"] == "accepted-local"));
         let (all, _) = store.cluster_discovery_page(0, 100, true).await.unwrap();
         let imported = all
             .iter()
@@ -1963,13 +1945,11 @@ mod tests {
         }
         {
             let _serial = runtime.leader_shared.mutation_serial.lock().await;
-            assert!(
-                runtime
-                    .engine
-                    .adopt_replicated_highwater(6000, 900)
-                    .await
-                    .unwrap()
-            );
+            assert!(runtime
+                .engine
+                .adopt_replicated_highwater(6000, 900)
+                .await
+                .unwrap());
             let before = runtime.leader_shared.engine_projection().await.unwrap();
             let fences = store
                 .job_revision_fences_for(&before.keys().copied().collect::<Vec<_>>())
@@ -2106,15 +2086,13 @@ mod tests {
                     .name,
                 "accepted replacement"
             );
-            assert!(
-                !runtime
-                    .engine
-                    .url_resolution_outbox(100)
-                    .await
-                    .unwrap()
-                    .iter()
-                    .any(|record| record.origin.id == old)
-            );
+            assert!(!runtime
+                .engine
+                .url_resolution_outbox(100)
+                .await
+                .unwrap()
+                .iter()
+                .any(|record| record.origin.id == old));
         }
         let final_record = store
             .commit_delivery(&record(&instance, "valid-after-bad"))
@@ -2142,21 +2120,17 @@ mod tests {
             .collect();
         assert!(by_id["invalid"]["discoveryError"].is_string());
         assert!(by_id["oversized"]["discoveryError"].is_string());
-        assert!(
-            by_id["too-many-copies"]["discoveryError"]
-                .as_str()
-                .unwrap()
-                .contains("64 source copies")
-        );
+        assert!(by_id["too-many-copies"]["discoveryError"]
+            .as_str()
+            .unwrap()
+            .contains("64 source copies"));
         assert!(
             by_id["private-proof"].get("discoveryError").is_none(),
             "private deletion proof bytes cannot reject a small public envelope"
         );
-        assert!(
-            by_id["private-proof"]["sourceCopies"][0]
-                .get("deletionFiles")
-                .is_none()
-        );
+        assert!(by_id["private-proof"]["sourceCopies"][0]
+            .get("deletionFiles")
+            .is_none());
         assert_eq!(page["nextCursor"], final_record.delivery.sequence);
         assert_eq!(by_id["first"]["sequence"], committed.delivery.sequence);
         assert_eq!(by_id["first"]["consumerReceiptId"], "consumer-receipt");
@@ -2167,13 +2141,11 @@ mod tests {
         let leader_bytes = std::fs::read(&leader_file).unwrap();
         std::fs::remove_file(&leader_file).unwrap();
         std::fs::create_dir(&leader_file).unwrap();
-        assert!(
-            !runtime
-                .engine
-                .adopt_replicated_highwater(9000, 9000)
-                .await
-                .unwrap()
-        );
+        assert!(!runtime
+            .engine
+            .adopt_replicated_highwater(9000, 9000)
+            .await
+            .unwrap());
         assert!(
             crate::admissions::adopt(&runtime.leader_shared)
                 .await
@@ -2208,16 +2180,14 @@ mod tests {
         runtime.cancel.cancel();
         runtime.tracker.wait().await;
         store.client.execute("UPDATE work_leases SET owner_incarnation='replacement-authority' WHERE resource='cluster/leader'",params!()).await.unwrap();
-        assert!(
-            store
-                .initialize_delivery_identity_guarded(
-                    "wrong-storage",
-                    "wrong-owner",
-                    Some(runtime.leader_shared.authority_identity())
-                )
-                .await
-                .is_err()
-        );
+        assert!(store
+            .initialize_delivery_identity_guarded(
+                "wrong-storage",
+                "wrong-owner",
+                Some(runtime.leader_shared.authority_identity())
+            )
+            .await
+            .is_err());
         assert_eq!(store.delivery_instance().await.unwrap(), instance);
         server.abort();
         runtime.shutdown().await;

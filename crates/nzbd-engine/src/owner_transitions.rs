@@ -451,8 +451,19 @@ impl Owner {
     pub(super) fn apply_post_record(
         &mut self,
         admission: crate::PostAdmission,
+        candidate: Job,
+        require_snapshot: bool,
+        callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
+    ) {
+        self.apply_post_record_proven(admission, candidate, require_snapshot, None, callback);
+    }
+
+    pub(super) fn apply_post_record_proven(
+        &mut self,
+        admission: crate::PostAdmission,
         mut candidate: Job,
         require_snapshot: bool,
+        completion_proof: Option<nzbd_state::artifacts::WorkerCompletionProof>,
         callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
     ) {
         if !self.post_scope_current(&admission)
@@ -464,6 +475,19 @@ impl Owner {
         {
             callback(self, false);
             return;
+        }
+        if completion_proof.is_some() {
+            match self.prepare_replacement_control(&mut candidate, completion_proof.as_ref()) {
+                Ok((true, _)) => {
+                    callback(self, true);
+                    return;
+                }
+                Ok((false, _)) => {}
+                Err(_) => {
+                    callback(self, false);
+                    return;
+                }
+            }
         }
         let Some(previous) = self.state.job(candidate.id).cloned() else {
             callback(self, false);
@@ -593,7 +617,7 @@ impl Owner {
             ));
         }
         let preserve_publication = if let Some(proof) = completion_proof {
-            let exact_context = nzbd_state::artifacts::WorkerControlContext::for_job(&job).as_ref()
+            let exact_context = nzbd_state::artifacts::WorkerControlContext::for_job(job).as_ref()
                 == Some(&proof.context)
                 && self
                     .state
@@ -652,7 +676,7 @@ impl Owner {
             false
         };
         let mut worker_control_restored = false;
-        let incoming_context = nzbd_state::artifacts::WorkerControlContext::for_job(&job);
+        let incoming_context = nzbd_state::artifacts::WorkerControlContext::for_job(job);
         let current_context = self
             .state
             .job(job.id)
@@ -676,10 +700,7 @@ impl Owner {
                         "import authority, source generation, or worker control changed",
                     ));
                 }
-                match self
-                    .artifacts
-                    .worker_control_for_job_metadata(&job, context)
-                {
+                match self.artifacts.worker_control_for_job_metadata(job, context) {
                     Ok(Some(checkpoint)) => {
                         worker_control_restored = true;
                         job.set_control(&checkpoint.control);
@@ -753,6 +774,7 @@ impl Owner {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn replace_job_proven_then(
         &mut self,
         mut candidate: Job,
@@ -1490,12 +1512,10 @@ mod tests {
                 .unwrap()
         );
         assert!(!admission.cancellation.is_cancelled());
-        assert!(
-            engine.recovery_document().await.unwrap().jobs[0]
-                .params
-                .iter()
-                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
-        );
+        assert!(engine.recovery_document().await.unwrap().jobs[0]
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM));
         engine.end_post_admission(admission).await.unwrap();
         engine.shutdown().await;
     }
@@ -1544,21 +1564,19 @@ mod tests {
         let doc = engine.recovery_document().await.unwrap();
         assert_eq!(doc.jobs.len(), 1);
         assert_eq!(doc.jobs[0].name, "replacement");
-        assert!(
-            !doc.jobs[0]
-                .params
-                .iter()
-                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
-        );
+        assert!(!doc.jobs[0]
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM));
         engine.shutdown().await;
     }
 
     struct ReleaseSave(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
     impl Drop for ReleaseSave {
         fn drop(&mut self) {
-            let mut ready = self.0.0.lock().unwrap();
+            let mut ready = self.0 .0.lock().unwrap();
             *ready = true;
-            self.0.1.notify_all();
+            self.0 .1.notify_all();
         }
     }
 
@@ -1643,22 +1661,18 @@ mod tests {
             .await
             .unwrap();
         allowed.store(false, Ordering::Release);
-        assert!(
-            engine
-                .import_job(record("replacement", JobStatus::Completed), false, false)
-                .await
-                .is_err()
-        );
+        assert!(engine
+            .import_job(record("replacement", JobStatus::Completed), false, false)
+            .await
+            .is_err());
         assert_eq!(
             engine.recovery_document().await.unwrap().jobs[0].name,
             "original"
         );
-        assert!(
-            engine
-                .adopt_replicated_authority(vec![record("replicated", JobStatus::Completed)])
-                .await
-                .is_err()
-        );
+        assert!(engine
+            .adopt_replicated_authority(vec![record("replicated", JobStatus::Completed)])
+            .await
+            .is_err());
         let disk = SnapshotStore::open(&temp.path().join("state"))
             .unwrap()
             .load()
@@ -1906,15 +1920,13 @@ mod tests {
             owner.state.job(JobId(1)).unwrap().files[0].segments[0].state,
             SegmentState::Done { .. }
         ));
-        assert!(
-            owner
-                .state
-                .job(JobId(1))
-                .unwrap()
-                .params
-                .iter()
-                .any(|(key, _)| key == "*File:proof:1")
-        );
+        assert!(owner
+            .state
+            .job(JobId(1))
+            .unwrap()
+            .params
+            .iter()
+            .any(|(key, _)| key == "*File:proof:1"));
     }
 
     #[tokio::test]
@@ -1936,12 +1948,10 @@ mod tests {
             SegmentState::Done { .. }
         ));
         assert_eq!(recovered.files[0].segments[1].state, SegmentState::Pending);
-        assert!(
-            recovered
-                .params
-                .iter()
-                .any(|(key, _)| key == "*File:proof:1")
-        );
+        assert!(recovered
+            .params
+            .iter()
+            .any(|(key, _)| key == "*File:proof:1"));
         assert!(engine.artifacts().for_job(1).unwrap().is_some());
         engine.shutdown().await;
     }
@@ -1958,29 +1968,23 @@ mod tests {
             .adopt_replicated_authority(vec![payload_record(JobStatus::Completed, b"abc", false)])
             .await
             .unwrap();
-        assert!(
-            engine
-                .begin_post_admission(JobId(1))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(engine
+            .begin_post_admission(JobId(1))
+            .await
+            .unwrap()
+            .is_none());
         let recovered = await_export(&engine, JobId(1)).await;
         assert_eq!(recovered.status, JobStatus::Queued);
         assert_eq!(recovered.files[0].segments[0].state, SegmentState::Pending);
-        assert!(
-            !recovered
-                .params
-                .iter()
-                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
-        );
-        assert!(
-            engine
-                .begin_post_admission(JobId(1))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(!recovered
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM));
+        assert!(engine
+            .begin_post_admission(JobId(1))
+            .await
+            .unwrap()
+            .is_none());
         engine.shutdown().await;
     }
 
@@ -2032,14 +2036,12 @@ mod tests {
         });
         tokio::task::yield_now().await;
         cancellation.cancel();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(2), waiter)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap()
-                .is_none()
-        );
+        assert!(tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .is_none());
         assert!(engine.export_job(JobId(1)).await.unwrap().is_some());
         engine.shutdown().await;
     }
@@ -2233,11 +2235,10 @@ mod tests {
         assert!(needs_payload(&job));
         normalize(&mut job);
         assert!(job.params.iter().any(|(key, _)| key == "*Recovery:pending"));
-        assert!(
-            job.params
-                .iter()
-                .any(|(key, _)| key == "*Recovery:journal-loading")
-        );
+        assert!(job
+            .params
+            .iter()
+            .any(|(key, _)| key == "*Recovery:journal-loading"));
         job.params
             .push((nzbd_types::PP_DONE_PARAM.into(), "SUCCESS/ALL".into()));
         assert!(!needs_payload(&job));

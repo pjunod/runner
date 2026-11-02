@@ -14,12 +14,12 @@
 mod admissions;
 pub mod automatic_control;
 pub mod backend;
+mod cluster_stop;
 mod download_capacity;
 pub mod events;
 pub mod failover;
 pub mod fetch;
 mod hold_recovery;
-mod cluster_stop;
 mod hold_release;
 pub mod queue;
 pub mod rate;
@@ -2135,7 +2135,7 @@ impl EngineHandle {
             preparation,
             authority,
             emit_finished,
-            reply,
+            reply: tx,
         })
         .await?;
         rx.await.map_err(|_| EngineError::Closed)?
@@ -2168,7 +2168,7 @@ impl EngineHandle {
             job: Box::new(job),
             require_snapshot: true,
             completion_proof: None,
-            reply: tx,
+            reply,
         })
         .await?;
         owner_reply(rx).await
@@ -2177,9 +2177,6 @@ impl EngineHandle {
         &self,
         job: nzbd_types::Job,
     ) -> Result<bool, EngineError> {
-        if self.post_scope.is_some() {
-            return self.apply_post_record(job, false).await;
-        }
         let (job, completion_proof) = if job.params.iter().any(|(key, _)| {
             key == nzbd_types::PP_DONE_PARAM || key == "*PP:selected-publication-outcome"
         }) {

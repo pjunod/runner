@@ -3,8 +3,8 @@
 //! (ARCHITECTURE.md §10.1). OpenAPI + roles are the remaining items.
 
 mod artifacts;
-pub mod control_pending;
 pub mod cluster_removal;
+pub mod control_pending;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -709,19 +709,40 @@ fn auth_exempt(path: &str) -> bool {
     ) || path.starts_with("/icons/")
 }
 
-async fn list_jobs(State(st): State<ApiState>,observations:Option<axum::Extension<control_pending::ControlPendingObservations>>) -> Response {
+async fn list_jobs(
+    State(st): State<ApiState>,
+    observations: Option<axum::Extension<control_pending::ControlPendingObservations>>,
+) -> Response {
     let snap = st.engine.snapshot();
-    let jobs=snap.jobs.iter().map(|job|control_pending::render(job,snap.pending_automatic_controls.contains(&job.id),observations.as_ref().map(|observations|&observations.0))).collect::<Vec<_>>();
+    let jobs = snap
+        .jobs
+        .iter()
+        .map(|job| {
+            control_pending::render(
+                job,
+                snap.pending_automatic_controls.contains(&job.id),
+                observations.as_ref().map(|observations| &observations.0),
+            )
+        })
+        .collect::<Vec<_>>();
     Json(json!({ "jobs": jobs })).into_response()
 }
 
-async fn get_job(State(st): State<ApiState>, Path(id): Path<u32>,observations:Option<axum::Extension<control_pending::ControlPendingObservations>>) -> Response {
+async fn get_job(
+    State(st): State<ApiState>,
+    Path(id): Path<u32>,
+    observations: Option<axum::Extension<control_pending::ControlPendingObservations>>,
+) -> Response {
     let snap = st.engine.snapshot();
     match snap.jobs.iter().find(|j| j.id == JobId(id)) {
         Some(job) if job.kind == nzbd_types::JobKind::Torrent => {
             match st.engine.export_job(JobId(id)).await {
                 Ok(Some(record)) => {
-                    let mut value = control_pending::render(job,snap.pending_automatic_controls.contains(&job.id),observations.as_ref().map(|observations|&observations.0));
+                    let mut value = control_pending::render(
+                        job,
+                        snap.pending_automatic_controls.contains(&job.id),
+                        observations.as_ref().map(|observations| &observations.0),
+                    );
                     if let Some(object) = value.as_object_mut() {
                         object.insert("torrent".into(), json!(record.torrent));
                     }
@@ -731,7 +752,12 @@ async fn get_job(State(st): State<ApiState>, Path(id): Path<u32>,observations:Op
                 Err(err) => error(StatusCode::SERVICE_UNAVAILABLE, &err.to_string()),
             }
         }
-        Some(job) => Json(control_pending::render(job,snap.pending_automatic_controls.contains(&job.id),observations.as_ref().map(|observations|&observations.0))).into_response(),
+        Some(job) => Json(control_pending::render(
+            job,
+            snap.pending_automatic_controls.contains(&job.id),
+            observations.as_ref().map(|observations| &observations.0),
+        ))
+        .into_response(),
         None => not_found(),
     }
 }
@@ -1272,7 +1298,7 @@ async fn park_write(st: &ApiState, mut parked: Parked) -> bool {
 async fn job_action(
     State(st): State<ApiState>,
     Path((id, action)): Path<(u32, String)>,
-    cluster_removal:Option<axum::Extension<cluster_removal::ClusterRemovalContext>>,
+    cluster_removal: Option<axum::Extension<cluster_removal::ClusterRemovalContext>>,
 ) -> Response {
     let engine = &st.engine;
     let job = JobId(id);
@@ -1324,9 +1350,14 @@ async fn job_action(
             .and_then(|parked| history_requeue_refusal(&parked.entry));
         // Cluster control commits the original removal mode first, then
         // exact source owners stop/join writers and drain their own copies.
-        return match engine.delete_job(job, files && cluster_removal.is_none()).await {
+        return match engine
+            .delete_job(job, files && cluster_removal.is_none())
+            .await
+        {
             Ok(true) => {
-                if let Some(context)=&cluster_removal {context.record(id,files);}
+                if let Some(context) = &cluster_removal {
+                    context.record(id, files);
+                }
                 let mut parked = false;
                 if let Some(s) = snapshot {
                     parked = park_write(&st, s).await;
@@ -1775,7 +1806,13 @@ fn unix_now() -> i64 {
 
 /// The 1 Hz SSE `tick` body: header status + job rows from one snapshot.
 fn tick_payload(snap: &QueueSnapshot) -> String {
-    let jobs=snap.jobs.iter().map(|job|control_pending::render(job,snap.pending_automatic_controls.contains(&job.id),None)).collect::<Vec<_>>();
+    let jobs = snap
+        .jobs
+        .iter()
+        .map(|job| {
+            control_pending::render(job, snap.pending_automatic_controls.contains(&job.id), None)
+        })
+        .collect::<Vec<_>>();
     json!({ "status": status_dto(snap), "jobs": jobs }).to_string()
 }
 
@@ -3981,17 +4018,26 @@ mod tests {
     }
 
     #[test]
-    fn sse_tick_preserves_pending_control_until_exact_ack(){
-        let mut snapshot=QueueSnapshot::default();
-        snapshot.jobs.push(summary(44,JobStatus::Queued));
+    fn sse_tick_preserves_pending_control_until_exact_ack() {
+        let mut snapshot = QueueSnapshot::default();
+        snapshot.jobs.push(summary(44, JobStatus::Queued));
         snapshot.pending_automatic_controls.insert(JobId(44));
-        let value:serde_json::Value=serde_json::from_str(&tick_payload(&snapshot)).unwrap();
-        assert_eq!(value["jobs"][0]["controlPending"]["state"],"pending");
-        assert!(value["jobs"][0]["controlPending"]["error"].as_str().unwrap().contains("source custody"));
-        assert_eq!(value["jobs"][0]["status"],serde_json::to_value(JobStatus::Queued).unwrap());
+        let value: serde_json::Value = serde_json::from_str(&tick_payload(&snapshot)).unwrap();
+        assert_eq!(value["jobs"][0]["controlPending"]["state"], "pending");
+        assert!(value["jobs"][0]["controlPending"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("source custody"));
+        assert_eq!(
+            value["jobs"][0]["status"],
+            serde_json::to_value(JobStatus::Queued).unwrap()
+        );
         snapshot.pending_automatic_controls.clear();
-        let accepted:serde_json::Value=serde_json::from_str(&tick_payload(&snapshot)).unwrap();
-        assert!(accepted["jobs"][0].get("controlPending").is_none(),"accepted ACK clears the observation without inventing a control");
+        let accepted: serde_json::Value = serde_json::from_str(&tick_payload(&snapshot)).unwrap();
+        assert!(
+            accepted["jobs"][0].get("controlPending").is_none(),
+            "accepted ACK clears the observation without inventing a control"
+        );
     }
 
     #[tokio::test]

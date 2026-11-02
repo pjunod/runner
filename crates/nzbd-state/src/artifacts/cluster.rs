@@ -704,14 +704,12 @@ mod tests {
                         &root,
                     )
                     .unwrap();
-                assert!(
-                    inventory
-                        .get(&artifact.id)
-                        .unwrap()
-                        .hold
-                        .as_ref()
-                        .is_some_and(|hold| hold.contains(&recovery.id))
-                );
+                assert!(inventory
+                    .get(&artifact.id)
+                    .unwrap()
+                    .hold
+                    .as_ref()
+                    .is_some_and(|hold| hold.contains(&recovery.id)));
             }
             if block == "unknown" {
                 std::fs::write(source.join("user-added.txt"), b"unowned bytes").unwrap();
@@ -764,11 +762,9 @@ mod tests {
         assert!(source.exists());
         let mut selected = copy.clone();
         selected.selected = true;
-        assert!(
-            inventory
-                .delete_cancelled_cluster_artifact_copy(&selected, proof(), &raw_seal())
-                .is_err()
-        );
+        assert!(inventory
+            .delete_cancelled_cluster_artifact_copy(&selected, proof(), &raw_seal())
+            .is_err());
     }
     #[test]
     fn queued_explicit_cancel_rechecks_consumer_acceptance_before_first_unlink() {
@@ -813,11 +809,9 @@ mod tests {
             .unwrap();
         assert_eq!(inventory.execute_delete(&op.id).unwrap().state, "review");
         assert!(source.exists());
-        assert!(
-            inventory
-                .delete_cancelled_cluster_artifact_copy(&copy, proof(), &raw_seal())
-                .is_err()
-        );
+        assert!(inventory
+            .delete_cancelled_cluster_artifact_copy(&copy, proof(), &raw_seal())
+            .is_err());
     }
     #[test]
     fn explicit_cancel_supports_new_nonconsumer_copies_but_not_legacy_or_unowned() {
@@ -850,17 +844,15 @@ mod tests {
                 size_bytes: 17,
                 sha256: format!("{:x}", Sha256::digest(b"nonconsumer bytes")),
             }];
-            assert!(
-                inventory
-                    .retire_cluster_artifact_copy_with_disposition(
-                        &copy,
-                        "SUCCESS",
-                        proof(),
-                        false,
-                        Some(&files)
-                    )
-                    .is_err()
-            );
+            assert!(inventory
+                .retire_cluster_artifact_copy_with_disposition(
+                    &copy,
+                    "SUCCESS",
+                    proof(),
+                    false,
+                    Some(&files)
+                )
+                .is_err());
             let result = inventory.delete_cancelled_cluster_artifact_copy(&copy, proof(), &files);
             if cohort == "new" {
                 assert_eq!(result.unwrap().status, "removed");
@@ -1002,11 +994,9 @@ mod tests {
             inventory.execute_delete(&operation.id).unwrap().state,
             "review"
         );
-        assert!(
-            inventory
-                .delete_cancelled_cluster_unpublished_publication(&copy, proof(), &files)
-                .is_err()
-        );
+        assert!(inventory
+            .delete_cancelled_cluster_unpublished_publication(&copy, proof(), &files)
+            .is_err());
         assert_eq!(
             std::fs::read(target.join("episode.mkv")).unwrap(),
             b"verified payload"
@@ -1283,19 +1273,15 @@ mod tests {
         assert!(source.join("episode.mkv").exists());
         let mut stale = copy.clone();
         stale.storage_instance_id.push_str("-replacement");
-        assert!(
-            inventory
-                .retire_cluster_artifact_copy(&stale, "SUCCESS", proof())
-                .is_err()
-        );
+        assert!(inventory
+            .retire_cluster_artifact_copy(&stale, "SUCCESS", proof())
+            .is_err());
         assert!(source.exists());
         let mut stale = copy;
         stale.publication.generation.push_str("-stale");
-        assert!(
-            inventory
-                .retire_cluster_artifact_copy(&stale, "SUCCESS", proof())
-                .is_err()
-        );
+        assert!(inventory
+            .retire_cluster_artifact_copy(&stale, "SUCCESS", proof())
+            .is_err());
         assert!(source.exists());
     }
 }
@@ -1430,15 +1416,13 @@ mod generation_tests {
         assert!(!path.exists());
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("replacement.mkv"), b"unowned replacement").unwrap();
-        assert!(
-            remove_cluster_generation_copy(
-                &root,
-                Path::new("job/fence-1"),
-                (identity.device, identity.inode),
-                &files
-            )
-            .is_err()
-        );
+        assert!(remove_cluster_generation_copy(
+            &root,
+            Path::new("job/fence-1"),
+            (identity.device, identity.inode),
+            &files
+        )
+        .is_err());
         assert!(path.join("replacement.mkv").exists());
     }
 

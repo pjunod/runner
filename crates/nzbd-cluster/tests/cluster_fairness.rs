@@ -1,13 +1,13 @@
 //! Actual mixed worker polling under fast download load. Instrumentation wraps
 //! the real HTTP route; neither lane selector nor production state is patched.
 
-use axum::body::{Body, to_bytes};
+use axum::body::{to_bytes, Body};
 use axum::extract::Request;
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use nzbd_cluster::{ClusterConfig, ClusterRuntime, ControlPeer};
 use nzbd_engine::{EngineHandle, Tuning};
-use nzbd_nserv::{NservBuilder, build_post, prng_bytes};
+use nzbd_nserv::{build_post, prng_bytes, NservBuilder};
 use nzbd_types::{CertLevel, JobStatus, ServerDef, ServerId, TlsMode};
 use serde::Serialize;
 use serde_json::Value;

@@ -1,5 +1,5 @@
 use super::*;
-use axum::{Router, middleware, routing::post};
+use axum::{middleware, routing::post, Router};
 use http_body_util::BodyExt;
 use nzbd_engine::Tuning;
 use nzbd_state::artifacts::{Delivery, DeliveryFile, FinalizationProof};
@@ -395,12 +395,10 @@ async fn retired_cross_node_keep_owner_restart_and_cleanup_race_are_truthful() {
     let (current, revision, _) = control.current_job_intent(9).await.unwrap().unwrap();
     assert_eq!(revision, 2);
     assert_eq!(current.name, queued.name);
-    assert!(
-        current
-            .params
-            .iter()
-            .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1")
-    );
+    assert!(current
+        .params
+        .iter()
+        .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1"));
     request(
         &leader,
         "PUT",

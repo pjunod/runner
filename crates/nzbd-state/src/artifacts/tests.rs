@@ -113,10 +113,9 @@ fn delivery_manifest_and_acceptance_survive_history_independently() {
     assert_eq!(transferred.state, "transferred");
     assert!(!transferred.owned);
     assert!(!transferred.keep);
-    assert!(
-        db.request_delete(&transferred.id, transferred.revision, "must-not-delete", 0)
-            .is_err()
-    );
+    assert!(db
+        .request_delete(&transferred.id, transferred.revision, "must-not-delete", 0)
+        .is_err());
     assert_eq!(delivery.protocol_version, 1);
     assert_eq!(delivery.sequence, 1);
     assert_eq!(delivery.files.len(), 2);
@@ -149,15 +148,14 @@ fn delivery_manifest_and_acceptance_survive_history_independently() {
         .unwrap(),
         accepted
     );
-    assert!(
-        db.accept_delivery(
+    assert!(db
+        .accept_delivery(
             &delivery.delivery_id,
             &delivery.publication_generation,
             &delivery.manifest_digest,
             "different-receipt",
         )
-        .is_err()
-    );
+        .is_err());
     assert!(db.deliveries_after(0, 10).unwrap().0.is_empty());
     assert_eq!(db.delivery(&delivery.delivery_id).unwrap(), accepted);
 }
@@ -185,12 +183,10 @@ fn pre_upgrade_artifacts_cannot_run_queued_automatic_deletion() {
     let result = db.execute_delete(&op.id).unwrap();
     assert_eq!(result.state, "review");
     assert!(legacy.path.exists());
-    assert!(
-        result
-            .error
-            .as_deref()
-            .is_some_and(|message| message.contains("pre-existing artifact"))
-    );
+    assert!(result
+        .error
+        .as_deref()
+        .is_some_and(|message| message.contains("pre-existing artifact")));
 }
 
 #[test]
@@ -267,11 +263,9 @@ fn interrupted_running_source_cleanup_is_retried_after_reopen() {
         recovered.source_cleanup.attempt_history[0].outcome,
         "interrupted"
     );
-    assert!(
-        recovered.source_cleanup.attempt_history[0]
-            .work_ms
-            .is_some()
-    );
+    assert!(recovered.source_cleanup.attempt_history[0]
+        .work_ms
+        .is_some());
     assert_eq!(
         recovered.source_cleanup.attempt_history[1].outcome,
         "succeeded"
@@ -524,11 +518,10 @@ fn standalone_lifecycle_publication_uses_selected_tree_and_journaled_source_reti
     assert!(!source.join("Season 1/ep01.mkv").exists());
     assert!(!source.join("release.nzb").exists());
     assert!(source.join("unknown.bin").exists());
-    assert!(
-        db.for_job(51)
-            .unwrap()
-            .is_some_and(|artifact| artifact.owned)
-    );
+    assert!(db
+        .for_job(51)
+        .unwrap()
+        .is_some_and(|artifact| artifact.owned));
     assert!(db.selected_publication_for_job(51).unwrap().is_some());
     assert!(db.delivery_for_job(51).unwrap().is_none());
     let whole_delete_queued: bool = db.db.lock().unwrap().query_row(
@@ -571,16 +564,15 @@ fn selected_publication_io_failure_keeps_source_for_same_attempt_retry() {
     relocation::FAULTS.with(|faults| {
         faults.borrow_mut().insert("copy_chunk", libc::EIO);
     });
-    assert!(
-        db.publish_selected_for_delivery_checked(
+    assert!(db
+        .publish_selected_for_delivery_checked(
             50,
             &target,
             selected.clone(),
             outcomes.clone(),
             &|| Ok(()),
         )
-        .is_err()
-    );
+        .is_err());
     let held = db.for_job(50).unwrap().unwrap();
     assert!(held.owned);
     assert_eq!(held.path, source);
@@ -709,10 +701,9 @@ fn clearing_keep_only_schedules_delete_for_persisted_unusable_assessment() {
     .unwrap();
     assert!(db.set_keep_on_failure(59, true).unwrap());
     assert!(db.set_keep_on_failure(59, false).unwrap());
-    assert!(
-        db.operation(&format!("failed-delete-{}", recoverable_artifact.id))
-            .is_err()
-    );
+    assert!(db
+        .operation(&format!("failed-delete-{}", recoverable_artifact.id))
+        .is_err());
     assert!(recoverable.join("complete.rar").exists());
 
     let unknown = root.join("legacy-no-assessment");
@@ -722,10 +713,9 @@ fn clearing_keep_only_schedules_delete_for_persisted_unusable_assessment() {
     let unknown_artifact = db.finish(60, &unknown, &root, "retained").unwrap();
     assert!(db.set_keep_on_failure(60, true).unwrap());
     assert!(db.set_keep_on_failure(60, false).unwrap());
-    assert!(
-        db.operation(&format!("failed-delete-{}", unknown_artifact.id))
-            .is_err()
-    );
+    assert!(db
+        .operation(&format!("failed-delete-{}", unknown_artifact.id))
+        .is_err());
     assert!(unknown.join("old.bin").exists());
 }
 
@@ -760,12 +750,11 @@ fn keep_toggle_resumes_default_terminal_delete_journal_without_assessment() {
         .unwrap();
     assert_eq!(operation.state, "retry");
     assert_eq!(operation.attempts, 1);
-    assert!(
-        db.get(&operation.artifact)
-            .unwrap()
-            .failure_assessment
-            .is_none()
-    );
+    assert!(db
+        .get(&operation.artifact)
+        .unwrap()
+        .failure_assessment
+        .is_none());
 
     assert!(db.set_keep_on_failure(65, true).unwrap());
     assert_eq!(db.operation(&op_id).unwrap().state, "cancelled");
@@ -1121,13 +1110,11 @@ fn legacy_four_field_restore_journal_is_fenced_without_startup_failure() {
     assert!(db.reconcile_transforms().is_ok());
     let fenced = db.operation("legacy-restore-four-tuple").unwrap();
     assert_eq!(fenced.state, "review");
-    assert!(
-        fenced
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("lacks rename content proof")
-    );
+    assert!(fenced
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("lacks rename content proof"));
     assert!(source_path.join("old.mkv").exists());
     assert!(!source_path.join("restored.mkv").exists());
 }
@@ -1191,10 +1178,9 @@ fn legacy_whole_source_relocation_replays_only_owned_private_staging() {
                 libc::EIO,
             );
         });
-        assert!(
-            db.relocate_for_delivery_checked(95, &target, &|| Ok(()))
-                .is_err()
-        );
+        assert!(db
+            .relocate_for_delivery_checked(95, &target, &|| Ok(()))
+            .is_err());
         let artifact = db.for_job(95).unwrap().unwrap();
         let op = db.pending_relocations(&artifact.id).unwrap().remove(0);
         let request: serde_json::Value = serde_json::from_str(&op.request).unwrap();
@@ -1269,10 +1255,9 @@ fn selected_publication_resumes_a_partial_private_copy_after_restart() {
     relocation::FAULTS.with(|faults| {
         faults.borrow_mut().insert("copy_chunk", libc::EIO);
     });
-    assert!(
-        db.publish_selected_for_delivery_checked(55, &target, selected, outcomes, &|| Ok(()))
-            .is_err()
-    );
+    assert!(db
+        .publish_selected_for_delivery_checked(55, &target, selected, outcomes, &|| Ok(()))
+        .is_err());
     assert!(source.join("episode.mkv").exists());
     assert!(!target.exists());
     drop(db);
@@ -1370,10 +1355,9 @@ fn selected_publication_retries_capacity_failure_before_scratch_exists() {
     std::fs::create_dir(&completed).unwrap();
     let target = completed.join("release-generation");
     crate::capacity::FAIL_NEXT_RESERVATION.with(|fail| fail.set(true));
-    assert!(
-        db.publish_selected_for_delivery_checked(57, &target, selected, outcomes, &|| Ok(()))
-            .is_err()
-    );
+    assert!(db
+        .publish_selected_for_delivery_checked(57, &target, selected, outcomes, &|| Ok(()))
+        .is_err());
     assert!(source.join("episode.mkv").exists());
     assert!(!target.exists());
 
@@ -1430,8 +1414,8 @@ fn resumed_relocation_does_not_restore_artifact_after_concurrent_delete() {
     relocation::FAULTS.with(|faults| {
         faults.borrow_mut().insert("copy_chunk", libc::EIO);
     });
-    assert!(
-        db.publish_selected_for_delivery_checked(
+    assert!(db
+        .publish_selected_for_delivery_checked(
             62,
             &target,
             selected,
@@ -1446,8 +1430,7 @@ fn resumed_relocation_does_not_restore_artifact_after_concurrent_delete() {
             }],
             &|| Ok(()),
         )
-        .is_err()
-    );
+        .is_err());
     let relocation_id: String = db
         .db
         .lock()
@@ -1712,10 +1695,9 @@ fn recovery_copy_is_independent_and_receipt_releases_only_a_complete_selection()
     assert!(db.get(&a.id).unwrap().hold.is_some());
     db.claim_recovery(&r.id, "consumer-a", "import-a", &r.manifest_digest)
         .unwrap();
-    assert!(
-        db.claim_recovery(&r.id, "consumer-b", "import-b", &r.manifest_digest)
-            .is_err()
-    );
+    assert!(db
+        .claim_recovery(&r.id, "consumer-b", "import-b", &r.manifest_digest)
+        .is_err());
     let receipt = Receipt {
         import_id: "import-a".into(),
         manifest_digest: r.manifest_digest.clone(),
@@ -1730,10 +1712,9 @@ fn recovery_copy_is_independent_and_receipt_releases_only_a_complete_selection()
             })
             .collect(),
     };
-    assert!(
-        db.recovery_receipt(&r.id, "wrong-consumer", receipt.clone())
-            .is_err()
-    );
+    assert!(db
+        .recovery_receipt(&r.id, "wrong-consumer", receipt.clone())
+        .is_err());
     assert_eq!(
         db.recovery_receipt(&r.id, "consumer-a", receipt.clone())
             .unwrap()
@@ -1791,10 +1772,9 @@ fn inspection_of_added_bytes_revokes_automatic_ownership() {
     std::fs::write(a.path.join("another.mkv"), b"unrelated").unwrap();
     let observed = db.inspect(&a.id).unwrap();
     assert!(!observed.owned && observed.keep);
-    assert!(
-        db.request_delete(&a.id, observed.revision, "after-inspect", 0)
-            .is_err()
-    );
+    assert!(db
+        .request_delete(&a.id, observed.revision, "after-inspect", 0)
+        .is_err());
 }
 #[test]
 fn a_missing_sidecar_never_becomes_success_on_retry() {
@@ -1872,36 +1852,30 @@ fn succeeded_relocation_proof_requires_exact_owned_current_generation_and_paths(
         artifact: artifact.id.clone(),
         generation: artifact.generation.clone(),
     };
-    assert!(
-        !db.has_succeeded_relocation(&generation, &source, &target)
-            .unwrap()
-    );
+    assert!(!db
+        .has_succeeded_relocation(&generation, &source, &target)
+        .unwrap());
     db.relocate(91, &target).unwrap();
-    assert!(
-        db.has_succeeded_relocation(&generation, &source, &target)
-            .unwrap()
-    );
-    assert!(
-        !db.has_succeeded_relocation(&generation, &target, &source)
-            .unwrap()
-    );
-    assert!(
-        !db.has_succeeded_relocation(&generation, &root.join("other"), &target)
-            .unwrap()
-    );
+    assert!(db
+        .has_succeeded_relocation(&generation, &source, &target)
+        .unwrap());
+    assert!(!db
+        .has_succeeded_relocation(&generation, &target, &source)
+        .unwrap());
+    assert!(!db
+        .has_succeeded_relocation(&generation, &root.join("other"), &target)
+        .unwrap());
     let mut stale = generation.clone();
     stale.generation.push_str("-stale");
-    assert!(
-        !db.has_succeeded_relocation(&stale, &source, &target)
-            .unwrap()
-    );
+    assert!(!db
+        .has_succeeded_relocation(&stale, &source, &target)
+        .unwrap());
     let mut current = db.get(&artifact.id).unwrap();
     current.owned = false;
     save_artifact(&db.db.lock().unwrap(), &current).unwrap();
-    assert!(
-        !db.has_succeeded_relocation(&generation, &source, &target)
-            .unwrap()
-    );
+    assert!(!db
+        .has_succeeded_relocation(&generation, &source, &target)
+        .unwrap());
 }
 
 #[test]
@@ -2081,10 +2055,9 @@ fn startup_orphaned_active_allocation_preserves_binding_until_explicit_successor
     assert!(orphan.keep && orphan.hold.is_some());
     assert_eq!(db.for_job(42).unwrap().unwrap().id, a.id);
     assert!(db.inspect(&a.id).is_ok());
-    assert!(
-        db.allocate_processing_successor(42, &root, &root.join("new-job"))
-            .is_ok()
-    );
+    assert!(db
+        .allocate_processing_successor(42, &root, &root.join("new-job"))
+        .is_ok());
 }
 #[test]
 fn enabled_discovery_coalesces_and_scans_explicit_nested_category_roots() {
@@ -2117,10 +2090,9 @@ fn stopped_inventory_releases_lock_but_old_handles_cannot_mutate() {
     let a = parked(&db, &root);
     db.close().unwrap();
     let restarted = Inventory::open(&tmp.path().join("state")).unwrap();
-    assert!(
-        db.request_delete(&a.id, a.revision, "stale-handle", 0)
-            .is_err()
-    );
+    assert!(db
+        .request_delete(&a.id, a.revision, "stale-handle", 0)
+        .is_err());
     assert!(db.set_settings(&Settings::default()).is_err());
     assert_eq!(restarted.get(&a.id).unwrap().path, a.path);
 }
@@ -2597,7 +2569,7 @@ fn staging_copies_hash_in_one_pass_and_publish_verifies_the_copy() {
 fn a_staging_failure_names_the_operation_and_the_path() {
     let (tmp, db, root) = fixture();
     let a = parked(&db, &root); // owned parked_failed, stageable as is
-    // The recovery root is a FILE, so creating the staging tree under it fails.
+                                // The recovery root is a FILE, so creating the staging tree under it fails.
     let recovery_root = tmp.path().join("recovery");
     std::fs::write(&recovery_root, b"not a directory").unwrap();
     let r = db
@@ -2711,16 +2683,15 @@ fn selected_publication_io_failure_resumes_in_process_on_tick() {
     relocation::FAULTS.with(|faults| {
         faults.borrow_mut().insert("copy_chunk", libc::EIO);
     });
-    assert!(
-        db.publish_selected_for_delivery_checked(
+    assert!(db
+        .publish_selected_for_delivery_checked(
             50,
             &target,
             selected.clone(),
             outcomes.clone(),
             &|| Ok(()),
         )
-        .is_err()
-    );
+        .is_err());
     let held = db.for_job(50).unwrap().unwrap();
     assert!(held.owned);
     assert_eq!(held.path, source);
@@ -3029,8 +3000,8 @@ fn delivery_stage_snapshot_is_bounded_optional_and_immutable_on_replay() {
     );
     let mut excessive = snapshot;
     excessive.spans = vec![excessive.spans[0]; 129];
-    assert!(
-        db.create_delivery_with_outcome_keep_and_stages(
+    assert!(db
+        .create_delivery_with_outcome_keep_and_stages(
             74,
             true,
             Some("stage-74"),
@@ -3040,8 +3011,7 @@ fn delivery_stage_snapshot_is_bounded_optional_and_immutable_on_replay() {
             false,
             Some(excessive)
         )
-        .is_err()
-    );
+        .is_err());
 }
 
 #[test]
@@ -3071,19 +3041,17 @@ fn delivery_discovery_skips_malformed_row_with_trusted_cursor() {
     assert_eq!(page.len(), 2);
     assert_eq!(page[0]["deliveryId"], deliveries[0].delivery_id);
     assert_eq!(page[0]["sequence"], deliveries[0].sequence);
-    assert!(
-        page[0]["discoveryError"]
-            .as_str()
-            .unwrap()
-            .contains("invalid")
-    );
+    assert!(page[0]["discoveryError"]
+        .as_str()
+        .unwrap()
+        .contains("invalid"));
     assert_eq!(page[1]["deliveryId"], deliveries[1].delivery_id);
     assert_eq!(cursor, deliveries[1].sequence);
 }
 
 #[test]
 fn blocked_startup_root_does_not_block_other_root_or_durable_metadata() {
-    use std::sync::{Condvar, mpsc};
+    use std::sync::{mpsc, Condvar};
     let (_tmp, inventory, root_a) = fixture();
     let root_b = root_a.parent().unwrap().join("other-root");
     std::fs::create_dir(&root_b).unwrap();
@@ -3170,11 +3138,9 @@ fn legacy_worker_enrollment_allows_operational_custody_without_cleanup_ownership
         .unwrap()
         .unwrap();
     assert_eq!(custody.source().artifact, admitted.id);
-    assert!(
-        inventory
-            .request_delete(&admitted.id, admitted.revision, "must-not-delete", 0)
-            .is_err()
-    );
+    assert!(inventory
+        .request_delete(&admitted.id, admitted.revision, "must-not-delete", 0)
+        .is_err());
     drop(custody);
 
     let mut held = inventory.for_job(801).unwrap().unwrap();

@@ -10,7 +10,7 @@ use crate::http::ClusterClient;
 use crate::proto::*;
 use crate::{ClusterConfig, PpSetup};
 use nzbd_engine::{EngineHandle, MirrorStats};
-use nzbd_post::manager::{PpCtx, process_job_ctx};
+use nzbd_post::manager::{process_job_ctx, PpCtx};
 use nzbd_types::{JobId, JobStatus, ServerDef};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -2564,12 +2564,10 @@ mod tests {
             .import_job(queued_test_job(), false, false)
             .await
             .unwrap();
-        assert!(
-            engine
-                .enter_post_stage(JobId(77), PostStage::ParVerify, 1_000, None)
-                .await
-                .unwrap()
-        );
+        assert!(engine
+            .enter_post_stage(JobId(77), PostStage::ParVerify, 1_000, None)
+            .await
+            .unwrap());
 
         engine
             .register_repair_attempt(JobId(77), "transition-lease:1".into())
@@ -2819,11 +2817,9 @@ mod tests {
             history_recorded_by_authority: true,
             cleanup_only: false,
         };
-        assert!(
-            accept_worker_retirement(&engine, &request, &response)
-                .await
-                .is_err()
-        );
+        assert!(accept_worker_retirement(&engine, &request, &response)
+            .await
+            .is_err());
         assert!(workspace.scratch.path.exists());
         response.ok = true;
         accept_worker_retirement(&engine, &request, &response)

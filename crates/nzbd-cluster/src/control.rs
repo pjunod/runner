@@ -325,7 +325,7 @@ impl ControlStore {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("install control schema statement: {error}"))?;
-        let store=Self{client};
+        let store = Self { client };
         crate::cancellation::install_schema(&store).await?;
         crate::cluster_keep::install_schema(&store).await?;
         Ok(store)
@@ -811,13 +811,23 @@ impl ControlStore {
         admissions: &[nzbd_state::UrlAdmissionReceipt],
         authority: Option<(&str, &str, u64)>,
     ) -> Result<(), String> {
-        self.commit_job_delta_guarded_with_removals(changes,expected_rows,admissions,authority,&Default::default()).await
+        self.commit_job_delta_guarded_with_removals(
+            changes,
+            expected_rows,
+            admissions,
+            authority,
+            &Default::default(),
+        )
+        .await
     }
     pub(crate) async fn commit_job_delta_guarded_with_removals(
-        &self,changes:&[(u64,Option<nzbd_types::Job>)],expected_rows:&std::collections::HashMap<u64,u64>,
-        admissions:&[nzbd_state::UrlAdmissionReceipt],authority:Option<(&str,&str,u64)>,
-        removals:&std::collections::BTreeMap<u32,crate::cancellation::RemovalMode>,
-    )->Result<(),String>{
+        &self,
+        changes: &[(u64, Option<nzbd_types::Job>)],
+        expected_rows: &std::collections::HashMap<u64, u64>,
+        admissions: &[nzbd_state::UrlAdmissionReceipt],
+        authority: Option<(&str, &str, u64)>,
+        removals: &std::collections::BTreeMap<u32, crate::cancellation::RemovalMode>,
+    ) -> Result<(), String> {
         let now = unix_ms()?;
         let mut statements: Vec<(String, hiqlite::Params)> = Vec::new();
         if let Some(authority) = authority {
@@ -894,8 +904,18 @@ impl ControlStore {
                         ),
                     ));
                     if deleted {
-                        let job=u32::try_from(*job_id).map_err(|e|e.to_string())?;
-                        statements.extend(crate::cancellation::tombstone_statements(job,&row.incarnation,expected,next_revision,removals.get(&job).copied().unwrap_or(crate::cancellation::RemovalMode::KeepFiles),now));
+                        let job = u32::try_from(*job_id).map_err(|e| e.to_string())?;
+                        statements.extend(crate::cancellation::tombstone_statements(
+                            job,
+                            &row.incarnation,
+                            expected,
+                            next_revision,
+                            removals
+                                .get(&job)
+                                .copied()
+                                .unwrap_or(crate::cancellation::RemovalMode::KeepFiles),
+                            now,
+                        ));
                     }
                 }
             }
@@ -979,13 +999,13 @@ impl ControlStore {
         &self,
         record: &nzbd_state::artifacts::UrlResolutionRecord,
     ) -> Result<bool, String> {
-        self.commit_url_outbox_with_source(record,None).await
+        self.commit_url_outbox_with_source(record, None).await
     }
     pub(crate) async fn commit_url_outbox_with_source(
         &self,
-        record:&nzbd_state::artifacts::UrlResolutionRecord,
-        source:Option<&crate::source_facts::OwnedSourceFact>,
-    )->Result<bool,String> {
+        record: &nzbd_state::artifacts::UrlResolutionRecord,
+        source: Option<&crate::source_facts::OwnedSourceFact>,
+    ) -> Result<bool, String> {
         use nzbd_state::artifacts::url_source_identity;
         if record.resolution_id != record.source_identity
             || url_source_identity(&record.origin).map_err(|error| error.to_string())?
@@ -1063,9 +1083,17 @@ impl ControlStore {
             next.params.retain(|(existing, _)| existing != key);
             next.params.push((key.clone(), value.clone()));
         }
-        if let Some(source)=source {
-            if source.dirname==nzbd_engine::queue::job_dir_name(&next) && !next.params.iter().any(|(key,_)|key==crate::delivery::AUTHORITY_COPY_PARAM) {
-                next.params.push((crate::delivery::AUTHORITY_COPY_PARAM.into(),source.value.clone()));
+        if let Some(source) = source {
+            if source.dirname == nzbd_engine::queue::job_dir_name(&next)
+                && !next
+                    .params
+                    .iter()
+                    .any(|(key, _)| key == crate::delivery::AUTHORITY_COPY_PARAM)
+            {
+                next.params.push((
+                    crate::delivery::AUTHORITY_COPY_PARAM.into(),
+                    source.value.clone(),
+                ));
             }
         }
         let next = serde_json::to_string(&next).map_err(|error| error.to_string())?;

@@ -239,7 +239,7 @@ async fn storage_full_during_file_sizing_is_fail_closed() -> Result<(), Box<dyn 
             return Err(io::Error::other(format!(
                 "sizing fault returned the wrong adapter error: {error}"
             ))
-            .into())
+            .into());
         }
         Ok(handle) => {
             let initialization_error =

@@ -5,10 +5,10 @@ use crate::{
     leader::LeaderShared,
 };
 use axum::{
-    Json,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json,
 };
 use nzbd_state::artifacts::{WorkerControlContext, WorkerStopRequest, WorkerStoppedReceipt};
 use serde::{Deserialize, Serialize};
@@ -491,5 +491,5 @@ async fn seal_authority_exact(
 }
 
 #[cfg(test)]
-#[path="cancellation_route_tests.rs"]
+#[path = "cancellation_route_tests.rs"]
 mod tests;

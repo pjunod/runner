@@ -967,11 +967,9 @@ mod tests {
                 .unwrap();
             std::fs::write(target.join("old"), b"retain old").unwrap();
             CUT.with(|cut| cut.set(Some(boundary)));
-            assert!(
-                inventory
-                    .materialize_generation(7, &root, &target, &accepted, (false, false, false))
-                    .is_err()
-            );
+            assert!(inventory
+                .materialize_generation(7, &root, &target, &accepted, (false, false, false))
+                .is_err());
             let selected = inventory
                 .materialize_generation(7, &root, &target, &accepted, (false, false, false))
                 .unwrap();
@@ -1004,11 +1002,9 @@ mod tests {
         std::fs::rename(&target, root.join("selected-preserved")).unwrap();
         std::fs::create_dir(&target).unwrap();
         std::fs::write(target.join("media"), b"accepted").unwrap();
-        assert!(
-            inventory
-                .materialize_generation(7, &root, &target, &accepted, (true, false, false))
-                .is_err()
-        );
+        assert!(inventory
+            .materialize_generation(7, &root, &target, &accepted, (true, false, false))
+            .is_err());
         assert_eq!(
             inventory.for_job(7).unwrap().unwrap().generation,
             selected.generation

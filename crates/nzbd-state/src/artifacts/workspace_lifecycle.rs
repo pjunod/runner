@@ -988,22 +988,18 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let target = root.join("fence-2");
         std::fs::create_dir(&target).unwrap();
-        assert!(
-            inventory
-                .allocate_processing_successor(12, &root, &target)
-                .is_err()
-        );
+        assert!(inventory
+            .allocate_processing_successor(12, &root, &target)
+            .is_err());
         assert_eq!(
             inventory.for_job(12).unwrap().unwrap().id,
             workspace.source.id
         );
         std::fs::remove_dir(&target).unwrap();
         let guard = inventory.acquire_attempt_use(12).unwrap().unwrap();
-        assert!(
-            inventory
-                .allocate_processing_successor(12, &root, &target)
-                .is_err()
-        );
+        assert!(inventory
+            .allocate_processing_successor(12, &root, &target)
+            .is_err());
         assert!(!target.exists());
         drop(guard);
         let mut kept = inventory.get(&workspace.source.id).unwrap();
@@ -1128,21 +1124,17 @@ mod tests {
         terminal(&inventory, &workspace, "retained");
         assert!(inventory.validate_post_retry(12).is_err());
         assert!(inventory.acquire_attempt_use(12).is_err());
-        assert!(
-            inventory
-                .finalize_workspaces(
-                    &source(&workspace),
-                    "FAILURE",
-                    FinalizationProof::Local { history_seq: 1 }
-                )
-                .is_err()
-        );
+        assert!(inventory
+            .finalize_workspaces(
+                &source(&workspace),
+                "FAILURE",
+                FinalizationProof::Local { history_seq: 1 }
+            )
+            .is_err());
         let parent = inventory.for_job(12).unwrap().unwrap();
-        assert!(
-            inventory
-                .request_delete(&parent.id, parent.revision, "live-worker", 0)
-                .is_err()
-        );
+        assert!(inventory
+            .request_delete(&parent.id, parent.revision, "live-worker", 0)
+            .is_err());
         drop(worker);
         assert!(inventory.validate_post_retry(12).is_ok());
         inventory
@@ -1334,11 +1326,9 @@ mod tests {
         let guard = inventory.acquire_attempt_use(12).unwrap().unwrap();
         terminal(&inventory, &workspace, "retained");
         let artifact = inventory.for_job(12).unwrap().unwrap();
-        assert!(
-            inventory
-                .request_delete(&artifact.id, artifact.revision, "outsider", 0)
-                .is_err()
-        );
+        assert!(inventory
+            .request_delete(&artifact.id, artifact.revision, "outsider", 0)
+            .is_err());
         assert_eq!(
             inventory
                 .delete_failed_payload(&guard, 12, &|| Ok(()))

@@ -511,7 +511,7 @@ pub fn descriptor_reference(job: &Job) -> Option<NativeDescriptorRef> {
     }
     let reference: NativeDescriptorRef = serde_json::from_str(raw).ok()?;
     if job.torrent.as_ref()?.metadata_file
-        != std::path::PathBuf::from(format!(
+        != std::path::Path::new(&format!(
             "torrents/native-cache/admission-{}.torrent",
             reference.job.0
         ))

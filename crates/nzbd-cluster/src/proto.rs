@@ -21,8 +21,10 @@ pub struct PollRequest {
     pub lifecycle_protocol: u8,
     pub node: String,
     pub owner_incarnation: String,
-    #[serde(default)] pub storage_instance_id:String,
-    #[serde(default)] pub start_ordering:u8,
+    #[serde(default)]
+    pub storage_instance_id: String,
+    #[serde(default)]
+    pub start_ordering: u8,
     pub free_download_slots: u32,
     /// Free post-processing slots (C2). Absent/0 = not a PP executor.
     #[serde(default)]

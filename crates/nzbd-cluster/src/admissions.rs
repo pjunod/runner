@@ -141,7 +141,7 @@ impl ControlStore {
         if receipt.custody_state == "curator" {
             return Ok(());
         }
-        let rows=self.client.query_consistent_map::<ReceiptRow,_>("SELECT json_object('deleted',j.deleted,'status',json_extract(j.intent_json,'$.status'),'files',coalesce(json_array_length(j.intent_json,'$.files'),0),'params',json(coalesce((SELECT json_group_array(json_array(json_extract(p.value,'$[0]'),substr(json_extract(p.value,'$[1]'),1,4096))) FROM json_each(j.intent_json,'$.params') p WHERE json_extract(p.value,'$[0]') IN('monarr-transfer','Failure:Stage','Failure:Reason','*Failure:Reason','Failure:KeepOnFailure','Artifact:Id','Artifact:Generation','Artifact:Custody','Delivery:Custody','*PP:done')),'[]'))) AS data FROM control_jobs j WHERE job_id=?1",params!(i64::from(receipt.job_id))).await.map_err(|e|e.to_string())?;
+        let rows=self.client.query_consistent_map::<ReceiptRow,_>("SELECT json_object('deleted',j.deleted,'removalMode',(SELECT r.mode FROM cluster_job_removals r WHERE r.job_id=j.job_id AND r.incarnation=j.incarnation AND r.applied_revision=j.revision),'cancellationRecorded',EXISTS(SELECT 1 FROM cluster_cancellation_decisions d WHERE d.job_id=j.job_id AND d.incarnation=j.incarnation AND d.removal_revision=j.revision),'status',json_extract(j.intent_json,'$.status'),'files',coalesce(json_array_length(j.intent_json,'$.files'),0),'params',json(coalesce((SELECT json_group_array(json_array(json_extract(p.value,'$[0]'),substr(json_extract(p.value,'$[1]'),1,4096))) FROM json_each(j.intent_json,'$.params') p WHERE json_extract(p.value,'$[0]') IN('monarr-transfer','Failure:Stage','Failure:Reason','*Failure:Reason','Failure:KeepOnFailure','Artifact:Id','Artifact:Generation','Artifact:Custody','Delivery:Custody','*PP:done','*Cluster:AuthoritySourceCopy')),'[]'))) AS data FROM control_jobs j WHERE job_id=?1",params!(i64::from(receipt.job_id))).await.map_err(|e|e.to_string())?;
         let Some(row) = rows.into_iter().next() else {
             return Ok(());
         };
@@ -187,6 +187,38 @@ impl ControlStore {
             param("Artifact:Generation").or_else(|| receipt.source_generation.clone());
         if let Some(custody) = param("Delivery:Custody").or_else(|| param("Artifact:Custody")) {
             receipt.custody_state = custody;
+        }
+        // A queue tombstone does not prove byte disposal. Preserve the exact
+        // owned-source identity and expose the raw-only cancellation limit
+        // until a sealed cancellation decision supplies actual cleanup facts.
+        let authority_source = param(crate::delivery::AUTHORITY_COPY_PARAM)
+            .and_then(|value| {
+                serde_json::from_str::<crate::delivery::AuthoritySourceCopy>(&value).ok()
+            })
+            .filter(|source| source.copy.job_id == receipt.job_id);
+        if let Some(source) = authority_source.as_ref() {
+            receipt
+                .source_artifact_id
+                .get_or_insert_with(|| source.copy.source.artifact.clone());
+            receipt
+                .source_generation
+                .get_or_insert_with(|| source.copy.source.generation.clone());
+        }
+        if value["deleted"] == 1
+            && value["cancellationRecorded"] == 0
+            && receipt.source_cleanup_status.as_deref() != Some("removed")
+            && receipt.custody_state != "deleted_by_runner"
+            && receipt.source_artifact_id.is_some()
+        {
+            receipt.source_cleanup_status = Some("retained".into());
+            receipt.failure_stage = Some("source_cleanup".into());
+            let keep_files = value["removalMode"] == "keep_files";
+            receipt.custody_state = if keep_files { "kept_by_user" } else { "runner" }.into();
+            receipt.failure_cause=Some(if keep_files {
+                "Removal kept the exact source files; no byte cleanup was authorized."
+            }else{
+                "Raw source retained for review: removal was recorded without a sealed cleanup receipt. The exact source owner must confirm stopped writers and file custody before cleanup."
+            }.into());
         }
         if receipt.terminal_outcome.is_some()
             && value["files"] == 0
@@ -580,7 +612,7 @@ pub(crate) async fn rollback_pending(shared: &LeaderShared) -> Result<(), String
         }
     }
     if !absent.is_empty() {
-        let jobs=crate::control_recovery::projection(shared).await?;
+        let jobs = crate::control_recovery::projection(shared).await?;
         shared
             .engine
             .adopt_replicated_authority(jobs)
@@ -643,7 +675,11 @@ async fn preserve_unproven_legacy(
     receipt: &UrlAdmissionReceipt,
 ) -> Result<String, String> {
     let token_digest = format!("{:x}", Sha256::digest(receipt.request_token.as_bytes()));
-    let message=format!("legacy admission job {}, token SHA-256 {} lacks matching durable job/tombstone authority; accepted receipt preserved. Restore the original replicated control backup or reconcile this exact receipt identity before enabling the cluster",receipt.job_id,&token_digest[..16]);
+    let message = format!(
+        "legacy admission job {}, token SHA-256 {} lacks matching durable job/tombstone authority; accepted receipt preserved. Restore the original replicated control backup or reconcile this exact receipt identity before enabling the cluster",
+        receipt.job_id,
+        &token_digest[..16]
+    );
     fenced_write(shared,authority,vec![("INSERT INTO cluster_delivery_meta(key,value) VALUES('admission_migration_review',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value".into(),params!(&message))]).await?;
     Ok(message)
 }

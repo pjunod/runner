@@ -2,12 +2,12 @@
 //! The immutable Delivery and deletion authority never change with this policy.
 use crate::{control::ControlStore, delivery::CopyObligation, leader::LeaderShared};
 use axum::{
-    Json,
     extract::{Request, State},
     middleware::Next,
     response::{IntoResponse, Response},
+    Json,
 };
-use hiqlite::{Row, macros::params};
+use hiqlite::{macros::params, Row};
 use nzbd_state::artifacts::{
     ClusterArtifactCopy, ClusterFailureKeepStatus, ClusterFailureKeepTarget,
 };

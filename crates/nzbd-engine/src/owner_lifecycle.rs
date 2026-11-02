@@ -70,7 +70,7 @@ impl Owner {
                 operation,
                 reply,
             } => {
-                self.note_seed_keep_block_then(job, marker, operation, move |_, ok| {
+                self.note_seed_keep_block_then(job, *marker, operation, move |_, ok| {
                     let _ = reply.send(ok);
                 });
             }
@@ -549,7 +549,9 @@ impl Owner {
                         && matches!(row.status, JobStatus::Queued | JobStatus::Downloading)
                 });
                 let before = self.state.job(job).cloned();
-                if !eligible || !self.hold_job(job, cause, "torrent_copy", &message) {
+                if !eligible
+                    || !self.prepare_hold_job_until(job, cause, "torrent_copy", &message, None)
+                {
                     let _ = reply.send(false);
                     return None;
                 }

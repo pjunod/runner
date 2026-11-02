@@ -1,6 +1,6 @@
 //! Immutable bounded grant provenance; never current permission to mutate bytes.
 use crate::control::{ControlStore, LeaseToken};
-use hiqlite::{Row, params};
+use hiqlite::{params, Row};
 
 pub(crate) const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS work_grant_receipts(resource TEXT NOT NULL CHECK(length(CAST(resource AS BLOB))<=256),fence INTEGER NOT NULL,job_id INTEGER NOT NULL,job_incarnation TEXT NOT NULL CHECK(length(CAST(job_incarnation AS BLOB))<=256),job_revision INTEGER NOT NULL,owner_node_id TEXT NOT NULL CHECK(length(CAST(owner_node_id AS BLOB))<=128),owner_incarnation TEXT NOT NULL CHECK(length(CAST(owner_incarnation AS BLOB))<=128),initial_revision INTEGER NOT NULL,initial_expiry_ms INTEGER NOT NULL,kind TEXT NOT NULL CHECK(length(kind)<=32),source_binding_json TEXT CHECK(source_binding_json IS NULL OR length(CAST(source_binding_json AS BLOB))<=8192),issued_at_ms INTEGER NOT NULL,PRIMARY KEY(resource,fence)) STRICT",

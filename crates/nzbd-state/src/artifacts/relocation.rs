@@ -2952,17 +2952,15 @@ mod lease_replay_tests {
             source_cleanup_status: "pending".into(),
         }];
         FAULTS.with(|faults| faults.borrow_mut().insert("copy_chunk", libc::ENOSPC));
-        assert!(
-            inventory
-                .publish_selected_for_delivery_checked(
-                    19,
-                    &target,
-                    artifact.files,
-                    outcomes,
-                    &|| Ok(())
-                )
-                .is_err()
-        );
+        assert!(inventory
+            .publish_selected_for_delivery_checked(
+                19,
+                &target,
+                artifact.files,
+                outcomes,
+                &|| Ok(())
+            )
+            .is_err());
         let operation = inventory
             .pending_relocations(&artifact.id)
             .unwrap()
@@ -3000,11 +2998,9 @@ mod lease_replay_tests {
             }
             Ok(())
         };
-        assert!(
-            inventory
-                .prepare_post_retry_checked(19, &checkpoint)
-                .is_err()
-        );
+        assert!(inventory
+            .prepare_post_retry_checked(19, &checkpoint)
+            .is_err());
         assert!(
             expired.get(),
             "grant expires after the new copy wrote its first chunk"

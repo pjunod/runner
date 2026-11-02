@@ -50,11 +50,9 @@ fn exact_failure_keep_is_durable_and_does_not_change_generic_or_unrelated_keep()
             .unwrap()
             .keep
     );
-    assert!(
-        inventory
-            .cluster_copy_failure_keep(&target, Some((1, true)))
-            .is_err()
-    );
+    assert!(inventory
+        .cluster_copy_failure_keep(&target, Some((1, true)))
+        .is_err());
     assert!(
         !inventory
             .get(&copy.source.artifact)
@@ -68,27 +66,23 @@ fn exact_failure_keep_refuses_replaced_directory_and_generation() {
     let (_temp, inventory, copy) = fixture();
     let mut wrong = copy.clone();
     wrong.source.generation = "other".into();
-    assert!(
-        inventory
-            .cluster_copy_failure_keep(
-                &ClusterFailureKeepTarget::Artifact { copy: wrong },
-                Some((1, true))
-            )
-            .is_err()
-    );
+    assert!(inventory
+        .cluster_copy_failure_keep(
+            &ClusterFailureKeepTarget::Artifact { copy: wrong },
+            Some((1, true))
+        )
+        .is_err());
     let artifact = inventory.get(&copy.source.artifact).unwrap();
     let retained = artifact.root.join("retained-original");
     std::fs::rename(&artifact.path, &retained).unwrap();
     std::fs::create_dir(&artifact.path).unwrap();
     std::fs::write(artifact.path.join("unknown"), b"unknown").unwrap();
-    assert!(
-        inventory
-            .cluster_copy_failure_keep(
-                &ClusterFailureKeepTarget::Artifact { copy },
-                Some((1, true))
-            )
-            .is_err()
-    );
+    assert!(inventory
+        .cluster_copy_failure_keep(
+            &ClusterFailureKeepTarget::Artifact { copy },
+            Some((1, true))
+        )
+        .is_err());
     assert_eq!(
         std::fs::read(retained.join("archive.bin")).unwrap(),
         b"independent source bytes"
@@ -132,14 +126,12 @@ fn exact_keep_clear_requeues_only_an_existing_eligible_failure_operation() {
         .cluster_copy_failure_keep(&target, Some((4, false)))
         .unwrap();
     assert_eq!(inventory.operation(&id).unwrap().state, "queued");
-    assert!(
-        inventory
-            .get(&copy.source.artifact)
-            .unwrap()
-            .path
-            .join("archive.bin")
-            .exists()
-    );
+    assert!(inventory
+        .get(&copy.source.artifact)
+        .unwrap()
+        .path
+        .join("archive.bin")
+        .exists());
 }
 #[test]
 fn sealed_failure_keep_survives_restart_and_never_adopts_replaced_or_missing_bytes() {
@@ -181,11 +173,9 @@ fn sealed_failure_keep_survives_restart_and_never_adopts_replaced_or_missing_byt
     let kept = root.join("old-copy");
     std::fs::rename(&path, &kept).unwrap();
     std::fs::create_dir(&path).unwrap();
-    assert!(
-        inventory
-            .cluster_copy_failure_keep(&target, Some((2, false)))
-            .is_err()
-    );
+    assert!(inventory
+        .cluster_copy_failure_keep(&target, Some((2, false)))
+        .is_err());
     assert_eq!(
         std::fs::read(kept.join("video.bin")).unwrap(),
         b"sealed bytes"
