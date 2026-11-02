@@ -1,7 +1,5 @@
 use super::*;
-use crate::cancellation::*;
 use crate::control::{LeaseClaim, LeaseToken};
-use hiqlite::params;
 use nzbd_state::artifacts::{
     ClusterArtifactCopy, DeliveryFile, FinalizationProof, Inventory, WorkerControlContext,
 };

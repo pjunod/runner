@@ -10,6 +10,7 @@
 mod admissions;
 mod cancellation;
 mod cancellation_routes;
+mod cluster_keep;
 pub mod control;
 mod control_proofs;
 mod control_recovery;
@@ -304,6 +305,7 @@ impl ClusterRuntime {
                     if cancel.is_cancelled(){break;}
                     if shared.view.borrow().is_me && shared.authority_ready() {
                         if let Err(error)=delivery::migrate_local_deliveries(&shared).await {tracing::warn!(%error,"cluster Delivery catalog adoption remains pending");}
+                        if let Err(error)=cluster_keep::reconcile_one(&shared).await {tracing::warn!(%error,"cluster Keep owner application remains pending");}
                         if let Err(error)=delivery::cleanup_one_copy(&shared,&mut cleanup_cursor).await {tracing::warn!(%error,"cluster source-copy cleanup remains pending");}
                     }
                     tokio::select!{_=cancel.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_secs(1))=>{}}
@@ -546,6 +548,10 @@ impl ClusterRuntime {
             .layer(middleware::from_fn_with_state(
                 self.leader_shared.clone(),
                 delivery::serve_cluster_delivery,
+            ))
+            .layer(middleware::from_fn_with_state(
+                self.leader_shared.clone(),
+                cluster_keep::serve,
             )),
             auth.clone(),
         )
@@ -600,6 +606,9 @@ async fn commit_control_mutation(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    if cluster_keep::serves(&request) {
+        return next.run(request).await;
+    }
     let observations = shared
         .control_proofs
         .snapshot()

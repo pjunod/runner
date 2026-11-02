@@ -327,6 +327,7 @@ impl ControlStore {
             .map_err(|error| format!("install control schema statement: {error}"))?;
         let store=Self{client};
         crate::cancellation::install_schema(&store).await?;
+        crate::cluster_keep::install_schema(&store).await?;
         Ok(store)
     }
 

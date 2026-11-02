@@ -113,6 +113,95 @@ fn save(db: &Connection, id: &str, record: &GrantJournal) -> Result<()> {
     Ok(())
 }
 impl Inventory {
+    /// Capture only the recorded owned manifest or the exact writer names of
+    /// the removed job, after the peer caller has joined every grant writer.
+    /// Unknown members are retained; this does not discover/adopt arbitrary files.
+    pub fn cluster_cancellation_file_seal(
+        &self,
+        copy: &ClusterArtifactCopy,
+        writer_paths: &[String],
+    ) -> Result<Vec<DeliveryFile>> {
+        use std::io::Read;
+        let _guard = self.mutation_guard()?;
+        let artifact = self.get(&copy.publication.artifact)?;
+        if copy.storage_instance_id != self.installation
+            || artifact.generation != copy.publication.generation
+            || artifact.job != Some(copy.job_id)
+            || !artifact.owned
+            || !artifact.automatic_cleanup_eligible
+            || self.artifact_in_use(&artifact)?
+        {
+            return Err(Error::Conflict(
+                "cancelled copy identity/use changed; retain for review".into(),
+            ));
+        }
+        let directory = self.verify(&artifact)?;
+        let observed = fs::manifest(&directory, 100_000)?;
+        let recorded: std::collections::HashMap<_, _> = artifact
+            .files
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect();
+        let paths: std::collections::HashSet<&str> =
+            writer_paths.iter().map(String::as_str).collect();
+        let allowed: std::collections::HashSet<&str> =
+            if artifact.files.is_empty() && artifact.state == "active" {
+                paths
+            } else {
+                recorded.keys().copied().collect()
+            };
+        let mut directories = std::collections::HashSet::new();
+        for path in &allowed {
+            let mut parent = Path::new(path).parent();
+            while let Some(path) = parent.filter(|p| !p.as_os_str().is_empty()) {
+                directories.insert(path.to_string_lossy().into_owned());
+                parent = path.parent();
+            }
+        }
+        let mut files = Vec::new();
+        for entry in observed {
+            if entry.identity.directory {
+                if !directories.contains(&entry.path) {
+                    return Err(Error::Conflict(format!(
+                        "unrecorded directory {}; source retained",
+                        entry.path
+                    )));
+                }
+                continue;
+            }
+            if !allowed.contains(entry.path.as_str())
+                || recorded
+                    .get(entry.path.as_str())
+                    .is_some_and(|known| known.identity != entry.identity)
+            {
+                return Err(Error::Conflict(format!(
+                    "unrecorded/changed file {}; source retained",
+                    entry.path
+                )));
+            }
+            let mut input = fs::open_relative(&directory, &entry.path)?;
+            let mut hash = Sha256::new();
+            let mut buffer = [0u8; 65536];
+            loop {
+                let count = input.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                hash.update(&buffer[..count]);
+            }
+            if fs::identity_for_file(&input)? != entry.identity {
+                return Err(Error::Conflict(
+                    "file changed while sealing stopped source".into(),
+                ));
+            }
+            files.push(DeliveryFile {
+                path: entry.path,
+                size_bytes: entry.identity.bytes,
+                sha256: format!("{:x}", hash.finalize()),
+            });
+        }
+        Ok(files)
+    }
     /// Resolve a previously journaled exact lease without reconstructing its
     /// renewed epoch from a caller. Missing means never-started only when the
     /// immutable authority grant advertised start ordering.

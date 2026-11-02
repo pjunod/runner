@@ -1,8 +1,8 @@
 //! Immutable bounded grant provenance; never current permission to mutate bytes.
 use crate::control::{ControlStore, LeaseToken};
-use hiqlite::{params, Row};
+use hiqlite::{Row, params};
 
-pub(crate) const SCHEMA:&[&str]=&[
+pub(crate) const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS work_grant_receipts(resource TEXT NOT NULL CHECK(length(CAST(resource AS BLOB))<=256),fence INTEGER NOT NULL,job_id INTEGER NOT NULL,job_incarnation TEXT NOT NULL CHECK(length(CAST(job_incarnation AS BLOB))<=256),job_revision INTEGER NOT NULL,owner_node_id TEXT NOT NULL CHECK(length(CAST(owner_node_id AS BLOB))<=128),owner_incarnation TEXT NOT NULL CHECK(length(CAST(owner_incarnation AS BLOB))<=128),initial_revision INTEGER NOT NULL,initial_expiry_ms INTEGER NOT NULL,kind TEXT NOT NULL CHECK(length(kind)<=32),source_binding_json TEXT CHECK(source_binding_json IS NULL OR length(CAST(source_binding_json AS BLOB))<=8192),issued_at_ms INTEGER NOT NULL,PRIMARY KEY(resource,fence)) STRICT",
     "CREATE TABLE IF NOT EXISTS work_grant_start_order(resource TEXT NOT NULL,fence INTEGER NOT NULL,storage_instance TEXT NOT NULL CHECK(length(CAST(storage_instance AS BLOB)) BETWEEN 1 AND 128),version INTEGER NOT NULL CHECK(version=1),PRIMARY KEY(resource,fence)) STRICT",
     "CREATE TRIGGER IF NOT EXISTS grant_start_order_insert AFTER INSERT ON work_leases WHEN NEW.resource<>'cluster/leader' AND json_extract(NEW.scope_json,'$._startOrdered')=1 BEGIN INSERT INTO work_grant_start_order(resource,fence,storage_instance,version) VALUES(NEW.resource,NEW.fence,json_extract(NEW.scope_json,'$._workerStorage'),1); END",
@@ -12,7 +12,7 @@ pub(crate) const SCHEMA:&[&str]=&[
     "CREATE TRIGGER IF NOT EXISTS grant_receipt_regrant AFTER UPDATE OF fence ON work_leases WHEN NEW.resource<>'cluster/leader' AND NEW.fence<>OLD.fence BEGIN INSERT INTO work_grant_receipts(resource,fence,job_id,job_incarnation,job_revision,owner_node_id,owner_incarnation,initial_revision,initial_expiry_ms,kind,source_binding_json,issued_at_ms) VALUES(NEW.resource,NEW.fence,NEW.job_id,NEW.job_incarnation,NEW.job_revision,NEW.owner_node_id,NEW.owner_incarnation,NEW.revision,NEW.expires_at_ms,NEW.kind,(SELECT json_extract(p.value,'$[1]') FROM control_jobs j,json_each(j.intent_json,'$.params') p WHERE j.job_id=NEW.job_id AND json_extract(p.value,'$[0]')='*Cluster:AuthoritySourceCopy' LIMIT 1),NEW.updated_at_ms); END",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HistoricalGrant {
     /// Original token at claim; later renewals may advance revision/expiry.
     pub initial_token: LeaseToken,
@@ -83,7 +83,9 @@ impl ControlStore {
         }
         let keys=self.client.query_consistent_map::<Key,_>("SELECT resource,fence FROM work_grant_receipts WHERE job_id=?1 AND job_incarnation=?2 ORDER BY issued_at_ms,resource,fence LIMIT 257",params!(i64::from(job),incarnation)).await.map_err(|e|e.to_string())?;
         if keys.len() > 256 {
-            return Err("job has more than256 historical grants; retain for operator review".into());
+            return Err(
+                "job has more than256 historical grants; retain for operator review".into(),
+            );
         }
         let mut grants = Vec::with_capacity(keys.len());
         for key in keys {

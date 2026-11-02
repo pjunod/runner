@@ -148,6 +148,7 @@ pub struct LeaderShared {
     post_poll_turn: Mutex<HashSet<String>>,
     completion_operations: CompletionOperations,
     pub(crate) copy_operations: CompletionOperations,
+    pub(crate) copy_guards: crate::cluster_keep::CopyGuards,
     pub(crate) control_proofs: crate::control_proofs::ControlProofs,
     pub(crate) worker_leases: Mutex<Option<crate::worker::ActiveLeases>>,
     #[cfg(test)]
@@ -219,6 +220,7 @@ impl LeaderShared {
             post_poll_turn: Mutex::new(HashSet::new()),
             completion_operations: CompletionOperations::default(),
             copy_operations: CompletionOperations::default(),
+            copy_guards: Default::default(),
             control_proofs: Default::default(),
             worker_leases: Mutex::new(None),
             #[cfg(test)]
@@ -823,6 +825,22 @@ pub fn router(shared: Arc<LeaderShared>) -> Router {
         .route("/cluster/v1/work/heartbeat", post(work_heartbeat))
         .route("/cluster/v1/work/complete", post(work_complete))
         .route("/cluster/v1/work/reject", post(work_reject))
+        .route(
+            "/cluster/v1/keep/apply",
+            post(crate::cluster_keep::apply_owner),
+        )
+        .route(
+            "/cluster/v1/work/cancellation-seal",
+            post(crate::cancellation_routes::seal),
+        )
+        .route(
+            "/cluster/v1/work/cancellation-stop-authority",
+            post(crate::cancellation_routes::stop_authority),
+        )
+        .route(
+            "/cluster/v1/work/cancellation-seal-authority",
+            post(crate::cancellation_routes::seal_authority),
+        )
         .route(
             "/cluster/v1/work/cancelled-completion",
             post(crate::cancellation_routes::completed),

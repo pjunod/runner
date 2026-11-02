@@ -1,7 +1,7 @@
 //! Exact, replicated disposition of a sealed result rejected after removal.
 //! A timeout, expired lease or peer-supplied path creates no byte authority.
 use crate::control::ControlStore;
-use hiqlite::{macros::params, Row};
+use hiqlite::{Row, macros::params};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,6 +12,7 @@ pub(crate) enum RemovalMode {
     CompletedRetirement,
 }
 impl RemovalMode {
+    #[cfg(test)]
     pub(crate) fn native_action(action: &str) -> Option<Self> {
         match action {
             "delete-files" => Some(Self::DeleteFiles),
@@ -19,6 +20,7 @@ impl RemovalMode {
             _ => None,
         }
     }
+    #[cfg(test)]
     pub(crate) fn compat_action(action: &str) -> Option<Self> {
         match action {
             "GroupFinalDelete" => Some(Self::DeleteFiles),
@@ -88,7 +90,7 @@ pub(crate) struct CancellationRequest {
     pub receipt_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RemovalRecord {
     pub job_id: u32,
     pub incarnation: String,
@@ -527,6 +529,48 @@ fn cancellation_record(
             }
         }
     }
+    // A selected publication is only the delivered subset. Its exact owned
+    // processing predecessor remains a separate disposal obligation.
+    if let Some(selected) = proof
+        .manifest
+        .artifact_copy
+        .as_ref()
+        .filter(|copy| copy.selected && copy.source != copy.publication)
+    {
+        let mut predecessor = selected.clone();
+        predecessor.publication = selected.source.clone();
+        predecessor.selected = false;
+        let id = format!(
+            "artifact:{}:{}:{}",
+            predecessor.storage_instance_id,
+            predecessor.publication.artifact,
+            predecessor.publication.generation
+        );
+        copies
+            .entry(id.clone())
+            .or_insert(crate::delivery::CopyObligation {
+                id,
+                owner_node: request.node.clone(),
+                artifact: Some(predecessor),
+                local_delivery_id: None,
+                result_ref: None,
+                result_id: None,
+                directory_identity: None,
+                deletion_files: None,
+                status: "review_required".into(),
+                error: Some(
+                    if removing {
+                        "Waiting for exact processing-source owner stop and recorded file seal."
+                    } else {
+                        "Removal keeps these processing source files."
+                    }
+                    .into(),
+                ),
+                claim_id: None,
+                attempts: 0,
+                next_retry_at: None,
+            });
+    }
     let id = format!("generation:{}", request.result_id);
     copies.insert(
         id.clone(),
@@ -727,6 +771,23 @@ pub(crate) async fn acknowledge_owner_stop(
     authenticated_owner: &str,
     issuer: (&str, &str, u64),
 ) -> Result<bool, String> {
+    acknowledge_owner_stop_policy(control, ack, authenticated_owner, issuer, false).await
+}
+pub(crate) async fn acknowledge_unpublished_owner_stop(
+    control: &ControlStore,
+    ack: &OwnerStopAck,
+    authenticated_owner: &str,
+    issuer: (&str, &str, u64),
+) -> Result<bool, String> {
+    acknowledge_owner_stop_policy(control, ack, authenticated_owner, issuer, true).await
+}
+async fn acknowledge_owner_stop_policy(
+    control: &ControlStore,
+    ack: &OwnerStopAck,
+    authenticated_owner: &str,
+    issuer: (&str, &str, u64),
+    unpublished: bool,
+) -> Result<bool, String> {
     use sha2::{Digest, Sha256};
     if !bounded_identity(authenticated_owner, 128)
         || !bounded_identity(&ack.cleanup_id, 256)
@@ -734,8 +795,8 @@ pub(crate) async fn acknowledge_owner_stop(
         || !bounded_identity(&ack.job_incarnation, 256)
         || ack.files.len() > 100_000
         || ack.copy.job_id != ack.job_id
-        || ack.copy.selected
-        || ack.copy.source != ack.copy.publication
+        || (ack.copy.selected && !unpublished)
+        || (!ack.copy.selected && ack.copy.source != ack.copy.publication)
     {
         return Err("owner-stop acknowledgment has invalid exact source identity".into());
     }

@@ -1,10 +1,10 @@
 //! Cluster-visible Delivery receipts. Payload authority is the committed
 //! publication receipt; mutable per-copy cleanup never changes its identity.
 use crate::control::ControlStore;
-use hiqlite::{macros::params, Row};
+use hiqlite::{Row, macros::params};
 use nzbd_state::artifacts::{ClusterArtifactCopy, Delivery};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub(crate) const AUTHORITY_COPY_PARAM: &str = "*Cluster:AuthoritySourceCopy";
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -453,22 +453,27 @@ pub(crate) fn immutable_delivery(record: &ClusterDelivery) -> Value {
 }
 pub(crate) fn discovery_value(record: &ClusterDelivery) -> Value {
     if record.copies.len() > 64 {
-        return discovery_stub(record.delivery.sequence,&record.delivery.delivery_id,
-            "publication has more than 64 source copies; source retained for review; private cleanup obligations remain available to the owning Runner nodes");
+        return discovery_stub(
+            record.delivery.sequence,
+            &record.delivery.delivery_id,
+            "publication has more than 64 source copies; source retained for review; private cleanup obligations remain available to the owning Runner nodes",
+        );
     }
     let mut value = if record.cleanup_only {
         json!({"protocolVersion":1,"cleanupOnly":true,"cleanupId":record.delivery.delivery_id,"jobId":record.delivery.job_id,"sourceCleanup":record.delivery.source_cleanup})
     } else {
         serde_json::to_value(&record.delivery).unwrap_or(Value::Null)
     };
-    value["sourceCopies"] = json!(record
-        .copies
-        .iter()
-        .map(|copy| json!({
-            "id":copy.id,"ownerNode":copy.owner_node,"status":copy.status,
-            "error":copy.error,"attempts":copy.attempts,"nextRetryAt":copy.next_retry_at
-        }))
-        .collect::<Vec<_>>());
+    value["sourceCopies"] = json!(
+        record
+            .copies
+            .iter()
+            .map(|copy| json!({
+                "id":copy.id,"ownerNode":copy.owner_node,"status":copy.status,
+                "error":copy.error,"attempts":copy.attempts,"nextRetryAt":copy.next_retry_at
+            }))
+            .collect::<Vec<_>>()
+    );
     if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > 8 * 1024 * 1024) {
         discovery_stub(
             record.delivery.sequence,
@@ -532,7 +537,11 @@ impl ControlStore {
             let value = if let Some(error) = row.discovery_error {
                 discovery_stub(row.sequence, &row.id, &error)
             } else if row.bytes > 8 * 1024 * 1024 {
-                discovery_stub(row.sequence,&row.id,"publication manifest exceeds supported discovery size; source retained for review")
+                discovery_stub(
+                    row.sequence,
+                    &row.id,
+                    "publication manifest exceeds supported discovery size; source retained for review",
+                )
             } else {
                 match self.public_delivery_value(&row.id).await {
                     Ok(Some(value)) => value,
@@ -642,7 +651,7 @@ pub(crate) async fn serve_cluster_delivery(
             Ok(token) => token,
             Err(error) => {
                 return (StatusCode::BAD_REQUEST, axum::Json(json!({"error":error})))
-                    .into_response()
+                    .into_response();
             }
         };
         let mut receipt = match control.admission(&token).await {
@@ -654,14 +663,14 @@ pub(crate) async fn serve_cluster_delivery(
                         json!({"error":"request admission not found in authoritative catalog"}),
                     ),
                 )
-                    .into_response()
+                    .into_response();
             }
             Err(error) => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     axum::Json(json!({"error":error})),
                 )
-                    .into_response()
+                    .into_response();
             }
         };
         // Terminal progress is derived from replicated intent/tombstones;
@@ -673,7 +682,7 @@ pub(crate) async fn serve_cluster_delivery(
                     StatusCode::SERVICE_UNAVAILABLE,
                     axum::Json(json!({"error":error})),
                 )
-                    .into_response()
+                    .into_response();
             }
         };
         if let Some(record) = record {
@@ -973,7 +982,7 @@ pub(crate) async fn cleanup_copy(
                 axum::http::StatusCode::CONFLICT,
                 axum::Json(json!({"error":error})),
             )
-                .into_response()
+                .into_response();
         }
     };
     let copy = authority.copy.clone();
@@ -989,9 +998,30 @@ pub(crate) async fn cleanup_copy(
     let inventory = shared.engine.artifacts();
     let root = shared.cfg.shared_dir.join(".nzbd-cluster/generations");
     let operation_key = format!("{}:{}", request.delivery_id, request.copy_id);
+    let guarded = shared.clone();
     let result = shared
         .copy_operations
         .run(operation_key, async move {
+            let guard = guarded.copy_guards.lock_for(&copy);
+            let _physical = guard.lock().await;
+            match crate::cluster_keep::check_copy_policy(&guarded, &copy, &authority.outcome).await
+            {
+                Ok(None) => {}
+                policy => {
+                    return (
+                        axum::http::StatusCode::CONFLICT,
+                        axum::Json(nzbd_state::artifacts::ClusterCopyCleanup {
+                            status: "retained".into(),
+                            error: Some(match policy {
+                                Ok(Some(reason)) => reason,
+                                Err(error) => error,
+                                _ => unreachable!(),
+                            }),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
             let result = tokio::task::spawn_blocking(
                 move || -> Result<nzbd_state::artifacts::ClusterCopyCleanup, String> {
                     if let Some(local) = copy.local_delivery_id {
@@ -1012,6 +1042,20 @@ pub(crate) async fn cleanup_copy(
                         if authority.source_disposition.as_deref()
                             == Some("cancellation_delete_files")
                         {
+                            if artifact.selected {
+                                return inventory
+                                    .delete_cancelled_cluster_unpublished_publication(
+                                        &artifact,
+                                        nzbd_state::artifacts::FinalizationProof::Cluster {
+                                            receipt: authority.receipt,
+                                            accepted_at_ms: authority.accepted_at_ms,
+                                        },
+                                        copy.deletion_files
+                                            .as_deref()
+                                            .ok_or("unpublished copy awaits exact owner seal")?,
+                                    )
+                                    .map_err(|e| e.to_string());
+                            }
                             return inventory
                                 .delete_cancelled_cluster_artifact_copy(
                                     &artifact,
@@ -1122,6 +1166,18 @@ pub(crate) async fn cleanup_one_copy(
     let mut selected = None;
     for mut record in rows {
         *cursor = record.delivery.sequence;
+        if record.source_disposition.as_deref() == Some("cancellation_delete_files")
+            && record
+                .copies
+                .iter()
+                .any(|copy| copy.artifact.is_some() && copy.status == "review_required")
+        {
+            crate::cancellation_routes::refresh_owner_seals(shared, &record).await?;
+            record = control
+                .cluster_delivery(&record.delivery.delivery_id)
+                .await?
+                .ok_or("cancellation ledger disappeared")?;
+        }
         let Some(index) = record.copies.iter().position(|copy| {
             copy.status != "removed"
                 && copy.status != "review_required"
@@ -1460,23 +1516,27 @@ mod tests {
             60000
         );
         let escaped = params!("\n".repeat(33 * 1024 * 1024));
-        assert!(bounded_statement(
-            "INSERT INTO cluster_delivery_meta(key,value) VALUES('oversize',?1)",
-            &escaped
-        )
-        .unwrap_err()
-        .contains("64 MiB"));
+        assert!(
+            bounded_statement(
+                "INSERT INTO cluster_delivery_meta(key,value) VALUES('oversize',?1)",
+                &escaped
+            )
+            .unwrap_err()
+            .contains("64 MiB")
+        );
         let mut oversized = store
             .cluster_delivery("old-delivery")
             .await
             .unwrap()
             .unwrap();
         oversized.delivery.failure_cause = Some("x".repeat(crate::proto::MAX_RPC_BYTES));
-        assert!(store
-            .update_cluster_delivery(&oversized)
-            .await
-            .unwrap_err()
-            .contains("32 MiB"));
+        assert!(
+            store
+                .update_cluster_delivery(&oversized)
+                .await
+                .unwrap_err()
+                .contains("32 MiB")
+        );
         assert_eq!(
             store
                 .cluster_delivery("old-delivery")
@@ -1617,31 +1677,37 @@ mod tests {
         let mut orphan = admission.clone();
         orphan.request_token = "uncommitted-local-only".into();
         fresh.name = "stale request must not win".into();
-        assert!(store
-            .commit_job_delta_guarded(
-                &[(5000, Some(fresh.clone()))],
-                &stale,
-                std::slice::from_ref(&orphan),
-                None
-            )
-            .await
-            .is_err());
-        assert!(store
-            .admission(&orphan.request_token)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .commit_job_delta_guarded(
+                    &[(5000, Some(fresh.clone()))],
+                    &stale,
+                    std::slice::from_ref(&orphan),
+                    None
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .admission(&orphan.request_token)
+                .await
+                .unwrap()
+                .is_none()
+        );
         // Absence in the caller's pre-request fence means INSERT-only, even
         // when a later owner has since occupied this same integer ID.
-        assert!(store
-            .commit_job_delta_guarded(
-                &[(5000, Some(fresh))],
-                &std::collections::HashMap::new(),
-                std::slice::from_ref(&orphan),
-                None
-            )
-            .await
-            .is_err());
+        assert!(
+            store
+                .commit_job_delta_guarded(
+                    &[(5000, Some(fresh))],
+                    &std::collections::HashMap::new(),
+                    std::slice::from_ref(&orphan),
+                    None
+                )
+                .await
+                .is_err()
+        );
         let (jobs, _) = store.highwater().await.unwrap();
         assert!(jobs >= 5000);
         let mut resolved = origin.clone();
@@ -1681,11 +1747,13 @@ mod tests {
             &runtime.leader_shared.layout.state_dir(),
         )
         .unwrap();
-        assert!(reopened
-            .pending(8)
-            .unwrap()
-            .iter()
-            .any(|row| row.resolution_id == prepared.resolution_id));
+        assert!(
+            reopened
+                .pending(8)
+                .unwrap()
+                .iter()
+                .any(|row| row.resolution_id == prepared.resolution_id)
+        );
         // Crash boundary: replicated commit won, old process died before ACK.
         assert!(store.commit_url_outbox(&prepared).await.unwrap());
         drop(serial);
@@ -1716,9 +1784,11 @@ mod tests {
         assert_eq!(selected.dir_name, "user-dir");
         assert_eq!(selected.category, None);
         assert_eq!(selected.priority, 9);
-        assert!(selected
-            .params
-            .contains(&("*Runner:KeepOnFailure".into(), "1".into())));
+        assert!(
+            selected
+                .params
+                .contains(&("*Runner:KeepOnFailure".into(), "1".into()))
+        );
         assert_eq!(selected.status, nzbd_types::JobStatus::Failed);
         let mut legacy = record(&instance, "accepted-local").delivery;
         legacy.sequence = 41;
@@ -1745,9 +1815,11 @@ mod tests {
             Some("41")
         );
         let (pending, _) = store.cluster_discovery_page(0, 100, false).await.unwrap();
-        assert!(!pending
-            .iter()
-            .any(|row| row["deliveryId"] == "accepted-local"));
+        assert!(
+            !pending
+                .iter()
+                .any(|row| row["deliveryId"] == "accepted-local")
+        );
         let (all, _) = store.cluster_discovery_page(0, 100, true).await.unwrap();
         let imported = all
             .iter()
@@ -1891,11 +1963,13 @@ mod tests {
         }
         {
             let _serial = runtime.leader_shared.mutation_serial.lock().await;
-            assert!(runtime
-                .engine
-                .adopt_replicated_highwater(6000, 900)
-                .await
-                .unwrap());
+            assert!(
+                runtime
+                    .engine
+                    .adopt_replicated_highwater(6000, 900)
+                    .await
+                    .unwrap()
+            );
             let before = runtime.leader_shared.engine_projection().await.unwrap();
             let fences = store
                 .job_revision_fences_for(&before.keys().copied().collect::<Vec<_>>())
@@ -2032,13 +2106,15 @@ mod tests {
                     .name,
                 "accepted replacement"
             );
-            assert!(!runtime
-                .engine
-                .url_resolution_outbox(100)
-                .await
-                .unwrap()
-                .iter()
-                .any(|record| record.origin.id == old));
+            assert!(
+                !runtime
+                    .engine
+                    .url_resolution_outbox(100)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|record| record.origin.id == old)
+            );
         }
         let final_record = store
             .commit_delivery(&record(&instance, "valid-after-bad"))
@@ -2066,17 +2142,21 @@ mod tests {
             .collect();
         assert!(by_id["invalid"]["discoveryError"].is_string());
         assert!(by_id["oversized"]["discoveryError"].is_string());
-        assert!(by_id["too-many-copies"]["discoveryError"]
-            .as_str()
-            .unwrap()
-            .contains("64 source copies"));
+        assert!(
+            by_id["too-many-copies"]["discoveryError"]
+                .as_str()
+                .unwrap()
+                .contains("64 source copies")
+        );
         assert!(
             by_id["private-proof"].get("discoveryError").is_none(),
             "private deletion proof bytes cannot reject a small public envelope"
         );
-        assert!(by_id["private-proof"]["sourceCopies"][0]
-            .get("deletionFiles")
-            .is_none());
+        assert!(
+            by_id["private-proof"]["sourceCopies"][0]
+                .get("deletionFiles")
+                .is_none()
+        );
         assert_eq!(page["nextCursor"], final_record.delivery.sequence);
         assert_eq!(by_id["first"]["sequence"], committed.delivery.sequence);
         assert_eq!(by_id["first"]["consumerReceiptId"], "consumer-receipt");
@@ -2087,11 +2167,13 @@ mod tests {
         let leader_bytes = std::fs::read(&leader_file).unwrap();
         std::fs::remove_file(&leader_file).unwrap();
         std::fs::create_dir(&leader_file).unwrap();
-        assert!(!runtime
-            .engine
-            .adopt_replicated_highwater(9000, 9000)
-            .await
-            .unwrap());
+        assert!(
+            !runtime
+                .engine
+                .adopt_replicated_highwater(9000, 9000)
+                .await
+                .unwrap()
+        );
         assert!(
             crate::admissions::adopt(&runtime.leader_shared)
                 .await
@@ -2126,14 +2208,16 @@ mod tests {
         runtime.cancel.cancel();
         runtime.tracker.wait().await;
         store.client.execute("UPDATE work_leases SET owner_incarnation='replacement-authority' WHERE resource='cluster/leader'",params!()).await.unwrap();
-        assert!(store
-            .initialize_delivery_identity_guarded(
-                "wrong-storage",
-                "wrong-owner",
-                Some(runtime.leader_shared.authority_identity())
-            )
-            .await
-            .is_err());
+        assert!(
+            store
+                .initialize_delivery_identity_guarded(
+                    "wrong-storage",
+                    "wrong-owner",
+                    Some(runtime.leader_shared.authority_identity())
+                )
+                .await
+                .is_err()
+        );
         assert_eq!(store.delivery_instance().await.unwrap(), instance);
         server.abort();
         runtime.shutdown().await;
