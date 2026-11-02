@@ -15,7 +15,8 @@ outside compiler caches in the task's durable evidence directory.
   through merge 1bac4dd7, with typed hold policy and one authority recovery loop.
 - Curator initially audited at dae7424; PR #76 (990e768) and PR #77 (17eb0f6)
   are preserved through merges 225cfd6 and 4935fab. PR #78 (ecee8fe) shutdown
-  ownership is preserved in a916ded. Mobile build 31 is retained.
+  ownership is preserved in a916ded. PR #79 (74111769) is preserved in 640f799;
+  its iOS build 33 is retained.
 - Lower-model agents implement isolated slices; primary reviews integration.
 - Final Astra adversarial review precedes the full required test gates.
 - Merge only after findings are resolved and required tests/checks pass.
@@ -90,8 +91,10 @@ Cluster partial-unlink replay now resumes its exact journal while preserving
 selected-copy original-source obligations. Actual mixed-worker fairness passes
 with real NNTP activity. Authority upgrade receipts and live-lease relocation
 checks and cluster admission failover are integrated. Native acquisition remains
-under construction; the copy helper has focused crash/cleanup tests while its
-per-file progress storage and engine integration are being completed. Cancellation disposition must still prove physical cleanup
+under construction; the copy helper and bounded per-file progress storage are
+integrated in ccf9b3f7/f2ec5639, with 28 focused crash/cleanup checks passing.
+Engine integration and the real paired native test remain pending.
+Cancellation disposition must still prove physical cleanup
 for explicit file deletion while preserving remove-job-and-keep-files behavior.
 
 ## 4. Durable work and recovery
