@@ -5981,6 +5981,10 @@ impl Owner {
         self.payload_then(
             root.clone(),
             move || {
+                // Admission can overtake the state-lane startup-root snapshot.
+                // Prepare its own prerequisite on the bounded payload worker;
+                // an enrolled missing mount must still remain unavailable.
+                prepare_unenrolled_payload_root(&inventory, &root)?;
                 let base = job_dir_name(&record);
                 let mut suffix = 0_u32;
                 let (name, path) = loop {
@@ -8630,6 +8634,65 @@ mod tests {
             !allocation.root.exists(),
             "an absent enrolled mount cannot be recreated as an empty directory"
         );
+    }
+
+    #[tokio::test]
+    async fn fresh_admission_prepares_root_before_startup_callback_and_refuses_missing_enrolled_root(
+    ) {
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        // Hold the completed state-lane enumeration before the owner can queue
+        // root reconciliation. Immediate user admission must work in this order.
+        let startup = tokio::time::timeout(Duration::from_secs(5), messages.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!owner.startup_roots_ready);
+        assert!(!owner.dest_dir.exists());
+        owner.state.jobs.push(pending_job(1));
+        let (reply, mut allocated) = oneshot::channel();
+        owner.allocate_new_payload_then(JobId(1), move |_, result| {
+            reply.send(result).unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    result = &mut allocated => break result.unwrap().unwrap(),
+                    message = messages.recv() => owner.on_msg(message.unwrap()),
+                }
+            }
+        })
+        .await
+        .expect("fresh admission must not depend on startup enumeration delivery");
+        assert!(!owner.startup_roots_ready);
+        let allocation = owner.allocation_cache[&JobId(1)].clone();
+        assert_eq!(allocation.root, owner.dest_dir);
+        assert!(allocation.path.is_dir());
+        let bound = owner.artifacts.for_job(1).unwrap().unwrap();
+        assert_eq!(bound.id, allocation.id);
+        assert_eq!(bound.generation, allocation.generation);
+        assert_eq!(bound.path, allocation.path);
+
+        owner.on_msg(startup);
+        pump(&mut owner, &mut messages).await;
+        std::fs::remove_dir_all(&allocation.path).unwrap();
+        std::fs::remove_dir(&allocation.root).unwrap();
+        owner.state.jobs.push(pending_job(2));
+        let (reply, refused) = oneshot::channel();
+        owner.allocate_new_payload_then(JobId(2), move |_, result| {
+            reply.send(result).unwrap();
+        });
+        pump(&mut owner, &mut messages).await;
+        assert!(refused.await.unwrap().is_err());
+        assert!(
+            !allocation.root.exists(),
+            "missing enrolled custody cannot become a fresh root"
+        );
+        let retained = owner.artifacts.for_job(1).unwrap().unwrap();
+        assert_eq!(retained.path, allocation.path);
+        assert_eq!(retained.generation, allocation.generation);
+        assert_eq!(retained.root_identity, allocation.root_identity);
+        assert!(owner.artifacts.for_job(2).unwrap().is_none());
+        assert!(!owner.allocation_cache.contains_key(&JobId(2)));
     }
 
     #[cfg(unix)]
