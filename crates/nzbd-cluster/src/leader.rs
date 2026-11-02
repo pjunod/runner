@@ -148,6 +148,7 @@ pub struct LeaderShared {
     post_poll_turn: Mutex<HashSet<String>>,
     completion_operations: CompletionOperations,
     pub(crate) copy_operations: CompletionOperations,
+    pub(crate) control_proofs:crate::control_proofs::ControlProofs,
     #[cfg(test)]
     verification_gate: Mutex<Option<Arc<VerificationGate>>>,
     #[cfg(test)]
@@ -217,6 +218,7 @@ impl LeaderShared {
             post_poll_turn: Mutex::new(HashSet::new()),
             completion_operations: CompletionOperations::default(),
             copy_operations: CompletionOperations::default(),
+            control_proofs:Default::default(),
             #[cfg(test)]
             verification_gate: Mutex::new(None),
             #[cfg(test)]
@@ -290,7 +292,8 @@ impl LeaderShared {
         for job in after.values_mut() {
             if let Some(marker)=nzbd_engine::automatic_control::transition(job) {
                 let old=before.get(&u64::from(job.id.0));
-                if let Some(old)=old.filter(|old|crate::control_recovery::business_intent(old).ok()==crate::control_recovery::business_intent(job).ok()) {
+                let same_business=match old {Some(old)=>crate::control_recovery::business_intent(old)?==crate::control_recovery::business_intent(job)?,None=>false};
+                if let Some(old)=old.filter(|_|same_business) {
                     // Automatic/progress changes on another job belong to
                     // reconciliation, never this request's whole-job delta.
                     *job=old.clone();continue;
@@ -400,6 +403,7 @@ impl LeaderShared {
         }
         serde_json::json!({
             "leases": leases,
+            "controlProofs":self.control_proofs.snapshot(),
             "provider_budgets": {
                 "generation": budget.generation,
                 "desired": budget.pending_target.as_ref().unwrap_or(&budget.grants),
@@ -2219,6 +2223,7 @@ pub fn spawn_leader_task(
                     }
                 }
             } else if !is_leader {
+                shared.control_proofs.invalidate();
                 authority_ready = false;
                 shared.authority_ready.store(false, Ordering::Release);
             }
@@ -4172,7 +4177,7 @@ mod tests {
         assert!(runtime.engine.hold_job(JobId(92),nzbd_types::HoldCause::Allocation,"download","allocation temporarily unavailable").await.unwrap());
         let held=runtime.engine.export_job(JobId(92)).await.unwrap().unwrap();
         let marker=nzbd_engine::automatic_control::transition(&held).expect("real actor hold has provenance");
-        crate::control_recovery::reconcile(shared).await.unwrap();
+        settle_automatic_control(shared,JobId(92)).await;
         let (durable,revision,_)=control.current_job_intent(92).await.unwrap().unwrap();
         assert_eq!(durable.control().as_ref(),Some(&marker.result_control));
         assert!(!durable.params.iter().any(|(key,_)|key==nzbd_engine::automatic_control::AUTOMATIC_CONTROL_PARAM));
@@ -4180,7 +4185,7 @@ mod tests {
         // Simulate a lost local ACK by restoring its exact persisted marker.
         runtime.engine.import_job(held,false,false).await.unwrap();
         assert!(nzbd_engine::automatic_control::transition(&runtime.engine.export_job(JobId(92)).await.unwrap().unwrap()).is_some());
-        crate::control_recovery::reconcile(shared).await.unwrap();
+        settle_automatic_control(shared,JobId(92)).await;
         assert_eq!(control.current_job_intent(92).await.unwrap().unwrap().1,revision,"ACK replay must not add another durable transition");
         // Advance only this fixture's persisted retry clock; the following
         // release still runs the production Recovery actor path.
@@ -4196,12 +4201,117 @@ mod tests {
         paused_control.revision=(paused_control.revision.parse::<u64>().unwrap()+1).to_string();
         paused.set_control(&paused_control);paused.status=JobStatus::Paused;
         control.commit_job_delta(&[(92,Some(paused))]).await.unwrap();
-        crate::control_recovery::reconcile(shared).await.unwrap();
+        settle_automatic_control(shared,JobId(92)).await;
         let current=runtime.engine.export_job(JobId(92)).await.unwrap().unwrap();
         assert_eq!(current.status,JobStatus::Paused);assert!(current.control().unwrap().manual_pause);
         assert!(nzbd_engine::automatic_control::transition(&current).is_none());
         assert_eq!(control.current_job_intent(92).await.unwrap().unwrap().0.control(),Some(paused_control));
         drop(_serial);runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn blocked_source_proof_preserves_pending_job_but_allows_other_controls_and_delete(){
+        let temp = tempfile::tempdir().unwrap();
+        let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ClusterConfig {
+            cluster_id: "grant-cas".into(),
+            node_name: "authority".into(),
+            shared_dir: temp.path().join("shared"),
+            advertise_url: "http://127.0.0.1:1".into(),
+            secret: "secret".into(),
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            pp_slots: 0,
+            lease_interval: std::time::Duration::from_millis(100),
+            takeover_after: std::time::Duration::from_secs(1),
+            worker_ttl: std::time::Duration::from_secs(3),
+            control_dir: temp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: raft.local_addr().unwrap().to_string(),
+            control_api_bind: api.local_addr().unwrap().to_string(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
+            disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
+        };
+        drop(raft);
+        drop(api);
+        let runtime = crate::ClusterRuntime::start(
+            cfg,
+            Vec::new(),
+            Tuning {
+                min_free_disk_bytes: 0,
+                ..Default::default()
+            },
+            temp.path().join("dest"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !runtime.leader_shared.authority_ready() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let shared=&runtime.leader_shared;let control=runtime.control.as_ref().unwrap();
+        let serial=shared.mutation_serial.lock().await;
+        let mut blocked=test_job(92);blocked.status=JobStatus::Queued;blocked.dir_name="proof-pending".into();
+        let inventory=runtime.engine.artifacts();
+        let source=inventory.allocate_for_delivery(92,&temp.path().join("dest"),&temp.path().join("dest/proof-pending"),true,false).unwrap();
+        let mut other=test_job(93);other.status=JobStatus::Queued;other.dir_name="other".into();
+        runtime.engine.import_job(blocked,false,false).await.unwrap();runtime.engine.import_job(other,false,false).await.unwrap();
+        let blocked=runtime.engine.export_job(JobId(92)).await.unwrap().unwrap();let other=runtime.engine.export_job(JobId(93)).await.unwrap().unwrap();
+        control.commit_job_delta(&[(92,Some(blocked)),(93,Some(other))]).await.unwrap();
+        crate::source_facts::reconcile(shared).await.unwrap();
+        let gate=Arc::new((tokio::sync::Semaphore::new(0),tokio::sync::Semaphore::new(0)));
+        *shared.control_proofs.gate.lock().unwrap()=Some(gate.clone());
+        assert!(runtime.engine.hold_job(JobId(92),nzbd_types::HoldCause::Allocation,"download","source proof delayed").await.unwrap());
+        crate::control_recovery::reconcile(shared).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3),gate.0.acquire()).await.unwrap().unwrap().forget();
+        shared.restore_control_projection().await.unwrap();
+        assert!(nzbd_engine::automatic_control::transition(&runtime.engine.export_job(JobId(92)).await.unwrap().unwrap()).is_some(),"unrelated projection rebuild cannot erase pending provenance");
+        drop(serial);
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+        let router=runtime.router("test",Vec::new());let serve=tokio::spawn(async move{axum::serve(listener,router).await.unwrap()});
+        let client=crate::http::ClusterClient::new("secret".into());
+        use http_body_util::BodyExt;
+        let detail=client.forward(&format!("http://{address}"),hyper::Request::get("/api/v1/jobs/92").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(detail.status(),StatusCode::OK);
+        let detail:serde_json::Value=serde_json::from_slice(&detail.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(detail["controlPending"]["state"],"pending");assert_eq!(detail["controlPending"]["owner"],"authority");
+        for (job,action) in [(93,"pause"),(92,"delete"),(93,"resume")] {
+            let response=tokio::time::timeout(std::time::Duration::from_secs(3),client.forward(&format!("http://{address}"),hyper::Request::post(format!("/api/v1/jobs/{job}/actions/{action}")).body(axum::body::Body::empty()).unwrap())).await.expect("a slow source proof must not monopolize mutation_serial").unwrap();
+            assert_eq!(response.status(),StatusCode::OK,"{job}/{action}");
+            if job==93 && action=="pause" {
+                assert!(nzbd_engine::automatic_control::transition(&runtime.engine.export_job(JobId(92)).await.unwrap().unwrap()).is_some());
+                assert_eq!(control.current_job_intent(93).await.unwrap().unwrap().0.status,JobStatus::Paused);
+            }
+        }
+        assert!(runtime.engine.export_job(JobId(92)).await.unwrap().is_none());assert!(control.current_job_intent(92).await.unwrap().is_none());
+        assert!(source.path.exists(),"ordinary removal keeps the blocked job's bytes");
+        crate::control_recovery::reconcile(shared).await.unwrap();
+        gate.1.add_permits(1);
+        tokio::task::yield_now().await;
+        assert!(shared.control_proofs.snapshot().iter().all(|value|value["jobId"]!=92));
+        assert!(runtime.engine.export_job(JobId(92)).await.unwrap().is_none(),"late proof cannot resurrect explicit removal");
+        serve.abort();let _=serve.await;runtime.shutdown().await;
+    }
+
+    async fn settle_automatic_control(shared:&LeaderShared,job:JobId){
+        let deadline=Instant::now()+std::time::Duration::from_secs(5);
+        loop{
+            crate::control_recovery::reconcile(shared).await.unwrap();
+            if shared.engine.export_job(job).await.unwrap().is_none_or(|job|nzbd_engine::automatic_control::transition(&job).is_none()){return}
+            assert!(Instant::now()<deadline,"automatic proof/commit did not settle");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     async fn current_job_resume(control: &ControlStore, shared: &LeaderShared, current: &Job) {

@@ -10,6 +10,7 @@
 mod admissions;
 pub mod control;
 mod control_recovery;
+mod control_proofs;
 mod source_facts;
 mod delivery;
 pub mod election;
@@ -541,6 +542,7 @@ impl ClusterRuntime {
         }
         self.cancel.cancel();
         self.tracker.wait().await;
+        self.leader_shared.control_proofs.shutdown().await;
         self.engine.shutdown().await;
         if let Some(control) = &self.control {
             if let Err(error) = control.shutdown().await {
@@ -552,9 +554,11 @@ impl ClusterRuntime {
 
 async fn commit_control_mutation(
     axum::extract::State(shared): axum::extract::State<Arc<LeaderShared>>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    let observations=shared.control_proofs.snapshot().into_iter().filter_map(|value|value["jobId"].as_u64().and_then(|id|u32::try_from(id).ok()).map(|id|(id,value))).collect();
+    request.extensions_mut().insert(nzbd_api::control_pending::ControlPendingObservations(observations));
     let safe = matches!(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS

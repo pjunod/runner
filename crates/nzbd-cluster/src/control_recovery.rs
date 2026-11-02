@@ -111,7 +111,28 @@ pub(crate) async fn reconcile(shared: &crate::leader::LeaderShared) -> Result<()
         .ok_or("replicated control unavailable")?;
     let issuer = shared.authority_identity();
     let mut restore_current = false;
-    for local in shared.engine_projection().await?.into_values() {
+    let scope = format!("{}:{}:{}", issuer.0, issuer.1, issuer.2);
+    let mut locals = shared
+        .engine_projection()
+        .await?
+        .into_values()
+        .collect::<Vec<_>>();
+    shared.control_proofs.prune(
+        &locals
+            .iter()
+            .filter_map(nzbd_engine::automatic_control::transition)
+            .map(|marker| marker.identity)
+            .collect(),
+        &scope,
+    );
+    locals.sort_by_key(|job| job.id.0);
+    let cursor = shared
+        .control_proofs
+        .cursor
+        .load(std::sync::atomic::Ordering::Acquire);
+    let rotate = locals.partition_point(|job| job.id.0 <= cursor);
+    locals.rotate_left(rotate);
+    for local in locals {
         let Some(marker) = transition(&local) else {
             continue;
         };
@@ -134,9 +155,9 @@ pub(crate) async fn reconcile(shared: &crate::leader::LeaderShared) -> Result<()
                 restore_current = true;
                 continue;
             }
-            match source_valid(shared,&durable,&marker).await {
-                Ok(true)=>{},
-                outcome=>{
+            match source_valid(shared, &durable, &marker, revision, &scope).await {
+                Ok(true) => {}
+                outcome => {
                     tracing::warn!(job=local.id.0,reason=?outcome,"automatic control remains pending on this job; source proof unavailable");
                     continue;
                 }
@@ -197,7 +218,7 @@ pub(crate) async fn reconcile(shared: &crate::leader::LeaderShared) -> Result<()
     if restore_current {
         // Only after all valid markers were committed/ACKed may a current
         // operator/source projection replace stale local automatic intent.
-        let jobs=projection(shared).await?;
+        let jobs = projection(shared).await?;
         shared
             .engine
             .adopt_replicated_authority(jobs)
@@ -224,6 +245,8 @@ async fn source_valid(
     shared: &crate::leader::LeaderShared,
     durable: &Job,
     marker: &nzbd_engine::automatic_control::AutomaticControlTransition,
+    revision: u64,
+    scope: &str,
 ) -> Result<bool, String> {
     let inventory = shared.engine.artifacts();
     let expected = shared
@@ -232,34 +255,51 @@ async fn source_valid(
     let source = marker.source.clone();
     let result = marker.source_path.clone();
     let job_id = durable.id.0;
+    use sha2::{Digest, Sha256};
+    let key = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(marker, revision, scope, business_intent(durable)?))
+                .map_err(|e| e.to_string())?
+        )
+    );
     if marker.storage_instance_id == inventory.installation {
-        return tokio::task::spawn_blocking(move || -> Result<bool, String> {
-            match (
-                source,
-                result,
-                inventory.for_job(job_id).map_err(|e| e.to_string())?,
-            ) {
-                (None, None, None) => Ok(true),
-                (Some(source), Some(path), Some(current)) => {
-                    if current.terminal()
-                        || current.id != source.artifact
-                        || current.generation != source.generation
-                        || current.path != path
-                    {
-                        return Ok(false);
+        return shared.control_proofs.resolve(
+            key,
+            marker.identity.clone(),
+            scope.into(),
+            job_id,
+            shared.cfg.node_name.clone(),
+            async move {
+                tokio::task::spawn_blocking(move || -> Result<bool, String> {
+                    match (
+                        source,
+                        result,
+                        inventory.for_job(job_id).map_err(|e| e.to_string())?,
+                    ) {
+                        (None, None, None) => Ok(true),
+                        (Some(source), Some(path), Some(current)) => {
+                            if current.terminal()
+                                || current.id != source.artifact
+                                || current.generation != source.generation
+                                || current.path != path
+                            {
+                                return Ok(false);
+                            }
+                            if path == expected {
+                                return Ok(true);
+                            }
+                            inventory
+                                .has_succeeded_relocation(&source, &expected, &path)
+                                .map_err(|e| e.to_string())
+                        }
+                        _ => Ok(false),
                     }
-                    if path == expected {
-                        return Ok(true);
-                    }
-                    inventory
-                        .has_succeeded_relocation(&source, &expected, &path)
-                        .map_err(|e| e.to_string())
-                }
-                _ => Ok(false),
-            }
-        })
-        .await
-        .map_err(|e| e.to_string())?;
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            },
+        );
     }
     let fact = durable
         .params
@@ -270,44 +310,83 @@ async fn source_valid(
             serde_json::from_str::<crate::delivery::AuthoritySourceCopy>(value).ok()
         });
     let Some(fact) = fact else {
-        return Ok(source.is_none() && result.is_none());
+        if source.is_none() && result.is_none() {
+            return Ok(true);
+        }
+        return shared.control_proofs.resolve(
+            key,
+            marker.identity.clone(),
+            scope.into(),
+            job_id,
+            marker.storage_instance_id.chars().take(128).collect(),
+            async { Ok(false) },
+        );
     };
     let (Some(source), Some(path)) = (source, result) else {
-        return Ok(false);
+        return shared.control_proofs.resolve(
+            key,
+            marker.identity.clone(),
+            scope.into(),
+            job_id,
+            fact.owner_node.chars().take(128).collect(),
+            async { Ok(false) },
+        );
     };
     if fact.copy.storage_instance_id != marker.storage_instance_id
         || fact.copy.source != source
         || fact.copy.job_id != durable.id.0
     {
-        return Ok(false);
+        return shared.control_proofs.resolve(
+            key,
+            marker.identity.clone(),
+            scope.into(),
+            job_id,
+            fact.owner_node.chars().take(128).collect(),
+            async { Ok(false) },
+        );
     }
     if path == expected {
         return Ok(true);
     }
     // Only a journal on the original storage owner can attest relocation.
     // Failure/offline is retried by the existing startup/scheduler loop.
-    let owner = crate::registry::read_nodes(&shared.layout)
-        .into_iter()
-        .find(|node| node.name == fact.owner_node)
-        .ok_or_else(|| {
-            format!(
-                "job {} awaits exact relocation proof from source owner {}",
-                durable.id.0, fact.owner_node
-            )
-        })?;
-    let reply = crate::http::ClusterClient::new(shared.cfg.secret.clone())
-        .post_json::<_, RelocationProofReply>(
-            &owner.api_url,
-            "/cluster/v1/work/relocation-proof",
-            &RelocationProofRequest {
-                storage: marker.storage_instance_id.clone(),
-                source,
-                from: expected,
-                to: path,
-            },
-        )
-        .await?;
-    Ok(reply.storage == marker.storage_instance_id && reply.valid)
+    let layout = shared.layout.clone();
+    let owner_name = fact.owner_node.clone();
+    let client = crate::http::ClusterClient::new(shared.cfg.secret.clone());
+    let storage = marker.storage_instance_id.clone();
+    let marker_id = marker.identity.clone();
+    shared.control_proofs.resolve(
+        key,
+        marker_id,
+        scope.into(),
+        job_id,
+        fact.owner_node,
+        async move {
+            let owner = tokio::task::spawn_blocking(move || {
+                crate::registry::read_nodes(&layout)
+                    .into_iter()
+                    .find(|node| node.name == owner_name)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                format!("job {job_id} source owner is offline; retry when it returns")
+            })?;
+            let reply = client
+                .post_json::<_, RelocationProofReply>(
+                    &owner.api_url,
+                    "/cluster/v1/work/relocation-proof",
+                    &RelocationProofRequest {
+                        storage: storage.clone(),
+                        source,
+                        from: expected,
+                        to: path,
+                    },
+                )
+                .await?;
+            Ok(reply.storage == storage && reply.valid)
+        },
+    )
 }
 
 pub(crate) async fn relocation_proof(
@@ -338,19 +417,31 @@ pub(crate) async fn relocation_proof(
 
 /// Preserve one exact locally pending automatic result in the local projection
 /// only. A newer durable operator/source edit or tombstone always replaces it.
-pub(crate) async fn projection(shared:&crate::leader::LeaderShared)->Result<Vec<Job>,String>{
-    let control=shared.control.as_ref().ok_or("replicated control unavailable")?;
-    let local=shared.engine_projection().await?;
-    let mut jobs=Vec::new();
-    for (mut durable,_,_) in control.load_jobs().await? {
-        if let Some(current)=local.get(&u64::from(durable.id.0)) {
-            if let Some(marker)=nzbd_engine::automatic_control::transition(current) {
-                if durable.control()==marker.base_control && durable.status==marker.base_status
-                    && business_intent(current)?==business_intent(&durable)? {
-                    durable.set_control(&marker.result_control);durable.status=marker.result_status;
-                    for key in [nzbd_engine::automatic_control::AUTOMATIC_CONTROL_PARAM,"*Control:attempts","*Control:probe_after"] {
-                        durable.params.retain(|(old,_)|old!=key);
-                        durable.params.extend(current.params.iter().filter(|(old,_)|old==key).cloned());
+pub(crate) async fn projection(shared: &crate::leader::LeaderShared) -> Result<Vec<Job>, String> {
+    let control = shared
+        .control
+        .as_ref()
+        .ok_or("replicated control unavailable")?;
+    let local = shared.engine_projection().await?;
+    let mut jobs = Vec::new();
+    for (mut durable, _, _) in control.load_jobs().await? {
+        if let Some(current) = local.get(&u64::from(durable.id.0)) {
+            if let Some(marker) = nzbd_engine::automatic_control::transition(current) {
+                if durable.control() == marker.base_control
+                    && durable.status == marker.base_status
+                    && business_intent(current)? == business_intent(&durable)?
+                {
+                    durable.set_control(&marker.result_control);
+                    durable.status = marker.result_status;
+                    for key in [
+                        nzbd_engine::automatic_control::AUTOMATIC_CONTROL_PARAM,
+                        "*Control:attempts",
+                        "*Control:probe_after",
+                    ] {
+                        durable.params.retain(|(old, _)| old != key);
+                        durable
+                            .params
+                            .extend(current.params.iter().filter(|(old, _)| old == key).cloned());
                     }
                 }
             }
