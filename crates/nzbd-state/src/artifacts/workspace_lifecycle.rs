@@ -108,54 +108,72 @@ impl Inventory {
         checkpoint: &dyn Fn() -> std::io::Result<()>,
         resume: bool,
     ) -> Result<Option<AttemptUse>> {
-        let _coordinator = self.mutation_guard()?;
         checkpoint()?;
-        let Some(mut artifact) = self.for_job(job)? else {
-            return Ok(None);
+        // Reserve the exact generation under the short coordinator. The
+        // reservation fences namespace mutation while root verification runs
+        // without holding a global lock across any payload syscall.
+        let artifact = {
+            let _coordinator = self.mutation_guard()?;
+            let Some(artifact) = self.for_job(job)? else {
+                return Ok(None);
+            };
+            let key = (artifact.id.clone(), artifact.generation.clone());
+            if self.workspace_uses.lock().unwrap().contains_key(&key)
+                || self.reconciliation_in_use(&artifact)
+                || self.allocation_uses.lock().unwrap().contains(&job)
+            {
+                return Err(Error::Conflict(
+                    "previous processing or allocation workers have not quiesced".into(),
+                ));
+            }
+            if artifact.hold.is_some()
+                || !matches!(
+                    artifact.state.as_str(),
+                    "active" | "transitioning" | "retained" | "completed"
+                )
+            {
+                return Err(Error::Conflict(
+                    "processing source is held or retiring".into(),
+                ));
+            }
+            self.workspace_uses.lock().unwrap().insert(key, 1);
+            artifact
         };
-        let key = (artifact.id.clone(), artifact.generation.clone());
-        if self.workspace_uses.lock().unwrap().contains_key(&key) {
-            return Err(Error::Conflict(
-                "previous processing workers have not quiesced".into(),
-            ));
-        }
-        if artifact.hold.is_some()
-            || !matches!(
-                artifact.state.as_str(),
-                "active" | "transitioning" | "retained" | "completed"
-            )
-        {
-            return Err(Error::Conflict(
-                "processing source is held or retiring".into(),
-            ));
-        }
-        self.verify(&artifact)?;
-        checkpoint()?;
-        if resume && (artifact.state == "retained" || artifact.state == "completed") {
-            artifact.state = "active".into();
-            artifact.revision += 1;
-            let mut db = self.db.lock().unwrap();
-            let tx = db.transaction()?;
-            save_artifact(&tx, &artifact)?;
-            tx.execute(
-                "DELETE FROM workspace_finalizations WHERE source=?1 AND generation=?2",
-                params![artifact.id, artifact.generation],
-            )?;
-            tx.commit()?;
-        } else if resume {
-            self.db.lock().unwrap().execute(
-                "DELETE FROM workspace_finalizations WHERE source=?1 AND generation=?2",
-                params![artifact.id, artifact.generation],
-            )?;
-        }
-        self.workspace_uses.lock().unwrap().insert(key, 1);
-        Ok(Some(AttemptUse(Arc::new(UseLease {
+        let lease = AttemptUse(Arc::new(UseLease {
             inventory: self.clone(),
             source: SourceGeneration {
-                artifact: artifact.id,
-                generation: artifact.generation,
+                artifact: artifact.id.clone(),
+                generation: artifact.generation.clone(),
             },
-        }))))
+        }));
+        self.verify(&artifact)?;
+        checkpoint()?;
+        {
+            let _coordinator = self.mutation_guard()?;
+            let mut current = self.get(&artifact.id)?;
+            if current.generation != artifact.generation
+                || current.path != artifact.path
+                || current.root != artifact.root
+                || current.state != artifact.state
+                || current.hold.is_some()
+            {
+                return Err(Error::Conflict(
+                    "processing source changed during custody verification".into(),
+                ));
+            }
+            if resume {
+                if matches!(current.state.as_str(), "retained" | "completed") {
+                    current.state = "active".into();
+                    current.revision += 1;
+                    save_artifact(&self.db.lock().unwrap(), &current)?;
+                }
+                self.db.lock().unwrap().execute(
+                    "DELETE FROM workspace_finalizations WHERE source=?1 AND generation=?2",
+                    params![current.id, current.generation],
+                )?;
+            }
+        }
+        Ok(Some(lease))
     }
     /// A managed seed's exact terminal journal can outlive its payload path.
     /// This only reserves the existing use registry: it adopts no inode and
@@ -239,6 +257,7 @@ impl Inventory {
             }
             let path = artifact.path.clone();
             let root = artifact.root.clone();
+            drop(_mutation);
             self.finish_artifact_unlocked(artifact, &path, &root, "retained")?
         };
         if !self.authorized_processing_use(&artifact, Some(guard)) {
@@ -262,12 +281,26 @@ impl Inventory {
         self.execute_delete_with_use(&op.id, Some((guard, checkpoint)))
     }
     pub(super) fn source_in_use(&self, source: &SourceGeneration) -> bool {
+        if self
+            .reconciliation_uses
+            .lock()
+            .unwrap()
+            .contains(&(source.artifact.clone(), source.generation.clone()))
+        {
+            return true;
+        }
         self.workspace_uses
             .lock()
             .unwrap()
             .contains_key(&(source.artifact.clone(), source.generation.clone()))
     }
     pub(super) fn artifact_in_use(&self, artifact: &Artifact) -> Result<bool> {
+        if artifact
+            .job
+            .is_some_and(|job| self.allocation_uses.lock().unwrap().contains(&job))
+        {
+            return Ok(true);
+        }
         if self.source_in_use(&SourceGeneration {
             artifact: artifact.id.clone(),
             generation: artifact.generation.clone(),
@@ -464,7 +497,6 @@ impl Inventory {
         .transpose()
     }
     pub fn workspace_assessment(&self, scratch: &str) -> Result<Option<WorkspaceAssessment>> {
-        let _coordinator = self.mutation_guard()?;
         let Some((op, workspace)) = self.scratch_operation(scratch)? else {
             return Ok(None);
         };
@@ -474,6 +506,20 @@ impl Inventory {
         &self,
         op: &Operation,
         workspace: &Workspace,
+    ) -> Result<WorkspaceAssessment> {
+        self.assess_workspace_reserved(op, workspace, false)
+    }
+    fn processing_workers_active(&self, source: &SourceGeneration) -> bool {
+        self.workspace_uses
+            .lock()
+            .unwrap()
+            .contains_key(&(source.artifact.clone(), source.generation.clone()))
+    }
+    fn assess_workspace_reserved(
+        &self,
+        op: &Operation,
+        workspace: &Workspace,
+        reserved: bool,
     ) -> Result<WorkspaceAssessment> {
         let scratch = self.get(&workspace.scratch.id)?;
         let parent = self.get(&workspace.source.id)?;
@@ -509,7 +555,11 @@ impl Inventory {
         if parent.generation != workspace.source.generation {
             reasons.push("source_generation_changed".into());
         }
-        if self.source_in_use(&source) {
+        if if reserved {
+            self.processing_workers_active(&source)
+        } else {
+            self.source_in_use(&source)
+        } {
             reasons.push("processing_workers_active".into());
         }
         if !matches!(op.state.as_str(), "succeeded" | "failed") {
@@ -572,7 +622,6 @@ impl Inventory {
     /// One bounded cursor advances past protected records rather than letting
     /// one permanently held workspace starve the remainder of the inventory.
     pub fn reconcile_workspace_retirements(&self) -> Result<()> {
-        let _coordinator = self.mutation_guard()?;
         let raws = {
             let db = self.db.lock().unwrap();
             let cursor = self.workspace_cursor.lock().unwrap().clone();
@@ -603,12 +652,18 @@ impl Inventory {
                 artifact: workspace.source.id.clone(),
                 generation: workspace.source.generation.clone(),
             };
+            let parent = self.get(&source.artifact)?;
+            let Some(_lease) = self.reserve_reconciliation(&[parent.clone(), scratch.clone()])?
+            else {
+                continue;
+            };
+
             if let Some((outcome, FinalizationProof::Cluster { .. })) =
                 self.workspace_finalization(&source)?
             {
                 let parent = self.get(&source.artifact)?;
                 if parent.generation == source.generation
-                    && !self.source_in_use(&source)
+                    && !self.processing_workers_active(&source)
                     && parent.hold.is_none()
                     && matches!(parent.state.as_str(), "active" | "transitioning")
                 {
@@ -630,7 +685,7 @@ impl Inventory {
             // aborted stage. A successful job never supplies this inference.
             if op.state == "running"
                 && workspace.keep_provenance
-                && !self.source_in_use(&SourceGeneration {
+                && !self.processing_workers_active(&SourceGeneration {
                     artifact: workspace.source.id.clone(),
                     generation: workspace.source.generation.clone(),
                 })
@@ -645,13 +700,20 @@ impl Inventory {
                 scratch.files = fs::manifest(&dir, 100_000)?;
                 scratch.state = "retained".into();
                 op.state = "failed".into();
+                let _coordinator = self.mutation_guard()?;
+                let original = self.get(&scratch.id)?;
+                if original.generation != scratch.generation
+                    || original.revision != scratch.revision
+                {
+                    continue;
+                }
                 let mut db = self.db.lock().unwrap();
                 let tx = db.transaction()?;
                 save_artifact(&tx, &scratch)?;
                 save_operation(&tx, &op)?;
                 tx.commit()?;
             }
-            let assessment = self.assess_workspace(&op, &workspace)?;
+            let assessment = self.assess_workspace_reserved(&op, &workspace, true)?;
             let retirement_id = format!("retire-{}", scratch.generation);
             if self.operation(&retirement_id).is_ok_and(|op| {
                 matches!(
@@ -667,6 +729,8 @@ impl Inventory {
                     assessment.reasons.join(", ")
                 ));
                 if scratch.error != error {
+                    let _coordinator = self.mutation_guard()?;
+                    self.check_payload_capture(&scratch)?;
                     scratch.error = error;
                     save_artifact(&self.db.lock().unwrap(), &scratch)?;
                 }
@@ -675,6 +739,15 @@ impl Inventory {
             let Some((outcome, proof)) = self.workspace_finalization(&assessment.source)? else {
                 continue;
             };
+            let _coordinator = self.mutation_guard()?;
+            self.check_payload_capture(&scratch)?;
+            let current_parent = self.get(&source.artifact)?;
+            if current_parent.generation != source.generation
+                || current_parent.hold.is_some()
+                || current_parent.keep
+            {
+                continue;
+            }
             scratch.hold = None; // only the known automatic transform hold
             scratch.error = None;
             scratch.revision += 1;
@@ -727,7 +800,8 @@ impl Inventory {
         Ok(())
     }
     pub fn execute_workspace_retirement(&self, key: &str) -> Result<Operation> {
-        let _coordinator = self.mutation_guard()?;
+        let _lease;
+        let coordinator = self.mutation_guard()?;
         let mut op = self.operation(key)?;
         if op.kind != "retire_workspace" {
             return Err(Error::Conflict("not a workspace retirement".into()));
@@ -776,7 +850,20 @@ impl Inventory {
                 "workspace finalization evidence is invalid".into(),
             ));
         }
-        let assessment = self.assess_workspace(&transform, &workspace)?;
+        let parent = self.get(&receipt.source.artifact)?;
+        let Some(lease) = self.reserve_reconciliation_locked(
+            &[parent.clone(), scratch.clone()],
+            None,
+            &coordinator,
+        )?
+        else {
+            return Err(Error::Conflict(
+                "workspace workers have not quiesced".into(),
+            ));
+        };
+        _lease = lease;
+        drop(coordinator);
+        let assessment = self.assess_workspace_reserved(&transform, &workspace, true)?;
         let replay_missing = op.attempts > 0
             && std::fs::symlink_metadata(&scratch.path)
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
@@ -799,6 +886,15 @@ impl Inventory {
         // A restart may supersede the source's terminal receipt while this
         // old scratch generation remains pending. Requalify against the new
         // durable finalization, preserving deletion replay attempts/manifests.
+        let coordinator = self.mutation_guard()?;
+        self.check_payload_capture(&scratch)?;
+        self.check_payload_capture(&parent)?;
+        let saved = self.operation(key)?;
+        if saved.request != op.request || saved.state != op.state || saved.attempts != op.attempts {
+            return Err(Error::Conflict(
+                "workspace retirement journal changed".into(),
+            ));
+        }
         receipt.outcome = outcome;
         receipt.proof = proof;
         op.request = serde_json::to_string(&receipt)?;
@@ -812,6 +908,8 @@ impl Inventory {
             save_artifact(&tx, &scratch)?;
             tx.commit()?;
         }
+        drop(coordinator);
+        let admitted = scratch.clone();
         match self.delete_manifest_checked(&scratch, op.attempts) {
             Ok(()) => {
                 scratch.state = "deleted".into();
@@ -832,6 +930,8 @@ impl Inventory {
                     now() + [60, 300, 1800, 21600][op.attempts.saturating_sub(1).min(3) as usize];
             }
         }
+        let _coordinator = self.mutation_guard()?;
+        self.check_payload_capture(&admitted)?;
         scratch.revision += 1;
         scratch.updated_at = now();
         let mut db = self.db.lock().unwrap();

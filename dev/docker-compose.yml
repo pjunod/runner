@@ -32,6 +32,7 @@ services:
     build: *nzbd-build
     image: nzbd:dev
     container_name: nzbd-dev
+    stop_grace_period: 30s
     depends_on:
       nzbd-init:
         condition: service_completed_successfully
@@ -47,7 +48,7 @@ services:
       - TZ=Etc/UTC
       - RUST_LOG=debug           # dev default; drop to info if too chatty
     healthcheck:
-      test: ["CMD", "nzbd", "status", "--url", "127.0.0.1:6789"]
+      test: ["CMD", "nzbd", "health"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -85,4 +86,4 @@ services:
     command: ["advertise", "--name", "${NZBD_DISCOVERY_NAME:-nzbd-dev}", "--port", "6789"]
     depends_on:
       nzbd:
-        condition: service_healthy
+        condition: service_started

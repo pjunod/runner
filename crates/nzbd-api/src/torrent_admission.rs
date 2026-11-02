@@ -601,9 +601,9 @@ impl TorrentAdmissionService {
 
     /// Restore durable torrents without waiting for network-sourced admissions.
     pub async fn recover_active(&self) -> Result<(), AdmissionError> {
-        let snapshot = nzbd_state::SnapshotStore::open(&self.state_dir)?
-            .load()?
-            .unwrap_or_default();
+        // Recovery plans are captured in owner order, alongside current
+        // admissions and linkage; a separately loaded disk snapshot can lag.
+        let snapshot = self.engine.recovery_document().await?;
         let source_store = PendingSourceStore::open(&self.state_dir)?;
         let linked = snapshot
             .pending_admissions
@@ -615,7 +615,9 @@ impl TorrentAdmissionService {
             .into_iter()
             .filter(|job| !linked.contains(job))
         {
-            source_store.remove(orphan)?;
+            // A new admission may have linked this sidecar since the plan was
+            // captured. Only the owner can authorize cleanup against live state.
+            self.engine.remove_orphan_torrent_source(orphan).await?;
         }
 
         let mut payload_roots = vec![self.session.output_root().to_path_buf()];
@@ -738,9 +740,9 @@ impl TorrentAdmissionService {
     /// Retry pending sources after the API listener is ready. Magnet lookup
     /// can take 120 seconds per job and must not hold the health check offline.
     pub async fn recover_pending(&self) -> Result<Vec<AdmissionResult>, AdmissionError> {
-        let snapshot = nzbd_state::SnapshotStore::open(&self.state_dir)?
-            .load()?
-            .unwrap_or_default();
+        // Recovery plans are captured in owner order, alongside current
+        // admissions and linkage; a separately loaded disk snapshot can lag.
+        let snapshot = self.engine.recovery_document().await?;
         let source_store = PendingSourceStore::open(&self.state_dir)?;
         let mut restored = Vec::new();
         for pending in snapshot.pending_admissions {
@@ -2245,7 +2247,7 @@ impl TorrentAdmissionService {
                                 StatusCode::UNPROCESSABLE_ENTITY,
                                 Json(json!({"error":"unsupported torrent source type"})),
                             )
-                                .into_response()
+                                .into_response();
                         }
                     };
                     self.admit_source(
@@ -2270,7 +2272,7 @@ impl TorrentAdmissionService {
                         StatusCode::UNPROCESSABLE_ENTITY,
                         Json(json!({"error":"invalid typed torrent request"})),
                     )
-                        .into_response()
+                        .into_response();
                 }
             },
             _ => {
@@ -2278,7 +2280,7 @@ impl TorrentAdmissionService {
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(json!({"error":"unsupported torrent content type"})),
                 )
-                    .into_response()
+                    .into_response();
             }
         };
         match result {
@@ -3858,6 +3860,32 @@ mod tests {
             .unwrap();
         assert!(persisted.pending_admissions.is_empty());
         assert_eq!(persisted.jobs[0].id, job);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_recovery_plan_cannot_remove_a_newly_linked_pending_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_service, engine) = service(&tmp).await;
+        let stale = engine.recovery_document().await.unwrap();
+        assert!(stale.pending_admissions.is_empty());
+        let job = engine
+            .reserve_torrent_admission(
+                TorrentSource::Url,
+                b"http://127.0.0.1/source".to_vec(),
+                AddOpts::default(),
+            )
+            .await
+            .unwrap();
+        let store = PendingSourceStore::open(&tmp.path().join("state")).unwrap();
+        // This ID appears unlinked in the old owner plan, but cleanup must
+        // recheck the current pending reservation in the owner's FIFO.
+        assert!(!engine.remove_orphan_torrent_source(job).await.unwrap());
+        assert_eq!(store.read(job).unwrap(), b"http://127.0.0.1/source");
+        let orphan = JobId(999);
+        store.write(orphan, b"unlinked").unwrap();
+        assert!(engine.remove_orphan_torrent_source(orphan).await.unwrap());
+        assert_eq!(store.inventory().unwrap(), vec![job]);
         engine.shutdown().await;
     }
 

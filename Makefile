@@ -210,12 +210,23 @@ fast-check-torrent: ## Reviewed torrent changes: bounded transfer, recovery, and
 	$(CARGO) test --locked -p nzbd-engine --test e2e cluster_authority_adoption_refuses_dormant_torrent_rows_without_rewrite -- --exact
 	RQBIT_SERIES_DISPATCH_ONLY=1 scripts/check-rqbit-maintained-patch-series.sh
 
+.PHONY: fast-check-startup
+fast-check-startup: ## Startup recovery writer, admission, enrollment, and daemon regressions
+	$(CARGO) test --locked -p nzbd-engine --lib writer::tests
+	$(CARGO) test --locked -p nzbd-engine --lib recovery::
+	$(CARGO) test --locked -p nzbd-engine --lib owner:: -- --skip torrent_ --skip seed_policy_
+	$(CARGO) test --locked -p nzbd-post --lib admission_tests
+	$(CARGO) test --locked -p nzbd-state --test enrollment
+	$(CARGO) test --locked -p nzbd --bin nzbd
+	$(CARGO) test --locked -p nzbd --test daemon -- --test-threads=1
+
 .PHONY: fast-check
 fast-check: ## Final affected fast lane; run once after the combined adversarial review
 	scripts/check-fast-lane-contract
 	$(MAKE) ui-test
 	$(MAKE) fast-check-rust
 	$(MAKE) fast-check-torrent
+	$(MAKE) fast-check-startup
 	@echo "OK - merge-candidate fast lane passed"
 
 .PHONY: gate

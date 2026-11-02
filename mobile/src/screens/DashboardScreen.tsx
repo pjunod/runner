@@ -677,11 +677,18 @@ export function JobCard({
         <View style={styles.jobMeta}>
           {showStatus ? (
             <Text style={[styles.status, (statusKey === 'failed' || phase === 'missing_files' || phase === 'failed') && styles.statusFailed]}>
-              {pendingLabel ?? (hold ? 'held' : acquisitionLabel ?? (phase ? torrentStatus(job) : jobStatusLabel(job.status, job.ready)))}
+              {pendingLabel ?? (hold ? 'held' : job.verification && job.status !== 'paused' ? 'Verifying recovery' : acquisitionLabel ?? (phase ? torrentStatus(job) : jobStatusLabel(job.status, job.ready)))}
             </Text>
           ) : null}
           {pendingLabel ? <Text style={job.controlPending?.state === 'review_required' ? styles.statusFailed : styles.metaText}>{controlPendingText(job)}</Text> : null}
           {hold ? <Text style={styles.statusFailed}>{hold.message}</Text> : null}
+          {job.verification ? (
+            <Text style={styles.metaText}>
+              Recovery verification: {job.verification.state}
+              {job.verification.total_bytes > 0 ? ` · ${formatBytes(job.verification.checked_bytes)} / ${formatBytes(job.verification.total_bytes)}` : ''}
+              {job.verification.reason ? ` · ${job.verification.reason}` : ''}
+            </Text>
+          ) : null}
           {fetchingNzb || fetchingAcquisition ? null : (
             <Text style={styles.metaText}>
               {seed ? 'Files ready' : `${formatBytes(job.downloaded_bytes)} / ${formatBytes(job.size_bytes)}`}

@@ -250,6 +250,12 @@ export class NzbdClient {
       }
     }
     if (!response.ok) {
+      if (response.status === 503) {
+        throw new ApiError(
+          'Runner is loading or recovering backend state. The last queue snapshot is still shown; retrying automatically.',
+          response.status,
+        );
+      }
       const message =
         typeof body === 'object' && body && 'error' in body
           ? String((body as { error: unknown }).error)

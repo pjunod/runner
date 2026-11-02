@@ -381,9 +381,12 @@ impl Inventory {
         path: &str,
         expected: &Identity,
     ) -> Result<String> {
+        let coordinated = guard.is_some();
         drop(guard.take());
         let digest = digest_file(root, path, expected);
-        *guard = Some(self.mutation_guard()?);
+        if coordinated {
+            *guard = Some(self.mutation_guard()?);
+        }
         let digest = digest?;
         let current = fs::open_relative(root, path)?;
         if fs::identity_for_file(&current)? != *expected {
@@ -402,8 +405,10 @@ impl Inventory {
         Ok(())
     }
 
-    /// Caller holds the inventory mutation guard. No marker inside the payload
-    /// grants ownership; every directory identity is checkpointed in SQLite.
+    /// Caller owns either the mutation coordinator or exact-generation
+    /// reconciliation leases. With leases the guard remains None throughout
+    /// payload work; the publication journal has its own single-flight lease.
+    /// Every directory identity is checkpointed in SQLite.
     pub(super) fn publish_directory_unlocked<'a>(
         &'a self,
         guard: &mut Option<MutationGuard<'a>>,

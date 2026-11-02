@@ -1,5 +1,5 @@
 //! Descriptor-anchored exclusive publication shared by PP and writers.
-use crate::artifacts::{fs, Error, Result};
+use crate::artifacts::{Error, Result, fs};
 use std::fs::File;
 #[cfg(unix)]
 use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
@@ -8,6 +8,8 @@ use std::path::{Component, Path};
 pub fn open_directory(path: &Path) -> Result<File> {
     fs::open_dir(path)
 }
+
+/// Object identity captured from the already-open descriptor, including mount identity.
 pub fn identity(file: &File) -> Result<crate::artifacts::Identity> {
     fs::identity_for_file(file)
 }

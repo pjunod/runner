@@ -4,6 +4,7 @@
 
 use clap::{Parser, Subcommand};
 
+mod control;
 mod discovery;
 mod tls;
 use nzbd_engine::{Engine, EngineConfig, Tuning};
@@ -45,6 +46,9 @@ enum Command {
         /// Override the listen address, e.g. 0.0.0.0:6789.
         #[arg(short, long)]
         bind: Option<String>,
+        /// Numeric loopback bootstrap monitor address (overrides NZBD_MONITOR_BIND).
+        #[arg(long)]
+        monitor_bind: Option<String>,
     },
     /// Add an NZB file to a running daemon.
     Add {
@@ -65,6 +69,16 @@ enum Command {
     Status {
         #[arg(long, default_value = "127.0.0.1:6789")]
         url: String,
+    },
+    /// Probe process liveness, or public control readiness, within two seconds.
+    Health {
+        #[arg(long)]
+        ready: bool,
+        #[arg(long)]
+        monitor_bind: Option<String>,
+        /// Transitional literal-loopback HTTP/HTTPS /healthz probe.
+        #[arg(long, conflicts_with = "monitor_bind")]
+        url: Option<String>,
     },
     /// Advertise a host-published nzbd API over DNS-SD/mDNS.
     ///
@@ -132,14 +146,48 @@ fn main() -> anyhow_lite::Result<()> {
             println!("Restored inventory quarantined. Review all held payloads before resuming retention.");
             Ok(())
         }
-        Command::Run { config, bind } => loop {
-            match run(config.clone(), bind.clone(), logbuf.clone())? {
-                RunOutcome::Exit => break Ok(()),
-                RunOutcome::Reload => {
-                    tracing::info!("restarting with the new configuration");
+        Command::Run {
+            config,
+            bind,
+            monitor_bind,
+        } => {
+            // No config, mirror, TLS, or state-volume access precedes this bind.
+            let control = control::Controller::start(
+                control::monitor_bind(monitor_bind.as_deref())?,
+                logbuf.clone(),
+            )?;
+            loop {
+                match run(config.clone(), bind.clone(), logbuf.clone(), &control) {
+                    Ok(RunOutcome::Exit) => break Ok(()),
+                    Ok(RunOutcome::Reload) => {
+                        tracing::info!("reloading backend; control service remains available")
+                    }
+                    Err(error) => {
+                        // Unknown initial security must never fall through to defaults.
+                        if !control.security_known() || control.is_stopping() {
+                            break Err(error);
+                        }
+                        tracing::error!(%error, "backend unavailable; retrying without closing control service");
+                        control.loading();
+                        control.reason("backend", error.to_string());
+                        for _ in 0..50 {
+                            if control.is_stopping() {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        if control.is_stopping() {
+                            break Ok(());
+                        }
+                    }
                 }
             }
-        },
+        }
+        Command::Health {
+            ready,
+            monitor_bind,
+            url,
+        } => control::health(ready, monitor_bind.as_deref(), url.as_deref()),
         Command::Add {
             file,
             url,
@@ -638,97 +686,468 @@ fn with_fs_hint<E: std::error::Error + 'static>(e: E) -> anyhow_lite::Error {
 /// boot into a failed one — it just means the mirror stays the source of
 /// truth until the mount is fixed.
 fn restore_config_file(path: &std::path::Path, toml: &str) -> bool {
-    if let Some(parent) = path.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return false;
+    use std::io::Write;
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let pending = parent.join(format!(
+        ".nzbd-recovered-config-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let result = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(parent)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&pending)?;
+        file.write_all(toml.as_bytes())?;
+        file.sync_all()?;
+        // Never replace a config that appeared after the missing-file read.
+        std::fs::hard_link(&pending, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&pending);
+    if let Err(error) = &result {
+        tracing::warn!(path = %path.display(), %error,
+            "could not restore missing config exclusively; running from saved copy without replacing local data");
+    }
+    result.is_ok()
+}
+
+/// Bootstrap has one real OS worker at a time. A timed-out filesystem call
+/// keeps its slot; retries never accumulate detached copies of that call.
+enum BootstrapError {
+    Unavailable(String),
+    Invalid(String),
+}
+
+type BootstrapSecurity = (
+    nzbd_config::Config,
+    Option<PathBuf>,
+    Option<PathBuf>,
+    Option<tls::TlsSetup>,
+    Option<String>,
+);
+
+fn load_bootstrap(
+    path: Option<PathBuf>,
+    control: &control::Controller,
+) -> anyhow_lite::Result<BootstrapSecurity> {
+    loop {
+        let worker_path = path.clone();
+        let trusted_configuration = control.trusted_configuration();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let started = std::time::Instant::now();
+        let worker = std::thread::Builder::new()
+            .name("nzbd-bootstrap-security".into())
+            .spawn(move || {
+                let result = read_bootstrap(worker_path, trusted_configuration);
+                let _ = tx.send(result);
+            })?;
+        let result = loop {
+            if control.is_stopping() {
+                return Err(anyhow_lite::Error::msg(
+                    "shutdown while configuration/security storage is unavailable",
+                ));
+            }
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(result) => break result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if started.elapsed() >= Duration::from_secs(10) {
+                        control.reason("configuration", "configuration/security storage deadline exceeded; waiting for the existing worker, no duplicate reads started");
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(anyhow_lite::Error::msg("bootstrap security worker failed"))
+                }
+            }
+        };
+        let _ = worker.join();
+        match result {
+            Ok(result) => {
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "configuration and security loaded"
+                );
+                return Ok(result);
+            }
+            Err(BootstrapError::Invalid(message)) => return Err(anyhow_lite::Error::msg(message)),
+            Err(BootstrapError::Unavailable(message)) => {
+                tracing::warn!(%message, "configuration/security storage unavailable; retrying");
+                control.reason("configuration", message);
+                for _ in 0..50 {
+                    if control.is_stopping() {
+                        return Err(anyhow_lite::Error::msg("shutdown during bootstrap retry"));
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
         }
     }
-    match std::fs::write(path, toml.as_bytes()) {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "could not write the recovered config back to its file; \
-                 running from the saved copy instead"
-            );
-            false
+}
+
+fn lifecycle_inventory_dir(cfg: &nzbd_config::Config) -> PathBuf {
+    if cfg.cluster.enabled {
+        let default = cfg
+            .paths
+            .main_dir
+            .join(".nzbd-control")
+            .join(&cfg.cluster.node_name);
+        nzbd_config::expand_home(cfg.cluster.control_dir.as_ref().unwrap_or(&default))
+            .join("file-lifecycle")
+    } else {
+        cfg.state_dir()
+    }
+}
+fn validate_installation_before_mutation(
+    cfg: &nzbd_config::Config,
+    config: Option<&std::path::Path>,
+) -> anyhow_lite::Result<Option<String>> {
+    let expected = expected_installation_id(config)?;
+    nzbd_state::artifacts::Inventory::validate_expected(
+        &lifecycle_inventory_dir(cfg),
+        expected.as_deref(),
+    )
+    .map_err(|error| {
+        anyhow_lite::Error::msg(format!("installation identity preflight: {error}"))
+    })?;
+    Ok(expected)
+}
+
+const SECURITY_RECEIPT: &str = ".nzbd-security-established";
+
+fn security_receipt(config: &std::path::Path) -> PathBuf {
+    config
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(SECURITY_RECEIPT)
+}
+
+/// Missing configuration is not positive evidence of a new installation.
+/// Any enrolled identity, historical state, security material, or uncertain
+/// probe keeps bootstrap nonpermissive until trusted settings are recovered.
+fn prove_first_installation(config: Option<&std::path::Path>) -> Result<(), String> {
+    if expected_installation_id(config)
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err("configuration and mirrors are missing for an enrolled installation; refusing unauthenticated first-run defaults".into());
+    }
+    if let Some(config) = config {
+        let receipt = security_receipt(config);
+        match std::fs::symlink_metadata(&receipt) {
+            Ok(_) => return Err(format!("configuration is missing but established security was recorded in {}; refusing first-run defaults", receipt.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(format!("cannot inspect established security {}: {error}", receipt.display())),
         }
     }
+    for directory in nzbd_config::durable::candidate_state_dirs() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot establish first installation from {}: {error}",
+                    directory.display()
+                ))
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "cannot inspect prior installation in {}: {error}",
+                    directory.display()
+                )
+            })?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(
+                name.as_ref(),
+                "artifacts.sqlite"
+                    | "artifacts.lock"
+                    | "queue.json"
+                    | "queue.json.bak"
+                    | "tls"
+                    | "jobs"
+                    | "workers"
+                    | "history"
+                    | "nzbd.toml.saved"
+                    | SECURITY_RECEIPT
+            ) || name.starts_with("unclean.")
+                || name.ends_with(".journal")
+            {
+                return Err(format!("configuration is missing but prior installation evidence exists at {}; refusing first-run defaults", entry.path().display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remember_established_security(config: &std::path::Path) {
+    use std::io::Write;
+    let receipt = security_receipt(config);
+    let result = (|| -> std::io::Result<()> {
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&receipt)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        file.write_all(b"nzbd established security v1\n")?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        std::fs::File::open(receipt.parent().unwrap())?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        tracing::warn!(path = %receipt.display(), %error, "cannot retain independent security history; keep the configuration or expected installation identity on durable storage");
+    }
+}
+
+fn read_bootstrap(
+    path: Option<PathBuf>,
+    trusted_configuration: Option<nzbd_config::Config>,
+) -> Result<BootstrapSecurity, BootstrapError> {
+    use BootstrapError::{Invalid, Unavailable};
+    let config_path = path.clone();
+    let mut setup_path = None;
+    let mut recovered_from = None;
+    let mut recovered_text = None;
+    let cfg = match path {
+        None => {
+            prove_first_installation(None).map_err(Unavailable)?;
+            nzbd_config::Config::default()
+        }
+        Some(path) => {
+            match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => return Err(Invalid(format!("config path {} is a DIRECTORY, not a file — check the Docker bind mount and create the host config file", path.display()))),
+                Ok(_) => {},
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(Unavailable(format!("cannot inspect config {}: {error}", path.display()))),
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(text) => nzbd_config::Config::from_toml(&text)
+                    .map_err(|error| Invalid(format!("{}: {error}", path.display())))?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if trusted_configuration.is_some() {
+                        return Err(Unavailable(format!("configuration {} disappeared; retaining the process's last trusted security and public listener until an explicit configuration returns", path.display())));
+                    }
+                    let mut recovered = None;
+                    // Do not use find_mirror(): its historical Option API hides
+                    // unreadable mirrors and could expose a permissive wizard.
+                    for dir in nzbd_config::durable::candidate_state_dirs() {
+                        let mirror = nzbd_config::durable::mirror_path(&dir);
+                        match std::fs::read_to_string(&mirror) {
+                            Ok(text) => {
+                                let cfg =
+                                    nzbd_config::Config::from_toml(&text).map_err(|error| {
+                                        Invalid(format!(
+                                            "saved config {}: {error}",
+                                            mirror.display()
+                                        ))
+                                    })?;
+                                recovered = Some(cfg);
+                                recovered_from = Some(mirror);
+                                recovered_text = Some(text);
+                                break;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => {
+                                return Err(Unavailable(format!(
+                                    "cannot read saved config {}: {error}",
+                                    mirror.display()
+                                )))
+                            }
+                        }
+                    }
+                    match recovered {
+                        Some(cfg) => cfg,
+                        None => {
+                            prove_first_installation(Some(&path)).map_err(Unavailable)?;
+                            setup_path = Some(path);
+                            nzbd_config::Config::default()
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    return Err(Invalid(format!(
+                        "invalid config text {}: {error}",
+                        path.display()
+                    )))
+                }
+                Err(error) => {
+                    return Err(Unavailable(format!(
+                        "cannot read config {}: {error}",
+                        path.display()
+                    )))
+                }
+            }
+        }
+    };
+    let tls = tls::server_config_checked(&cfg, &cfg.state_dir(), || {
+        validate_installation_before_mutation(&cfg, config_path.as_deref())
+            .map(|_| ())
+            .map_err(|error| anyhow_lite::Error::msg(format!("storage unavailable: {error}")))
+    })
+    .map_err(|error| {
+        let message = error.to_string();
+        if message.starts_with("storage unavailable:") {
+            Unavailable(message)
+        } else {
+            Invalid(message)
+        }
+    })?;
+    if setup_path.is_none() {
+        if let Some(path) = config_path.as_deref() {
+            remember_established_security(path);
+        }
+    }
+    Ok((cfg, setup_path, recovered_from, tls, recovered_text))
+}
+
+const INSTALLATION_ID_ENV: &str = "NZBD_EXPECTED_INSTALLATION_ID";
+
+fn identity_sidecar(config: &std::path::Path) -> PathBuf {
+    config
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(".nzbd-installation-id")
+}
+fn validate_installation_id(text: &str) -> anyhow_lite::Result<String> {
+    let id = text.trim();
+    if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow_lite::Error::msg(
+            "installation identity must be 32 hexadecimal characters",
+        ));
+    }
+    Ok(id.to_ascii_lowercase())
+}
+fn expected_installation_id(
+    config: Option<&std::path::Path>,
+) -> anyhow_lite::Result<Option<String>> {
+    let environment = match std::env::var(INSTALLATION_ID_ENV) {
+        Ok(value) => Some(validate_installation_id(&value)?),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let stored = if let Some(config) = config {
+        let path = identity_sidecar(config);
+        match std::fs::read_to_string(&path) {
+            Ok(value) => Some(validate_installation_id(&value).map_err(|error| {
+                anyhow_lite::Error::msg(format!("{}: {error}", path.display()))
+            })?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(anyhow_lite::Error::msg(format!(
+                    "cannot read installation anchor {}: {error}",
+                    path.display()
+                )))
+            }
+        }
+    } else {
+        None
+    };
+    if let (Some(environment), Some(stored)) = (&environment, &stored) {
+        if environment != stored {
+            return Err(anyhow_lite::Error::msg(
+                "launch installation identity conflicts with the durable config sidecar",
+            ));
+        }
+    }
+    Ok(environment.or(stored))
+}
+
+fn enroll_installation_id(
+    config: Option<&std::path::Path>,
+    accepted: &str,
+) -> anyhow_lite::Result<bool> {
+    use std::io::Write;
+    if expected_installation_id(config)?.is_some() {
+        return Ok(true);
+    }
+    let Some(config) = config else {
+        return Ok(false);
+    };
+    // An image-layer config or absent first-run config is not an independent
+    // durable anchor. Readonly mounts require an explicit launch identity.
+    if nzbd_config::durable::durability(config) != nzbd_config::durable::Durability::Persistent
+        || !config.is_file()
+    {
+        return Ok(false);
+    }
+    let path = identity_sidecar(config);
+    let parent = path.parent().unwrap();
+    let pending = parent.join(format!(
+        ".nzbd-installation-id.pending-{}",
+        std::process::id()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = match options.open(&pending) {
+        Ok(file) => file,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            return Ok(false)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let result = (|| -> anyhow_lite::Result<()> {
+        writeln!(file, "{accepted}")?;
+        file.sync_all()?;
+        match std::fs::hard_link(&pending, &path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if expected_installation_id(Some(config))?.as_deref() != Some(accepted) {
+                    return Err(anyhow_lite::Error::msg(
+                        "concurrent installation enrollment conflicts with accepted inventory",
+                    ));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&pending);
+    result?;
+    Ok(true)
 }
 
 fn run(
     config: Option<PathBuf>,
     bind: Option<String>,
     logbuf: Arc<nzbd_api::LogBuffer>,
+    control: &control::Controller,
 ) -> anyhow_lite::Result<RunOutcome> {
-    let mut setup_path: Option<PathBuf> = None;
-    let mut recovered_from: Option<PathBuf> = None;
-    let cfg = match &config {
-        Some(path) => {
-            // Actionable errors for the two classic container mistakes.
-            if path.is_dir() {
-                return Err(anyhow_lite::Error::msg(format!(
-                    "config path {} is a DIRECTORY, not a file — if this is a \
-                     Docker bind mount, the host file didn't exist when the \
-                     container was created, so Docker made a directory in its \
-                     place. Remove it on the host (rmdir), create the real \
-                     config file, and recreate the container.",
-                    path.display()
-                )));
-            }
-            if !path.exists() {
-                // A missing config file is not proof of a first run. In a
-                // container it usually means nothing is mounted at the
-                // config directory, so the config written last time went
-                // into the image's writable layer and died with the
-                // container — and serving the wizard here would throw away
-                // a working install on every deploy. Look for the mirror
-                // we keep on the data volume first.
-                match nzbd_config::durable::find_mirror() {
-                    Some(rec) => {
-                        // Put the file back if we can: the operator's next
-                        // `cat`/hand-edit should find a real config, and a
-                        // config dir that IS durable self-heals for good.
-                        let restored = restore_config_file(path, &rec.toml);
-                        tracing::warn!(
-                            path = %path.display(),
-                            recovered_from = %rec.from.display(),
-                            restored,
-                            "config file is MISSING — recovered the last saved \
-                             configuration from the data volume. The config \
-                             directory did not keep what was written to it: in \
-                             Docker this means no volume is mounted at it, so \
-                             every container recreate loses the file. Mount one \
-                             (see docs/DEPLOY.md); until then this copy is what \
-                             keeps the daemon configured."
-                        );
-                        recovered_from = Some(rec.from);
-                        rec.config
-                    }
-                    None => {
-                        // Genuinely nothing to run: first-run setup, boot
-                        // with defaults (no servers) and let the web UI
-                        // write this file, then reload.
-                        tracing::warn!(
-                            path = %path.display(),
-                            "no config file — first-run setup is live in the web UI"
-                        );
-                        setup_path = Some(path.clone());
-                        nzbd_config::Config::default()
-                    }
-                }
-            } else {
-                let text = std::fs::read_to_string(path).map_err(|e| {
-                    anyhow_lite::Error::msg(format!("cannot read config {}: {e}", path.display()))
-                })?;
-                nzbd_config::Config::from_toml(&text)
-                    .map_err(|e| anyhow_lite::Error::msg(format!("{}: {e}", path.display())))?
-            }
-        }
-        None => nzbd_config::Config::default(),
-    };
+    let (cfg, setup_path, recovered_from, tls_setup, recovered_text) =
+        load_bootstrap(config.clone(), control)?;
     let bind = bind.unwrap_or_else(|| cfg.api.bind.clone());
+    // Start the known-secure public control service before SetupHandle's
+    // writable probe, history opening, Engine::spawn, or other backend I/O.
+    control.public(&cfg, &bind, tls_setup)?;
+    let expected_identity = validate_installation_before_mutation(&cfg, config.as_deref())?;
+    if let (Some(path), Some(text)) = (&config, &recovered_text) {
+        let restored = restore_config_file(path, text);
+        tracing::warn!(path = %path.display(), recovered_from = ?recovered_from, restored,
+            "missing config recovered from saved data-volume mirror; check config persistence");
+    }
     // Always present: in setup mode it powers the wizard; in normal runs
     // it powers the Settings tab (view/edit config + hot reload).
     let setup = Some(match setup_path {
@@ -785,7 +1204,11 @@ fn run(
         .build()?;
 
     if cfg.cluster.enabled {
-        runtime.block_on(run_cluster(cfg, servers, tuning, bind, logbuf))?;
+        let result = runtime.block_on(run_cluster(
+            cfg, servers, tuning, bind, logbuf, control, config,
+        ));
+        runtime.shutdown_timeout(Duration::from_secs(1));
+        result?;
         return Ok(RunOutcome::Exit);
     }
 
@@ -799,8 +1222,14 @@ fn run(
     engine_cfg.disk_guard_roots = disk_guard_roots(&cfg);
     engine_cfg.torrent_payload_roots = torrent_payload_roots(&cfg);
     engine_cfg.max_active_downloads = cfg.max_active_downloads();
+    engine_cfg.expected_installation_id = expected_identity;
 
-    runtime.block_on(async move {
+    // Keep a shutdown handle outside the startup future: any later failure
+    // (torrent restore, watch roots, router setup) must drain the accepted
+    // engine before a retry can create another owner/writer scope.
+    let startup_engine = Arc::new(std::sync::Mutex::new(None::<nzbd_engine::EngineHandle>));
+    let cleanup_engine = startup_engine.clone();
+    let result = runtime.block_on(async move {
         // History is a queue-terminal dependency for torrents even when
         // Usenet post-processing is disabled: payload disposition must be
         // durable before a confirmed removal can leave the active queue.
@@ -820,6 +1249,19 @@ fn run(
             .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
         engine_cfg.history = history_db.clone();
         let engine = Engine::spawn(engine_cfg).await.map_err(with_fs_hint)?;
+        *startup_engine.lock().unwrap() = Some(engine.clone());
+        match enroll_installation_id(config.as_deref(), &engine.artifacts().installation) {
+            Ok(true) => control.identity(true, None),
+            Ok(false) => {
+                let reason = format!("installation identity is not independently enrolled; persist {} beside the config or set {INSTALLATION_ID_ENV} to {} in durable deployment configuration", ".nzbd-installation-id", engine.artifacts().installation);
+                tracing::warn!(%reason);
+                control.identity(false, Some(reason));
+            }
+            Err(error) => {
+                tracing::error!(%error, "installation enrollment unavailable; preserving accepted inventory without replacing anchor");
+                control.identity(false, Some(error.to_string()));
+            }
+        }
         if !cfg.torrent.enabled {
             let live_torrents = engine
                 .snapshot()
@@ -828,7 +1270,11 @@ fn run(
                 .filter(|job| job.kind == nzbd_types::JobKind::Torrent)
                 .count();
             if live_torrents > 0 {
-                engine.shutdown().await;
+                if !matches!(tokio::time::timeout(Duration::from_secs(8), engine.shutdown()).await, Ok(true)) {
+                    tracing::error!("disabled torrent backend did not drain durably; refusing replacement");
+                    std::process::exit(1);
+                }
+                *startup_engine.lock().unwrap() = None;
                 return Err(anyhow_lite::Error::msg(format!(
                     "[torrent] is disabled but {live_torrents} live torrent queue record(s) remain; re-enable BitTorrent and explicitly remove or drain them before disabling"
                 )));
@@ -1062,41 +1508,20 @@ fn run(
             )));
         }
 
-        // A second view of the shutdown signal for the drain deadline below.
-        let mut force_rx = sse_shutdown_tx.subscribe();
+        control.install(app, engine.clone());
         let shutdown_setup = setup.clone();
-        let shutdown = async move {
+        let shutdown = async {
             match &shutdown_setup {
-                Some(s) => {
-                    tokio::select! {
-                        _ = shutdown_signal() => tracing::info!("shutting down"),
-                        _ = s.reload.notified() => {
-                            tracing::info!("configuration changed; restarting with it")
-                        }
-                    }
-                }
-                None => {
-                    shutdown_signal().await;
-                    tracing::info!("shutting down");
-                }
+                Some(s) => tokio::select! {
+                    _ = control.stopped() => tracing::info!("shutting down"),
+                    _ = s.reload.notified() => tracing::info!("configuration changed; reloading backend"),
+                },
+                None => control.stopped().await,
             }
-            // Tell open SSE streams to end so graceful shutdown can drain
-            // (otherwise a live `/api/v1/events` connection blocks forever).
+            control.loading();
             let _ = sse_shutdown_tx.send(true);
         };
 
-        // Hard deadline on the drain: once shutdown is triggered, a client
-        // holding a connection open must never stall a restart. If graceful
-        // shutdown hasn't finished a few seconds after the trigger, proceed
-        // anyway — dropping `serve` closes whatever is left.
-        let force = async move {
-            let _ = force_rx.wait_for(|triggered| *triggered).await;
-            tokio::time::sleep(Duration::from_secs(3)).await;
-        };
-
-        let tls_setup = tls::server_config(&cfg, &cfg.state_dir())
-            .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
-        let listener = tokio::net::TcpListener::bind(&bind).await?;
         // Pending magnets and source URLs can be unreachable for minutes.
         // The listener and restored torrents are ready before retrying them.
         let pending_cancel = torrent_cancel.clone();
@@ -1121,42 +1546,11 @@ fn run(
                 }
             })
         });
-        let listener_address = listener.local_addr()?;
-        let _advertiser =
-            discovery::Advertiser::start(&cfg.api, listener_address, None, tls_setup.is_some());
-        match tls_setup {
-            None => {
-                tracing::info!(%bind, "nzbd listening");
-                let serve = std::future::IntoFuture::into_future(
-                    axum::serve(
-                        listener,
-                        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                    )
-                    .with_graceful_shutdown(shutdown),
-                );
-                tokio::pin!(serve, force);
-                tokio::select! {
-                    r = &mut serve => r?,
-                    _ = &mut force => {
-                        tracing::warn!("graceful shutdown exceeded its deadline; forcing restart");
-                    }
-                }
-            }
-            Some(t) => {
-                tracing::info!(%bind, %t.note, "nzbd listening (https)");
-                serve_tls(listener, t.config, app, shutdown).await?;
-            }
-        }
+        shutdown.await;
 
-        // Subsystem teardown is BOUNDED. This sequence runs between "the
-        // listener is down" and "the listener is back" — every second here
-        // is user-visible dead air on a restart. A PP job or feed poll that
-        // outlives its cancel must not hold the daemon offline (field
-        // report 2026-07-25: a restart hung for minutes behind one PP job;
-        // the page never came back). Stragglers die with this pass's
-        // runtime; PP is crash-safe and re-runs on the next pass. Filesystem
-        // probes use detached OS threads, so a wedged syscall cannot make
-        // Tokio runtime teardown wait for it.
+        // The control listener remains up during backend teardown. A stuck
+        // old worker must never be replaced by a second writer/PP scope.
+        let drain = async {
         if let Some(worker) = &_history_worker { worker.stop(); }
         feed_cancel.cancel();
         pp_cancel.cancel();
@@ -1186,12 +1580,19 @@ fn run(
             .await
             .is_err()
         {
-            tracing::warn!(
-                "feed/post-processing tasks ignored shutdown for 10s — restarting anyway \
-                 (an interrupted PP job re-runs on the next pass)"
-            );
+            tracing::error!("feed/post-processing tasks ignored shutdown for 10s; refusing overlapping replacement scope");
+            std::process::exit(1);
         }
-        engine.shutdown().await;
+        if !matches!(tokio::time::timeout(Duration::from_secs(8), engine.shutdown()).await, Ok(true)) {
+            // A live writer scope cannot be inherited by a replacement backend.
+            tracing::error!("backend drain timed out; refusing replacement while old writer scope may be live");
+            std::process::exit(1);
+        }
+        };
+        if tokio::time::timeout(Duration::from_secs(20), drain).await.is_err() {
+            tracing::error!("backend teardown exceeded 20 seconds; process exit preserves recovery evidence and prevents overlapping scopes");
+            std::process::exit(1);
+        }
         let reload = setup
             .as_ref()
             .is_some_and(|s| s.applied.load(std::sync::atomic::Ordering::Relaxed));
@@ -1200,45 +1601,21 @@ fn run(
         } else {
             RunOutcome::Exit
         })
-    })
-}
-
-/// Serve the router over TLS: hand-rolled accept loop (tokio-rustls +
-/// hyper-util's auto builder) so we stay on the workspace's existing
-/// rustls stack. Per-connection tasks die with the runtime when a run
-/// pass ends (shutdown or setup reload).
-async fn serve_tls(
-    listener: tokio::net::TcpListener,
-    config: std::sync::Arc<rustls::ServerConfig>,
-    app: axum::Router,
-    shutdown: impl std::future::Future<Output = ()>,
-) -> anyhow_lite::Result<()> {
-    let acceptor = tokio_rustls::TlsAcceptor::from(config);
-    let mut shutdown = std::pin::pin!(shutdown);
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => break,
-            accepted = listener.accept() => {
-                let Ok((stream, peer)) = accepted else { continue };
-                let acceptor = acceptor.clone();
-                let app = app
-                    .clone()
-                    .layer(axum::Extension(axum::extract::ConnectInfo(peer)));
-                tokio::spawn(async move {
-                    let Ok(stream) = acceptor.accept(stream).await else {
-                        return; // handshake failure (scanner, plain HTTP, …)
-                    };
-                    let service = hyper_util::service::TowerToHyperService::new(app);
-                    let _ = hyper_util::server::conn::auto::Builder::new(
-                        hyper_util::rt::TokioExecutor::new(),
-                    )
-                    .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), service)
-                    .await;
-                });
+    });
+    if result.is_err() {
+        let engine = cleanup_engine.lock().unwrap().take();
+        if let Some(engine) = engine {
+            let drained = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(8), engine.shutdown()).await
+            });
+            if !matches!(drained, Ok(true)) {
+                tracing::error!("failed backend did not drain; refusing replacement while writer scope remains live");
+                std::process::exit(1);
             }
         }
     }
-    Ok(())
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
 }
 
 /// Cluster mode (docs/CLUSTERING.md): shared-volume state, elected leader,
@@ -1249,9 +1626,12 @@ async fn run_cluster(
     tuning: Tuning,
     bind: String,
     logbuf: Arc<nzbd_api::LogBuffer>,
+    control: &control::Controller,
+    config_path: Option<PathBuf>,
 ) -> anyhow_lite::Result<()> {
     let c = &cfg.cluster;
     let (cluster_cfg, shared_dir) = cluster_runtime_config(&cfg)?;
+    let expected_identity = validate_installation_before_mutation(&cfg, config_path.as_deref())?;
     // Job data must be visible to every node: default dest to the shared
     // volume unless the operator pointed it there (or elsewhere) already.
     let dest_dir = cfg.download_dir();
@@ -1288,7 +1668,7 @@ async fn run_cluster(
         None
     };
 
-    let runtime = nzbd_cluster::ClusterRuntime::start(
+    let runtime = nzbd_cluster::ClusterRuntime::start_expected(
         cluster_cfg,
         servers,
         tuning,
@@ -1296,9 +1676,26 @@ async fn run_cluster(
         cfg.speed_limit_bps(),
         cfg.max_active_downloads(),
         pp,
+        expected_identity,
     )
     .await
     .map_err(with_fs_hint)?;
+
+    match enroll_installation_id(
+        config_path.as_deref(),
+        &runtime.engine.artifacts().installation,
+    ) {
+        Ok(true) => control.identity(true, None),
+        Ok(false) => {
+            let reason = format!("cluster lifecycle installation identity is not independently enrolled; persist .nzbd-installation-id beside the config or set {INSTALLATION_ID_ENV} to {} in durable deployment configuration", runtime.engine.artifacts().installation);
+            tracing::warn!(%reason);
+            control.identity(false, Some(reason));
+        }
+        Err(error) => {
+            tracing::error!(%error, "cluster installation enrollment unavailable; preserving accepted inventory and existing anchor");
+            control.identity(false, Some(error.to_string()));
+        }
+    }
 
     let scan_notify = Arc::new(tokio::sync::Notify::new());
     if let Some(watch) = &cfg.paths.nzb_watch_dir {
@@ -1339,30 +1736,17 @@ async fn run_cluster(
         Some(scan_notify),
         feeds_handle,
     );
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
-    let listener_address = listener.local_addr()?;
-    let _advertiser = discovery::Advertiser::start(
-        &cfg.api,
-        listener_address,
-        Some(&cfg.cluster.node_name),
-        false,
-    );
-    tracing::info!(
-        %bind,
-        node = %cfg.cluster.node_name,
-        "nzbd listening (cluster mode: C2 distributed post-processing)"
-    );
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutting down");
-        })
-        .await?;
+    control.install(app, runtime.engine.clone());
+    control.stopped().await;
+    control.loading();
 
     feed_cancel.cancel();
     feed_tracker.wait().await;
-    runtime.shutdown().await;
+    if !runtime.shutdown().await {
+        return Err(anyhow_lite::Error::msg(
+            "cluster shutdown did not complete durably; refusing replacement",
+        ));
+    }
     Ok(())
 }
 
@@ -1494,6 +1878,30 @@ mod anyhow_lite {
 mod tests {
     use super::*;
 
+    #[test]
+    fn missing_primary_after_known_security_never_selects_default_or_stale_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("lost.toml");
+        let mut trusted = nzbd_config::Config::default();
+        trusted.api.password = Some("known-secret".into());
+        trusted.api.tls = true;
+        match read_bootstrap(Some(missing), Some(trusted)) {
+            Err(BootstrapError::Unavailable(message)) => {
+                assert!(message.contains("last trusted security"))
+            }
+            _ => panic!(
+                "lost primary configuration must retain established security and remain retryable"
+            ),
+        }
+        assert!(
+            !tmp.path()
+                .join(".nzbd-security-established")
+                .try_exists()
+                .unwrap(),
+            "a missing primary must not manufacture a new security receipt or TLS identity"
+        );
+    }
+
     fn cfg_with(extra: &str) -> nzbd_config::Config {
         let toml = format!("[paths]\nmain_dir = \"/data\"\ndest_dir = \"/data/complete\"\n{extra}");
         nzbd_config::Config::from_toml(&toml).unwrap()
@@ -1552,7 +1960,7 @@ mod tests {
             let allocation = engine.artifacts().for_job(job.0).unwrap().unwrap();
             assert_eq!(allocation.root, cfg.paths.main_dir);
             assert!(!cfg.dest_dir().join("storage-contract").exists());
-            tokio::time::timeout(Duration::from_secs(10), async {
+            if tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     if let Event::JobFinished {
                         job: finished,
@@ -1568,7 +1976,16 @@ mod tests {
                 }
             })
             .await
-            .expect("download must finish");
+            .is_err()
+            {
+                eprintln!("download timeout snapshot: {:#?}", engine.snapshot());
+                eprintln!("download timeout job: {:?}", engine.export_job(job).await);
+                eprintln!(
+                    "download timeout allocation: {:?}",
+                    engine.artifacts().for_job(job.0)
+                );
+                panic!("download must finish");
+            }
             assert_eq!(
                 std::fs::read(allocation.path.join("payload.mkv")).unwrap(),
                 data
@@ -1589,6 +2006,7 @@ mod tests {
                 nzbd_state::history::HistoryDb::open(&cfg.state_dir().join("history.sqlite"), None)
                     .unwrap(),
             );
+            let mut pp_events = engine.subscribe();
             let result = nzbd_post::manager::process_job(
                 &engine,
                 &post_config(&cfg, 1, None),
@@ -1607,6 +2025,27 @@ mod tests {
                 assert!(!published_dir.join("payload.mkv").exists());
             } else {
                 assert_eq!(result.unwrap(), nzbd_post::manager::PpFinal::Success);
+                let (pp_status, final_dir) = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match pp_events
+                            .recv()
+                            .await
+                            .expect("post-processing event stream")
+                        {
+                            Event::JobPpFinished {
+                                job: finished,
+                                pp_status,
+                                final_dir,
+                                ..
+                            } if finished == job => break (pp_status, final_dir),
+                            _ => continue,
+                        }
+                    }
+                })
+                .await
+                .expect("durable post-processing completion event");
+                assert_eq!(pp_status, "SUCCESS");
+                assert_eq!(final_dir.as_deref(), Some(published_dir.to_str().unwrap()));
                 assert!(engine.export_job(job).await.unwrap().unwrap().ready());
                 assert_eq!(
                     std::fs::read(published_dir.join("payload.mkv")).unwrap(),
@@ -1862,6 +2301,9 @@ mod tests {
             .build()
             .unwrap();
 
+        let control =
+            control::Controller::start("127.0.0.1:0".parse().unwrap(), nzbd_api::LogBuffer::new(1))
+                .unwrap();
         let result = runtime
             .block_on(async {
                 tokio::time::timeout(
@@ -1872,6 +2314,8 @@ mod tests {
                         tuning,
                         "127.0.0.1:0".into(),
                         nzbd_api::LogBuffer::new(1),
+                        &control,
+                        None,
                     ),
                 )
                 .await
@@ -1968,10 +2412,14 @@ mod tests {
     #[test]
     fn directory_config_path_explains_the_docker_bind_mount_mistake() {
         let tmp = tempfile::tempdir().unwrap();
+        let control =
+            control::Controller::start("127.0.0.1:0".parse().unwrap(), nzbd_api::LogBuffer::new(1))
+                .unwrap();
         let err = match run(
             Some(tmp.path().to_path_buf()),
             Some("127.0.0.1:0".into()),
             nzbd_api::LogBuffer::new(1),
+            &control,
         ) {
             Err(err) => err,
             Ok(_) => panic!("a directory cannot be parsed as nzbd.toml"),

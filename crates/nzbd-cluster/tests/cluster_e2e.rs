@@ -164,6 +164,10 @@ async fn start_node_with_control(
     auth: nzbd_api::AuthConfig,
     control: Option<TestControl>,
 ) -> Node {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     let control = control.unwrap_or_else(|| control_topology(1).remove(0));
     let listener = control
         .reservations
@@ -903,11 +907,25 @@ async fn article_ranges_use_two_workers_and_one_authoritative_assembly() {
     .await;
 
     add_job(&leader.url, "ranged", post.nzb.as_bytes()).await;
-    wait_for("authoritative range assembly", 60, || {
-        get_json(&leader.url, "/api/v1/jobs")["jobs"][0]["status"] == "completed"
-            && tmp.path().join("complete/ranged/range.bin").is_file()
+    let assembled = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if get_json(&leader.url, "/api/v1/jobs")["jobs"][0]["status"] == "completed"
+                && tmp.path().join("complete/ranged/range.bin").is_file()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     })
     .await;
+    assert!(
+        assembled.is_ok(),
+        "range assembly stalled: leader={} b={} c={} cluster={}",
+        get_json(&leader.url, "/api/v1/jobs"),
+        get_json(&b.url, "/api/v1/jobs"),
+        get_json(&c.url, "/api/v1/jobs"),
+        get_json(&leader.url, "/api/v1/cluster")
+    );
     assert_eq!(
         std::fs::read(tmp.path().join("complete/ranged/range.bin")).unwrap(),
         data

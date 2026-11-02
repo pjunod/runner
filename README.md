@@ -146,6 +146,9 @@ workspace retirement, repair, and qualification work specified by the
 | [docs/INTEGRATION_PLAN.md](docs/INTEGRATION_PLAN.md) | The event/cursor contract consumers build against, and how it was built |
 | [docs/DEFECT_HISTORY_DELETE.md](docs/DEFECT_HISTORY_DELETE.md) | Resolved defect: why history rows resurrected, why forget now means everywhere, and how portable tombstones converge |
 | [docs/STARTUP_RECOVERY_REVIEW.md](docs/STARTUP_RECOVERY_REVIEW.md) | Review of the 2026-09-25 startup delay: pending magnet retries held the API offline, plus fix and rollout checks |
+| [docs/STARTUP_VERIFICATION_STATUS.md](docs/STARTUP_VERIFICATION_STATUS.md) | Owner, implementation progress, validation and merge status for startup runtime recovery |
+| [docs/STARTUP_VERIFICATION_PLAN.md](docs/STARTUP_VERIFICATION_PLAN.md) | Startup incident evidence and reviewed runtime recovery contract |
+| [docs/STARTUP_VERIFICATION_REVIEW.md](docs/STARTUP_VERIFICATION_REVIEW.md) | Astra and Opus review findings and disposition |
 | [docs/HISTORY_LOADING_PLAN.md](docs/HISTORY_LOADING_PLAN.md) | History loading: measured root cause, implemented first release, operator controls, and remaining deployment validation |
 | [docs/HISTORY_LOADING_STATUS.md](docs/HISTORY_LOADING_STATUS.md) | History performance delivery status, review, final checks, and merge evidence |
 | [docs/HISTORY_INCREMENTAL.md](docs/HISTORY_INCREMENTAL.md) | Incremental history ingestion: delivery status, merge equivalence, recovery, and resource checks |

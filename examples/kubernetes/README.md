@@ -2,7 +2,7 @@
 
 A minimal, production-shaped single-node deployment: one replica, config
 from a Secret (it contains news-server credentials), downloads on a PVC,
-health probes on `/healthz`.
+and local exec probes against nzbd's bootstrap monitor.
 
 ```sh
 # 1. Edit secret.yaml — put your real nzbd.toml in it
@@ -21,6 +21,38 @@ Files:
 | `deployment.yaml` | the daemon: probes, resources, non-root security context |
 | `service.yaml` | ClusterIP on 6789 |
 | `kustomization.yaml` | ties it together (`kubectl apply -k .`) |
+
+## Probe behavior and image rollouts
+
+The startup and liveness probes run `nzbd health` inside the container.
+They check the loopback monitor on `127.0.0.1:6790`, which reports whether
+the control service can answer health requests while config, queue, or
+payload recovery continues. Readiness runs `nzbd health --ready`; it
+removes the Pod from Service routing until the configured secure public
+control listener responds. A ready Pod may still report queue loading or
+storage trouble in application status. These component states do not make
+the UI unreachable.
+
+The startup probe checks every 5 seconds with a 3-second timeout and allows
+6 failures (about 30 seconds). Liveness and readiness each have an explicit
+3-second timeout; the CLI bounds its own request to 2 seconds. The Pod has
+30 seconds for graceful termination.
+
+The probe command is part of the image interface. Roll out this manifest
+with an image that contains `nzbd health`; rolling the manifest back also
+requires rolling the image back to a version with the matching interface.
+An older binary exits on the unknown `health` command, and Kubernetes will
+restart it. Pin an image version for controlled rollouts, check that the
+target image supports the probe commands before applying, and keep the
+previous image reference with the manifest rollback. Do not apply this
+manifest first and update the image later.
+
+If the monitor uses a custom port, set `NZBD_MONITOR_BIND` on the container
+so both the daemon and its exec probes resolve the same address. A CLI
+override given only to the daemon is not inherited by probe processes. The
+environment value must be a numeric loopback address; the monitor is
+plaintext and exposes only nonsecret health summaries. A bind error such as
+a port conflict prevents startup with a clear failure before storage I/O.
 
 Notes:
 

@@ -10,7 +10,7 @@ use crate::http::ClusterClient;
 use crate::proto::*;
 use crate::{ClusterConfig, PpSetup};
 use nzbd_engine::{EngineHandle, MirrorStats};
-use nzbd_post::manager::{process_job_ctx, PpCtx};
+use nzbd_post::manager::{PpCtx, process_job_ctx};
 use nzbd_types::{JobId, JobStatus, ServerDef};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -516,7 +516,13 @@ async fn report_completions(
             .map(|pending| pending.request)
             .unwrap_or(req);
         if submit_completion(
-            cfg, engine, client, active, pp, leader_url, (lease.kind, &req),
+            cfg,
+            engine,
+            client,
+            active,
+            pp,
+            leader_url,
+            (lease.kind, &req),
         )
         .await
         {
@@ -623,7 +629,7 @@ async fn replay_completion_outbox(
             active,
             pp,
             leader_url,
-            (pending.kind,&pending.request),
+            (pending.kind, &pending.request),
         )
         .await
         {
@@ -639,9 +645,9 @@ async fn submit_completion(
     active: &ActiveLeases,
     pp: &Option<PpSetup>,
     leader_url: &str,
-    completion: (LeaseKind,&CompleteRequest),
+    completion: (LeaseKind, &CompleteRequest),
 ) -> bool {
-    let (kind,req)=completion;
+    let (kind, req) = completion;
     let job_id = req.job.id;
     let lease_id = req.lease_id.clone();
     match client
@@ -849,7 +855,10 @@ async fn poll_for_work(
     for mut grant in resp.grants {
         let job_id = grant.job.id;
         if grant.job.delivery_lifecycle && grant.lifecycle_protocol < LIFECYCLE_PROTOCOL {
-            tracing::warn!(job=job_id.0,"leader requires cluster lifecycle protocol 2; grant refused before payload mutation");
+            tracing::warn!(
+                job = job_id.0,
+                "leader requires cluster lifecycle protocol 2; grant refused before payload mutation"
+            );
             reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token).await;
             continue;
         }
@@ -1170,6 +1179,46 @@ async fn reject_remote_grant(
     }
 }
 
+/// Lease renewals can extend the deadline while owner recovery is pending.
+/// Recheck at the exact recorded deadline; never drop an issued owner request.
+async fn wait_pp_owner_admission(
+    engine: &EngineHandle,
+    active: &ActiveLeases,
+    lease_id: &str,
+    job: JobId,
+    cancellation: &CancellationToken,
+) -> Result<Option<nzbd_engine::PostAdmission>, nzbd_engine::EngineError> {
+    let wait_cancel = cancellation.child_token();
+    let waiting = engine.wait_post_admission(job, &wait_cancel);
+    tokio::pin!(waiting);
+    loop {
+        let deadline = active
+            .lock()
+            .unwrap()
+            .get(lease_id)
+            .filter(|state| state.job == job && !state.cancel.is_cancelled())
+            .map(|state| state.deadline);
+        let Some(deadline) = deadline.filter(|deadline| *deadline > Instant::now()) else {
+            wait_cancel.cancel();
+            return waiting.await;
+        };
+        tokio::select! {
+            result = &mut waiting => {
+                let admission = result?;
+                let current = active.lock().unwrap().get(lease_id)
+                    .is_some_and(|state| state.job == job && state.deadline > Instant::now()
+                        && !state.cancel.is_cancelled());
+                if !current || cancellation.is_cancelled() {
+                    if let Some(admission) = admission { engine.end_post_admission(admission).await?; }
+                    return Ok(None);
+                }
+                return Ok(admission);
+            }
+            _ = tokio::time::sleep_until(deadline) => {},
+        }
+    }
+}
+
 /// Execute one PP lease: the stage pipeline fenced by the lease id, with a
 /// commit check against the live lease map (a cancelled/reclaimed lease
 /// must never publish results or stamp the job).
@@ -1213,6 +1262,18 @@ fn run_pp_lease(
                 .await;
             return;
         }
+        let admission = match wait_pp_owner_admission(&engine, &active, &lease_id, job_id, &initial.cancel).await {
+            Ok(Some(admission)) => admission,
+            result => {
+                tracing::debug!(job=job_id.0, lease=%lease_id, ?result, "PP owner admission ended before processing");
+                if active.lock().unwrap().remove(&lease_id).is_some() {
+                    let _ = engine.remove_job_silent(job_id).await;
+                }
+                return;
+            }
+        };
+        let admitted_engine = engine.for_post_admission(&admission);
+        let admission_cancel = admission.cancellation.clone();
         let script_receipt: nzbd_post::manager::ScriptReceiptHook = Arc::new({
             let active = active.clone();
             let lease_id = lease_id.clone();
@@ -1278,7 +1339,7 @@ fn run_pp_lease(
                 ("NZBCLUSTER_LEASE_REVISION".into(), initial.token.revision.to_string()),
             ],
             script_receipt_prefix: Some(format!("script:{}:", initial.job_incarnation)),
-            commit_ok: lease_authority(&active,&lease_id,&initial),
+            commit_ok: {let live=lease_authority(&active,&lease_id,&initial);let cancel=admission_cancel.clone();Arc::new(move||!cancel.is_cancelled() && live())},
         };
         loop {
             if initial.cancel.is_cancelled(){break;}
@@ -1297,17 +1358,24 @@ fn run_pp_lease(
                 if !release_worker_hold(&engine,job_id,control,lease_authority(&active,&lease_id,&initial)).await {
                     tokio::select!{_=initial.cancel.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_secs(1))=>{}}
                     continue;
+
                 }
             }
             let mut attempt=ctx.clone();attempt.cancel=initial.cancel.child_token();attempt.workers=TaskTracker::new();
-            let result=tokio::select!{
-                _=initial.cancel.cancelled()=>Err(nzbd_post::PostError::Subprocess("PP lease authority expired".into())),
-                result=process_job_ctx(&engine,&setup.post,&setup.history,&dest_dir,job_id,&attempt)=>result,
+            let processing=process_job_ctx(&admitted_engine,&setup.post,&setup.history,&dest_dir,job_id,&attempt);
+            tokio::pin!(processing);
+            let outcome=tokio::select!{
+                _=initial.cancel.cancelled()=>None,
+                _=admission_cancel.cancelled()=>None,
+                result=&mut processing=>Some(result),
             };
+            attempt.cancel.cancel();
+            let result=match outcome{Some(result)=>result,None=>{let _=processing.await;Err(nzbd_post::PostError::Subprocess("PP lease authority expired".into()))}};
             attempt.cancel.cancel();attempt.workers.close();attempt.workers.wait().await;
             match result {
                 Ok(outcome)=>{
                     tracing::info!(job=job_id.0,%lease_id,outcome=outcome.as_str(),"pp lease finished");
+                    if let Err(error)=engine.end_post_admission(admission).await{tracing::warn!(job=job_id.0,%error,"PP custody release remains pending");}
                     if let Some(state)=active.lock().unwrap().get_mut(&lease_id){state.pp_ready=true;}
                     return;
                 },
@@ -1326,6 +1394,7 @@ fn run_pp_lease(
                 }
             }
         }
+        if let Err(error)=engine.end_post_admission(admission).await{tracing::warn!(job=job_id.0,%error,"PP custody release remains pending");}
         if active.lock().unwrap().remove(&lease_id).is_some(){let _=engine.remove_job_silent(job_id).await;}
 
     });
@@ -1493,44 +1562,22 @@ pub(crate) struct GenerationManifest {
 
 impl GenerationManifest {
     fn computed_identity(&self) -> Result<String, String> {
-        use sha2::{Digest, Sha256};
-        let bytes = if self.identity_version >= 3 {
-            serde_json::to_vec(&(
-                self.job_id,
-                &self.job_incarnation,
-                &self.owner_node_id,
-                self.fence,
-                &self.job_sha256,
-                &self.files,
-                &self.artifact_copy,
-                &self.directory_identity,
-                &self.file_outcomes,
-                &self.source_disposition,
-            ))
-        } else if self.identity_version >= 2 {
-            serde_json::to_vec(&(
-                self.job_id,
-                &self.job_incarnation,
-                &self.owner_node_id,
-                self.fence,
-                &self.job_sha256,
-                &self.files,
-                &self.artifact_copy,
-                &self.directory_identity,
-                &self.file_outcomes,
-            ))
-        } else {
-            serde_json::to_vec(&(
-                self.job_id,
-                &self.job_incarnation,
-                self.fence,
-                &self.job_sha256,
-                &self.files,
-            ))
-        }
-        .map_err(|error| error.to_string())?;
-        Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+        nzbd_state::artifacts::external_generation_identity(
+            self.identity_version,
+            self.job_id,
+            &self.job_incarnation,
+            &self.owner_node_id,
+            self.fence,
+            &self.job_sha256,
+            &self.files,
+            &self.artifact_copy,
+            &self.directory_identity,
+            &self.file_outcomes,
+            &self.source_disposition,
+        )
+        .map_err(|error| error.to_string())
     }
+
     pub(crate) fn identity_matches(&self) -> bool {
         self.computed_identity()
             .is_ok_and(|computed| computed == self.result_id)
@@ -1629,8 +1676,17 @@ fn resolve_post_seal_source(
     if matches!(job.status, JobStatus::Failed | JobStatus::Deleted) {
         return Ok(None);
     }
-    Err(format!("completed PP lease has no selected publication for private attempt {}; exact source {:?}; current {:?}",expected_source.display(),source,
-        inventory.for_job(job.id.0).ok().flatten().map(|artifact|(artifact.id,artifact.generation,artifact.path,artifact.state))))
+    Err(format!(
+        "completed PP lease has no selected publication for private attempt {}; exact source {:?}; current {:?}",
+        expected_source.display(),
+        source,
+        inventory.for_job(job.id.0).ok().flatten().map(|artifact| (
+            artifact.id,
+            artifact.generation,
+            artifact.path,
+            artifact.state
+        ))
+    ))
 }
 
 async fn seal_generation(
@@ -2287,10 +2343,12 @@ mod tests {
             .import_job(queued_test_job(), false, false)
             .await
             .unwrap();
-        assert!(engine
-            .enter_post_stage(JobId(77), PostStage::ParVerify, 1_000, None)
-            .await
-            .unwrap());
+        assert!(
+            engine
+                .enter_post_stage(JobId(77), PostStage::ParVerify, 1_000, None)
+                .await
+                .unwrap()
+        );
 
         engine
             .register_repair_attempt(JobId(77), "transition-lease:1".into())
@@ -2540,9 +2598,11 @@ mod tests {
             history_recorded_by_authority: true,
             cleanup_only: false,
         };
-        assert!(accept_worker_retirement(&engine, &request, &response)
-            .await
-            .is_err());
+        assert!(
+            accept_worker_retirement(&engine, &request, &response)
+                .await
+                .is_err()
+        );
         assert!(workspace.scratch.path.exists());
         response.ok = true;
         accept_worker_retirement(&engine, &request, &response)

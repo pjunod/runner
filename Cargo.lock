@@ -2592,6 +2592,7 @@ dependencies = [
  "nzbd-torrent",
  "nzbd-types",
  "rcgen 0.13.2",
+ "reqwest 0.12.28",
  "rustls",
  "serde_json",
  "sha2 0.10.9",
@@ -2599,6 +2600,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

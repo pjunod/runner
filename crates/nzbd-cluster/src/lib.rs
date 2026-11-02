@@ -9,9 +9,8 @@
 
 mod admissions;
 pub mod control;
-mod control_recovery;
 mod control_proofs;
-mod source_facts;
+mod control_recovery;
 mod delivery;
 pub mod election;
 mod grant_receipts;
@@ -22,25 +21,26 @@ pub mod proto;
 pub mod proxy;
 pub mod range;
 pub mod registry;
+mod source_facts;
 pub mod worker;
 
 use axum::routing::get;
-use axum::{middleware, response::IntoResponse, Json, Router};
+use axum::{Json, Router, middleware, response::IntoResponse};
 use control::ControlStore;
-use election::{persist_guard, spawn_election, spawn_replicated_election, ElectionCfg, LeaderView};
+use election::{ElectionCfg, LeaderView, persist_guard, spawn_election, spawn_replicated_election};
 use http::ClusterClient;
 use layout::SharedLayout;
-use leader::{spawn_leader_task, LeaderDurability, LeaderShared};
+use leader::{LeaderDurability, LeaderShared, spawn_leader_task};
 use nzbd_engine::{Engine, EngineConfig, EngineHandle, Tuning};
 use nzbd_types::ServerDef;
-use proxy::{proxy_to_leader, ProxyState};
+use proxy::{ProxyState, proxy_to_leader};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use worker::{spawn_worker, ActiveLeases};
+use worker::{ActiveLeases, spawn_worker};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterError {
@@ -128,8 +128,11 @@ async fn drain_url_outbox(shared: &Arc<leader::LeaderShared>) -> Result<(), Stri
             .control
             .as_ref()
             .ok_or("replicated control unavailable")?;
-        let source=crate::source_facts::for_resolved(shared,&record.resolved)?;
-        if control.commit_url_outbox_with_source(&record,source.as_ref()).await? {
+        let source = crate::source_facts::for_resolved(shared, &record.resolved)?;
+        if control
+            .commit_url_outbox_with_source(&record, source.as_ref())
+            .await?
+        {
             // Queue projection is rebuilt only from the just-committed/current
             // intent. A retry never imports a stale resolved Job over user edits.
             shared.restore_control_projection().await?;
@@ -155,8 +158,41 @@ impl ClusterRuntime {
         dest_dir: PathBuf,
         speed_limit_bps: Option<u64>,
         max_active_downloads: Option<u32>,
-        mut pp: Option<PpSetup>,
+        pp: Option<PpSetup>,
     ) -> Result<ClusterRuntime, ClusterError> {
+        Self::start_expected(
+            cfg,
+            servers,
+            tuning,
+            dest_dir,
+            speed_limit_bps,
+            max_active_downloads,
+            pp,
+            None,
+        )
+        .await
+    }
+
+    /// Start with an independently enrolled lifecycle inventory identity.
+    /// The original constructor remains suitable for first-time enrollment.
+    #[allow(clippy::too_many_arguments)] // Preserve the existing constructor plus its enrollment identity.
+    pub async fn start_expected(
+        cfg: ClusterConfig,
+        servers: Vec<ServerDef>,
+        tuning: Tuning,
+        dest_dir: PathBuf,
+        speed_limit_bps: Option<u64>,
+        max_active_downloads: Option<u32>,
+        mut pp: Option<PpSetup>,
+        expected_installation_id: Option<String>,
+    ) -> Result<ClusterRuntime, ClusterError> {
+        nzbd_state::artifacts::Inventory::validate_expected(
+            &cfg.control_dir.join("file-lifecycle"),
+            expected_installation_id.as_deref(),
+        )
+        .map_err(|error| {
+            ClusterError::Control(format!("installation identity preflight: {error}"))
+        })?;
         let layout = SharedLayout::new(&cfg.shared_dir, &cfg.node_name)?;
         if let Some(setup) = pp.as_mut() {
             if setup.post.failure_action == nzbd_post::manager::FailureAction::Park {
@@ -220,6 +256,7 @@ impl ClusterRuntime {
             download_enabled: false,
             state_dir: layout.state_dir(),
             artifact_dir: Some(cfg.control_dir.join("file-lifecycle")),
+            expected_installation_id,
             dest_dir: dest_dir.clone(),
             torrent_payload_roots: cfg.torrent_payload_roots.clone(),
             history: pp.as_ref().map(|setup| setup.history.clone()),
@@ -536,19 +573,22 @@ impl ClusterRuntime {
     }
 
     /// Stop cluster tasks, then flush the engine.
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self) -> bool {
         if let Some(worker) = &self.history_worker {
             worker.stop();
         }
         self.cancel.cancel();
         self.tracker.wait().await;
         self.leader_shared.control_proofs.shutdown().await;
-        self.engine.shutdown().await;
+        let mut complete = self.engine.shutdown().await;
+
         if let Some(control) = &self.control {
             if let Err(error) = control.shutdown().await {
                 tracing::warn!(%error, "replicated control shutdown did not complete cleanly");
+                complete = false;
             }
         }
+        complete
     }
 }
 
@@ -557,8 +597,22 @@ async fn commit_control_mutation(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let observations=shared.control_proofs.snapshot().into_iter().filter_map(|value|value["jobId"].as_u64().and_then(|id|u32::try_from(id).ok()).map(|id|(id,value))).collect();
-    request.extensions_mut().insert(nzbd_api::control_pending::ControlPendingObservations(observations));
+    let observations = shared
+        .control_proofs
+        .snapshot()
+        .into_iter()
+        .filter_map(|value| {
+            value["jobId"]
+                .as_u64()
+                .and_then(|id| u32::try_from(id).ok())
+                .map(|id| (id, value))
+        })
+        .collect();
+    request
+        .extensions_mut()
+        .insert(nzbd_api::control_pending::ControlPendingObservations(
+            observations,
+        ));
     let safe = matches!(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
@@ -597,8 +651,12 @@ async fn commit_control_mutation(
         )
             .into_response();
     }
-    if let Err(error)=crate::control_recovery::reconcile(&shared).await {
-        return (axum::http::StatusCode::SERVICE_UNAVAILABLE,Json(serde_json::json!({"error":error}))).into_response();
+    if let Err(error) = crate::control_recovery::reconcile(&shared).await {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":error})),
+        )
+            .into_response();
     }
     let before = match shared.engine_projection().await {
         Ok(jobs) => jobs,
@@ -633,7 +691,7 @@ async fn commit_control_mutation(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error":error})),
             )
-                .into_response()
+                .into_response();
         }
     };
     let response = next.run(request).await;
@@ -651,7 +709,8 @@ async fn commit_control_mutation(
     if let Err(error) = shared.commit_mutation_delta(&before, &fences).await {
         tracing::error!(%error, "queue mutation was rolled back after replicated commit failed");
         if admissions::rollback_pending(&shared).await.is_err()
-            || shared.restore_control_projection().await.is_err() {
+            || shared.restore_control_projection().await.is_err()
+        {
             shared.fence_authority();
         }
         return (

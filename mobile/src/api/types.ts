@@ -60,6 +60,12 @@ export interface ControlPending {
 
 export interface JobSummary {
   controlPending?: ControlPending | null;
+  verification?: {
+    state: string;
+    reason?: string | null;
+    checked_bytes: number;
+    total_bytes: number;
+  } | null;
   control?: JobControl | null;
   id: number;
   kind?: 'nzb' | 'torrent';

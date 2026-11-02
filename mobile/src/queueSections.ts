@@ -41,7 +41,7 @@ export const QUEUE_SECTIONS: readonly QueueSectionDefinition[] = [
   { key: 'downloading', label: 'Downloading', ordered: true },
   { key: 'fetching', label: 'Fetching NZB', ordered: true },
   { key: 'torrent_metadata', label: 'Fetching torrent metadata', ordered: true },
-  { key: 'checking', label: 'Checking torrent files', ordered: false },
+  { key: 'checking', label: 'Checking files', ordered: false },
   { key: 'post_queued', label: 'Waiting to post-process', ordered: false },
   { key: 'renaming', label: 'Renaming', ordered: false },
   { key: 'verifying', label: 'Checking integrity', ordered: false },
@@ -94,6 +94,7 @@ export function queueSectionKey(job: JobSummary): QueueSectionKey {
   }
   const { status, stages } = job;
   if (status === 'paused') return 'paused';
+  if (job.verification) return job.verification.state === 'blocked' ? 'attention' : 'checking';
   if (job.pp_done || job.ready) return 'completed';
   const stage = currentPostStage(status, stages);
   if (stage) return POST_STAGE_SECTIONS[stage] ?? 'post_queued';

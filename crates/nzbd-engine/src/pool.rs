@@ -286,12 +286,17 @@ async fn fail_leases(ctx: &ConnCtx, leases: &[Lease], outcome: AttemptOutcome) {
     for lease in leases {
         let _ = ctx
             .engine_tx
-            .send(EngineMsg::SegmentFailed {
+            .send(EngineMsg::ScopedOutcome {
                 job: lease.r.job,
                 file: lease.r.file,
-                seg_number: lease.r.seg_number,
-                server: ctx.server.id,
-                outcome,
+                generation: lease.generation,
+                message: Box::new(EngineMsg::SegmentFailed {
+                    job: lease.r.job,
+                    file: lease.r.file,
+                    seg_number: lease.r.seg_number,
+                    server: ctx.server.id,
+                    outcome,
+                }),
             })
             .await;
     }
@@ -421,11 +426,16 @@ async fn stream_body(
 
     let _ = ctx
         .engine_tx
-        .send(EngineMsg::FileMetadata {
+        .send(EngineMsg::ScopedOutcome {
             job: lease.r.job,
             file: lease.r.file,
-            name: result.header.name.clone(),
-            size: result.header.size,
+            generation: lease.generation,
+            message: Box::new(EngineMsg::FileMetadata {
+                job: lease.r.job,
+                file: lease.r.file,
+                name: result.header.name.clone(),
+                size: result.header.size,
+            }),
         })
         .await;
     // Hand the decoded part to the file's writer. A closed writer means the
@@ -589,6 +599,7 @@ mod adaptive_tests {
                 seg_number: 5,
             },
             message_id: "article@example".into(),
+            generation: 7,
             writer,
         };
         let task = tokio::spawn(connection_task(ctx));
@@ -604,13 +615,8 @@ mod adaptive_tests {
         ));
         assert!(matches!(
             engine_rx.recv().await,
-            Some(EngineMsg::SegmentFailed {
-                job: JobId(3),
-                file: FileId(4),
-                seg_number: 5,
-                server: ServerId(1),
-                outcome: AttemptOutcome::ConnectionFailed,
-            })
+            Some(EngineMsg::ScopedOutcome {generation:7,message,..}) if matches!(*message,
+                EngineMsg::SegmentFailed {job:JobId(3),file:FileId(4),seg_number:5,server:ServerId(1),outcome:AttemptOutcome::ConnectionFailed})
         ));
         cancel.cancel();
         task.await.unwrap();

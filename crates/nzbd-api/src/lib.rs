@@ -3259,6 +3259,7 @@ mod tests {
 
     fn summary(id: u32, status: JobStatus) -> JobSummary {
         JobSummary {
+            verification: None,
             repair_progress: None,
             control: None,
             lifecycle_eligible: false,

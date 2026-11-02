@@ -21,6 +21,7 @@ spec:
         runAsUser: 1000      # image's unprivileged user
         runAsGroup: 1000
         fsGroup: 1000        # PVC writable by the pod
+      terminationGracePeriodSeconds: 30
       containers:
         - name: nzbd
           image: ghcr.io/pjunod/nzbd:latest
@@ -39,17 +40,21 @@ spec:
             # - name: RUST_LOG
             #   value: info
           readinessProbe:
-            httpGet:
-              path: /healthz       # always unauthenticated
-              port: http
-            initialDelaySeconds: 3
+            exec:
+              command: ["nzbd", "health", "--ready"]
             periodSeconds: 10
+            timeoutSeconds: 3
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: http
-            initialDelaySeconds: 10
+            exec:
+              command: ["nzbd", "health"]
             periodSeconds: 30
+            timeoutSeconds: 3
+          startupProbe:
+            exec:
+              command: ["nzbd", "health"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
           resources:
             requests:
               cpu: 250m
