@@ -3814,6 +3814,27 @@ impl Owner {
             QueueCommand::SetKeepOnFailure { job, keep, reply } => {
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 let before = self.state.job(job).cloned();
+                if before.is_none() {
+                    // Queue retirement does not retire separately owned source
+                    // custody. Its inventory journal remains the exact authority
+                    // for this preference; no queue row needs reconstruction.
+                    if self.persistence_fenced {
+                        let _ = reply.send(false);
+                        return;
+                    }
+                    let artifacts = self.artifacts.clone();
+                    self.io_then(
+                        move || artifacts.set_keep_on_failure(job.0, keep)
+                            .map_err(|error| nzbd_state::StateError::Corrupt(format!("artifact inventory: {error}"))),
+                        move |_, result| {
+                            if let Err(error) = &result {
+                                tracing::warn!(job = job.0, %error, "could not update retired source Keep intent");
+                            }
+                            let _ = reply.send(result.unwrap_or(false));
+                        },
+                    );
+                    return;
+                }
                 let prior_keep = before.as_ref().is_some_and(|record| {
                     record
                         .params
