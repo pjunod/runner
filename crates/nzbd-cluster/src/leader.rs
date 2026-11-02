@@ -1196,7 +1196,7 @@ async fn work_complete(
                     StatusCode::CONFLICT,
                     Json(serde_json::json!({"error": "invalid durable receipt kind"})),
                 )
-                    .into_response()
+                    .into_response();
             }
         };
         if !publication_retry_matches(receipt, &req, kind) {
@@ -1275,14 +1275,17 @@ async fn work_complete(
         }),
     )
     .await;
-    if !matches!(verified, Ok(Ok(Ok(())))) {
-        tracing::warn!(job = job_id.0, owner_incarnation = %verify_incarnation, "completion generation validation failed or timed out");
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({"error": "invalid completion generation"})),
-        )
-            .into_response();
-    }
+    let verified_files = match verified {
+        Ok(Ok(Ok(files))) => files,
+        _ => {
+            tracing::warn!(job = job_id.0, owner_incarnation = %verify_incarnation, "completion generation validation failed or timed out");
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "invalid completion generation"})),
+            )
+                .into_response();
+        }
+    };
     let outcome = match &s.control {
         Some(control) => {
             let result_job_json =
@@ -1387,55 +1390,48 @@ async fn work_complete(
                 .into_response();
         };
         let final_path = dest_dir.join(&original_dir);
-        let publish_dir = original_dir.clone();
-        let publish = tokio::task::spawn_blocking(move || {
-            publish_generation(
-                &dest_dir,
-                &result_ref,
-                &publish_dir,
-                fence,
-                &publish_result_id,
-            )
-        })
-        .await;
-        if !matches!(publish, Ok(Ok(()))) {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "generation selected but final directory publication is incomplete"})),
-            )
-                .into_response();
-        }
         published_job.dir_name = original_dir;
         published_job
             .params
-            .retain(|(k, _)| k != "*Cluster:final-dir");
+            .retain(|(key, _)| key != "*Cluster:final-dir");
         published_job.params.push((
             "*Cluster:final-dir".into(),
             final_path.to_string_lossy().into_owned(),
         ));
+        let publication = nzbd_state::artifacts::ExternalGeneration {
+            result_id: publish_result_id,
+            fence,
+            source: PathBuf::from(result_ref).join("files"),
+            files: verified_files,
+        };
+        let history = (info.kind == LeaseKind::Post && s.history.is_some())
+            .then(|| pp_history_entry(&published_job, accepted_at_ms, &final_path));
+        if let Err(error) = s
+            .engine
+            .materialize_generation(
+                published_job.clone(),
+                dest_dir,
+                final_path.clone(),
+                publication,
+                history,
+                true,
+            )
+            .await
+        {
+            tracing::warn!(job=job_id.0, %error, "accepted generation materialization remains pending");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "generation selected but final directory publication is incomplete"})),
+            ).into_response();
+        }
         final_publication = Some(final_path);
     }
     let history_recorded_by_authority = info.kind == LeaseKind::Post && s.history.is_some();
-    if info.kind == LeaseKind::Post {
-        if let Err(error) = record_pp_history(
-            &s,
-            &published_job,
-            accepted_at_ms,
-            final_publication.as_deref().expect("post publication path"),
-        )
-        .await
-        {
-            tracing::warn!(job = job_id.0, %error, "published PP result awaits durable history");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "published result awaits durable history"})),
-            )
-                .into_response();
-        }
-    }
     tracing::info!(job = job_id.0, node = %req.node, "job completed remotely");
-    if let Err(error) = s.engine.import_job(published_job, false, true).await {
-        tracing::error!(job = job_id.0, %error, "durable result accepted but local projection failed");
+    if !matches!(info.kind, LeaseKind::Post | LeaseKind::Assemble) {
+        if let Err(error) = s.engine.import_job(published_job, false, true).await {
+            tracing::error!(job = job_id.0, %error, "durable result accepted but local projection failed");
+        }
     }
     if info.kind == LeaseKind::Assemble {
         let _ = s.engine.set_delegated(job_id, None).await;
@@ -1524,15 +1520,8 @@ struct VerifyGenerationManifest {
     fence: u64,
     result_id: String,
     job_sha256: String,
-    files: Vec<VerifyGenerationFile>,
+    files: Vec<nzbd_state::artifacts::ExternalGenerationFile>,
     total_bytes: u64,
-}
-
-#[derive(serde::Deserialize)]
-struct VerifyGenerationFile {
-    path: String,
-    bytes: u64,
-    sha256: String,
 }
 
 fn verify_generation(
@@ -1542,7 +1531,7 @@ fn verify_generation(
     job_incarnation: Option<&str>,
     fence: u64,
     expected_job: &nzbd_types::Job,
-) -> Result<(), String> {
+) -> Result<Vec<nzbd_state::artifacts::ExternalGenerationFile>, String> {
     let allowed = std::fs::canonicalize(shared_dir.join(".nzbd-cluster/generations"))
         .map_err(|error| format!("canonicalize generation root: {error}"))?;
     let selected = std::fs::canonicalize(result_ref)
@@ -1575,7 +1564,7 @@ fn verify_generation(
         return Err("generation job does not match completion request".into());
     }
     let mut total = 0u64;
-    for expected in manifest.files {
+    for expected in &manifest.files {
         let relative = PathBuf::from(&expected.path);
         if relative.is_absolute()
             || relative
@@ -1626,99 +1615,7 @@ fn verify_generation(
     if total != manifest.total_bytes {
         return Err("generation total byte count mismatch".into());
     }
-    Ok(())
-}
-
-/// Materialize a selected immutable generation. Existing output is moved to
-/// a uniquely named recoverable sibling and is never deleted here. A marker
-/// makes retries idempotent without repeatedly moving the selected output.
-fn publish_generation(
-    dest_dir: &Path,
-    result_ref: &str,
-    original_dir: &str,
-    fence: u64,
-    result_id: &str,
-) -> Result<(), String> {
-    let relative = PathBuf::from(original_dir);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        return Err("original directory is not a safe relative path".into());
-    }
-    let source = PathBuf::from(result_ref).join("files");
-    let target = dest_dir.join(&relative);
-    let marker = target.join(".nzbd-generation");
-    if std::fs::read_to_string(&marker)
-        .ok()
-        .is_some_and(|selected| selected == result_id)
-    {
-        return Ok(());
-    }
-    let parent = target
-        .parent()
-        .ok_or_else(|| "final directory has no parent".to_owned())?;
-    std::fs::create_dir_all(parent).map_err(|error| format!("create final parent: {error}"))?;
-    let leaf = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "final directory has no safe file name".to_owned())?;
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let building = parent.join(format!(".{leaf}.publish-{fence}-{nonce}"));
-    let backup = parent.join(format!(".{leaf}.superseded-{fence}-{nonce}"));
-    std::fs::create_dir(&building)
-        .map_err(|error| format!("create publication directory: {error}"))?;
-    copy_publication_tree(&source, &building)?;
-    std::fs::write(building.join(".nzbd-generation"), result_id)
-        .map_err(|error| format!("write generation marker: {error}"))?;
-    std::fs::File::open(&building)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("flush publication directory: {error}"))?;
-    if target.exists() {
-        std::fs::rename(&target, &backup)
-            .map_err(|error| format!("preserve prior final directory: {error}"))?;
-    }
-    if let Err(error) = std::fs::rename(&building, &target) {
-        if backup.exists() && !target.exists() {
-            let _ = std::fs::rename(&backup, &target);
-        }
-        return Err(format!("select final generation: {error}"));
-    }
-    std::fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("flush final publication parent: {error}"))?;
-    Ok(())
-}
-
-fn copy_publication_tree(source: &Path, target: &Path) -> Result<(), String> {
-    for entry in
-        std::fs::read_dir(source).map_err(|error| format!("read selected generation: {error}"))?
-    {
-        let entry = entry.map_err(|error| format!("read selected entry: {error}"))?;
-        let metadata = entry
-            .file_type()
-            .map_err(|error| format!("inspect selected entry: {error}"))?;
-        if metadata.is_symlink() {
-            return Err("selected generation contains a symlink".into());
-        }
-        let destination = target.join(entry.file_name());
-        if metadata.is_dir() {
-            std::fs::create_dir(&destination)
-                .map_err(|error| format!("create selected directory: {error}"))?;
-            copy_publication_tree(&entry.path(), &destination)?;
-        } else if metadata.is_file() {
-            std::fs::copy(entry.path(), &destination)
-                .map_err(|error| format!("copy selected file: {error}"))?;
-            std::fs::File::open(&destination)
-                .and_then(|file| file.sync_all())
-                .map_err(|error| format!("flush selected file: {error}"))?;
-        }
-    }
-    Ok(())
+    Ok(manifest.files)
 }
 
 // ---------------------------------------------------------------------------
@@ -1835,34 +1732,43 @@ async fn recover_selected_publications(s: &LeaderShared) -> Result<(), String> {
         let dest_dir = s.publication_root(&job, kind == "post");
         let original_dir = original_dir.clone();
         let final_path = dest_dir.join(&original_dir);
-        tokio::task::spawn_blocking(move || {
-            publish_generation(&dest_dir, &result_ref, &original_dir, fence, &result_id)
-        })
-        .await
-        .map_err(|error| format!("publication recovery task failed: {error}"))??;
-        if kind == "post" {
-            record_pp_history(s, &job, accepted_at_ms, &final_path).await?;
-        }
+        let publication = nzbd_state::artifacts::ExternalGeneration {
+            result_id,
+            fence,
+            source: PathBuf::from(result_ref).join("files"),
+            // The bounded payload worker reloads and authenticates the sealed
+            // manifest against the accepted content ID before any namespace edit.
+            files: Vec::new(),
+        };
+        let history = (kind == "post" && s.history.is_some())
+            .then(|| pp_history_entry(&job, accepted_at_ms, &final_path));
+        s.engine
+            .materialize_generation(
+                job.clone(),
+                dest_dir,
+                final_path,
+                publication,
+                history,
+                false,
+            )
+            .await
+            .map_err(|error| format!("publication recovery remains pending: {error}"))?;
     }
     Ok(())
 }
 
-async fn record_pp_history(
-    s: &LeaderShared,
+fn pp_history_entry(
     job: &nzbd_types::Job,
     accepted_at_ms: i64,
     final_path: &Path,
-) -> Result<(), String> {
-    let Some(history) = &s.history else {
-        return Ok(());
-    };
+) -> nzbd_state::HistoryEntry {
     let status = job
         .params
         .iter()
         .find(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
         .map(|(_, value)| value.clone())
         .unwrap_or_else(|| "SUCCESS".into());
-    let entry = nzbd_state::HistoryEntry {
+    nzbd_state::HistoryEntry {
         job: job.id,
         name: job.name.clone(),
         category: job.category.clone(),
@@ -1888,7 +1794,20 @@ async fn record_pp_history(
         record: Some(nzbd_state::JobRecord::from_job(job)),
         stages: job.stages.clone(),
         seq: 0,
+    }
+}
+
+#[cfg(test)]
+async fn record_pp_history(
+    s: &LeaderShared,
+    job: &nzbd_types::Job,
+    accepted_at_ms: i64,
+    final_path: &Path,
+) -> Result<(), String> {
+    let Some(history) = &s.history else {
+        return Ok(());
     };
+    let entry = pp_history_entry(job, accepted_at_ms, final_path);
     let history = history.clone();
     tokio::task::spawn_blocking(move || history.record_seq(&entry))
         .await

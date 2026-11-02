@@ -7,6 +7,8 @@ mod policy;
 mod publication;
 pub use policy::{RetentionChange, RetentionPreview};
 mod delivery;
+mod materialization;
+pub use materialization::{ExternalGeneration, ExternalGenerationFile};
 mod recovery;
 mod relocation;
 pub use delivery::{Delivery, DeliveryFile, DeliveryFileOutcome};

@@ -131,9 +131,23 @@ fn fresh_epoch() -> u64 {
 // Messages
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
+pub(crate) struct GenerationMaterialization {
+    pub job: Job,
+    pub root: PathBuf,
+    pub target: PathBuf,
+    pub generation: nzbd_state::artifacts::ExternalGeneration,
+    pub history: Option<nzbd_state::HistoryEntry>,
+    pub emit_finished: bool,
+}
+
 /// External commands (wrapped by `EngineHandle` methods).
 #[derive(Debug)]
 pub(crate) enum QueueCommand {
+    MaterializeGeneration {
+        request: Box<GenerationMaterialization>,
+        reply: oneshot::Sender<Result<(), nzbd_state::StateError>>,
+    },
     ApplyPostRecord {
         admission: crate::PostAdmission,
         job: Box<Job>,
@@ -1555,7 +1569,8 @@ impl Owner {
                             let _ = reply.send(ok);
                         }),
                         // Replacing an allocation is never an admitted PP update.
-                        QueueCommand::ImportJob { .. }
+                        QueueCommand::MaterializeGeneration { .. }
+                        | QueueCommand::ImportJob { .. }
                         | QueueCommand::AdoptAuthority { .. }
                         | QueueCommand::AdoptReplicatedAuthority { .. }
                         | QueueCommand::Delete { .. } => {}
@@ -1663,6 +1678,7 @@ impl Owner {
 
     fn on_command(&mut self, cmd: QueueCommand) {
         let replacement = match &cmd {
+            QueueCommand::MaterializeGeneration { request, .. } => Some(request.job.id),
             QueueCommand::ImportJob { job, .. } | QueueCommand::ImportJobIfPresent { job, .. } => {
                 Some(job.id)
             }
@@ -1767,6 +1783,11 @@ impl Owner {
             }
         }
         match cmd {
+            QueueCommand::MaterializeGeneration { request, reply } => {
+                self.materialize_generation_then(*request, move |_, result| {
+                    let _ = reply.send(result);
+                });
+            }
             QueueCommand::ApplyPostRecord {
                 admission,
                 job,
@@ -6297,6 +6318,7 @@ impl Owner {
                 continue;
             }
             let job = match &command {
+                QueueCommand::MaterializeGeneration { request, .. } => request.job.id,
                 QueueCommand::ImportJob { job, .. }
                 | QueueCommand::ImportJobIfPresent { job, .. } => job.id,
                 QueueCommand::RemoveJobSilent { job, .. } | QueueCommand::Delete { job, .. } => {

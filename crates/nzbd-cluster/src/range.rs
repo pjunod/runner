@@ -246,6 +246,11 @@ pub fn assemble(
     }
     expected.crc32 = Some(whole_crc);
     expected.finalized = true;
+    // Exact contiguous coverage and the flushed assembled object establish
+    // this length; recovery must not infer it from nominal article sizes.
+    let size_key = format!("*File:size:{}", scope.file_id);
+    job.params.retain(|(key, _)| key != &size_key);
+    job.params.push((size_key, file_size.to_string()));
     job.files.retain(|file| file.id == FileId(scope.file_id));
     job.dir_name = private_dir
         .strip_prefix(dest_dir)

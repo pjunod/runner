@@ -64,6 +64,10 @@ Checks tab and owner-maintained body record actual results and merge status.
 - Post-processing updates carry their admission scope through deferred owner
   work. Durable imports replace a job in one acknowledged snapshot. Resume and
   Start remain fenced until the exact pending control revision is saved.
+- Accepted cluster publications create a journaled fresh inventory generation;
+  prior directories retain their custody at backup. Current authority, actual
+  worker drain, durable history and canonical queue replacement fence the
+  transition. Startup replay cannot blindly rebind a substituted inode.
 - Explicit operator Retry safely stages corrupt legacy download-owned final
   publications back to partial files after durable generation retirement;
   current-proof integrity contradictions remain review holds.

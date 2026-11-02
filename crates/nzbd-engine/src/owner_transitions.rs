@@ -240,6 +240,152 @@ pub(super) struct StartupRoot {
 }
 
 impl Owner {
+    pub(super) fn materialize_generation_then(
+        &mut self,
+        request: GenerationMaterialization,
+        callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
+    ) {
+        let job = request.job.id;
+        if !self.persist
+            || self.cancel.is_cancelled()
+            || self.allocating_jobs.contains(&job)
+            || self.record_transitions.contains(&job)
+            || self.pending_control_commits.contains(&job)
+            || self.post_admissions.contains_key(&job)
+            || self.retiring_writers.contains_key(&job)
+            || self
+                .verification
+                .get(&job)
+                .is_some_and(|state| state.running)
+        {
+            callback(
+                self,
+                Err(failure(
+                    "generation publication has not acquired quiescent authority",
+                )),
+            );
+            return;
+        }
+        if !matches!(
+            request.job.status,
+            JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
+        ) || !request.root.is_absolute()
+            || request.target.parent() != Some(request.root.as_path())
+            || request.target != request.root.join(job_dir_name(&request.job))
+            || request.root.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            callback(
+                self,
+                Err(failure(
+                    "accepted generation must be terminal with an immediate-child publication target",
+                )),
+            );
+            return;
+        }
+        if request.history.is_some() && self.history.is_none() {
+            callback(
+                self,
+                Err(failure("accepted generation history store is unavailable")),
+            );
+            return;
+        }
+        let import_existing = self.state.job(job).is_some();
+        let record = self.state.job(job).unwrap_or(&request.job);
+        let policy = (
+            record.lifecycle_eligible(),
+            record.delivery_lifecycle,
+            record
+                .params
+                .iter()
+                .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1"),
+        );
+        let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+        self.allocating_jobs.insert(job);
+        self.record_transitions.insert(job);
+        self.pending_control_commits.insert(job);
+        let inventory = self.artifacts.clone();
+        let root = request.root.clone();
+        let canonical = request.job.clone();
+        let history = request.history;
+        let emit_finished = request.emit_finished;
+        let authority = self.persist_guard.clone();
+        let cancellation = self.cancel.clone();
+        let history_authority = authority.clone();
+        let history_cancel = cancellation.clone();
+        self.payload_then(root, move || {
+            let checkpoint = || {
+                if cancellation.is_cancelled() || authority.as_ref().is_some_and(|guard| !guard()) {
+                    Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "generation publication authority changed"))
+                } else { Ok(()) }
+            };
+            inventory.materialize_generation_checked(job.0, &request.root, &request.target,
+                &request.generation, policy, &checkpoint).map_err(failure)
+        }, move |owner, result| {
+            owner.allocating_jobs.remove(&job);
+            let allocation = match result {
+                Ok(allocation) => allocation,
+                Err(error) => {
+                    owner.record_transitions.remove(&job);
+                    if !owner.pending_control_revisions.contains_key(&job) { owner.pending_control_commits.remove(&job); }
+                    if owner.state.job(job).is_some() {
+                        owner.queue_verification(job);
+                        owner.payload_recovery_failed(job, failure(&error));
+                    }
+                    callback(owner, Err(error));
+                    owner.drain_replacements();
+                    return;
+                }
+            };
+            owner.allocation_cache.insert(job, allocation);
+            owner.allocated_jobs.insert(job);
+            if let Some(verification) = owner.verification.remove(&job) { verification.cancel.cancel(); }
+            // Keep the operational fence through durable history and canonical
+            // queue import. Takeover may have normalized the current row Queued.
+            let finish = move |owner: &mut Owner, history_result: Result<(), nzbd_state::StateError>| {
+                owner.record_transitions.remove(&job);
+                if !owner.pending_control_revisions.contains_key(&job) { owner.pending_control_commits.remove(&job); }
+                if let Err(error) = history_result {
+                    if owner.state.job(job).is_some() {
+                        owner.queue_verification(job);
+                        owner.payload_recovery_failed(job, failure(&error));
+                    }
+                    callback(owner, Err(error));
+                    owner.drain_replacements();
+                    return;
+                }
+                if !owner.persist || owner.cancel.is_cancelled() || owner.job_epochs.get(&job) != Some(&epoch)
+                    || owner.pending_control_revisions.contains_key(&job) {
+                    if owner.state.job(job).is_some() { owner.queue_payload_recovery(job); }
+                    callback(owner, Err(failure("generation publication authority or control revision changed before queue import")));
+                    owner.drain_replacements();
+                    return;
+                }
+                if import_existing && owner.state.job(job).is_some() {
+                    owner.replace_job_then(canonical, false, emit_finished, true, true, callback);
+                } else {
+                    // Historical accepted results can rebuild custody/history,
+                    // but never resurrect a retired queue job.
+                    callback(owner, Ok(()));
+                    owner.drain_replacements();
+                }
+            };
+            if let Some(entry) = history {
+                let history = owner.history.clone().unwrap();
+                owner.io_then(move || {
+                    if history_cancel.is_cancelled() || history_authority.as_ref().is_some_and(|guard| !guard()) {
+                        return Err(failure("generation publication authority changed before history"));
+                    }
+                    history.record_seq_durable(&entry).map(|_| ()).map_err(failure)
+                }, finish);
+            } else { finish(owner, Ok(())); }
+        });
+    }
+
     pub(super) fn post_scope_current(&self, admission: &crate::PostAdmission) -> bool {
         self.post_admissions.get(&admission.job) == Some(&admission.generation)
             && self.job_epochs.get(&admission.job) == Some(&admission.generation)

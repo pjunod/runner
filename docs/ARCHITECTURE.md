@@ -301,7 +301,14 @@ global mutation coordinator, then recheck revision before committing.
 Runtime transforms, relocation, deletion and interrupted-operation replay use
 this same boundary. Their generation reservations retain namespace custody
 until actual worker completion; new scratch joins that reservation in the
-transaction that records it. See [startup verification status](STARTUP_VERIFICATION_STATUS.md).
+transaction that records it. Accepted cluster publications use the same owner
+payload lane: a durable intent binds the verified sealed result, old directory,
+building directory and backup identities. Selection commits a fresh inventory
+generation while retaining prior custody. History and the canonical queue
+replacement complete before the owner releases operational fences. Replay
+requires the accepted control result and current authority checkpoint, and
+never adopts a replacement inode merely because a marker exists.
+See [startup verification status](STARTUP_VERIFICATION_STATUS.md).
 
 Shutdown stops intake, cancels workers, consumes their remaining results, and waits for actual worker termination before saving the final document and clearing the diagnostic marker. A failed drain or final save prevents a replacement backend from being started in the same process.
 

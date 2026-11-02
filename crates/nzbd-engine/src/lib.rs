@@ -1407,6 +1407,33 @@ impl EngineHandle {
 
     // -- cluster operations (used by nzbd-cluster; harmless elsewhere) ------
 
+    /// Select a durably accepted immutable result through the owner's payload
+    /// lane, recording its allocation generation before importing queue facts.
+    pub async fn materialize_generation(
+        &self,
+        job: nzbd_types::Job,
+        root: PathBuf,
+        target: PathBuf,
+        generation: nzbd_state::artifacts::ExternalGeneration,
+        history: Option<nzbd_state::HistoryEntry>,
+        emit_finished: bool,
+    ) -> Result<(), EngineError> {
+        let (reply, response) = oneshot::channel();
+        self.send(QueueCommand::MaterializeGeneration {
+            request: Box::new(owner::GenerationMaterialization {
+                job,
+                root,
+                target,
+                generation,
+                history,
+                emit_finished,
+            }),
+            reply,
+        })
+        .await?;
+        owner_reply(response).await?.map_err(EngineError::State)
+    }
+
     /// Insert or replace a job with ids preserved; optionally fold its
     /// shared per-job journals (cross-node resume).
     pub async fn import_job(
