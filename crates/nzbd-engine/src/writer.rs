@@ -198,7 +198,7 @@ async fn writer_task(
                 if reservation.is_none() && file_size > 0 {
                     let _ = tokio::fs::create_dir_all(&dir).await;
                     let credit = if checkpoint.1 <= file_size {
-                        crate::download_capacity::allocated_credit(
+                        crate::download_capacity::persisted_credit(
                             &part_path,
                             checkpoint.0.min(file_size),
                             checkpoint.1,

@@ -26,7 +26,7 @@ pub(crate) fn done_coverage(file: &FileEntry, size: u64) -> (u64, u64) {
     (covered, end)
 }
 
-pub(crate) fn allocated_credit(path: &Path, done: u64, checkpoint_end: u64) -> u64 {
+pub(crate) fn persisted_credit(path: &Path, done: u64, checkpoint_end: u64) -> u64 {
     if done == 0 {
         return 0;
     }
@@ -39,15 +39,10 @@ pub(crate) fn allocated_credit(path: &Path, done: u64, checkpoint_end: u64) -> u
     if !metadata.is_file() || metadata.len() < checkpoint_end {
         return 0;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        done.min(metadata.blocks().saturating_mul(512))
-    }
-    #[cfg(not(unix))]
-    {
-        0
-    } // No allocated-block evidence on this platform: reserve conservatively.
+    // Done carries fsync/CRC proof from the owner or validated recovery.
+    // Sparse zeros and compression still represent those bytes completely;
+    // their physical block count is not remaining write demand.
+    done
 }
 
 fn checkpoint_path(job: &Job, file: &FileEntry, root: &Path) -> Option<PathBuf> {
@@ -94,7 +89,7 @@ pub(crate) fn remaining(job: &Job, root: &Path) -> u64 {
                 });
             let (done, end) = done_coverage(file, size);
             let credit = checkpoint_path(job, file, root)
-                .map_or(0, |path| allocated_credit(&path, done, end));
+                .map_or(0, |path| persisted_credit(&path, done, end));
             size.saturating_sub(credit)
         })
         .fold(0u64, u64::saturating_add)
@@ -154,26 +149,31 @@ mod tests {
         let mut output = std::fs::File::create(&path).unwrap();
         output.set_len(128 * 1024 * 1024).unwrap();
         output.sync_all().unwrap();
-        assert_eq!(allocated_credit(&path, 0, 0), 0);
-        assert_eq!(
-            allocated_credit(&path, 65536, 65536),
+        assert_eq!(persisted_credit(&path, 0, 0), 0);
+        assert!(crate::writer::validate_range(
+            &path,
             0,
-            "sparse logical size is not allocation"
+            65536,
+            crc32fast::hash(&[0; 65536])
+        ));
+        assert_eq!(
+            persisted_credit(&path, 65536, 65536),
+            65536,
+            "CRC-verified sparse-zero Done ranges need no further writes"
         );
         output.rewind().unwrap();
         output.write_all(&[11; 65536]).unwrap();
         output.sync_all().unwrap();
-        #[cfg(unix)]
-        assert!(allocated_credit(&path, 65536, 65536) > 0);
+        assert_eq!(persisted_credit(&path, 65536, 65536), 65536);
         assert_eq!(
-            allocated_credit(&path, 0, 0),
+            persisted_credit(&path, 0, 0),
             0,
             "allocated but unverified bytes are not progress"
         );
         output.set_len(1).unwrap();
         output.sync_all().unwrap();
         assert_eq!(
-            allocated_credit(&path, 65536, 65536),
+            persisted_credit(&path, 65536, 65536),
             0,
             "truncated checkpoints cannot earn stale credit"
         );
@@ -182,7 +182,7 @@ mod tests {
             let alias = temporary.path().join("alias");
             std::os::unix::fs::symlink(&path, &alias).unwrap();
             assert_eq!(
-                allocated_credit(&alias, 1, 1),
+                persisted_credit(&alias, 1, 1),
                 0,
                 "symlinks never supply checkpoint evidence"
             );
