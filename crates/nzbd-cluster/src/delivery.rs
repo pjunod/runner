@@ -83,12 +83,27 @@ impl ControlStore {
         installation: &str,
         owner: &str,
     ) -> Result<(), String> {
-        let writes:Vec<(String,hiqlite::Params)>=vec![
+        self.initialize_delivery_identity_guarded(installation, owner, None)
+            .await
+    }
+    pub(crate) async fn initialize_delivery_identity_guarded(
+        &self,
+        installation: &str,
+        owner: &str,
+        authority: Option<(&str, &str, u64)>,
+    ) -> Result<(), String> {
+        let mut writes:Vec<(String,hiqlite::Params)>=vec![
             ("INSERT INTO cluster_delivery_meta(key,value) VALUES('instance',?1) ON CONFLICT(key) DO NOTHING".into(),params!(installation)),
             ("INSERT INTO cluster_delivery_meta(key,value) VALUES('migration_owner',?1) ON CONFLICT(key) DO NOTHING".into(),params!(owner)),
             ("INSERT INTO cluster_delivery_meta(key,value) VALUES('migration_storage',?1) ON CONFLICT(key) DO NOTHING".into(),params!(installation)),
             ("INSERT INTO cluster_delivery_meta(key,value) VALUES('migration_cursor','0') ON CONFLICT(key) DO NOTHING".into(),params!())];
+        if let Some(authority) = authority {
+            writes.insert(0, crate::control::authority_statement(authority)?);
+        }
         bounded_transaction(&writes)?;
+        if let Some(authority) = authority {
+            writes[0] = crate::control::authority_statement(authority)?;
+        }
         self.client
             .txn(writes)
             .await
@@ -388,7 +403,7 @@ const MAX_DELIVERY_TRANSACTION_BYTES: usize = 64 * 1024 * 1024;
 fn bounded_statement(sql: &str, params: &hiqlite::Params) -> Result<(), String> {
     bounded_transaction(&[(sql.to_owned(), params.clone())])
 }
-fn bounded_transaction(writes: &[(String, hiqlite::Params)]) -> Result<(), String> {
+pub(crate) fn bounded_transaction(writes: &[(String, hiqlite::Params)]) -> Result<(), String> {
     let bytes = serde_json::to_vec(writes)
         .map_err(|error| error.to_string())?
         .len();
@@ -630,6 +645,27 @@ pub(crate) async fn serve_cluster_delivery(
                     .into_response()
             }
         };
+        let mut receipt = match control.admission(&token).await {
+            Ok(Some(receipt)) => receipt,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(
+                        json!({"error":"request admission not found in authoritative catalog"}),
+                    ),
+                )
+                    .into_response()
+            }
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(json!({"error":error})),
+                )
+                    .into_response()
+            }
+        };
+        // Terminal progress is derived from replicated intent/tombstones;
+        // no local orphan or stale projection may override that authority.
         let record = match control.cluster_delivery_for_token(&token).await {
             Ok(record) => record,
             Err(error) => {
@@ -641,52 +677,49 @@ pub(crate) async fn serve_cluster_delivery(
             }
         };
         if let Some(record) = record {
-            if let Ok(Some(mut receipt)) = shared.engine.url_admission(&token).await {
-                if receipt.job_id == record.delivery.job_id {
-                    let done = record.delivery.source_cleanup.status == "succeeded";
-                    receipt.runner_instance_id = record.delivery.runner_instance_id.clone();
-                    receipt.terminal_outcome = Some(record.delivery.terminal_outcome.clone());
-                    receipt.outcome = if record.delivery.terminal_outcome == "SUCCESS" {
-                        "completed"
+            if receipt.job_id == record.delivery.job_id {
+                let done = record.delivery.source_cleanup.status == "succeeded";
+                receipt.runner_instance_id = record.delivery.runner_instance_id.clone();
+                receipt.terminal_outcome = Some(record.delivery.terminal_outcome.clone());
+                receipt.outcome = if record.delivery.terminal_outcome == "SUCCESS" {
+                    "completed"
+                } else {
+                    "failed"
+                }
+                .into();
+                receipt.failure_stage = record.delivery.failure_stage.clone();
+                receipt.failure_cause = record.delivery.failure_cause.clone();
+                receipt.keep_source_on_failure = record.delivery.keep_source_on_failure && !done;
+                receipt.source_artifact_id = Some(record.delivery.source_artifact_id.clone());
+                receipt.source_generation = Some(record.delivery.source_generation.clone());
+                receipt.source_cleanup_status = Some(
+                    if done {
+                        "removed"
+                    } else if record.copies.iter().any(|copy| copy.status == "retained") {
+                        "retained"
                     } else {
-                        "failed"
+                        "pending"
+                    }
+                    .into(),
+                );
+                if record.cleanup_only {
+                    receipt.publication_path = None;
+                    receipt.custody_state = if done {
+                        "deleted_by_runner"
+                    } else if receipt.keep_source_on_failure {
+                        "kept_by_user"
+                    } else {
+                        "runner_owned"
                     }
                     .into();
-                    receipt.failure_stage = record.delivery.failure_stage.clone();
-                    receipt.failure_cause = record.delivery.failure_cause.clone();
-                    receipt.keep_source_on_failure =
-                        record.delivery.keep_source_on_failure && !done;
-                    receipt.source_artifact_id = Some(record.delivery.source_artifact_id.clone());
-                    receipt.source_generation = Some(record.delivery.source_generation.clone());
-                    receipt.source_cleanup_status = Some(
-                        if done {
-                            "removed"
-                        } else if record.copies.iter().any(|copy| copy.status == "retained") {
-                            "retained"
-                        } else {
-                            "pending"
-                        }
-                        .into(),
-                    );
-                    if record.cleanup_only {
-                        receipt.publication_path = None;
-                        receipt.custody_state = if done {
-                            "deleted_by_runner"
-                        } else if receipt.keep_source_on_failure {
-                            "kept_by_user"
-                        } else {
-                            "runner_owned"
-                        }
-                        .into();
-                    } else {
-                        receipt.publication_path = Some(record.delivery.publication_path.clone());
-                        receipt.custody_state = "curator".into();
-                    }
-                    return axum::Json(receipt).into_response();
+                } else {
+                    receipt.publication_path = Some(record.delivery.publication_path.clone());
+                    receipt.custody_state = "curator".into();
                 }
+                return axum::Json(receipt).into_response();
             }
         }
-        return next.run(request).await;
+        return axum::Json(receipt).into_response();
     }
     let _serial = shared.delivery_serial.lock().await;
     let method = request.method().clone();
@@ -1219,6 +1252,7 @@ pub(crate) async fn cleanup_one_copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
     use std::{collections::HashMap, time::Duration};
     fn record(instance: &str, id: &str) -> ClusterDelivery {
         let delivery:Delivery=serde_json::from_value(json!({
@@ -1531,6 +1565,72 @@ mod tests {
             torrent: None,
             stages: Vec::new(),
         };
+        // Fresh admission + job is one transaction. A stale request cannot
+        // occupy a later leader's ID, and failed job CAS commits no receipt.
+        let admission:nzbd_state::UrlAdmissionReceipt=serde_json::from_value(json!({"protocolVersion":1,"requestToken":"catalog-cas","submissionSha256":"exact-submission","jobId":5000,"generation":"exact-generation","runnerInstanceId":instance,"custodyState":"runner_owned"})).unwrap();
+        let mut fresh = origin.clone();
+        fresh.id = nzbd_types::JobId(5000);
+        fresh
+            .params
+            .push(("monarr-transfer".into(), admission.request_token.clone()));
+        let fences = store.job_revision_fences().await.unwrap();
+        store
+            .commit_job_delta_guarded(
+                &[(5000, Some(fresh.clone()))],
+                &fences,
+                std::slice::from_ref(&admission),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .admission("catalog-cas")
+                .await
+                .unwrap()
+                .unwrap()
+                .job_id,
+            5000
+        );
+        let mut fork = admission.clone();
+        fork.job_id = 5001;
+        assert!(store.import_admissions(&[fork]).await.is_err());
+        let stale = store.job_revision_fences().await.unwrap();
+        fresh.name = "newer durable intent".into();
+        store
+            .commit_job_delta(&[(5000, Some(fresh.clone()))])
+            .await
+            .unwrap();
+        let mut orphan = admission.clone();
+        orphan.request_token = "uncommitted-local-only".into();
+        fresh.name = "stale request must not win".into();
+        assert!(store
+            .commit_job_delta_guarded(
+                &[(5000, Some(fresh.clone()))],
+                &stale,
+                std::slice::from_ref(&orphan),
+                None
+            )
+            .await
+            .is_err());
+        assert!(store
+            .admission(&orphan.request_token)
+            .await
+            .unwrap()
+            .is_none());
+        // Absence in the caller's pre-request fence means INSERT-only, even
+        // when a later owner has since occupied this same integer ID.
+        assert!(store
+            .commit_job_delta_guarded(
+                &[(5000, Some(fresh))],
+                &std::collections::HashMap::new(),
+                std::slice::from_ref(&orphan),
+                None
+            )
+            .await
+            .is_err());
+        let (jobs, _) = store.highwater().await.unwrap();
+        assert!(jobs >= 5000);
         let mut resolved = origin.clone();
         resolved.name = "provider-name".into();
         resolved.dir_name = "provider-dir".into();
@@ -1776,6 +1876,157 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
         }
+        {
+            let _serial = runtime.leader_shared.mutation_serial.lock().await;
+            assert!(runtime
+                .engine
+                .adopt_replicated_highwater(6000, 900)
+                .await
+                .unwrap());
+            let before = runtime.leader_shared.engine_projection().await.unwrap();
+            let fences = store
+                .job_revision_fences_for(&before.keys().copied().collect::<Vec<_>>())
+                .await
+                .unwrap();
+            let token = "failed-native-admission";
+            let opts = nzbd_engine::AddOpts {
+                params: vec![
+                    ("monarr-transfer".into(), token.into()),
+                    ("monarr-delivery".into(), "1".into()),
+                ],
+                paused: true,
+                ..Default::default()
+            };
+            let local = runtime
+                .engine
+                .add_url(
+                    "uncommitted local",
+                    "http://127.0.0.1:9/no-descriptor",
+                    opts,
+                )
+                .await
+                .unwrap();
+            let mut occupied = origin.clone();
+            occupied.id = local;
+            occupied.name = "different authoritative job".into();
+            occupied
+                .params
+                .push(("monarr-transfer".into(), "different-request".into()));
+            store
+                .seed_job(
+                    u64::from(local.0),
+                    "foreign-committed-job",
+                    &serde_json::to_string(&occupied).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                runtime
+                    .leader_shared
+                    .commit_mutation_delta(&before, &fences)
+                    .await
+                    .is_err(),
+                "fresh admission cannot overwrite later occupied ID"
+            );
+            crate::admissions::rollback_pending(&runtime.leader_shared)
+                .await
+                .unwrap();
+            assert!(runtime.engine.url_admission(token).await.unwrap().is_none());
+            assert!(store.admission(token).await.unwrap().is_none());
+            assert_eq!(
+                runtime
+                    .engine
+                    .export_job(local)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .name,
+                occupied.name
+            );
+            assert!(
+                !runtime
+                    .engine
+                    .url_resolution_outbox(100)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|record| record.origin.id == local),
+                "exact unaccepted URL cache must be cancelled"
+            );
+            // Another leader may have committed the same token on a different
+            // ID while this local admission was uncertain. Cancel A before
+            // adopting B, preserving B and every unrelated occupied row.
+            let token = "replacement-admission";
+            let opts = nzbd_engine::AddOpts {
+                params: vec![
+                    ("monarr-transfer".into(), token.into()),
+                    ("monarr-delivery".into(), "1".into()),
+                ],
+                paused: true,
+                ..Default::default()
+            };
+            let old = runtime
+                .engine
+                .add_url("old local", "http://127.0.0.1:9/old", opts)
+                .await
+                .unwrap();
+            let mut accepted = runtime.engine.url_admission(token).await.unwrap().unwrap();
+            let replacement = nzbd_types::JobId(old.0 + 10);
+            accepted.job_id = replacement.0;
+            accepted.generation = format!(
+                "{}-url-{}-{:x}",
+                accepted.runner_instance_id,
+                replacement.0,
+                sha2::Sha256::digest(token.as_bytes())
+            );
+            let mut replacement_job = runtime.engine.export_job(old).await.unwrap().unwrap();
+            replacement_job.id = replacement;
+            replacement_job.name = "accepted replacement".into();
+            let fences = store
+                .job_revision_fences_for(&[u64::from(replacement.0)])
+                .await
+                .unwrap();
+            store
+                .commit_job_delta_guarded(
+                    &[(u64::from(replacement.0), Some(replacement_job))],
+                    &fences,
+                    std::slice::from_ref(&accepted),
+                    None,
+                )
+                .await
+                .unwrap();
+            crate::admissions::rollback_pending(&runtime.leader_shared)
+                .await
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .engine
+                    .url_admission(token)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .job_id,
+                replacement.0
+            );
+            assert!(runtime.engine.export_job(old).await.unwrap().is_none());
+            assert_eq!(
+                runtime
+                    .engine
+                    .export_job(replacement)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .name,
+                "accepted replacement"
+            );
+            assert!(!runtime
+                .engine
+                .url_resolution_outbox(100)
+                .await
+                .unwrap()
+                .iter()
+                .any(|record| record.origin.id == old));
+        }
         let final_record = store
             .commit_delivery(&record(&instance, "valid-after-bad"))
             .await
@@ -1816,6 +2067,61 @@ mod tests {
         assert_eq!(page["nextCursor"], final_record.delivery.sequence);
         assert_eq!(by_id["first"]["sequence"], committed.delivery.sequence);
         assert_eq!(by_id["first"]["consumerReceiptId"], "consumer-receipt");
+        // Force an actual false actor commit after its snapshot fence fails.
+        // A directory at the projection path also defeats concurrent election
+        // projection rewrites until we repair it; no sleep-based race proof.
+        let leader_file = runtime.leader_shared.layout.leader_file();
+        let leader_bytes = std::fs::read(&leader_file).unwrap();
+        std::fs::remove_file(&leader_file).unwrap();
+        std::fs::create_dir(&leader_file).unwrap();
+        assert!(!runtime
+            .engine
+            .adopt_replicated_highwater(9000, 9000)
+            .await
+            .unwrap());
+        assert!(
+            crate::admissions::adopt(&runtime.leader_shared)
+                .await
+                .is_err(),
+            "false engine boundary must refuse admission adoption"
+        );
+        runtime.leader_shared.fence_authority();
+        assert!(!runtime.leader_shared.authority_ready());
+        std::fs::remove_dir(&leader_file).unwrap();
+        std::fs::write(&leader_file, leader_bytes).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !runtime.leader_shared.authority_ready() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            runtime
+                .engine
+                .url_admission("replacement-admission")
+                .await
+                .unwrap()
+                .unwrap()
+                .job_id,
+            store
+                .admission("replacement-admission")
+                .await
+                .unwrap()
+                .unwrap()
+                .job_id
+        );
+        // A superseded initializer cannot commit even no-op migration writes.
+        runtime.cancel.cancel();
+        runtime.tracker.wait().await;
+        store.client.execute("UPDATE work_leases SET owner_incarnation='replacement-authority' WHERE resource='cluster/leader'",params!()).await.unwrap();
+        assert!(store
+            .initialize_delivery_identity_guarded(
+                "wrong-storage",
+                "wrong-owner",
+                Some(runtime.leader_shared.authority_identity())
+            )
+            .await
+            .is_err());
+        assert_eq!(store.delivery_instance().await.unwrap(), instance);
         server.abort();
         runtime.shutdown().await;
     }

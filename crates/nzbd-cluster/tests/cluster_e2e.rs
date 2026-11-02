@@ -6,6 +6,7 @@ use nzbd_cluster::{ClusterConfig, ClusterRuntime, ControlPeer};
 use nzbd_engine::Tuning;
 use nzbd_nserv::{build_post, prng_bytes, NservBuilder};
 use nzbd_types::{CertLevel, ServerDef, ServerId, TlsMode};
+use sha2::Digest;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -1739,6 +1740,61 @@ async fn delivery_receipts_survive_authority_restart_and_consumer_removed_public
     successor.kill().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_retired_receipt_without_control_proof_is_preserved_and_refuses_upgrade() {
+    let tmp = tempfile::tempdir().unwrap();
+    let token = "unproven-legacy-receipt";
+    let receipt:nzbd_state::UrlAdmissionReceipt=serde_json::from_value(serde_json::json!({"protocolVersion":1,"requestToken":token,"submissionSha256":"accepted-original-fields","jobId":40,"generation":format!("prior-instance-url-40-{:x}",sha2::Sha256::digest(token.as_bytes())),"runnerInstanceId":"prior-instance","outcome":"completed","terminalOutcome":"SUCCESS","custodyState":"curator","sourceCleanupStatus":"removed"})).unwrap();
+    let snapshot = nzbd_state::QueueSnapshotDoc {
+        url_admission_receipts: vec![receipt.clone()],
+        next_job_id: 40,
+        ..Default::default()
+    };
+    let state = tmp.path().join(".nzbd-cluster");
+    nzbd_state::SnapshotStore::open(&state)
+        .unwrap()
+        .save(&snapshot)
+        .unwrap();
+    let node = start_node(
+        tmp.path(),
+        "a",
+        NodeOpts {
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            min_free_disk_bytes: 0,
+        },
+        9,
+        1,
+    )
+    .await;
+    wait_for(
+        "legacy ambiguity remains visible and fences admission",
+        15,
+        || {
+            let (code, body) = http(
+                &node.url,
+                "POST",
+                "/api/v1/jobs?name=refused",
+                b"invalid NZB",
+            );
+            code == 503 && body.contains("legacy admission") && body.contains("receipt preserved")
+        },
+    )
+    .await;
+    let preserved: nzbd_state::QueueSnapshotDoc =
+        serde_json::from_slice(&std::fs::read(state.join("queue.json")).unwrap()).unwrap();
+    assert_eq!(preserved.url_admission_receipts.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&preserved.url_admission_receipts[0]).unwrap(),
+        serde_json::to_value(&receipt).unwrap()
+    );
+    assert!(node.runtime.engine.snapshot().jobs.is_empty());
+    node.kill().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn delivery_receipts_and_copy_acks_survive_actual_majority_authority_change() {
     let _ = tracing_subscriber::fmt()
@@ -1746,6 +1802,44 @@ async fn delivery_receipts_and_copy_acks_survive_actual_majority_authority_chang
         .with_test_writer()
         .try_init();
     let tmp = tempfile::tempdir().unwrap();
+    // Pre-upgrade receipt has no live job. It must be captured before the
+    // new authority rewrites the old shared queue snapshot.
+    let mut legacy:nzbd_state::UrlAdmissionReceipt=serde_json::from_value(serde_json::json!({"protocolVersion":1,"requestToken":"retired-before-upgrade","submissionSha256":"original-submission","jobId":700,"generation":"original-generation","runnerInstanceId":"original-public-instance","outcome":"completed","terminalOutcome":"SUCCESS","custodyState":"curator","sourceCleanupStatus":"removed"})).unwrap();
+    legacy.generation = format!(
+        "{}-url-700-{:x}",
+        legacy.runner_instance_id,
+        sha2::Sha256::digest(legacy.request_token.as_bytes())
+    );
+    let retired = nzbd_types::Job {
+        id: nzbd_types::JobId(700),
+        kind: nzbd_types::JobKind::Nzb,
+        name: "retired legacy".into(),
+        dir_name: "retired-legacy".into(),
+        name_provisional: false,
+        delivery_lifecycle: true,
+        queued_at_unix: 1,
+        original_name: String::new(),
+        category: None,
+        priority: 0,
+        dupe: Default::default(),
+        params: vec![("monarr-transfer".into(), legacy.request_token.clone())],
+        files: Vec::new(),
+        totals: Default::default(),
+        status: nzbd_types::JobStatus::Deleted,
+        torrent: None,
+        stages: Vec::new(),
+    };
+    let old = nzbd_state::QueueSnapshotDoc {
+        jobs: vec![retired],
+        url_admission_receipts: vec![legacy.clone()],
+        next_job_id: 700,
+        next_file_id: 900,
+        ..Default::default()
+    };
+    nzbd_state::SnapshotStore::open(&tmp.path().join(".nzbd-cluster"))
+        .unwrap()
+        .save(&old)
+        .unwrap();
     let bytes = prng_bytes(83, 90_000);
     let post = build_post("cluster-ready", &[("episode.mkv", bytes.clone())], 20_000);
     let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
@@ -1803,9 +1897,52 @@ async fn delivery_receipts_and_copy_acks_survive_actual_majority_authority_chang
                 .is_ok_and(|page| page["catalogAdoptionComplete"] == true)
     })
     .await;
-    let admitted=post_until_created("lifecycle NZB admission",15,||http(&authority.url,"POST",
-        "/api/v1/jobs?name=cluster-ready&params=%7B%22monarr-delivery%22%3A%221%22%2C%22monarr-transfer%22%3A%22cluster-ready-token%22%7D",post.nzb.as_bytes())).await;
-    assert!(admitted.contains("id"));
+    let descriptor_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let descriptor_port = descriptor_listener.local_addr().unwrap().port();
+    let descriptor = post.nzb.clone();
+    let descriptor_app = axum::Router::new()
+        .route(
+            "/nzb",
+            axum::routing::get(move || {
+                let descriptor = descriptor.clone();
+                async move { descriptor }
+            }),
+        )
+        .route("/bad-nzb", axum::routing::get(|| async { "not an NZB" }))
+        .route(
+            "/slow-nzb",
+            axum::routing::get(|| async { std::future::pending::<String>().await }),
+        );
+    let descriptor_server = tokio::spawn(async move {
+        axum::serve(descriptor_listener, descriptor_app)
+            .await
+            .unwrap();
+    });
+    let admission_path=format!("/api/v1/jobs?name=cluster-ready&url=http%3A%2F%2F127.0.0.1%3A{descriptor_port}%2Fnzb&params=%7B%22monarr-delivery%22%3A%221%22%2C%22monarr-transfer%22%3A%22cluster-ready-token%22%7D");
+    let admitted = post_until_created("lifecycle URL admission", 15, || {
+        http(&authority.url, "POST", &admission_path, b"")
+    })
+    .await;
+    let original_id = serde_json::from_str::<serde_json::Value>(&admitted).unwrap()["id"]
+        .as_u64()
+        .unwrap();
+    let original_admission = get_json(
+        &authority.url,
+        "/api/v1/request-admissions/cluster-ready-token",
+    );
+    assert_eq!(original_admission["jobId"], original_id);
+    assert_eq!(
+        get_json(
+            &authority.url,
+            "/api/v1/request-admissions/retired-before-upgrade"
+        ),
+        serde_json::to_value(&legacy).unwrap()
+    );
+    assert!(original_id > 700);
+    assert_eq!(
+        original_admission["runnerInstanceId"],
+        legacy.runner_instance_id
+    );
     let debug_started = tokio::time::Instant::now();
     wait_for("remote POST creates cluster-visible READY", 45, || {
         if debug_started.elapsed().as_secs() % 10 == 9 {
@@ -1902,6 +2039,61 @@ async fn delivery_receipts_and_copy_acks_survive_actual_majority_authority_chang
         manifest_paths(&tmp.path().join(".nzbd-cluster/generations")).is_empty(),
         "all exact sealed duplicates must drain"
     );
+    // Admission replay outlives its live queue row and must preserve its exact
+    // original identity on another authority after normal history retirement.
+    wait_for("completed job retired before authority change", 15, || {
+        !authority
+            .runtime
+            .engine
+            .snapshot()
+            .jobs
+            .iter()
+            .any(|job| u64::from(job.id.0) == original_id)
+    })
+    .await;
+    let cancel_path=format!("/api/v1/jobs?name=cancel-before-fetch&paused=true&url=http%3A%2F%2F127.0.0.1%3A{descriptor_port}%2Fslow-nzb&params=%7B%22monarr-delivery%22%3A%221%22%2C%22monarr-transfer%22%3A%22cancel-before-fetch%22%7D");
+    let cancelled = post_until_created("URL to cancel before payload", 15, || {
+        http(&authority.url, "POST", &cancel_path, b"")
+    })
+    .await;
+    let cancelled_id = serde_json::from_str::<serde_json::Value>(&cancelled).unwrap()["id"]
+        .as_u64()
+        .unwrap();
+    let (code, body) = http(
+        &authority.url,
+        "POST",
+        &format!("/api/v1/jobs/{cancelled_id}/actions/delete"),
+        b"",
+    );
+    assert_eq!(code, 200, "{body}");
+    let cancelled_receipt = get_json(
+        &authority.url,
+        "/api/v1/request-admissions/cancel-before-fetch",
+    );
+    assert_eq!(cancelled_receipt["outcome"], "deleted");
+    assert_eq!(cancelled_receipt["terminalOutcome"], "DELETED");
+    let failure_path=format!("/api/v1/jobs?name=bad-fetch&url=http%3A%2F%2F127.0.0.1%3A{descriptor_port}%2Fbad-nzb&params=%7B%22monarr-delivery%22%3A%221%22%2C%22monarr-transfer%22%3A%22failed-fetch%22%7D");
+    let failed = post_until_created("terminal failed URL descriptor", 15, || {
+        http(&authority.url, "POST", &failure_path, b"")
+    })
+    .await;
+    let failed_id = serde_json::from_str::<serde_json::Value>(&failed).unwrap()["id"]
+        .as_u64()
+        .unwrap();
+    wait_for("failed URL durable outcome", 15, || {
+        get_json(&authority.url, "/api/v1/request-admissions/failed-fetch")["outcome"] == "failed"
+    })
+    .await;
+    let (code, body) = http(
+        &authority.url,
+        "POST",
+        &format!("/api/v1/jobs/{failed_id}/actions/delete"),
+        b"",
+    );
+    assert_eq!(code, 200, "{body}");
+    let failed_receipt = get_json(&authority.url, "/api/v1/request-admissions/failed-fetch");
+    assert_eq!(failed_receipt["outcome"], "failed");
+    assert_eq!(failed_receipt["terminalOutcome"], "FAILURE");
     let initial = get_json(&authority.url, "/api/v1/cluster")["leader"]["node"]
         .as_str()
         .unwrap()
@@ -1960,9 +2152,80 @@ async fn delivery_receipts_and_copy_acks_survive_actual_majority_authority_chang
         .unwrap()
         .iter()
         .all(|copy| copy["status"] == "removed"));
+    assert_eq!(
+        get_json(
+            &successor.url,
+            "/api/v1/request-admissions/retired-before-upgrade"
+        ),
+        serde_json::to_value(&legacy).unwrap(),
+        "preupgrade retired receipt must survive different authority"
+    );
+    assert_eq!(
+        get_json(
+            &successor.url,
+            "/api/v1/request-admissions/cancel-before-fetch"
+        ),
+        cancelled_receipt,
+        "deleted prepublication receipt regressed after different authority"
+    );
+    assert_eq!(
+        get_json(&successor.url, "/api/v1/request-admissions/failed-fetch"),
+        failed_receipt,
+        "terminal URL failure regressed after retirement/failover"
+    );
+    let replay_admission = get_json(
+        &successor.url,
+        "/api/v1/request-admissions/cluster-ready-token",
+    );
+    for key in [
+        "requestToken",
+        "submissionSha256",
+        "jobId",
+        "generation",
+        "runnerInstanceId",
+    ] {
+        assert_eq!(
+            replay_admission[key], original_admission[key],
+            "admission {key} changed across authority"
+        );
+    }
+    let replay = post_until_created("same URL token on successor", 15, || {
+        http(&successor.url, "POST", &admission_path, b"")
+    })
+    .await;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&replay).unwrap()["id"],
+        original_id
+    );
+    assert!(
+        !successor
+            .runtime
+            .engine
+            .snapshot()
+            .jobs
+            .iter()
+            .any(|job| u64::from(job.id.0) == original_id),
+        "accepted retired token must not recreate queue work"
+    );
+    let next = post_until_created("fresh job after retired highwater", 15, || {
+        http(
+            &successor.url,
+            "POST",
+            "/api/v1/jobs?name=next-after-retirement&paused=true",
+            post.nzb.as_bytes(),
+        )
+    })
+    .await;
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&next).unwrap()["id"]
+            .as_u64()
+            .unwrap()
+            > original_id
+    );
     for node in nodes {
         node.kill().await;
     }
+    descriptor_server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -2059,7 +2322,7 @@ async fn worker_restart_regrant_preserves_retry_deadline_and_private_generation(
         }
         worker.runtime.engine.snapshot().jobs.iter().any(|job| {
             job.control.as_ref().is_some_and(|control| {
-                control.lifecycle == "held" && control.retry_policy == "scheduled_retry"
+                control.lifecycle == "held" && control.hold_cause().policy().automatic()
             })
         })
     })
@@ -2113,7 +2376,7 @@ async fn worker_restart_regrant_preserves_retry_deadline_and_private_generation(
         || {
             restarted.runtime.engine.snapshot().jobs.iter().any(|job| {
                 job.control.as_ref().is_some_and(|control| {
-                    control.lifecycle == "held" && control.retry_policy == "scheduled_retry"
+                    control.lifecycle == "held" && control.hold_cause().policy().automatic()
                 })
             })
         },

@@ -7,6 +7,7 @@
 //! Phase C1 distributes whole-job downloads; PP leases (C2) reuse the same
 //! protocol when phase 2 lands.
 
+mod admissions;
 pub mod control;
 mod delivery;
 pub mod election;
@@ -559,10 +560,18 @@ async fn commit_control_mutation(
     }
     let _serial = shared.mutation_serial.lock().await;
     if !shared.authority_ready() {
+        let review = match &shared.control {
+            Some(control) => control
+                .delivery_meta("admission_migration_review")
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error": "queue authority is still being adopted; retry"
+                "error": review.unwrap_or_else(||"queue authority is still being adopted; retry".into())
             })),
         )
             .into_response();
@@ -587,18 +596,58 @@ async fn commit_control_mutation(
             return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
+    let mut affected_ids: Vec<u64> = before.keys().copied().collect();
+    // Explicit history/Undo restoration may re-enter a known tombstone. Its
+    // ID is observed before execution; fresh admissions remain INSERT-only.
+    if let Some(raw) = request
+        .uri()
+        .path()
+        .strip_prefix("/api/v1/history/")
+        .and_then(|rest| rest.split('/').next())
+    {
+        if let Ok(id) = raw.parse::<u64>() {
+            affected_ids.push(id);
+        }
+    }
+    let fences = match shared
+        .control
+        .as_ref()
+        .unwrap()
+        .job_revision_fences_for(&affected_ids)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error":error})),
+            )
+                .into_response()
+        }
+    };
     let response = next.run(request).await;
     if !response.status().is_success() {
-        let _ = shared.restore_control_projection().await;
+        if admissions::rollback_pending(&shared).await.is_err() {
+            shared.fence_authority();
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        if shared.restore_control_projection().await.is_err() {
+            shared.fence_authority();
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         return response;
     }
-    if let Err(error) = shared.commit_mutation_delta(&before).await {
+    if let Err(error) = shared.commit_mutation_delta(&before, &fences).await {
         tracing::error!(%error, "queue mutation was rolled back after replicated commit failed");
-        let _ = shared.restore_control_projection().await;
+        if admissions::rollback_pending(&shared).await.is_err() {
+            shared.fence_authority();
+        } else if shared.restore_control_projection().await.is_err() {
+            shared.fence_authority();
+        }
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error": "replicated control did not commit the mutation; local projection rolled back"
+                "error": "replicated control did not confirm the mutation; retry after authoritative reconciliation"
             })),
         )
             .into_response();

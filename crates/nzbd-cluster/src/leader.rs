@@ -274,7 +274,8 @@ impl LeaderShared {
         self.engine
             .adopt_replicated_authority(jobs)
             .await
-            .map_err(|error| format!("replace local control projection: {error}"))
+            .map_err(|error| format!("replace local control projection: {error}"))?;
+        crate::admissions::adopt_counters(self).await
     }
 
     /// Commit only rows changed by one serialized HTTP request. This avoids
@@ -283,6 +284,7 @@ impl LeaderShared {
     pub(crate) async fn commit_mutation_delta(
         &self,
         before: &HashMap<u64, nzbd_types::Job>,
+        fences: &HashMap<u64, u64>,
     ) -> Result<(), String> {
         let control = self
             .control
@@ -307,8 +309,34 @@ impl LeaderShared {
                 changes.push((job_id, after.get(&job_id).cloned()));
             }
         }
-        control.commit_job_delta(&changes).await?;
+        let receipts = crate::admissions::pending_receipts(self).await?;
+        control
+            .commit_job_delta_guarded(
+                &changes,
+                fences,
+                &receipts,
+                Some((&self.cfg.node_name, &self.owner_incarnation, self.epoch())),
+            )
+            .await?;
+        if !receipts.is_empty()
+            && !self
+                .engine
+                .adopt_url_admissions(receipts)
+                .await
+                .map_err(|error| error.to_string())?
+        {
+            self.fence_authority();
+            return Err("engine refused committed admission projection".into());
+        }
         self.restore_control_projection().await
+    }
+
+    pub(crate) fn authority_identity(&self) -> (&str, &str, u64) {
+        (&self.cfg.node_name, &self.owner_incarnation, self.epoch())
+    }
+
+    pub(crate) fn fence_authority(&self) {
+        self.authority_ready.store(false, Ordering::Release);
     }
 
     fn is_leader(&self) -> bool {
@@ -2102,6 +2130,7 @@ pub fn spawn_leader_task(
                 break;
             }
             let is_leader = shared.is_leader();
+            if is_leader && authority_ready && !shared.authority_ready(){authority_ready=false;}
             if is_leader && !was_leader {
                 // Taking office: discard leases inherited from the old view.
                 // New leases arrive via worker heartbeats or fresh grants.
@@ -2116,6 +2145,7 @@ pub fn spawn_leader_task(
                 // without restarting the daemon or forcing an election flap.
                 match shared.engine.adopt_authority().await {
                     Ok(()) => {
+                        if let Err(error)=crate::admissions::initialize(&shared).await {tracing::error!(%error,"admission authority adoption incomplete");tokio::time::sleep(shared.cfg.lease_interval).await;continue;}
                         let replicated = match &shared.control {
                             Some(control) => control.load_jobs().await,
                             None => Err("replicated control unavailable".into()),
@@ -2125,6 +2155,7 @@ pub fn spawn_leader_task(
                                 let jobs = rows.into_iter().map(|(job, _, _)| job).collect();
                                 match shared.engine.adopt_replicated_authority(jobs).await {
                                     Ok(()) => {
+                                        if let Err(error)=crate::admissions::adopt(&shared).await {tracing::error!(%error,"admission catalog projection incomplete");continue;}
                                         if let Err(error) = shared.engine.resume_url_fetches().await {
                                             tracing::warn!(%error, "durable URL fetches could not resume");
                                         }

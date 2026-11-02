@@ -44,6 +44,15 @@ const CONTROL_SCHEMA: &[&str] = &[
         deleted INTEGER NOT NULL DEFAULT 0,
         updated_at_ms INTEGER NOT NULL
     ) STRICT",
+    "CREATE TABLE IF NOT EXISTS request_admissions(token TEXT PRIMARY KEY,identity TEXT NOT NULL,job_id INTEGER NOT NULL,data TEXT NOT NULL CHECK(length(CAST(data AS BLOB))<=8192)) STRICT",
+    "CREATE TRIGGER IF NOT EXISTS admission_identity BEFORE INSERT ON request_admissions BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM request_admissions WHERE token=NEW.token AND identity<>NEW.identity) THEN RAISE(ABORT,'admission identity conflict') END; END",
+    "CREATE TRIGGER IF NOT EXISTS admission_job_binding BEFORE INSERT ON request_admissions BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM control_jobs j,json_each(j.intent_json,'$.params') p WHERE j.job_id=NEW.job_id AND json_extract(p.value,'$[0]')='monarr-transfer' AND json_extract(p.value,'$[1]')=NEW.token) THEN RAISE(ABORT,'admission job binding conflict') END; END",
+    "CREATE TRIGGER IF NOT EXISTS control_job_highwater_insert AFTER INSERT ON control_jobs BEGIN
+       INSERT INTO control_counters(name,value) VALUES('next_job_id',NEW.job_id) ON CONFLICT(name) DO UPDATE SET value=max(value,excluded.value);
+       INSERT INTO control_counters(name,value) VALUES('next_file_id',coalesce((SELECT max(CAST(json_extract(value,'$.id') AS INTEGER)) FROM json_each(NEW.intent_json,'$.files')),0)) ON CONFLICT(name) DO UPDATE SET value=max(value,excluded.value); END",
+    "CREATE TRIGGER IF NOT EXISTS control_job_highwater_update AFTER UPDATE OF intent_json ON control_jobs BEGIN
+       INSERT INTO control_counters(name,value) VALUES('next_file_id',coalesce((SELECT max(CAST(json_extract(value,'$.id') AS INTEGER)) FROM json_each(NEW.intent_json,'$.files')),0)) ON CONFLICT(name) DO UPDATE SET value=max(value,excluded.value); END",
+    "CREATE TRIGGER IF NOT EXISTS admission_highwater AFTER INSERT ON request_admissions BEGIN INSERT INTO control_counters(name,value) VALUES('next_job_id',NEW.job_id) ON CONFLICT(name) DO UPDATE SET value=max(value,excluded.value); END",
     "CREATE TABLE IF NOT EXISTS work_leases (
         resource TEXT PRIMARY KEY,
         cluster_id TEXT NOT NULL,
@@ -60,6 +69,8 @@ const CONTROL_SCHEMA: &[&str] = &[
         terminal INTEGER NOT NULL DEFAULT 0,
         updated_at_ms INTEGER NOT NULL
     ) STRICT",
+    "CREATE TABLE IF NOT EXISTS request_authority(id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL,incarnation TEXT NOT NULL,fence INTEGER NOT NULL,checked_at_ms INTEGER NOT NULL) STRICT",
+    "CREATE TRIGGER IF NOT EXISTS request_authority_validate BEFORE INSERT ON request_authority BEGIN SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM work_leases WHERE resource='cluster/leader' AND owner_node_id=NEW.owner AND owner_incarnation=NEW.incarnation AND fence=NEW.fence AND expires_at_ms>NEW.checked_at_ms AND terminal=0) THEN RAISE(ABORT,'stale request authority') END; END",
     "CREATE TABLE IF NOT EXISTS command_receipts (
         command_id TEXT PRIMARY KEY,
         job_id INTEGER NOT NULL,
@@ -228,6 +239,12 @@ pub struct PublicationReceipt {
     pub kind: String,
 }
 
+pub(crate) fn authority_statement(
+    (owner, incarnation, fence): (&str, &str, u64),
+) -> Result<(String, hiqlite::Params), String> {
+    Ok(("INSERT INTO request_authority(id,owner,incarnation,fence,checked_at_ms) VALUES(1,?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET owner=excluded.owner,incarnation=excluded.incarnation,fence=excluded.fence,checked_at_ms=excluded.checked_at_ms".into(),params!(owner,incarnation,i64_value("authority fence",fence)?,unix_ms()?)))
+}
+
 impl ControlStore {
     pub async fn start(cfg: &ClusterConfig) -> Result<Self, String> {
         Self::start_with_wal_size(cfg, (crate::proto::MAX_RPC_BYTES * 4) as u32).await
@@ -379,18 +396,24 @@ impl ControlStore {
             let incarnation = format!("legacy-{:x}", Sha256::digest(intent_json.as_bytes()));
             statements.push((
                 "INSERT INTO control_jobs
-                 (job_id,incarnation,revision,intent_json,updated_at_ms)
-                 VALUES($1,$2,1,$3,$4)"
+                 (job_id,incarnation,revision,intent_json,updated_at_ms,deleted)
+                 VALUES($1,$2,1,$3,$4,$5)"
                     .into(),
-                params!(i64::from(job.id.0), incarnation, intent_json, now),
+                params!(
+                    i64::from(job.id.0),
+                    incarnation,
+                    intent_json,
+                    now,
+                    job.status == nzbd_types::JobStatus::Deleted
+                ),
             ));
         }
         statements.push((
-            "INSERT INTO control_counters(name,value) VALUES('next_job_id',$1)".into(),
+            "INSERT INTO control_counters(name,value) VALUES('next_job_id',$1) ON CONFLICT(name) DO UPDATE SET value=max(value,excluded.value)".into(),
             params!(i64::from(snapshot.next_job_id)),
         ));
         statements.push((
-            "INSERT INTO control_counters(name,value) VALUES('next_file_id',$1)".into(),
+            "INSERT INTO control_counters(name,value) VALUES('next_file_id',$1) ON CONFLICT(name) DO UPDATE SET value=max(value,excluded.value)".into(),
             params!(i64::from(snapshot.next_file_id)),
         ));
         statements.push((
@@ -747,11 +770,25 @@ impl ControlStore {
         &self,
         changes: &[(u64, Option<nzbd_types::Job>)],
     ) -> Result<(), String> {
-        if changes.is_empty() {
-            return Ok(());
-        }
+        let expected = self
+            .job_revision_fences_for(&changes.iter().map(|(id, _)| *id).collect::<Vec<_>>())
+            .await?;
+        self.commit_job_delta_guarded(changes, &expected, &[], None)
+            .await
+    }
+
+    pub(crate) async fn commit_job_delta_guarded(
+        &self,
+        changes: &[(u64, Option<nzbd_types::Job>)],
+        expected_rows: &std::collections::HashMap<u64, u64>,
+        admissions: &[nzbd_state::UrlAdmissionReceipt],
+        authority: Option<(&str, &str, u64)>,
+    ) -> Result<(), String> {
         let now = unix_ms()?;
         let mut statements: Vec<(String, hiqlite::Params)> = Vec::new();
+        if let Some(authority) = authority {
+            statements.push(authority_statement(authority)?);
+        }
         for (job_id, desired_job) in changes {
             let rows = self
                 .client
@@ -766,7 +803,14 @@ impl ControlStore {
                 .map(serde_json::to_string)
                 .transpose()
                 .map_err(|error| format!("encode replicated request row: {error}"))?;
-            match rows.into_iter().next() {
+            let row = rows.into_iter().next();
+            let actual = row.as_ref().map(|row| row.revision as u64);
+            if actual != expected_rows.get(job_id).copied() {
+                return Err(format!(
+                    "job {job_id} changed during request; retry against current authority"
+                ));
+            }
+            match row {
                 None => {
                     let intent = desired.as_deref().ok_or_else(|| {
                         format!("request attempted to delete unknown job {job_id}")
@@ -818,8 +862,15 @@ impl ControlStore {
                 }
             }
         }
+        statements.extend(crate::admissions::admission_statements(admissions)?);
         if statements.is_empty() {
             return Ok(());
+        }
+        crate::delivery::bounded_transaction(&statements)?;
+        // Per-job reads and bounded encoding can be slow. Refresh only this
+        // deterministic proposal timestamp immediately before submission.
+        if let Some(authority) = authority {
+            statements[0] = authority_statement(authority)?;
         }
         self.client
             .txn(statements)
