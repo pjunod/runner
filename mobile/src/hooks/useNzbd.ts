@@ -2,7 +2,7 @@ import { File } from 'expo-file-system';
 import { AppState } from 'react-native';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { mergePendingJobs } from '../controlPending';
+import { mergePendingJobs, overlayPendingObservations } from '../controlPending';
 import { JobActionResult, runJobAction } from '../api/jobActions';
 import { NzbdClient } from '../api/client';
 import { SseParser } from '../api/sse';
@@ -50,6 +50,9 @@ export function useNzbd(config: ConnectionConfig): HookResult {
   activeClient.current = client;
   useEffect(() => { activeClient.current = client; return () => { activeClient.current = null; }; }, [client]);
   const [snapshot, setSnapshot] = useState<QueueSnapshot | null>(null);
+  const snapshotRef = useRef(snapshot);
+  snapshotRef.current = snapshot;
+  const pendingObservation = useRef<{ client: NzbdClient; controller: AbortController } | null>(null);
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
   const [error, setError] = useState<string | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
@@ -81,6 +84,22 @@ export function useNzbd(config: ConnectionConfig): HookResult {
       });
     refreshPromise.current = request;
     return request;
+  }, [client]);
+
+  const refreshPendingObservations = useCallback(() => {
+    if (activeClient.current !== client || pendingObservation.current?.client === client) return;
+    const requested = snapshotRef.current?.jobs.filter(job => job.controlPending) ?? [];
+    if (!requested.length) return;
+    const request = { client, controller: new AbortController() };
+    pendingObservation.current = request;
+    const timeout = setTimeout(() => request.controller.abort(), 12_000);
+    void client.getJobs(request.controller.signal).then(observed => {
+      if (activeClient.current !== client) return;
+      setSnapshot(current => current ? { ...current, jobs: overlayPendingObservations(current.jobs, requested, observed) } : current);
+    }).catch(() => undefined).finally(() => {
+      clearTimeout(timeout);
+      if (pendingObservation.current === request) pendingObservation.current = null;
+    });
   }, [client]);
 
   useEffect(() => {
@@ -142,6 +161,8 @@ export function useNzbd(config: ConnectionConfig): HookResult {
     const poll = setInterval(() => {
       if (Date.now() - lastFrameAt.current > 7_000) {
         void refresh().catch(() => undefined);
+      } else {
+        refreshPendingObservations();
       }
     }, 5_000);
     const appState = AppState.addEventListener('change', (state) => {
@@ -151,10 +172,11 @@ export function useNzbd(config: ConnectionConfig): HookResult {
     return () => {
       disposed = true;
       controller.abort();
+      if (pendingObservation.current?.client === client) pendingObservation.current.controller.abort();
       clearInterval(poll);
       appState.remove();
     };
-  }, [client, refresh]);
+  }, [client, refresh, refreshPendingObservations]);
 
   const mutate = useCallback(
     async <T,>(key: string, operation: () => Promise<T>): Promise<T> => {

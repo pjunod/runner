@@ -32,3 +32,19 @@ export function controlPendingText(job: JobSummary): string | undefined {
     typeof pending.error === 'string' ? pending.error.slice(0, 2048) : undefined, date && Number.isFinite(date.getTime()) ? `Next check: ${date.toLocaleString()}` : undefined,
     'Existing controls remain available.'].filter(Boolean).join(' · ');
 }
+
+// A detail response is observation-only: never replace queue/control state.
+// Object identity fences a marker that vanished and reappeared mid-request.
+export function overlayPendingObservations(current: JobSummary[], requested: readonly JobSummary[], observed: readonly JobSummary[]): JobSummary[] {
+  const requests = new Map(requested.map(job => [job.id, job]));
+  const observations = new Map(observed.map(job => [job.id, job]));
+  return current.map(job => {
+    const request = requests.get(job.id), detail = observations.get(job.id);
+    if (!job.controlPending || !job.control || !request?.control || !detail?.control
+        || job.controlPending !== request.controlPending || !detail.controlPending
+        || detail.controlPending.jobId !== job.id
+        || job.control.revision !== request.control.revision || job.control.instance !== request.control.instance
+        || detail.control.revision !== job.control.revision || detail.control.instance !== job.control.instance) return job;
+    return { ...job, controlPending: detail.controlPending };
+  });
+}

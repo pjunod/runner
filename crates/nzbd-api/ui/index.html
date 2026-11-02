@@ -1857,6 +1857,37 @@ function mergePendingJobs(previous, next) {
     return { ...j, controlPending: old.controlPending };
   });
 }
+function overlayPendingObservations(current, requested, observed) {
+  const requests = new Map(requested.map(j => [j.id, j])), details = new Map(observed.map(j => [j.id, j]));
+  return current.map(j => {
+    const request = requests.get(j.id), detail = details.get(j.id);
+    if (!j.controlPending || !j.control || !request || !request.control || !detail || !detail.control
+        || j.controlPending !== request.controlPending || !detail.controlPending || detail.controlPending.jobId !== j.id
+        || j.control.revision !== request.control.revision || j.control.instance !== request.control.instance
+        || detail.control.revision !== j.control.revision || detail.control.instance !== j.control.instance) return j;
+    return { ...j, controlPending: detail.controlPending };
+  });
+}
+let pendingObservationRefresh = null;
+function refreshPendingObservations() {
+  if (pendingObservationRefresh) return pendingObservationRefresh;
+  const requested = (store.jobs || []).filter(j => j.controlPending);
+  if (!requested.length) return Promise.resolve();
+  const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), 12000);
+  const request = (async () => {
+    try {
+      const response = await jfetch("/api/v1/jobs", { signal: controller.signal });
+      if (!response.ok) return;
+      const body = await response.json();
+      if (!Array.isArray(body.jobs)) return;
+      store.jobs = overlayPendingObservations(store.jobs, requested, body.jobs);
+      if (activeTab === "queue") renderQueue();
+    } catch { /* retain the last observation until the next bounded refresh */ }
+    finally { clearTimeout(timeout); pendingObservationRefresh = null; }
+  })();
+  pendingObservationRefresh = request;
+  return request;
+}
 function acquisitionStatus(j) {
   if (!isTorrentAcquisition(j)) return "";
   if (j.status === "queued" && j.seed_donor_job_id != null) return "Waiting for seed source";
@@ -6680,6 +6711,7 @@ function pollPass() {
     if (verdict !== "live") refreshAll();
     else if (activeTab !== "queue") refreshTab();
   } else if (activeTab !== "queue") refreshTab();
+  if (Date.now() - lastTickAt <= 6500 || connFromGaps() === "live") refreshPendingObservations();
   if (openJob != null) refreshJobDetail();
   if (activeTab === "history" && openHist != null) { refreshFailureKeep(openHist); refreshJobDelivery(openHist, store.history?.find(entry => entry.job === openHist)?.params); }
 }
@@ -6717,7 +6749,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
   window.__nzbd_test = {
     readDisplay, displayMode, applyDisplay, DISPLAY_LAYOUTS, DISPLAY_PALETTES,
     rowModel, reconcileRows, applyRow, differ, KINDS, store,
-    controlPendingLabel, controlPendingText, mergePendingJobs, acquisitionStatus,
+    controlPendingLabel, controlPendingText, mergePendingJobs, acquisitionStatus, overlayPendingObservations, refreshPendingObservations,
     histModel, fileModel, statusModels, storageModels, queueModels, detailModel,
     statusName, statusLabel, healthColor, repairProgressText, fmtBytes, fmtRate, fmtEta, fmtDur, ppSummary,
     sectionOf, currentPostStage, pipelineModels, stageElapsedMs, SECTIONS, ORDERED,

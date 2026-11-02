@@ -79,8 +79,10 @@ separate source, not the child copy interval.
 A pending cluster source check is shown on the job card and detail panel,
 including its owner, reason and next check when known. **Source needs review**
 means the exact source proof changed; it does not mean recovery succeeded.
-Generic live ticks retain the last detailed observation until a newer control
-or an acknowledged result clears it. Existing pause, removal and Keep controls
+While a marker remains, one bounded observation refresh runs every five
+seconds even on a healthy live stream. Generic ticks retain the last detailed
+observation; a newer control or acknowledged result clears it. Late detail
+responses cannot revive cleared markers. Existing pause, removal and Keep controls
 remain available according to the job's current state.
 
 When a cross-node Keep change is durably requested but an exact source owner

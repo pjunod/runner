@@ -43,8 +43,8 @@ export class NzbdClient {
     return this.json<StatusDto>('/api/v1/status');
   }
 
-  async getJobs(): Promise<JobSummary[]> {
-    const result = await this.json<{ jobs: JobSummary[] }>('/api/v1/jobs');
+  async getJobs(signal?: AbortSignal): Promise<JobSummary[]> {
+    const result = await this.json<{ jobs: JobSummary[] }>('/api/v1/jobs', { signal });
     return result.jobs;
   }
 
@@ -218,7 +218,7 @@ export class NzbdClient {
       return await fetch(`${this.config.baseUrl}${path}`, {
         ...init,
         headers: this.headers(init.headers as Record<string, string> | undefined),
-        signal: controller.signal,
+        signal: init.signal ?? controller.signal,
       });
     } catch (error) {
       if (controller.signal.aborted) {
