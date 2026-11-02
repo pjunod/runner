@@ -302,3 +302,76 @@ The focused `work_rpc_round_trips_descriptors_above_one_mib_and_bounds_both_dire
 test sends a real 2 MiB loopback HTTP request and response, then checks refusal
 of oversized request and response bodies. The cluster peer router applies the
 same request cap before JSON extraction.
+
+## Durable Delivery and exact copy cleanup
+
+A cluster has one replicated consumer identity. Node storage identities remain
+local and identify the owner of a particular artifact generation; a successor
+leader must not reinterpret another node's device or inode as local ownership.
+Upgrade migration preserves the established consumer identity and existing
+Delivery sequence high-water before accepting new publications. Ambiguous
+historical admission identity is retained with an actionable review diagnostic.
+
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant L as Current authority
+    participant C as Curator
+    participant O as Exact source owners
+    W->>W: Seal payload and persist completion outbox
+    W->>L: Complete exact grant/result
+    L->>L: Commit selection and durable materialization
+    L->>L: Commit immutable READY and copy obligations
+    C->>L: Discover READY; accept exact manifest
+    L->>L: Commit consumer receipt
+    L->>O: Retry exact owned copies independently
+    O-->>L: Actual removed, retained, or retry result
+```
+
+A committed READY remains authoritative after Curator removes its consumer
+path. Replay uses the durable receipt rather than requiring an impossible
+rehash of that removed path. Each mutable copy result is merged by exact
+revision/claim CAS; an old leader cannot overwrite a newer consumer receipt.
+Completion and cleanup operations own their bulk work independently of a
+short HTTP timeout, so retries join existing work instead of launching
+concurrent hashes or unlinks. Heartbeats run on a separate control lane.
+
+Every new receiver advertises its storage identity and start-ordering
+capability. The original lease transaction records these facts. The receiver
+journals start before private copying/import/writer creation; removal fencing
+serializes against that journal. Missing legacy capability is not upgraded
+implicitly. Cleanup requires actual writer/task stop acknowledgments; lease
+expiry or an absent queue row alone cannot prove quiescence.
+
+Explicit DeleteFiles records its original mode with the exact current job
+incarnation/tombstone before physical deletion. It may override Keep only for
+those exact owned copies. Remove/Park/Trash preserve files. Consumer handoff,
+active use, recoverable dependencies and unknown members remain separate
+custody guards. A rejected sealed result gets a durable private cleanup or
+retention receipt; it never produces an empty public READY. Source-owner
+seal/cleanup replay remains bound to the original generation.
+
+Keep on failure is mutable desired policy, separate from immutable Delivery
+admission metadata. HTTP202 and `applied:false` mean owners have not all
+acknowledged the requested policy. An offline owner stays pending; a removed
+source reports unavailable. Successful-source retirement remains eligible
+regardless of this failure-only preference. Partial raw copies without proof
+that all recoverable dependencies are safe remain visibly retained. Automatic
+retirement of redundant partial raw copies is deferred.
+
+### Bounds and upgrade order
+
+- Delivery discovery is bounded to 8 MiB per public row and 16 MiB per page. An
+  invalid/oversized row becomes a trusted sequence/ID `discoveryError` stub,
+  allowing the next cursor to advance while retaining the source for review.
+- Public `sourceCopies` is bounded to 64 small progress records. Private file
+  deletion manifests are not part of that public projection.
+- Descriptors are 16 MiB, peer request/response bodies 32 MiB, private Delivery
+  records 32 MiB and serialized transaction parameters 64 MiB. Raft WAL segments
+  are 128 MiB; existing smaller WAL configuration upgrades on reopen.
+- Upgrade Curator first so it understands discovery stubs, then upgrade Runner
+  coordinators and workers together. The coordinator lease scope and receiver
+  capability fence reject incompatible lifecycle participants. Downgrading
+  while new lifecycle obligations exist is unsupported.
+- This upgrade migrates receipts and metadata only. It does not sweep legacy
+  or unowned payload paths or authorize backlog cleanup.

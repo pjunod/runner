@@ -465,3 +465,45 @@ admission receipt even after history and the queue row are cleared.
 accepted, including current source-cleanup progress. Use it after acceptance
 when cleanup state needs refreshing; the collection endpoint intentionally
 omits accepted rows from pending discovery.
+
+## Cluster replay, bounded discovery, and timing
+
+Cluster publication commits READY only after durable payload materialization.
+Its stable consumer identity, sequence/cursor, admission identity and consumer
+receipt survive a leader change. Node storage identity remains an exact-copy
+owner fact. A consumed path may disappear after acceptance; the immutable READY
+receipt still proves publication and must not be replaced by a fresh path hash.
+
+List, detail and action responses include the same bounded public
+`sourceCopies` progress projection: copy ID, owner, status, reason, attempts and
+next retry. Raw deletion manifests stay private. Source cleanup retry queues
+eligible work without reporting an owner ACK prematurely; all-removed cleanup
+remains succeeded. Failure Keep responses distinguish desired policy from
+actual owner application with `applied` and `pendingOwners`.
+
+Each discovery row is at most 8 MiB and a page at most 16 MiB. A malformed or
+unsupported row is returned as `{protocolVersion,sequence,deliveryId,
+discoveryError}`. This is retained review evidence, not acceptance authority.
+Clients advance only through the server's trusted cursor and continue to later
+rows. Upgrade Curator before Runner: older clients may reject a page containing
+these stubs. Unsupported manifests remain reviewable and their sources remain
+retained; this change does not renew old custody or clean old backlog.
+
+New READY records may include immutable `runnerStages` and `lifecycleTiming`.
+Legacy StageSpan durations have `nodeId:unrecorded` and
+`clockDomain:unrecorded`; their original host/boot cannot be reconstructed.
+Major lifecycle intervals retain their recorded node/process clock domains and
+bounded omitted-interval counts. Missing legacy timing stays unknown. Do not
+add overlapping stage intervals or invent cross-host elapsed totals. Handoff
+and source-cleanup retries are mutable receipt progress after the frozen READY
+snapshot.
+
+```mermaid
+flowchart LR
+    R[Durable Runner READY] --> D[Bounded discovery]
+    D --> I[Curator import]
+    D --> X[Unsupported row: retained review]
+    I --> A[Durable consumer acceptance]
+    A --> O[Exact source-owner cleanup]
+    O --> P[Pending / retained / actual removed]
+```
