@@ -157,6 +157,50 @@ impl Inventory {
             },
         }))))
     }
+    /// A managed seed's exact terminal journal can outlive its payload path.
+    /// This only reserves the existing use registry: it adopts no inode and
+    /// resets no stage/finalization state. The caller validates fresh ownership
+    /// or an existing deletion receipt and supplies current backend/ref proof.
+    pub(super) fn acquire_seed_retirement_use(
+        self: &Arc<Self>,
+        job: u32,
+        source: &SourceGeneration,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> Result<AttemptUse> {
+        let _coordinator = self.mutation_guard()?;
+        checkpoint()?;
+        let artifact = self.get(&source.artifact)?;
+        if artifact.generation != source.generation
+            || artifact.job != Some(job)
+            || !artifact.owned
+            || !artifact.automatic_cleanup_eligible
+            || artifact.hold.is_some()
+            || !matches!(
+                artifact.state.as_str(),
+                "active" | "retained" | "completed" | "deleting" | "delete_failed"
+            )
+        {
+            return Err(Error::Conflict(
+                "managed seed retirement source generation/cohort is held or changed".into(),
+            ));
+        }
+        if self.artifact_in_use(&artifact)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "managed seed source still has active readers or writers",
+            )
+            .into());
+        }
+        checkpoint()?;
+        self.workspace_uses
+            .lock()
+            .unwrap()
+            .insert((source.artifact.clone(), source.generation.clone()), 1);
+        Ok(AttemptUse(Arc::new(UseLease {
+            inventory: self.clone(),
+            source: source.clone(),
+        })))
+    }
     pub(super) fn authorized_processing_use(
         &self,
         artifact: &Artifact,
@@ -844,18 +888,22 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let target = root.join("fence-2");
         std::fs::create_dir(&target).unwrap();
-        assert!(inventory
-            .allocate_processing_successor(12, &root, &target)
-            .is_err());
+        assert!(
+            inventory
+                .allocate_processing_successor(12, &root, &target)
+                .is_err()
+        );
         assert_eq!(
             inventory.for_job(12).unwrap().unwrap().id,
             workspace.source.id
         );
         std::fs::remove_dir(&target).unwrap();
         let guard = inventory.acquire_attempt_use(12).unwrap().unwrap();
-        assert!(inventory
-            .allocate_processing_successor(12, &root, &target)
-            .is_err());
+        assert!(
+            inventory
+                .allocate_processing_successor(12, &root, &target)
+                .is_err()
+        );
         assert!(!target.exists());
         drop(guard);
         let mut kept = inventory.get(&workspace.source.id).unwrap();
@@ -980,17 +1028,21 @@ mod tests {
         terminal(&inventory, &workspace, "retained");
         assert!(inventory.validate_post_retry(12).is_err());
         assert!(inventory.acquire_attempt_use(12).is_err());
-        assert!(inventory
-            .finalize_workspaces(
-                &source(&workspace),
-                "FAILURE",
-                FinalizationProof::Local { history_seq: 1 }
-            )
-            .is_err());
+        assert!(
+            inventory
+                .finalize_workspaces(
+                    &source(&workspace),
+                    "FAILURE",
+                    FinalizationProof::Local { history_seq: 1 }
+                )
+                .is_err()
+        );
         let parent = inventory.for_job(12).unwrap().unwrap();
-        assert!(inventory
-            .request_delete(&parent.id, parent.revision, "live-worker", 0)
-            .is_err());
+        assert!(
+            inventory
+                .request_delete(&parent.id, parent.revision, "live-worker", 0)
+                .is_err()
+        );
         drop(worker);
         assert!(inventory.validate_post_retry(12).is_ok());
         inventory
@@ -1182,9 +1234,11 @@ mod tests {
         let guard = inventory.acquire_attempt_use(12).unwrap().unwrap();
         terminal(&inventory, &workspace, "retained");
         let artifact = inventory.for_job(12).unwrap().unwrap();
-        assert!(inventory
-            .request_delete(&artifact.id, artifact.revision, "outsider", 0)
-            .is_err());
+        assert!(
+            inventory
+                .request_delete(&artifact.id, artifact.revision, "outsider", 0)
+                .is_err()
+        );
         assert_eq!(
             inventory
                 .delete_failed_payload(&guard, 12, &|| Ok(()))

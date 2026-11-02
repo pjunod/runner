@@ -15,6 +15,7 @@ pub use delivery::{Delivery, DeliveryFile, DeliveryFileOutcome, DeliveryRunnerSt
 pub use relocation::{RelocationResult, SelectedPublication};
 mod tasks;
 mod torrent;
+mod torrent_seed;
 mod transforms;
 mod url_resolutions;
 mod worker_controls;
@@ -1967,6 +1968,14 @@ impl Inventory {
         if op.kind != "delete" {
             return Err(Error::Conflict("not a deletion operation".into()));
         }
+        if op.id.starts_with("failed-delete-torrent-seed-")
+            && authority.is_none()
+            && !matches!(op.state.as_str(), "succeeded" | "cancelled" | "review")
+        {
+            return Err(Error::Conflict(
+                "managed seed deletion requires fresh backend-stop and dependency proof".into(),
+            ));
+        }
         // A deferred move may have a stale/legacy retirement operation in the
         // journal. Its task row is not authority: require the durable delivery
         // bound to the exact source generation at execution time as well.
@@ -2285,7 +2294,7 @@ impl Inventory {
         let pending = {
             let db = self.db.lock().unwrap();
             let mut stmt = db.prepare(
-                "SELECT id FROM operations WHERE state IN ('queued','running','retry') AND json_extract(data,'$.kind')='delete' AND json_extract(data,'$.not_before')<=unixepoch() AND json_extract(data,'$.next_retry')<=unixepoch() ORDER BY json_extract(data,'$.next_retry'),json_extract(data,'$.created_at') LIMIT 25",
+                "SELECT id FROM operations WHERE state IN ('queued','running','retry') AND id NOT LIKE 'failed-delete-torrent-seed-%' AND json_extract(data,'$.kind')='delete' AND json_extract(data,'$.not_before')<=unixepoch() AND json_extract(data,'$.next_retry')<=unixepoch() ORDER BY json_extract(data,'$.next_retry'),json_extract(data,'$.created_at') LIMIT 25",
             )?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
