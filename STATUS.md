@@ -1,5 +1,32 @@
 # nzbd — Project Status
 
+## Empty failed sources retained "for recovery" — 2026-11-02
+
+**Status:** fixed on `codex/empty-failed-source`, paired with Curator
+`codex/runner-failure-handoff`. Field report (Paul, 2026-11-02, eleven Dexter:
+Resurrection jobs #2192–#2202): "curator is just sitting there like it doesn't
+know. I would expect it to instantly know the status of the downloads is
+failed, and to continue queueing up more attempts" — "interconnection is a
+first class citizen between the two apps. time to act like it".
+
+- Every job failed `FAILURE/HEALTH` before a file finished; each
+  `/processing/<job>` was empty. `failed_source_assessment` classified an
+  empty outcome set as `unknown`, so the source was "retained for recovery:
+  no regular source files were available…" as `runner_owned`. Curator holds
+  replacement while Runner owns failed bytes, so the season froze behind
+  eleven empty directories.
+- The retained generation was never pinned into the request receipt (the
+  history row got `Artifact:Id` without `Artifact:Generation`), so a later
+  delete or Keep in Files could not reach Curator either: the hold was
+  permanent even with a person trying to clear it.
+- Fix: an empty outcome set is `unusable` (the PP path already said so) and is
+  disposed at failure time. The file-lifecycle tick disposes retained failed
+  sources whose complete manifest is empty, unless Keep is set, through the
+  same generation-bound `failed-delete-<artifact>` authority Keep-off uses.
+  Retained failures pin id + generation. Receipts written before the pin adopt
+  their job's allocation on the next lookup, so the eleven live rows settle on
+  deploy with no click.
+
 ## Held jobs with no way out — 2026-11-01
 
 **Status:** fixed on `fix/held-jobs-always-have-an-exit`; plan and root cause

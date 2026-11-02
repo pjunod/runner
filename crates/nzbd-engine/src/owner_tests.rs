@@ -6263,3 +6263,54 @@ async fn resource_probes_continue_after_eight_failures_and_explicit_retry_bypass
         .unwrap();
     assert_eq!(count, 13);
 }
+
+#[test]
+fn unpinned_failed_receipt_adopts_its_jobs_source_and_reports_disposal() {
+    // Field report 2026-11-02: health failures retained before the receipt
+    // pinned its source reported runner_owned forever, so Curator never saw
+    // the source go and never replaced the release.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("processing");
+    std::fs::create_dir(&root).unwrap();
+    let inventory = nzbd_state::artifacts::Inventory::open(&tmp.path().join("state")).unwrap();
+    let source = root.join("health-failed");
+    inventory
+        .allocate_for_delivery(2202, &root, &source, true, false)
+        .unwrap();
+    let artifact = inventory.finish(2202, &source, &root, "retained").unwrap();
+    let mut receipt = UrlAdmissionReceipt {
+        protocol_version: 1,
+        request_token: "t-health".into(),
+        submission_sha256: "a".repeat(64),
+        job_id: 2202,
+        generation: "admission".into(),
+        runner_instance_id: inventory.installation.clone(),
+        terminal_outcome: Some("FAILURE/HEALTH".into()),
+        outcome: "failed".into(),
+        failure_stage: Some("health".into()),
+        failure_cause: Some("retained for recovery".into()),
+        custody_state: "runner_owned".into(),
+        keep_source_on_failure: false,
+        source_cleanup_status: None,
+        publication_path: None,
+        source_artifact_id: None,
+        source_generation: None,
+    };
+    let mut foreign = receipt.clone();
+    foreign.runner_instance_id = "another-installation".into();
+
+    assert!(refresh_url_admission_custody(&mut receipt, &inventory));
+    assert_eq!(
+        receipt.source_artifact_id.as_deref(),
+        Some(artifact.id.as_str())
+    );
+    assert_eq!(receipt.custody_state, "runner_owned");
+    assert!(!refresh_url_admission_custody(&mut foreign, &inventory));
+    assert!(foreign.source_artifact_id.is_none());
+
+    inventory.reconcile_empty_failed_sources().unwrap();
+    inventory.run_due_deletes().unwrap();
+    assert!(refresh_url_admission_custody(&mut receipt, &inventory));
+    assert_eq!(receipt.custody_state, "deleted_by_runner");
+    assert_eq!(receipt.source_cleanup_status.as_deref(), Some("removed"));
+}
