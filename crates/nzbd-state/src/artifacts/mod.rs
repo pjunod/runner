@@ -3,7 +3,7 @@
 //! SQLite owns intent and policy; external sidecars own allocation identity.
 //! Nothing in a media payload is a marker or grants permission to remove it.
 mod cluster;
-pub use cluster::{remove_cluster_generation_copy, ClusterArtifactCopy, ClusterCopyCleanup};
+pub use cluster::{ClusterArtifactCopy, ClusterCopyCleanup, remove_cluster_generation_copy};
 pub(crate) mod fs;
 mod policy;
 mod publication;
@@ -19,12 +19,12 @@ mod transforms;
 mod url_resolutions;
 mod worker_controls;
 pub use url_resolutions::{
-    url_source_identity, url_storage_retry_deadline, UrlFileReservation, UrlResolutionFault,
-    UrlResolutionRecord, UrlResolutionStore, UrlStorageRetry,
+    UrlFileReservation, UrlResolutionFault, UrlResolutionRecord, UrlResolutionStore,
+    UrlStorageRetry, url_source_identity, url_storage_retry_deadline,
 };
 mod workspace_lifecycle;
 pub use recovery::{Receipt, ReceiptFile, Recovery, RecoveryFile};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -35,8 +35,8 @@ use std::{
 };
 pub use transforms::{CustodyEvidence, Workspace};
 pub use worker_controls::{
-    WorkerCompletionProof, WorkerControlCheckpoint, WorkerControlContext, WorkerRetryAdoption,
-    WORKER_CONTROL_CONTEXT_PARAM,
+    WORKER_CONTROL_CONTEXT_PARAM, WorkerCompletionProof, WorkerControlCheckpoint,
+    WorkerControlContext, WorkerRetryAdoption,
 };
 pub use workspace_lifecycle::{
     AttemptUse, FinalizationProof, SourceGeneration, StagedCompletion, WorkspaceAssessment,
@@ -215,6 +215,9 @@ pub struct Operation {
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum DeleteRequest {
+    // Exact cancellation receipt and immutable owned selection binding keep
+    // explicit byte authority separate from mutable Keep/revision changes.
+    ClusterCancellation((String, u64, u64, bool, String, bool, String, String)),
     Cluster((String, u64, u64, bool, String, bool)),
     Scoped((String, u64, u64, bool, String)),
     Legacy((String, u64, u64, bool)),
@@ -222,6 +225,9 @@ enum DeleteRequest {
 impl DeleteRequest {
     fn fields(&self) -> (&str, u64, u64, bool, Option<&str>) {
         match self {
+            Self::ClusterCancellation((id, rev, undo, auto, generation, _, _, _)) => {
+                (id, *rev, *undo, *auto, Some(generation))
+            }
             Self::Cluster((id, rev, undo, auto, generation, _)) => {
                 (id, *rev, *undo, *auto, Some(generation))
             }
@@ -270,8 +276,12 @@ impl ListFilter {
         match self {
             Self::All => "1=1",
             Self::Live => "state NOT IN ('deleted','source_gone')",
-            Self::Attention => "state NOT IN ('deleted','source_gone') AND (json_extract(data,'$.owned')=0 OR json_extract(data,'$.hold') IS NOT NULL OR json_extract(data,'$.error') IS NOT NULL)",
-            Self::Owned => "state NOT IN ('deleted','source_gone') AND json_extract(data,'$.owned')=1",
+            Self::Attention => {
+                "state NOT IN ('deleted','source_gone') AND (json_extract(data,'$.owned')=0 OR json_extract(data,'$.hold') IS NOT NULL OR json_extract(data,'$.error') IS NOT NULL)"
+            }
+            Self::Owned => {
+                "state NOT IN ('deleted','source_gone') AND json_extract(data,'$.owned')=1"
+            }
             Self::Cleared => "state IN ('deleted','source_gone')",
         }
     }
@@ -1463,6 +1473,13 @@ impl Inventory {
             drop(stmt);
             for raw in ops {
                 let mut op: Operation = serde_json::from_str(&raw)?;
+                if op.kind == "delete"
+                    && matches!(serde_json::from_str::<DeleteRequest>(&op.request),Ok(DeleteRequest::ClusterCancellation((_,_,_,false,ref generation,false,ref receipt,_))) if generation==&a.generation && !receipt.is_empty())
+                {
+                    // The executor still rechecks its independent receipt and
+                    // exact owned manifest after any Keep-only revision change.
+                    continue;
+                }
                 op.state = "cancelled".into();
                 save_operation(&tx, &op)?;
             }
@@ -1801,6 +1818,7 @@ impl Inventory {
             automatic,
             authority,
             false,
+            None,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -1813,6 +1831,7 @@ impl Inventory {
         automatic: bool,
         authority: Option<(&AttemptUse, &dyn Fn() -> std::io::Result<()>)>,
         failure_keep_guard: bool,
+        cancellation_receipt: Option<&str>,
     ) -> Result<Operation> {
         let _guard = self.mutation_guard()?;
         if let Some((_, checkpoint)) = authority {
@@ -1825,7 +1844,29 @@ impl Inventory {
             ));
         }
         let a = self.get(key)?;
-        let request = if request_id.starts_with("cluster-copy-") {
+        let explicit_cancellation = cancellation_receipt
+            .map(|receipt| self.cluster_cancellation_delete_accepted(&a.id, &a.generation, receipt))
+            .transpose()?
+            .unwrap_or(false);
+        if cancellation_receipt.is_some()
+            && (!explicit_cancellation || automatic || failure_keep_guard)
+        {
+            return Err(Error::Conflict(
+                "explicit cancellation lacks its exact durable receipt".into(),
+            ));
+        }
+        let request = if let Some(receipt) = cancellation_receipt {
+            serde_json::to_string(&(
+                key,
+                revision,
+                undo_seconds,
+                automatic,
+                &a.generation,
+                false,
+                receipt,
+                self.cluster_cancellation_delete_binding(&a)?,
+            ))?
+        } else if request_id.starts_with("cluster-copy-") {
             serde_json::to_string(&(
                 key,
                 revision,
@@ -1857,7 +1898,7 @@ impl Inventory {
         if a.revision != revision
             || (self.artifact_in_use(&a)? && !self.authorized_processing_use(&a, use_guard))
             || !a.owned
-            || a.keep
+            || (a.keep && !explicit_cancellation)
             || a.hold.is_some()
             || !matches!(
                 a.state.as_str(),
@@ -1950,7 +1991,36 @@ impl Inventory {
         }
         let request: DeleteRequest = serde_json::from_str(&op.request)?;
         let (_, revision, _, automatic, generation) = request.fields();
+        let explicit_cancellation = if let DeleteRequest::ClusterCancellation((
+            _,
+            _,
+            _,
+            _,
+            _,
+            failure_guard,
+            receipt,
+            binding,
+        )) = &request
+        {
+            if automatic
+                || *failure_guard
+                || !self.cluster_cancellation_delete_accepted(&a.id, &a.generation, receipt)?
+                || self.cluster_cancellation_delete_binding(&a)? != *binding
+            {
+                op.state = "review".into();
+                op.error = Some(
+                    "explicit cancellation receipt changed; review this exact source generation"
+                        .into(),
+                );
+                save_operation(&self.db.lock().unwrap(), &op)?;
+                return Ok(op);
+            }
+            true
+        } else {
+            false
+        };
         let failure_guard = match &request {
+            DeleteRequest::ClusterCancellation(_) => false,
             DeleteRequest::Cluster((_, _, _, _, _, guard)) => *guard,
             _ => {
                 op.id.starts_with("cluster-copy-")
@@ -1979,7 +2049,7 @@ impl Inventory {
             return Ok(op);
         }
         if op.attempts == 0
-            && (a.revision != revision
+            && ((a.revision != revision && !explicit_cancellation)
                 || (automatic
                     && (!self.settings()?.enabled
                         || !a.eligible()
@@ -1992,7 +2062,7 @@ impl Inventory {
             return Ok(op);
         }
         if (self.artifact_in_use(&a)? && !self.authorized_processing_use(&a, use_guard))
-            || a.keep
+            || (a.keep && !explicit_cancellation)
             || a.hold.is_some()
             || !a.owned
         {

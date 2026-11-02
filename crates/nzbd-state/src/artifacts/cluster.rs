@@ -124,6 +124,62 @@ impl Inventory {
             params![artifact, generation], |row| row.get(0))?)
     }
 
+    pub(super) fn cluster_cancellation_delete_binding(
+        &self,
+        artifact: &Artifact,
+    ) -> Result<String> {
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(
+                &artifact.origin_path,
+                &artifact.root,
+                &artifact.root_identity,
+                &artifact.path,
+                &artifact.identity,
+                artifact.job,
+                &artifact.files
+            ))?)
+        ))
+    }
+    pub(super) fn cluster_cancellation_delete_accepted(
+        &self,
+        artifact: &str,
+        generation: &str,
+        receipt: &str,
+    ) -> Result<bool> {
+        Ok(!receipt.is_empty() && self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM workspace_finalizations WHERE source=?1 AND generation=?2 AND activated=1 AND outcome='CANCELLED' AND json_extract(proof,'$.kind')='cluster' AND json_extract(proof,'$.receipt')=?3 AND EXISTS(SELECT 1 FROM artifacts a WHERE a.id=?1 AND a.state<>'transferred') AND NOT EXISTS(SELECT 1 FROM deliveries d WHERE d.artifact=?1 AND d.generation=?2 AND (d.accepted_at IS NOT NULL OR d.consumer_receipt_id IS NOT NULL)))",params![artifact,generation,receipt],|row|row.get(0))?)
+    }
+
+    /// The authenticated peer handler proves exact DeleteFiles cancellation
+    /// and source-owner quiescence before entering. Keep is overridden only
+    /// for this raw generation, without changing its mutable Keep preference.
+    /// Accepted consumer publication, active writers and recovery holds remain
+    /// separate custody and are never promoted by cancellation.
+    pub fn delete_cancelled_cluster_artifact_copy(
+        &self,
+        copy: &ClusterArtifactCopy,
+        proof: FinalizationProof,
+        raw_files: &[DeliveryFile],
+    ) -> Result<ClusterCopyCleanup> {
+        if copy.selected || copy.publication != copy.source {
+            return Err(Error::Conflict("selected publication needs separate exact custody review before cancellation deletion".into()));
+        }
+        let accepted:bool=self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM deliveries WHERE artifact=?1 AND generation=?2 AND (accepted_at IS NOT NULL OR consumer_receipt_id IS NOT NULL))",params![copy.publication.artifact,copy.publication.generation],|row|row.get(0))?;
+        if accepted || self.get(&copy.publication.artifact)?.state == "transferred" {
+            return Err(Error::Conflict(
+                "consumer custody cannot be replaced by cancellation deletion".into(),
+            ));
+        }
+        self.retire_cluster_artifact_copy_policy(
+            copy,
+            "CANCELLED",
+            proof,
+            true,
+            Some(raw_files),
+            true,
+        )
+    }
+
     /// The peer handler first proves this exact copy is a replicated cleanup
     /// obligation of a READY delivery. Local storage identity, generation,
     /// current Keep/holds and the existing relocation journal remain decisive.
@@ -143,6 +199,18 @@ impl Inventory {
         unusable: bool,
         raw_files: Option<&[DeliveryFile]>,
     ) -> Result<ClusterCopyCleanup> {
+        self.retire_cluster_artifact_copy_policy(copy, outcome, proof, unusable, raw_files, false)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn retire_cluster_artifact_copy_policy(
+        &self,
+        copy: &ClusterArtifactCopy,
+        outcome: &str,
+        proof: FinalizationProof,
+        unusable: bool,
+        raw_files: Option<&[DeliveryFile]>,
+        explicit_cancellation: bool,
+    ) -> Result<ClusterCopyCleanup> {
         if copy.storage_instance_id != self.installation
             || !matches!(proof, FinalizationProof::Cluster { .. })
         {
@@ -161,7 +229,12 @@ impl Inventory {
             ));
         }
         let key = format!(
-            "cluster-copy-{:x}",
+            "{}{:x}",
+            if explicit_cancellation {
+                "cluster-cancel-copy-"
+            } else {
+                "cluster-copy-"
+            },
             Sha256::digest(serde_json::to_vec(&(copy, &proof))?)
         );
         let existing = match self.operation(&key) {
@@ -170,9 +243,12 @@ impl Inventory {
             Err(error) => return Err(error),
         };
         if !artifact.terminal()
-            && (artifact.keep
+            && ((artifact.keep && !explicit_cancellation)
                 || artifact.hold.is_some()
-                || (!copy.selected && outcome != "SUCCESS" && artifact.keep_on_failure))
+                || (!explicit_cancellation
+                    && !copy.selected
+                    && outcome != "SUCCESS"
+                    && artifact.keep_on_failure))
         {
             return Ok(ClusterCopyCleanup {
                 status: "retained".into(),
@@ -237,12 +313,24 @@ impl Inventory {
                 for entry in &observed {
                     if entry.identity.directory {
                         if !directories.contains(&entry.path) {
-                            return Ok(ClusterCopyCleanup{status:"retained".into(),error:Some(format!("review required: raw directory {} was not in the accepted transfer seal",entry.path))});
+                            return Ok(ClusterCopyCleanup {
+                                status: "retained".into(),
+                                error: Some(format!(
+                                    "review required: raw directory {} was not in the accepted transfer seal",
+                                    entry.path
+                                )),
+                            });
                         }
                         continue;
                     }
                     let Some(file) = by_path.get(entry.path.as_str()) else {
-                        return Ok(ClusterCopyCleanup{status:"retained".into(),error:Some(format!("review required: raw file {} was not in the accepted transfer seal",entry.path))});
+                        return Ok(ClusterCopyCleanup {
+                            status: "retained".into(),
+                            error: Some(format!(
+                                "review required: raw file {} was not in the accepted transfer seal",
+                                entry.path
+                            )),
+                        });
                     };
                     let mut input = fs::open_relative(&directory, &entry.path)?;
                     use std::io::Read;
@@ -259,7 +347,13 @@ impl Inventory {
                         || format!("{:x}", hash.finalize()) != file.sha256
                         || fs::identity_for_file(&input)? != entry.identity
                     {
-                        return Ok(ClusterCopyCleanup{status:"retained".into(),error:Some(format!("review required: raw file {} differs from its accepted transfer seal",entry.path))});
+                        return Ok(ClusterCopyCleanup {
+                            status: "retained".into(),
+                            error: Some(format!(
+                                "review required: raw file {} differs from its accepted transfer seal",
+                                entry.path
+                            )),
+                        });
                     }
                 }
                 if observed
@@ -328,10 +422,13 @@ impl Inventory {
                 let mut current = self.get(&artifact.id)?;
                 if current.generation != copy.publication.generation
                     || !current.owned
-                    || current.keep
+                    || (current.keep && !explicit_cancellation)
                     || current.hold.is_some()
                     || self.source_in_use(&copy.publication)
-                    || (!copy.selected && outcome != "SUCCESS" && current.keep_on_failure)
+                    || (!explicit_cancellation
+                        && !copy.selected
+                        && outcome != "SUCCESS"
+                        && current.keep_on_failure)
                 {
                     return Err(Error::Conflict(
                         "cluster copy retained by current ownership, Keep or active use".into(),
@@ -346,6 +443,18 @@ impl Inventory {
                 }
                 current.revision
             };
+            let cancellation_receipt = if explicit_cancellation {
+                match &proof {
+                    FinalizationProof::Cluster { receipt, .. } => Some(receipt.as_str()),
+                    _ => {
+                        return Err(Error::Conflict(
+                            "explicit cancellation requires a cluster receipt".into(),
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
             self.request_delete_with_policy(
                 &artifact.id,
                 revision,
@@ -353,7 +462,8 @@ impl Inventory {
                 0,
                 false,
                 None,
-                !copy.selected && outcome != "SUCCESS",
+                !explicit_cancellation && !copy.selected && outcome != "SUCCESS",
+                cancellation_receipt,
             )?;
         }
         if !self.get(&artifact.id)?.terminal() {
@@ -406,6 +516,279 @@ mod tests {
             receipt: "exact-replicated-ready".into(),
             accepted_at_ms: 1,
         }
+    }
+    fn raw_seal() -> Vec<DeliveryFile> {
+        [
+            ("episode.mkv", b"verified payload".as_slice()),
+            ("readme.txt", b"junk".as_slice()),
+        ]
+        .into_iter()
+        .map(|(path, bytes)| DeliveryFile {
+            path: path.into(),
+            size_bytes: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        })
+        .collect()
+    }
+    #[test]
+    fn explicit_cancel_overrides_only_selected_keep_and_replays_partial_delete_after_restart() {
+        let (temp, mut inventory, source, copy) = fixture();
+        let artifact = inventory.get(&copy.publication.artifact).unwrap();
+        inventory
+            .retention(&artifact.id, artifact.revision, true, None)
+            .unwrap();
+        inventory.set_keep_on_failure(7, true).unwrap();
+        let unrelated = source.parent().unwrap().join("unrelated-kept");
+        let other = inventory
+            .allocate_for_delivery(8, source.parent().unwrap(), &unrelated, true, true)
+            .unwrap();
+        std::fs::write(unrelated.join("keep.bin"), b"unrelated kept bytes").unwrap();
+        inventory
+            .finish(8, &unrelated, source.parent().unwrap(), "completed")
+            .unwrap();
+        let other = inventory.get(&other.id).unwrap();
+        inventory
+            .retention(&other.id, other.revision, true, None)
+            .unwrap();
+        inventory.set_keep_on_failure(8, true).unwrap();
+        DELETE_FAIL_AFTER.with(|counter| counter.set(Some(1)));
+        let result = inventory
+            .delete_cancelled_cluster_artifact_copy(&copy, proof(), &raw_seal())
+            .unwrap();
+        assert_eq!(result.status, "retry");
+        assert_eq!(std::fs::read_dir(&source).unwrap().count(), 1);
+        let key = format!(
+            "cluster-cancel-copy-{:x}",
+            Sha256::digest(serde_json::to_vec(&(&copy, &proof())).unwrap())
+        );
+        let mut operation = inventory.operation(&key).unwrap();
+        let request: DeleteRequest = serde_json::from_str(&operation.request).unwrap();
+        assert!(
+            matches!(request,DeleteRequest::ClusterCancellation((_,_,_,false,_,false,ref receipt,_)) if receipt=="exact-replicated-ready")
+        );
+        assert!(inventory.get(&copy.publication.artifact).unwrap().keep);
+        operation.next_retry = 0;
+        save_operation(&inventory.db.lock().unwrap(), &operation).unwrap();
+        drop(inventory);
+        inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        inventory.reconcile_startup(&[]).unwrap();
+        assert_eq!(inventory.execute_delete(&key).unwrap().state, "succeeded");
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read(unrelated.join("keep.bin")).unwrap(),
+            b"unrelated kept bytes"
+        );
+        let other = inventory.for_job(8).unwrap().unwrap();
+        assert!(other.keep && other.keep_on_failure);
+    }
+    #[test]
+    fn queued_explicit_cancel_survives_keep_revision_change_before_first_unlink_and_restart() {
+        let (temp, mut inventory, source, copy) = fixture();
+        inventory
+            .finish(7, &source, source.parent().unwrap(), "completed")
+            .unwrap();
+        inventory
+            .accept_cluster_completion(&copy.publication, "CANCELLED", proof())
+            .unwrap();
+        let artifact = inventory.get(&copy.publication.artifact).unwrap();
+        let op = inventory
+            .request_delete_with_policy(
+                &artifact.id,
+                artifact.revision,
+                "cluster-cancel-copy-queued-keep-change",
+                0,
+                false,
+                None,
+                false,
+                Some("exact-replicated-ready"),
+            )
+            .unwrap();
+        inventory
+            .retention(&artifact.id, artifact.revision, true, None)
+            .unwrap();
+        inventory.set_keep_on_failure(7, true).unwrap();
+        assert_eq!(inventory.operation(&op.id).unwrap().state, "queued");
+        assert_ne!(
+            inventory.get(&artifact.id).unwrap().revision,
+            artifact.revision
+        );
+        drop(inventory);
+        inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        inventory.reconcile_startup(&[]).unwrap();
+        let current = inventory.get(&artifact.id).unwrap();
+        assert!(current.keep && current.keep_on_failure);
+        assert_eq!(inventory.execute_delete(&op.id).unwrap().state, "succeeded");
+        assert!(!source.exists());
+    }
+    #[test]
+    fn queued_explicit_cancel_rejects_changed_owned_manifest_even_when_keep_changed() {
+        let (_temp, inventory, source, copy) = fixture();
+        inventory
+            .finish(7, &source, source.parent().unwrap(), "completed")
+            .unwrap();
+        inventory
+            .accept_cluster_completion(&copy.publication, "CANCELLED", proof())
+            .unwrap();
+        let artifact = inventory.get(&copy.publication.artifact).unwrap();
+        let op = inventory
+            .request_delete_with_policy(
+                &artifact.id,
+                artifact.revision,
+                "cluster-cancel-copy-manifest-change",
+                0,
+                false,
+                None,
+                false,
+                Some("exact-replicated-ready"),
+            )
+            .unwrap();
+        let mut changed = artifact.clone();
+        changed.files[0].digest = Some("changed receipt".into());
+        changed.revision += 1;
+        save_artifact(&inventory.db.lock().unwrap(), &changed).unwrap();
+        assert_eq!(inventory.execute_delete(&op.id).unwrap().state, "review");
+        assert!(source.exists());
+    }
+    #[test]
+    fn explicit_cancel_still_refuses_active_use_recovery_hold_and_unknown_members() {
+        for block in ["active", "recovery", "unknown"] {
+            let (_temp, inventory, source, copy) = fixture();
+            let inventory = std::sync::Arc::new(inventory);
+            let guard = if block == "active" {
+                inventory.acquire_terminal_use(7, &|| Ok(())).unwrap()
+            } else {
+                None
+            };
+            if block == "recovery" {
+                inventory
+                    .finish(7, &source, source.parent().unwrap(), "completed")
+                    .unwrap();
+                let artifact = inventory.get(&copy.publication.artifact).unwrap();
+                let root = source.parent().unwrap().join("recovery-copies");
+                std::fs::create_dir(&root).unwrap();
+                let recovery = inventory
+                    .stage_recovery(
+                        &artifact.id,
+                        artifact.revision,
+                        "shared-dependent-recovery",
+                        &["episode.mkv".into()],
+                        &root,
+                    )
+                    .unwrap();
+                assert!(
+                    inventory
+                        .get(&artifact.id)
+                        .unwrap()
+                        .hold
+                        .as_ref()
+                        .is_some_and(|hold| hold.contains(&recovery.id))
+                );
+            }
+            if block == "unknown" {
+                std::fs::write(source.join("user-added.txt"), b"unowned bytes").unwrap();
+            }
+            let result =
+                inventory.delete_cancelled_cluster_artifact_copy(&copy, proof(), &raw_seal());
+            assert!(
+                result.is_err() || result.unwrap().status != "removed",
+                "bypassed {block}"
+            );
+            assert_eq!(
+                std::fs::read(source.join("episode.mkv")).unwrap(),
+                b"verified payload"
+            );
+            drop(guard);
+        }
+    }
+    #[test]
+    fn explicit_cancel_refuses_missing_receipt_on_replay_and_selected_consumer_custody() {
+        let (_temp, inventory, source, copy) = fixture();
+        let artifact = inventory.get(&copy.publication.artifact).unwrap();
+        inventory
+            .retention(&artifact.id, artifact.revision, true, None)
+            .unwrap();
+        DELETE_FAIL_AFTER.with(|counter| counter.set(Some(1)));
+        assert_eq!(
+            inventory
+                .delete_cancelled_cluster_artifact_copy(&copy, proof(), &raw_seal())
+                .unwrap()
+                .status,
+            "retry"
+        );
+        let key = format!(
+            "cluster-cancel-copy-{:x}",
+            Sha256::digest(serde_json::to_vec(&(&copy, &proof())).unwrap())
+        );
+        let mut operation = inventory.operation(&key).unwrap();
+        operation.next_retry = 0;
+        save_operation(&inventory.db.lock().unwrap(), &operation).unwrap();
+        inventory
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM workspace_finalizations WHERE source=?1",
+                [&copy.publication.artifact],
+            )
+            .unwrap();
+        assert_eq!(inventory.execute_delete(&key).unwrap().state, "review");
+        assert!(source.exists());
+        let mut selected = copy.clone();
+        selected.selected = true;
+        assert!(
+            inventory
+                .delete_cancelled_cluster_artifact_copy(&selected, proof(), &raw_seal())
+                .is_err()
+        );
+    }
+    #[test]
+    fn queued_explicit_cancel_rechecks_consumer_acceptance_before_first_unlink() {
+        let (_temp, inventory, source, copy) = fixture();
+        inventory
+            .finish(7, &source, source.parent().unwrap(), "completed")
+            .unwrap();
+        inventory
+            .accept_cluster_completion(&copy.publication, "CANCELLED", proof())
+            .unwrap();
+        let artifact = inventory.get(&copy.publication.artifact).unwrap();
+        let op = inventory
+            .request_delete_with_policy(
+                &artifact.id,
+                artifact.revision,
+                "cluster-cancel-copy-late-consumer",
+                0,
+                false,
+                None,
+                false,
+                Some("exact-replicated-ready"),
+            )
+            .unwrap();
+        let receipt = inventory
+            .create_delivery_with_outcome_and_keep(
+                7,
+                true,
+                Some("consumer-transfer"),
+                "SUCCESS",
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        inventory
+            .accept_delivery(
+                &receipt.delivery_id,
+                &receipt.publication_generation,
+                &receipt.manifest_digest,
+                "durable-consumer-mapping",
+            )
+            .unwrap();
+        assert_eq!(inventory.execute_delete(&op.id).unwrap().state, "review");
+        assert!(source.exists());
+        assert!(
+            inventory
+                .delete_cancelled_cluster_artifact_copy(&copy, proof(), &raw_seal())
+                .is_err()
+        );
     }
     #[test]
     fn accepted_selected_cluster_copy_drains_and_replays_without_payload() {
@@ -674,15 +1057,19 @@ mod tests {
         assert!(source.join("episode.mkv").exists());
         let mut stale = copy.clone();
         stale.storage_instance_id.push_str("-replacement");
-        assert!(inventory
-            .retire_cluster_artifact_copy(&stale, "SUCCESS", proof())
-            .is_err());
+        assert!(
+            inventory
+                .retire_cluster_artifact_copy(&stale, "SUCCESS", proof())
+                .is_err()
+        );
         assert!(source.exists());
         let mut stale = copy;
         stale.publication.generation.push_str("-stale");
-        assert!(inventory
-            .retire_cluster_artifact_copy(&stale, "SUCCESS", proof())
-            .is_err());
+        assert!(
+            inventory
+                .retire_cluster_artifact_copy(&stale, "SUCCESS", proof())
+                .is_err()
+        );
         assert!(source.exists());
     }
 }
@@ -817,13 +1204,15 @@ mod generation_tests {
         assert!(!path.exists());
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("replacement.mkv"), b"unowned replacement").unwrap();
-        assert!(remove_cluster_generation_copy(
-            &root,
-            Path::new("job/fence-1"),
-            (identity.device, identity.inode),
-            &files
-        )
-        .is_err());
+        assert!(
+            remove_cluster_generation_copy(
+                &root,
+                Path::new("job/fence-1"),
+                (identity.device, identity.inode),
+                &files
+            )
+            .is_err()
+        );
         assert!(path.join("replacement.mkv").exists());
     }
 
