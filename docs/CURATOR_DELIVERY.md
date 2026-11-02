@@ -228,7 +228,24 @@ when they remain unresolved after a partial publication. A failed job is
 retained for recovery only when Runner has a concrete retry or repair reason;
 the mere presence of an archive, unknown extension, or PAR file does not prove
 that recovery is viable. Terminally unusable work follows its explicit Keep
-choice or the new-work default disposition.
+choice or the new-work default disposition. An attempt that left no source
+files at all (a health failure before any file finished) has nothing to
+recover and is disposed like any other unusable source. The 30-second
+file-lifecycle tick also disposes any retained failed source whose directory
+has no entries at all, unless Keep is set, through the same generation-bound
+`failed-delete-<artifact>` operation that clearing Keep uses. An `unknown`
+assessment still retains: it covers complete payload files whose segments all
+finished but whose poster supplied no whole-file CRC, which are salvageable.
+
+A retained failed source is pinned into its request receipt
+(`sourceArtifactId` / `sourceGeneration`), and every receipt lookup refreshes
+`custodyState` from that exact generation. Curator holds a replacement while
+custody is `runner_owned`, so this pin is what lets a later disposal, delete,
+or Keep reach Curator. Receipts written before the pin existed adopt the
+allocation this installation recorded for the same job on their next lookup.
+A pinned source that the lifecycle sweep finds missing under a verified root
+(`source_gone`) settles the receipt like a delete: nothing is left in Runner
+custody.
 
 ### Bounded repairability assessment
 

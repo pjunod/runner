@@ -1413,7 +1413,18 @@ async fn handle_failed_job_admitted(
                         return;
                     }
                 }
+                // Pin the exact retained generation, not just its id. The
+                // request receipt adopts Artifact:Id + Artifact:Generation as
+                // its source; with the id alone it stayed unpinned, so a later
+                // delete or Keep in Files never reached Curator and the
+                // failure held its replacement forever.
+                entry
+                    .params
+                    .retain(|(key, _)| key != "Artifact:Id" && key != "Artifact:Generation");
                 entry.params.push(("Artifact:Id".into(), artifact.id));
+                entry
+                    .params
+                    .push(("Artifact:Generation".into(), artifact.generation));
             }
             Err(e) => {
                 tracing::error!(job=job.0,error=%e,"failed payload inventory not committed; finalization held");
@@ -1965,10 +1976,18 @@ fn failed_source_assessment(outcomes: &[DeliveryFileOutcome]) -> FailedSourceAss
             reason,
         };
     }
+    // The manifest walk is complete and refuses symlinks and special files, so
+    // an empty outcome set is positive proof that the attempt left no bytes.
+    // There is nothing to recover and nothing to review. Classifying it
+    // `unknown` retained an empty directory "for recovery" under Runner
+    // custody, and Curator correctly refuses to replace an attempt whose
+    // source Runner still owns: the want was frozen behind nothing
+    // (field report 2026-11-02, eleven Dexter: Resurrection FAILURE/HEALTH
+    // jobs). The post-processing path already treats this as unusable.
     if outcomes.is_empty() {
         return FailedSourceAssessment {
-            disposition: "unknown".into(),
-            reason: "no regular source files were available to the bounded integrity/format assessment; inspect or retry diagnostics".into(),
+            disposition: "unusable".into(),
+            reason: "the failed attempt left no source files; nothing to retain".into(),
         };
     }
     if outcomes.iter().all(|file| {
@@ -6453,6 +6472,15 @@ mod decision_tests {
             repair_dependency: false,
             source_cleanup_status: "pending".into(),
         }
+    }
+
+    #[test]
+    fn a_failed_attempt_that_left_no_files_retains_nothing() {
+        // Field report 2026-11-02: FAILURE/HEALTH before any file finished
+        // was retained "for recovery" under Runner custody, so Curator held
+        // the replacement forever behind an empty directory.
+        let assessment = failed_source_assessment(&[]);
+        assert_eq!(assessment.disposition, "unusable");
     }
 
     #[test]

@@ -9537,6 +9537,43 @@ fn refresh_url_admission_custody(
     receipt: &mut UrlAdmissionReceipt,
     inventory: &nzbd_state::artifacts::Inventory,
 ) -> bool {
+    let pinned = pin_unpinned_failed_source(receipt, inventory);
+    refresh_pinned_url_admission_custody(receipt, inventory) || pinned
+}
+
+/// Failures retained before Runner pinned their source generation into the
+/// receipt reported `runner_owned` with no artifact to refresh from, so no
+/// later delete or Keep could ever reach Curator, which holds replacement
+/// while Runner owns failed bytes. Adopt the allocation this installation
+/// recorded for the exact job. This pins identity only; custody still comes
+/// from that artifact's own state below.
+fn pin_unpinned_failed_source(
+    receipt: &mut UrlAdmissionReceipt,
+    inventory: &nzbd_state::artifacts::Inventory,
+) -> bool {
+    if receipt.source_artifact_id.is_some()
+        || receipt.source_generation.is_some()
+        || receipt.custody_state != "runner_owned"
+        || receipt.outcome != "failed"
+        || receipt.runner_instance_id != inventory.installation
+    {
+        return false;
+    }
+    let Ok(Some(artifact)) = inventory.for_job(receipt.job_id) else {
+        return false;
+    };
+    if artifact.job != Some(receipt.job_id) || (!artifact.owned && !artifact.terminal()) {
+        return false;
+    }
+    receipt.source_artifact_id = Some(artifact.id);
+    receipt.source_generation = Some(artifact.generation);
+    true
+}
+
+fn refresh_pinned_url_admission_custody(
+    receipt: &mut UrlAdmissionReceipt,
+    inventory: &nzbd_state::artifacts::Inventory,
+) -> bool {
     // Consumer custody is terminal for this receipt. Retention of a separate
     // processing source cannot reclaim the accepted publication.
     let Some((artifact_id, source_generation)) = receipt
@@ -9569,7 +9606,11 @@ fn refresh_url_admission_custody(
         }
         return keep_changed || changed;
     }
-    if artifact.state == "deleted" {
+    // `source_gone` is reconcile_missing's positive finding: the storage root
+    // verified and the exact source directory is absent. Nothing remains in
+    // Runner custody, so it settles the receipt exactly like a Runner delete;
+    // reporting runner_owned for it held Curator's replacement forever.
+    if artifact.state == "deleted" || (artifact.state == "source_gone" && artifact.owned) {
         let changed = receipt.custody_state != "deleted_by_runner"
             || receipt.source_cleanup_status.as_deref() != Some("removed")
             || keep_changed;

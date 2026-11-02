@@ -372,6 +372,7 @@ pub struct Inventory {
     relocation_active: Mutex<std::collections::HashSet<String>>,
     clocks: Mutex<std::collections::HashMap<String, (u64, Instant)>>,
     reconcile_cursor: Mutex<String>,
+    empty_failed_cursor: Mutex<String>,
     // One task runner at a time: the maintenance tick and an API kick can
     // both drain the queue, and a task must never execute twice.
     tasks: Mutex<()>,
@@ -771,6 +772,7 @@ impl Inventory {
             relocation_active: Mutex::new(std::collections::HashSet::new()),
             clocks: Mutex::new(std::collections::HashMap::new()),
             reconcile_cursor: Mutex::new(String::new()),
+            empty_failed_cursor: Mutex::new(String::new()),
             tasks: Mutex::new(()),
         })
     }
@@ -1391,6 +1393,95 @@ impl Inventory {
                 current.updated_at = now();
                 current.revision += 1;
                 save_artifact(&self.db.lock().unwrap(), &current)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Dispose of retained failed sources that hold no files.
+    ///
+    /// Retention exists to keep bytes that may still become media. A
+    /// retained generation whose complete manifest walk finds no regular file
+    /// keeps nothing, yet under Runner custody it is exactly what Curator
+    /// waits on before it may replace the failed release. Releases that failed
+    /// health before any file finished were retained this way "for recovery"
+    /// (field report 2026-11-02): eleven empty directories froze a whole
+    /// season. Classification now disposes them at failure time; this sweep
+    /// settles generations retained before that, and any whose bytes were
+    /// removed by hand, through the ordinary audited delete operation.
+    pub fn reconcile_empty_failed_sources(&self) -> Result<()> {
+        let raws = {
+            let db = self.db.lock().unwrap();
+            let mut stmt = db.prepare(
+                "SELECT data FROM artifacts WHERE state='retained' AND job IS NOT NULL AND id>?1 ORDER BY id LIMIT 200",
+            )?;
+            let cursor = self.empty_failed_cursor.lock().unwrap().clone();
+            let rows = stmt.query_map([cursor], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if raws.is_empty() {
+            self.empty_failed_cursor.lock().unwrap().clear();
+        }
+        for raw in raws {
+            let artifact: Artifact = serde_json::from_str(&raw)?;
+            *self.empty_failed_cursor.lock().unwrap() = artifact.id.clone();
+            if !artifact.owned
+                || !artifact.automatic_cleanup_eligible
+                || artifact.keep
+                || artifact.keep_on_failure
+                || artifact.hold.is_some()
+            {
+                continue;
+            }
+            let empty = {
+                let Some(_lease) = self.reserve_reconciliation(std::slice::from_ref(&artifact))?
+                else {
+                    continue;
+                };
+                if self.verify_root(&artifact).is_err() {
+                    continue;
+                }
+                let Ok(dir) = self.verify(&artifact) else {
+                    continue;
+                };
+                // One directory read per tick, not a manifest walk: the
+                // sweep runs every 30 s over /processing, which may be NFS.
+                // Only a directory with no entries at all qualifies; any
+                // entry, or an error reading it, leaves it for a person.
+                fs::names(&dir).is_ok_and(|names| names.is_empty())
+            };
+            if !empty {
+                continue;
+            }
+            // The same authority Keep-off uses for a no-Delivery failed
+            // source: a persisted `unusable` assessment pinned to this
+            // generation, then the generation-bound failed-delete operation
+            // (which a later Keep still cancels).
+            let assessed = match self.set_failure_assessment(
+                &artifact.id,
+                &artifact.generation,
+                "unusable",
+                "the failed attempt left no source files; nothing to retain",
+            ) {
+                Ok(assessed) => assessed,
+                Err(error) => {
+                    tracing::warn!(artifact = %artifact.id, %error,
+                        "empty retained failed source could not be assessed");
+                    continue;
+                }
+            };
+            let request = format!("failed-delete-{}", assessed.id);
+            match self.request_delete(&assessed.id, assessed.revision, &request, 0) {
+                Ok(_) => tracing::info!(
+                    artifact = %artifact.id,
+                    job = ?artifact.job,
+                    "retained failed source holds no files; disposing it"
+                ),
+                Err(error) => tracing::warn!(
+                    artifact = %artifact.id,
+                    %error,
+                    "empty retained failed source could not be queued for disposal"
+                ),
             }
         }
         Ok(())
@@ -2718,6 +2809,12 @@ impl Inventory {
         self.run_tasks()?;
         self.reconcile_missing()?;
         self.compact()?;
+        // Last, so it never delays the ordered retention, relocation and
+        // recovery steps above. Its failed-delete operations run on the next
+        // tick's run_due_deletes.
+        if let Err(error) = self.reconcile_empty_failed_sources() {
+            tracing::warn!(%error, "empty failed-source reconciliation did not complete");
+        }
         Ok(())
     }
     /// Execute every delete whose undo window has closed. Part of the

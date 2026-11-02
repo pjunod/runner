@@ -3238,3 +3238,39 @@ fn completed_relocation_retirement_requires_released_exact_generation() {
         b"verified publication"
     );
 }
+
+#[test]
+fn empty_retained_failed_source_is_disposed_but_files_and_keep_are_not() {
+    // Field report 2026-11-02: health failures retained empty directories
+    // "for recovery" and froze Curator's replacement behind nothing.
+    let (_tmp, db, root) = fixture();
+    let empty = root.join("health-failed-empty");
+    db.allocate_for_delivery(71, &root, &empty, true, false)
+        .unwrap();
+    let empty_artifact = db.finish(71, &empty, &root, "retained").unwrap();
+
+    let populated = root.join("health-failed-with-bytes");
+    db.allocate_for_delivery(72, &root, &populated, true, false)
+        .unwrap();
+    std::fs::write(populated.join("partial.mkv"), b"bytes a person may inspect").unwrap();
+    let populated_artifact = db.finish(72, &populated, &root, "retained").unwrap();
+
+    let kept = root.join("health-failed-kept");
+    db.allocate_for_delivery(73, &root, &kept, true, false)
+        .unwrap();
+    let kept_artifact = db.finish(73, &kept, &root, "retained").unwrap();
+    assert!(db.set_keep_on_failure(73, true).unwrap());
+
+    db.reconcile_empty_failed_sources().unwrap();
+    db.run_due_deletes().unwrap();
+
+    assert!(
+        !empty.exists(),
+        "an empty retained source has nothing to keep"
+    );
+    assert_eq!(db.get(&empty_artifact.id).unwrap().state, "deleted");
+    assert!(populated.join("partial.mkv").exists());
+    assert_eq!(db.get(&populated_artifact.id).unwrap().state, "retained");
+    assert!(kept.exists(), "an explicit Keep is never overridden");
+    assert_eq!(db.get(&kept_artifact.id).unwrap().state, "retained");
+}
