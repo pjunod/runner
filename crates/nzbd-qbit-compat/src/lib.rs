@@ -1073,11 +1073,30 @@ mod tests {
             .clone()
             .oneshot(multipart_add_request(
                 torrent,
-                "tv,monarr-transfer-second-token",
+                "tv,monarr-transfer-first-token",
             ))
             .await
             .unwrap();
         assert_eq!(duplicate.status(), StatusCode::OK);
+
+        let different_request = app
+            .clone()
+            .oneshot(multipart_add_request(
+                torrent,
+                "tv,monarr-transfer-second-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(different_request.status(), StatusCode::CONFLICT);
+        let reason = different_request
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(std::str::from_utf8(&reason)
+            .unwrap()
+            .contains("different request"));
 
         let before_restart = app.clone().oneshot(info_request()).await.unwrap();
         let before_restart: Value = serde_json::from_slice(
@@ -1089,6 +1108,7 @@ mod tests {
                 .to_bytes(),
         )
         .unwrap();
+        assert_eq!(before_restart.as_array().unwrap().len(), 1);
         assert_eq!(before_restart[0]["tags"], "tv,monarr-transfer-first-token");
 
         engine.shutdown().await;

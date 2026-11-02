@@ -1188,14 +1188,19 @@ impl Inventory {
                 self.cancel_obsolete_relocation(&mut op)?;
                 return Err(e);
             }
-            if matches!(e, Error::Io(_)) {
+            let unsupported = matches!(&e, Error::Io(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)));
+            if matches!(e, Error::Io(_)) && !unsupported {
                 let delay = [30, 60, 120, 300][op.attempts.saturating_sub(1).min(3) as usize];
                 op.state = "retry".into();
                 op.next_retry = now().saturating_add(delay);
             } else {
                 op.state = "review".into();
             }
-            op.error = Some(e.to_string());
+            op.error = Some(if unsupported {
+                format!("unsupported publication requires review: {e}")
+            } else {
+                e.to_string()
+            });
             save_operation(&self.db.lock().unwrap(), &op)?;
             if let Some(scratch) = &relocation.scratch {
                 let mut row = self.get(&scratch.id)?;
@@ -2317,6 +2322,13 @@ impl Inventory {
         for raw in raws {
             checkpoint()?;
             let mut op: Operation = serde_json::from_str(&raw)?;
+            if op.state == "review"
+                && op.error.as_deref().is_some_and(|error| {
+                    error.starts_with("unsupported publication requires review:")
+                })
+            {
+                continue;
+            }
             if !self.relocation_active.lock().unwrap().insert(op.id.clone()) {
                 continue;
             }

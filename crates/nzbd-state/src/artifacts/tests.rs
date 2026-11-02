@@ -965,7 +965,14 @@ fn clearing_keep_retries_partial_delivery_cleanup_without_deleting_recoverable_i
     db.publish_selected_for_delivery_checked(61, &target, selected, outcomes, &|| Ok(()))
         .unwrap();
     let delivery = db
-        .create_delivery(61, true, Some("keep-partial-token"))
+        .create_delivery_with_outcome(
+            61,
+            true,
+            Some("keep-partial-token"),
+            "PARTIAL",
+            Some("assessment"),
+            Some("archive_review"),
+        )
         .unwrap();
     assert!(db.set_keep_on_failure(61, true).unwrap());
     let kept = db.retire_delivery_source(&delivery.delivery_id).unwrap();

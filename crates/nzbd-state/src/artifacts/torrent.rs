@@ -585,7 +585,7 @@ fn fingerprint(
     Ok(format!("{:x}", Sha256::digest(raw)))
 }
 fn transient_use(error: Error) -> Error {
-    if matches!(&error,Error::Conflict(reason) if reason=="previous processing workers have not quiesced")
+    if matches!(&error,Error::Conflict(reason) if matches!(reason.as_str(), "previous processing workers have not quiesced" | "previous processing or allocation workers have not quiesced"))
     {
         std::io::Error::new(
             std::io::ErrorKind::WouldBlock,

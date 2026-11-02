@@ -276,10 +276,25 @@ impl Inventory {
             checkpoint()?;
             let path = artifact.path.clone();
             let root = artifact.root.clone();
+            // Capture performs its own short mutation/CAS commit. Keep the
+            // exact source use live, but do not recursively lock its coordinator.
+            drop(_mutation);
             let mut finished = self.finish_artifact_unlocked(artifact, &path, &root, "retained")?;
             if finished.files != observed {
                 let reason =
                     "managed seed membership changed during final sealing; retained for review";
+                let _coordinator = self.mutation_guard()?;
+                let current = self.get(&finished.id)?;
+                if current.generation != finished.generation
+                    || current.revision != finished.revision
+                    || current.path != finished.path
+                    || current.root != finished.root
+                {
+                    return Err(Error::Conflict(
+                        "managed seed changed during final sealing".into(),
+                    ));
+                }
+                finished = current;
                 finished.hold = Some("review: managed seed metainfo mismatch".into());
                 finished.error = Some(reason.into());
                 finished.revision += 1;

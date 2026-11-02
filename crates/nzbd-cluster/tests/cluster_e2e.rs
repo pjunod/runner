@@ -2618,13 +2618,28 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
         // which starts a fresh payload verification before controls may run.
         verified_paused(&authority.runtime.engine, nzbd_types::JobId(job_id as u32)).await;
     }
-    let (code, body) = http(
-        &authority.url,
-        "POST",
-        &format!("/api/v1/jobs/{job_id}/actions/resume"),
-        b"",
-    );
-    assert_eq!(code, 200, "{body}");
+    // Reconciliation can start another verification after the readiness
+    // observation above. Retry only an empty transient 503 while the exact
+    // job still resolves to Paused; never replay an accepted Resume.
+    let resume_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let (code, body) = http(
+            &authority.url,
+            "POST",
+            &format!("/api/v1/jobs/{job_id}/actions/resume"),
+            b"",
+        );
+        if code == 200 {
+            break;
+        }
+        assert!(code == 503 && body.is_empty(), "Resume: {code}: {body}");
+        assert!(
+            tokio::time::Instant::now() < resume_deadline,
+            "Resume remained blocked by verification"
+        );
+        verified_paused(&authority.runtime.engine, nzbd_types::JobId(job_id as u32)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let history = tmp.path().join(".nzbd-cluster/history/history.c.jsonl");
     let empty_debug = std::cell::Cell::new(false);
     let empty_started = tokio::time::Instant::now();
