@@ -6314,3 +6314,43 @@ fn unpinned_failed_receipt_adopts_its_jobs_source_and_reports_disposal() {
     assert_eq!(receipt.custody_state, "deleted_by_runner");
     assert_eq!(receipt.source_cleanup_status.as_deref(), Some("removed"));
 }
+
+#[test]
+fn failed_receipt_settles_when_its_source_is_gone() {
+    // Review finding 2026-11-02: a retained failed source removed by hand is
+    // marked source_gone, which still read as runner_owned and held Curator.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("processing");
+    std::fs::create_dir(&root).unwrap();
+    let inventory = nzbd_state::artifacts::Inventory::open(&tmp.path().join("state")).unwrap();
+    let source = root.join("health-failed-removed");
+    inventory
+        .allocate_for_delivery(2203, &root, &source, true, false)
+        .unwrap();
+    std::fs::write(source.join("partial.mkv"), b"partial").unwrap();
+    let artifact = inventory.finish(2203, &source, &root, "retained").unwrap();
+    let mut receipt = UrlAdmissionReceipt {
+        protocol_version: 1,
+        request_token: "t-gone".into(),
+        submission_sha256: "a".repeat(64),
+        job_id: 2203,
+        generation: "admission".into(),
+        runner_instance_id: inventory.installation.clone(),
+        terminal_outcome: Some("FAILURE/HEALTH".into()),
+        outcome: "failed".into(),
+        failure_stage: Some("health".into()),
+        failure_cause: None,
+        custody_state: "runner_owned".into(),
+        keep_source_on_failure: false,
+        source_cleanup_status: None,
+        publication_path: None,
+        source_artifact_id: Some(artifact.id.clone()),
+        source_generation: Some(artifact.generation.clone()),
+    };
+    std::fs::remove_dir_all(&source).unwrap();
+    inventory.reconcile_missing().unwrap();
+    assert_eq!(inventory.get(&artifact.id).unwrap().state, "source_gone");
+    assert!(refresh_url_admission_custody(&mut receipt, &inventory));
+    assert_eq!(receipt.custody_state, "deleted_by_runner");
+    assert_eq!(receipt.source_cleanup_status.as_deref(), Some("removed"));
+}

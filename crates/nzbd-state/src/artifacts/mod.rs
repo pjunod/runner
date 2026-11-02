@@ -372,6 +372,7 @@ pub struct Inventory {
     relocation_active: Mutex<std::collections::HashSet<String>>,
     clocks: Mutex<std::collections::HashMap<String, (u64, Instant)>>,
     reconcile_cursor: Mutex<String>,
+    empty_failed_cursor: Mutex<String>,
     // One task runner at a time: the maintenance tick and an API kick can
     // both drain the queue, and a task must never execute twice.
     tasks: Mutex<()>,
@@ -771,6 +772,7 @@ impl Inventory {
             relocation_active: Mutex::new(std::collections::HashSet::new()),
             clocks: Mutex::new(std::collections::HashMap::new()),
             reconcile_cursor: Mutex::new(String::new()),
+            empty_failed_cursor: Mutex::new(String::new()),
             tasks: Mutex::new(()),
         })
     }
@@ -1411,13 +1413,18 @@ impl Inventory {
         let raws = {
             let db = self.db.lock().unwrap();
             let mut stmt = db.prepare(
-                "SELECT data FROM artifacts WHERE state='retained' AND job IS NOT NULL ORDER BY id LIMIT 200",
+                "SELECT data FROM artifacts WHERE state='retained' AND job IS NOT NULL AND id>?1 ORDER BY id LIMIT 200",
             )?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let cursor = self.empty_failed_cursor.lock().unwrap().clone();
+            let rows = stmt.query_map([cursor], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
+        if raws.is_empty() {
+            self.empty_failed_cursor.lock().unwrap().clear();
+        }
         for raw in raws {
             let artifact: Artifact = serde_json::from_str(&raw)?;
+            *self.empty_failed_cursor.lock().unwrap() = artifact.id.clone();
             if !artifact.owned
                 || !artifact.automatic_cleanup_eligible
                 || artifact.keep
@@ -1437,10 +1444,11 @@ impl Inventory {
                 let Ok(dir) = self.verify(&artifact) else {
                     continue;
                 };
-                // Any error (a special file, a symlink, an unreadable entry)
-                // is not proof of emptiness; leave it for a person.
-                fs::manifest(&dir, 1_000)
-                    .is_ok_and(|files| files.iter().all(|file| file.identity.directory))
+                // One directory read per tick, not a manifest walk: the
+                // sweep runs every 30 s over /processing, which may be NFS.
+                // Only a directory with no entries at all qualifies; any
+                // entry, or an error reading it, leaves it for a person.
+                fs::names(&dir).is_ok_and(|names| names.is_empty())
             };
             if !empty {
                 continue;

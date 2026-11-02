@@ -9606,7 +9606,11 @@ fn refresh_pinned_url_admission_custody(
         }
         return keep_changed || changed;
     }
-    if artifact.state == "deleted" {
+    // `source_gone` is reconcile_missing's positive finding: the storage root
+    // verified and the exact source directory is absent. Nothing remains in
+    // Runner custody, so it settles the receipt exactly like a Runner delete;
+    // reporting runner_owned for it held Curator's replacement forever.
+    if artifact.state == "deleted" || (artifact.state == "source_gone" && artifact.owned) {
         let changed = receipt.custody_state != "deleted_by_runner"
             || receipt.source_cleanup_status.as_deref() != Some("removed")
             || keep_changed;

@@ -26,6 +26,13 @@ first class citizen between the two apps. time to act like it".
   Retained failures pin id + generation. Receipts written before the pin adopt
   their job's allocation on the next lookup, so the eleven live rows settle on
   deploy with no click.
+- Review (Fable): root cause confirmed. Two follow-ups taken: an owned
+  `source_gone` source now settles the receipt like a delete (121 live
+  artifacts are `source_gone`), and the sweep reads one directory instead of
+  walking a manifest, with a cursor past 200 rows. Reverted: purging every
+  `unknown` source — that bucket holds complete no-CRC episodes, which are
+  salvageable. Live check: all eleven Dexter artifacts are `retained`, owned,
+  cleanup-eligible, no Keep, no hold, zero files.
 
 ## Held jobs with no way out — 2026-11-01
 
