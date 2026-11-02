@@ -19,6 +19,7 @@ pub mod events;
 pub mod failover;
 pub mod fetch;
 mod hold_recovery;
+mod cluster_stop;
 mod hold_release;
 pub mod queue;
 pub mod rate;

@@ -4,6 +4,7 @@
 
 mod artifacts;
 pub mod control_pending;
+pub mod cluster_removal;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -1271,6 +1272,7 @@ async fn park_write(st: &ApiState, mut parked: Parked) -> bool {
 async fn job_action(
     State(st): State<ApiState>,
     Path((id, action)): Path<(u32, String)>,
+    cluster_removal:Option<axum::Extension<cluster_removal::ClusterRemovalContext>>,
 ) -> Response {
     let engine = &st.engine;
     let job = JobId(id);
@@ -1320,8 +1322,11 @@ async fn job_action(
         let requeue_reason = snapshot
             .as_ref()
             .and_then(|parked| history_requeue_refusal(&parked.entry));
-        return match engine.delete_job(job, files).await {
+        // Cluster control commits the original removal mode first, then
+        // exact source owners stop/join writers and drain their own copies.
+        return match engine.delete_job(job, files && cluster_removal.is_none()).await {
             Ok(true) => {
+                if let Some(context)=&cluster_removal {context.record(id,files);}
                 let mut parked = false;
                 if let Some(s) = snapshot {
                     parked = park_write(&st, s).await;

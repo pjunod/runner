@@ -1923,7 +1923,7 @@ mod tests {
             assert!(
                 runtime
                     .leader_shared
-                    .commit_mutation_delta(&before, &fences)
+                    .commit_mutation_delta(&before, &fences,&Default::default())
                     .await
                     .is_err(),
                 "fresh admission cannot overwrite later occupied ID"

@@ -8,6 +8,7 @@
 //! protocol when phase 2 lands.
 
 mod admissions;
+mod cancellation;
 pub mod control;
 mod control_proofs;
 mod control_recovery;
@@ -383,6 +384,7 @@ impl ClusterRuntime {
         }
 
         let active: ActiveLeases = Default::default();
+        *leader_shared.worker_leases.lock().unwrap() = Some(active.clone());
         spawn_worker(
             cfg.clone(),
             servers.clone(),
@@ -613,11 +615,21 @@ async fn commit_control_mutation(
         .insert(nzbd_api::control_pending::ControlPendingObservations(
             observations,
         ));
+    let compat_mutation = request.method() == axum::http::Method::GET
+        && matches!(request.uri().path(), "/jsonrpc" | "/jsonprpc")
+        && axum::extract::Query::<std::collections::HashMap<String, String>>::try_from_uri(
+            request.uri(),
+        )
+        .ok()
+        .is_some_and(|q| {
+            q.get("method")
+                .is_some_and(|method| method.eq_ignore_ascii_case("editqueue"))
+        });
     let safe = matches!(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
     );
-    if safe || !shared.view.borrow().is_me {
+    if (safe && !compat_mutation) || !shared.view.borrow().is_me {
         return next.run(request).await;
     }
     let _serial = shared.mutation_serial.lock().await;
@@ -694,7 +706,9 @@ async fn commit_control_mutation(
                 .into_response();
         }
     };
-    let response = next.run(request).await;
+    let removals = nzbd_api::cluster_removal::ClusterRemovalContext::default();
+    request.extensions_mut().insert(removals.clone());
+    let mut response = next.run(request).await;
     if !response.status().is_success() {
         if admissions::rollback_pending(&shared).await.is_err() {
             shared.fence_authority();
@@ -706,7 +720,10 @@ async fn commit_control_mutation(
         }
         return response;
     }
-    if let Err(error) = shared.commit_mutation_delta(&before, &fences).await {
+    if let Err(error) = shared
+        .commit_mutation_delta(&before, &fences, &removals.confirmed())
+        .await
+    {
         tracing::error!(%error, "queue mutation was rolled back after replicated commit failed");
         if admissions::rollback_pending(&shared).await.is_err()
             || shared.restore_control_projection().await.is_err()
@@ -720,6 +737,10 @@ async fn commit_control_mutation(
             })),
         )
             .into_response();
+    }
+    if removals.confirmed().values().any(|files| *files) {
+        // Queue removal is committed; exact source cleanup is asynchronous.
+        *response.status_mut() = axum::http::StatusCode::ACCEPTED;
     }
     response
 }

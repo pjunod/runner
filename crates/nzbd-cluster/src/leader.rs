@@ -149,6 +149,7 @@ pub struct LeaderShared {
     completion_operations: CompletionOperations,
     pub(crate) copy_operations: CompletionOperations,
     pub(crate) control_proofs: crate::control_proofs::ControlProofs,
+    pub(crate) worker_leases: Mutex<Option<crate::worker::ActiveLeases>>,
     #[cfg(test)]
     verification_gate: Mutex<Option<Arc<VerificationGate>>>,
     #[cfg(test)]
@@ -219,6 +220,7 @@ impl LeaderShared {
             completion_operations: CompletionOperations::default(),
             copy_operations: CompletionOperations::default(),
             control_proofs: Default::default(),
+            worker_leases: Mutex::new(None),
             #[cfg(test)]
             verification_gate: Mutex::new(None),
             #[cfg(test)]
@@ -283,6 +285,7 @@ impl LeaderShared {
         &self,
         before: &HashMap<u64, nzbd_types::Job>,
         fences: &HashMap<u64, u64>,
+        removals: &std::collections::BTreeMap<u32, bool>,
     ) -> Result<(), String> {
         let control = self
             .control
@@ -351,11 +354,24 @@ impl LeaderShared {
         }
         let receipts = crate::admissions::pending_receipts(self).await?;
         control
-            .commit_job_delta_guarded(
+            .commit_job_delta_guarded_with_removals(
                 &changes,
                 fences,
                 &receipts,
                 Some((&self.cfg.node_name, &self.owner_incarnation, self.epoch())),
+                &removals
+                    .iter()
+                    .map(|(job, files)| {
+                        (
+                            *job,
+                            if *files {
+                                crate::cancellation::RemovalMode::DeleteFiles
+                            } else {
+                                crate::cancellation::RemovalMode::KeepFiles
+                            },
+                        )
+                    })
+                    .collect(),
             )
             .await?;
         if !receipts.is_empty()
@@ -765,7 +781,7 @@ impl LeaderShared {
             job_revision,
             control_revision: job_revision,
             scope,
-            epoch: self.epoch(),
+            epoch: issuer_fence,
             kind,
             job,
             server_budgets,
@@ -957,6 +973,12 @@ async fn leader_info(State(s): State<Arc<LeaderShared>>, headers: HeaderMap) -> 
     .into_response()
 }
 
+fn poll_scope(request: &PollRequest, mut scope: serde_json::Value) -> serde_json::Value {
+    scope["_workerStorage"] = serde_json::Value::String(request.storage_instance_id.clone());
+    scope["_startOrdered"] = serde_json::json!(request.start_ordering);
+    scope
+}
+
 async fn work_poll(
     State(s): State<Arc<LeaderShared>>,
     headers: HeaderMap,
@@ -970,6 +992,13 @@ async fn work_poll(
     }
     if !s.authority_ready() {
         return authority_not_ready();
+    }
+    if req.start_ordering != 1
+        || req.storage_instance_id.is_empty()
+        || req.storage_instance_id.len() > 128
+        || req.storage_instance_id.chars().any(char::is_control)
+    {
+        return (StatusCode::UPGRADE_REQUIRED,Json(serde_json::json!({"error":"worker requires durable start/stop ordering and receiver storage identity; upgrade before accepting work"}))).into_response();
     }
     if req.lifecycle_protocol < LIFECYCLE_PROTOCOL {
         return (StatusCode::UPGRADE_REQUIRED,Json(serde_json::json!({"error":"worker requires cluster lifecycle protocol 2 (durable completion outbox and exact copy cleanup); upgrade this worker"}))).into_response();
@@ -1053,7 +1082,7 @@ async fn work_poll(
                         &req.owner_incarnation,
                         LeaseKind::Segment,
                         job.clone(),
-                        serde_json::to_value(scope).unwrap(),
+                        poll_scope(&req, serde_json::to_value(scope).unwrap()),
                     )
                     .await
                 {
@@ -1093,7 +1122,7 @@ async fn work_poll(
                             &req.owner_incarnation,
                             LeaseKind::Assemble,
                             job,
-                            serde_json::to_value(scope).unwrap(),
+                            poll_scope(&req, serde_json::to_value(scope).unwrap()),
                         )
                         .await
                     {
@@ -1139,7 +1168,7 @@ async fn work_poll(
                 &req.owner_incarnation,
                 LeaseKind::Download,
                 job,
-                serde_json::json!({"whole_job": true}),
+                poll_scope(&req, serde_json::json!({"whole_job": true})),
             )
             .await
         {
@@ -1194,7 +1223,7 @@ async fn grant_post_candidate(
                 &req.owner_incarnation,
                 LeaseKind::Post,
                 job,
-                serde_json::json!({"whole_job": true}),
+                poll_scope(&req, serde_json::json!({"whole_job": true})),
             )
             .await
         {
@@ -2671,10 +2700,24 @@ async fn schedule(s: &Arc<LeaderShared>) {
             && durable_status.get(&j.id) == Some(&j.status)
         {
             let committed = match &s.control {
-                Some(control) => control
-                    .commit_job_delta(&[(u64::from(j.id.0), None)])
-                    .await
-                    .is_ok(),
+                Some(control) => {
+                    match control.job_revision_fences_for(&[u64::from(j.id.0)]).await {
+                        Ok(fences) => control
+                            .commit_job_delta_guarded_with_removals(
+                                &[(u64::from(j.id.0), None)],
+                                &fences,
+                                &[],
+                                Some(s.authority_identity()),
+                                &std::collections::BTreeMap::from([(
+                                    j.id.0,
+                                    crate::cancellation::RemovalMode::CompletedRetirement,
+                                )]),
+                            )
+                            .await
+                            .is_ok(),
+                        Err(_) => false,
+                    }
+                }
                 None => false,
             };
             if committed {

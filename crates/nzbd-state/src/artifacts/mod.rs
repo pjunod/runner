@@ -29,6 +29,8 @@ pub use torrent_seed::{TorrentSeedRetirementIntent, TorrentSeedRetirementReason}
 mod transforms;
 mod url_resolutions;
 mod worker_controls;
+mod worker_stops;
+pub use worker_stops::{WorkerStopRequest,WorkerStopTicket,WorkerStoppedReceipt,same_worker_operation};
 pub use url_resolutions::{
     UrlFileReservation, UrlResolutionFault, UrlResolutionRecord, UrlResolutionStore,
     UrlStorageRetry, url_source_identity, url_storage_retry_deadline,
@@ -355,6 +357,7 @@ pub struct Inventory {
     workspace_uses: Mutex<std::collections::HashMap<(String, String), usize>>,
     workspace_cursor: Mutex<String>,
     _process_lock: File,
+    worker_session:String,
     closed: std::sync::atomic::AtomicBool,
     state_dir: PathBuf,
     pub installation: String,
@@ -628,6 +631,9 @@ impl Inventory {
           CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,artifact TEXT NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS worker_controls(job INTEGER PRIMARY KEY,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS worker_authority(job INTEGER PRIMARY KEY,data TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS worker_grant_stops(id TEXT PRIMARY KEY,job INTEGER NOT NULL,incarnation TEXT NOT NULL,lease TEXT NOT NULL,revision INTEGER NOT NULL,control_revision INTEGER NOT NULL,phase TEXT NOT NULL,data TEXT NOT NULL CHECK(length(CAST(data AS BLOB))<=16384));
+          CREATE INDEX IF NOT EXISTS worker_grant_stops_job ON worker_grant_stops(job,incarnation,lease);
+          CREATE TABLE IF NOT EXISTS worker_removal_fences(job INTEGER NOT NULL,incarnation TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(job,incarnation));
           CREATE TABLE IF NOT EXISTS worker_completions(job INTEGER PRIMARY KEY,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS worker_completion_receipts(id TEXT PRIMARY KEY,job INTEGER NOT NULL,data TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS operations_state ON operations(state);
@@ -745,6 +751,7 @@ impl Inventory {
             )?;
         }
         fs::sync_directory(&fs::open_dir(state_dir)?)?;
+        let worker_session=id(&db)?;
         Ok(Self {
             db: Mutex::new(db),
             allocation_uses: Mutex::new(std::collections::HashSet::new()),
@@ -752,6 +759,7 @@ impl Inventory {
             workspace_uses: Mutex::new(std::collections::HashMap::new()),
             workspace_cursor: Mutex::new(String::new()),
             _process_lock: process_lock,
+            worker_session,
             closed: std::sync::atomic::AtomicBool::new(false),
             state_dir: state_dir.into(),
             installation,

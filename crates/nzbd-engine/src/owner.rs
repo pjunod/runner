@@ -338,6 +338,15 @@ pub(crate) enum QueueCommand {
         job: JobId,
         reply: oneshot::Sender<bool>,
     },
+    PrepareClusterWritersStop {
+        ticket: nzbd_state::artifacts::WorkerStopTicket,
+        execution_joined: bool,
+        reply: oneshot::Sender<Result<crate::cluster_stop::StopPreparation, String>>,
+    },
+    ForgetClusterWriterStops {
+        context: nzbd_state::artifacts::WorkerControlContext,
+        reply: oneshot::Sender<bool>,
+    },
     QuiescePayload {
         job: JobId,
         reply: oneshot::Sender<Result<Vec<WriterHandle>, String>>,
@@ -884,6 +893,7 @@ pub(crate) struct Owner {
     /// Unlike the unrelated set of commit barriers, this protects overlapping
     /// Pause/Resume intents from releasing one another's operational fence.
     pending_control_revisions: HashMap<JobId, u64>,
+    cluster_writer_stops: crate::cluster_stop::WriterStops,
     allocated_jobs: HashSet<JobId>,
     finalize_sent: HashSet<FileId>,
     pending_finalize: Vec<(JobId, FileId)>,
@@ -1363,6 +1373,7 @@ impl Owner {
             pending_journal_loads: HashMap::new(),
             pending_control_commits: HashSet::new(),
             pending_control_revisions: HashMap::new(),
+            cluster_writer_stops: Default::default(),
             allocated_jobs,
             finalize_sent: HashSet::new(),
             pending_finalize: Vec::new(),
@@ -3529,6 +3540,75 @@ impl Owner {
                     let _ = reply.send(ok);
                 });
             }
+            QueueCommand::PrepareClusterWritersStop {
+                ticket,
+                execution_joined,
+                reply,
+            } => {
+                let job = JobId(ticket.request.job);
+                let result = (|| -> Result<crate::cluster_stop::StopPreparation, String> {
+                    let current = self.state.job(job).cloned().filter(|record| {
+                        nzbd_state::artifacts::WorkerControlContext::for_job(record).is_some_and(
+                            |context| {
+                                nzbd_state::artifacts::same_worker_operation(
+                                    &context,
+                                    &ticket.request.context,
+                                )
+                            },
+                        )
+                    });
+                    if let Some(record) = current {
+                        if record.torrent.is_some() {
+                            return Err(
+                                "torrent backend must provide its own actual stop acknowledgment"
+                                    .into(),
+                            );
+                        }
+                        if ticket.never_started {
+                            return Err("live queue state contradicts absent start receipt; retain for review".into());
+                        }
+                        let source = self.artifacts.for_job(job.0).map_err(|e| e.to_string())?;
+                        self.cluster_writer_stops
+                            .observe(&record, source.as_ref(), None);
+                        for file in &record.files {
+                            if let Some(writer) = self.writers.remove(&file.id) {
+                                writer.stop.cancel();
+                                self.cluster_writer_stops.observe(
+                                    &record,
+                                    source.as_ref(),
+                                    Some(&writer),
+                                );
+                            }
+                            self.finalize_sent.remove(&file.id);
+                        }
+                        self.allocated_jobs.remove(&job);
+                        self.attempts.retain(|reference, _| reference.job != job);
+                        self.pending_finalize.retain(|(id, _)| *id != job);
+                        if let Some(record) = self.state.job_mut(job) {
+                            if !matches!(
+                                record.status,
+                                JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
+                            ) {
+                                record.status = JobStatus::Paused;
+                            }
+                        }
+                        self.bump_epoch();
+                        self.publish_now();
+                    } else if ticket.never_started
+                        && self.cluster_writer_stops.known(&ticket.request.context)
+                    {
+                        return Err(
+                            "tracked writer contradicts absent start receipt; retain for review"
+                                .into(),
+                        );
+                    }
+                    self.cluster_writer_stops.prepare(&ticket, execution_joined)
+                })();
+                let _ = reply.send(result);
+            }
+            QueueCommand::ForgetClusterWriterStops { context, reply } => {
+                let _ = reply.send(self.cluster_writer_stops.forget_joined(&context));
+            }
             QueueCommand::QuiescePayload { job, reply } => {
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 if self.delegated.contains_key(&job) {
@@ -5220,6 +5300,9 @@ impl Owner {
         let retirement = fresh_epoch();
         self.retirement_epochs.insert(job, retirement);
         self.retiring_writers.entry(job).or_default();
+        let source = self.artifacts.for_job(job.0).ok().flatten();
+        self.cluster_writer_stops
+            .observe(&record, source.as_ref(), None);
         self.dirty = true;
         self.persist_then(move |owner, committed| {
             if owner.retirement_epochs.get(&job) != Some(&retirement) {
@@ -7169,6 +7252,17 @@ impl Owner {
         job: JobId,
         _new_admission: bool,
     ) -> Result<(), nzbd_state::artifacts::Error> {
+        if let Some(context) = self
+            .state
+            .job(job)
+            .and_then(nzbd_state::artifacts::WorkerControlContext::for_job)
+        {
+            if self.artifacts.worker_grant_is_stopped(job.0, &context)? {
+                return Err(nzbd_state::artifacts::Error::Conflict(
+                    "worker grant was durably stopped".into(),
+                ));
+            }
+        }
         if self.retiring_writers.contains_key(&job) {
             return Err(nzbd_state::artifacts::Error::Conflict(
                 "writer retirement in progress".into(),
@@ -7408,6 +7502,12 @@ impl Owner {
                 owner.engine_tx.clone(),
                 scope,
             );
+            if let Some(record) = owner.state.job(job) {
+                let source = owner.artifacts.for_job(job.0).ok().flatten();
+                owner
+                    .cluster_writer_stops
+                    .observe(record, source.as_ref(), Some(&writer));
+            }
             owner.writer_epochs.insert(file, generation);
             owner.writers.insert(file, writer);
             owner.bump_epoch();

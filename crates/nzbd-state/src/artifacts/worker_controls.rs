@@ -628,6 +628,7 @@ impl Inventory {
     pub fn bind_worker_context(&self, job: u32, context: &WorkerControlContext) -> Result<()> {
         let _guard = self.mutation_guard()?;
         let db = self.db.lock().unwrap();
+        if self.worker_grant_is_stopped_unlocked(&db,job,context)? {return Err(Error::Conflict("worker grant was durably stopped".into()))}
         let raw: Option<String> = db
             .query_row(
                 "SELECT data FROM worker_authority WHERE job=?1",

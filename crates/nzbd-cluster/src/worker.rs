@@ -41,7 +41,34 @@ pub struct LeaseState {
 }
 
 /// Lease-id → state map, shared with the demotion path (`retain_jobs`).
-pub type ActiveLeases = Arc<Mutex<HashMap<String, LeaseState>>>;
+#[derive(Clone,Default)]
+pub struct ActiveLeases {
+    states:Arc<Mutex<HashMap<String,LeaseState>>>,
+    admissions:Arc<Mutex<HashMap<String,watch::Receiver<bool>>>>,
+    operations:Arc<Mutex<HashMap<String,watch::Receiver<bool>>>>,
+}
+impl std::ops::Deref for ActiveLeases{
+    type Target=Mutex<HashMap<String,LeaseState>>;
+    fn deref(&self)->&Self::Target{&self.states}
+}
+impl ActiveLeases {
+    fn spawn_operation<F>(&self,tracker:&TaskTracker,id:String,work:F) where F:std::future::Future<Output=()>+Send+'static{
+        let (done,joined)=watch::channel(false);self.operations.lock().unwrap().insert(id,joined);
+        tracker.spawn(async move{work.await;let _=done.send(true);});
+    }
+    pub(crate) async fn join_execution(&self,id:&str)->Result<bool,String>{
+        let admission=self.admissions.lock().unwrap().get(id).cloned();
+        let operation=self.operations.lock().unwrap().get(id).cloned();
+        let observed=admission.is_some() || operation.is_some();
+        for mut joined in admission.into_iter().chain(operation){
+            if !*joined.borrow(){joined.wait_for(|done|*done).await.map_err(|_|"execution stop acknowledgment lost; retain for review".to_owned())?;}
+        }
+        Ok(observed)
+    }
+    pub(crate) fn forget_joined(&self,id:&str){
+        self.admissions.lock().unwrap().remove(id);self.operations.lock().unwrap().remove(id);
+    }
+}
 type BudgetReceipt = Arc<Mutex<Option<BudgetAck>>>;
 
 #[allow(clippy::too_many_arguments)]
@@ -655,6 +682,11 @@ async fn submit_completion(
         .await
     {
         Ok(resp) if resp.ok => {
+            if let Some(context)=nzbd_state::artifacts::WorkerControlContext::for_job(&req.job){
+                if let Err(error)=compact_joined_grant(engine,active,job_id,&context).await{
+                    tracing::warn!(job=job_id.0,%error,"accepted completion awaits actual writer/execution join");return false;
+                }
+            }
             if kind == LeaseKind::Post && !resp.history_recorded_by_authority {
                 // Older authorities omit the concrete path. Their selected
                 // immutable generation stores payloads under files/.
@@ -745,6 +777,30 @@ async fn submit_completion(
         }
     }
     false
+}
+
+pub(crate) async fn cancel_and_join_execution(shared:&crate::leader::LeaderShared,context:&nzbd_state::artifacts::WorkerControlContext)->Result<bool,String>{
+    let active=shared.worker_leases.lock().unwrap().clone().ok_or("worker execution registry unavailable")?;
+    {
+        let states=active.lock().unwrap();
+        if let Some(state)=states.get(&context.lease_id){
+            if state.job_incarnation!=context.job_incarnation || state.job_revision!=context.job_revision || state.control_revision!=context.control_revision {
+                return Err("worker grant intent changed before cancellation".into());
+            }
+            state.cancel.cancel();
+        }
+    }
+    active.join_execution(&context.lease_id).await
+}
+
+pub(crate) async fn compact_joined_grant(engine:&EngineHandle,active:&ActiveLeases,job:JobId,context:&nzbd_state::artifacts::WorkerControlContext)->Result<(),String>{
+    let inventory=engine.artifacts();let context=context.clone();
+    let request=tokio::task::spawn_blocking(move||inventory.worker_grant_request(job.0,&context)).await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
+    let Some(request)=request else{return Ok(())}; // legacy never gains a stop proof
+    let id=request.context.lease_id.clone();
+    let execution_joined=active.join_execution(&id).await?;
+    engine.join_cluster_writers(request,execution_joined).await.map_err(|e|e.to_string())?;
+    active.forget_joined(&id);Ok(())
 }
 
 async fn record_published_pp_history(
@@ -839,6 +895,8 @@ async fn poll_for_work(
         lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
         node: cfg.node_name.clone(),
         owner_incarnation: owner_incarnation.to_owned(),
+        storage_instance_id:engine.artifacts().installation.clone(),
+        start_ordering:1,
         free_download_slots: free_dl,
         free_pp_slots: free_pp,
     };
@@ -853,6 +911,10 @@ async fn poll_for_work(
         }
     };
     for mut grant in resp.grants {
+        let (admission_done,admission_joined)=watch::channel(false);
+        active.admissions.lock().unwrap().insert(grant.lease_id.clone(),admission_joined);
+        async {
+
         let job_id = grant.job.id;
         if grant.job.delivery_lifecycle && grant.lifecycle_protocol < LIFECYCLE_PROTOCOL {
             tracing::warn!(
@@ -860,13 +922,13 @@ async fn poll_for_work(
                 "leader requires cluster lifecycle protocol 2; grant refused before payload mutation"
             );
             reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token).await;
-            continue;
+            return;
         }
         if engine.snapshot().disk_low {
             reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token).await;
-            continue;
+            return;
         }
-        if matches!(grant.kind, LeaseKind::Download | LeaseKind::Post) {
+        {
             let context = nzbd_state::artifacts::WorkerControlContext {
                 lease_id: grant.lease_id.clone(),
                 job_incarnation: grant.job_incarnation.clone(),
@@ -882,6 +944,21 @@ async fn poll_for_work(
                 nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
                 serde_json::to_string(&context).expect("grant context serializes"),
             ));
+            if grant.token.owner_node_id!=cfg.node_name || grant.token.owner_incarnation!=owner_incarnation
+                || grant.scope.get("_startOrdered").and_then(serde_json::Value::as_u64)!=Some(1)
+                || grant.scope.get("_workerStorage").and_then(serde_json::Value::as_str)!=Some(engine.artifacts().installation.as_str()) {
+                tracing::warn!(job=job_id.0,"grant lacks exact receiver/start ordering; refuse before payload mutation");
+                reject_remote_grant(cfg,client,leader_url,&grant.lease_id,&grant.token).await;return;
+            }
+            let request=nzbd_state::artifacts::WorkerStopRequest{
+                job:job_id.0,context:context.clone(),owner_incarnation:owner_incarnation.to_owned(),
+                storage_instance_id:engine.artifacts().installation.clone(),removal_revision:None,
+                authority_source_json:grant.job.params.iter().find(|(key,_)|key==crate::delivery::AUTHORITY_COPY_PARAM).map(|(_,value)|value.clone()),start_ordered:true,
+            };
+            let inventory=engine.artifacts();
+            if let Err(error)=tokio::task::spawn_blocking(move||inventory.begin_worker_grant(&request)).await.map_err(|error|error.to_string()).and_then(|result|result.map_err(|error|error.to_string())) {
+                tracing::warn!(job=job_id.0,%error,"durable grant start refused");reject_remote_grant(cfg,client,leader_url,&grant.lease_id,&grant.token).await;return;
+            }
             if grant.kind == LeaseKind::Download
                 && grant
                     .job
@@ -913,7 +990,7 @@ async fn poll_for_work(
                         );
                         reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
                             .await;
-                        continue;
+                        return;
                     }
                 }
             }
@@ -998,7 +1075,7 @@ async fn poll_for_work(
                 }
             }
             LeaseKind::Post => {
-                let Some(setup) = pp else { continue };
+                let Some(setup) = pp else { return };
                 tracing::info!(job = job_id.0, lease = %grant.lease_id, "pp lease received");
                 if grant.post_fetch_budgeted {
                     apply_budgets(
@@ -1039,7 +1116,7 @@ async fn poll_for_work(
                     tracing::warn!(job = job_id.0, %error, "private PP attempt could not be prepared");
                     reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
                         .await;
-                    continue;
+                    return;
                 }
                 let restored_ready = grant
                     .job
@@ -1051,7 +1128,7 @@ async fn poll_for_work(
                         let _ = engine.remove_job_silent(job_id).await;
                         reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
                             .await;
-                        continue;
+                        return;
                     }
                     active.lock().unwrap().insert(
                         grant.lease_id.clone(),
@@ -1117,7 +1194,7 @@ async fn poll_for_work(
                 else {
                     reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
                         .await;
-                    continue;
+                    return;
                 };
                 let lease_id = grant.lease_id.clone();
                 let token = grant.token.clone();
@@ -1148,7 +1225,10 @@ async fn poll_for_work(
                 );
             }
         }
+        }.await;
+        let _=admission_done.send(true);
     }
+
 }
 
 async fn reject_remote_grant(
@@ -1241,7 +1321,7 @@ fn run_pp_lease(
     for rule in &mut setup.post.categories {
         rule.dest_dir = None;
     }
-    tracker.spawn(async move {
+    active.clone().spawn_operation(tracker,lease_id.clone(),async move {
         let Some(initial) = active.lock().unwrap().get(&lease_id).cloned() else {
             return;
         };
@@ -1518,7 +1598,7 @@ fn run_assembly(
     lease_id: String,
     tracker: &TaskTracker,
 ) {
-    tracker.spawn(async move {
+    active.clone().spawn_operation(tracker,lease_id.clone(),async move {
         let result = tokio::task::spawn_blocking(move || {
             crate::range::assemble(job, &scope, &dest_dir, fence)
         })
