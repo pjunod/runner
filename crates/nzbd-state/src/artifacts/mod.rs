@@ -3,7 +3,9 @@
 //! SQLite owns intent and policy; external sidecars own allocation identity.
 //! Nothing in a media payload is a marker or grants permission to remove it.
 mod cluster;
+mod cluster_keep;
 pub use cluster::{remove_cluster_generation_copy, ClusterArtifactCopy, ClusterCopyCleanup};
+pub use cluster_keep::{ClusterFailureKeepStatus, ClusterFailureKeepTarget};
 pub(crate) mod fs;
 mod policy;
 mod publication;
@@ -1547,9 +1549,21 @@ impl Inventory {
     pub fn set_keep_on_failure(&self, job: u32, keep: bool) -> Result<bool> {
         let guard = self.mutation_guard()?;
         let artifact = self.failure_keep_source(job)?;
-        let Some(mut artifact) = artifact else {
+        let Some(artifact) = artifact else {
             return Ok(false);
         };
+        let result = self.set_failure_keep_artifact_locked(job, artifact, keep, false);
+        drop(guard);
+        result
+    }
+
+    fn set_failure_keep_artifact_locked(
+        &self,
+        job: u32,
+        mut artifact: Artifact,
+        keep: bool,
+        existing_only: bool,
+    ) -> Result<bool> {
         if !artifact.owned || artifact.terminal() {
             return Ok(false);
         }
@@ -1655,10 +1669,11 @@ impl Inventory {
                     // New authorization requires a persisted assessment for
                     // this generation. A failed/in-flight deletion without
                     // its journal cannot be reconstructed from Keep-off.
-                    if artifact
-                        .failure_assessment
-                        .as_ref()
-                        .is_some_and(|assessment| assessment.disposition == "unusable")
+                    if !existing_only
+                        && artifact
+                            .failure_assessment
+                            .as_ref()
+                            .is_some_and(|assessment| assessment.disposition == "unusable")
                         && matches!(artifact.state.as_str(), "retained" | "completed")
                     {
                         Some(Operation {
@@ -1699,10 +1714,16 @@ impl Inventory {
                     .optional()?;
                 if let Some((delivery_id, cleanup_status)) = delivery {
                     if matches!(cleanup_status.as_str(), "pending" | "retry" | "blocked") {
-                        tx.execute(
-                            "UPDATE deliveries SET cleanup_status='retry',cleanup_error=NULL,cleanup_next_retry_at=0 WHERE id=?1 AND cleanup_status IN ('pending','retry','blocked')",
-                            [&delivery_id],
-                        )?;
+                        if existing_only {
+                            // Retry the existing obligation without erasing a
+                            // review/identity reason or creating byte authority.
+                            tx.execute("UPDATE deliveries SET cleanup_next_retry_at=0 WHERE id=?1 AND cleanup_status IN ('pending','retry','blocked')", [&delivery_id])?;
+                        } else {
+                            tx.execute(
+                                "UPDATE deliveries SET cleanup_status='retry',cleanup_error=NULL,cleanup_next_retry_at=0 WHERE id=?1 AND cleanup_status IN ('pending','retry','blocked')",
+                                [&delivery_id],
+                            )?;
+                        }
                     }
                 }
             }
@@ -1714,7 +1735,6 @@ impl Inventory {
             )?;
             tx.commit()?;
         }
-        drop(guard);
         Ok(true)
     }
 
