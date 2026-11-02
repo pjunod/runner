@@ -129,6 +129,8 @@ struct TorrentCopy {
     file_count: usize,
     directory_count: usize,
     selection_digest: String,
+    #[serde(default)]
+    integrity_verified: bool,
     // These names have no ownership receipt. Never adopt, move or delete them.
     // They live outside the final payload; bounded retention need not strand it.
     uncommitted_stages: Vec<UncommittedStage>,
@@ -647,6 +649,60 @@ impl Inventory {
             && receipt.compacted_delete.is_none())
     }
 
+    /// Only a completed piece-verified private copy grants content evidence.
+    /// The caller must freshly validate these identities/digests or a verified
+    /// rename before publishing; this DB projection alone grants no authority.
+    pub(super) fn torrent_copy_integrity_files(
+        &self,
+        job: u32,
+        source: &Artifact,
+    ) -> Result<Vec<FileEntry>> {
+        let op = match self.operation(&format!("torrent-copy-job-{job}")) {
+            Ok(op) => op,
+            Err(Error::NotFound) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        if op.kind != "torrent-copy"
+            || op.state != "succeeded"
+            || op.artifact != source.id
+            || !source.owned
+        {
+            return Ok(Vec::new());
+        }
+        let receipt: TorrentCopy = serde_json::from_str(&op.request)?;
+        if !receipt.integrity_verified
+            || receipt.job != job
+            || receipt.generation != source.generation
+            || receipt.destination != source.path
+            || receipt.compacted_delete.is_some()
+            || receipt.compacted_delivery.is_some()
+        {
+            return Ok(Vec::new());
+        }
+        let plan = load_plan(self, &op)?;
+        plan.files
+            .into_iter()
+            .map(|file| {
+                Ok(FileEntry {
+                    path: file.path,
+                    identity: file.target.ok_or_else(|| {
+                        Error::Conflict("verified torrent copy lacks target identity".into())
+                    })?,
+                    digest: Some(
+                        file.digest
+                            .filter(|digest| {
+                                digest.len() == 64
+                                    && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            })
+                            .ok_or_else(|| {
+                                Error::Conflict("verified torrent copy lacks durable digest".into())
+                            })?,
+                    ),
+                })
+            })
+            .collect()
+    }
+
     /// Reading a legacy/unowned donor creates no deletion authority. A known
     /// owned donor is pinned by the existing exact-generation use registry.
     fn pin_torrent_donor(
@@ -918,6 +974,7 @@ impl Inventory {
                 file_count: 0,
                 directory_count: 0,
                 selection_digest: String::new(),
+                integrity_verified: verifier.is_some(),
                 uncommitted_stages: Vec::new(),
                 compacted_delivery: None,
                 compacted_source: None,
@@ -943,6 +1000,10 @@ impl Inventory {
         let mut plan = load_plan(self, &op)?;
         if replaying {
             verify_copy_files(&source, &plan.files, verifier)?;
+            if verifier.is_some() && !plan.integrity_verified {
+                plan.integrity_verified = true;
+                persist(self, &mut op, &plan)?;
+            }
         }
         if plan.generation != artifact.generation
             || op.artifact != artifact.id
@@ -2247,6 +2308,52 @@ mod tests {
         );
     }
     #[test]
+    fn verified_torrent_copy_enters_custody_evidence_and_preserves_rename_binding() {
+        let f = Fixture::new(true, 1);
+        f.inventory
+            .copy_torrent_acquisition_verified(
+                2,
+                1,
+                HASH,
+                &f.donor,
+                &f.selected,
+                &f.root,
+                &f.target,
+                false,
+                &|reader| {
+                    let mut bytes = [0u8; 1];
+                    reader.read_exact_at(&f.selected[0].0, 0, &mut bytes)?;
+                    assert_eq!(bytes, [42]);
+                    Ok(())
+                },
+                &|| Ok(()),
+            )
+            .unwrap();
+        let evidence = f.inventory.verified_custody_evidence(2, || Ok(())).unwrap();
+        assert!(evidence.verified_outputs.contains("media-0.mkv"));
+        f.inventory
+            .restore_file(
+                2,
+                &f.target.join("media-0.mkv"),
+                &f.target.join("renamed.mkv"),
+            )
+            .unwrap();
+        let evidence = f.inventory.verified_custody_evidence(2, || Ok(())).unwrap();
+        assert!(evidence.verified_outputs.contains("renamed.mkv"));
+        std::fs::write(f.target.join("renamed.mkv"), b"changed").unwrap();
+        let evidence = f.inventory.verified_custody_evidence(2, || Ok(()));
+        assert!(evidence.is_err() || !evidence.unwrap().verified_outputs.contains("renamed.mkv"));
+        let unverified = Fixture::new(true, 1);
+        unverified.run().unwrap();
+        assert!(unverified
+            .inventory
+            .verified_custody_evidence(2, || Ok(()))
+            .unwrap()
+            .verified_outputs
+            .is_empty());
+    }
+
+    #[test]
     fn inventory_maintenance_compacts_delivery_without_live_job_or_service() {
         let f = Fixture::new(true, 2);
         f.run().unwrap();
@@ -2980,6 +3087,7 @@ mod tests {
                 file_count: 0,
                 directory_count: 0,
                 selection_digest: String::new(),
+                integrity_verified: false,
                 uncommitted_stages: Vec::new(),
                 compacted_delivery: None,
                 compacted_source: None,

@@ -903,6 +903,33 @@ impl Inventory {
                 }
             }
         }
+        // Native acquisitions have no NZB segments/CRC. Their completed
+        // piece-verified copy journal carries independent content proof, with
+        // the same fresh identity/digest and rename checks as repaired output.
+        for proof in self.torrent_copy_integrity_files(job, &source)? {
+            let Some(expected_digest) = proof.digest.as_deref() else {
+                continue;
+            };
+            if observed
+                .iter()
+                .any(|entry| entry.path == proof.path && entry.identity == proof.identity)
+            {
+                checkpoint()?;
+                if digest_file_with_checkpoint(
+                    &root,
+                    &proof.path,
+                    &proof.identity,
+                    &mut checkpoint,
+                )? == expected_digest
+                {
+                    outputs.insert(proof.path.clone());
+                }
+            } else if let Some(rename) = renamed.get(&proof.path) {
+                if rename.before == proof.identity && rename.digest == expected_digest {
+                    outputs.insert(rename.current.clone());
+                }
+            }
+        }
         let _coordinator = self.mutation_guard()?;
         self.check_payload_capture(&source)?;
         Ok(CustodyEvidence {
