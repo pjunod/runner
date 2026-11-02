@@ -258,7 +258,7 @@ async fn explicit_delete_waits_remote_join_before_owner_seal_and_physical_cleanu
         .unwrap();
     let response = client.forward(&a.url, request).await.unwrap();
     let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+    let body = axum::body::to_bytes(axum::body::Body::new(response.into_body()), 64 * 1024)
         .await
         .unwrap();
     assert_eq!(
@@ -381,13 +381,12 @@ async fn explicit_delete_waits_remote_join_before_owner_seal_and_physical_cleanu
             .is_empty(),
         "cancellation cannot fabricate READY"
     );
-    assert!(
-        b.runtime
-            .engine
-            .artifacts()
-            .worker_grant_is_stopped(7, &context)
-            .unwrap()
-    );
+    assert!(b
+        .runtime
+        .engine
+        .artifacts()
+        .worker_grant_is_stopped(7, &context)
+        .unwrap());
     assert!(
         b.runtime
             .engine

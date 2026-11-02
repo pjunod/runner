@@ -2938,7 +2938,8 @@ impl Owner {
                             source_artifact_id: None,
                             source_generation: None,
                         };
-                        self.state.url_admission_receipts.push(receipt);
+                        self.state.url_admission_receipts.push(receipt.clone());
+                        self.unaccepted_admissions.insert(token.clone(), receipt);
                         let token = token.clone();
                         let generation = fresh_epoch();
                         self.job_epochs.insert(id, generation);
@@ -2952,6 +2953,7 @@ impl Owner {
                                         .state
                                         .url_admission_receipts
                                         .retain(|receipt| receipt.request_token != token);
+                                    owner.unaccepted_admissions.remove(&token);
                                 }
                                 let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
                             }
@@ -3032,7 +3034,7 @@ impl Owner {
                 if let (Some(token), Some(fingerprint)) =
                     (request_token.as_ref(), submission_sha256.as_ref())
                 {
-                    self.state.url_admission_receipts.push(UrlAdmissionReceipt {
+                    let receipt = UrlAdmissionReceipt {
                         protocol_version: 1,
                         request_token: token.clone(),
                         submission_sha256: fingerprint.clone(),
@@ -3053,7 +3055,9 @@ impl Owner {
                         publication_path: None,
                         source_artifact_id: None,
                         source_generation: None,
-                    });
+                    };
+                    self.state.url_admission_receipts.push(receipt.clone());
+                    self.unaccepted_admissions.insert(token.clone(), receipt);
                 }
                 let generation = fresh_epoch();
                 self.job_epochs.insert(id, generation);
@@ -3073,6 +3077,9 @@ impl Owner {
                                 .state
                                 .url_admission_receipts
                                 .retain(|receipt| receipt.job_id != id.0);
+                            owner
+                                .unaccepted_admissions
+                                .retain(|_, receipt| receipt.job_id != id.0);
                         }
                         let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
                     }
@@ -5522,8 +5529,27 @@ impl Owner {
                         }
                     }
                 }
+                let was_fenced = owner.persistence_fenced;
+                // Only explicit authority adoption may reopen a fenced writer,
+                // after loading its snapshot and validating the current epoch.
+                if owner.persist_guard.as_ref().is_some_and(|guard| !guard())
+                    || (was_fenced && owner.persist_guard.is_none())
+                {
+                    owner.persist = false;
+                    callback(owner, Err(nzbd_state::StateError::Corrupt(
+                        "authority snapshot fence is not current".into(),
+                    )));
+                    return;
+                }
+                owner.persistence_fenced = false;
                 owner.persist = true;
-                owner.replace_projection_then(jobs, callback);
+                owner.replace_projection_then(jobs, move |owner, result| {
+                    if was_fenced && result.is_err() {
+                        owner.persistence_fenced = true;
+                        owner.persist = false;
+                    }
+                    callback(owner, result);
+                });
             },
         );
     }
