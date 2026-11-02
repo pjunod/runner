@@ -178,6 +178,15 @@ impl Inventory {
         generation: &str,
         reason: &str,
     ) -> Result<()> {
+        Self::cancel_relocations_snapshot(db, artifact, generation, reason, None)
+    }
+    fn cancel_relocations_snapshot(
+        db: &Connection,
+        artifact: &str,
+        generation: &str,
+        reason: &str,
+        snapshot: Option<&StartupReconciliation>,
+    ) -> Result<()> {
         let raws = {
             let mut stmt = db.prepare("SELECT data FROM operations WHERE artifact=?1 AND state NOT IN ('succeeded','cancelled') AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.generation')=?2")?;
             let rows = stmt.query_map([artifact, generation], |r| r.get::<_, String>(0))?;
@@ -185,6 +194,11 @@ impl Inventory {
         };
         for raw in raws {
             let mut op: Operation = serde_json::from_str(&raw)?;
+            if let Some(snapshot) = snapshot {
+                if !snapshot.contains_operation(&op)? {
+                    continue;
+                }
+            }
             op.state = "cancelled".into();
             op.error = Some(reason.into());
             save_operation(db, &op)?;
@@ -197,7 +211,14 @@ impl Inventory {
     /// could overwrite its tombstone with a stale move's review state. Restore
     /// the journal's result before interpreting any unfinished operations;
     /// never inspect or delete the bytes now occupying the old pathname.
+    #[cfg(test)]
     pub(super) fn reconcile_deleted_artifacts(&self) -> Result<()> {
+        self.reconcile_deleted_artifacts_snapshot(None)
+    }
+    pub(super) fn reconcile_deleted_artifacts_snapshot(
+        &self,
+        snapshot: Option<&StartupReconciliation>,
+    ) -> Result<()> {
         let _guard = self.mutation_guard()?;
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
@@ -206,7 +227,7 @@ impl Inventory {
             // this generation and predates even the deletion REQUEST. This is
             // stricter than comparing with success time (old operations do not
             // store that timestamp). Equal-second ordering is left for review.
-            let mut stmt = tx.prepare("SELECT DISTINCT a.data FROM artifacts a
+            let mut stmt = tx.prepare("SELECT DISTINCT a.data,d.data FROM artifacts a
                 JOIN operations d ON d.artifact=a.id
                 WHERE d.state='succeeded' AND json_extract(d.data,'$.kind')='delete'
                 AND (
@@ -224,16 +245,30 @@ impl Inventory {
                     AND m.state NOT IN ('succeeded','cancelled')
                     AND json_extract(m.data,'$.kind')='relocate'
                 ))")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        for raw in raws {
+        let mut seen = std::collections::HashSet::new();
+        for (raw, deletion_raw) in raws {
             let mut a: Artifact = serde_json::from_str(&raw)?;
-            Self::cancel_relocations(
+            let deletion: Operation = serde_json::from_str(&deletion_raw)?;
+            if let Some(snapshot) = snapshot {
+                if !snapshot.allows_artifact_db(&tx, &a)?
+                    || !snapshot.contains_operation(&deletion)?
+                {
+                    continue;
+                }
+            }
+            if !seen.insert(a.id.clone()) {
+                continue;
+            }
+            Self::cancel_relocations_snapshot(
                 &tx,
                 &a.id,
                 &a.generation,
                 "source deletion already committed",
+                snapshot,
             )?;
             if a.state != "deleted" {
                 a.state = "deleted".into();
@@ -1881,6 +1916,13 @@ impl Inventory {
         Ok(())
     }
     pub(super) fn reconcile_relocations_root(&self, root: &Path) -> Result<()> {
+        self.reconcile_relocations_root_snapshot(root, None)
+    }
+    pub(super) fn reconcile_relocations_root_snapshot(
+        &self,
+        root: &Path,
+        snapshot: Option<&StartupReconciliation>,
+    ) -> Result<()> {
         // Publication's journal lease and the generation leases below replace
         // the global payload lock. A None guard stays None while hashing.
         let mut guard = None;
@@ -1895,6 +1937,13 @@ impl Inventory {
         let mut retired = Vec::new();
         for raw in raws {
             let mut op: Operation = serde_json::from_str(&raw)?;
+            if let Some(snapshot) = snapshot {
+                if !snapshot.contains_operation(&op)?
+                    || !snapshot.allows_artifact(self, &self.get(&op.artifact)?)?
+                {
+                    continue;
+                }
+            }
             let mut movement: Relocation = serde_json::from_str(&op.request)?;
             let source = {
                 let _coordinator = self.mutation_guard()?;
@@ -1911,6 +1960,15 @@ impl Inventory {
             let Some(mut lease) = self.reserve_reconciliation(&participants)? else {
                 continue;
             };
+            if let Some(snapshot) = snapshot {
+                let mut allowed = true;
+                for participant in &participants {
+                    allowed &= snapshot.allows_artifact(self, participant)?;
+                }
+                if !allowed {
+                    continue;
+                }
+            }
             let baseline = self.operation(&op.id)?;
             if baseline.request != op.request || baseline.state != op.state {
                 continue;
@@ -2277,12 +2335,36 @@ impl Inventory {
                 retired.push(op.id);
             }
         }
-        {
+        let cleanup = {
             let db = self.db.lock().unwrap();
-            let mut stmt = db.prepare("SELECT id FROM operations o WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.root')=?1 AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup_done'),0)=0 AND json_extract(json_extract(data,'$.request'),'$.source.automatic_cleanup_eligible')=1 AND (COALESCE(json_extract(json_extract(data,'$.request'),'$.defer_source_retirement'),0)=0 OR json_extract(json_extract(data,'$.request'),'$.publication_files') IS NOT NULL OR EXISTS (SELECT 1 FROM deliveries d WHERE d.artifact=o.artifact AND d.generation=json_extract(json_extract(o.data,'$.request'),'$.source.generation'))) LIMIT 25")?;
+            let mut stmt = db.prepare("SELECT data FROM operations o WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.root')=?1 AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup_done'),0)=0 AND json_extract(json_extract(data,'$.request'),'$.source.automatic_cleanup_eligible')=1 AND (COALESCE(json_extract(json_extract(data,'$.request'),'$.defer_source_retirement'),0)=0 OR json_extract(json_extract(data,'$.request'),'$.publication_files') IS NOT NULL OR EXISTS (SELECT 1 FROM deliveries d WHERE d.artifact=o.artifact AND d.generation=json_extract(json_extract(o.data,'$.request'),'$.source.generation'))) LIMIT 25")?;
             let rows =
                 stmt.query_map([root.to_string_lossy().as_ref()], |r| r.get::<_, String>(0))?;
-            retired.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in cleanup {
+            let operation: Operation = serde_json::from_str(&raw)?;
+            if let Some(snapshot) = snapshot {
+                if !snapshot.contains_operation(&operation)? {
+                    continue;
+                }
+                let movement: Relocation = serde_json::from_str(&operation.request)?;
+                let mut participants = vec![self.get(&operation.artifact)?];
+                if let Some(scratch) = movement.scratch {
+                    participants.push(self.get(&scratch.id)?);
+                }
+                if let Ok(source) = self.get(&format!("source-{}", operation.id)) {
+                    participants.push(source);
+                }
+                let mut allowed = true;
+                for participant in &participants {
+                    allowed &= snapshot.allows_artifact(self, participant)?;
+                }
+                if !allowed {
+                    continue;
+                }
+            }
+            retired.push(operation.id);
         }
         drop(guard.take());
         retired.sort();

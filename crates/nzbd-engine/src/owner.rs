@@ -690,6 +690,7 @@ pub(crate) struct Owner {
     record_transitions: HashSet<JobId>,
     projection_transition: bool,
     startup_reconciliation: HashMap<PathBuf, transitions::StartupRoot>,
+    startup_snapshot: Arc<nzbd_state::artifacts::StartupReconciliation>,
     startup_roots_loading: bool,
     startup_roots_ready: bool,
     startup_roots_retry_at: Instant,
@@ -979,6 +980,13 @@ impl Owner {
             )
             .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?,
         );
+        // Capture the metadata boundary before runtime Inventory handles can
+        // admit allocations or journals while payload workers are delayed.
+        let startup_snapshot = Arc::new(
+            artifacts
+                .capture_startup_reconciliation()
+                .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?,
+        );
         let marker = UncleanMarker::new(state_dir, journal_suffix);
         let was_unclean = marker.check_and_arm()?;
         let snap_store = SnapshotStore::open(state_dir)?;
@@ -1130,6 +1138,7 @@ impl Owner {
             record_transitions: HashSet::new(),
             projection_transition: false,
             startup_reconciliation: HashMap::new(),
+            startup_snapshot,
             startup_roots_loading: false,
             startup_roots_ready: false,
             startup_roots_retry_at: Instant::now(),

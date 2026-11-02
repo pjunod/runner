@@ -1290,7 +1290,15 @@ impl Inventory {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(super) fn reconcile_transforms_root(&self, root: &Path) -> Result<()> {
+        self.reconcile_transforms_root_snapshot(root, None)
+    }
+    pub(super) fn reconcile_transforms_root_snapshot(
+        &self,
+        root: &Path,
+        snapshot: Option<&StartupReconciliation>,
+    ) -> Result<()> {
         let raws = {
             let db = self.db.lock().unwrap();
             let mut statement=db.prepare("SELECT o.data FROM operations o JOIN artifacts a ON a.id=o.artifact WHERE json_extract(a.data,'$.root')=?2 AND (o.state='running' OR (o.state='retry' AND COALESCE(json_extract(o.data,'$.next_retry'),0)<=?1)) AND json_extract(o.data,'$.kind') IN ('par_restore','par_repair','extract')")?;
@@ -1303,6 +1311,11 @@ impl Inventory {
         for raw in raws {
             let mut op: Operation = serde_json::from_str(&raw)?;
             let source = self.get(&op.artifact)?;
+            if let Some(snapshot) = snapshot {
+                if !snapshot.contains_operation(&op)? || !snapshot.allows_artifact(self, &source)? {
+                    continue;
+                }
+            }
             let mut participants = vec![source.clone()];
             let mut obsolete = source.terminal() || source.state == "deleting";
             if op.kind != "par_restore" {
@@ -1323,6 +1336,15 @@ impl Inventory {
             let Some(_lease) = self.reserve_reconciliation(&participants)? else {
                 continue;
             };
+            if let Some(snapshot) = snapshot {
+                let mut allowed = true;
+                for participant in &participants {
+                    allowed &= snapshot.allows_artifact(self, participant)?;
+                }
+                if !allowed {
+                    continue;
+                }
+            }
             let baseline = self.operation(&op.id)?;
             if baseline.request != op.request || baseline.state != op.state {
                 continue;

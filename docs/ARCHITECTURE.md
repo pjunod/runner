@@ -258,7 +258,10 @@ and the [reviewed recovery plan](STARTUP_VERIFICATION_PLAN.md).
 Recovery loads queue metadata before touching payload roots. Root-scoped workers
 then reconcile lifecycle state and establish allocation capabilities
 independently, so a blocked mount does not hold engine construction or another
-root's metadata progress. Verification uses bounded batches (up to 64 ranges,
+root's metadata progress. The owner captures startup artifact generations,
+revisions and existing journal fingerprints before admitting runtime work.
+Root replay is limited to that snapshot; delayed startup work cannot classify
+new runtime allocations or operations as crash leftovers. Verification uses bounded batches (up to 64 ranges,
 32 MiB, or 250 ms), retaining a cursor bound to the observed file identity
 between batches. The owner publishes checked-byte progress and can admit newly
 eligible higher-priority work before a yielded job resumes; manual pauses

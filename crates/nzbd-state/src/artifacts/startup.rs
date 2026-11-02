@@ -1,6 +1,79 @@
 //! Root-scoped startup recovery. Payload syscalls never own the coordinator.
 use super::*;
 
+/// Immutable metadata boundary captured before the owner is exposed to
+/// runtime callers. No payload manifests or filesystem handles are retained.
+#[derive(Clone)]
+pub struct StartupReconciliation {
+    artifacts: std::collections::HashMap<String, StartupArtifact>,
+    operations: std::collections::HashMap<String, [u8; 32]>,
+    roots: Vec<PathBuf>,
+}
+#[derive(Clone)]
+struct StartupArtifact {
+    generation: String,
+    revision: u64,
+    root: PathBuf,
+    path: PathBuf,
+    state: String,
+    job: Option<u32>,
+}
+impl StartupReconciliation {
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    pub(super) fn contains_artifact(&self, artifact: &Artifact) -> bool {
+        self.artifacts.get(&artifact.id).is_some_and(|captured| {
+            captured.generation == artifact.generation
+                && captured.revision == artifact.revision
+                && captured.root == artifact.root
+                && captured.path == artifact.path
+                && captured.state == artifact.state
+                && captured.job == artifact.job
+        })
+    }
+
+    pub(super) fn contains_operation(&self, operation: &Operation) -> Result<bool> {
+        let Some(fingerprint) = self.operations.get(&operation.id) else {
+            return Ok(false);
+        };
+        Ok(*fingerprint == operation_fingerprint(operation)?)
+    }
+
+    /// A new runtime journal can claim an existing allocation without changing
+    /// its revision (for example, workspace admission). Such an allocation is
+    /// also outside startup's authority, even though its generation is old.
+    pub(super) fn allows_artifact(
+        &self,
+        inventory: &Inventory,
+        artifact: &Artifact,
+    ) -> Result<bool> {
+        let db = inventory.db.lock().unwrap();
+        self.allows_artifact_db(&db, artifact)
+    }
+
+    pub(super) fn allows_artifact_db(&self, db: &Connection, artifact: &Artifact) -> Result<bool> {
+        if !self.contains_artifact(artifact) {
+            return Ok(false);
+        }
+        let mut statement = db.prepare("SELECT data FROM operations WHERE artifact=?1")?;
+        let mut rows = statement.query([&artifact.id])?;
+        while let Some(row) = rows.next()? {
+            let operation: Operation = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            if !self.contains_operation(&operation)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+fn operation_fingerprint(operation: &Operation) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    Ok(Sha256::digest(serde_json::to_vec(operation)?).into())
+}
+
 #[derive(Serialize, Deserialize)]
 struct OrphanReceipt {
     generation: String,
@@ -190,6 +263,55 @@ impl Inventory {
         Ok(())
     }
 
+    /// Capture the startup inventory while only this owner can admit work.
+    /// The coordinator and one SQLite read transaction give artifacts and
+    /// journals the same cutoff; no root is opened or probed here.
+    pub fn capture_startup_reconciliation(&self) -> Result<StartupReconciliation> {
+        let _coordinator = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let mut artifacts = std::collections::HashMap::new();
+        let mut roots = Vec::new();
+        {
+            let mut statement = tx.prepare("SELECT id,json_extract(data,'$.generation'),json_extract(data,'$.revision'),json_extract(data,'$.root'),path,state,json_extract(data,'$.job') FROM artifacts")?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let root = PathBuf::from(row.get::<_, String>(3)?);
+                roots.push(root.clone());
+                artifacts.insert(
+                    row.get::<_, String>(0)?,
+                    StartupArtifact {
+                        generation: row.get(1)?,
+                        revision: u64::try_from(row.get::<_, i64>(2)?).map_err(|_| {
+                            Error::Conflict("invalid startup artifact revision".into())
+                        })?,
+                        root,
+                        path: PathBuf::from(row.get::<_, String>(4)?),
+                        state: row.get(5)?,
+                        job: row.get(6)?,
+                    },
+                );
+            }
+        }
+        let mut operations = std::collections::HashMap::new();
+        {
+            let mut statement = tx.prepare("SELECT data FROM operations")?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let operation: Operation = serde_json::from_str(&row.get::<_, String>(0)?)?;
+                operations.insert(operation.id.clone(), operation_fingerprint(&operation)?);
+            }
+        }
+        tx.commit()?;
+        roots.sort();
+        roots.dedup();
+        Ok(StartupReconciliation {
+            artifacts,
+            operations,
+            roots,
+        })
+    }
+
     /// Metadata-only enumeration: an unavailable mount cannot delay startup.
     pub fn startup_reconciliation_roots(&self) -> Result<Vec<PathBuf>> {
         let db = self.db.lock().unwrap();
@@ -201,9 +323,21 @@ impl Inventory {
     /// Run in the bounded worker for this root before admitting its recovered
     /// jobs. Other roots and metadata commits never wait on its payload I/O.
     pub fn reconcile_startup_root(&self, root: &Path, live_jobs: &[u32]) -> Result<()> {
-        self.reconcile_deleted_artifacts()?;
-        self.reconcile_relocations_root(root)?;
-        self.reconcile_transforms_root(root)?;
+        let snapshot = self.capture_startup_reconciliation()?;
+        self.reconcile_startup_root_snapshot(root, live_jobs, &snapshot)
+    }
+
+    /// Replay only the inventory that existed at the owner's synchronous
+    /// startup boundary, even if this root's worker runs much later.
+    pub fn reconcile_startup_root_snapshot(
+        &self,
+        root: &Path,
+        live_jobs: &[u32],
+        snapshot: &StartupReconciliation,
+    ) -> Result<()> {
+        self.reconcile_deleted_artifacts_snapshot(Some(snapshot))?;
+        self.reconcile_relocations_root_snapshot(root, Some(snapshot))?;
+        self.reconcile_transforms_root_snapshot(root, Some(snapshot))?;
         let rows = {
             let db = self.db.lock().unwrap();
             let mut statement = db.prepare("SELECT data FROM artifacts WHERE state IN ('allocating','retiring','active') AND json_extract(data,'$.root')=?1")?;
@@ -214,6 +348,9 @@ impl Inventory {
         };
         for raw in rows {
             let original: Artifact = serde_json::from_str(&raw)?;
+            if !snapshot.allows_artifact(self, &original)? {
+                continue;
+            }
             if self.is_transform_scratch(&original)? {
                 continue;
             }
@@ -224,6 +361,11 @@ impl Inventory {
             let Some(_lease) = self.reserve_reconciliation(std::slice::from_ref(&original))? else {
                 continue;
             };
+            // Recheck after reserving: a runtime workspace may have been
+            // admitted between the metadata query and this custody lease.
+            if !snapshot.allows_artifact(self, &original)? {
+                continue;
+            }
             let mut artifact = original.clone();
             if self.verify_root(&artifact).is_err() {
                 continue;
@@ -356,5 +498,82 @@ impl Inventory {
         save_operation(&tx, &operation)?;
         tx.commit()?;
         Ok(Some(artifact))
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    fn inventory() -> (tempfile::TempDir, Inventory, PathBuf) {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("payload");
+        std::fs::create_dir(&root).unwrap();
+        let inventory = Inventory::open(&temporary.path().join("state")).unwrap();
+        (temporary, inventory, root)
+    }
+
+    #[test]
+    fn startup_snapshot_does_not_claim_new_runtime_allocation_or_finished_workspace() {
+        let (_temporary, inventory, root) = inventory();
+        let snapshot = inventory.capture_startup_reconciliation().unwrap();
+        let source = inventory
+            .allocate(77, &root, &root.join("runtime"))
+            .unwrap();
+        std::fs::write(source.path.join("payload"), b"owned").unwrap();
+        let workspace = inventory.workspace(77, "par_repair", "runtime").unwrap();
+        std::fs::write(workspace.scratch.path.join("temporary"), b"scratch").unwrap();
+        inventory.finish_workspace(&workspace).unwrap();
+        let source_before = inventory.get(&source.id).unwrap();
+        let scratch_before = inventory.get(&workspace.scratch.id).unwrap();
+        let operation_before = inventory.operation(&workspace.operation_id).unwrap();
+
+        inventory
+            .reconcile_startup_root_snapshot(&root, &[], &snapshot)
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(inventory.get(&source.id).unwrap()).unwrap(),
+            serde_json::to_value(source_before).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(inventory.get(&workspace.scratch.id).unwrap()).unwrap(),
+            serde_json::to_value(scratch_before).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(inventory.operation(&workspace.operation_id).unwrap()).unwrap(),
+            serde_json::to_value(operation_before).unwrap()
+        );
+        assert!(!inventory.for_job(77).unwrap().unwrap().keep);
+        assert!(inventory.for_job(77).unwrap().unwrap().hold.is_none());
+    }
+
+    #[test]
+    fn startup_snapshot_excludes_new_runtime_journal_on_existing_generation() {
+        let (_temporary, inventory, root) = inventory();
+        let source = inventory
+            .allocate(78, &root, &root.join("existing"))
+            .unwrap();
+        std::fs::write(source.path.join("payload"), b"owned").unwrap();
+        let snapshot = inventory.capture_startup_reconciliation().unwrap();
+        let workspace = inventory
+            .workspace(78, "par_repair", "new-runtime-operation")
+            .unwrap();
+        let source_before = inventory.get(&source.id).unwrap();
+        let operation_before = inventory.operation(&workspace.operation_id).unwrap();
+
+        inventory
+            .reconcile_startup_root_snapshot(&root, &[], &snapshot)
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(inventory.get(&source.id).unwrap()).unwrap(),
+            serde_json::to_value(source_before).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(inventory.operation(&workspace.operation_id).unwrap()).unwrap(),
+            serde_json::to_value(operation_before).unwrap()
+        );
+        assert!(workspace.scratch.path.exists());
     }
 }

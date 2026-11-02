@@ -575,8 +575,8 @@ impl Owner {
                 state.phase = "loading".into();
             }
         }
-        let inventory = self.artifacts.clone();
-        self.io_then(move || inventory.startup_reconciliation_roots().map_err(failure), move |owner, result| {
+        let snapshot = self.startup_snapshot.clone();
+        self.io_then(move || Ok::<_, nzbd_state::StateError>(snapshot.roots().to_vec()), move |owner, result| {
             owner.startup_roots_loading = false;
             match result {
                 Ok(mut roots) => {
@@ -623,9 +623,10 @@ impl Owner {
             .map(|job| job.id.0)
             .collect::<Vec<_>>();
         let worker_root = root.clone();
+        let snapshot = self.startup_snapshot.clone();
         self.payload_then(root.clone(), move || {
             prepare_unenrolled_payload_root(&inventory, &worker_root)?;
-            inventory.reconcile_startup_root(&worker_root, &live).map_err(failure)
+            inventory.reconcile_startup_root_snapshot(&worker_root, &live, &snapshot).map_err(failure)
         }, move |owner, result| {
             let state = owner.startup_reconciliation.get_mut(&root).unwrap();
             state.running = false;
