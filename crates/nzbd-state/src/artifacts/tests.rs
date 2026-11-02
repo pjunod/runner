@@ -1840,6 +1840,45 @@ fn relocation_refuses_existing_destination_and_commits_identity_after_rename() {
     assert!(a.owned);
 }
 #[test]
+fn succeeded_relocation_proof_requires_exact_owned_current_generation_and_paths() {
+    let (tmp, db, root) = fixture();
+    let source = root.join("proof-source");
+    let artifact = db.allocate(91, &root, &source).unwrap();
+    std::fs::write(source.join("media.mkv"), b"whole media").unwrap();
+    let target_root = tmp.path().join("proof-target");
+    std::fs::create_dir(&target_root).unwrap();
+    let target = target_root.join("published");
+    let generation = SourceGeneration {
+        artifact: artifact.id.clone(),
+        generation: artifact.generation.clone(),
+    };
+    assert!(!db
+        .has_succeeded_relocation(&generation, &source, &target)
+        .unwrap());
+    db.relocate(91, &target).unwrap();
+    assert!(db
+        .has_succeeded_relocation(&generation, &source, &target)
+        .unwrap());
+    assert!(!db
+        .has_succeeded_relocation(&generation, &target, &source)
+        .unwrap());
+    assert!(!db
+        .has_succeeded_relocation(&generation, &root.join("other"), &target)
+        .unwrap());
+    let mut stale = generation.clone();
+    stale.generation.push_str("-stale");
+    assert!(!db
+        .has_succeeded_relocation(&stale, &source, &target)
+        .unwrap());
+    let mut current = db.get(&artifact.id).unwrap();
+    current.owned = false;
+    save_artifact(&db.db.lock().unwrap(), &current).unwrap();
+    assert!(!db
+        .has_succeeded_relocation(&generation, &source, &target)
+        .unwrap());
+}
+
+#[test]
 fn published_recovery_reconciles_after_lost_acknowledgement() {
     let (tmp, db, root) = fixture();
     let a = parked(&db, &root);

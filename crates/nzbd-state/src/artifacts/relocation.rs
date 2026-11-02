@@ -147,6 +147,47 @@ impl Drop for RelocationLease<'_> {
     }
 }
 impl Inventory {
+    /// Metadata-only proof of a committed path transition in this storage
+    /// inventory. Callers must match their storage instance to `installation`;
+    /// this does not authorize filesystem reads, adoption, or deletion.
+    pub fn has_succeeded_relocation(
+        &self,
+        source: &SourceGeneration,
+        from: &Path,
+        to: &Path,
+    ) -> Result<bool> {
+        let _guard = self.mutation_guard()?;
+        let current = match self.get(&source.artifact) {
+            Ok(current) => current,
+            Err(Error::NotFound) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !current.owned
+            || current.generation != source.generation
+            || current.path != to
+            || matches!(current.state.as_str(), "deleted" | "source_gone")
+        {
+            return Ok(false);
+        }
+        let (Some(from), Some(to)) = (from.to_str(), to.to_str()) else {
+            return Ok(false);
+        };
+        // Extract only the immutable scalar proof, never a publication manifest.
+        // Legacy registry-only journals cannot prove owned relocation custody.
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state='succeeded'
+             AND json_extract(data,'$.kind')='relocate'
+             AND json_extract(json_extract(data,'$.request'),'$.source.id')=?1
+             AND json_extract(json_extract(data,'$.request'),'$.source.generation')=?2
+             AND json_extract(json_extract(data,'$.request'),'$.source.owned')=1
+             AND json_extract(json_extract(data,'$.request'),'$.source.path')=?3
+             AND json_extract(json_extract(data,'$.request'),'$.destination')=?4
+             AND COALESCE(json_extract(json_extract(data,'$.request'),'$.registry'),0)=0)",
+            params![source.artifact, source.generation, from, to],
+            |row| row.get(0),
+        )?)
+    }
+
     pub(super) fn resume_post_relocation_checked(
         &self,
         job: u32,
