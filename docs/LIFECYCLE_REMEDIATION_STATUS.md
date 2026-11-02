@@ -49,10 +49,10 @@ outside compiler caches in the task's durable evidence directory.
 The PR #261 merge passes affected crate checks and focused tests for repeated
 ENOSPC, a source already renamed before move commit, review/deletion refusal,
 probe singleflight and worker control persistence. Worker lease-driven recovery
-still needs integration with that unified policy. Cluster partial-copy claims,
+is integrated with that unified policy and exact lease-renewal checks. Cluster partial-copy claims,
 cross-node Keep and explicit cancellation disposition remain active work.
 Resumed download capacity now accounts for verified existing progress, with a
-real partial writer restart regression; final capacity review remains active.
+real partial writer restart regression and exact-root isolated headroom proof.
 
 The later cluster checkpoint e570dc5 (integration bc12c425) proves terminal
 unusable copy disposal, exact raw-copy seal refusal, newer-Delete protection,
@@ -96,6 +96,19 @@ integrated in ccf9b3f7/f2ec5639, with 28 focused crash/cleanup checks passing.
 Engine integration and the real paired native test remain pending.
 Cancellation disposition must still prove physical cleanup
 for explicit file deletion while preserving remove-job-and-keep-files behavior.
+
+The scoped cancellation state changes are integrated in 61b60f25/5f94139d.
+Eleven focused tests pass, including explicit deletion despite Keep for the
+selected copy, partial-delete restart, fresh nonconsumer copies, and refusal
+of legacy/unowned copies. Cluster route and remote-writer stop integration
+remain active. Native acquisition has two passing initial construction tests;
+its later failure, paused-intent and seed-retirement changes remain unqualified.
+No native capability is advertised until the complete path is proven.
+
+Host disk exhaustion interrupted construction builds. Source, Git checkpoints,
+stashes and evidence were preserved; only this task's inactive compiler cache
+was reclaimed. Source work and one reduced-debug build resumed after capacity
+recovered. This interruption does not waive final review, coverage or test gates.
 
 ## 4. Durable work and recovery
 
