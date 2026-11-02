@@ -1893,7 +1893,14 @@ fn lifecycle_scale_one_million_tombstones() {
     let bytes = std::fs::metadata(tmp.path().join("state/artifacts.sqlite"))
         .unwrap()
         .len();
-    eprintln!("lifecycle rows=1000001 list_p95_ms={:.3} database_bytes={} preparation_seconds={:.1} os={} arch={}",times[94],bytes,started.elapsed().as_secs_f64(),std::env::consts::OS,std::env::consts::ARCH);
+    eprintln!(
+        "lifecycle rows=1000001 list_p95_ms={:.3} database_bytes={} preparation_seconds={:.1} os={} arch={}",
+        times[94],
+        bytes,
+        started.elapsed().as_secs_f64(),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
     assert!(
         times[94] < 200.0,
         "cached first-page latency exceeded design target"
@@ -2592,4 +2599,59 @@ fn adopted_startup_orphan_restores_only_automatic_keep_and_hold() {
     inventory.reconcile_startup_root(&root, &[]).unwrap();
     let recovered = inventory.reclaim_recovered_orphan(83).unwrap().unwrap();
     assert!(recovered.keep && kept.keep);
+}
+
+#[test]
+fn legacy_worker_enrollment_allows_operational_custody_without_cleanup_ownership() {
+    let (_tmp, inventory, root) = fixture();
+    let inventory = Arc::new(inventory);
+    let path = root.join("shared-worker-input");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("payload.bin"), b"shared bytes").unwrap();
+    inventory.register_legacy_active(801, &root, &path).unwrap();
+    let admitted = inventory.for_job(801).unwrap().unwrap();
+    assert_eq!(admitted.state, "active");
+    assert!(!admitted.owned);
+    assert!(admitted.keep);
+    assert!(admitted.hold.is_none());
+    assert_eq!(
+        inventory.allocate(801, &root, &path).unwrap().id,
+        admitted.id
+    );
+    let custody = inventory
+        .acquire_terminal_use(801, &|| Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(custody.source().artifact, admitted.id);
+    assert!(inventory
+        .request_delete(&admitted.id, admitted.revision, "must-not-delete", 0)
+        .is_err());
+    drop(custody);
+
+    let mut held = inventory.for_job(801).unwrap().unwrap();
+    held.hold = Some("review: operator blocked this source".into());
+    held.revision += 1;
+    save_artifact(&inventory.db.lock().unwrap(), &held).unwrap();
+    inventory.register_legacy_active(801, &root, &path).unwrap();
+    let preserved = inventory.for_job(801).unwrap().unwrap();
+    assert_eq!(preserved.hold, held.hold);
+    assert_eq!(preserved.revision, held.revision);
+}
+
+#[test]
+fn unavailable_legacy_enrollment_preserves_existing_association_and_controls() {
+    let (temp, inventory, root) = fixture();
+    let path = root.join("shared-worker-input");
+    std::fs::create_dir(&path).unwrap();
+    inventory.register_legacy_active(802, &root, &path).unwrap();
+    let before = inventory.for_job(802).unwrap().unwrap();
+    std::fs::rename(&root, temp.path().join("offline-root")).unwrap();
+    assert!(inventory.register_legacy_active(802, &root, &path).is_err());
+    let after = inventory.for_job(802).unwrap().unwrap();
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.path, before.path);
+    assert_eq!(after.hold, before.hold);
+    assert_eq!(after.job, Some(802));
 }

@@ -10,7 +10,7 @@ use crate::http::ClusterClient;
 use crate::proto::*;
 use crate::{ClusterConfig, PpSetup};
 use nzbd_engine::{EngineHandle, MirrorStats};
-use nzbd_post::manager::{process_job_ctx, PpCtx};
+use nzbd_post::manager::{PpCtx, process_job_ctx};
 use nzbd_types::{JobId, JobStatus, ServerDef};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -745,6 +745,46 @@ async fn reject_remote_grant(
 /// commit check against the live lease map (a cancelled/reclaimed lease
 /// must never publish results or stamp the job).
 #[allow(clippy::too_many_arguments)]
+/// Lease renewals can extend the deadline while owner recovery is pending.
+/// Recheck at the exact recorded deadline; never drop an issued owner request.
+async fn wait_pp_owner_admission(
+    engine: &EngineHandle,
+    active: &ActiveLeases,
+    lease_id: &str,
+    job: JobId,
+    cancellation: &CancellationToken,
+) -> Result<Option<nzbd_engine::PostAdmission>, nzbd_engine::EngineError> {
+    let wait_cancel = cancellation.child_token();
+    let waiting = engine.wait_post_admission(job, &wait_cancel);
+    tokio::pin!(waiting);
+    loop {
+        let deadline = active
+            .lock()
+            .unwrap()
+            .get(lease_id)
+            .filter(|state| state.job == job && !state.cancel.is_cancelled())
+            .map(|state| state.deadline);
+        let Some(deadline) = deadline.filter(|deadline| *deadline > Instant::now()) else {
+            wait_cancel.cancel();
+            return waiting.await;
+        };
+        tokio::select! {
+            result = &mut waiting => {
+                let admission = result?;
+                let current = active.lock().unwrap().get(lease_id)
+                    .is_some_and(|state| state.job == job && state.deadline > Instant::now()
+                        && !state.cancel.is_cancelled());
+                if !current || cancellation.is_cancelled() {
+                    if let Some(admission) = admission { engine.end_post_admission(admission).await?; }
+                    return Ok(None);
+                }
+                return Ok(admission);
+            }
+            _ = tokio::time::sleep_until(deadline) => {},
+        }
+    }
+}
+
 fn run_pp_lease(
     engine: EngineHandle,
     mut setup: PpSetup,
@@ -784,6 +824,18 @@ fn run_pp_lease(
                 .await;
             return;
         }
+        let admission = match wait_pp_owner_admission(&engine, &active, &lease_id, job_id, &initial.cancel).await {
+            Ok(Some(admission)) => admission,
+            result => {
+                tracing::debug!(job=job_id.0, lease=%lease_id, ?result, "PP owner admission ended before processing");
+                if active.lock().unwrap().remove(&lease_id).is_some() {
+                    let _ = engine.remove_job_silent(job_id).await;
+                }
+                return;
+            }
+        };
+        let admitted_engine = engine.for_post_admission(&admission);
+        let admission_cancel = admission.cancellation.clone();
         let script_receipt: nzbd_post::manager::ScriptReceiptHook = Arc::new({
             let active = active.clone();
             let lease_id = lease_id.clone();
@@ -852,8 +904,9 @@ fn run_pp_lease(
             commit_ok: Arc::new({
                 let active = active.clone();
                 let lease_id = lease_id.clone();
+                let admission_cancel = admission_cancel.clone();
                 move || {
-                    active
+                    !admission_cancel.is_cancelled() && active
                         .lock()
                         .unwrap()
                         .get(&lease_id)
@@ -862,11 +915,28 @@ fn run_pp_lease(
             }),
         };
         let pp_cancel = initial.cancel.clone();
-        let result = tokio::select! {
-            _ = pp_cancel.cancelled() => Err(nzbd_post::PostError::Subprocess("PP lease authority expired".into())),
-            result = process_job_ctx(&engine, &setup.post, &setup.history, &dest_dir, job_id, &ctx) => result,
+        let processing = process_job_ctx(&admitted_engine, &setup.post, &setup.history, &dest_dir, job_id, &ctx);
+        tokio::pin!(processing);
+        let outcome = tokio::select! {
+            _ = pp_cancel.cancelled() => None,
+            _ = admission_cancel.cancelled() => None,
+            result = &mut processing => Some(result),
         };
-        ctx.cancel.cancel(); ctx.workers.close(); ctx.workers.wait().await;
+        ctx.cancel.cancel();
+        let result = match outcome {
+            Some(result) => result,
+            None => {
+                // Keep custody through every already-started blocking worker,
+                // including recovery/finalization outside the attempt tracker.
+                let _ = processing.await;
+                Err(nzbd_post::PostError::Subprocess("PP lease authority expired".into()))
+            }
+        };
+        ctx.workers.close();
+        ctx.workers.wait().await;
+        if let Err(error) = engine.end_post_admission(admission).await {
+            tracing::warn!(job=job_id.0, lease=%lease_id, %error, "PP owner custody release remains unresolved");
+        }
         match result {
             Ok(outcome) => {
                 tracing::info!(job = job_id.0, lease = %lease_id, outcome = outcome.as_str(), "pp lease finished");
@@ -1585,10 +1655,12 @@ mod tests {
             .import_job(queued_test_job(), false, false)
             .await
             .unwrap();
-        assert!(engine
-            .enter_post_stage(JobId(77), PostStage::ParVerify, 1_000, None)
-            .await
-            .unwrap());
+        assert!(
+            engine
+                .enter_post_stage(JobId(77), PostStage::ParVerify, 1_000, None)
+                .await
+                .unwrap()
+        );
 
         engine
             .register_repair_attempt(JobId(77), "transition-lease:1".into())
@@ -1836,9 +1908,11 @@ mod tests {
             accepted_at_unix_ms: Some(10),
             history_recorded_by_authority: true,
         };
-        assert!(accept_worker_retirement(&engine, &request, &response)
-            .await
-            .is_err());
+        assert!(
+            accept_worker_retirement(&engine, &request, &response)
+                .await
+                .is_err()
+        );
         assert!(workspace.scratch.path.exists());
         response.ok = true;
         accept_worker_retirement(&engine, &request, &response)

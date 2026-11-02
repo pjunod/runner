@@ -8455,6 +8455,7 @@ mod tests {
             budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
             url_fetches: Arc::new(std::sync::Mutex::new(HashSet::new())),
             post_scope: None,
+            queue_changes: owner.epoch_tx.subscribe(),
             owner_heartbeat: owner.owner_heartbeat.clone(),
             shutdown_complete: owner.shutdown_complete.clone(),
         };

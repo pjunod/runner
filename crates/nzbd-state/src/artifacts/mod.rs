@@ -252,8 +252,12 @@ impl ListFilter {
         match self {
             Self::All => "1=1",
             Self::Live => "state NOT IN ('deleted','source_gone')",
-            Self::Attention => "state NOT IN ('deleted','source_gone') AND (json_extract(data,'$.owned')=0 OR json_extract(data,'$.hold') IS NOT NULL OR json_extract(data,'$.error') IS NOT NULL)",
-            Self::Owned => "state NOT IN ('deleted','source_gone') AND json_extract(data,'$.owned')=1",
+            Self::Attention => {
+                "state NOT IN ('deleted','source_gone') AND (json_extract(data,'$.owned')=0 OR json_extract(data,'$.hold') IS NOT NULL OR json_extract(data,'$.error') IS NOT NULL)"
+            }
+            Self::Owned => {
+                "state NOT IN ('deleted','source_gone') AND json_extract(data,'$.owned')=1"
+            }
             Self::Cleared => "state IN ('deleted','source_gone')",
         }
     }
@@ -422,7 +426,7 @@ impl Inventory {
                 None => {
                     return Err(Error::Conflict(
                         "transform journal lacks generation evidence".into(),
-                    ))
+                    ));
                 }
             }
         }
@@ -1171,34 +1175,95 @@ impl Inventory {
     /// Upgrade a live queue record without claiming its pre-existing bytes.
     /// It may resume writing; destructive actions still need operator adoption.
     pub fn register_legacy_active(&self, job: u32, root: &Path, path: &Path) -> Result<()> {
-        if !path.exists() {
+        let previous = self.for_job(job)?;
+        if let Some(previous) = previous.as_ref().filter(|previous| previous.path == path) {
+            // I/O uncertainty cannot revoke an established allocation. Capture
+            // and verify outside the coordinator, then preserve newer controls.
+            self.verify(previous)?;
+            let _coordinator = self.mutation_guard()?;
+            self.check_payload_capture(previous)?;
+            if !previous.owned
+                && previous.keep
+                && previous.state == "active"
+                && previous.hold.as_deref() == Some("review")
+            {
+                let mut admitted = previous.clone();
+                admitted.hold = None;
+                admitted.revision += 1;
+                save_artifact(&self.db.lock().unwrap(), &admitted)?;
+            }
             return Ok(());
         }
-        if let Some(mut previous) = self.for_job(job)? {
-            if previous.path == path && self.verify(&previous).is_ok() {
-                return Ok(());
+        // Inspect the destination before detaching the prior association. Even
+        // a proven missing old directory requires a verified enrolled root.
+        let previous_present = if let Some(previous) = &previous {
+            self.verify_root(previous)?;
+            let present = previous.path.try_exists()?;
+            if present {
+                self.verify(previous)?;
             }
-            let _guard = self.mutation_guard()?;
-            if self.artifact_in_use(&previous)? {
-                return Err(Error::Conflict("legacy allocation remains in use".into()));
+            present
+        } else {
+            false
+        };
+        if !path.try_exists()? {
+            return Ok(());
+        }
+        let mut admitted = self.discover(root, path, true)?;
+        self.verify(&admitted)?;
+        let captured = admitted.clone();
+        let _coordinator = self.mutation_guard()?;
+        self.check_payload_capture(&captured)?;
+        match (&previous, self.for_job(job)?) {
+            (Some(expected), Some(current)) if current.id == expected.id => {
+                self.check_payload_capture(expected)?;
+                if self.artifact_in_use(expected)? {
+                    return Err(Error::Conflict("legacy allocation remains in use".into()));
+                }
             }
+            (None, None) => (),
+            _ => {
+                return Err(Error::Conflict(
+                    "legacy job association changed during enrollment".into(),
+                ));
+            }
+        }
+        if admitted.job.is_some_and(|owner| owner != job) {
+            return Err(Error::Conflict("legacy path belongs to another job".into()));
+        }
+        // This generic hold belongs to automatic unowned discovery. Queue
+        // admission permits operational verification/writes, while Keep and
+        // unowned custody continue to prohibit automatic payload cleanup.
+        if !admitted.owned
+            && admitted.keep
+            && matches!(admitted.state.as_str(), "active_unverified" | "unknown")
+            && admitted.hold.as_deref() == Some("review")
+        {
+            admitted.hold = None;
+        }
+        admitted.job = Some(job);
+        admitted.state = "active".into();
+        admitted.revision += 1;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        if let Some(mut previous) = previous {
             previous.job = None;
-            previous.state = if previous.path == path {
-                "source_gone"
-            } else {
+            previous.state = if previous_present {
                 "retained"
+            } else {
+                "source_gone"
             }
             .into();
             previous.keep = true;
-            previous.hold = Some("review: previous external job generation".into());
+            previous
+                .hold
+                .get_or_insert_with(|| "review: previous external job generation".into());
             previous.revision += 1;
-            save_artifact(&self.db.lock().unwrap(), &previous)?;
+            save_artifact(&tx, &previous)?;
         }
-        let mut a = self.discover(root, path, true)?;
-        let _guard = self.mutation_guard()?;
-        a.job = Some(job);
-        a.state = "active".into();
-        save_artifact(&self.db.lock().unwrap(), &a)
+        save_artifact(&tx, &admitted)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Compatibility entry point for callers without a payload scheduler.

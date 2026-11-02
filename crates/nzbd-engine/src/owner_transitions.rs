@@ -1136,6 +1136,64 @@ mod tests {
         engine.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn post_admission_waits_for_imported_payload_recovery_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = config(&temp);
+        let path = cfg.dest_dir.join("fixture");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("payload.bin"), b"abc").unwrap();
+        let engine = crate::Engine::spawn(cfg).await.unwrap();
+        let mut job = payload_record(JobStatus::Completed, b"abc", false);
+        job.files[0].finalized = true;
+        engine.import_job(job, false, false).await.unwrap();
+        let cancellation = CancellationToken::new();
+        let admission = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.wait_post_admission(JobId(1), &cancellation),
+        )
+        .await
+        .expect("owner verification changes should wake PP admission")
+        .unwrap()
+        .unwrap();
+        let scoped = engine.for_post_admission(&admission);
+        let mut stamp = scoped.export_job(JobId(1)).await.unwrap().unwrap();
+        stamp
+            .params
+            .push((nzbd_types::PP_DONE_PARAM.into(), "SUCCESS/ALL".into()));
+        assert!(scoped.import_worker_job_if_present(stamp).await.unwrap());
+        engine.end_post_admission(admission).await.unwrap();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_post_admission_wait_does_not_require_another_queue_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = crate::Engine::spawn(config(&temp)).await.unwrap();
+        engine
+            .import_job(record("queued", JobStatus::Queued), false, false)
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let waiter_engine = engine.clone();
+        let waiter_cancel = cancellation.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_engine
+                .wait_post_admission(JobId(1), &waiter_cancel)
+                .await
+        });
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        assert!(tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .is_none());
+        assert!(engine.export_job(JobId(1)).await.unwrap().is_some());
+        engine.shutdown().await;
+    }
+
     #[test]
     fn completed_download_without_post_receipt_uses_the_same_recovery_classification() {
         let mut job = record("completed", JobStatus::Completed);

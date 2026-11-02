@@ -478,6 +478,7 @@ impl Engine {
             budget_tracker,
             url_fetches: Arc::new(Mutex::new(HashSet::new())),
             post_scope: None,
+            queue_changes: epoch_rx,
             owner_heartbeat,
             shutdown_complete,
         };
@@ -593,6 +594,7 @@ pub struct EngineHandle {
     budget_tracker: Arc<pool::BudgetTracker>,
     url_fetches: Arc<Mutex<HashSet<JobId>>>,
     post_scope: Option<PostAdmission>,
+    queue_changes: watch::Receiver<u64>,
     owner_heartbeat: Arc<std::sync::atomic::AtomicU64>,
     shutdown_complete: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -638,6 +640,36 @@ impl EngineHandle {
             .await?;
         owner_reply(rx).await.map_err(|_| EngineError::Closed)
     }
+    /// Wait for the current lifetime's verified PP custody. Queue changes
+    /// wake retries; cancellation never drops an issued admission request.
+    pub async fn wait_post_admission(
+        &self,
+        job: JobId,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<PostAdmission>, EngineError> {
+        let mut changes = self.queue_changes.clone();
+        loop {
+            if cancellation.is_cancelled() || self.cancel.is_cancelled() {
+                return Ok(None);
+            }
+            changes.borrow_and_update();
+            // Receive every issued result even if cancellation wins during
+            // persistence. An issued scope must be explicitly released.
+            if let Some(admission) = self.begin_post_admission(job).await? {
+                if cancellation.is_cancelled() || self.cancel.is_cancelled() {
+                    self.end_post_admission(admission).await?;
+                    return Ok(None);
+                }
+                return Ok(Some(admission));
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => return Ok(None),
+                _ = self.cancel.cancelled() => return Ok(None),
+                changed = changes.changed() => { changed.map_err(|_| EngineError::Closed)?; }
+            }
+        }
+    }
+
     pub fn for_post_admission(&self, admission: &PostAdmission) -> Self {
         let mut scoped = self.clone();
         scoped.post_scope = Some(admission.clone());
