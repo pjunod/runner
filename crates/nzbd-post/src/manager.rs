@@ -992,13 +992,19 @@ async fn handle_failed_job_admitted(
     } else {
         None
     };
-    let recoverable_failed_source =
-        failed_source_assessment
-            .as_ref()
-            .and_then(|(path, assessment)| match assessment.disposition.as_str() {
-                "recoverable" | "unknown" => Some((path.clone(), assessment.reason.clone())),
-                _ => None,
-            });
+    let recoverable_failed_source = failed_source_assessment
+        .as_ref()
+        // Retain only on a concrete recovery reason (docs/CURATOR_DELIVERY.md:
+        // "retained for recovery only when Runner has a concrete retry or
+        // repair reason"). A health or fetch failure with nothing salvaged
+        // and no named repair path has nothing worth keeping; `unknown`
+        // used to retain here, which kept failed attempts under Runner
+        // custody and froze Curator's replacement (2026-11-02). Keep on
+        // failure still retains: it is applied to failure_cfg below.
+        .and_then(|(path, assessment)| match assessment.disposition.as_str() {
+            "recoverable" => Some((path.clone(), assessment.reason.clone())),
+            _ => None,
+        });
     let mut failure_cfg = cfg.clone();
     if keep_on_failure {
         failure_cfg.failure_action = FailureAction::None;
