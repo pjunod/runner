@@ -14,6 +14,7 @@ mod relocation;
 pub use delivery::{Delivery, DeliveryFile, DeliveryFileOutcome, DeliveryRunnerStages};
 pub use relocation::{RelocationResult, SelectedPublication};
 mod tasks;
+mod torrent;
 mod transforms;
 mod url_resolutions;
 mod worker_controls;
