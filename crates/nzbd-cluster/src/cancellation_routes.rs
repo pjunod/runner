@@ -201,7 +201,7 @@ async fn complete_exact(
         .ok_or("exact committed removal unavailable")?;
     // Stop every recorded writer of this incarnation, including an earlier
     // delegated download owner. A local empty queue cannot acknowledge it.
-    if removal.mode == crate::cancellation::RemovalMode::DeleteFiles {
+    if removal.mode != crate::cancellation::RemovalMode::CompletedRetirement {
         for grant in control
             .historical_grants_for_removal(request.job_id, &request.job_incarnation)
             .await?
