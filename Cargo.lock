@@ -2849,6 +2849,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "httpdate",
  "icu_casemap",
  "icu_normalizer",
  "librqbit",

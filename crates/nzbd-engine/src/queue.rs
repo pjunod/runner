@@ -607,7 +607,7 @@ impl QueueState {
         let TorrentAdmissionCommit {
             name,
             category,
-            priority,
+            priority: _,
             paused: _,
             params: _,
             mut record,
@@ -616,9 +616,13 @@ impl QueueState {
             .jobs
             .iter()
             .find(|job| {
-                job.torrent.as_ref().is_some_and(|torrent| {
-                    torrent.info_hash_v1 == record.info_hash_v1 && torrent.removal_intent.is_none()
-                }) && !matches!(job.status, JobStatus::Deleted | JobStatus::Failed)
+                !job.held()
+                    && crate::torrent_acquisitions::seed_retirement(job).is_none()
+                    && job.torrent.as_ref().is_some_and(|torrent| {
+                        torrent.info_hash_v1 == record.info_hash_v1
+                            && torrent.removal_intent.is_none()
+                    })
+                    && !matches!(job.status, JobStatus::Deleted | JobStatus::Failed)
             })
             .map(|job| job.id);
         let seed_created = existing.is_none();
@@ -632,6 +636,10 @@ impl QueueState {
                 record.payload_root = record
                     .payload_root
                     .join(format!(".runner-seed-{}", donor_id.0));
+                let gated = original.status == JobStatus::Paused || original.held();
+                if gated {
+                    record.control_intent = nzbd_types::TorrentControlIntent::Paused;
+                }
                 self.jobs.push(Job {
                     id: donor_id,
                     kind: JobKind::Torrent,
@@ -642,15 +650,29 @@ impl QueueState {
                     queued_at_unix: unix_now(),
                     original_name: String::new(),
                     category: category.clone(),
-                    priority,
+                    priority: original.priority,
                     dupe: DupeInfo::default(),
-                    params: vec![(OWNED_SEED_PARAM.into(), "1".into())],
+                    params: if gated {
+                        vec![
+                            (OWNED_SEED_PARAM.into(), "1".into()),
+                            (
+                                crate::torrent_acquisitions::SEED_GATE_PARAM.into(),
+                                id.0.to_string(),
+                            ),
+                        ]
+                    } else {
+                        vec![(OWNED_SEED_PARAM.into(), "1".into())]
+                    },
                     files: Vec::new(),
                     totals: nzbd_types::JobTotals {
                         size: record.total_bytes,
                         ..Default::default()
                     },
-                    status: JobStatus::Queued,
+                    status: if gated {
+                        JobStatus::Paused
+                    } else {
+                        JobStatus::Queued
+                    },
                     torrent: Some(record.clone()),
                     stages: Vec::new(),
                 });

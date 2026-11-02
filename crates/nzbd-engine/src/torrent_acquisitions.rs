@@ -44,6 +44,8 @@ pub fn metadata_attempt(job: &Job) -> u32 {
 }
 pub const DONOR_PARAM: &str = "*Torrent:Donor";
 pub const INFO_HASH_PARAM: &str = "*Torrent:InfoHash";
+pub const SEED_GATE_PARAM: &str = "*Torrent:AcquisitionGate";
+pub const COPY_COMPLETE_PARAM: &str = "*Torrent:CopyComplete";
 pub const OWNED_SEED_PARAM: &str = "*Torrent:OwnedSeed";
 
 pub fn donor(job: &Job) -> Option<JobId> {
@@ -109,6 +111,7 @@ pub fn submission_fingerprint(
         opts.seed_time_limit_secs,
         opts.stop_seeding_on_complete,
         &opts.dupe,
+        &opts.torrent_tags,
         params,
     ))
     .map_err(|_| {
@@ -155,6 +158,35 @@ pub(crate) fn blob_origin(job: &Job, metadata: bool) -> Result<Job, crate::Engin
 }
 
 impl crate::EngineHandle {
+    pub async fn claim_native_failure_cleanup(
+        &self,
+        job: JobId,
+    ) -> Result<Option<Job>, crate::EngineError> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.send(crate::owner::QueueCommand::ClaimNativeFailureCleanup { job, reply })
+            .await?;
+        result.await.map_err(|_| crate::EngineError::Closed)
+    }
+
+    pub async fn fail_native_torrent(
+        &self,
+        job: JobId,
+        donor: Option<JobId>,
+        stage: String,
+        message: String,
+        cleanup_complete: bool,
+    ) -> Result<bool, crate::EngineError> {
+        self.roundtrip_bool(|reply| crate::owner::QueueCommand::FailNativeTorrent {
+            job,
+            donor,
+            stage,
+            message,
+            cleanup_complete,
+            reply,
+        })
+        .await
+    }
+
     pub fn native_torrent_delivery_supported(&self) -> bool {
         !self.url_outbox_external && self.snapshot().queue_authority
     }
@@ -175,6 +207,11 @@ impl crate::EngineHandle {
         opts: crate::AddOpts,
         defaults: ManagedTorrentDefaults,
     ) -> Result<ManagedTorrentReservation, crate::EngineError> {
+        if !self.native_torrent_delivery_supported() {
+            return Err(crate::EngineError::RequestConflict(
+                "native torrent Deliveries require standalone Runner".into(),
+            ));
+        }
         crate::validate_external_params(&opts.params)?;
         managed_token(&opts.params)?.ok_or_else(|| {
             crate::EngineError::RequestConflict(
@@ -250,5 +287,63 @@ impl crate::EngineHandle {
         .await
         .map_err(|_| crate::EngineError::Closed)?
         .map_err(|error| crate::EngineError::Lifecycle(error.to_string()))
+    }
+}
+
+pub const SEED_RETIREMENT_PARAM: &str = "*Torrent:SeedRetirement";
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedSeedRetirement {
+    pub identity: String,
+    pub source: nzbd_state::artifacts::SourceGeneration,
+    pub payload_root: std::path::PathBuf,
+    pub phase: String,
+}
+pub fn seed_retirement(job: &Job) -> Option<ManagedSeedRetirement> {
+    let raw = job
+        .params
+        .iter()
+        .find(|(key, _)| key == SEED_RETIREMENT_PARAM)?
+        .1
+        .as_str();
+    if raw.len() > 16 * 1024 {
+        return None;
+    }
+    serde_json::from_str(raw).ok()
+}
+pub fn is_managed_seed(job: &Job) -> bool {
+    job.torrent.is_some()
+        && job
+            .params
+            .iter()
+            .any(|(key, value)| key == OWNED_SEED_PARAM && value == "1")
+}
+pub fn preparation_hold(job: &Job, control: &nzbd_types::JobControl) -> bool {
+    (is_acquisition(job) && matches!(control.stage.as_str(), "torrent_copy" | "torrent_metadata"))
+        || (is_managed_seed(job) && control.stage == "torrent_attach")
+}
+impl crate::EngineHandle {
+    pub async fn begin_managed_seed_retirement(
+        &self,
+        job: JobId,
+    ) -> Result<bool, crate::EngineError> {
+        self.roundtrip_bool(
+            |reply| crate::owner::QueueCommand::BeginManagedSeedRetirement { job, reply },
+        )
+        .await
+    }
+    pub async fn complete_managed_seed_retirement(
+        &self,
+        job: JobId,
+        identity: String,
+    ) -> Result<bool, crate::EngineError> {
+        self.roundtrip_bool(
+            |reply| crate::owner::QueueCommand::CompleteManagedSeedRetirement {
+                job,
+                identity,
+                reply,
+            },
+        )
+        .await
     }
 }

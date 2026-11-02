@@ -848,20 +848,6 @@ impl EngineHandle {
         self.roundtrip_bool(|reply| QueueCommand::StartTorrentAcquisition { job, reply })
             .await
     }
-    pub async fn retry_torrent_acquisition(
-        &self,
-        job: JobId,
-        revision: String,
-        force: bool,
-    ) -> Result<bool, EngineError> {
-        self.roundtrip_bool(|reply| QueueCommand::RetryTorrentAcquisition {
-            job,
-            revision,
-            force,
-            reply,
-        })
-        .await
-    }
     pub async fn complete_torrent_acquisition(
         &self,
         job: JobId,
@@ -1502,9 +1488,7 @@ impl EngineHandle {
         if !self.snapshot().queue_authority && !guard.matches(&self.artifacts(), &record, false) {
             return Ok(Err("a live execution grant is required on this node".into()));
         }
-        if torrent_acquisitions::is_acquisition(&record)
-            && matches!(control.stage.as_str(), "torrent_copy" | "torrent_metadata")
-        {
+        if torrent_acquisitions::preparation_hold(&record, &control) {
             let (reply, result) = oneshot::channel();
             self.send(QueueCommand::RetryHold {
                 job,
@@ -2283,11 +2267,22 @@ impl EngineHandle {
         stage: &str,
         message: &str,
     ) -> Result<bool, EngineError> {
+        self.hold_job_until(job, cause, stage, message, None).await
+    }
+    pub async fn hold_job_until(
+        &self,
+        job: JobId,
+        cause: nzbd_types::HoldCause,
+        stage: &str,
+        message: &str,
+        not_before: Option<i64>,
+    ) -> Result<bool, EngineError> {
         self.roundtrip_bool(|reply| QueueCommand::HoldJob {
             job,
             cause,
             stage: stage.into(),
             message: message.into(),
+            not_before,
             reply,
         })
         .await

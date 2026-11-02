@@ -234,6 +234,29 @@ async fn fetch_redirect_chain(
         }
 
         if !response.status().is_success() {
+            if matches!(response.status().as_u16(), 429 | 503) {
+                let now = std::time::SystemTime::now();
+                let not_before_unix = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| {
+                        value
+                            .parse::<u64>()
+                            .ok()
+                            .and_then(|seconds| {
+                                now.checked_add(std::time::Duration::from_secs(seconds))
+                            })
+                            .or_else(|| httpdate::parse_http_date(value).ok())
+                    })
+                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|at| i64::try_from(at.as_secs()).ok());
+                return Err(TorrentError::TorrentSourceRetry {
+                    status: response.status().as_u16(),
+                    origin,
+                    not_before_unix,
+                });
+            }
             return Err(TorrentError::TorrentSourceHttpStatus {
                 status: response.status().as_u16(),
                 origin,

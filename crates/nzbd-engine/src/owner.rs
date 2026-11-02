@@ -111,6 +111,27 @@ pub(crate) enum QueueCommand {
         commit: Box<crate::queue::TorrentAdmissionCommit>,
         reply: oneshot::Sender<Result<Option<Result<JobId, JobId>>, crate::EngineError>>,
     },
+    BeginManagedSeedRetirement {
+        job: JobId,
+        reply: oneshot::Sender<bool>,
+    },
+    CompleteManagedSeedRetirement {
+        job: JobId,
+        identity: String,
+        reply: oneshot::Sender<bool>,
+    },
+    ClaimNativeFailureCleanup {
+        job: JobId,
+        reply: oneshot::Sender<Option<Job>>,
+    },
+    FailNativeTorrent {
+        job: JobId,
+        donor: Option<JobId>,
+        stage: String,
+        message: String,
+        cleanup_complete: bool,
+        reply: oneshot::Sender<bool>,
+    },
     NativeTorrentPending {
         job: JobId,
         reply: oneshot::Sender<Option<nzbd_state::PendingAdmission>>,
@@ -139,12 +160,6 @@ pub(crate) enum QueueCommand {
     },
     StartTorrentAcquisition {
         job: JobId,
-        reply: oneshot::Sender<bool>,
-    },
-    RetryTorrentAcquisition {
-        job: JobId,
-        revision: String,
-        force: bool,
         reply: oneshot::Sender<bool>,
     },
     CompleteTorrentAcquisition {
@@ -485,6 +500,7 @@ pub(crate) enum QueueCommand {
         cause: nzbd_types::HoldCause,
         stage: String,
         message: String,
+        not_before: Option<i64>,
         reply: oneshot::Sender<bool>,
     },
     SetJobStatus {
@@ -1544,6 +1560,105 @@ impl Owner {
                 }
                 let _ = reply.send(Ok(result));
             }
+            QueueCommand::BeginManagedSeedRetirement { job, reply } => {
+                let _ = reply.send(self.begin_managed_seed_retirement(job));
+            }
+            QueueCommand::CompleteManagedSeedRetirement {
+                job,
+                identity,
+                reply,
+            } => {
+                let before = self.state.job(job).cloned();
+                let retirement = before
+                    .as_ref()
+                    .and_then(crate::torrent_acquisitions::seed_retirement);
+                let eligible = !self.persistence_fenced
+                    && self.persist
+                    && retirement.as_ref().is_some_and(|retirement| {
+                        retirement.identity == identity
+                            && retirement.phase == "detached"
+                            && self
+                                .artifacts
+                                .get(&retirement.source.artifact)
+                                .is_ok_and(|source| {
+                                    source.generation == retirement.source.generation
+                                        && source.state == "deleted"
+                                })
+                    });
+                if eligible {
+                    let row = self.state.job_mut(job).unwrap();
+                    let mut marker = retirement.unwrap();
+                    marker.phase = "deleted".into();
+                    set_owner_param(
+                        &mut row.params,
+                        crate::torrent_acquisitions::SEED_RETIREMENT_PARAM,
+                        Some(serde_json::to_string(&marker).unwrap()),
+                    );
+                    row.torrent.as_mut().unwrap().removal_outcome =
+                        Some(TorrentPayloadDisposition::Deleted);
+                }
+                let committed = eligible && self.save_snapshot();
+                if !committed {
+                    if let Some(before) = before {
+                        if let Some(row) = self.state.job_mut(job) {
+                            *row = before;
+                        }
+                    }
+                } else {
+                    self.publish_now();
+                    self.bump_epoch();
+                }
+                let _ = reply.send(committed);
+            }
+            QueueCommand::ClaimNativeFailureCleanup { job, reply } => {
+                let before =
+                    self.state
+                        .job(job)
+                        .filter(|row| {
+                            crate::torrent_acquisitions::is_acquisition(row)
+                                && row.status == JobStatus::Failed
+                                && row.params.iter().any(|(key, value)| {
+                                    key == "Failure:Stage" && value == "torrent_metadata"
+                                })
+                                && !row.params.iter().any(|(key, value)| {
+                                    key == "*Runner:KeepOnFailure" && value == "1"
+                                })
+                                && !row.params.iter().any(|(key, value)| {
+                                    key == "Delivery:SourceCleanup" && value == "deleted"
+                                })
+                        })
+                        .cloned();
+                let result = if !self.persistence_fenced && self.persist {
+                    before.and_then(|before| {
+                        set_owner_param(
+                            &mut self.state.job_mut(job).unwrap().params,
+                            "Delivery:SourceCleanup",
+                            Some("deleting".into()),
+                        );
+                        if self.save_snapshot() {
+                            Some(self.state.job(job).unwrap().clone())
+                        } else {
+                            *self.state.job_mut(job).unwrap() = before;
+                            None
+                        }
+                    })
+                } else {
+                    None
+                };
+                let _ = reply.send(result);
+            }
+            QueueCommand::FailNativeTorrent {
+                job,
+                donor,
+                stage,
+                message,
+                cleanup_complete,
+                reply,
+            } => {
+                let result =
+                    self.fail_native_torrent(job, donor, &stage, &message, cleanup_complete);
+                let _ = reply.send(result);
+            }
             QueueCommand::NativeTorrentPending { job, reply } => {
                 let _ = reply.send(
                     self.state
@@ -1698,57 +1813,6 @@ impl Owner {
                 }
                 let _ = reply.send(committed);
             }
-            QueueCommand::RetryTorrentAcquisition {
-                job,
-                revision,
-                force,
-                reply,
-            } => {
-                let before = self.state.job(job).cloned();
-                let mut changed = false;
-                if !self.persistence_fenced && self.persist {
-                    if let Some(row) = self
-                        .state
-                        .job_mut(job)
-                        .filter(|row| crate::torrent_acquisitions::donor(row).is_some())
-                    {
-                        if let Some(mut control) = row.control().filter(|control| {
-                            control.revision == revision
-                                && control.stage == "torrent_copy"
-                                && control.lifecycle == "held"
-                                && matches!(control.cause.as_str(), "io" | "capacity" | "quota")
-                                && (force
-                                    || (!control.manual_pause
-                                        && control
-                                            .next_retry_at_unix
-                                            .is_some_and(|deadline| deadline <= unix_now())))
-                        }) {
-                            if let Some(next) = control
-                                .revision
-                                .parse::<u64>()
-                                .ok()
-                                .and_then(|revision| revision.checked_add(1))
-                            {
-                                control.revision = next.to_string();
-                                control.lifecycle = "running".into();
-                                control.manual_pause = false;
-                                control.next_retry_at_unix = None;
-                                row.set_control(&control);
-                                row.status = JobStatus::Queued;
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-                let committed = changed && self.save_snapshot();
-                if committed {
-                    self.publish_now();
-                    self.bump_epoch();
-                } else if let Some(before) = before {
-                    *self.state.job_mut(job).unwrap() = before;
-                }
-                let _ = reply.send(committed);
-            }
             QueueCommand::CompleteTorrentAcquisition {
                 job,
                 donor,
@@ -1790,10 +1854,24 @@ impl Owner {
                     let _ = reply.send(false);
                     return;
                 }
+                let count = source
+                    .files
+                    .iter()
+                    .filter(|entry| !entry.identity.directory)
+                    .count();
+                if u32::try_from(count)
+                    .ok()
+                    .and_then(|count| self.state.next_file_id.checked_add(count))
+                    .is_none()
+                {
+                    let _ = reply.send(false);
+                    return;
+                }
                 let previous_next_file = self.state.next_file_id;
                 let timing_checkpoint = self.timing_cache.checkpoint(job);
                 let mut file_params = Vec::new();
                 let mut files = Vec::new();
+                let mut file_sizes = Vec::new();
                 for entry in source
                     .files
                     .iter()
@@ -1801,6 +1879,7 @@ impl Owner {
                 {
                     self.state.next_file_id += 1;
                     let id = FileId(self.state.next_file_id);
+                    file_sizes.push((id, entry.identity.bytes));
                     file_params.push((
                         format!("*File:size:{}", id.0),
                         entry.identity.bytes.to_string(),
@@ -1821,6 +1900,11 @@ impl Owner {
                 }
                 let row = self.state.job_mut(job).unwrap();
                 row.params.extend(file_params);
+                set_owner_param(
+                    &mut row.params,
+                    crate::torrent_acquisitions::COPY_COMPLETE_PARAM,
+                    Some("1".into()),
+                );
                 row.files = files;
                 row.totals.success_size = source.summary().1;
                 row.status = JobStatus::Completed;
@@ -1832,15 +1916,7 @@ impl Owner {
                     let _ = reply.send(false);
                     return;
                 }
-                for file in &self.state.job(job).unwrap().files {
-                    if let Some(entry) = source
-                        .files
-                        .iter()
-                        .find(|entry| entry.path == file.filename)
-                    {
-                        self.file_sizes.insert(file.id, entry.identity.bytes);
-                    }
-                }
+                self.file_sizes.extend(file_sizes);
                 self.publish_now();
                 self.bump_epoch();
                 let row = self.state.job(job).unwrap();
@@ -2380,6 +2456,10 @@ impl Owner {
                 let _ = reply.send(ok);
             }
             QueueCommand::Pause { job, reply } => {
+                if let Some(result) = self.set_native_acquisition_paused(job, true) {
+                    let _ = reply.send(result);
+                    return;
+                }
                 if self
                     .state
                     .job(job)
@@ -2475,6 +2555,10 @@ impl Owner {
                 let _ = reply.send(ok);
             }
             QueueCommand::Resume { job, reply } => {
+                if let Some(result) = self.set_native_acquisition_paused(job, false) {
+                    let _ = reply.send(result);
+                    return;
+                }
                 if self
                     .state
                     .job(job)
@@ -2623,10 +2707,10 @@ impl Owner {
                                 .params
                                 .iter()
                                 .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
-                            && self
-                                .artifacts
-                                .for_job(row.id.0)
-                                .is_ok_and(|source| source.is_none())
+                            && !row.params.iter().any(|(key, value)| {
+                                key == crate::torrent_acquisitions::COPY_COMPLETE_PARAM
+                                    && value == "1"
+                            })
                     })
                 {
                     let _ = reply.send(false);
@@ -2711,6 +2795,18 @@ impl Owner {
                     let _ = reply.send(ok);
                     return;
                 }
+                if keep
+                    && before.as_ref().is_some_and(|row| {
+                        crate::torrent_acquisitions::is_acquisition(row)
+                            && row.params.iter().any(|(key, value)| {
+                                key == "Delivery:SourceCleanup"
+                                    && matches!(value.as_str(), "deleting" | "deleted")
+                            })
+                    })
+                {
+                    let _ = reply.send(false);
+                    return;
+                }
                 let prior_keep = before.as_ref().is_some_and(|record| {
                     record
                         .params
@@ -2776,7 +2872,7 @@ impl Owner {
                                 matches!(
                                     record.status,
                                     JobStatus::Fetching | JobStatus::Queued | JobStatus::Paused
-                                )
+                                ) || crate::torrent_acquisitions::is_acquisition(record)
                             }) =>
                         {
                             true
@@ -3616,9 +3712,10 @@ impl Owner {
                 cause,
                 stage,
                 message,
+                not_before,
                 reply,
             } => {
-                let committed = self.hold_job(job, cause, &stage, &message);
+                let committed = self.hold_job_until(job, cause, &stage, &message, not_before);
                 let _ = reply.send(committed);
             }
             QueueCommand::SetJobStatus { job, status, reply } => {
@@ -4900,6 +4997,16 @@ impl Owner {
         stage: &str,
         message: &str,
     ) -> bool {
+        self.hold_job_until(job, cause, stage, message, None)
+    }
+    fn hold_job_until(
+        &mut self,
+        job: JobId,
+        cause: nzbd_types::HoldCause,
+        stage: &str,
+        message: &str,
+        not_before: Option<i64>,
+    ) -> bool {
         if self.persistence_fenced || self.automatic_control_pending(job) {
             return false;
         }
@@ -4980,8 +5087,10 @@ impl Owner {
             } else {
                 attempts_made
             },
-            next_retry_at_unix: timed
-                .then(|| now.saturating_add(hold_retry_delay_with_jitter(job, attempts_made, now))),
+            next_retry_at_unix: timed.then(|| {
+                now.saturating_add(hold_retry_delay_with_jitter(job, attempts_made, now))
+                    .max(not_before.unwrap_or(0))
+            }),
             blocked_since_unix: episode.and_then(|c| c.blocked_since_unix).or(Some(now)),
             released_at_unix: None,
         };
@@ -5079,8 +5188,7 @@ impl Owner {
         if control.revision != revision {
             return Err("the hold changed since it was read; reload and retry".into());
         }
-        let native_preparation = crate::torrent_acquisitions::is_acquisition(&before)
-            && matches!(control.stage.as_str(), "torrent_copy" | "torrent_metadata");
+        let native_preparation = crate::torrent_acquisitions::preparation_hold(&before, &control);
         if control.hold_cause().is_storage() && !control.post_side() && !native_preparation {
             return Err("storage holds are released by the capacity check".into());
         }
@@ -5091,7 +5199,7 @@ impl Owner {
         {
             return Err("the hold is not due for automatic recovery".into());
         }
-        if before.torrent.is_some() {
+        if before.torrent.is_some() && !native_preparation {
             return Err("torrent holds are released from the torrent's own actions".into());
         }
         if before
@@ -5984,6 +6092,310 @@ impl Owner {
         freed
     }
 
+    fn begin_managed_seed_retirement(&mut self, id: JobId) -> bool {
+        use crate::torrent_acquisitions::*;
+        if self.persistence_fenced || !self.persist {
+            return false;
+        }
+        let Some(before) = self
+            .state
+            .job(id)
+            .filter(|job| is_managed_seed(job))
+            .cloned()
+        else {
+            return false;
+        };
+        if seed_retirement(&before).is_some() {
+            return true;
+        }
+        let torrent = before.torrent.as_ref().unwrap();
+        if before.held()
+            || !(torrent.phase == TorrentPhase::Failed
+                || (torrent.phase == TorrentPhase::PausedSeed
+                    && matches!(
+                        torrent.stop_reason,
+                        Some(
+                            nzbd_types::TorrentStopReason::DownloadComplete
+                                | nzbd_types::TorrentStopReason::RatioLimit
+                                | nzbd_types::TorrentStopReason::TimeLimit
+                        )
+                    )))
+        {
+            return false;
+        }
+        let Ok(Some(source)) = self.artifacts.for_job(id.0) else {
+            return false;
+        };
+        if !source.owned
+            || !source.automatic_cleanup_eligible
+            || source.path != torrent.payload_root
+            || source.terminal()
+        {
+            return false;
+        }
+        let identity = format!(
+            "{:x}",
+            Sha256::digest(
+                format!(
+                    "{}:{}:{}:{}",
+                    self.artifacts.installation, id.0, source.id, source.generation
+                )
+                .as_bytes()
+            )
+        );
+        let marker = ManagedSeedRetirement {
+            identity,
+            source: nzbd_state::artifacts::SourceGeneration {
+                artifact: source.id,
+                generation: source.generation,
+            },
+            payload_root: source.path,
+            phase: "requested".into(),
+        };
+        let row = self.state.job_mut(id).unwrap();
+        set_owner_param(
+            &mut row.params,
+            SEED_RETIREMENT_PARAM,
+            Some(serde_json::to_string(&marker).unwrap()),
+        );
+        row.torrent.as_mut().unwrap().removal_intent =
+            Some(TorrentRemovalIntent { delete_data: false });
+        if !self.persist_then_command(BackendCommand::Remove {
+            job: id,
+            delete_data: false,
+            content_path: torrent.content_path.clone(),
+            files: torrent.files.clone(),
+            allowed_roots: self.torrent_payload_roots.clone(),
+        }) {
+            *self.state.job_mut(id).unwrap() = before;
+            return false;
+        }
+        self.publish_now();
+        self.bump_epoch();
+        true
+    }
+
+    fn fail_native_torrent(
+        &mut self,
+        id: JobId,
+        donor: Option<JobId>,
+        stage: &str,
+        message: &str,
+        cleanup_complete: bool,
+    ) -> bool {
+        if self.persistence_fenced
+            || !self.persist
+            || !matches!(stage, "torrent_metadata" | "torrent_source")
+        {
+            return false;
+        }
+        let Some(before) = self
+            .state
+            .job(id)
+            .filter(|row| {
+                crate::torrent_acquisitions::is_acquisition(row)
+                    && !row.params.iter().any(|(key, value)| {
+                        key == crate::torrent_acquisitions::COPY_COMPLETE_PARAM && value == "1"
+                    })
+                    && !matches!(row.status, JobStatus::Deleted)
+            })
+            .cloned()
+        else {
+            return false;
+        };
+        let already_failed = before.status == JobStatus::Failed
+            && before
+                .params
+                .iter()
+                .any(|(key, value)| key == "Failure:Stage" && value == stage);
+        if !already_failed
+            && if stage == "torrent_metadata" {
+                donor.is_some()
+                    || !self
+                        .state
+                        .pending_admissions
+                        .iter()
+                        .any(|pending| pending.job_id == id)
+            } else {
+                donor.is_none() || crate::torrent_acquisitions::donor(&before) != donor
+            }
+        {
+            return false;
+        }
+        let previous_pending = self.state.pending_admissions.clone();
+        let previous_receipts = self.state.url_admission_receipts.clone();
+        let keep = before
+            .params
+            .iter()
+            .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
+        let row = self.state.job_mut(id).unwrap();
+        row.status = JobStatus::Failed;
+        row.params
+            .retain(|(key, _)| key != nzbd_types::CONTROL_PARAM);
+        set_owner_param(
+            &mut row.params,
+            nzbd_types::PP_DONE_PARAM,
+            Some("FAILURE/TORRENT_SOURCE".into()),
+        );
+        set_owner_param(&mut row.params, "Failure:Stage", Some(stage.into()));
+        set_owner_param(
+            &mut row.params,
+            "Failure:Reason",
+            Some(message.chars().take(2048).collect()),
+        );
+        set_owner_param(
+            &mut row.params,
+            "Failure:KeepOnFailure",
+            Some(keep.to_string()),
+        );
+        set_owner_param(&mut row.params, "*Torrent:SourceFailed", Some("1".into()));
+        if !already_failed {
+            set_owner_param(
+                &mut row.params,
+                "*Torrent:FailedAt",
+                Some(unix_now().to_string()),
+            );
+        }
+        if cleanup_complete {
+            set_owner_param(
+                &mut row.params,
+                "Delivery:SourceCleanup",
+                Some(if keep { "kept" } else { "deleted" }.into()),
+            );
+        }
+        self.state
+            .pending_admissions
+            .retain(|pending| pending.job_id != id);
+        if !self.save_snapshot() {
+            *self.state.job_mut(id).unwrap() = before;
+            self.state.pending_admissions = previous_pending;
+            self.state.url_admission_receipts = previous_receipts;
+            return false;
+        }
+        let row = self.state.job(id).unwrap().clone();
+        if !row
+            .params
+            .iter()
+            .any(|(key, value)| key == "*Torrent:FailureRecorded" && value == "1")
+        {
+            let at = row
+                .params
+                .iter()
+                .find(|(key, _)| key == "*Torrent:FailedAt")
+                .and_then(|(_, value)| value.parse().ok())
+                .unwrap_or(unix_now());
+            let entry = nzbd_state::HistoryEntry {
+                job: id,
+                name: row.name.clone(),
+                category: row.category.clone(),
+                final_dir: None,
+                status: "FAILURE/TORRENT_SOURCE".into(),
+                size: row.totals.size,
+                health: 0,
+                params: row
+                    .params
+                    .iter()
+                    .filter(|(key, _)| !key.starts_with('*'))
+                    .cloned()
+                    .collect(),
+                dupe_key: row.dupe.key.clone(),
+                dupe_score: row.dupe.score,
+                completed_at_unix: at,
+                hidden: false,
+                first_seen_at_unix: None,
+                last_seen_at_unix: None,
+                seen_count: 0,
+                removed_at_unix: None,
+                picked_up_by: None,
+                record: Some(nzbd_state::JobRecord::from_job(&row)),
+                stages: row.stages.clone(),
+                seq: 0,
+            };
+            if self
+                .history
+                .as_ref()
+                .is_some_and(|history| history.record_seq_durable(&entry).is_err())
+            {
+                self.publish_now();
+                return false;
+            }
+            set_owner_param(
+                &mut self.state.job_mut(id).unwrap().params,
+                "*Torrent:FailureRecorded",
+                Some("1".into()),
+            );
+            if !self.save_snapshot() {
+                self.publish_now();
+                return false;
+            }
+        }
+        self.bump_epoch();
+        self.publish_now();
+        true
+    }
+
+    fn set_native_acquisition_paused(&mut self, id: JobId, paused: bool) -> Option<bool> {
+        let child = self
+            .state
+            .job(id)
+            .filter(|row| {
+                crate::torrent_acquisitions::is_acquisition(row)
+                    && !row.held()
+                    && matches!(
+                        row.status,
+                        JobStatus::Fetching
+                            | JobStatus::Queued
+                            | JobStatus::Downloading
+                            | JobStatus::Paused
+                    )
+            })?
+            .clone();
+        if self.persistence_fenced || !self.persist {
+            return Some(false);
+        }
+        let donor_before = crate::torrent_acquisitions::donor(&child)
+            .and_then(|donor| self.state.job(donor))
+            .filter(|donor| {
+                donor.params.iter().any(|(key, value)| {
+                    key == crate::torrent_acquisitions::SEED_GATE_PARAM
+                        && value == &id.0.to_string()
+                })
+            })
+            .cloned();
+        let pending = self
+            .state
+            .pending_admissions
+            .iter()
+            .any(|pending| pending.job_id == id);
+        self.state.job_mut(id).unwrap().status = if paused {
+            JobStatus::Paused
+        } else if pending {
+            JobStatus::Fetching
+        } else {
+            JobStatus::Queued
+        };
+        if !paused {
+            if let Some(before) = &donor_before {
+                let donor = self.state.job_mut(before.id).unwrap();
+                donor
+                    .params
+                    .retain(|(key, _)| key != crate::torrent_acquisitions::SEED_GATE_PARAM);
+                donor.status = JobStatus::Queued;
+                donor.torrent.as_mut().unwrap().control_intent = TorrentControlIntent::Running;
+            }
+        }
+        if !self.save_snapshot() {
+            *self.state.job_mut(id).unwrap() = child;
+            if let Some(before) = donor_before {
+                *self.state.job_mut(before.id).unwrap() = before;
+            }
+            return Some(false);
+        }
+        self.bump_epoch();
+        self.publish_now();
+        Some(true)
+    }
+
     fn delete_job(&mut self, job_id: JobId, delete_files: bool) -> bool {
         if delete_files {
             return false;
@@ -6660,6 +7072,10 @@ impl Owner {
                         | RemovalOutcome::RefusedInventoryMismatch => None,
                     };
                     if let Some(disposition) = disposition {
+                        let before = self.state.job(*job).cloned();
+                        let managed_retiring = before.as_ref().is_some_and(|row| {
+                            crate::torrent_acquisitions::seed_retirement(row).is_some()
+                        });
                         if let Some(torrent) = self
                             .state
                             .job_mut(*job)
@@ -6667,7 +7083,25 @@ impl Owner {
                         {
                             torrent.removal_outcome = Some(disposition);
                             torrent.removal_confirmed_at_unix = Some(unix_now());
+                            if let Some(row) = self.state.job_mut(*job) {
+                                if let Some(mut marker) =
+                                    crate::torrent_acquisitions::seed_retirement(row)
+                                        .filter(|marker| marker.phase == "requested")
+                                {
+                                    marker.phase = "detached".into();
+                                    set_owner_param(
+                                        &mut row.params,
+                                        crate::torrent_acquisitions::SEED_RETIREMENT_PARAM,
+                                        Some(serde_json::to_string(&marker).unwrap()),
+                                    );
+                                }
+                            }
                             self.dirty = true;
+                        }
+                        if managed_retiring && !self.save_snapshot() {
+                            if let Some(before) = before {
+                                *self.state.job_mut(*job).unwrap() = before;
+                            }
                         }
                         continue;
                     }
@@ -6724,6 +7158,9 @@ impl Owner {
                 job.torrent
                     .as_ref()
                     .is_some_and(|torrent| torrent.removal_outcome.is_some())
+                    && (!crate::torrent_acquisitions::is_managed_seed(job)
+                        || crate::torrent_acquisitions::seed_retirement(job)
+                            .is_some_and(|marker| marker.phase == "deleted"))
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -6769,7 +7206,12 @@ impl Owner {
                 },
                 size: torrent.selected_bytes,
                 health: 1000,
-                params: job.params.clone(),
+                params: job
+                    .params
+                    .iter()
+                    .filter(|(key, _)| !key.starts_with("*Torrent:"))
+                    .cloned()
+                    .collect(),
                 dupe_key: job.dupe.key.clone(),
                 dupe_score: job.dupe.score,
                 completed_at_unix,

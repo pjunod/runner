@@ -166,6 +166,12 @@ pub enum TorrentError {
     TorrentSourceRequestFailed { origin: String },
     #[error("torrent source request timed out for {origin}")]
     TorrentSourceTimeout { origin: String },
+    #[error("torrent source returned temporary HTTP {status} from {origin}")]
+    TorrentSourceRetry {
+        status: u16,
+        origin: String,
+        not_before_unix: Option<i64>,
+    },
     #[error("torrent source returned HTTP {status} from {origin}")]
     TorrentSourceHttpStatus { status: u16, origin: String },
     #[error("torrent source exceeded the redirect limit ({limit})")]
@@ -1168,6 +1174,43 @@ impl TorrentRegistry {
             .insert(identity.id, identity.info_hash_v1.clone());
         self.by_hash.insert(identity.info_hash_v1.clone(), handle);
         Ok(identity)
+    }
+
+    /// Recover a lost add response only for the exact durable payload root.
+    /// Hash equality alone never binds another seed's backend handle.
+    pub fn recover_committed(
+        &mut self,
+        hash: &str,
+        expected_root: &Path,
+    ) -> Result<Option<EngineIdentity>, TorrentError> {
+        let id = TorrentIdOrHash::try_from(hash).map_err(engine_error)?;
+        let Some(handle) = self.session.inner.get(id) else {
+            return Ok(None);
+        };
+        let details = librqbit::Api::new(self.session.inner.clone(), None)
+            .api_torrent_details(id)
+            .map_err(engine_error)?;
+        if Path::new(&details.output_folder) != expected_root {
+            return Err(TorrentError::DuplicateEngineIdentity);
+        }
+        let identity = EngineIdentity {
+            id: handle.id(),
+            info_hash_v1: handle.info_hash().as_string(),
+        };
+        if self
+            .id_to_hash
+            .get(&identity.id)
+            .is_some_and(|known| known != hash)
+        {
+            return Err(TorrentError::DuplicateEngineIdentity);
+        }
+        self.id_to_hash
+            .insert(identity.id, identity.info_hash_v1.clone());
+        self.by_hash.insert(
+            identity.info_hash_v1.clone(),
+            TorrentHandle { inner: handle },
+        );
+        Ok(Some(identity))
     }
 
     /// Restore only caller-authorized descriptors, always paused. Duplicate

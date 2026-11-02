@@ -204,9 +204,14 @@ impl TorrentAdmissionService {
             {
                 return Err(AdmissionError::MissingPending);
             }
-            return self
+            let result = self
                 .finish(Some(reservation.id), bytes, TorrentSource::Metainfo, opts)
                 .await;
+            if let Err(error) = &result {
+                self.handle_native_metadata_failure(reservation.id, error)
+                    .await;
+            }
+            return result;
         }
         self.finish(None, bytes, TorrentSource::Metainfo, opts)
             .await
@@ -379,19 +384,130 @@ impl TorrentAdmissionService {
             return;
         }
         let service = self.clone();
-        tasks.insert(id, tokio::spawn(async move {
-            let result = service.resolve_managed_metadata(id).await;
-            if let Err(error) = result {
-                if !service.stopped.load(std::sync::atomic::Ordering::SeqCst) {
-                    let cause = match &error {
-                        AdmissionError::Io(error) => nzbd_engine::io_hold_cause(&error.to_string()),
-                        AdmissionError::Torrent(nzbd_torrent::TorrentError::MagnetMetadataTimeout) => nzbd_types::HoldCause::StorageUnavailable,
-                        _ => nzbd_types::HoldCause::Io,
-                    };
-                    let _ = service.engine.hold_job(id, cause, "torrent_metadata", "Torrent metadata could not be resolved; retry or remove this acquisition").await;
+        tasks.insert(
+            id,
+            tokio::spawn(async move {
+                let result = service.resolve_managed_metadata(id).await;
+                if let Err(error) = result {
+                    if !service.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                        service.handle_native_metadata_failure(id, &error).await;
+                    }
                 }
+            }),
+        );
+    }
+
+    async fn handle_native_metadata_failure(&self, id: JobId, error: &AdmissionError) {
+        use nzbd_torrent::TorrentError;
+        let (cause, not_before, permanent) = match error {
+            AdmissionError::MissingPending => return,
+            AdmissionError::Torrent(
+                TorrentError::TorrentSourceRequestFailed { .. }
+                | TorrentError::TorrentSourceTimeout { .. }
+                | TorrentError::MagnetMetadataTimeout,
+            ) => (nzbd_types::HoldCause::StorageUnavailable, None, false),
+            AdmissionError::Torrent(TorrentError::TorrentSourceRetry {
+                not_before_unix, ..
+            }) => (
+                nzbd_types::HoldCause::StorageUnavailable,
+                *not_before_unix,
+                false,
+            ),
+            AdmissionError::Torrent(TorrentError::TorrentSourceHttpStatus { status, .. })
+                if *status >= 500 =>
+            {
+                (nzbd_types::HoldCause::StorageUnavailable, None, false)
             }
-        }));
+            AdmissionError::Io(error) => {
+                (nzbd_engine::io_hold_cause(&error.to_string()), None, false)
+            }
+            AdmissionError::Engine(nzbd_engine::EngineError::Lifecycle(message))
+                if nzbd_engine::io_hold_cause(message).policy().automatic() =>
+            {
+                (nzbd_engine::io_hold_cause(message), None, false)
+            }
+            AdmissionError::State(nzbd_state::StateError::Io { source, .. }) => {
+                (nzbd_engine::io_hold_cause(&source.to_string()), None, false)
+            }
+            AdmissionError::Engine(_) | AdmissionError::State(_) => {
+                (nzbd_types::HoldCause::IdentityConflict, None, false)
+            }
+            _ => (nzbd_types::HoldCause::Io, None, true),
+        };
+        if permanent {
+            if self.engine.fail_native_torrent(id,None,"torrent_metadata".into(),"Torrent metadata is invalid or permanently unavailable; start a fresh Grab to change the source".into(),false).await.unwrap_or(false) {
+                self.drain_native_failure(id).await;
+            }
+            return;
+        }
+        let _ = self
+            .engine
+            .hold_job_until(
+                id,
+                cause,
+                "torrent_metadata",
+                "Torrent metadata could not be resolved; retry or remove this acquisition",
+                not_before,
+            )
+            .await;
+    }
+
+    async fn drain_native_failure(&self, id: JobId) {
+        let Ok(Some(row)) = self.engine.export_job(id).await else {
+            return;
+        };
+        if row.status != nzbd_types::JobStatus::Failed {
+            return;
+        }
+        let Some(stage) = row
+            .params
+            .iter()
+            .find(|(key, _)| key == "Failure:Stage")
+            .map(|(_, value)| value.clone())
+        else {
+            return;
+        };
+        let donor = nzbd_engine::torrent_acquisitions::donor(&row);
+        let keep = row
+            .params
+            .iter()
+            .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
+        let done = row
+            .params
+            .iter()
+            .any(|(key, value)| key == "*Torrent:FailureRecorded" && value == "1")
+            && (stage != "torrent_metadata"
+                || row.params.iter().any(|(key, value)| {
+                    key == "Delivery:SourceCleanup"
+                        && value == if keep { "kept" } else { "deleted" }
+                }));
+        if done {
+            return;
+        }
+        if !keep && stage == "torrent_metadata" {
+            let Ok(Some(claimed)) = self.engine.claim_native_failure_cleanup(id).await else {
+                return;
+            };
+            if self
+                .engine
+                .retire_native_torrent_blobs(&claimed)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        let cleanup_complete = stage == "torrent_metadata";
+        let _ = self
+            .engine
+            .fail_native_torrent(
+                id,
+                donor,
+                stage,
+                "Torrent source is permanently unavailable; start a fresh Grab".into(),
+                cleanup_complete,
+            )
+            .await;
     }
 
     async fn resolve_managed_metadata(&self, id: JobId) -> Result<(), AdmissionError> {
@@ -510,10 +626,23 @@ impl TorrentAdmissionService {
                 key == nzbd_engine::torrent_acquisitions::OWNED_SEED_PARAM && value == "1"
             }) {
                 if let Some(record) = &job.torrent {
+                    if nzbd_engine::torrent_acquisitions::seed_retirement(job).is_some()
+                        || record.removal_intent.is_some()
+                        || record.removal_outcome.is_some()
+                    {
+                        continue;
+                    }
                     self.ensure_owned_seed_root(job.id, &record.payload_root)
                         .await?;
                     payload_roots.push(record.payload_root.clone());
                 }
+            }
+        }
+        for job in &snapshot.jobs {
+            if nzbd_engine::torrent_acquisitions::seed_retirement(job)
+                .is_some_and(|marker| marker.phase == "requested")
+            {
+                self.attach_seed(job.id).await?;
             }
         }
         let restore_plan = nzbd_engine::torrent_runtime::plan_restore_with_roots(
@@ -537,6 +666,9 @@ impl TorrentAdmissionService {
             let Some(torrent) = &job.torrent else {
                 continue;
             };
+            if nzbd_engine::torrent_acquisitions::seed_retirement(job).is_some() {
+                continue;
+            }
             let payload_root = if torrent.payload_root.as_os_str().is_empty() {
                 self.session.output_root()
             } else {
@@ -983,18 +1115,38 @@ impl TorrentAdmissionService {
             .await?
             .ok_or(AdmissionError::MissingPending)?;
         let record = job.torrent.as_ref().ok_or(AdmissionError::MissingPending)?;
-        if matches!(
-            job.status,
-            nzbd_types::JobStatus::Failed | nzbd_types::JobStatus::Deleted
-        ) || record.removal_intent.is_some()
+        let retiring = nzbd_engine::torrent_acquisitions::seed_retirement(&job)
+            .is_some_and(|marker| marker.phase == "requested");
+        if !retiring
+            && (matches!(
+                job.status,
+                nzbd_types::JobStatus::Failed | nzbd_types::JobStatus::Deleted
+            ) || record.removal_intent.is_some())
         {
             return Err(AdmissionError::MissingPending);
         }
         if job.params.iter().any(|(key, value)| {
             key == nzbd_engine::torrent_acquisitions::OWNED_SEED_PARAM && value == "1"
         }) {
-            self.ensure_owned_seed_root(id, &record.payload_root)
-                .await?;
+            if retiring {
+                let marker = nzbd_engine::torrent_acquisitions::seed_retirement(&job)
+                    .ok_or(AdmissionError::MissingPending)?;
+                let source = self
+                    .engine
+                    .artifacts()
+                    .get(&marker.source.artifact)
+                    .map_err(|e| nzbd_engine::EngineError::Lifecycle(e.to_string()))?;
+                if !source.owned
+                    || source.generation != marker.source.generation
+                    || source.path != record.payload_root
+                    || source.terminal()
+                {
+                    return Err(AdmissionError::MissingPending);
+                }
+            } else {
+                self.ensure_owned_seed_root(id, &record.payload_root)
+                    .await?;
+            }
         }
         let path = self.state_dir.join(&record.metadata_file);
         let bytes = tokio::task::spawn_blocking(move || std::fs::read(path))
@@ -1009,20 +1161,22 @@ impl TorrentAdmissionService {
             hook()?;
         }
         let mut registry = self.registry.lock().await;
-        if registry.identity_by_hash(&record.info_hash_v1).is_some() {
-            // An association to another root/old failed donor is never adopted.
-            return Err(nzbd_torrent::TorrentError::DuplicateEngineIdentity.into());
-        }
-        let identity = registry
-            .add_committed(
-                bytes,
-                TorrentAddConfig {
-                    paused: true,
-                    output_root: Some(record.payload_root.clone()),
-                    ..Default::default()
-                },
-            )
-            .await?;
+        let identity = if let Some(identity) =
+            registry.recover_committed(&record.info_hash_v1, &record.payload_root)?
+        {
+            identity
+        } else {
+            registry
+                .add_committed(
+                    bytes,
+                    TorrentAddConfig {
+                        paused: true,
+                        output_root: Some(record.payload_root.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await?
+        };
         self.associations.lock().await.insert(
             id,
             Association {
@@ -1047,6 +1201,10 @@ impl TorrentAdmissionService {
             let snapshot = self.engine.snapshot();
             for summary in &snapshot.jobs {
                 if summary.torrent_role == Some("acquisition")
+                    && summary.status == nzbd_types::JobStatus::Failed
+                {
+                    self.drain_native_failure(summary.id).await;
+                } else if summary.torrent_role == Some("acquisition")
                     && summary.seed_donor_job_id.is_none()
                     && matches!(
                         summary.status,

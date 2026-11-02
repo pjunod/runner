@@ -992,7 +992,9 @@ async fn get_failure_keep(State(st): State<ApiState>, Path(id): Path<u32>) -> Re
         Ok(Ok((Some(source),_)))=>Json(json!({"available":true,"keep":source.keep_on_failure,"sourceArtifactId":source.id,"sourceGeneration":source.generation})).into_response(),
         Ok(Ok((None,true)))=>Json(json!({"available":false,"keep":false})).into_response(),
         Ok(Ok((None,false)))=>match st.engine.export_job(JobId(id)).await {
-            Ok(Some(job)) if matches!(job.status,nzbd_types::JobStatus::Fetching|nzbd_types::JobStatus::Queued|nzbd_types::JobStatus::Paused)=>Json(json!({"available":true,"keep":job.params.iter().any(|(key,value)|key=="*Runner:KeepOnFailure"&&value=="1")})).into_response(),
+            Ok(Some(job)) if matches!(job.status,nzbd_types::JobStatus::Fetching|nzbd_types::JobStatus::Queued|nzbd_types::JobStatus::Paused)
+                || (nzbd_engine::torrent_acquisitions::is_acquisition(&job)
+                    && !job.params.iter().any(|(key,value)|key == "Delivery:SourceCleanup" && matches!(value.as_str(),"deleting"|"deleted")))=>Json(json!({"available":true,"keep":job.params.iter().any(|(key,value)|key=="*Runner:KeepOnFailure"&&value=="1")})).into_response(),
             Ok(_)=>Json(json!({"available":false,"keep":false})).into_response(),
             Err(failure)=>error(StatusCode::SERVICE_UNAVAILABLE,&failure.to_string()),
         },
@@ -1016,6 +1018,24 @@ async fn set_keep_on_failure(
 }
 
 async fn retry_job_now(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
+    if let Ok(Some(row)) = st.engine.export_job(JobId(id)).await {
+        if nzbd_engine::torrent_acquisitions::is_acquisition(&row) {
+            if let Some(control) = row.control().filter(|control| {
+                control.lifecycle == "held"
+                    && matches!(control.stage.as_str(), "torrent_copy" | "torrent_metadata")
+            }) {
+                return match st
+                    .engine
+                    .release_hold(row.id, control.revision, nzbd_engine::RetryBy::Operator)
+                    .await
+                {
+                    Ok(Ok(())) => Json(json!({"ok":true,"retrying":true})).into_response(),
+                    Ok(Err(reason)) => error(StatusCode::CONFLICT, &reason),
+                    Err(failure) => error(StatusCode::SERVICE_UNAVAILABLE, &failure.to_string()),
+                };
+            }
+        }
+    }
     let Some(manager) = st.pp_manager.as_ref() else {
         return error(
             StatusCode::NOT_IMPLEMENTED,
