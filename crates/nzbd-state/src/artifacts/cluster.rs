@@ -181,6 +181,7 @@ impl Inventory {
             true,
             Some(raw_files),
             true,
+            None,
         )
     }
 
@@ -227,7 +228,29 @@ impl Inventory {
         unusable: bool,
         raw_files: Option<&[DeliveryFile]>,
     ) -> Result<ClusterCopyCleanup> {
-        self.retire_cluster_artifact_copy_policy(copy, outcome, proof, unusable, raw_files, false)
+        self.retire_cluster_artifact_copy_policy(
+            copy, outcome, proof, unusable, raw_files, false, None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn retire_cluster_artifact_copy_with_result(
+        &self,
+        copy: &ClusterArtifactCopy,
+        outcome: &str,
+        proof: FinalizationProof,
+        unusable: bool,
+        raw_files: Option<&[DeliveryFile]>,
+        result: &str,
+    ) -> Result<ClusterCopyCleanup> {
+        self.retire_cluster_artifact_copy_policy(
+            copy,
+            outcome,
+            proof,
+            unusable,
+            raw_files,
+            false,
+            Some(result),
+        )
     }
     #[allow(clippy::too_many_arguments)]
     fn retire_cluster_artifact_copy_policy(
@@ -238,6 +261,7 @@ impl Inventory {
         unusable: bool,
         raw_files: Option<&[DeliveryFile]>,
         explicit_cancellation: bool,
+        result: Option<&str>,
     ) -> Result<ClusterCopyCleanup> {
         if copy.storage_instance_id != self.installation
             || !matches!(proof, FinalizationProof::Cluster { .. })
@@ -246,9 +270,20 @@ impl Inventory {
                 "cluster cleanup belongs to another storage instance".into(),
             ));
         }
-        let artifact = self.get(&copy.publication.artifact)?;
+        let mut artifact = self.get(&copy.publication.artifact)?;
+        let predecessor = if artifact.job.is_none() && outcome == "SUCCESS" && !copy.selected {
+            match result {
+                Some(result) => self.cluster_materialized_predecessor(copy, result)?,
+                None => false,
+            }
+        } else {
+            false
+        };
+        if predecessor {
+            artifact = self.get(&copy.publication.artifact)?;
+        }
         if artifact.generation != copy.publication.generation
-            || artifact.job != Some(copy.job_id)
+            || (artifact.job != Some(copy.job_id) && !predecessor)
             || !artifact.owned
             || !artifact.automatic_cleanup_eligible
             || (!artifact.delivery_lifecycle && !explicit_cancellation)

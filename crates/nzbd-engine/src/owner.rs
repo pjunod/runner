@@ -453,6 +453,7 @@ pub(crate) enum QueueCommand {
     /// history or events — the executor-side handoff cleanup.
     RemoveJobSilent {
         job: JobId,
+        accepted_context: Option<nzbd_state::artifacts::WorkerControlContext>,
         reply: oneshot::Sender<bool>,
     },
     /// Mark a job as executing on another node: the local scheduler skips
@@ -2924,9 +2925,9 @@ impl Owner {
                             generation: url_admission_generation(
                                 id,
                                 token,
-                                &self.artifacts.installation,
+                                &self.consumer_instance_id,
                             ),
-                            runner_instance_id: self.artifacts.installation.clone(),
+                            runner_instance_id: self.consumer_instance_id.clone(),
                             terminal_outcome: None,
                             outcome: job_status_name(existing_job.status).into(),
                             failure_stage: None,
@@ -3039,12 +3040,8 @@ impl Owner {
                         request_token: token.clone(),
                         submission_sha256: fingerprint.clone(),
                         job_id: id.0,
-                        generation: url_admission_generation(
-                            id,
-                            token,
-                            &self.artifacts.installation,
-                        ),
-                        runner_instance_id: self.artifacts.installation.clone(),
+                        generation: url_admission_generation(id, token, &self.consumer_instance_id),
+                        runner_instance_id: self.consumer_instance_id.clone(),
                         terminal_outcome: None,
                         outcome: "fetching".into(),
                         failure_stage: None,
@@ -4222,8 +4219,24 @@ impl Owner {
                 };
                 let _ = reply.send(result);
             }
-            QueueCommand::RemoveJobSilent { job, reply } => {
-                let _ = reply.send(self.remove_job_silent(job));
+            QueueCommand::RemoveJobSilent {
+                job,
+                accepted_context,
+                reply,
+            } => {
+                let accepted = accepted_context.as_ref().is_some_and(|expected| {
+                    self.state.job(job).is_some_and(|record| {
+                        nzbd_state::artifacts::WorkerControlContext::for_job(record).as_ref()
+                            == Some(expected)
+                    })
+                });
+                if accepted_context.is_some() && !accepted {
+                    // A delayed completion must not retire another grant's journal.
+                    let _ = reply.send(false);
+                } else {
+                    let _ = reply
+                        .send(self.remove_job_silent_with_journal(job, self.persist || accepted));
+                }
             }
             QueueCommand::SetDelegated { job, node, reply } => {
                 let replacement_pending =
@@ -4883,7 +4896,11 @@ impl Owner {
                     .collect();
                 for id in drop_ids {
                     let (reply, _) = oneshot::channel();
-                    self.on_command(QueueCommand::RemoveJobSilent { job: id, reply });
+                    self.on_command(QueueCommand::RemoveJobSilent {
+                        job: id,
+                        accepted_context: None,
+                        reply,
+                    });
                 }
                 self.delegated.clear();
                 self.mirror.clear();
@@ -5249,6 +5266,10 @@ impl Owner {
     }
 
     fn remove_job_silent(&mut self, job: JobId) -> bool {
+        self.remove_job_silent_with_journal(job, self.persist)
+    }
+
+    fn remove_job_silent_with_journal(&mut self, job: JobId, compact_journal: bool) -> bool {
         if self.post_admissions.contains_key(&job)
             || self
                 .verification
@@ -5318,7 +5339,13 @@ impl Owner {
                 return;
             }
             if committed {
-                owner.remove_journal(job);
+                // A worker's local snapshot does not cover the authority's
+                // pending download. Preserve its shared verified ranges on
+                // stop/expiry; only acknowledged completion or authority
+                // retirement permits journal compaction.
+                if compact_journal {
+                    owner.remove_journal(job);
+                }
                 owner.retirement_epochs.remove(&job);
                 owner.retiring_writers.remove(&job);
                 owner.drain_replacements();

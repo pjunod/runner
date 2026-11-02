@@ -339,6 +339,139 @@ fn rename_at(_: &File, _: &Path, _: &Path) -> Result<()> {
 }
 
 impl Inventory {
+    /// Verify the exact durable materialization receipt and its still-current
+    /// owned namespace. New materializations have no payload marker file.
+    pub fn materialized_generation_matches(
+        &self,
+        job: u32,
+        root: &Path,
+        target: &Path,
+        generation: &ExternalGeneration,
+    ) -> Result<bool> {
+        let _coordinator = self.mutation_guard()?;
+        let key = format!(
+            "materialize-{:x}",
+            Sha256::digest(serde_json::to_vec(&(
+                job,
+                root,
+                target,
+                &generation.result_id,
+                generation.fence
+            ))?)
+        );
+        let operation = match self.operation(&key) {
+            Ok(operation) => operation,
+            Err(Error::NotFound) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if operation.kind != "materialize_generation" || operation.state != "succeeded" {
+            return Ok(false);
+        }
+        let record: Materialization = serde_json::from_str(&operation.request)?;
+        if record.job != job
+            || record.root != root
+            || record.target != target
+            || record.accepted != *generation
+        {
+            return Ok(false);
+        }
+        let Some(current) = self.for_job(job)? else {
+            return Ok(false);
+        };
+        if !current.owned
+            || current.id != record.selected.id
+            || current.generation != record.selected.generation
+            || current.path != record.target
+            || current.root != record.root
+            || current.root_identity != record.selected.root_identity
+            || current.identity != record.selected.identity
+            || current.files != record.selected.files
+        {
+            return Ok(false);
+        }
+        // The receipt proves the completed digest/copy/fsync transaction;
+        // current descriptor identity proves that its selected namespace was
+        // not replaced before READY. Do not invent a legacy marker file.
+        let _selected = self.verify(&current)?;
+        Ok(true)
+    }
+
+    /// Bind a detached predecessor to this exact succeeded materialization.
+    /// Only its generated retention may be released; later policy changes
+    /// remain protected by the existing deletion guards and journal.
+    pub(super) fn cluster_materialized_predecessor(
+        &self,
+        copy: &ClusterArtifactCopy,
+        result: &str,
+    ) -> Result<bool> {
+        let _guard = self.mutation_guard()?;
+        let Some(selected) = self.for_job(copy.job_id)? else {
+            return Ok(false);
+        };
+        let rows = {
+            let db = self.db.lock().unwrap();
+            let mut query=db.prepare("SELECT data FROM operations WHERE artifact=?1 AND state='succeeded' AND json_extract(data,'$.kind')='materialize_generation' LIMIT 2")?;
+            let rows = query.query_map([&selected.id], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if rows.len() != 1 {
+            return Ok(false);
+        }
+        let operation: Operation = serde_json::from_str(&rows[0])?;
+        let record: Materialization = serde_json::from_str(&operation.request)?;
+        let Some(previous) = record.previous else {
+            return Ok(false);
+        };
+        let mut current = self.get(&copy.publication.artifact)?;
+        if copy.storage_instance_id != self.installation
+            || copy.selected
+            || copy.source != copy.publication
+            || record.job != copy.job_id
+            || record.accepted.result_id != result
+            || record.selected.id != selected.id
+            || record.selected.generation != selected.generation
+            || previous.job != Some(copy.job_id)
+            || previous.id != current.id
+            || previous.generation != current.generation
+            || current.generation != copy.publication.generation
+            || !previous.owned
+            || !current.owned
+            || current.job.is_some()
+            || current.root != previous.root
+            || current.path != previous.path
+            || current.root_identity != previous.root_identity
+            || current.identity != previous.identity
+            || current.files != previous.files
+        {
+            return Ok(false);
+        }
+        if current.state == "retained"
+            && current.keep
+            && current.hold.as_deref() == Some("review: superseded by accepted generation")
+            && !previous.keep
+            && previous.hold.is_none()
+            && current.revision == previous.revision.saturating_add(1)
+        {
+            // This is the exact pin created by materialization, not a user
+            // Keep or review action. Keep job detached from the new result.
+            current.keep = false;
+            current.hold = None;
+            current.revision += 1;
+            current.updated_at = now();
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
+            save_artifact(&tx, &current)?;
+            event(
+                &tx,
+                &current.id,
+                "materialized_predecessor_retirement",
+                &operation.id,
+            )?;
+            tx.commit()?;
+        }
+        Ok(true)
+    }
+
     pub fn materialize_generation(
         &self,
         job: u32,

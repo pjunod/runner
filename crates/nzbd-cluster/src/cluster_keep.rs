@@ -514,7 +514,19 @@ pub(crate) async fn serve(
         }
         writes.push(write(&value)?);txn(control,writes).await?;
         drop(_delivery);
-        if queue_changed{shared.restore_control_projection().await?;}
+        if queue_changed {
+            if let Err(reason) = shared.restore_control_projection().await {
+                if reason != "export queue projection: file lifecycle: job verification or writer retirement is still in progress; retry later" {
+                    return Err(reason);
+                }
+                // Desired preference and job CAS are already durable. A
+                // provisional local projection must not report a rejected PUT.
+                let mut pending = reply(&value, crate::control::unix_ms_public());
+                pending.applied = false;
+                pending.message = "Keep change saved; waiting for local queue verification and source-owner confirmation".into();
+                return Ok(pending);
+            }
+        }
         Ok::<_,String>(reply(&value,crate::control::unix_ms_public()))
     }.await;
     match result {
@@ -601,6 +613,8 @@ struct Authority {
     target: Target,
     desired: Option<bool>,
     revision: u64,
+    #[serde(default)]
+    redundant_transfer: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct OwnerReply {
@@ -630,6 +644,7 @@ async fn authority(shared: &LeaderShared, request: &OwnerRequest) -> Result<Auth
         target,
         desired: value.desired,
         revision: value.desired_revision,
+        redundant_transfer: false,
     })
 }
 async fn fetch_authority(
@@ -792,13 +807,75 @@ async fn policy_authority(
                 && physical_key(&target.obligation()) == physical_key(&copy.obligation())
         })
         .ok_or("Keep copy is not an exact committed obligation")?;
+    let redundant_transfer = if let Some(delivery) = &target.delivery {
+        control
+            .cluster_delivery(delivery)
+            .await?
+            .is_some_and(|record| redundant_transfer(&record, &target))
+    } else {
+        false
+    };
     let value = load(control, job).await?;
     Ok(Authority {
         target,
         desired: value.as_ref().and_then(|value| value.desired),
         revision: value.map_or(0, |value| value.desired_revision),
+        redundant_transfer,
     })
 }
+fn redundant_transfer(record: &crate::delivery::ClusterDelivery, target: &Target) -> bool {
+    if !record.cleanup_only
+        || record.source_disposition.as_deref() != Some("unusable")
+        || record.delivery.job_id != target.job
+        || target.artifact.is_some()
+        || target.local_delivery.is_some()
+    {
+        return false;
+    }
+    let Some(copy) = record.copies.iter().find(|copy| {
+        copy.id == target.copy_id
+            && copy.owner_node == target.owner
+            && physical_key(copy) == physical_key(&target.obligation())
+    }) else {
+        return false;
+    };
+    let Some(files) = copy.deletion_files.as_ref() else {
+        return false;
+    };
+    if !files.iter().any(|file| file.path == "manifest.json")
+        || !files.iter().any(|file| file.path == "job.json")
+    {
+        return false;
+    }
+    record.copies.iter().any(|raw| {
+        if raw.status != "retained"
+            || !raw.artifact.as_ref().is_some_and(|artifact| {
+                artifact.job_id == target.job
+                    && !artifact.selected
+                    && artifact.source == artifact.publication
+            })
+        {
+            return false;
+        }
+        let Some(raw_files) = raw.deletion_files.as_ref() else {
+            return false;
+        };
+        let raw_files = raw_files
+            .iter()
+            .map(|file| (file.path.as_str(), file))
+            .collect::<HashMap<_, _>>();
+        files.iter().all(|file| {
+            if matches!(file.path.as_str(), "manifest.json" | "job.json") {
+                return true;
+            }
+            file.path
+                .strip_prefix("files/")
+                .and_then(|path| raw_files.get(path))
+                .is_some_and(|raw| raw.size_bytes == file.size_bytes && raw.sha256 == file.sha256)
+        })
+    })
+}
+
 pub(crate) async fn check_copy_policy(
     shared: &LeaderShared,
     copy: &CopyObligation,
@@ -827,20 +904,32 @@ pub(crate) async fn check_copy_policy(
                 .post_json::<_, Authority>(&leader, PEER_PATH, &request)
                 .await?
         };
+    let target = owner_target(shared, &proof.target)?;
+    let inventory = shared.engine.artifacts();
+    let (status, independent_sealed_keep) = tokio::task::spawn_blocking(move || {
+        let status = inventory.cluster_copy_failure_keep(&target, None)?;
+        let independent = if proof.redundant_transfer {
+            inventory
+                .cluster_sealed_failure_keep_revision(&target)?
+                .is_some_and(|(revision, keep)| {
+                    keep && !(proof.desired == Some(true) && revision == proof.revision)
+                })
+        } else {
+            false
+        };
+        Ok::<_, nzbd_state::artifacts::Error>((status, independent))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if proof.redundant_transfer && !independent_sealed_keep {
+        return Ok(None);
+    }
     if proof.desired == Some(true) {
         return Ok(Some(
             "Current Keep on failure is enabled for this exact source copy".into(),
         ));
     }
-    let target = owner_target(shared, &proof.target)?;
-    let inventory = shared.engine.artifacts();
-    let status = tokio::task::spawn_blocking(move || {
-        inventory
-            .cluster_copy_failure_keep(&target, None)
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
     Ok((status.available && status.keep)
         .then(|| "Current owner Keep on failure is enabled for this exact source copy".into()))
 }
@@ -868,6 +957,26 @@ pub(crate) async fn reconcile_one(shared: &Arc<LeaderShared>) -> Result<(), Stri
             return Ok(());
         };
         let mut value = refreshed(control, next.job as u32).await?;
+        let restore_queue = if let Some(durable_keep) = value.queue_keep {
+            shared
+                .engine
+                .recovery_document()
+                .await
+                .map_err(|error| error.to_string())?
+                .jobs
+                .iter()
+                .find(|job| job.id.0 == value.job)
+                .is_some_and(|job| {
+                    !matches!(job.status, nzbd_types::JobStatus::Deleted)
+                        && job
+                            .params
+                            .iter()
+                            .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1")
+                            != durable_keep
+                })
+        } else {
+            false
+        };
         let now = crate::control::unix_ms_public();
         let selected = (0..value.targets.len())
             .map(|offset| (value.cursor + offset) % value.targets.len())
@@ -887,6 +996,12 @@ pub(crate) async fn reconcile_one(shared: &Arc<LeaderShared>) -> Result<(), Stri
             )
         });
         txn(control,vec![crate::control::authority_statement(shared.authority_identity())?,write(&value)?,("INSERT INTO cluster_failure_keep_meta(key,value) VALUES('cursor',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value".into(),params!(next.job))]).await?;
+        drop(_delivery);
+        if restore_queue {
+            // Retry a previously accepted Keep whose local projection was
+            // busy. Read fresh durable intent; never recreate a missing row.
+            shared.restore_control_projection().await?;
+        }
         selected
     };
     let Some((job, revision, target)) = selected else {

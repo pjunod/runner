@@ -666,6 +666,10 @@ impl LeaderShared {
             }
         };
         if !crate::control_recovery::grant_intent_matches(&job, &durable).ok()? {
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let differences = grant_intent_differences(&job, &durable);
+                tracing::debug!(job=job.id.0,%node,?kind,?differences,"grant awaits exact replicated intent");
+            }
             return None;
         }
         if serde_json::to_vec(&(&job, &scope)).ok()?.len() > MAX_DESCRIPTOR_BYTES {
@@ -1031,11 +1035,14 @@ async fn work_poll(
     }
     // The registry is the leader's independent admission fact. Do not trust
     // slot counts from a poll whose node is already known to be held.
-    if read_nodes(&s.layout)
+    let registered = read_nodes(&s.layout)
         .into_iter()
-        .find(|node| node.name == req.node)
-        .is_none_or(|node| !worker_admits_new_work(&node))
+        .find(|node| node.name == req.node);
+    if registered
+        .as_ref()
+        .is_none_or(|node| !worker_admits_new_work(node))
     {
+        tracing::debug!(node=%req.node,free_pp=req.free_pp_slots,registered=registered.is_some(),disk_low=?registered.as_ref().map(|node|node.disk_low),disk_guard=?registered.as_ref().map(|node|node.disk_guard_capable),"worker poll awaits registry admission");
         return Json(PollResponse::default()).into_response();
     }
 
@@ -1234,14 +1241,20 @@ async fn grant_post_candidate(
         .collect();
     for job_id in pp_candidates {
         if req.free_pp_slots == 0 {
+            tracing::debug!(job=job_id.0,node=%req.node,"POST grant awaits free worker slot");
             break;
         }
         let already = s.leases.lock().unwrap().values().any(|l| l.job == job_id);
         if already {
+            tracing::debug!(job=job_id.0,node=%req.node,"POST grant awaits existing lease retirement");
             continue;
         }
-        let Ok(Some(job)) = s.engine.export_job(job_id).await else {
-            continue;
+        let job = match s.engine.export_job(job_id).await {
+            Ok(Some(job)) => job,
+            result => {
+                tracing::debug!(job=job_id.0,node=%req.node,error=?result.err(),"POST grant awaits export readiness");
+                continue;
+            }
         };
         if let Some(grant) = s
             .grant_job(
@@ -1257,6 +1270,92 @@ async fn grant_post_candidate(
         }
     }
     None
+}
+
+/// Field names only: never log a URL, descriptor or parameter value.
+fn grant_intent_differences(local: &nzbd_types::Job, durable: &nzbd_types::Job) -> Vec<String> {
+    let mut differences = Vec::new();
+    if local.status != durable.status {
+        differences.push("status".into());
+    }
+    if local.control() != durable.control() {
+        differences.push("control".into());
+    }
+    if durable.held() {
+        differences.push("durable-held".into());
+    }
+    if nzbd_engine::automatic_control::transition(local).is_some() {
+        differences.push("local-automatic-transition".into());
+    }
+    let pair = crate::control_recovery::business_intent(local).and_then(|local| {
+        crate::control_recovery::business_intent(durable).map(|durable| (local, durable))
+    });
+    let Ok((local, durable)) = pair else {
+        differences.push("intent-serialization".into());
+        return differences;
+    };
+    let pair = serde_json::from_slice::<serde_json::Value>(&local).and_then(|local| {
+        serde_json::from_slice::<serde_json::Value>(&durable).map(|durable| (local, durable))
+    });
+    let Ok((local, durable)) = pair else {
+        differences.push("intent-decoding".into());
+        return differences;
+    };
+    for (index, name) in [
+        "id",
+        "kind",
+        "name",
+        "dir_name",
+        "name_provisional",
+        "queued_at_unix",
+        "original_name",
+        "category",
+        "priority",
+        "dupe",
+        "delivery_lifecycle",
+        "params",
+        "files",
+    ]
+    .iter()
+    .enumerate()
+    {
+        if local[index] == durable[index] {
+            continue;
+        }
+        differences.push((*name).into());
+        if *name == "params" {
+            let map =
+                |value: &serde_json::Value| -> std::collections::BTreeMap<String, Vec<String>> {
+                    let mut map = std::collections::BTreeMap::new();
+                    for pair in value.as_array().into_iter().flatten() {
+                        if let (Some(key), Some(value)) = (pair[0].as_str(), pair[1].as_str()) {
+                            map.entry(key.to_owned())
+                                .or_insert_with(Vec::new)
+                                .push(value.to_owned());
+                        }
+                    }
+                    map
+                };
+            let left = map(&local[index]);
+            let right = map(&durable[index]);
+            for key in left
+                .keys()
+                .chain(right.keys())
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                if left.get(key) != right.get(key) {
+                    differences.push(format!(
+                        "param:{}",
+                        key.chars().take(96).collect::<String>()
+                    ));
+                    if differences.len() >= 48 {
+                        return differences;
+                    }
+                }
+            }
+        }
+    }
+    differences
 }
 
 fn post_lane_first(turns: &mut HashSet<String>, node: &str) -> bool {
@@ -2447,15 +2546,39 @@ async fn ensure_cluster_delivery(
         .selected_publication_job(job.id.0, result_id)
         .await?
         .ok_or("selected publication was cancelled before READY")?;
-    // Receipt selection alone is not READY: final bytes and the publication
-    // marker must have reached the durable materialization boundary first.
-    if !cleanup_only
-        && std::fs::read_to_string(final_path.join(".nzbd-generation"))
-            .ok()
-            .as_deref()
-            != Some(result_id)
-    {
-        return Err("materialized publication marker is not durable".into());
+    // New main materialization commits an exact Inventory operation and
+    // selected owned artifact, rather than writing a legacy payload marker.
+    if !cleanup_only {
+        let inventory = s.engine.artifacts();
+        let target = final_path.to_path_buf();
+        let root = target
+            .parent()
+            .ok_or("materialized publication has no root")?
+            .to_path_buf();
+        let generation = nzbd_state::artifacts::ExternalGeneration {
+            result_id: result_id.to_owned(),
+            fence: manifest.fence,
+            source: Path::new(result_ref).join("files"),
+            files: manifest
+                .files
+                .iter()
+                .map(|file| nzbd_state::artifacts::ExternalGenerationFile {
+                    path: file.path.clone(),
+                    bytes: file.bytes,
+                    sha256: file.sha256.clone(),
+                })
+                .collect(),
+        };
+        let job_id = job.id.0;
+        let matched = tokio::task::spawn_blocking(move || {
+            inventory.materialized_generation_matches(job_id, &root, &target, &generation)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+        if !matched {
+            return Err("exact durable materialization receipt or selected publication identity is unavailable".into());
+        }
     }
     let mut copies = Vec::new();
     let mut copy_cursor = 0;
@@ -2762,6 +2885,22 @@ async fn sweep_expired(s: &Arc<LeaderShared>) {
     s.apply_local_budgets().await;
 }
 
+struct SelectedDeliveryReady(bool);
+impl From<&mut hiqlite::Row<'_>> for SelectedDeliveryReady {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self(row.get::<i64>("ready") != 0)
+    }
+}
+async fn selected_result_has_delivery(control: &ControlStore, job: JobId) -> Result<bool, String> {
+    // The exact selected result's immutable ledger is sufficient for both a
+    // public READY and terminal empty-payload private cleanup; never demand
+    // a public empty manifest. Primary-key lookup avoids historical scans.
+    control.client.query_consistent_map::<SelectedDeliveryReady,_>(
+        "SELECT EXISTS(SELECT 1 FROM control_jobs j JOIN cluster_deliveries d ON d.id='cluster-delivery:'||j.result_id WHERE j.job_id=?1 AND j.deleted=0) AS ready",
+        hiqlite::params!(i64::from(job.0)),
+    ).await.map(|rows|rows.into_iter().next().is_some_and(|row|row.0)).map_err(|error|error.to_string())
+}
+
 async fn schedule(s: &Arc<LeaderShared>) {
     let _serial = s.mutation_serial.lock().await;
     if let Err(error) = crate::control_recovery::reconcile(s).await {
@@ -2772,11 +2911,17 @@ async fn schedule(s: &Arc<LeaderShared>) {
         tracing::warn!(%error,"scheduler awaits durable source custody");
         return;
     }
+    let mut requires_delivery = HashSet::new();
     let durable_status: HashMap<JobId, JobStatus> = match &s.control {
         Some(control) => match control.load_jobs().await {
             Ok(rows) => rows
                 .into_iter()
-                .map(|(job, _, _)| (job.id, job.status))
+                .map(|(job, _, _)| {
+                    if job.delivery_lifecycle {
+                        requires_delivery.insert(job.id);
+                    }
+                    (job.id, job.status)
+                })
                 .collect(),
             Err(error) => {
                 tracing::warn!(%error, "scheduler paused: replicated queue unavailable");
@@ -2825,6 +2970,19 @@ async fn schedule(s: &Arc<LeaderShared>) {
             && matches!(j.status, JobStatus::Completed | JobStatus::Failed)
             && durable_status.get(&j.id) == Some(&j.status)
         {
+            // Main's durable materialization can expose PP_DONE locally
+            // before complete_operation commits its Delivery. Retirement must
+            // not tombstone that still-selected result in the intervening gap.
+            if requires_delivery.contains(&j.id) {
+                let ready = match &s.control {
+                    Some(control) => selected_result_has_delivery(control, j.id).await,
+                    None => Ok(false),
+                };
+                if !matches!(ready, Ok(true)) {
+                    tracing::debug!(job=j.id.0,error=?ready.err(),"finished lifecycle job awaits selected-result Delivery before retirement");
+                    continue;
+                }
+            }
             let committed = match &s.control {
                 Some(control) => {
                     match control.job_revision_fences_for(&[u64::from(j.id.0)]).await {

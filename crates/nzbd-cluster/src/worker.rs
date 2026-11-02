@@ -755,7 +755,13 @@ async fn submit_completion(
                 }
             };
             if removed {
-                let _ = engine.remove_job_silent(job_id).await;
+                if let Some(context) =
+                    nzbd_state::artifacts::WorkerControlContext::for_job(&req.job)
+                {
+                    let _ = engine.remove_accepted_worker_job(job_id, context).await;
+                } else {
+                    let _ = engine.remove_job_silent(job_id).await;
+                }
             }
             return true;
         }
@@ -1594,8 +1600,23 @@ fn run_pp_lease(
             match result {
                 Ok(outcome)=>{
                     tracing::info!(job=job_id.0,%lease_id,outcome=outcome.as_str(),"pp lease finished");
-                    if let Err(error)=engine.end_post_admission(admission).await{tracing::warn!(job=job_id.0,%error,"PP custody release remains pending");}
-                    if let Some(state)=active.lock().unwrap().get_mut(&lease_id){state.pp_ready=true;}
+                    // Ending main's owner admission retires its queue row.
+                    // Preserve the exact completed descriptor for sealing before
+                    // that retirement; its worker checkpoint already persists
+                    // restart recovery under this same grant/source context.
+                    let ready=match admitted_engine.export_job(job_id).await {
+                        Ok(Some(job)) if lease_authority(&active,&lease_id,&initial)()
+                            && job.params.iter().any(|(key,_)|key==nzbd_types::PP_DONE_PARAM)
+                            && nzbd_state::artifacts::WorkerControlContext::for_job(&job).is_some_and(|context|
+                                context.lease_id==lease_id && context.job_incarnation==initial.job_incarnation
+                                && context.job_revision==initial.job_revision && context.control_revision==initial.control_revision)=>job,
+                        result=>{tracing::warn!(job=job_id.0,%lease_id,?result,"completed PP descriptor awaits exact owner/grant custody");break;}
+                    };
+                    if let Some(state)=active.lock().unwrap().get_mut(&lease_id){state.ready_job=Some(Box::new(ready));}
+                    if let Err(error)=engine.end_post_admission(admission).await{tracing::warn!(job=job_id.0,%error,"PP custody release remains pending");return;}
+                    if lease_authority(&active,&lease_id,&initial)(){
+                        if let Some(state)=active.lock().unwrap().get_mut(&lease_id){state.pp_ready=true;}
+                    }
                     return;
                 },
                 Err(error)=>{

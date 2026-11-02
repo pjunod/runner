@@ -639,6 +639,7 @@ impl Inventory {
           CREATE TABLE IF NOT EXISTS worker_completions(job INTEGER PRIMARY KEY,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS worker_completion_receipts(id TEXT PRIMARY KEY,job INTEGER NOT NULL,data TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS operations_state ON operations(state);
+          CREATE INDEX IF NOT EXISTS operations_artifact ON operations(artifact);
           CREATE TABLE IF NOT EXISTS recoveries(id TEXT PRIMARY KEY,artifact TEXT NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS workspace_finalizations(source TEXT NOT NULL,generation TEXT NOT NULL,outcome TEXT NOT NULL,proof TEXT NOT NULL,job INTEGER,activated INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(source,generation));
           CREATE TABLE IF NOT EXISTS deliveries(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,artifact TEXT NOT NULL,generation TEXT NOT NULL,data TEXT NOT NULL,accepted_at INTEGER,consumer_receipt_id TEXT,cleanup_status TEXT NOT NULL DEFAULT 'pending',cleanup_error TEXT,cleanup_attempts INTEGER NOT NULL DEFAULT 0,cleanup_next_retry_at INTEGER,cleanup_blocked_since INTEGER,cleanup_started_at INTEGER,cleanup_last_attempt_at INTEGER,cleanup_completed_at INTEGER,UNIQUE(artifact,generation));

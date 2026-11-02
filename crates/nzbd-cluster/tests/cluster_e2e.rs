@@ -1081,6 +1081,13 @@ async fn worker_death_reclaims_and_resumes_elsewhere_without_refetch() {
     .await;
     let done_before = journaled_segments(&shared);
     b.kill().await;
+    eprintln!(
+        "journaled before shutdown: {done_before:?}; request counts before successor starts: {:?}",
+        done_before
+            .iter()
+            .map(|segment| (*segment, ns.hits(&post.message_id("big.bin", *segment))))
+            .collect::<Vec<_>>()
+    );
 
     // Third node joins; the lease expires; the job is reclaimed and
     // re-delegated to c, which must not re-fetch journaled segments.
@@ -1666,11 +1673,21 @@ async fn delivery_receipts_survive_authority_restart_and_consumer_removed_public
     assert!(accepted.contains("sourceCopies"));
     // Consumer is entitled to remove its transferred publication immediately.
     std::fs::remove_dir_all(&path).unwrap();
+    let last_cleanup_progress = std::cell::RefCell::new(String::new());
     wait_for(
         "all exact successful source copies acknowledged removed",
         30,
         || {
             let value = get_json(&authority.url, &format!("/api/v1/deliveries/{id}"));
+            let progress=serde_json::json!({
+                "status":value["sourceCleanup"]["status"],
+                "error":value["sourceCleanup"]["error"].as_str().map(|error|error.chars().take(1024).collect::<String>()),
+                "copies":value["sourceCopies"].as_array().map(|copies|copies.iter().take(16).map(|copy|serde_json::json!({
+                    "id":copy["id"],"ownerNode":copy["ownerNode"],"status":copy["status"],"attempts":copy["attempts"],"nextRetryAt":copy["nextRetryAt"],
+                    "error":copy["error"].as_str().map(|error|error.chars().take(1024).collect::<String>())
+                })).collect::<Vec<_>>())
+            }).to_string();
+            if *last_cleanup_progress.borrow()!=progress {eprintln!("exact source cleanup: {progress}");*last_cleanup_progress.borrow_mut()=progress;}
             value["sourceCleanup"]["status"] == "succeeded"
                 && value["sourceCopies"].as_array().is_some_and(|copies| {
                     !copies.is_empty() && copies.iter().all(|copy| copy["status"] == "removed")
@@ -2020,11 +2037,21 @@ async fn delivery_receipts_and_copy_acks_survive_actual_majority_authority_chang
     assert!(accepted.contains("sourceCopies"));
     // Consumer is entitled to remove its transferred publication immediately.
     std::fs::remove_dir_all(&path).unwrap();
+    let last_cleanup_progress = std::cell::RefCell::new(String::new());
     wait_for(
         "all exact successful source copies acknowledged removed",
         30,
         || {
             let value = get_json(&authority.url, &format!("/api/v1/deliveries/{id}"));
+            let progress=serde_json::json!({
+                "status":value["sourceCleanup"]["status"],
+                "error":value["sourceCleanup"]["error"].as_str().map(|error|error.chars().take(1024).collect::<String>()),
+                "copies":value["sourceCopies"].as_array().map(|copies|copies.iter().take(16).map(|copy|serde_json::json!({
+                    "id":copy["id"],"ownerNode":copy["ownerNode"],"status":copy["status"],"attempts":copy["attempts"],"nextRetryAt":copy["nextRetryAt"],
+                    "error":copy["error"].as_str().map(|error|error.chars().take(1024).collect::<String>())
+                })).collect::<Vec<_>>())
+            }).to_string();
+            if *last_cleanup_progress.borrow()!=progress {eprintln!("exact source cleanup: {progress}");*last_cleanup_progress.borrow_mut()=progress;}
             value["sourceCleanup"]["status"] == "succeeded"
                 && value["sourceCopies"].as_array().is_some_and(|copies| {
                     !copies.is_empty() && copies.iter().all(|copy| copy["status"] == "removed")
@@ -2400,13 +2427,19 @@ async fn worker_restart_regrant_preserves_retry_deadline_and_private_generation(
         },
     )
     .await;
-    let recovered = restarted
-        .runtime
-        .engine
-        .export_job(held.id)
-        .await
-        .unwrap()
-        .unwrap();
+    // The held regrant becomes visible before main's imported source
+    // verification is exportable. Read only after that exact barrier clears.
+    let export_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let recovered = loop {
+        match restarted.runtime.engine.export_job(held.id).await {
+            Ok(Some(job))=>break job,
+            Err(nzbd_engine::EngineError::Lifecycle(error)) if error=="job verification or writer retirement is still in progress; retry later"=>{
+                assert!(tokio::time::Instant::now()<export_deadline,"regranted held source did not become exportable: {error}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            result=>panic!("regranted held source was not preserved: {result:?}"),
+        }
+    };
     let after = recovered.control().unwrap();
     let fresh = nzbd_state::artifacts::WorkerControlContext::for_job(&recovered).unwrap();
     assert_ne!(fresh.lease_id, context.lease_id);
@@ -2531,6 +2564,29 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
     let job_id = serde_json::from_str::<serde_json::Value>(&admitted).unwrap()["id"]
         .as_u64()
         .unwrap();
+    // A durable URL admission is still Fetching. AddPaused takes effect
+    // only after its descriptor is resolved and verified; Resume is not a
+    // valid action on the provisional Fetching row.
+    async fn verified_paused(engine: &nzbd_engine::EngineHandle, id: nzbd_types::JobId) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match engine.export_job(id).await {
+                Ok(Some(job)) if job.status == nzbd_types::JobStatus::Paused => break,
+                Ok(Some(job)) => assert_eq!(job.status, nzbd_types::JobStatus::Fetching,
+                    "paused admission reached an unexpected state"),
+                Ok(None) => panic!("paused admission disappeared before Resume"),
+                Err(nzbd_engine::EngineError::Lifecycle(message))
+                    if message == "job verification or writer retirement is still in progress; retry later" => {},
+                Err(error) => panic!("export paused admission: {error}"),
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "URL admission did not resolve into a verified Paused job"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    verified_paused(&authority.runtime.engine, nzbd_types::JobId(job_id as u32)).await;
     if keep {
         let (code, body) = http_with_headers(
             &authority.url,
@@ -2539,7 +2595,28 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
             br#"{"keep":true}"#,
             &[("content-type", "application/json")],
         );
-        assert_eq!(code, 200, "{body}");
+        assert!(matches!(code, 200 | 202), "Keep setter: {code}: {body}");
+        wait_for("exact source owner confirms Keep before Resume", 15, || {
+            let (code, body) = http(
+                &authority.url,
+                "GET",
+                &format!("/api/v1/jobs/{job_id}/failure-keep"),
+                b"",
+            );
+            assert!(
+                matches!(code, 200 | 202),
+                "Keep observation: {code}: {body}"
+            );
+            let state: serde_json::Value = serde_json::from_str(&body).unwrap();
+            code == 200
+                && state["available"] == true
+                && state["keep"] == true
+                && state["applied"] == true
+        })
+        .await;
+        // Keep updates the replicated job and restores its local projection,
+        // which starts a fresh payload verification before controls may run.
+        verified_paused(&authority.runtime.engine, nzbd_types::JobId(job_id as u32)).await;
     }
     let (code, body) = http(
         &authority.url,
@@ -2612,9 +2689,19 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
     } else {
         assert_eq!(raw.state, "deleted");
     }
+    let remaining = manifest_paths(&tmp.path().join(".nzbd-cluster/generations"));
+    let remaining_files = remaining
+        .iter()
+        .map(|path| {
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            (path, value["files"].clone())
+        })
+        .collect::<Vec<_>>();
     assert!(
-        manifest_paths(&tmp.path().join(".nzbd-cluster/generations")).is_empty(),
-        "all redundant sealed transfer copies must drain"
+        remaining.is_empty(),
+        "all redundant sealed transfer copies must drain: remaining={remaining_files:?}; cleanup={}",
+        get_json(&authority.url, &format!("/api/v1/deliveries/{id}"))
     );
     let admission = get_json(
         &authority.url,
@@ -2825,7 +2912,26 @@ async fn automatic_hold_release_is_replicated_before_different_authority_adopts(
             .as_u64()
             .unwrap() as u32,
     );
-    let job = a.runtime.engine.export_job(id).await.unwrap().unwrap();
+    async fn verified_job(
+        engine: &nzbd_engine::EngineHandle,
+        id: nzbd_types::JobId,
+    ) -> nzbd_types::Job {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match engine.export_job(id).await {
+                Ok(job) => return job.expect("admitted job remains present"),
+                Err(nzbd_engine::EngineError::Lifecycle(message))
+                    if message == "job verification or writer retirement is still in progress; retry later" =>
+                {
+                    assert!(tokio::time::Instant::now() < deadline,
+                        "job verification did not finish: {message}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("export admitted job: {error}"),
+            }
+        }
+    }
+    let job = verified_job(&a.runtime.engine, id).await;
     let root = tmp.path().join("complete");
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join(nzbd_engine::queue::job_dir_name(&job));
@@ -2902,13 +3008,7 @@ async fn automatic_hold_release_is_replicated_before_different_authority_adopts(
             .any(|job| job.id == id)
     })
     .await;
-    let adopted = successor
-        .runtime
-        .engine
-        .export_job(id)
-        .await
-        .unwrap()
-        .unwrap();
+    let adopted = verified_job(&successor.runtime.engine, id).await;
     assert_eq!(adopted.status, nzbd_types::JobStatus::Queued);
     assert_eq!(adopted.control(), Some(control));
     assert!(!adopted

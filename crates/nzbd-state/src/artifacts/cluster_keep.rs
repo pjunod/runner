@@ -27,6 +27,38 @@ pub struct ClusterFailureKeepStatus {
 }
 
 impl Inventory {
+    /// Observe the existing sealed preference revision so a peer can distinguish
+    /// the current propagated job value from an independent local preference.
+    /// Call only after observing the same exact target through the normal
+    /// identity-checked owner API; this adds no deletion authority.
+    pub fn cluster_sealed_failure_keep_revision(
+        &self,
+        target: &ClusterFailureKeepTarget,
+    ) -> Result<Option<(u64, bool)>> {
+        if !matches!(target, ClusterFailureKeepTarget::Sealed { .. }) {
+            return Err(Error::Conflict(
+                "explicit sealed Keep requires a sealed target".into(),
+            ));
+        }
+        let raw = serde_json::to_vec(target)?;
+        if raw.len() > 16384 {
+            return Err(Error::Conflict(
+                "sealed Keep descriptor exceeds supported bounds".into(),
+            ));
+        }
+        let key = format!("{:x}", Sha256::digest(&raw));
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT revision,keep FROM cluster_failure_keep WHERE key=?1",
+                [&key],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// `revision=None` observes current policy. A mutation must have an exact
     /// still-current replicated desired revision, verified by the peer caller.
     pub fn cluster_copy_failure_keep(

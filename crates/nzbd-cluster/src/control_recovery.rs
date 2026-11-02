@@ -11,12 +11,18 @@ pub(crate) fn business_intent(job: &Job) -> Result<Vec<u8>, String> {
         .iter()
         .filter(|(key, _)| {
             key != nzbd_types::CONTROL_PARAM
+                // Verified file proof/generation belongs to the observing
+                // node's recovery lane, not operator or source intent. The
+                // exact file descriptor and custody checks remain below.
+                && !key.starts_with("*File:proof:")
+                && !key.starts_with("*File:generation:")
                 && !matches!(
                     key.as_str(),
                     "*Control:attempts"
                         | "*Control:probe_after"
                         | "*Cluster:AutomaticControl"
                         | "*Runner:LifecycleTiming"
+                        | "*Recovery:journal-loading"
                 )
         })
         .collect::<Vec<_>>();
@@ -112,10 +118,19 @@ pub(crate) async fn reconcile(shared: &crate::leader::LeaderShared) -> Result<()
     let issuer = shared.authority_identity();
     let mut restore_current = false;
     let scope = format!("{}:{}:{}", issuer.0, issuer.1, issuer.2);
+    // A private automatic-control marker is metadata, not permission to
+    // execute unverified payload. Public export deliberately refuses jobs
+    // whose recovery/writer joins are pending; unrelated pending work must
+    // not prevent a successor from adopting control authority. Only the
+    // exact actor-stamped transitions enter the source proof and Raft CAS.
     let mut locals = shared
-        .engine_projection()
-        .await?
-        .into_values()
+        .engine
+        .recovery_document()
+        .await
+        .map_err(|error| format!("read automatic control metadata: {error}"))?
+        .jobs
+        .into_iter()
+        .filter(|job| transition(job).is_some())
         .collect::<Vec<_>>();
     shared.control_proofs.prune(
         &locals

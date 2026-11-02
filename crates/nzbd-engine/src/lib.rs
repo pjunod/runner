@@ -2281,8 +2281,28 @@ impl EngineHandle {
                 })
                 .await;
         }
-        self.roundtrip_bool(|reply| QueueCommand::RemoveJobSilent { job, reply })
-            .await
+        self.roundtrip_bool(|reply| QueueCommand::RemoveJobSilent {
+            job,
+            accepted_context: None,
+            reply,
+        })
+        .await
+    }
+
+    /// Retire executor state after the authority accepted completion and the
+    /// caller joined the exact grant's writers/execution. A later grant is
+    /// protected by the actor's context check.
+    pub async fn remove_accepted_worker_job(
+        &self,
+        job: JobId,
+        context: nzbd_state::artifacts::WorkerControlContext,
+    ) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::RemoveJobSilent {
+            job,
+            accepted_context: Some(context),
+            reply,
+        })
+        .await
     }
 
     pub async fn set_delegated(

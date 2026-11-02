@@ -889,6 +889,8 @@ pub(crate) struct CopyRequest {
 }
 #[derive(Serialize, Deserialize)]
 struct CopyAuthority {
+    #[serde(default)]
+    result_id: String,
     copy: CopyObligation,
     outcome: String,
     receipt: String,
@@ -926,6 +928,7 @@ async fn authorized_copy(
         .cloned()
         .ok_or("copy cleanup claim changed")?;
     Ok(CopyAuthority {
+        result_id: record.result_id,
         copy,
         outcome: record.delivery.terminal_outcome,
         receipt: if record.receipt_id.is_empty() {
@@ -1068,7 +1071,7 @@ pub(crate) async fn cleanup_copy(
                                 .map_err(|e| e.to_string());
                         }
                         return inventory
-                            .retire_cluster_artifact_copy_with_disposition(
+                            .retire_cluster_artifact_copy_with_result(
                                 &artifact,
                                 &authority.outcome,
                                 nzbd_state::artifacts::FinalizationProof::Cluster {
@@ -1077,6 +1080,7 @@ pub(crate) async fn cleanup_copy(
                                 },
                                 authority.source_disposition.as_deref() == Some("unusable"),
                                 copy.deletion_files.as_deref(),
+                                &authority.result_id,
                             )
                             .map_err(|e| e.to_string());
                     }
@@ -1139,6 +1143,9 @@ pub(crate) async fn cleanup_copy(
         }
         Err(error) => ("retry".into(), Some(error)),
     };
+    if status != "removed" {
+        tracing::debug!(copy=%request.copy_id,owner=%shared.cfg.node_name,%status,error=?error.as_ref().map(|error|error.chars().take(1024).collect::<String>()),"exact source-copy cleanup awaits owner disposition");
+    }
     axum::Json(CopyResult {
         copy_id: request.copy_id,
         claim_id: request.claim_id,
