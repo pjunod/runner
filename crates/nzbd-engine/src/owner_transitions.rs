@@ -1535,6 +1535,181 @@ mod tests {
         })
     }
 
+    async fn finish_fixture_verification(
+        owner: &mut Owner,
+        messages: &mut mpsc::Receiver<EngineMsg>,
+        job: JobId,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while owner.verification.contains_key(&job) {
+                owner.start_verifications();
+                if let Some(state) = owner.verification.get(&job) {
+                    assert_ne!(
+                        state.phase, "blocked",
+                        "recovery unexpectedly blocked: {:?}",
+                        state.reason
+                    );
+                }
+                owner.on_msg(
+                    messages
+                        .recv()
+                        .await
+                        .expect("verification producer must complete"),
+                );
+            }
+        })
+        .await
+        .expect("real verification and durable acceptance must complete");
+    }
+
+    #[tokio::test]
+    async fn journal_fold_before_root_reconciliation_keeps_recovery_loading() {
+        let (_temp, mut owner, _adapter, mut messages) = super::super::tests::control_test_owner();
+        super::super::tests::pump(&mut owner, &mut messages).await;
+        let root = owner.dest_dir.clone();
+        let path = root.join("fixture");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join(".runner-file-1.part"), b"BAD").unwrap();
+        owner.startup_reconciliation.clear();
+        let held = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let _release_on_panic = ReleaseSave(held.clone());
+        let (started, entered) = oneshot::channel();
+        let worker_gate = held.clone();
+        owner.payload_then(
+            root,
+            move || {
+                let _ = started.send(());
+                let mut released = worker_gate.0.lock().unwrap();
+                while !*released {
+                    released = worker_gate.1.wait(released).unwrap();
+                }
+                Ok(())
+            },
+            |_, result| result.unwrap(),
+        );
+        entered.await.unwrap();
+        let (reply, mut adopted) = oneshot::channel();
+        owner.on_command(QueueCommand::AdoptReplicatedAuthority {
+            jobs: vec![payload_record(JobStatus::Completed, b"abc", false)],
+            reply,
+        });
+        // Force journal replay to finish while the actual root worker still
+        // owns its slot. This is the completion order that failed under CI.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                owner.on_msg(
+                    messages
+                        .recv()
+                        .await
+                        .expect("adoption/fold producer must complete"),
+                );
+                if owner.state.job(JobId(1)).is_some_and(|job| {
+                    !job.params
+                        .iter()
+                        .any(|(key, _)| key == "*Recovery:journal-loading")
+                }) && !owner.pending_journal_loads.contains_key(&JobId(1))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("journal fold must complete independently of held payload root");
+        assert!(adopted.try_recv().unwrap().is_ok());
+        owner.start_verifications();
+        let ticket = owner.verification.get(&JobId(1)).unwrap();
+        assert_eq!(ticket.phase, "loading");
+        assert!(!ticket.running && ticket.reason.is_none());
+        assert!(!owner.allocation_cache.contains_key(&JobId(1)));
+        assert!(matches!(
+            owner.state.job(JobId(1)).unwrap().files[0].segments[0].state,
+            SegmentState::Done { .. }
+        ));
+        let (reply, admission) = oneshot::channel();
+        owner.on_command(QueueCommand::BeginPostAdmission {
+            job: JobId(1),
+            reply,
+        });
+        assert!(admission.await.unwrap().is_none());
+        {
+            let mut released = held.0.lock().unwrap();
+            *released = true;
+            held.1.notify_all();
+        }
+        super::super::tests::pump(&mut owner, &mut messages).await;
+        finish_fixture_verification(&mut owner, &mut messages, JobId(1)).await;
+        let recovered = owner.state.job(JobId(1)).unwrap();
+        assert_eq!(recovered.status, JobStatus::Queued);
+        assert_eq!(recovered.files[0].segments[0].state, SegmentState::Pending);
+        assert!(owner.allocation_cache.contains_key(&JobId(1)));
+    }
+
+    #[tokio::test]
+    async fn active_journal_fold_cannot_be_skipped_by_requeued_verification() {
+        let (_temp, mut owner, _adapter, mut messages) = super::super::tests::control_test_owner();
+        super::super::tests::pump(&mut owner, &mut messages).await;
+        let path = owner.dest_dir.join("fixture");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join(".runner-file-1.part"), b"abc").unwrap();
+        owner
+            .state
+            .jobs
+            .push(payload_record(JobStatus::Paused, b"abc", false));
+        owner
+            .artifacts
+            .register_legacy_active(1, &owner.dest_dir, &path)
+            .unwrap();
+        owner
+            .allocation_cache
+            .insert(JobId(1), owner.artifacts.for_job(1).unwrap().unwrap());
+        owner.allocated_jobs.insert(JobId(1));
+        let held = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let _release_on_panic = ReleaseSave(held.clone());
+        let (started, entered) = oneshot::channel();
+        let worker_gate = held.clone();
+        owner.io_then(
+            move || {
+                let _ = started.send(());
+                let mut released = worker_gate.0.lock().unwrap();
+                while !*released {
+                    released = worker_gate.1.wait(released).unwrap();
+                }
+                Ok(())
+            },
+            |_, result| result.unwrap(),
+        );
+        entered.await.unwrap();
+        owner.fold_job_journals(JobId(1));
+        // Simulate the independently finishing allocation path requeuing a
+        // ticket with a valid cache while journal replay still owns its slot.
+        owner.queue_verification(JobId(1));
+        owner.start_verifications();
+        let ticket = owner.verification.get(&JobId(1)).unwrap();
+        assert_eq!(ticket.phase, "loading");
+        assert!(!ticket.running && ticket.reason.is_none());
+        assert!(owner.verification_roots.is_empty());
+        {
+            let mut released = held.0.lock().unwrap();
+            *released = true;
+            held.1.notify_all();
+        }
+        super::super::tests::pump(&mut owner, &mut messages).await;
+        assert!(!owner.pending_journal_loads.contains_key(&JobId(1)));
+        finish_fixture_verification(&mut owner, &mut messages, JobId(1)).await;
+        assert_eq!(owner.state.job(JobId(1)).unwrap().status, JobStatus::Paused);
+        assert!(matches!(
+            owner.state.job(JobId(1)).unwrap().files[0].segments[0].state,
+            SegmentState::Done { .. }
+        ));
+        assert!(owner
+            .state
+            .job(JobId(1))
+            .unwrap()
+            .params
+            .iter()
+            .any(|(key, _)| key == "*File:proof:1"));
+    }
+
     #[tokio::test]
     async fn replicated_only_partial_rebuilds_allocation_and_verifies_legacy_ranges() {
         let temp = tempfile::tempdir().unwrap();

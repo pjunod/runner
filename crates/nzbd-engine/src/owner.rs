@@ -718,6 +718,7 @@ pub(crate) struct Owner {
     deferred_replacements: VecDeque<QueueCommand>,
     pending_writer_birth: HashMap<FileId, u64>,
     allocating_jobs: HashSet<JobId>,
+    pending_journal_loads: HashMap<JobId, (u64, usize)>,
     pending_control_commits: HashSet<JobId>,
     /// Exact queue control revision currently awaiting its durable snapshot.
     /// Unlike the unrelated set of commit barriers, this protects overlapping
@@ -1166,6 +1167,7 @@ impl Owner {
             deferred_replacements: VecDeque::new(),
             pending_writer_birth: HashMap::new(),
             allocating_jobs: HashSet::new(),
+            pending_journal_loads: HashMap::new(),
             pending_control_commits: HashSet::new(),
             pending_control_revisions: HashMap::new(),
             allocated_jobs,
@@ -4269,6 +4271,11 @@ impl Owner {
     ) {
         let state_dir = self.state_dir.clone();
         let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+        let loading = self.pending_journal_loads.entry(job).or_insert((epoch, 0));
+        if loading.0 != epoch {
+            *loading = (epoch, 0);
+        }
+        loading.1 += 1;
         if let Some(state) = self.verification.get(&job) {
             state.cancel.cancel();
         }
@@ -4287,6 +4294,16 @@ impl Owner {
         self.io_then(
             move || JobJournals::replay_job_with_provenance(&state_dir, job),
             move |owner, result| {
+                if let Some(loading) = owner
+                    .pending_journal_loads
+                    .get_mut(&job)
+                    .filter(|loading| loading.0 == epoch)
+                {
+                    loading.1 -= 1;
+                    if loading.1 == 0 {
+                        owner.pending_journal_loads.remove(&job);
+                    }
+                }
                 if owner.job_epochs.get(&job) != Some(&epoch) {
                     callback(
                         owner,
@@ -8326,7 +8343,7 @@ mod tests {
     /// Execute genuine ordered persistence/IO completions before observing a
     /// direct Owner fixture. The worker remains asynchronous and its bounded
     /// result channel is drained exactly as the production owner loop does.
-    async fn pump(owner: &mut Owner, messages: &mut mpsc::Receiver<EngineMsg>) {
+    pub(super) async fn pump(owner: &mut Owner, messages: &mut mpsc::Receiver<EngineMsg>) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 while let Ok(message) = messages.try_recv() { owner.on_msg(message); }
@@ -8808,7 +8825,7 @@ mod tests {
         (tmp, owner, epoch_rx, adapter, engine_messages)
     }
 
-    fn control_test_owner() -> (
+    pub(super) fn control_test_owner() -> (
         tempfile::TempDir,
         Owner,
         crate::backend::BackendAdapterPort,

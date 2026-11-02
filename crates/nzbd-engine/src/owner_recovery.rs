@@ -392,6 +392,19 @@ impl Owner {
         }
         let total_bytes = done_bytes(current);
         let generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+        let missing_allocation = !self.allocation_cache.contains_key(&job);
+        let journal_loading = self
+            .pending_journal_loads
+            .get(&job)
+            .is_some_and(|loading| loading.0 == generation);
+        let loading = !self.startup_roots_ready
+            || missing_allocation
+            || self.allocating_jobs.contains(&job)
+            || journal_loading;
+        let drive_allocation = missing_allocation
+            && self.startup_roots_ready
+            && !self.allocating_jobs.contains(&job)
+            && !self.pending_control_commits.contains(&job);
         if let Some(existing) = self.verification.get_mut(&job) {
             // A resume changes priority, not the number of live storage readers.
             if existing.running {
@@ -403,7 +416,7 @@ impl Owner {
             job,
             VerificationState {
                 generation,
-                phase: "pending".into(),
+                phase: if loading { "loading" } else { "pending" }.into(),
                 reason: None,
                 checked_bytes: 0,
                 total_bytes,
@@ -423,6 +436,12 @@ impl Owner {
         self.dirty = true;
         self.publish_now();
         self.bump_epoch();
+        if drive_allocation {
+            // Missing metadata is a prerequisite, not evidence of unavailable
+            // storage. The allocation marker bounds this nested ticket update
+            // and its actual completion schedules verification when ready.
+            self.queue_payload_recovery(job);
+        }
     }
 
     pub(super) fn start_verifications(&mut self) {
@@ -447,6 +466,11 @@ impl Owner {
                     && !self.pending_control_revisions.contains_key(&job.id)
                     && !self.post_admissions.contains_key(&job.id)
                     && !self.retiring_writers.contains_key(&job.id)
+                    && !self.allocating_jobs.contains(&job.id)
+                    && !self
+                        .pending_journal_loads
+                        .get(&job.id)
+                        .is_some_and(|loading| self.job_epochs.get(&job.id) == Some(&loading.0))
                     && !job
                         .files
                         .iter()
@@ -469,10 +493,7 @@ impl Owner {
                 break;
             }
             let Some(allocation) = self.allocation_cache.get(&job).cloned() else {
-                self.block_verification(
-                    job,
-                    VerificationFailure::unavailable("allocation metadata is unavailable", 0),
-                );
+                self.queue_payload_recovery(job);
                 changed = true;
                 continue;
             };
