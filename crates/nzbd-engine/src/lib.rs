@@ -576,6 +576,7 @@ impl Engine {
             import_state_dir: cfg.state_dir.clone(),
             url_history: cfg.history.clone(),
             url_outbox_external: cfg.persist_guard.is_some(),
+            owner_persist_guard: cfg.persist_guard.clone(),
             cmd_tx: engine_tx,
             shared,
             events,
@@ -687,6 +688,7 @@ pub struct EngineHandle {
     import_state_dir: PathBuf,
     url_history: Option<Arc<nzbd_state::history::HistoryDb>>,
     url_outbox_external: bool,
+    owner_persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     cmd_tx: mpsc::Sender<EngineMsg>,
     shared: SharedSnapshot,
     events: broadcast::Sender<Event>,
@@ -1369,7 +1371,8 @@ impl EngineHandle {
         revision: String,
         by: RetryBy,
     ) -> Result<Result<(), String>, EngineError> {
-        self.release_hold_prepared(job, revision, by, None).await
+        self.release_hold_prepared(job, revision, by, self.owner_persist_guard.clone(), false)
+            .await
     }
 
     /// A leased execution lane must prove that the exact grant remains live
@@ -1381,7 +1384,7 @@ impl EngineHandle {
         by: RetryBy,
         authority: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<Result<(), String>, EngineError> {
-        self.release_hold_prepared(job, revision, by, Some(authority))
+        self.release_hold_prepared(job, revision, by, Some(authority), true)
             .await
     }
 
@@ -1391,9 +1394,10 @@ impl EngineHandle {
         revision: String,
         by: RetryBy,
         authority: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+        worker_checked: bool,
     ) -> Result<Result<(), String>, EngineError> {
         if authority.as_ref().is_some_and(|check| !check()) {
-            return Ok(Err("the worker grant is no longer live".into()));
+            return Ok(Err("execution authority is no longer live".into()));
         }
         let Some(record) = self.export_job(job).await? else {
             return Ok(Err("job not found".into()));
@@ -1410,8 +1414,11 @@ impl EngineHandle {
             .artifacts()
             .for_job(job.0)
             .map_err(|error| EngineError::Lifecycle(error.to_string()))?;
-        let mut guard =
-            hold_release::HoldReleaseGuard::prepare(&record, source.as_ref(), authority);
+        let mut guard = if worker_checked {
+            hold_release::HoldReleaseGuard::prepare(&record, source.as_ref(), authority)
+        } else {
+            hold_release::HoldReleaseGuard::prepare_queue_owner(&record, source.as_ref(), authority)
+        };
         if !self.snapshot().queue_authority && !guard.matches(&self.artifacts(), &record, false) {
             return Ok(Err("a live execution grant is required on this node".into()));
         }
@@ -1465,11 +1472,7 @@ impl EngineHandle {
             .await
             {
                 Ok(Ok(source)) => {
-                    guard = hold_release::HoldReleaseGuard::prepare(
-                        &record,
-                        Some(&source),
-                        guard.authority_callback(),
-                    );
+                    guard = guard.rebind_source(&record, Some(&source));
                     true
                 }
                 Ok(Err(e)) => return Ok(Err(format!("post-processing retry refused: {e}"))),
@@ -1567,8 +1570,14 @@ impl EngineHandle {
         revision: String,
         reason: String,
     ) -> Result<bool, EngineError> {
-        self.reschedule_hold_prepared(job, revision, reason, None)
-            .await
+        self.reschedule_hold_prepared(
+            job,
+            revision,
+            reason,
+            self.owner_persist_guard.clone(),
+            false,
+        )
+        .await
     }
 
     pub async fn reschedule_hold_checked(
@@ -1578,7 +1587,7 @@ impl EngineHandle {
         reason: String,
         authority: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<bool, EngineError> {
-        self.reschedule_hold_prepared(job, revision, reason, Some(authority))
+        self.reschedule_hold_prepared(job, revision, reason, Some(authority), true)
             .await
     }
 
@@ -1588,6 +1597,7 @@ impl EngineHandle {
         revision: String,
         reason: String,
         authority: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+        worker_checked: bool,
     ) -> Result<bool, EngineError> {
         if authority.as_ref().is_some_and(|check| !check()) {
             return Ok(false);
@@ -1599,7 +1609,11 @@ impl EngineHandle {
             .artifacts()
             .for_job(job.0)
             .map_err(|error| EngineError::Lifecycle(error.to_string()))?;
-        let guard = hold_release::HoldReleaseGuard::prepare(&record, source.as_ref(), authority);
+        let guard = if worker_checked {
+            hold_release::HoldReleaseGuard::prepare(&record, source.as_ref(), authority)
+        } else {
+            hold_release::HoldReleaseGuard::prepare_queue_owner(&record, source.as_ref(), authority)
+        };
         self.roundtrip_bool(|reply| QueueCommand::RescheduleHold {
             job,
             revision,

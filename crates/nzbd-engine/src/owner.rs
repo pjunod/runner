@@ -2957,7 +2957,7 @@ impl Owner {
             } => {
                 if self.persistence_fenced
                     || (by == RetryBy::Recovery
-                        && !guard.checked()
+                        && !guard.worker_checked()
                         && self.delegated.contains_key(&job))
                     || !self.state.job(job).is_some_and(|current| {
                         guard.matches(&self.artifacts, current, self.persist)
@@ -3036,7 +3036,7 @@ impl Owner {
             } => {
                 if self.persistence_fenced
                     || (by == RetryBy::Recovery
-                        && !guard.checked()
+                        && !guard.worker_checked()
                         && self.delegated.contains_key(&job))
                     || !self.state.job(job).is_some_and(|current| {
                         guard.matches(&self.artifacts, current, self.persist)
@@ -4538,10 +4538,10 @@ impl Owner {
             .job(job)
             .cloned()
             .ok_or_else(|| "job not found".to_string())?;
-        if by == RetryBy::Recovery && !guard.checked() && self.delegated.contains_key(&job) {
+        if by == RetryBy::Recovery && !guard.worker_checked() && self.delegated.contains_key(&job) {
             return Err("this job is assigned to its worker execution lane".into());
         }
-        if !self.persist && !guard.checked() {
+        if !self.persist && !guard.worker_checked() {
             return Err("this node is not the queue authority".into());
         }
         if !guard.matches(&self.artifacts, &before, self.persist) {
@@ -4657,7 +4657,7 @@ impl Owner {
         guard: &crate::hold_release::HoldReleaseGuard,
     ) -> bool {
         if self.persistence_fenced
-            || (!guard.checked() && self.delegated.contains_key(&job))
+            || (!guard.worker_checked() && self.delegated.contains_key(&job))
             || !self
                 .state
                 .job(job)
@@ -10557,6 +10557,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authority_fence_stops_relocation_midcopy_before_publication_and_recovers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("working");
+        let completed = temporary.path().join("completed");
+        std::fs::create_dir(&completed).unwrap();
+        let valid = Arc::new(AtomicBool::new(true));
+        let armed = Arc::new(AtomicBool::new(false));
+        let scope = Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+        let observed = valid.clone();
+        let watching = scope.clone();
+        let copy_started = armed.clone();
+        let mut config = crate::EngineConfig::single_node(
+            Vec::new(),
+            temporary.path().join("state"),
+            destination.clone(),
+            Tuning::default(),
+            None,
+        );
+        config.persist_guard = Some(Arc::new(move || {
+            if !observed.load(Ordering::SeqCst) {
+                return false;
+            }
+            if let Some(path) = watching.lock().unwrap().as_ref() {
+                for entry in std::fs::read_dir(path).unwrap().flatten() {
+                    if entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".runner-copy-")
+                    {
+                        let length = entry.metadata().unwrap().len();
+                        if length == 0 {
+                            copy_started.store(true, Ordering::SeqCst);
+                        }
+                        if copy_started.load(Ordering::SeqCst) && length >= 65536 {
+                            observed.store(false, Ordering::SeqCst);
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        }));
+        let engine = crate::Engine::spawn(config).await.unwrap();
+        let inventory = engine.artifacts();
+        let mut row = pending_job(95);
+        row.status = JobStatus::PostQueued;
+        row.delivery_lifecycle = true;
+        mark_new_lifecycle_cohort(&mut row);
+        let source = destination.join(&row.dir_name);
+        inventory
+            .allocate_for_delivery(95, &destination, &source, true, true)
+            .unwrap();
+        let payload = vec![17u8; 256 * 1024];
+        std::fs::write(source.join("episode.mkv"), &payload).unwrap();
+        let artifact = inventory
+            .finish(95, &source, &destination, "active")
+            .unwrap();
+        engine.import_job(row, false, false).await.unwrap();
+        let target = completed.join("episode");
+        {
+            let _fault = inventory
+                .inject_relocation_test_fault(95, "copy_chunk", libc::ENOSPC)
+                .unwrap();
+            assert!(inventory
+                .publish_selected_for_delivery_checked(
+                    95,
+                    &target,
+                    artifact.files,
+                    vec![nzbd_state::artifacts::DeliveryFileOutcome {
+                        source_path: "episode.mkv".into(),
+                        publication_path: Some("episode.mkv".into()),
+                        classification: "media".into(),
+                        outcome: "published".into(),
+                        reason: None,
+                        repair_dependency: false,
+                        source_cleanup_status: "pending".into()
+                    }],
+                    &|| Ok(())
+                )
+                .is_err());
+        }
+        engine
+            .hold_job(
+                JobId(95),
+                nzbd_types::HoldCause::Capacity,
+                "move",
+                "volume full",
+            )
+            .await
+            .unwrap();
+        let operation = inventory
+            .pending_relocations(&artifact.id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let movement: serde_json::Value = serde_json::from_str(&operation.request).unwrap();
+        *scope.lock().unwrap() = Some(PathBuf::from(movement["scratch"]["path"].as_str().unwrap()));
+        let revision = engine
+            .export_job(JobId(95))
+            .await
+            .unwrap()
+            .unwrap()
+            .control()
+            .unwrap()
+            .revision;
+        assert!(engine
+            .release_hold(JobId(95), revision, RetryBy::Operator)
+            .await
+            .unwrap()
+            .is_err());
+        assert!(!valid.load(Ordering::SeqCst));
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(source.join("episode.mkv")).unwrap(), payload);
+        assert_eq!(inventory.operation(&operation.id).unwrap().state, "retry");
+        *scope.lock().unwrap() = None;
+        valid.store(true, Ordering::SeqCst);
+        engine.adopt_authority().await.unwrap();
+        let revision = engine
+            .export_job(JobId(95))
+            .await
+            .unwrap()
+            .unwrap()
+            .control()
+            .unwrap()
+            .revision;
+        assert!(engine
+            .release_hold(JobId(95), revision, RetryBy::Operator)
+            .await
+            .unwrap()
+            .is_ok());
+        let delivery = inventory
+            .create_delivery(95, true, Some("authority-fence-recovered"))
+            .unwrap();
+        assert_eq!(delivery.files.len(), 1);
+        assert_eq!(
+            inventory.operation(&operation.id).unwrap().state,
+            "succeeded"
+        );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn worker_reschedule_refuses_expiry_and_same_revision_regrant() {
         use nzbd_state::artifacts::{WorkerControlContext, WORKER_CONTROL_CONTEXT_PARAM};
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -10597,6 +10740,16 @@ mod tests {
             Some(Arc::new(move || observed.load(Ordering::SeqCst))),
         );
         let original = row.control().unwrap();
+        let authority_guard = crate::hold_release::HoldReleaseGuard::prepare_queue_owner(
+            &row,
+            Some(&source),
+            Some(Arc::new(|| true)),
+        );
+        assert!(!authority_guard.worker_checked());
+        assert!(
+            !authority_guard.matches(&owner.artifacts, &row, false),
+            "an authority fence is not a worker grant"
+        );
         assert!(!owner.reschedule_hold(
             row.id,
             &original.revision,
@@ -10688,12 +10841,18 @@ mod tests {
         held.next_retry_at_unix = Some(0);
         owner.state.job_mut(row.id).unwrap().set_control(&held);
         assert!(!owner.reschedule_hold(row.id, &held.revision, "late authority pass"));
+        let current = owner.state.job(row.id).unwrap().clone();
+        let authority_guard = crate::hold_release::HoldReleaseGuard::prepare_queue_owner(
+            &current,
+            Some(&source),
+            Some(Arc::new(|| true)),
+        );
         let (reply, result) = oneshot::channel();
         owner.on_command(QueueCommand::ReleaseResourceHold {
             job: row.id,
             revision: held.revision,
             by: RetryBy::Recovery,
-            guard: Default::default(),
+            guard: authority_guard,
             reply,
         });
         assert!(!result.await.unwrap());

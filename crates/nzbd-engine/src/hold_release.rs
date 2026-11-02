@@ -28,6 +28,7 @@ pub(crate) struct HoldReleaseGuard(Arc<HoldReleaseProof>);
 
 #[derive(Debug, Default)]
 struct HoldReleaseProof {
+    worker_checked: bool,
     authority: Option<ImportAuthority>,
     context: Option<WorkerControlContext>,
     source_bound: bool,
@@ -39,12 +40,40 @@ impl HoldReleaseGuard {
         source: Option<&Artifact>,
         authority: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     ) -> Self {
+        let worker_checked = authority.is_some();
+        Self::build(record, source, authority, worker_checked)
+    }
+    pub(crate) fn prepare_queue_owner(
+        record: &Job,
+        source: Option<&Artifact>,
+        authority: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> Self {
+        Self::build(record, source, authority, false)
+    }
+    fn build(
+        record: &Job,
+        source: Option<&Artifact>,
+        authority: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+        worker_checked: bool,
+    ) -> Self {
         Self(Arc::new(HoldReleaseProof {
+            worker_checked,
             authority: authority.map(ImportAuthority),
             context: WorkerControlContext::for_job(record),
             source_bound: true,
             source: source.map(SourceVersion::from),
         }))
+    }
+    pub(crate) fn rebind_source(&self, record: &Job, source: Option<&Artifact>) -> Self {
+        Self::build(
+            record,
+            source,
+            self.authority_callback(),
+            self.0.worker_checked,
+        )
+    }
+    pub(crate) fn worker_checked(&self) -> bool {
+        self.0.worker_checked
     }
     pub(crate) fn checked(&self) -> bool {
         self.0.authority.is_some()
@@ -73,12 +102,15 @@ impl HoldReleaseGuard {
                 return false;
             }
         }
+        if WorkerControlContext::for_job(current).is_some() && !self.0.worker_checked {
+            return false;
+        }
         if persistent {
             return true;
         }
         // A durable old context is a checkpoint, not evidence that its lease
         // is still live. The execution lane supplies the live grant check.
-        if self.0.authority.is_none() {
+        if !self.0.worker_checked || self.0.authority.is_none() {
             return false;
         }
         let Some(context) = &self.0.context else {
