@@ -139,6 +139,27 @@ async fn explicit_delete_waits_remote_join_before_owner_seal_and_physical_cleanu
         .import_job(job.clone(), false, false)
         .await
         .unwrap();
+    // Main's import ACK precedes its bounded startup verification. The
+    // deletion API intentionally refuses while that owner transition is in
+    // flight; establish the fixture's ready source before granting B work.
+    let imported_until = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match a.runtime.engine.export_job(job.id).await {
+            Ok(Some(_)) => break,
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("job verification or writer retirement is still in progress") =>
+            {
+                assert!(
+                    tokio::time::Instant::now() < imported_until,
+                    "fixture import verification did not finish: {error}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            result => panic!("fixture imported source did not become readable: {result:?}"),
+        }
+    }
     let control = a.runtime.control.as_ref().unwrap();
     control
         .commit_job_delta(&[(7, Some(job.clone()))])
@@ -236,7 +257,16 @@ async fn explicit_delete_waits_remote_join_before_owner_seal_and_physical_cleanu
         .body(axum::body::Body::empty())
         .unwrap();
     let response = client.forward(&a.url, request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "DeleteFiles response: {}",
+        String::from_utf8_lossy(&body)
+    );
     assert!(
         file.exists(),
         "owner A cannot unlink while delegated B still holds its writer"
@@ -351,12 +381,13 @@ async fn explicit_delete_waits_remote_join_before_owner_seal_and_physical_cleanu
             .is_empty(),
         "cancellation cannot fabricate READY"
     );
-    assert!(b
-        .runtime
-        .engine
-        .artifacts()
-        .worker_grant_is_stopped(7, &context)
-        .unwrap());
+    assert!(
+        b.runtime
+            .engine
+            .artifacts()
+            .worker_grant_is_stopped(7, &context)
+            .unwrap()
+    );
     assert!(
         b.runtime
             .engine

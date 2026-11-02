@@ -422,7 +422,24 @@ async fn pending_worker_crc_accepts_real_renewal_and_refuses_expired_or_replaced
                 1,
                 "renewed same-operation import refused"
             );
-            let job = engine.export_job(JobId(8801)).await.unwrap().unwrap();
+            // The import ACK establishes the durable replacement. Startup
+            // verification and stopped-writer joins finish independently, and
+            // the public export correctly refuses that provisional interval.
+            let job = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match engine.export_job(JobId(8801)).await {
+                        Ok(Some(job)) => break job,
+                        Err(nzbd_engine::EngineError::Lifecycle(reason))
+                            if reason == "job verification or writer retirement is still in progress; retry later" =>
+                        {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        other => panic!("accepted worker import did not remain available: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("accepted worker import did not finish verification and writer retirement");
             assert!(matches!(
                 job.files[0].segments[0].state,
                 SegmentState::Done { .. }

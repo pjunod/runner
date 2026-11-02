@@ -192,7 +192,8 @@ impl From<&mut Row<'_>> for RawTarget {
 }
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS cluster_failure_keep(job_id INTEGER PRIMARY KEY,version INTEGER NOT NULL CHECK(version>0),data TEXT NOT NULL CHECK(length(CAST(data AS BLOB))<=1048576)) STRICT",
-    "CREATE INDEX IF NOT EXISTS cluster_deliveries_keep_job ON cluster_deliveries(json_extract(data,'$.delivery.jobId'))",
+    "DROP INDEX IF EXISTS cluster_deliveries_keep_job",
+    "CREATE INDEX IF NOT EXISTS cluster_deliveries_keep_job_valid ON cluster_deliveries(CASE WHEN json_valid(data) THEN json_extract(data,'$.delivery.jobId') END)",
     "CREATE TABLE IF NOT EXISTS cluster_failure_keep_meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL) STRICT",
     "CREATE TRIGGER IF NOT EXISTS cluster_failure_keep_cas BEFORE INSERT ON cluster_failure_keep BEGIN SELECT CASE WHEN EXISTS(SELECT 1 FROM cluster_failure_keep WHERE job_id=NEW.job_id AND version<>NEW.version-1) OR (NOT EXISTS(SELECT 1 FROM cluster_failure_keep WHERE job_id=NEW.job_id) AND NEW.version<>1) THEN RAISE(ABORT,'copy Keep observation changed; retry') END; END",
 ];
@@ -236,9 +237,9 @@ fn write(value: &Preference) -> Result<(String, hiqlite::Params), String> {
 }
 async fn targets(control: &ControlStore, job: u32) -> Result<Vec<Target>, String> {
     // Project only small exact proof; never materialize per-file manifests.
-    let projection = "json_object('id','','owner',json_extract(c.value,'$.ownerNode'),'job',json_extract(d.data,'$.delivery.jobId'),'delivery',d.id,'copy_id',json_extract(c.value,'$.id'),'artifact',json_extract(c.value,'$.artifact'),'local_delivery',json_extract(c.value,'$.localDeliveryId'),'result_ref',json_extract(c.value,'$.resultRef'),'result_id',json_extract(c.value,'$.resultId'),'directory_identity',json_extract(c.value,'$.directoryIdentity'),'initial_keep',json(CASE WHEN json_extract(d.data,'$.delivery.keepSourceOnFailure') THEN 'true' ELSE 'false' END),'removed',json(CASE WHEN json_extract(c.value,'$.status')='removed' THEN 'true' ELSE 'false' END))";
+    let projection = "json_object('id','','owner',json_extract(CASE WHEN json_valid(c.value) THEN c.value ELSE '{}' END,'$.ownerNode'),'job',json_extract(CASE WHEN json_valid(d.data) THEN d.data ELSE '{}' END,'$.delivery.jobId'),'delivery',d.id,'copy_id',json_extract(CASE WHEN json_valid(c.value) THEN c.value ELSE '{}' END,'$.id'),'artifact',json_extract(CASE WHEN json_valid(c.value) THEN c.value ELSE '{}' END,'$.artifact'),'local_delivery',json_extract(CASE WHEN json_valid(c.value) THEN c.value ELSE '{}' END,'$.localDeliveryId'),'result_ref',json_extract(CASE WHEN json_valid(c.value) THEN c.value ELSE '{}' END,'$.resultRef'),'result_id',json_extract(CASE WHEN json_valid(c.value) THEN c.value ELSE '{}' END,'$.resultId'),'directory_identity',json_extract(CASE WHEN json_valid(c.value) THEN c.value ELSE '{}' END,'$.directoryIdentity'),'initial_keep',json(CASE WHEN json_extract(CASE WHEN json_valid(d.data) THEN d.data ELSE '{}' END,'$.delivery.keepSourceOnFailure') THEN 'true' ELSE 'false' END),'removed',json(CASE WHEN json_extract(CASE WHEN json_valid(c.value) THEN c.value ELSE '{}' END,'$.status')='removed' THEN 'true' ELSE 'false' END))";
     let sql = format!(
-        "WITH selected AS (SELECT {projection} AS raw FROM cluster_deliveries d,json_each(d.data,'$.copies') c WHERE json_extract(d.data,'$.delivery.jobId')=?1) SELECT CASE WHEN length(CAST(raw AS BLOB))<=16384 THEN raw ELSE '{{}}' END AS data,length(CAST(raw AS BLOB)) AS bytes FROM selected LIMIT 65"
+        "WITH selected AS (SELECT {projection} AS raw FROM cluster_deliveries d,json_each(CASE WHEN json_valid(d.data) THEN d.data ELSE '{}' END,'$.copies') c WHERE (CASE WHEN json_valid(d.data) THEN json_extract(d.data,'$.delivery.jobId') END)=?1) SELECT CASE WHEN length(CAST(raw AS BLOB))<=16384 THEN raw ELSE '{{}}' END AS data,length(CAST(raw AS BLOB)) AS bytes FROM selected LIMIT 65"
     );
     let rows = control
         .client
