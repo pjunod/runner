@@ -88,6 +88,7 @@ export class NzbdClient {
         || value.sourceCleanup && typeof value.sourceCleanup.status !== 'string') throw new ApiError('Runner returned malformed lifecycle details; refresh and review.');
       return value;
     } catch (error) {
+      if (error instanceof ApiError) throw error;
       if (controller.signal.aborted) throw new ApiError('Runner lifecycle details did not answer within 12 seconds.');
       throw error;
     } finally { clearTimeout(timeout); }
@@ -208,19 +209,24 @@ export class NzbdClient {
   }
 
   private async json<T>(path: string, init: RequestInit = {}): Promise<T> {
-    return this.readJson<T>(await this.request(path, init));
+    return this.request(path, init, response => this.readJson<T>(response));
   }
 
-  private async request(path: string, init: RequestInit = {}): Promise<Response> {
+  private async request<T = Response>(path: string, init: RequestInit = {}, read?: (response: Response) => Promise<T>): Promise<T> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 12_000);
+    const abort = () => controller.abort();
+    init.signal?.addEventListener('abort', abort, { once: true });
+    if (init.signal?.aborted) abort();
     try {
-      return await fetch(`${this.config.baseUrl}${path}`, {
+      const response = await fetch(`${this.config.baseUrl}${path}`, {
         ...init,
         headers: this.headers(init.headers as Record<string, string> | undefined),
-        signal: init.signal ?? controller.signal,
+        signal: controller.signal,
       });
+      return read ? await read(response) : response as T;
     } catch (error) {
+      if (error instanceof ApiError) throw error;
       if (controller.signal.aborted) {
         throw new ApiError('The Runner server did not answer within 12 seconds.');
       }
@@ -229,6 +235,7 @@ export class NzbdClient {
       );
     } finally {
       clearTimeout(timeout);
+      init.signal?.removeEventListener('abort', abort);
     }
   }
 

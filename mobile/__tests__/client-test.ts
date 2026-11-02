@@ -87,3 +87,47 @@ test('202 Keep response remains pending even if an optional body omits applicati
   const client = new NzbdClient({ baseUrl: 'https://nzbd.example.test', username: '', password: '', token: '' });
   expect((await client.setFailureKeep(42, true)).applied).toBe(false);
 });
+
+test.each(['timeout', 'external', 'already-aborted'])('request composes %s abort with its own deadline', async mode => {
+  jest.useFakeTimers();
+  try {
+    const external = new AbortController();
+    const remove = jest.spyOn(external.signal, 'removeEventListener');
+    if (mode === 'already-aborted') external.abort();
+    mockedFetch.mockReset();
+    mockedFetch.mockImplementation(async (_url, init) => new Promise((_resolve, reject) => {
+      const signal = init!.signal!;
+      if (signal.aborted) reject(new Error('aborted'));
+      else signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    }));
+    const client = new NzbdClient({ baseUrl: 'http://test', username: '', password: '', token: '' });
+    const request = client.getJobs(external.signal);
+    const rejected = expect(request).rejects.toThrow();
+    if (mode === 'external') external.abort();
+    if (mode === 'timeout') await jest.advanceTimersByTimeAsync(12_000);
+    await rejected;
+    expect(mockedFetch.mock.calls[0][1]!.signal).not.toBe(external.signal);
+    expect(mockedFetch.mock.calls[0][1]!.signal!.aborted).toBe(true);
+    expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
+  } finally { jest.useRealTimers(); }
+});
+
+test('pending jobs body remains bounded after headers arrive', async () => {
+  jest.useFakeTimers();
+  try {
+    mockedFetch.mockReset();
+    mockedFetch.mockImplementation(async (_url, init) => ({ok:true,status:200,text:()=>new Promise((_resolve,reject)=>{
+      init!.signal!.addEventListener('abort',()=>reject(new Error('aborted')),{once:true});
+    })} as any));
+    const client = new NzbdClient({ baseUrl: 'http://test', username: '', password: '', token: '' });
+    const pending = client.getJobs(new AbortController().signal);
+    const rejected = expect(pending).rejects.toThrow('12 seconds');
+    await jest.advanceTimersByTimeAsync(12_000);
+    await rejected;
+  } finally { jest.useRealTimers(); }
+});
+test('bounded JSON parsing preserves provider HTTP error status', async () => {
+  mockedFetch.mockReset(); mockedFetch.mockResolvedValue({ok:false,status:409,text:async()=>JSON.stringify({error:'Source changed'})} as any);
+  const client = new NzbdClient({ baseUrl: 'http://test', username: '', password: '', token: '' });
+  await expect(client.getJobs()).rejects.toMatchObject({status:409,message:'Source changed'});
+});
