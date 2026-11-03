@@ -472,7 +472,7 @@ async fn manager_task(
                     JobStatus::Failed if claim(&gate, job) => {
                         handle_failed_job(
                             &engine, &cfg, &history, &dest_dir, &gate, job, name, health,
-                            &mut last_disposition,
+                            &mut last_disposition, false,
                         )
                         .await;
                     }
@@ -519,7 +519,7 @@ async fn manager_task(
                         Ok(Some(row)) if !row.lifecycle_eligible() => {
                             Err(RestartPostError::NotOwned)
                         }
-                        Ok(Some(mut row)) if row.status == JobStatus::Failed => {
+                        Ok(Some(row)) if row.status == JobStatus::Failed => {
                             let has_cleanup_retry = row.params.iter().any(|(key, _)| {
                                 key == PP_FAILED_CLEANUP_NEXT_RETRY_PARAM
                                     || key == PP_FAILED_CLEANUP_LAST_ERROR_PARAM
@@ -527,24 +527,14 @@ async fn manager_task(
                             if !has_cleanup_retry {
                                 Err(RestartPostError::NotReady)
                             } else {
-                                set_param(&mut row.params, PP_FAILED_CLEANUP_NEXT_RETRY_PARAM, "0".into());
-                                match engine.import_job_if_present(row.clone()).await {
-                                    Ok(true) => {
-                                        handle_failed_job(
-                                            &engine,
-                                            &cfg,
-                                            &history,
-                                            &dest_dir,
-                                            &gate,
-                                            job,
-                                            row.name,
-                                            Health::calc(&row.totals).0,
-                                            &mut last_disposition,
-                                        ).await;
-                                        Ok(())
-                                    }
-                                    Ok(false) => Err(RestartPostError::NotFound),
-                                    Err(_) => Err(RestartPostError::Closed),
+                                if handle_failed_job(
+                                    &engine, &cfg, &history, &dest_dir, &gate, job,
+                                    row.name, Health::calc(&row.totals).0,
+                                    &mut last_disposition, true,
+                                ).await {
+                                    Ok(())
+                                } else {
+                                    Err(RestartPostError::NotReady)
                                 }
                             }
                         }
@@ -668,13 +658,17 @@ async fn handle_failed_job(
     name: String,
     health: u16,
     last_disposition: &mut HashMap<JobId, tokio::time::Instant>,
-) {
+    force_retry: bool,
+) -> bool {
+    if gate.as_ref().is_some_and(|claim| !claim(job)) {
+        return false;
+    }
     let admission = match engine.begin_post_admission(job).await {
         Ok(Some(admission)) => admission,
-        Ok(None) => return,
+        Ok(None) => return false,
         Err(error) => {
             tracing::warn!(job=job.0,%error,"failed-job cleanup awaits owner admission");
-            return;
+            return false;
         }
     };
     let scoped = engine.for_post_admission(&admission);
@@ -695,11 +689,15 @@ async fn handle_failed_job(
         name,
         health,
         last_disposition,
+        force_retry,
     )
     .await;
+    let authorized = admitted_gate.as_ref().is_none_or(|claim| claim(job));
     if let Err(error) = engine.end_post_admission(admission).await {
         tracing::warn!(job=job.0,%error,"failed-job cleanup custody release remains pending");
+        return false;
     }
+    authorized
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -713,6 +711,7 @@ async fn handle_failed_job_admitted(
     name: String,
     health: u16,
     last_disposition: &mut HashMap<JobId, tokio::time::Instant>,
+    force_retry: bool,
 ) {
     // Below critical health: no PP; record history and stamp so the retire
     // sweep moves the job out. Cluster disk admission gates this whole
@@ -721,9 +720,10 @@ async fn handle_failed_job_admitted(
     if exported.as_ref().is_some_and(pp_done) {
         return; // already handled (event/rescan overlap)
     }
-    if exported
-        .as_ref()
-        .is_some_and(|row| row.lifecycle_eligible())
+    if !force_retry
+        && exported
+            .as_ref()
+            .is_some_and(|row| row.lifecycle_eligible())
         && exported.as_ref().is_some_and(|row| {
             param_i64(&row.params, PP_FAILED_CLEANUP_NEXT_RETRY_PARAM).is_some_and(|at| at > now())
         })
@@ -1093,9 +1093,10 @@ async fn handle_failed_job_admitted(
                         // disposition that resolves, or a finalization retrying
                         // after a failed commit, is a different path and stays
                         // immediate.
-                        if last_disposition
-                            .get(&job)
-                            .is_some_and(|at| at.elapsed() < RESCAN_INTERVAL / 2)
+                        if !force_retry
+                            && last_disposition
+                                .get(&job)
+                                .is_some_and(|at| at.elapsed() < RESCAN_INTERVAL / 2)
                         {
                             return;
                         }
@@ -2132,6 +2133,7 @@ async fn scan_queue(
                 j.name.clone(),
                 j.health,
                 last_disposition,
+                false,
             )
             .await;
             continue;
@@ -2181,37 +2183,7 @@ async fn schedule_recoverable_post_retry(engine: &EngineHandle, job: JobId) {
     {
         return;
     }
-    let delay = retry_delay_with_jitter(
-        post_retry_delay_seconds(control.retry_attempt),
-        job,
-        u32::from(control.retry_attempt),
-    );
-    control.retry_attempt = control.retry_attempt.saturating_add(1);
-    control.next_retry_at_unix = Some(
-        now()
-            .saturating_add(delay)
-            .max(control.next_retry_at_unix.unwrap_or(0)),
-    );
-    control.blocked_since_unix.get_or_insert_with(now);
-    control.retry_policy = "scheduled_retry".into();
-    let reason = control
-        .message
-        .split("; retry ")
-        .next()
-        .unwrap_or("recoverable post-processing error")
-        .chars()
-        .take(1200)
-        .collect::<String>();
-    control.message = format!(
-        "{reason}; retry {} scheduled in {} seconds; source retained while Runner retries{}",
-        control.retry_attempt,
-        delay,
-        if now().saturating_sub(control.blocked_since_unix.unwrap_or_else(now)) >= 30 * 60 {
-            "; warning: blocked for at least 30 minutes"
-        } else {
-            ""
-        },
-    );
+    prepare_recoverable_post_retry(&mut control, job, now());
     if !engine
         .schedule_post_retry(
             job,
@@ -2226,6 +2198,39 @@ async fn schedule_recoverable_post_retry(engine: &EngineHandle, job: JobId) {
     {
         tracing::warn!(job = job.0, "recoverable retry schedule was not committed");
     }
+}
+
+fn prepare_recoverable_post_retry(control: &mut nzbd_types::JobControl, job: JobId, at: i64) {
+    let delay = retry_delay_with_jitter(
+        post_retry_delay_seconds(control.retry_attempt),
+        job,
+        u32::from(control.retry_attempt),
+    );
+    control.retry_attempt = control.retry_attempt.saturating_add(1);
+    control.next_retry_at_unix = Some(
+        at.saturating_add(delay)
+            .max(control.next_retry_at_unix.unwrap_or(0)),
+    );
+    control.blocked_since_unix.get_or_insert(at);
+    control.retry_policy = "scheduled_retry".into();
+    let reason = control
+        .message
+        .split("; retry ")
+        .next()
+        .unwrap_or("recoverable post-processing error")
+        .chars()
+        .take(1200)
+        .collect::<String>();
+    control.message = format!(
+        "{reason}; retry {} scheduled in {} seconds; source retained while Runner retries{}",
+        control.retry_attempt,
+        delay,
+        if at.saturating_sub(control.blocked_since_unix.unwrap_or(at)) >= 30 * 60 {
+            "; warning: blocked for at least 30 minutes"
+        } else {
+            ""
+        },
+    );
 }
 
 /// Retain the exact leased worker attempt through recoverable post failures.
@@ -6460,6 +6465,96 @@ mod decision_tests {
     use nzbd_types::{DupeInfo, FileEntry, FileId, JobKind, JobTotals, Segment, SegmentState};
     use std::os::unix::fs::PermissionsExt;
 
+    // Direct pipeline fixtures use the same owner admission as the manager.
+    async fn process_job_ctx(
+        engine: &EngineHandle,
+        cfg: &PostConfig,
+        history: &Arc<HistoryDb>,
+        dest_dir: &Path,
+        job: JobId,
+        ctx: &PpCtx,
+    ) -> Result<PpFinal, PostError> {
+        let admission = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.wait_post_admission(job, &ctx.cancel),
+        )
+        .await
+        .expect("fixture processing admission must settle")
+        .map_err(|error| PostError::Subprocess(error.to_string()))?
+        .expect("fixture must be eligible for processing");
+        let scoped = engine.for_post_admission(&admission);
+        let result = super::process_job_ctx(&scoped, cfg, history, dest_dir, job, ctx).await;
+        engine
+            .end_post_admission(admission)
+            .await
+            .map_err(|error| PostError::Subprocess(error.to_string()))?;
+        result
+    }
+
+    trait FixtureImport {
+        async fn import_fixture_job(
+            &self,
+            job: Job,
+            fold: bool,
+            emit: bool,
+        ) -> Result<(), nzbd_engine::EngineError>;
+    }
+    impl FixtureImport for EngineHandle {
+        async fn import_fixture_job(
+            &self,
+            mut job: Job,
+            fold: bool,
+            emit: bool,
+        ) -> Result<(), nzbd_engine::EngineError> {
+            // Real completed downloads record the publication length alongside
+            // their durable segment ranges. Preserve that evidence in fixtures.
+            for file in &job.files {
+                let key = format!("*File:size:{}", file.id.0);
+                if !file.segments.is_empty()
+                    && file
+                        .segments
+                        .iter()
+                        .all(|segment| matches!(segment.state, SegmentState::Done { .. }))
+                    && !job.params.iter().any(|(name, _)| name == &key)
+                {
+                    let size = file
+                        .segments
+                        .iter()
+                        .map(|segment| match segment.state {
+                            SegmentState::Done { offset, len, .. } => offset + u64::from(len),
+                            _ => unreachable!(),
+                        })
+                        .max()
+                        .unwrap();
+                    job.params.push((key, size.to_string()));
+                }
+            }
+            let id = job.id;
+            self.import_job(job, fold, emit).await?;
+            let settled = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match self.export_job(id).await {
+                        Err(nzbd_engine::EngineError::Lifecycle(reason))
+                            if reason == "job verification or writer retirement is still in progress; retry later" => {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        Ok(Some(_)) => return Ok(()),
+                        Ok(None) => panic!("imported fixture job disappeared"),
+                        Err(error) => return Err(error),
+                    }
+                }
+            })
+            .await;
+            match settled {
+                Ok(result) => result,
+                Err(_) => panic!(
+                    "fixture verification must settle: {:?}",
+                    self.recovery_document().await.unwrap().jobs
+                ),
+            }
+        }
+    }
+
     fn payload_entry(path: &str) -> nzbd_state::artifacts::FileEntry {
         nzbd_state::artifacts::FileEntry {
             path: path.into(),
@@ -6977,6 +7072,7 @@ mod decision_tests {
             HistoryDb::open(&temp.path().join("history.sqlite"), Some(temp.path())).unwrap(),
         );
         let downloads = temp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
         let completed = temp.path().join("completed");
         let mut config = nzbd_engine::EngineConfig::single_node(
             Vec::new(),
@@ -7021,12 +7117,16 @@ mod decision_tests {
         inventory
             .allocate_for_delivery(41, &downloads, &source_path, true, true)
             .unwrap();
-        engine.import_job(request, false, false).await.unwrap();
+
         let source = inventory.for_job(41).unwrap().unwrap();
         std::fs::write(source.path.join("episode-01.mkv"), good_bytes).unwrap();
         std::fs::write(source.path.join("episode-02.mkv"), b"partial").unwrap();
         inventory
             .finish(41, &source.path, &downloads, "active")
+            .unwrap();
+        engine
+            .import_fixture_job(request, false, false)
+            .await
             .unwrap();
 
         let cfg = PostConfig {
@@ -7046,6 +7146,7 @@ mod decision_tests {
             "Some.Release".into(),
             0,
             &mut HashMap::new(),
+            false,
         )
         .await;
 
@@ -7073,6 +7174,7 @@ mod decision_tests {
             HistoryDb::open(&temp.path().join("history.sqlite"), Some(temp.path())).unwrap(),
         );
         let downloads = temp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
         let completed = temp.path().join("completed");
         let mut config = nzbd_engine::EngineConfig::single_node(
             Vec::new(),
@@ -7123,14 +7225,22 @@ mod decision_tests {
         inventory
             .allocate_for_delivery(41, &downloads, &source_path, true, true)
             .unwrap();
-        engine.import_job(request, false, false).await.unwrap();
+
         let source = inventory.for_job(41).unwrap().unwrap();
         std::fs::write(source.path.join("retry-episode.mkv"), bytes).unwrap();
         inventory
             .finish(41, &source.path, &downloads, "active")
             .unwrap();
+        engine
+            .import_fixture_job(request, false, false)
+            .await
+            .unwrap();
         let offline = temp.path().join("downloads-offline");
-        std::fs::rename(&downloads, &offline).unwrap();
+        let admission = engine
+            .begin_post_admission(JobId(41))
+            .await
+            .unwrap()
+            .unwrap();
 
         let cfg = PostConfig {
             completed_dir: Some(completed),
@@ -7143,7 +7253,7 @@ mod decision_tests {
         let tracker = tokio_util::task::TaskTracker::new();
         let manager = spawn_post_manager(
             engine.clone(),
-            cfg,
+            cfg.clone(),
             history.clone(),
             downloads.clone(),
             None,
@@ -7152,9 +7262,60 @@ mod decision_tests {
         );
         // Let the startup scan observe the future retry deadline and hold.
         tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = engine.export_job(JobId(41)).await.unwrap().unwrap();
+        assert_eq!(
+            param_i64(&before.params, PP_FAILURE_DISPOSITION_ATTEMPTS_PARAM),
+            Some(1)
+        );
+        let deadline = param_i64(&before.params, PP_FAILED_CLEANUP_NEXT_RETRY_PARAM);
+        assert!(
+            deadline.unwrap() > now(),
+            "ordinary scan must preserve the future deadline"
+        );
+        assert!(matches!(
+            manager.retry_now(JobId(41)).await,
+            Err(RestartPostError::NotReady)
+        ));
+        let unchanged = engine.export_job(JobId(41)).await.unwrap().unwrap();
+        assert_eq!(
+            param_i64(&unchanged.params, PP_FAILED_CLEANUP_NEXT_RETRY_PARAM),
+            deadline
+        );
+        engine.end_post_admission(admission).await.unwrap();
+        handle_failed_job(
+            &engine,
+            &cfg,
+            &history,
+            &downloads,
+            &None,
+            JobId(41),
+            before.name.clone(),
+            0,
+            &mut HashMap::new(),
+            false,
+        )
+        .await;
+        let scheduled = engine.export_job(JobId(41)).await.unwrap().unwrap();
+        assert_eq!(
+            param_i64(&scheduled.params, PP_FAILED_CLEANUP_NEXT_RETRY_PARAM),
+            deadline
+        );
+        assert_eq!(
+            param_i64(&scheduled.params, PP_FAILURE_DISPOSITION_ATTEMPTS_PARAM),
+            Some(1)
+        );
+        std::fs::rename(&downloads, &offline).unwrap();
         manager.retry_now(JobId(41)).await.unwrap();
 
-        let held = engine.export_job(JobId(41)).await.unwrap().unwrap();
+        // The unavailable root intentionally fences public payload export.
+        let held = engine
+            .recovery_document()
+            .await
+            .unwrap()
+            .jobs
+            .into_iter()
+            .find(|job| job.id == JobId(41))
+            .unwrap();
         assert_eq!(
             param_i64(&held.params, PP_FAILURE_DISPOSITION_ATTEMPTS_PARAM),
             Some(2),
@@ -7191,6 +7352,7 @@ mod decision_tests {
         }
         let temp = tempfile::tempdir().unwrap();
         let downloads = temp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
         let mut config = nzbd_engine::EngineConfig::single_node(
             Vec::new(),
             temp.path().join("queue"),
@@ -7271,6 +7433,7 @@ mod decision_tests {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let downloads = temp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
         let mut config = nzbd_engine::EngineConfig::single_node(
             Vec::new(),
             temp.path().join("queue"),
@@ -7363,6 +7526,7 @@ mod decision_tests {
         }
         let temp = tempfile::tempdir().unwrap();
         let downloads = temp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
         let mut config = nzbd_engine::EngineConfig::single_node(
             Vec::new(),
             temp.path().join("queue"),
@@ -7458,7 +7622,7 @@ mod decision_tests {
         );
         request.status = JobStatus::Failed;
         engine
-            .import_job(request.clone(), false, false)
+            .import_fixture_job(request.clone(), false, false)
             .await
             .unwrap();
         handle_failed_job(
@@ -7474,6 +7638,7 @@ mod decision_tests {
             request.name.clone(),
             100,
             &mut HashMap::new(),
+            false,
         )
         .await;
         let delivery = inventory
@@ -7516,6 +7681,7 @@ mod decision_tests {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let downloads = temp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
         let mut config = nzbd_engine::EngineConfig::single_node(
             Vec::new(),
             temp.path().join("queue"),
@@ -7818,6 +7984,7 @@ mod decision_tests {
             },
         ];
         let first = delivery_stage_snapshot(&inventory, &row).unwrap();
+        inventory.close().unwrap();
         drop(inventory);
         let restarted = nzbd_state::artifacts::Inventory::open(&path).unwrap();
         let replay = delivery_stage_snapshot(&restarted, &row).unwrap();
@@ -7851,16 +8018,20 @@ mod decision_tests {
         job.params.push(("monarr-delivery".into(), "1".into()));
         let inventory = engine.artifacts();
         let downloads = tmp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
         let source_path = downloads.join(nzbd_engine::queue::job_dir_name(&job));
         inventory
             .allocate_for_delivery(41, &downloads, &source_path, true, true)
             .unwrap();
-        engine.import_job(job.clone(), false, false).await.unwrap();
 
         let source = inventory.for_job(41).unwrap().unwrap();
         std::fs::write(source.path.join("movie.mkv"), b"payload").unwrap();
         inventory
             .finish(41, &source.path, &source.root, "active")
+            .unwrap();
+        engine
+            .import_fixture_job(job.clone(), false, false)
+            .await
             .unwrap();
         let source = inventory.refresh_for_delivery(41).unwrap();
         let root = tmp.path().join("completed");
@@ -7933,6 +8104,7 @@ mod decision_tests {
     async fn obfuscated_release(with_par2: bool) -> ObfuscatedRelease {
         let temp = tempfile::tempdir().unwrap();
         let downloads = temp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
         let completed = temp.path().join("completed");
         let history = Arc::new(
             HistoryDb::open(&temp.path().join("history.sqlite"), Some(temp.path())).unwrap(),
@@ -8007,15 +8179,16 @@ mod decision_tests {
         inventory
             .allocate_for_delivery(41, &downloads, &source_path, true, true)
             .unwrap();
-        engine
-            .import_job(request.clone(), false, false)
-            .await
-            .unwrap();
+
         let source = inventory.for_job(41).unwrap().unwrap().path;
         for name in &names {
             std::fs::copy(staging.join(name), source.join(name)).unwrap();
         }
         inventory.finish(41, &source, &downloads, "active").unwrap();
+        engine
+            .import_fixture_job(request.clone(), false, false)
+            .await
+            .unwrap();
         ObfuscatedRelease {
             _temp: temp,
             engine,
@@ -8061,7 +8234,7 @@ mod decision_tests {
         }
 
         /// The publication holds exactly the release-named media.
-        fn assert_published_once(&self) {
+        fn assert_published_once(&self, move_attempts: usize) {
             let published = self.publication();
             assert_eq!(
                 std::fs::read(published.join("Some.Release.mkv")).unwrap(),
@@ -8085,12 +8258,12 @@ mod decision_tests {
                 .collect();
             assert_eq!(
                 moves.len(),
-                1,
-                "selected publication must survive the terminal snapshot"
+                move_attempts,
+                "each publication attempt must survive the terminal snapshot"
             );
             assert!(
-                moves[0].ms.is_some(),
-                "history must freeze a closed Move span"
+                moves.iter().all(|span| span.ms.is_some()),
+                "history must freeze every Move span closed"
             );
         }
     }
@@ -8111,7 +8284,7 @@ mod decision_tests {
             matches!(outcome, Ok(PpFinal::Success)),
             "deobfuscated extraction must publish: {outcome:?}"
         );
-        release.assert_published_once();
+        release.assert_published_once(1);
         assert!(!release
             .publication()
             .join(format!("{}.mkv", release.hash))
@@ -8171,7 +8344,7 @@ mod decision_tests {
                 matches!(outcome, Ok(PpFinal::Success)),
                 "retry (par2={with_par2}) must publish without re-extracting: {outcome:?}"
             );
-            release.assert_published_once();
+            release.assert_published_once(2);
             release.engine.shutdown().await;
         }
     }
@@ -8253,15 +8426,15 @@ mod decision_tests {
         ]);
         assert_eq!(
             summary,
-            "no file has integrity evidence for publication; source retained (Show.S01E01.mkv: no integrity evidence)"
+            "no file has integrity evidence for publication; source retained (Show.S01E01.part01.rar: archive; Show.S01E01.mkv: no integrity evidence)"
         );
         assert_eq!(
             unpublishable_summary(&[row("x.rar", "archive_input", None)]),
-            "no media, book, or audio file was found in the download; source retained"
+            "no file has integrity evidence for publication; source retained (x.rar)"
         );
         assert_eq!(
             PostError::NothingPublishable(summary).to_string(),
-            "nothing publishable: no file has integrity evidence for publication; source retained (Show.S01E01.mkv: no integrity evidence)"
+            "nothing publishable: no file has integrity evidence for publication; source retained (Show.S01E01.part01.rar: archive; Show.S01E01.mkv: no integrity evidence)"
         );
     }
 
@@ -8272,6 +8445,7 @@ mod decision_tests {
         }
         let temp = tempfile::tempdir().unwrap();
         let downloads = temp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
         let completed = temp.path().join("completed");
         let history = Arc::new(
             HistoryDb::open(&temp.path().join("history.sqlite"), Some(temp.path())).unwrap(),
@@ -8320,13 +8494,14 @@ mod decision_tests {
         inventory
             .allocate_for_delivery(41, &downloads, &source_path, true, true)
             .unwrap();
-        engine
-            .import_job(request.clone(), false, false)
-            .await
-            .unwrap();
+
         let source = inventory.for_job(41).unwrap().unwrap().path;
         std::fs::copy(temp.path().join("episode.zip"), source.join("episode.zip")).unwrap();
         inventory.finish(41, &source, &downloads, "active").unwrap();
+        engine
+            .import_fixture_job(request.clone(), false, false)
+            .await
+            .unwrap();
         extract_complete_failed_archives(&engine, &PostConfig::default(), &request, &None)
             .await
             .unwrap();
@@ -8382,6 +8557,7 @@ mod decision_tests {
         }
         let temp = tempfile::tempdir().unwrap();
         let downloads = temp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
         let completed = temp.path().join("completed");
         let history = Arc::new(
             HistoryDb::open(&temp.path().join("history.sqlite"), Some(temp.path())).unwrap(),
@@ -8440,14 +8616,15 @@ mod decision_tests {
         inventory
             .allocate_for_delivery_with_keep(41, &downloads, &source_path, true, true, true)
             .unwrap();
-        engine
-            .import_job(request.clone(), false, false)
-            .await
-            .unwrap();
+
         let source = inventory.for_job(41).unwrap().unwrap().path;
         std::fs::copy(temp.path().join("episode.zip"), source.join("episode.zip")).unwrap();
         std::fs::write(source.join("incomplete.rar"), b"Rar!\x1a\x07partial").unwrap();
         inventory.finish(41, &source, &downloads, "active").unwrap();
+        engine
+            .import_fixture_job(request.clone(), false, false)
+            .await
+            .unwrap();
         extract_complete_failed_archives(&engine, &PostConfig::default(), &request, &None)
             .await
             .unwrap();
@@ -8492,6 +8669,7 @@ mod decision_tests {
             "failed-archive-pack".into(),
             0,
             &mut last_disposition,
+            false,
         )
         .await;
         let delivery = inventory.delivery_for_job(41).unwrap().unwrap();
@@ -8515,6 +8693,7 @@ mod decision_tests {
             "failed-archive-pack".into(),
             0,
             &mut last_disposition,
+            false,
         )
         .await;
         let replayed = inventory.delivery_for_job(41).unwrap().unwrap();
@@ -8547,11 +8726,11 @@ mod decision_tests {
         job.params.push(("monarr-delivery".into(), "1".into()));
         let inventory = engine.artifacts();
         let downloads = tmp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
         let source_path = downloads.join(nzbd_engine::queue::job_dir_name(&job));
         inventory
             .allocate_for_delivery(42, &downloads, &source_path, true, true)
             .unwrap();
-        engine.import_job(job, false, false).await.unwrap();
 
         let source = inventory.for_job(42).unwrap().unwrap();
         std::fs::write(
@@ -8562,6 +8741,7 @@ mod decision_tests {
         inventory
             .finish(42, &source.path, &source.root, "active")
             .unwrap();
+        engine.import_fixture_job(job, false, false).await.unwrap();
         let source = inventory.refresh_for_delivery(42).unwrap();
         let root = tmp.path().join("completed");
         std::fs::create_dir_all(&root).unwrap();
@@ -9279,12 +9459,18 @@ mod decision_tests {
         let mut damaged = bytes;
         damaged[..8192].fill(0);
         std::fs::write(dir.join("payload.bin"), damaged).unwrap();
-        engine.import_job(job, false, false).await.unwrap();
+        engine.import_fixture_job(job, false, false).await.unwrap();
         let count = temp.path().join("verifications");
         let fake = temp.path().join("par-tool.sh");
         std::fs::write(&fake,format!("#!/bin/sh\necho x >> '{}'\necho 'Repair is not possible.'\necho 'You need 1 more recovery blocks to be able to repair.'\nexit 2\n",count.display())).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let feeder_engine = engine.clone();
+        let admission = engine
+            .begin_post_admission(JobId(401))
+            .await
+            .unwrap()
+            .unwrap();
+        let scoped = engine.for_post_admission(&admission);
+        let feeder_engine = scoped.clone();
         let feeder_dir = dir.clone();
         let feeder = tokio::spawn(async move {
             for (name, data) in delayed {
@@ -9303,7 +9489,10 @@ mod decision_tests {
                             len: data.len() as u32,
                             crc: crc32fast::hash(&data),
                         };
-                        feeder_engine.import_job(job, false, false).await.unwrap();
+                        feeder_engine
+                            .import_fixture_job(job, false, false)
+                            .await
+                            .unwrap();
                         break;
                     }
                     tokio::task::yield_now().await;
@@ -9332,7 +9521,7 @@ mod decision_tests {
         };
         let result = tokio::time::timeout(
             Duration::from_secs(8),
-            process_job_ctx(&engine, &cfg, &history, &root, JobId(401), &ctx),
+            super::process_job_ctx(&scoped, &cfg, &history, &root, JobId(401), &ctx),
         )
         .await
         .unwrap()
@@ -9342,6 +9531,7 @@ mod decision_tests {
             .await
             .unwrap()
             .unwrap();
+        engine.end_post_admission(admission).await.unwrap();
         assert_eq!(std::fs::read_to_string(count).unwrap().lines().count(), 2);
         {
             let observed = observations.lock().unwrap();
@@ -9362,6 +9552,7 @@ mod decision_tests {
     async fn deleted_failed_source_replays_terminal_history_without_diagnostics() {
         let temp = tempfile::tempdir().unwrap();
         let downloads = temp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
         let config = nzbd_engine::EngineConfig::single_node(
             Vec::new(),
             temp.path().join("queue"),
@@ -9384,7 +9575,7 @@ mod decision_tests {
         std::fs::write(source.join(".runner-file-1.part"), b"unrecoverable").unwrap();
         inventory.finish(41, &source, &downloads, "active").unwrap();
         engine
-            .import_job(request.clone(), false, false)
+            .import_fixture_job(request.clone(), false, false)
             .await
             .unwrap();
         let cfg = PostConfig {
@@ -9416,6 +9607,7 @@ mod decision_tests {
             request.name.clone(),
             0,
             &mut HashMap::new(),
+            false,
         )
         .await;
         let row = engine.export_job(request.id).await.unwrap().unwrap();
@@ -9488,6 +9680,7 @@ mod decision_tests {
     async fn native_book_containers_publish_without_rename_or_extraction() {
         let temp = tempfile::tempdir().unwrap();
         let downloads = temp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
         let completed = temp.path().join("completed");
         let config = nzbd_engine::EngineConfig::single_node(
             Vec::new(),
@@ -9544,7 +9737,7 @@ mod decision_tests {
         inventory
             .allocate_for_delivery(41, &downloads, &source, true, true)
             .unwrap();
-        engine.import_job(request, false, false).await.unwrap();
+
         for (name, bytes) in payloads {
             std::fs::write(source.join(name), bytes).unwrap();
         }
@@ -9556,6 +9749,10 @@ mod decision_tests {
         )
         .unwrap();
         inventory.finish(41, &source, &downloads, "active").unwrap();
+        engine
+            .import_fixture_job(request, false, false)
+            .await
+            .unwrap();
         let cfg = PostConfig {
             completed_dir: Some(completed),
             deobfuscate_final: false,
@@ -9609,6 +9806,7 @@ mod decision_tests {
     async fn completed_junk_only_attempt_drains_owned_source() {
         let temp = tempfile::tempdir().unwrap();
         let downloads = temp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
         let config = nzbd_engine::EngineConfig::single_node(
             Vec::new(),
             temp.path().join("queue"),
@@ -9628,10 +9826,14 @@ mod decision_tests {
         inventory
             .allocate_for_delivery(41, &downloads, &source, true, true)
             .unwrap();
-        engine.import_job(request, false, false).await.unwrap();
+
         std::fs::write(source.join("readme.txt"), b"junk").unwrap();
         std::fs::write(source.join("orphan.srt"), b"unmatched sidecar").unwrap();
         inventory.finish(41, &source, &downloads, "active").unwrap();
+        engine
+            .import_fixture_job(request, false, false)
+            .await
+            .unwrap();
         let cfg = PostConfig {
             deobfuscate_final: true,
             cleanup: false,
@@ -9699,7 +9901,7 @@ mod decision_tests {
                 released_at_unix: None,
             });
             engine
-                .import_job(request.clone(), false, false)
+                .import_fixture_job(request.clone(), false, false)
                 .await
                 .unwrap();
             schedule_recoverable_post_retry(&engine, request.id).await;
@@ -9718,10 +9920,12 @@ mod decision_tests {
                 "an existing deadline cannot be shortened"
             );
             assert_eq!(scheduled.blocked_since_unix, Some(first_block));
-            assert_eq!(scheduled.retry_policy, "scheduled_retry");
-            assert!(scheduled
-                .message
-                .contains("warning: blocked for at least 30 minutes"));
+            assert_eq!(
+                scheduled.retry_policy,
+                HoldCause::parse(cause).policy().as_str()
+            );
+            assert_eq!(scheduled.retry_attempt, 0);
+            assert_eq!(scheduled.message, "temporarily blocked");
         }
         let expected = engine
             .export_job(JobId(44))
@@ -9730,6 +9934,19 @@ mod decision_tests {
             .unwrap()
             .control()
             .unwrap();
+        // Exercise scheduling itself separately from import's policy migration.
+        let mut unscheduled = expected.clone();
+        unscheduled.retry_attempt = 0;
+        unscheduled.next_retry_at_unix = None;
+        unscheduled.message = "temporarily blocked".into();
+        let scheduled_at = now();
+        prepare_recoverable_post_retry(&mut unscheduled, JobId(44), scheduled_at);
+        assert_eq!(unscheduled.retry_attempt, 1);
+        assert!(unscheduled.next_retry_at_unix.unwrap() > scheduled_at);
+        assert_eq!(unscheduled.blocked_since_unix, Some(first_block));
+        assert!(unscheduled
+            .message
+            .contains("warning: blocked for at least 30 minutes"));
         let mut paused = job(vec![], vec![]);
         paused.id = JobId(45);
         paused.delivery_lifecycle = true;
@@ -9737,7 +9954,10 @@ mod decision_tests {
         let mut manual = expected.clone();
         manual.manual_pause = true;
         paused.set_control(&manual);
-        engine.import_job(paused, false, false).await.unwrap();
+        engine
+            .import_fixture_job(paused, false, false)
+            .await
+            .unwrap();
         schedule_recoverable_post_retry(&engine, JobId(45)).await;
         assert_eq!(
             engine

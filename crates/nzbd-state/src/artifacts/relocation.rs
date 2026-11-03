@@ -46,6 +46,8 @@ struct CleanupSchedule {
     error: Option<String>,
     #[serde(default)]
     wake_revision: u64,
+    #[serde(default)]
+    retry_on_release: bool,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1532,6 +1534,25 @@ impl Inventory {
             {
                 continue;
             }
+            if movement.cleanup.state == CleanupState::Retry && movement.cleanup.retry_on_release {
+                let _guard = self.mutation_guard()?;
+                let mut operation = self.operation(&id)?;
+                let mut movement: Relocation = serde_json::from_str(&operation.request)?;
+                if movement.cleanup.state == CleanupState::Retry
+                    && movement.cleanup.retry_on_release
+                {
+                    movement.cleanup.state = CleanupState::Pending;
+                    movement.cleanup.next_retry = 0;
+                    movement.cleanup.retry_on_release = false;
+                    operation.request = serde_json::to_string(&movement)?;
+                    let mut db = self.db.lock().unwrap();
+                    let tx = db.transaction()?;
+                    save_operation(&tx, &operation)?;
+                    tx.execute("INSERT INTO meta(key,value) VALUES(?1,'1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1", [format!("cleanup-wake:{id}")])?;
+                    tx.execute("UPDATE deliveries SET cleanup_next_retry_at=0 WHERE artifact=?1 AND generation=?2 AND cleanup_status='retry'", params![source.artifact, source.generation])?;
+                    tx.commit()?;
+                }
+            }
             self.retire_relocation_source(&id)?;
         }
         Ok(())
@@ -1589,6 +1610,7 @@ impl Inventory {
                 }
             }
             movement.cleanup.state = CleanupState::Running;
+            movement.cleanup.retry_on_release = false;
             movement.cleanup.attempts = movement.cleanup.attempts.saturating_add(1);
             movement.cleanup.wake_revision =
                 Self::cleanup_wake_revision(&self.db.lock().unwrap(), key)?;
@@ -1633,6 +1655,8 @@ impl Inventory {
             }
             Err(error @ (Error::Io(_) | Error::Sql(_))) => {
                 movement.cleanup.state = CleanupState::Retry;
+                movement.cleanup.retry_on_release =
+                    matches!(&error,Error::Io(e) if e.kind()==std::io::ErrorKind::WouldBlock);
                 let delay =
                     [30, 60, 120, 300][movement.cleanup.attempts.saturating_sub(1).min(3) as usize];
                 movement.cleanup.next_retry = now().saturating_add(delay);
@@ -1853,7 +1877,7 @@ impl Inventory {
             || published.path != movement.destination
             || !matches!(
                 published.state.as_str(),
-                "active" | "completed" | "retained"
+                "active" | "completed" | "retained" | "transferred"
             )
         {
             return Err(Error::Conflict(
@@ -3436,7 +3460,11 @@ mod performance_tests {
         );
         let delivery = db.create_delivery(1, true, Some("performance-1")).unwrap();
         let cleanup = db.retire_delivery_source(&delivery.delivery_id).unwrap();
-        assert_eq!(cleanup.source_cleanup.status, "succeeded");
+        assert_eq!(
+            cleanup.source_cleanup.status, "succeeded",
+            "{:?}",
+            cleanup.source_cleanup
+        );
         assert_eq!(
             crate::fileops::PAYLOAD_READ_BYTES.with(|n| n.get()),
             3 * 131073
@@ -3694,6 +3722,38 @@ mod performance_tests {
     }
 
     #[test]
+    fn custody_release_between_cleanup_ledgers_keeps_delivery_due() {
+        let (tmp, db, root) = setup();
+        let db = std::sync::Arc::new(db);
+        publish(&db, &root, &tmp.path().join("completed"), 1, false);
+        let custody = db.acquire_attempt_use(1).unwrap().unwrap();
+        let generation = custody.source().clone();
+        let delivery = db
+            .create_delivery(1, true, Some("release-between-ledgers"))
+            .unwrap();
+        let other = db.clone();
+        DELIVERY_SETTLE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                drop(custody);
+                other.retire_completed_relocations(&generation).unwrap();
+            }));
+        });
+        let after = db.retire_delivery_source(&delivery.delivery_id).unwrap();
+        assert_eq!(after.source_cleanup.status, "retry");
+        assert!(after.source_cleanup.next_retry_at.unwrap() <= now());
+        assert!(root.join("job-1/media.mkv").exists());
+        db.reconcile_relocations().unwrap();
+        assert_eq!(
+            db.delivery(&delivery.delivery_id)
+                .unwrap()
+                .source_cleanup
+                .status,
+            "succeeded"
+        );
+        assert!(!root.join("job-1").exists());
+    }
+
+    #[test]
     fn deferred_moves_without_delivery_do_not_occupy_cleanup_batch() {
         let (tmp, db, root) = setup();
         let completed = tmp.path().join("completed");
@@ -3721,6 +3781,9 @@ mod performance_tests {
         let source = root.join("job");
         db.allocate_for_delivery(1, &root, &source, true, false)
             .unwrap();
+        // The fault fires after one successful unlink; keep a second file
+        // to demonstrate that retry scheduling preserves unfinished work.
+        std::fs::write(source.join("first.txt"), b"first unlink").unwrap();
         std::fs::write(source.join("media.mkv"), b"original").unwrap();
         fs::RENAME_FAILURE.with(|failure| failure.set(Some(libc::EXDEV)));
         super::super::DELETE_FAIL_AFTER.with(|failure| failure.set(Some(0)));
@@ -3736,6 +3799,17 @@ mod performance_tests {
         assert_eq!(movement.cleanup.state, CleanupState::Retry);
         assert_eq!(movement.cleanup.next_retry, deletion.next_retry);
         assert!(deletion.next_retry > now());
+        let not_due = db.retire_completed_relocations(&SourceGeneration {
+            artifact: movement.source.id.clone(),
+            generation: movement.source.generation.clone(),
+        });
+        assert!(
+            matches!(not_due, Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        let after: Relocation =
+            serde_json::from_str(&db.operation(&moved.operation_id).unwrap().request).unwrap();
+        assert_eq!(after.cleanup.state, CleanupState::Retry);
+        assert_eq!(after.cleanup.next_retry, movement.cleanup.next_retry);
         assert_eq!(
             std::fs::read(source.join("media.mkv")).unwrap(),
             b"original"

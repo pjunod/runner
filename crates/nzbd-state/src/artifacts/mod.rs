@@ -1970,6 +1970,9 @@ impl Inventory {
                 "fresh retention period"
             },
         )?;
+        if !keep {
+            Self::wake_relocation_cleanup(&tx, &a.id, &a.generation)?;
+        }
         tx.commit()?;
         Ok(a)
     }

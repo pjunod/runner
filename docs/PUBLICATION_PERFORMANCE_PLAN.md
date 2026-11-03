@@ -468,9 +468,9 @@ CRC fingerprinting are useful optimizations to preserve.
 | Root cause and plan | Drafted | Source-linked evidence, explicit proof boundaries, and tests defined. |
 | Astra design review | Complete; findings addressed | Seven corrections recorded below; follow-up review found no further material design blockers after the diagram/extraction qualifications recorded below. |
 | Broader I/O audit | Complete | Six findings source-checked; scope and validation recorded in §6. |
-| Rename/copy/publication correction | Candidate implemented; untested | §5.1 integrity and read-budget checks pass. |
-| Cleanup scheduling and Move timing | Candidate implemented; untested | Blocked/due selection and all completion paths pass regressions. |
-| Integration checks and controlled measurements | Not started | Results and remaining limits recorded; required CI green. |
+| Rename/copy/publication correction | Unit regressions green | §5.1 integrity and read-budget checks pass. |
+| Cleanup scheduling and Move timing | Unit regressions green | Blocked/due selection and all completion paths pass regressions. |
+| Integration checks and controlled measurements | Required CI pending; live measurements pending | Results and remaining limits recorded; required CI green. |
 | Deployment and observation | Not started | Qualified build identified on nuc3 and §5.2 checks recorded. |
 
 ### 7.1 Astra findings and dispositions
@@ -499,9 +499,9 @@ publication, makes journal-owned rename primitives metadata-only with owner
 verification, combines PAR MD5/SHA capture for filename restoration, schedules
 cleanup through durable claims, and closes Move before terminal snapshots.
 Read-budget, corruption, restore replay, cleanup deadline/restart/fairness,
-and final-history regressions are written but have not run. Compilation and
-focused Clippy checks are the pre-review checks; unit tests wait for Astra's
-PR review and correction of its findings, as requested.
+and final-history regressions are included. Compilation and focused Clippy
+checks preceded review. Astra cleared the corrected implementation at
+`78bcce3` before the first unit run, as requested.
 
 **Extraction isolation exception:** current extraction workspaces retain
 independent output while the job may perform subsequent naming/repair work.
@@ -533,5 +533,56 @@ following corrections and regressions are included in the next candidate.
 
 The wake revision is a counter in the existing metadata store, not a new
 payload state machine or a digest cache. Eligibility changes still grant no
-new byte authority. Static compilation/Clippy checks pass; these regressions
-remain unrun until Astra verifies the corrections.
+new byte authority. Static compilation/Clippy checks passed before Astra cleared the corrections
+for unit testing. The first run passed the new corruption, recovery, and wake
+regressions but exposed successful-cleanup and custody-release regressions;
+these are being corrected and reviewed before rerunning tests.
+
+
+### 7.3 First unit run and correction scope
+
+The first reviewed run reported 279 state tests passed, seven failed, and two
+ignored; post-processing reported 101 passed and 18 failed. Merge is held.
+The state failures exposed three missing compatibility cases: refreshing the
+published identity after Delivery transfers ownership, preserving the retained
+cluster outcome with the new typed cleanup block, and waking exact-generation
+custody retries in both cleanup ledgers when workers release the source.
+Keep-off must also wake the same cleanup schedule. Added coverage exercises
+Delivery-backed custody release, release between ledger settlements, and
+preservation of genuine I/O backoff. Restart tests explicitly expire injected
+I/O retry deadlines instead of assuming restart cancels durable backoff.
+
+All 18 post-processing failures were reproduced unchanged at base `ea8a402b`
+using an isolated source export and the same build slot/tools. Fixture repairs
+create download roots before direct inventory allocation, feed delayed PAR
+records through owner-issued processing custody, and update stale diagnostic
+expectations. These test repairs do not broaden production import authority.
+Final green results, required CI, and merge will be recorded after validation.
+
+
+### 7.4 Corrected unit results
+
+Astra reviewed the cleanup corrections and the explicit RetryNow mode before
+unit reruns. State is green: **287 passed, two existing ignored**. Post is green:
+**119 passed** with required PAR2/7z tools enabled. The latter includes one
+closed Move span for each executed publication attempt, including a failed
+attempt followed by a successful retry.
+
+The older failed-source RetryNow path also had a real admission bug: replacing
+the whole queue record to clear its deadline started asynchronous verification,
+then immediately attempted processing while that verification blocked admission.
+RetryNow now requests an explicit forced attempt through the existing admission
+wrapper. Only the automatic deadline and debounce are bypassed. Existing gate,
+processing custody, integrity checks, and durable outcome writes still apply;
+denied admission reports NotReady and preserves the stored deadline. Regressions
+cover that refusal, ordinary deadline preservation, an offline-source attempt,
+and successful recovery. The retry calculation has a pure test for the
+30-minute warning, first-block preservation, and attempt increment; normalized
+existing-deadline controls retain their idempotence test.
+
+Local read-budget results are deterministic byte counters, not storage-throughput
+benchmarks. Fresh generic copies read the source once while copying and the
+published destination once; journal-owned primitive renames read no payload.
+A linked publication cleanup that changes ctime retains the additional verified
+refresh described in §3.2. No live nuc3 performance claim is made by these tests.
+Required CI and merge remain pending; production deployment is not yet performed.
