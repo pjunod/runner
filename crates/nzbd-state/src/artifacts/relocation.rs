@@ -83,6 +83,7 @@ type RefreshHook = Box<dyn FnMut(&str)>;
 thread_local! {
     static COPY_CHUNK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static CLEANUP_SETTLE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static DELIVERY_SETTLE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static REFRESH_FILE_HOOK: std::cell::RefCell<Option<RefreshHook>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
@@ -2418,6 +2419,24 @@ impl Inventory {
             &delivery.publication_generation,
             Path::new(&delivery.publication_path),
         );
+        #[cfg(test)]
+        if let Some(hook) = DELIVERY_SETTLE_HOOK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+        // Both durable ledgers settle under the policy writer's guard. A wake
+        // after inner settlement must not be overwritten by this stale result.
+        let _guard = self.mutation_guard()?;
+        let woke: bool = self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations o WHERE artifact=?1 AND state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.generation')=?2 AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup_done'),0)=0 AND COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='cleanup-wake:'||o.id),0)<>COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup.wake_revision'),0))",
+            params![delivery.artifact_id,delivery.publication_generation], |r|r.get(0))?;
+        let result = if woke {
+            Err(Error::CleanupRetry {
+                next_retry: now(),
+                reason: "cleanup eligibility changed before delivery settlement".into(),
+            })
+        } else {
+            result
+        };
         match result {
             Ok(true) => {
                 self.finish_cleanup_attempt(delivery_id, attempt, "succeeded", None)?;
@@ -3648,6 +3667,29 @@ mod performance_tests {
         let movement: Relocation =
             serde_json::from_str(&db.operation(&moved.operation_id).unwrap().request).unwrap();
         assert_eq!(movement.cleanup.state, CleanupState::Retry);
+        assert!(root.join("job-1/unresolved.rar").exists());
+    }
+
+    #[test]
+    fn explicit_retry_between_inner_and_delivery_settlement_remains_due() {
+        let (tmp, db, root) = setup();
+        let db = std::sync::Arc::new(db);
+        let moved = publish(&db, &root, &tmp.path().join("completed"), 1, true);
+        let delivery = db
+            .create_delivery(1, true, Some("wake-between-ledgers"))
+            .unwrap();
+        let other = db.clone();
+        let id = delivery.delivery_id.clone();
+        DELIVERY_SETTLE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                other.retry_delivery_source_cleanup(&id).unwrap();
+            }))
+        });
+        let after = db.retire_delivery_source(&delivery.delivery_id).unwrap();
+        assert_eq!(after.source_cleanup.status, "retry");
+        let movement: Relocation =
+            serde_json::from_str(&db.operation(&moved.operation_id).unwrap().request).unwrap();
+        assert_eq!(movement.cleanup.state, CleanupState::Pending);
         assert!(root.join("job-1/unresolved.rar").exists());
     }
 

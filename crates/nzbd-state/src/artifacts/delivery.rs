@@ -235,7 +235,8 @@ fn read_delivery(db: &Connection, id: &str) -> Result<Delivery> {
         warning: blocked_since
             .filter(|at| now().saturating_sub(*at) >= 1800)
             .map(|_| {
-                "source cleanup has been blocked for at least 30 minutes; retries continue".into()
+                "source cleanup has been blocked for at least 30 minutes; review the recorded cause"
+                    .into()
             }),
         started_at: cleanup_started,
         last_attempt_at: cleanup_last_attempt,
