@@ -615,3 +615,23 @@ candidate. The final affected post unit rerun passes all 119 tests; the six targ
 failure regressions also pass. The requested merge still requires the
 repository's required CI checks to pass. Live nuc3 measurements and deployment
 remain separate pending work.
+
+
+### 7.6 Current-main integration review
+
+Main advanced to `e34f1772` (repair-timeout recovery and cluster shutdown/
+admission corrections) during validation. The branch incorporates it through
+merge `bdd04857`. Astra reviewed the combined code before the next unit run.
+Its interaction finding is addressed: publication-marker and final-timing
+reads use the bounded typed engine-read helper, while marker mutations retain
+a single attempt and typed errors. Delivery uses the same already-captured
+closed timing snapshot as history, removing a second owner export and its
+stale-job fallback. The regression asserts equality of both immutable stage
+snapshots as well as one closed Move span per executed publication attempt.
+Earlier full integration baseline comparisons in §7.5 specifically describe
+`ea8a402b`; they are not measurements of the later main revision.
+
+The combined unit rerun is green: **state 287 passed, two existing ignored;
+post 120 passed**. Combined workspace/all-target compilation and focused
+state/post all-target Clippy also pass. Required CI on the final branch still
+gates merge; no production deployment is performed by this change.

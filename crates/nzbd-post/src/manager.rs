@@ -4432,10 +4432,11 @@ async fn process_job_ctx_from_inner(
                     ));
                 }
                 if job.delivery_lifecycle {
-                    let Some(mut marker) = engine
-                        .export_job(job_id)
-                        .await
-                        .map_err(|error| PostError::Subprocess(error.to_string()))?
+                    let Some(mut marker) =
+                        read_post_job(job_id, "read publication outcome marker", || {
+                            engine.export_job(job_id)
+                        })
+                        .await?
                     else {
                         return Err(PostError::Subprocess(
                             "job vanished before selected publication".into(),
@@ -4451,7 +4452,10 @@ async fn process_job_ctx_from_inner(
                     } else {
                         engine.import_worker_job_if_present(marker).await
                     };
-                    if !marker_commit.map_err(|error| PostError::Subprocess(error.to_string()))? {
+                    if !marker_commit.map_err(|source| PostError::Engine {
+                        operation: "commit publication outcome marker",
+                        source,
+                    })? {
                         return Err(PostError::Subprocess(
                             "publication outcome was not committed".into(),
                         ));
@@ -4491,14 +4495,12 @@ async fn process_job_ctx_from_inner(
         // The selected publication starts after `fin` was exported. Preserve
         // accumulated terminal parameters, but take the closed attempt timeline
         // before either the worker stamp, Delivery, or history freezes it.
-        let timing = engine
-            .export_job(job_id)
-            .await
-            .map_err(|e| PostError::Subprocess(e.to_string()))?
-            .ok_or_else(|| {
-                PostError::Subprocess("job vanished before final timing snapshot".into())
-            })?;
-        fin.stages = timing.stages;
+        let timing = read_post_job(job_id, "read final timing snapshot", || {
+            engine.export_job(job_id)
+        })
+        .await?
+        .ok_or_else(|| PostError::Subprocess("job vanished before final timing snapshot".into()))?;
+        fin.stages = timing.stages.clone();
         if let Some(source) = crate::attempt::current().and_then(|control| control.source.clone()) {
             fin.params
                 .retain(|(key, _)| key != "Artifact:Id" && key != "Artifact:Generation");
@@ -4596,15 +4598,8 @@ async fn process_job_ctx_from_inner(
                     .iter()
                     .find(|(key, _)| key == "Failure:Reason" || key == "Failure:Files")
                     .map(|(_, value)| value.clone());
-                let timing_job = engine
-                    .export_job(job_id)
-                    .await
-                    .map_err(|error| {
-                        PostError::Subprocess(format!("publication timing snapshot: {error}"))
-                    })?
-                    .unwrap_or_else(|| job.clone());
-                let runner_stages = delivery_stage_snapshot(&inventory, &timing_job);
-                let lifecycle_timing = nzbd_engine::frozen_lifecycle_timing(&timing_job);
+                let runner_stages = delivery_stage_snapshot(&inventory, &timing);
+                let lifecycle_timing = nzbd_engine::frozen_lifecycle_timing(&timing);
                 let delivery_inventory = inventory.clone();
                 let delivery = crate::attempt::current()
                     .expect("processing control")
@@ -8300,6 +8295,17 @@ mod decision_tests {
                 "SUCCESS"
             );
             let history = self.history.get(JobId(41)).unwrap().unwrap();
+            let delivery = self
+                .engine
+                .artifacts()
+                .delivery_for_job(41)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                delivery.runner_stages.unwrap().spans,
+                history.stages,
+                "Delivery and history must freeze the same closed timeline"
+            );
             let moves: Vec<_> = history
                 .stages
                 .iter()
