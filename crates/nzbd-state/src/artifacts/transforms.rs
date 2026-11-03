@@ -585,6 +585,9 @@ impl Inventory {
                 if !rename_transition_matches(&entry.identity, &final_identity)
                     || digest_open(&mut final_file.try_clone()?)? != *expected_digest
                     || fs::identity_for_file(&final_file)? != final_identity
+                    || crate::fileops::identity(&crate::fileops::open(
+                        &workspace.source.path.join(&backup),
+                    )?)? != final_identity
                 {
                     return Err(Error::Conflict("retained replay content changed".into()));
                 }
@@ -619,6 +622,9 @@ impl Inventory {
         if !rename_transition_matches(&entry.identity, &observed)
             || digest_open(&mut renamed.try_clone()?)? != digest
             || fs::identity_for_file(&renamed)? != observed
+            || crate::fileops::identity(&crate::fileops::open(
+                &workspace.source.path.join(&backup),
+            )?)? != observed
         {
             return Err(Error::Conflict(
                 "retained original changed during rename".into(),
@@ -1342,6 +1348,7 @@ impl Inventory {
         if !rename_transition_matches(&identity, &observed_identity)
             || digest_open(&mut observed.try_clone()?)? != digest
             || fs::identity_for_file(&observed)? != observed_identity
+            || crate::fileops::identity(&crate::fileops::open(to)?)? != observed_identity
         {
             return Err(Error::Conflict("restore identity changed".into()));
         }
@@ -1571,6 +1578,9 @@ impl Inventory {
                     if !rename_transition_matches(&identity, &final_identity)
                         || digest_open(&mut final_file.try_clone()?)? != digest
                         || fs::identity_for_file(&final_file)? != final_identity
+                        || crate::fileops::identity(&crate::fileops::open(
+                            &source.path.join(&new),
+                        )?)? != final_identity
                     {
                         return Err(Error::Conflict("restore replay content changed".into()));
                     }

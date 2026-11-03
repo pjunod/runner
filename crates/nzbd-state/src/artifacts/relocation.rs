@@ -44,6 +44,8 @@ struct CleanupSchedule {
     next_retry: i64,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    wake_revision: u64,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,12 +78,20 @@ thread_local! { pub(super) static FAULTS: std::cell::RefCell<std::collections::H
 #[cfg(test)]
 thread_local! { pub(super) static FAIL_SOURCE_UNLINK_REFRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
-type CopyGate = Option<(
+type RefreshHook = Box<dyn FnMut(&str)>;
+#[cfg(test)]
+thread_local! {
+    static COPY_CHUNK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static CLEANUP_SETTLE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static REFRESH_FILE_HOOK: std::cell::RefCell<Option<RefreshHook>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+type CopyGate = (
     Identity,
     std::sync::Arc<(std::sync::Barrier, std::sync::Barrier)>,
-)>;
+);
 #[cfg(test)]
-pub(super) static COPY_GATE: std::sync::Mutex<CopyGate> = std::sync::Mutex::new(None);
+pub(super) static COPY_GATE: std::sync::Mutex<Vec<CopyGate>> = std::sync::Mutex::new(Vec::new());
 #[cfg(feature = "test-support")]
 static SHARED_TEST_FAULTS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<(String, String), i32>>,
@@ -120,6 +130,12 @@ impl Inventory {
     }
 }
 fn boundary(stage: &'static str, scope: Option<&Identity>) -> Result<()> {
+    #[cfg(test)]
+    if stage == "copy_chunk" {
+        if let Some(hook) = COPY_CHUNK_HOOK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
     #[cfg(feature = "test-support")]
     if let Some(identity) = scope {
         if let Some(errno) = SHARED_TEST_FAULTS
@@ -136,17 +152,24 @@ fn boundary(stage: &'static str, scope: Option<&Identity>) -> Result<()> {
         return Err(std::io::Error::from_raw_os_error(code).into());
     }
     #[cfg(test)]
-    if matches!(stage, "copy_chunk" | "before_source_cleanup") {
+    if matches!(
+        stage,
+        "copy_chunk" | "before_source_cleanup" | "refresh_file"
+    ) {
         let gate = {
             let mut configured = COPY_GATE.lock().unwrap();
-            if configured
-                .as_ref()
-                .is_some_and(|(expected, _)| scope.is_some_and(|scope| scope == expected))
-            {
-                configured.take().map(|(_, gate)| gate)
-            } else {
-                None
-            }
+            configured
+                .iter()
+                .position(|(expected, _)| {
+                    scope.is_some_and(|scope| {
+                        if stage == "refresh_file" {
+                            scope.same_object(expected)
+                        } else {
+                            scope == expected
+                        }
+                    })
+                })
+                .map(|index| configured.swap_remove(index).1)
         };
         if let Some(gate) = gate {
             gate.0.wait();
@@ -1566,13 +1589,30 @@ impl Inventory {
             }
             movement.cleanup.state = CleanupState::Running;
             movement.cleanup.attempts = movement.cleanup.attempts.saturating_add(1);
+            movement.cleanup.wake_revision =
+                Self::cleanup_wake_revision(&self.db.lock().unwrap(), key)?;
             op.request = serde_json::to_string(&movement)?;
             save_operation(&self.db.lock().unwrap(), &op)?;
         }
         let result = self.retire_relocation_source_inner(key);
+        #[cfg(test)]
+        if let Some(hook) = CLEANUP_SETTLE_HOOK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
         let _guard = self.mutation_guard()?;
         let mut op = self.operation(key)?;
         let mut movement: Relocation = serde_json::from_str(&op.request)?;
+        let wake_revision = Self::cleanup_wake_revision(&self.db.lock().unwrap(), key)?;
+        let result = if result.is_err() && wake_revision != movement.cleanup.wake_revision {
+            // Policy can change while the worker unwinds. Its independently
+            // persisted wake counter cannot be overwritten by copy checkpoints.
+            Err(Error::CleanupRetry {
+                next_retry: now(),
+                reason: "cleanup eligibility changed during the attempt".into(),
+            })
+        } else {
+            result
+        };
         let result = match result {
             Ok(()) => {
                 movement.cleanup.state = if movement.cleanup_done {
@@ -1581,6 +1621,14 @@ impl Inventory {
                     CleanupState::Pending
                 };
                 Ok(())
+            }
+            Err(error @ Error::CleanupRetry { .. }) => {
+                if let Error::CleanupRetry { next_retry, reason } = &error {
+                    movement.cleanup.state = CleanupState::Retry;
+                    movement.cleanup.next_retry = *next_retry;
+                    movement.cleanup.error = Some(reason.clone());
+                }
+                Err(error)
             }
             Err(error @ (Error::Io(_) | Error::Sql(_))) => {
                 movement.cleanup.state = CleanupState::Retry;
@@ -1603,6 +1651,18 @@ impl Inventory {
         result
     }
 
+    fn cleanup_wake_revision(db: &Connection, key: &str) -> Result<u64> {
+        Ok(db
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key=?1",
+                [format!("cleanup-wake:{key}")],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            .max(0) as u64)
+    }
+
     /// Wake permits re-evaluation, never new byte-deletion authority. The
     /// caller holds its policy transaction and exact generation guard.
     pub(super) fn wake_relocation_cleanup(
@@ -1620,13 +1680,15 @@ impl Inventory {
             let mut movement: Relocation = serde_json::from_str(&op.request)?;
             if !movement.cleanup_done
                 && (movement.source.id == artifact || format!("source-{}", op.id) == artifact)
-                && movement.cleanup.state != CleanupState::Running
             {
-                movement.cleanup.state = CleanupState::Pending;
-                movement.cleanup.next_retry = 0;
-                movement.cleanup.error = None;
-                op.request = serde_json::to_string(&movement)?;
-                save_operation(db, &op)?;
+                db.execute("INSERT INTO meta(key,value) VALUES(?1,'1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",[format!("cleanup-wake:{}",op.id)])?;
+                if movement.cleanup.state != CleanupState::Running {
+                    movement.cleanup.state = CleanupState::Pending;
+                    movement.cleanup.next_retry = 0;
+                    movement.cleanup.error = None;
+                    op.request = serde_json::to_string(&movement)?;
+                    save_operation(db, &op)?;
+                }
                 db.execute("UPDATE deliveries SET cleanup_status='retry',cleanup_next_retry_at=0 WHERE artifact=?1 AND generation=?2 AND cleanup_status IN ('blocked','retry')", params![movement.source.id,movement.source.generation])?;
             }
         }
@@ -1723,6 +1785,14 @@ impl Inventory {
                         };
                         let result = self.execute_delete(&deletion.id)?;
                         if result.state != "succeeded" {
+                            if matches!(result.state.as_str(), "retry" | "queued" | "running") {
+                                return Err(Error::CleanupRetry {
+                                    next_retry: result.next_retry.max(now()),
+                                    reason: result
+                                        .error
+                                        .unwrap_or_else(|| "source deletion is pending".into()),
+                                });
+                            }
                             return Err(Error::Conflict(format!(
                                 "source retirement {}: {}",
                                 result.state,
@@ -1855,6 +1925,13 @@ impl Inventory {
                 }
                 let mut hasher = Sha256::new();
                 let mut buffer = [0u8; 64 * 1024];
+                #[cfg(test)]
+                REFRESH_FILE_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().as_mut() {
+                        hook(&actual.path);
+                    }
+                });
+                boundary("refresh_file", Some(&actual.identity))?;
                 loop {
                     let read = file.read(&mut buffer)?;
                     crate::fileops::payload_read(read);
@@ -1874,6 +1951,14 @@ impl Inventory {
             }
         }
         let _guard = self.mutation_guard()?;
+        let rebound = fs::open_dir(&movement.destination)?;
+        if !fs::identity_for_file(&root)?.same_object(&fs::identity_for_file(&rebound)?)
+            || fs::manifest(&rebound, 100_000)? != observed
+        {
+            return Err(Error::Conflict(
+                "published manifest changed during cleanup verification".into(),
+            ));
+        }
         let mut current = self.get(&movement.source.id)?;
         if current.generation != published.generation
             || current.path != published.path
@@ -2383,7 +2468,11 @@ impl Inventory {
                     3 => 120,
                     _ => 300,
                 };
-                let next_retry = now().saturating_add(delay);
+                let next_retry = if let Error::CleanupRetry { next_retry, .. } = error {
+                    next_retry
+                } else {
+                    now().saturating_add(delay)
+                };
                 self.finish_cleanup_attempt(delivery_id, attempt, "retry", Some(&message))?;
                 self.db.lock().unwrap().execute(
                     "UPDATE deliveries SET cleanup_status='retry',cleanup_error=?2,cleanup_next_retry_at=?3,cleanup_blocked_since=COALESCE(cleanup_blocked_since,?4) WHERE id=?1",
@@ -2416,15 +2505,16 @@ impl Inventory {
         delivery_id: &str,
     ) -> Result<crate::artifacts::Delivery> {
         let delivery = self.delivery(delivery_id)?;
-        Self::wake_relocation_cleanup(
-            &self.db.lock().unwrap(),
-            &delivery.artifact_id,
-            &delivery.publication_generation,
-        )?;
-        let changed = self.db.lock().unwrap().execute(
-            "UPDATE deliveries SET cleanup_status='retry',cleanup_error=NULL,cleanup_next_retry_at=0 WHERE id=?1 AND cleanup_status IN ('blocked','retry')",
-            [delivery_id],
-        )?;
+        let changed = {
+            let _guard = self.mutation_guard()?;
+            let db = self.db.lock().unwrap();
+            Self::wake_relocation_cleanup(
+                &db,
+                &delivery.artifact_id,
+                &delivery.publication_generation,
+            )?;
+            db.execute("UPDATE deliveries SET cleanup_status='retry',cleanup_error=NULL,cleanup_next_retry_at=0 WHERE id=?1 AND cleanup_status IN ('blocked','retry')",[delivery_id])?
+        };
         if changed == 0 {
             return self.delivery(delivery_id);
         }
@@ -2494,7 +2584,7 @@ impl Inventory {
         let mut guard = None;
         let raws = {
             let db = self.db.lock().unwrap();
-            let mut stmt = db.prepare("SELECT data FROM operations WHERE (state='running' OR (?2 AND state='review') OR (state='retry' AND COALESCE(json_extract(data,'$.next_retry'),0)<=?1)) AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.root')=?3 AND (?4 IS NULL OR artifact=?4) ORDER BY CASE state WHEN 'review' THEN 1 ELSE 0 END,COALESCE(json_extract(data,'$.next_retry'),0),json_extract(data,'$.created_at'),id AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup.state'),'pending') NOT IN ('blocked','running') AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup.next_retry'),0)<=unixepoch() AND NOT EXISTS(SELECT 1 FROM deliveries d WHERE d.artifact=o.artifact AND d.generation=json_extract(json_extract(o.data,'$.request'),'$.source.generation') AND (d.cleanup_status IN ('blocked','running','succeeded') OR COALESCE(d.cleanup_next_retry_at,0)>unixepoch())) ORDER BY o.rowid LIMIT 25")?;
+            let mut stmt = db.prepare("SELECT data FROM operations WHERE (state='running' OR (?2 AND state='review') OR (state='retry' AND COALESCE(json_extract(data,'$.next_retry'),0)<=?1)) AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.root')=?3 AND (?4 IS NULL OR artifact=?4) ORDER BY CASE state WHEN 'review' THEN 1 ELSE 0 END,COALESCE(json_extract(data,'$.next_retry'),0),json_extract(data,'$.created_at'),id LIMIT 25")?;
             let rows = stmt.query_map(
                 params![
                     now(),
@@ -2692,13 +2782,14 @@ impl Inventory {
                         drop(db);
                         lease.extend_locked(&scratch, &coordinator)?;
                         drop(coordinator);
-                        let published = self.publish_directory_unlocked_checked(
+                        let published = self.publish_directory_with_copy_digests_checked(
                             &mut guard,
                             &scratch.path,
                             &movement.destination,
                             &op.artifact,
                             &publication_key,
                             checkpoint,
+                            Some(&scratch.files),
                         )?;
                         let current_op = self.operation(&op.id)?;
                         if current_op.request != op.request
@@ -2866,14 +2957,16 @@ impl Inventory {
                         lease.extend_locked(&scratch, &coordinator)?;
                         drop(coordinator);
                         let publication_key = format!("{}-copy", op.id);
-                        movement.publication = Some(self.publish_directory_unlocked_checked(
-                            &mut guard,
-                            &scratch.path,
-                            &movement.destination,
-                            &op.artifact,
-                            &publication_key,
-                            checkpoint,
-                        )?);
+                        movement.publication =
+                            Some(self.publish_directory_with_copy_digests_checked(
+                                &mut guard,
+                                &scratch.path,
+                                &movement.destination,
+                                &op.artifact,
+                                &publication_key,
+                                checkpoint,
+                                Some(&scratch.files),
+                            )?);
                         let current_op = self.operation(&op.id)?;
                         if current_op.request != op.request
                             || !matches!(current_op.state.as_str(), "running" | "review" | "retry")
@@ -2951,7 +3044,7 @@ impl Inventory {
         }
         let cleanup = {
             let db = self.db.lock().unwrap();
-            let mut stmt = db.prepare("SELECT data FROM operations o WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.root')=?1 AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup_done'),0)=0 AND json_extract(json_extract(data,'$.request'),'$.source.automatic_cleanup_eligible')=1 AND (COALESCE(json_extract(json_extract(data,'$.request'),'$.defer_source_retirement'),0)=0 OR json_extract(json_extract(data,'$.request'),'$.publication_files') IS NOT NULL OR EXISTS (SELECT 1 FROM deliveries d WHERE d.artifact=o.artifact AND d.generation=json_extract(json_extract(o.data,'$.request'),'$.source.generation'))) AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup.state'),'pending') NOT IN ('blocked','running') AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup.next_retry'),0)<=unixepoch() AND NOT EXISTS(SELECT 1 FROM deliveries d WHERE d.artifact=o.artifact AND d.generation=json_extract(json_extract(o.data,'$.request'),'$.source.generation') AND (d.cleanup_status IN ('blocked','running','succeeded') OR COALESCE(d.cleanup_next_retry_at,0)>unixepoch())) ORDER BY o.rowid LIMIT 25")?;
+            let mut stmt = db.prepare("SELECT data FROM operations o WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.root')=?1 AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup_done'),0)=0 AND json_extract(json_extract(data,'$.request'),'$.source.automatic_cleanup_eligible')=1 AND (COALESCE(json_extract(json_extract(data,'$.request'),'$.defer_source_retirement'),0)=0 OR EXISTS (SELECT 1 FROM deliveries d WHERE d.artifact=o.artifact AND d.generation=json_extract(json_extract(o.data,'$.request'),'$.source.generation')) OR EXISTS (SELECT 1 FROM workspace_finalizations f WHERE f.source=o.artifact AND f.generation=json_extract(json_extract(o.data,'$.request'),'$.source.generation') AND f.activated=1 AND json_extract(f.proof,'$.kind')='cluster')) AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup.state'),'pending') NOT IN ('blocked','running') AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup.next_retry'),0)<=unixepoch() AND NOT EXISTS(SELECT 1 FROM deliveries d WHERE d.artifact=o.artifact AND d.generation=json_extract(json_extract(o.data,'$.request'),'$.source.generation') AND (d.cleanup_status IN ('blocked','running','succeeded') OR COALESCE(d.cleanup_next_retry_at,0)>unixepoch())) ORDER BY o.rowid LIMIT 25")?;
             let rows =
                 stmt.query_map([root.to_string_lossy().as_ref()], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -3403,6 +3496,212 @@ mod performance_tests {
         let after: Relocation =
             serde_json::from_str(&db.operation(&moved.operation_id).unwrap().request).unwrap();
         assert_eq!(before.cleanup.attempts, after.cleanup.attempts);
+    }
+
+    #[test]
+    fn recovery_copies_reject_corruption_against_the_streamed_source_digest() {
+        use std::io::Write;
+        for fault in ["before_move", "copy_chunk"] {
+            let (tmp, db, root) = setup();
+            let source = root.join("job");
+            db.allocate_for_delivery(1, &root, &source, true, true)
+                .unwrap();
+            std::fs::write(source.join("media.mkv"), vec![23; 131073]).unwrap();
+            let original = db.refresh_for_delivery(1).unwrap();
+            let selected = original.files.clone();
+            let outcomes = vec![DeliveryFileOutcome {
+                source_path: "media.mkv".into(),
+                publication_path: Some("media.mkv".into()),
+                classification: "video".into(),
+                outcome: "published".into(),
+                reason: None,
+                repair_dependency: false,
+                source_cleanup_status: "pending".into(),
+            }];
+            let completed = tmp.path().join("completed");
+            FAULTS.with(|faults| {
+                faults.borrow_mut().insert(fault, libc::EIO);
+            });
+            assert!(db
+                .publish_selected_for_delivery_checked(
+                    1,
+                    &completed.join("release"),
+                    selected,
+                    outcomes,
+                    &|| Ok(())
+                )
+                .is_err());
+            let mut operation: Operation = {
+                let connection = db.db.lock().unwrap();
+                let raw:String=connection.query_row("SELECT data FROM operations WHERE artifact=?1 AND json_extract(data,'$.kind')='relocate' ORDER BY rowid DESC LIMIT 1",[&original.id],|r|r.get(0)).unwrap();
+                serde_json::from_str(&raw).unwrap()
+            };
+            operation.next_retry = 0;
+            save_operation(&db.db.lock().unwrap(), &operation).unwrap();
+            COPY_CHUNK_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let temp = std::fs::read_dir(&completed)
+                        .unwrap()
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.file_name().to_string_lossy().starts_with(".runner-"))
+                        .flat_map(|e| std::fs::read_dir(e.path()).unwrap().filter_map(|e| e.ok()))
+                        .find(|e| e.file_name().to_string_lossy().starts_with(".runner-copy-"))
+                        .unwrap();
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(temp.path())
+                        .unwrap()
+                        .write_all(b"!")
+                        .unwrap();
+                }))
+            });
+            db.reconcile_relocations().unwrap();
+            assert_ne!(
+                db.operation(&operation.id).unwrap().state,
+                "succeeded",
+                "corruption must not become the recovery publisher's expected checksum"
+            );
+            assert_eq!(
+                std::fs::read(source.join("media.mkv")).unwrap(),
+                vec![23; 131073]
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_rechecks_earlier_files_after_hashing_later_files() {
+        let (tmp, db, root) = setup();
+        let source = root.join("job");
+        db.allocate_for_delivery(1, &root, &source, true, true)
+            .unwrap();
+        for name in ["a.mkv", "b.mkv"] {
+            std::fs::write(source.join(name), b"original").unwrap();
+        }
+        let original = db.refresh_for_delivery(1).unwrap();
+        let outcomes = original
+            .files
+            .iter()
+            .map(|f| DeliveryFileOutcome {
+                source_path: f.path.clone(),
+                publication_path: Some(f.path.clone()),
+                classification: "video".into(),
+                outcome: "published".into(),
+                reason: None,
+                repair_dependency: false,
+                source_cleanup_status: "pending".into(),
+            })
+            .collect();
+        let target = tmp.path().join("completed/release");
+        super::super::publication::FORCE_LINK_PUBLICATION.with(|force| force.set(true));
+        db.publish_selected_for_delivery_checked(1, &target, original.files, outcomes, &|| Ok(()))
+            .unwrap();
+        let delivery = db.create_delivery(1, true, Some("refresh-batch")).unwrap();
+        let first = target.join("a.mkv");
+        let modified = std::fs::metadata(&first).unwrap().modified().unwrap();
+        REFRESH_FILE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                if path == "b.mkv" {
+                    std::fs::write(&first, b"modified").unwrap();
+                    std::fs::File::options()
+                        .write(true)
+                        .open(&first)
+                        .unwrap()
+                        .set_modified(modified)
+                        .unwrap();
+                }
+            }))
+        });
+        assert_eq!(
+            db.retire_delivery_source(&delivery.delivery_id)
+                .unwrap()
+                .source_cleanup
+                .status,
+            "blocked"
+        );
+        REFRESH_FILE_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(std::fs::read(source.join("a.mkv")).unwrap(), b"original");
+        assert_eq!(std::fs::read(source.join("b.mkv")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn explicit_retry_during_running_cleanup_is_not_lost_when_attempt_blocks() {
+        let (tmp, db, root) = setup();
+        let db = std::sync::Arc::new(db);
+        let moved = publish(&db, &root, &tmp.path().join("completed"), 1, true);
+        let delivery = db
+            .create_delivery(1, true, Some("wake-during-settle"))
+            .unwrap();
+        let other = db.clone();
+        let id = delivery.delivery_id.clone();
+        CLEANUP_SETTLE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                other.retry_delivery_source_cleanup(&id).unwrap();
+            }))
+        });
+        assert_eq!(
+            db.retire_delivery_source(&delivery.delivery_id)
+                .unwrap()
+                .source_cleanup
+                .status,
+            "retry"
+        );
+        let movement: Relocation =
+            serde_json::from_str(&db.operation(&moved.operation_id).unwrap().request).unwrap();
+        assert_eq!(movement.cleanup.state, CleanupState::Retry);
+        assert!(root.join("job-1/unresolved.rar").exists());
+    }
+
+    #[test]
+    fn deferred_moves_without_delivery_do_not_occupy_cleanup_batch() {
+        let (tmp, db, root) = setup();
+        let completed = tmp.path().join("completed");
+        for job in 1..=25 {
+            publish(&db, &root, &completed, job, false);
+        }
+        publish(&db, &root, &completed, 26, false);
+        let delivery = db
+            .create_delivery(26, true, Some("ready-after-deferred"))
+            .unwrap();
+        db.reconcile_relocations().unwrap();
+        assert_eq!(
+            db.delivery(&delivery.delivery_id)
+                .unwrap()
+                .source_cleanup
+                .status,
+            "succeeded"
+        );
+        assert!(root.join("job-1/media.mkv").exists());
+    }
+
+    #[test]
+    fn transient_delete_operation_remains_a_retry_with_its_original_deadline() {
+        let (tmp, db, root) = setup();
+        let source = root.join("job");
+        db.allocate_for_delivery(1, &root, &source, true, false)
+            .unwrap();
+        std::fs::write(source.join("media.mkv"), b"original").unwrap();
+        fs::RENAME_FAILURE.with(|failure| failure.set(Some(libc::EXDEV)));
+        super::super::DELETE_FAIL_AFTER.with(|failure| failure.set(Some(0)));
+        let moved = db
+            .relocate(1, &tmp.path().join("completed/release"))
+            .unwrap();
+        let movement: Relocation =
+            serde_json::from_str(&db.operation(&moved.operation_id).unwrap().request).unwrap();
+        let deletion = db
+            .operation(&format!("retire-{}", moved.operation_id))
+            .unwrap();
+        assert_eq!(deletion.state, "retry");
+        assert_eq!(movement.cleanup.state, CleanupState::Retry);
+        assert_eq!(movement.cleanup.next_retry, deletion.next_retry);
+        assert!(deletion.next_retry > now());
+        assert_eq!(
+            std::fs::read(source.join("media.mkv")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            std::fs::read(moved.published_path.join("media.mkv")).unwrap(),
+            b"original"
+        );
     }
 
     #[test]

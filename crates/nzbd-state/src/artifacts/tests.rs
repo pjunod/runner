@@ -1460,7 +1460,10 @@ fn resumed_relocation_does_not_restore_artifact_after_concurrent_delete() {
 
     let reopened = Arc::new(Inventory::open(&tmp.path().join("state")).unwrap());
     let gate = Arc::new((Barrier::new(2), Barrier::new(2)));
-    *relocation::COPY_GATE.lock().unwrap() = Some((expected_source_identity, gate.clone()));
+    relocation::COPY_GATE
+        .lock()
+        .unwrap()
+        .push((expected_source_identity.clone(), gate.clone()));
     let worker_inventory = reopened.clone();
     let worker = std::thread::spawn(move || worker_inventory.reconcile_relocations());
     gate.0.wait();
@@ -1484,7 +1487,10 @@ fn resumed_relocation_does_not_restore_artifact_after_concurrent_delete() {
     }
     gate.1.wait();
     worker.join().unwrap().unwrap();
-    *relocation::COPY_GATE.lock().unwrap() = None;
+    relocation::COPY_GATE
+        .lock()
+        .unwrap()
+        .retain(|(identity, _)| !identity.same_object(&expected_source_identity));
 
     let artifact = reopened.get(&source_artifact.id).unwrap();
     assert_eq!(artifact.state, "deleted");
@@ -2867,7 +2873,10 @@ fn keep_enabled_between_source_lookup_and_unlink_retains_failed_incidental_bytes
         .identity
         .unwrap();
     let gate = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
-    *relocation::COPY_GATE.lock().unwrap() = Some((identity, gate.clone()));
+    relocation::COPY_GATE
+        .lock()
+        .unwrap()
+        .push((identity, gate.clone()));
     let worker_db = db.clone();
     let worker =
         std::thread::spawn(move || worker_db.retire_delivery_source(&delivery.delivery_id));

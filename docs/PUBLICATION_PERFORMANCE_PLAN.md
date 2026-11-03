@@ -514,3 +514,24 @@ for that path. The broader writer/torrent follow-ups in §6 remain separate.
 
 Controlled measurements, required CI, merge, and deployment remain pending.
 Documentation validation and static checks are not unit-test results.
+
+### 7.2 Implementation PR review before unit tests
+
+Draft [PR #270](https://github.com/pjunod/runner/pull/270) was reviewed by Astra
+at `ccb2194` before any unit tests ran. The review requested changes; the
+following corrections and regressions are included in the next candidate.
+
+| Finding | Correction and regression |
+|---|---|
+| P1 · Cleanup filtering broke the pending-move SQL query | Restore the original pending query; keep due/readiness predicates in the separate succeeded-cleanup query. Reconciliation/recovery tests exercise preparation. |
+| P1 · Recovery copies dropped the streamed source digest | Pass copy evidence through both recovery branches and validate supplied proof against existing publication journals. Corrupt copies during both initial-scratch and resumed-scratch recovery and require refusal. |
+| P1 · Earlier files could change during a later cleanup hash | Rebind the root and recheck the complete manifest before refreshing identities or permitting source retirement. Mutate file A while file B is being verified and require both originals to remain. |
+| P1 · Verified descriptors were not rebound to final names | Reopen full anchored source/destination paths at the proof boundary, including rename owners. Replace a destination ancestor before readback and require refusal even though the old descriptor still contains valid bytes. |
+| P1 · Transient delete journals became permanent blocks | Preserve typed retry/in-flight state and the deletion journal's deadline; report active deletion custody as contention. Inject deletion I/O failure and require a scheduled retry. |
+| P2 · Policy wakeups could be lost during claim settlement | Persist a per-operation wake revision outside mutable relocation checkpoints and compare it before settling a failed attempt. Explicitly retry during settlement and require a due retry rather than a permanent block. |
+| P2 · Deferred moves without handoff authority could starve due work | Require Delivery or activated cluster acceptance before batch selection. Place 25 unready moves before eligible work and require that work to complete. |
+
+The wake revision is a counter in the existing metadata store, not a new
+payload state machine or a digest cache. Eligibility changes still grant no
+new byte authority. Static compilation/Clippy checks pass; these regressions
+remain unrun until Astra verifies the corrections.

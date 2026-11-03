@@ -72,6 +72,8 @@ pub enum Error {
     Conflict(String),
     #[error("{0}")]
     CleanupBlocked(String),
+    #[error("{reason}")]
+    CleanupRetry { next_retry: i64, reason: String },
     #[error("artifact not found")]
     NotFound,
 }
@@ -2591,16 +2593,15 @@ impl Inventory {
             save_operation(&self.db.lock().unwrap(), &op)?;
             return Ok(op);
         }
-        if (self.artifact_in_use(&a)? && !self.authorized_processing_use(&a, use_guard))
-            || (a.keep && !explicit_cancellation)
-            || a.hold.is_some()
-            || !a.owned
-        {
+        if self.artifact_in_use(&a)? && !self.authorized_processing_use(&a, use_guard) {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+        }
+        if (a.keep && !explicit_cancellation) || a.hold.is_some() || !a.owned {
             return Err(Error::Conflict("payload acquired a hold".into()));
         }
         _lease = self
             .reserve_reconciliation_locked(std::slice::from_ref(&a), use_guard, &guard)?
-            .ok_or_else(|| Error::Conflict("deletion custody is already active".into()))?;
+            .ok_or_else(|| Error::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)))?;
         op.state = "running".into();
         op.attempts += 1;
         a.state = "deleting".into();

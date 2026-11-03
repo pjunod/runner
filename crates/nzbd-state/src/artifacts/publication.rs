@@ -293,6 +293,14 @@ fn verified_target<'a>(
             return Err(Error::Conflict("publication entry identity changed".into()));
         }
     }
+    let rebound = fs::open_dir(&p.target)?;
+    if !identity.same_object(&fs::identity_for_file(&rebound)?)
+        || fs::manifest(&rebound, 100_000)? != files
+    {
+        return Err(Error::Conflict(
+            "publication manifest changed during verification".into(),
+        ));
+    }
     Ok(PublishedDirectory {
         identity,
         files,
@@ -519,6 +527,34 @@ impl Inventory {
         }
         let baseline_request = op.request.clone();
         let mut hashes_added = false;
+        if let Some(expected) = expected {
+            if p.files.len() != expected.len() {
+                return Err(Error::Conflict("resumed copy manifest changed".into()));
+            }
+            for (file, proof) in p.files.iter_mut().zip(expected) {
+                let identity_matches = if p.linked {
+                    controlled_link_matches(&file.identity, &proof.identity)
+                } else {
+                    file.identity == proof.identity
+                };
+                if file.path != proof.path
+                    || !identity_matches
+                    || (!file.identity.directory && proof.digest.is_none())
+                    || file
+                        .digest
+                        .as_ref()
+                        .is_some_and(|digest| Some(digest) != proof.digest.as_ref())
+                {
+                    return Err(Error::Conflict(
+                        "resumed publication disagrees with source copy digest".into(),
+                    ));
+                }
+                if file.digest.is_none() && proof.digest.is_some() {
+                    file.digest.clone_from(&proof.digest);
+                    hashes_added = true;
+                }
+            }
+        }
         if p.files
             .iter()
             .any(|entry| !entry.identity.directory && entry.digest.is_none())

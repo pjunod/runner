@@ -7,6 +7,8 @@ use std::path::{Component, Path};
 
 #[cfg(test)]
 thread_local! { pub(crate) static PAYLOAD_READ_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+thread_local! { static BEFORE_COPY_READBACK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
 #[inline]
 pub(crate) fn payload_read(bytes: usize) {
     #[cfg(test)]
@@ -164,8 +166,13 @@ pub fn copy_publish_checked(
     );
     match fs::open_at(&parent, basename, false) {
         Ok(mut existing) => {
+            let existing_identity = fs::identity_for_file(&existing)?;
             let expected = hash(&mut input)?;
-            if hash(&mut existing)? == expected && fs::identity_for_file(&input)? == identity {
+            if hash(&mut existing)? == expected
+                && fs::identity_for_file(&input)? == identity
+                && fs::identity_for_file(&open(target)?)? == existing_identity
+                && fs::identity_for_file(&open(source)?)? == identity
+            {
                 return Ok(());
             }
             return Err(Error::Conflict(
@@ -202,7 +209,7 @@ pub fn copy_publish_checked(
             )
         };
         use std::os::fd::FromRawFd;
-        let (mut output, expected) = if fd < 0 {
+        let (output, expected) = if fd < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() != std::io::ErrorKind::AlreadyExists {
                 return Err(e.into());
@@ -266,10 +273,18 @@ pub fn copy_publish_checked(
         // namespace mutation so link/unlink ctime changes do not cause scans.
         fs::unlink(&parent, Path::new(&tmp_name), false)?;
         fs::sync_directory(&parent)?;
-        if hash(&mut published)? != expected || fs::identity_for_file(&input)? != identity {
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_COPY_READBACK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+        let verified_identity = fs::identity_for_file(&published)?;
+        if hash(&mut published)? != expected
+            || fs::identity_for_file(&input)? != identity
+            || fs::identity_for_file(&open(target)?)? != verified_identity
+            || fs::identity_for_file(&open(source)?)? != identity
+        {
             return Err(Error::Conflict("publication source or copy changed".into()));
         }
-        output.flush()?;
         Ok(())
     }
     #[cfg(not(unix))]
@@ -337,6 +352,28 @@ pub fn writer(path: &Path, create: bool) -> Result<File> {
 #[cfg(test)]
 mod copy_budget_tests {
     use super::*;
+
+    #[test]
+    fn final_readback_rejects_replaced_ancestor_even_when_old_descriptor_is_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        std::fs::write(&source, b"original").unwrap();
+        let parent = tmp.path().join("destination");
+        std::fs::create_dir(&parent).unwrap();
+        let target = parent.join("media");
+        let parked = tmp.path().join("parked");
+        let replacement = target.clone();
+        BEFORE_COPY_READBACK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(&parent, &parked).unwrap();
+                std::fs::create_dir(&parent).unwrap();
+                std::fs::write(&replacement, b"replaced").unwrap();
+            }))
+        });
+        assert!(copy_publish_checked(&source, &target, &|| Ok(())).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+        assert_eq!(std::fs::read(&target).unwrap(), b"replaced");
+    }
 
     #[test]
     fn fresh_copy_reads_each_source_and_destination_byte_once() {
