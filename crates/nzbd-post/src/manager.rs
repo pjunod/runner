@@ -2035,6 +2035,38 @@ fn job_keeps_failed_source(job: &Job) -> bool {
         .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1")
 }
 
+/// Retry only a read: an owner deadline does not cancel an issued mutation.
+/// In particular, a brief owner stall at the Keep boundary must neither
+/// authorize disposal from a stale snapshot nor restart a failed PAR repair.
+async fn read_post_job<F, Fut>(
+    job: JobId,
+    operation: &'static str,
+    mut read: F,
+) -> Result<Option<Job>, PostError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Job>, nzbd_engine::EngineError>>,
+{
+    for attempt in 0..3 {
+        if let Some(control) = crate::attempt::current() {
+            control.checkpoint()?;
+        }
+        match read().await {
+            Ok(job) => return Ok(job),
+            Err(nzbd_engine::EngineError::Timeout(_)) if attempt < 2 => {
+                tracing::warn!(
+                    job = job.0,
+                    operation,
+                    "engine read timed out; retaining source and retrying the read"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(source) => return Err(PostError::Engine { operation, source }),
+        }
+    }
+    unreachable!("last read returns its result")
+}
+
 /// Convert a completed failure action into a node-independent history fact.
 /// A successor that observes an already-completed Delete/Park must emit the
 /// same immutable payload as the authority that performed it. Failed actions
@@ -4192,13 +4224,13 @@ async fn process_job_ctx_from_inner(
     // disposal boundary so a stale PP snapshot cannot silently discard a
     // newly requested retention (or preserve a source after Keep was cleared).
     let keep_at_disposition = if outcome != PpFinal::Success {
-        engine
-            .export_job(job_id)
-            .await
-            .map_err(|e| PostError::Subprocess(format!("read live Keep setting: {e}")))?
-            .as_ref()
-            // A disappearing job cannot authorize deleting its source.
-            .is_none_or(job_keeps_failed_source)
+        read_post_job(job_id, "read live Keep setting", || {
+            engine.export_job(job_id)
+        })
+        .await?
+        .as_ref()
+        // A disappearing job cannot authorize deleting its source.
+        .is_none_or(job_keeps_failed_source)
     } else {
         false
     };
@@ -4234,7 +4266,9 @@ async fn process_job_ctx_from_inner(
     // final stage is the one an operator looks at first.
     stages.finish().await;
     // Stamp + set final status in one import (replaces the job atomically).
-    if let Ok(Some(mut fin)) = engine.export_job(job_id).await {
+    if let Some(mut fin) =
+        read_post_job(job_id, "read terminal job", || engine.export_job(job_id)).await?
+    {
         fin.params.retain(|(key, _)| key != PP_DONE_PARAM);
         fin.params
             .push((PP_DONE_PARAM.into(), outcome.as_str().into()));
@@ -4460,7 +4494,10 @@ async fn process_job_ctx_from_inner(
             if !engine
                 .import_worker_job_if_present(fin)
                 .await
-                .map_err(|e| PostError::Subprocess(format!("remote terminal stamp: {e}")))?
+                .map_err(|source| PostError::Engine {
+                    operation: "remote terminal stamp",
+                    source,
+                })?
             {
                 return Err(PostError::Subprocess(
                     "remote terminal stamp was not committed".into(),
@@ -4702,7 +4739,10 @@ async fn process_job_ctx_from_inner(
         if !engine
             .import_job_if_present(fin.clone())
             .await
-            .map_err(|e| PostError::Subprocess(format!("durable terminal stamp: {e}")))?
+            .map_err(|source| PostError::Engine {
+                operation: "durable terminal stamp",
+                source,
+            })?
         {
             return Err(PostError::Subprocess(
                 "terminal stamp was not durably committed".into(),
@@ -5033,6 +5073,15 @@ fn select_delivery_payload(
 /// The hold cause when post-processing stops with `error`: whether retrying
 /// can help, decided by the errno where there is one.
 fn post_hold_cause(error: &PostError) -> HoldCause {
+    if matches!(
+        error,
+        PostError::Engine {
+            source: nzbd_engine::EngineError::Timeout(_) | nzbd_engine::EngineError::Closed,
+            ..
+        }
+    ) {
+        return HoldCause::EngineUnavailable;
+    }
     // Its detail names payload files; a release title must never steer the
     // cause through the substring checks below.
     if matches!(error, PostError::NothingPublishable(_)) {
@@ -8200,6 +8249,71 @@ mod decision_tests {
                 "restore source changed identity".into()
             )),
             HoldCause::IdentityConflict
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_reads_retry_timeouts_and_use_the_live_keep_setting() {
+        for keep in [false, true] {
+            let mut live = job(vec![], vec![]);
+            if keep {
+                live.params
+                    .push(("*Runner:KeepOnFailure".into(), "1".into()));
+            }
+            let mut calls = 0;
+            let current = read_post_job(live.id, "read live Keep setting", || {
+                calls += 1;
+                std::future::ready(if calls < 3 {
+                    Err(nzbd_engine::EngineError::Timeout(
+                        "waiting for the owner reply",
+                    ))
+                } else {
+                    Ok(Some(live.clone()))
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(calls, 3);
+            assert_eq!(job_keeps_failed_source(&current), keep);
+        }
+        let mut calls = 0;
+        let error = read_post_job(JobId(41), "read live Keep setting", || {
+            calls += 1;
+            std::future::ready(Err(nzbd_engine::EngineError::Timeout(
+                "waiting for the owner reply",
+            )))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls, 3, "persistent stalls leave the bounded read loop");
+        assert_eq!(post_hold_cause(&error), HoldCause::EngineUnavailable);
+        assert!(post_hold_cause(&error).policy().timed());
+        assert!(!error.to_string().contains("subprocess"));
+        assert!(!error.to_string().contains("shutting down"));
+        for source in [
+            nzbd_engine::EngineError::Closed,
+            nzbd_engine::EngineError::OwnershipLost,
+        ] {
+            let mut source = Some(source);
+            let mut calls = 0;
+            let error = read_post_job(JobId(41), "read terminal job", || {
+                calls += 1;
+                std::future::ready(Err(source.take().expect("no retry of non-timeout errors")))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(calls, 1);
+            assert!(matches!(error, PostError::Engine { .. }));
+        }
+        let absent = read_post_job(JobId(41), "read live Keep setting", || {
+            std::future::ready(Ok(None))
+        })
+        .await
+        .unwrap();
+        assert!(
+            absent.as_ref().is_none_or(job_keeps_failed_source),
+            "a disappearing job must never authorize disposal"
         );
     }
 

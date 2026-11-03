@@ -36,11 +36,12 @@ pub(crate) async fn run(handle: EngineHandle, cancel: CancellationToken) {
             _ = tick.tick() => {}
         }
         passes = passes.wrapping_add(1);
-        if pass(&handle, passes.is_multiple_of(REOBSERVE_EVERY))
-            .await
-            .is_err()
-        {
-            break; // engine closed
+        match pass(&handle, passes.is_multiple_of(REOBSERVE_EVERY)).await {
+            Err(crate::EngineError::Closed) => break,
+            Err(error) => {
+                tracing::warn!(%error, "hold recovery pass unavailable; retrying on the next pass");
+            }
+            Ok(_) => {}
         }
     }
 }

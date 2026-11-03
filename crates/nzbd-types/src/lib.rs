@@ -577,6 +577,8 @@ pub const CONTROL_PARAM: &str = "*Control:v1";
 /// the same way every time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HoldCause {
+    /// The queue owner did not answer a control request in time.
+    EngineUnavailable,
     /// The storage under the job stopped answering (ENOTCONN, EIO, ESTALE…):
     /// a dropped network/FUSE mount, or the state volume refusing a save.
     StorageUnavailable,
@@ -642,7 +644,8 @@ impl HoldPolicy {
 
 impl HoldCause {
     /// Every cause this build writes, for tests that must cover the set.
-    pub const ALL: [HoldCause; 10] = [
+    pub const ALL: [HoldCause; 11] = [
+        HoldCause::EngineUnavailable,
         HoldCause::StorageUnavailable,
         HoldCause::Capacity,
         HoldCause::Quota,
@@ -657,6 +660,7 @@ impl HoldCause {
 
     pub fn as_str(&self) -> &str {
         match self {
+            HoldCause::EngineUnavailable => "engine_unavailable",
             HoldCause::StorageUnavailable => "storage_unavailable",
             HoldCause::Capacity => "capacity",
             HoldCause::Quota => "quota",
@@ -682,7 +686,9 @@ impl HoldCause {
     /// The one table.
     pub fn policy(&self) -> HoldPolicy {
         match self {
-            HoldCause::StorageUnavailable | HoldCause::MissingTool => HoldPolicy::ScheduledRetry,
+            HoldCause::EngineUnavailable
+            | HoldCause::StorageUnavailable
+            | HoldCause::MissingTool => HoldPolicy::ScheduledRetry,
             HoldCause::Capacity | HoldCause::Quota | HoldCause::Allocation => {
                 HoldPolicy::ResumeSameJob
             }

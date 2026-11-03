@@ -224,6 +224,22 @@ ranges despite 100% article health. When no usable PAR bytes are known, the UI
 says **recovery data unconfirmed** instead of presenting the 85% fallback as a
 repair guarantee.
 
+A control-request timeout during failed-repair cleanup preserves the source.
+Runner retries the live Keep read up to three times, with a one-second wait
+between reads. If the owner still cannot answer, the job carries
+`cause=engine_unavailable`, `retry_policy=scheduled_retry` and a retry time.
+The normal hold backoff applies; a timeout does not establish bad payload data
+or authorize deletion. Issued mutations are not replayed by the read retry.
+The hold recovery task continues after request timeouts.
+
+On upgrade, the exact legacy hold `subprocess failed: read live Keep setting:
+engine is shutting down` is re-armed automatically. Manual pauses remain in
+force. Once Runner can read the live job again, a failed repair completes as
+`PAR_FAILURE` in History, preserving files when Keep is set. Other review holds
+retain their existing policy. The
+`legacy_repair_timeout_recovers_automatically_and_records_terminal_failure`
+regression checks this recovery with Keep both set and clear.
+
 Multipart posts may use a different obfuscated yEnc filename in every article.
 Runner keeps the first safe confirmed filename for that NZB file, including any
 collision suffix, while requiring all articles to declare the same total size.

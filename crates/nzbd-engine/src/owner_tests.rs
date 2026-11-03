@@ -2386,6 +2386,57 @@ async fn every_hold_cause_has_an_exit() {
     }
 }
 
+#[tokio::test]
+async fn automatic_hold_recovery_survives_an_owner_request_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut handle = crate::Engine::spawn(crate::EngineConfig::single_node(
+        vec![],
+        temp.path().join("state"),
+        temp.path().join("dest"),
+        crate::Tuning::default(),
+        None,
+    ))
+    .await
+    .unwrap();
+    handle.import_job(bare_job(), false, false).await.unwrap();
+    assert!(handle
+        .hold_job(
+            JobId(1),
+            HoldCause::EngineUnavailable,
+            "par_repair",
+            "owner reply timed out"
+        )
+        .await
+        .unwrap());
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.jobs[0]
+        .control
+        .as_mut()
+        .unwrap()
+        .next_retry_at_unix = Some(0);
+    assert!(handle.shutdown().await);
+    // Retain a due hold and a live command channel whose receiver stalls.
+    // Only the reply deadline, rather than a closed channel, may end a pass.
+    handle.shared = Arc::new(ArcSwap::from_pointee(snapshot));
+    let (sender, mut receiver) = mpsc::channel(1);
+    handle.cmd_tx = sender;
+    let cancel = CancellationToken::new();
+    tokio::time::pause();
+    let recovery = tokio::spawn(crate::hold_recovery::run(handle, cancel.clone()));
+    let first = tokio::time::timeout(Duration::from_secs(20), receiver.recv())
+        .await
+        .unwrap()
+        .expect("first recovery pass sends an owner request");
+    let second = tokio::time::timeout(Duration::from_secs(30), receiver.recv())
+        .await
+        .expect("recovery must run another pass after the owner deadline")
+        .expect("the recovery service must remain alive after a timeout");
+    assert!(!recovery.is_finished());
+    cancel.cancel();
+    drop((first, second));
+    recovery.await.unwrap();
+}
+
 /// §3.3: `import_job` keeps a held fence, which is why a scheduling
 /// write that went through it could never land. The fence stays; the
 /// schedule now lives in `hold_job`, and only owner methods change it.
@@ -2623,6 +2674,30 @@ fn rearm_reclassifies_by_errno_and_derives_policy() {
         "due on the first pass"
     );
     assert_eq!(fixed.revision, "5");
+    // #2301: a control deadline at the failed-repair Keep boundary.
+    let legacy = hold(
+        "post_failure",
+        "review",
+        "subprocess failed: read live Keep setting: engine is shutting down",
+    );
+    let fixed = rearmed_hold(legacy.clone(), 1000).expect("legacy timeout is re-armed");
+    assert_eq!(fixed.cause, "engine_unavailable");
+    assert_eq!(fixed.retry_policy, "scheduled_retry");
+    assert_eq!(fixed.next_retry_at_unix, Some(1000));
+    assert_eq!(fixed.blocked_since_unix, legacy.blocked_since_unix);
+    assert_eq!(fixed.revision, "5");
+    assert!(!fixed.message.contains("shutting down"));
+    let mut manual = legacy.clone();
+    manual.manual_pause = true;
+    assert!(rearmed_hold(manual, 1000).unwrap().manual_pause);
+    for cause in ["identity_conflict", "io"] {
+        let mut other = legacy.clone();
+        other.cause = cause.into();
+        assert!(rearmed_hold(other, 1000).is_none());
+    }
+    let mut unrelated = legacy;
+    unrelated.message.push_str(" in a payload filename");
+    assert!(rearmed_hold(unrelated, 1000).is_none());
     // #2183 exactly.
     assert!(rearmed_hold(
         hold(

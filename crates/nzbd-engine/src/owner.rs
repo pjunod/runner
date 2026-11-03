@@ -9699,6 +9699,16 @@ pub(crate) fn rearmed_hold(
     if cause == nzbd_types::HoldCause::Io && crate::is_storage_unavailable(&control.message) {
         cause = nzbd_types::HoldCause::StorageUnavailable;
     }
+    // Older builds called a control-request timeout a shutdown and turned
+    // this exact failed-repair cleanup error into a permanent review hold.
+    // Do not infer retryability from arbitrary subprocess output or titles.
+    if cause == nzbd_types::HoldCause::PostFailure
+        && control.message.split("; retry ").next()
+            == Some("subprocess failed: read live Keep setting: engine is shutting down")
+    {
+        cause = nzbd_types::HoldCause::EngineUnavailable;
+        control.message = "read live Keep setting: engine request was unavailable; retrying failed-job finalization".into();
+    }
     let policy = cause.policy();
     let unscheduled = policy.timed() && control.next_retry_at_unix.is_none();
     if control.cause == cause.as_str() && control.retry_policy == policy.as_str() && !unscheduled {
