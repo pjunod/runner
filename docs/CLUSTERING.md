@@ -248,6 +248,10 @@ voter set as well as a successful linearizable quorum read. A learner that
 can forward reads is still unready. During takeover, control reconciliation
 reads actor-stamped queue metadata while payload recovery remains fenced;
 pending payload verification must not restart authority adoption repeatedly.
+Shutdown revokes cluster work and closes control streams before joining
+background tasks, so a pending quorum request cannot block the stop of a
+minority node. Accepted Raft writes drain through control shutdown, and owned
+filesystem workers are still joined before the engine closes.
 
 ## Configuration checklist
 

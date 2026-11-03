@@ -581,22 +581,27 @@ impl ClusterRuntime {
             .merge(proxied)
     }
 
-    /// Stop cluster tasks, then flush the engine.
+    /// Revoke cluster work, close control requests, then join and flush.
     pub async fn shutdown(&self) -> bool {
         if let Some(worker) = &self.history_worker {
             worker.stop();
         }
         self.cancel.cancel();
-        self.tracker.wait().await;
-        self.leader_shared.control_proofs.shutdown().await;
-        let mut complete = self.engine.shutdown().await;
-
+        let mut complete = true;
+        // A task may be awaiting a quorum request when the final voter loses
+        // its peers. Close the owned Raft/client streams before joining those
+        // tasks, so their pending requests resolve rather than deadlock with
+        // the control shutdown that used to follow tracker.wait(). Raft owns
+        // the accepted-write drain; filesystem workers are still joined below.
         if let Some(control) = &self.control {
             if let Err(error) = control.shutdown().await {
                 tracing::warn!(%error, "replicated control shutdown did not complete cleanly");
                 complete = false;
             }
         }
+        self.tracker.wait().await;
+        self.leader_shared.control_proofs.shutdown().await;
+        complete &= self.engine.shutdown().await;
         complete
     }
 }

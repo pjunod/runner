@@ -198,6 +198,7 @@ fast-check-rust: ## Reviewed merge candidate: compile/lint Rust and run bounded 
 	$(CARGO) fmt --all --check
 	$(CARGO) check --workspace --all-targets --locked
 	$(CARGO) clippy --workspace --all-targets --locked -- -D warnings
+	$(CARGO) test --manifest-path vendor/hiqlite/Cargo.toml --locked --no-default-features --features sqlite --lib api_stream_stop_watch_ignores_live_updates_and_observes_terminal_states
 	$(CARGO) test --locked -p nzbd-cluster --lib
 	$(CARGO) test --locked -p nzbd-cluster --test cluster_e2e -- --test-threads=1
 
