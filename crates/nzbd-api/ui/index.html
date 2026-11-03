@@ -371,8 +371,54 @@ try {
 
   .cfg-meta { color: var(--muted); font-size: 12px; margin-top: 12px; line-height: 1.5; }
   .cfg-meta code { color: var(--ink2); }
-  #history-sync, #history-loading { margin: 8px 0; font-size: 12px; overflow-wrap: anywhere; }
-  #history-sync button { margin: 4px 8px; }
+  #history-loading { margin: 8px 0; font-size: 12px; overflow-wrap: anywhere; }
+  #history-sync { margin: 18px 0 20px; padding: 0; overflow: hidden;
+    border: 1px solid var(--line); border-radius: 10px; background: var(--panel); font-size: 13px; color: var(--ink);
+    --sync-tone: var(--ink2); border-left: 3px solid var(--sync-tone); }
+  .sync-top { display: flex; gap: 14px; align-items: flex-start; padding: 18px 20px 14px; }
+  .sync-symbol { color: var(--sync-tone); flex: none; margin-top: 2px; width: 20px; height: 20px; }
+  .sync-content { flex: 1; min-width: 0; }
+  .sync-heading { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .sync-heading h2 { font-size: 14px; line-height: 1.4; margin: 0; font-weight: 650; letter-spacing: -.1px; }
+  .sync-badge { font-size: 10px; line-height: 1.6; padding: 1px 7px; border-radius: 5px; color: var(--sync-tone);
+    background: color-mix(in srgb,var(--sync-tone) 12%,transparent); font-weight: 650; }
+  .sync-message { font-size: 13px; line-height: 1.6; color: var(--ink2); margin: 7px 0 0; max-width: 75ch; }
+  .sync-meta { display: flex; flex-wrap: wrap; gap: 4px 16px; color: var(--muted); font-size: 11.5px; margin-top: 10px; }
+  .sync-meta strong { font-weight: 500; color: var(--ink2); }
+  #history-sync button { margin: 0; white-space: nowrap; font-size: 12px; padding: 6px 11px; color: var(--ink2); }
+  .sync-details { border-top: 1px solid var(--line); }
+  .sync-details summary { padding: 10px 20px; cursor: pointer; color: var(--ink2); font-size: 11.5px; user-select: none; }
+  .sync-details summary:hover { color: var(--ink); }
+  .sync-diagnostics { padding: 4px 20px 18px; }
+  .sync-metrics { display: grid; grid-template-columns: repeat(4,minmax(0,1fr));
+    gap: 18px; margin: 4px 0 17px; }
+  .sync-metrics dt { font-size: 10.5px; color: var(--muted); margin-bottom: 4px; }
+  .sync-metrics dd { font-size: 12px; color: var(--ink2); margin: 0; font-variant-numeric: tabular-nums; }
+  .sync-storage { display: grid; grid-template-columns: 100px minmax(0,1fr); gap: 7px 12px; font-size: 11.5px; margin: 0; }
+  .sync-storage dt { color: var(--muted); }
+  .sync-storage dd { margin: 0; color: var(--ink2); overflow-wrap: anywhere; }
+  .sync-storage code { font: 11px/1.6 var(--font-mono); }
+  .sync-error { margin: 16px 0 0; padding: 11px 13px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
+  .sync-error span { display: block; color: var(--muted); font-size: 10.5px; margin-bottom: 5px; }
+  .sync-error code { font: 11px/1.6 var(--font-mono); color: var(--ink2); overflow-wrap: anywhere; }
+  #history-sync[data-tone="ok"] { --sync-tone: var(--ok); }
+  #history-sync[data-tone="warning"] { --sync-tone: var(--warn); }
+  #history-sync[data-tone="error"] { --sync-tone: var(--bad); }
+  .sync-log-notes { margin: 14px 0 0; color: var(--warn); font-size: 11.5px; }
+  @media(max-width: 600px) {
+    .sync-top { padding: 16px; gap: 10px; flex-wrap: wrap; }
+    .sync-content { flex: 1 1 calc(100% - 30px); }
+    #history-sync button { margin-left: 30px; }
+    .sync-heading { gap: 6px; }
+    .sync-heading h2 { font-size: 13px; }
+    .sync-meta { display: block; font-size: 11px; }
+    .sync-meta span { display: block; margin-top: 3px; }
+    .sync-details summary { padding: 11px 16px; }
+    .sync-diagnostics { padding: 4px 16px 16px; }
+    .sync-metrics { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 14px; }
+    .sync-storage { grid-template-columns: 1fr; gap: 3px; }
+    .sync-storage dd { margin-bottom: 6px; }
+  }
   #cfg-form { margin-top: 4px; }
   .cfg-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
     padding: 14px 16px 10px; margin-top: 12px; }
@@ -1264,10 +1310,44 @@ try {
   <section id="tab-history" hidden>
     <div id="clients-strip" hidden></div>
     <div id="history-loading" role="status" hidden></div>
-    <div id="history-sync" class="muted" hidden>
-      <span id="history-sync-info"></span>
-      <button id="history-sync-toggle" type="button">Pause synchronization</button>
-    </div>
+    <section id="history-sync" aria-labelledby="history-sync-title" hidden>
+      <div class="sync-top">
+        <svg class="sync-symbol" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+          <circle cx="12" cy="12" r="9"/><path id="history-sync-symbol" d="M12 7v6m0 3v1"/>
+        </svg>
+        <div class="sync-content">
+          <div class="sync-heading">
+            <h2 id="history-sync-title">History synchronization</h2>
+            <span id="history-sync-info" class="sync-badge" role="status"></span>
+          </div>
+          <p id="history-sync-message" class="sync-message"></p>
+          <div class="sync-meta">
+            <span id="history-sync-mode"></span>
+            <span>Last successful sync <strong id="history-sync-age"></strong></span>
+          </div>
+        </div>
+        <button id="history-sync-toggle" type="button">Pause synchronization</button>
+      </div>
+      <details class="sync-details" id="history-sync-details">
+        <summary>Technical details</summary>
+        <div class="sync-diagnostics">
+          <dl class="sync-metrics">
+            <div><dt>Last attempt</dt><dd id="history-sync-attempt"></dd></div>
+            <div><dt>Last completed scan</dt><dd id="history-sync-scan"></dd></div>
+            <div><dt>Log files rebuilt</dt><dd id="history-sync-rebuilt"></dd></div>
+            <div><dt>Repair pending</dt><dd id="history-sync-repair"></dd></div>
+          </dl>
+          <dl class="sync-storage">
+            <dt>Index location</dt><dd><code id="history-sync-path"></code></dd>
+            <dt>Storage type</dt><dd id="history-sync-storage"></dd>
+          </dl>
+          <p id="history-sync-log-notes" class="sync-log-notes" hidden></p>
+          <div id="history-sync-error" class="sync-error" hidden>
+            <span>Reported error</span><code id="history-sync-error-text"></code>
+          </div>
+        </div>
+      </details>
+    </section>
     <table>
       <thead><tr><th>Job</th><th>Status</th><th>Handoff</th><th class="num">Size</th>
         <th>Finished</th><th style="width:170px"></th></tr></thead>
@@ -4047,22 +4127,66 @@ let historyInFlight = null;
 let historySync = null;
 let historySyncRevision = 0;
 let historySyncBusy = false;
+function historySyncAge(seconds) {
+  if (seconds == null || !Number.isFinite(seconds)) return "Never";
+  seconds = Math.max(0, Math.floor(seconds));
+  if (seconds < 5) return "just now";
+  if (seconds < 60) return seconds + "s ago";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return minutes + "m ago";
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours + "h " + minutes % 60 + "m ago";
+  return Math.floor(hours / 24) + "d " + hours % 24 + "h ago";
+}
 function renderHistorySync(status) {
   if (!status) return;
   historySync = status;
-  $("history-sync").hidden = false;
-  const age = status.last_success_age_secs == null ? "never" : status.last_success_age_secs + "s ago";
-  const mode = status.mode === "local_only" ? "Local history" : "Shared history";
-  $("history-sync-info").textContent = mode + " · " + status.state +
-    " · last pass " + status.last_duration_ms + " ms / " + fmtBytes(status.last_bytes_read) +
-    (status.last_scan ? " · " + status.last_scan + " scan / " + status.last_entries_reconciled + " entries / " + status.last_files_rebuilt + " files rebuilt" : "") +
-    (status.last_incomplete_tails ? " · " + status.last_incomplete_tails + " unfinished log tails" : "") +
-    (status.last_malformed_lines ? " · " + status.last_malformed_lines + " unrecognized log lines" : "") +
-    " · last reconciliation " + age + " · storage: " + status.placement +
-    " · index: " + status.index_path +
-    (status.repair_pending ? " · repair pending" : "") +
-    (status.paused ? " · peer updates and repair are paused; local writes continue" : "") +
-    (status.last_error ? " · " + status.last_error : "");
+  const local = status.mode === "local_only";
+  const interrupted = status.state === "failed" &&
+    (status.last_error || "").includes("history changed during reconciliation");
+  const states = {
+    idle: ["Ready", "ok", local ? "Local history is written immediately. No repair is pending." : "Peer history is synchronized in the background."],
+    running: ["Synchronizing", "neutral", "Updating the history index in the background. Your indexed history is still available."],
+    paused: ["Paused", "neutral", "Background synchronization and repair are paused. Local history writes continue."],
+    stopping: ["Stopping", "neutral", "Finishing the current synchronization work. Your indexed history is still available."],
+    stopped: ["Stopped", "neutral", "Background synchronization has stopped. Your indexed history is still available."],
+    failed: interrupted
+      ? ["Interrupted", "warning", "History changed during synchronization. Your indexed history is still available."]
+      : ["Needs attention", "error", "Synchronization could not finish. Your indexed history is still available."],
+  };
+  let [label, tone, message] = states[status.state] || ["Unknown", "neutral", "Synchronization status is unavailable."];
+  if (status.repair_pending && !status.paused && ["idle", "running", "failed"].includes(status.state)) {
+    message = status.state === "idle"
+      ? "A history repair is pending and will retry automatically. Your indexed history is still available."
+      : message + " A repair is pending and will retry automatically.";
+    if (status.state === "idle") { label = "Repair pending"; tone = "warning"; }
+  }
+  const panel = $("history-sync");
+  panel.hidden = false;
+  panel.dataset.tone = tone;
+  setText($("history-sync-info"), label);
+  $("history-sync-message").textContent = message;
+  $("history-sync-symbol").setAttribute("d", tone === "ok" ? "M7 12l3 3 7-7" : "M12 7v6m0 3v1");
+  $("history-sync-mode").textContent = local ? "Local history" : "Shared history";
+  $("history-sync-age").textContent = historySyncAge(status.last_success_age_secs);
+  $("history-sync-attempt").textContent = (status.last_duration_ms || 0) + " ms · " + fmtBytes(status.last_bytes_read || 0) + " read";
+  const scans = { full: "Full", incremental: "Incremental", unchanged: "Unchanged" };
+  $("history-sync-scan").textContent = scans[status.last_scan]
+    ? scans[status.last_scan] + " · " + (status.last_entries_reconciled || 0) + " entries" : "Not available";
+  $("history-sync-rebuilt").textContent = String(status.last_files_rebuilt || 0);
+  $("history-sync-repair").textContent = status.repair_pending ? "Yes" : "No";
+  $("history-sync-path").textContent = status.index_path || "Not available";
+  $("history-sync-storage").textContent = {
+    local: "Local filesystem", network: "Network filesystem", network_or_fuse: "Network or FUSE filesystem",
+    ephemeral_or_overlay: "Temporary or overlay filesystem",
+  }[status.placement] || "Unknown";
+  const notes = [];
+  if (status.last_incomplete_tails) notes.push(status.last_incomplete_tails + " unfinished log tails");
+  if (status.last_malformed_lines) notes.push(status.last_malformed_lines + " unrecognized log lines");
+  $("history-sync-log-notes").textContent = notes.join(" · ");
+  $("history-sync-log-notes").hidden = !notes.length;
+  $("history-sync-error").hidden = !status.last_error;
+  $("history-sync-error-text").textContent = status.last_error || "";
   $("history-sync-toggle").textContent = status.paused ? "Resume synchronization" : "Pause synchronization";
   renderHistoryEnable();
 }

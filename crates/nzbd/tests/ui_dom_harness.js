@@ -2281,14 +2281,51 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
       "unmet storage readiness does not disable enablement");
     await vm.runInContext("toggleHistorySync()", sandbox);
     eq(syncState.paused, false, "Dev enable resumes synchronization on network storage");
-    ok(doc.getElementById("history-sync-info").textContent.includes("idle"),
+    ok(doc.getElementById("history-sync-info").textContent === "Repair pending",
       "successful resume updates displayed synchronization state");
     eq(doc.getElementById("cfg-history-sync-enable").textContent, "Pause history synchronization",
       "successful resume offers the inverse operation");
     await vm.runInContext("toggleHistorySync()", sandbox);
     eq(syncState.paused, true, "the next click pauses instead of resuming again");
-    ok(doc.getElementById("history-sync-info").textContent.includes("paused"),
+    ok(doc.getElementById("history-sync-info").textContent === "Paused",
       "successful pause renders the new state");
+
+    // Diagnostics stay collapsed by default, survive live ticks, and use text
+    // nodes even when a filesystem error contains HTML-like filenames.
+    const renderSync = status => vm.runInContext("renderHistorySync(" + JSON.stringify(status) + ")", sandbox);
+    const failedSync = { ...syncState, paused: false, state: "failed", repair_pending: false,
+      last_success_age_secs: 63401, last_duration_ms: 437, last_bytes_read: 0,
+      last_scan: "full", last_entries_reconciled: 482, last_files_rebuilt: 1,
+      last_error: "corrupt state: history changed during reconciliation; retrying" };
+    renderSync(failedSync);
+    eq(doc.getElementById("history-sync-info").textContent, "Interrupted", "a replay conflict gets a readable status");
+    eq(doc.getElementById("history-sync").dataset.tone, "warning", "a replay conflict is amber");
+    ok(!doc.getElementById("history-sync-message").textContent.includes("retry automatically"),
+      "clean local history does not promise an unnecessary retry");
+    eq(doc.getElementById("history-sync-age").textContent, "17h 36m ago", "sync age uses readable units");
+    eq(doc.getElementById("history-sync-scan").textContent, "Full · 482 entries", "completed scan is distinct from last attempt");
+    eq(doc.getElementById("history-sync-error-text").textContent, failedSync.last_error, "raw diagnostics remain available");
+    eq(doc.getElementById("history-sync-storage").textContent, "Network or FUSE filesystem", "storage type has a readable label");
+    const details = doc.getElementById("history-sync-details");
+    details.open = true;
+    const rawError = 'open <img src=x onerror="alert(1)">: permission denied';
+    renderSync({ ...failedSync, repair_pending: true, last_error: rawError,
+      last_incomplete_tails: 1, last_malformed_lines: 2 });
+    eq(doc.getElementById("history-sync-info").textContent, "Needs attention", "a persistent error remains prominent");
+    eq(doc.getElementById("history-sync").dataset.tone, "error", "a persistent error is red");
+    eq(doc.getElementById("history-sync-error-text").textContent, rawError, "errors are displayed as literal text");
+    eq(doc.getElementById("history-sync-error-text").innerHTML, "", "errors never become HTML markup");
+    eq(details.open, true, "status updates preserve expanded diagnostics");
+    eq(doc.getElementById("history-sync-log-notes").hidden, false, "log anomalies remain visible in diagnostics");
+    renderSync({ ...failedSync, state: "idle", last_error: null, last_success_age_secs: 0 });
+    eq(doc.getElementById("history-sync-info").textContent, "Ready", "healthy local history is ready");
+    eq(doc.getElementById("history-sync-error").hidden, true, "recovery hides the old error");
+    eq(doc.getElementById("history-sync-error-text").textContent, "", "recovery clears the old error text");
+    eq(doc.getElementById("history-sync-log-notes").hidden, true, "recovery clears log anomalies");
+    eq(doc.getElementById("history-sync-age").textContent, "just now", "recent synchronization has a readable age");
+    eq(vm.runInContext("historySyncAge(null)", sandbox), "Never", "missing success is explicit");
+    eq(vm.runInContext("historySyncAge(172861)", sandbox), "2d 0h ago", "old synchronization uses days");
+    renderSync(syncState);
 
     eq(vm.runInContext("cfgDirty", sandbox), false, "live enable does not dirty config form");
     eq(doc.getElementById("cfg-history-sync-enable").disabled, false,
