@@ -3623,6 +3623,14 @@ mod tests {
             .add_nzb("huge", huge.as_bytes(), None, 0)
             .await
             .unwrap();
+        // Scope simulated headroom to this exact payload directory. A fixed
+        // 256 GB request does not exceed real free space on every test host.
+        #[cfg(unix)]
+        let _capacity_limit = nzbd_state::capacity::inject_available_test_limit(
+            &engine.artifacts().for_job(big.0).unwrap().unwrap().path,
+            2 * 1024 * 1024 * 1024,
+        )
+        .unwrap();
         engine
             .hold_job(
                 big,
