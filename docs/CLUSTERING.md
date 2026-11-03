@@ -243,6 +243,12 @@ Authentication, stale-token checks, invalid configuration, and transaction
 conflicts still reject the operation they protect; they are correctness
 boundaries, not feature gates.
 
+Quorum-commit health requires the local node to have joined the committed
+voter set as well as a successful linearizable quorum read. A learner that
+can forward reads is still unready. During takeover, control reconciliation
+reads actor-stamped queue metadata while payload recovery remains fenced;
+pending payload verification must not restart authority adoption repeatedly.
+
 ## Configuration checklist
 
 Before enabling, normally verify:
