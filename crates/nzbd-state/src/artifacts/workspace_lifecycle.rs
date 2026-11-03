@@ -458,10 +458,12 @@ impl Inventory {
                     "workspace finalization lacks generation or quiescence evidence".into(),
                 ));
             }
-            if !matches!(
-                parent.state.as_str(),
-                "completed" | "parked_failed" | "retained" | "deleted" | "source_gone"
-            ) {
+            if !self.workspace_parent_transferred(&parent)?
+                && !matches!(
+                    parent.state.as_str(),
+                    "completed" | "parked_failed" | "retained" | "deleted" | "source_gone"
+                )
+            {
                 return Err(Error::Conflict("workspace parent has not finalized".into()));
             }
             self.db.lock().unwrap().execute(
@@ -496,6 +498,98 @@ impl Inventory {
         })
         .transpose()
     }
+
+    /// Publication relinquishes the parent to its consumer, not the private
+    /// scratch. Only the exact durable handoff permits this ownership exception;
+    /// consumer moves/removal must not require reading its payload again.
+    fn workspace_parent_transferred(&self, parent: &Artifact) -> Result<bool> {
+        if parent.state != "transferred" || parent.owned || !parent.delivery_lifecycle {
+            return Ok(false);
+        }
+        let delivery = match self.delivery(&format!("{}:{}", parent.id, parent.generation)) {
+            Ok(delivery) => delivery,
+            Err(Error::NotFound) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(delivery.artifact_id == parent.id
+            && delivery.publication_generation == parent.generation
+            && delivery.runner_instance_id == self.installation
+            && delivery.publication_path == parent.path.to_string_lossy()
+            && !delivery.files.is_empty())
+    }
+
+    /// The API has durably recorded a confirmed queue deletion. Retire only
+    /// internal scratch; keeping the source for Undo/recovery is independent.
+    pub fn finalize_deleted_workspaces(&self, entry: &crate::HistoryEntry) -> Result<()> {
+        let Some(id) = entry
+            .params
+            .iter()
+            .find_map(|(key, value)| (key == "Artifact:Id").then_some(value))
+        else {
+            return Ok(());
+        };
+        let parent = self.get(id)?;
+        {
+            let Some(_lease) = self.reserve_reconciliation(std::slice::from_ref(&parent))? else {
+                return Ok(());
+            };
+            self.record_deleted_workspace_finalization(&parent, entry)?;
+        }
+        self.reconcile_workspace_retirements()?;
+        self.run_workspace_retirements()
+    }
+
+    fn record_deleted_workspace_finalization(
+        &self,
+        parent: &Artifact,
+        entry: &crate::HistoryEntry,
+    ) -> Result<()> {
+        let param = |key: &str| {
+            entry
+                .params
+                .iter()
+                .find_map(|(k, v)| (k == key).then_some(v.as_str()))
+        };
+        // Old DELETED entries lack Artifact:Generation. Their random allocation
+        // id, job, retained path and timestamp jointly bind the existing source.
+        // Allocation ids are never recycled when a new generation is allocated.
+        let exact_generation = param("Artifact:Generation");
+        if entry.status != "DELETED"
+            || entry.seq <= 0
+            || parent.job != Some(entry.job.0)
+            || param("Artifact:Id") != Some(parent.id.as_str())
+            || entry.completed_at_unix < parent.created_at
+            || exact_generation.is_some_and(|generation| generation != parent.generation)
+            || (exact_generation.is_none() && entry.final_dir.as_deref() != parent.path.to_str())
+            || !parent.owned
+            || !matches!(
+                parent.state.as_str(),
+                "retained" | "parked_failed" | "deleted" | "source_gone"
+            )
+        {
+            return Ok(());
+        }
+        let _coordinator = self.mutation_guard()?;
+        self.check_payload_capture(parent)?;
+        // A confirmed deletion supersedes an unfinished PP stamp barrier after
+        // workers quiesce. Already activated terminal evidence remains intact.
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let inserted = tx.execute(
+            "INSERT INTO workspace_finalizations(source,generation,outcome,proof,job,activated) VALUES(?1,?2,'DELETED',?3,?4,1) ON CONFLICT(source,generation) DO UPDATE SET outcome=excluded.outcome,proof=excluded.proof,job=excluded.job,activated=1 WHERE workspace_finalizations.activated=0",
+            params![parent.id, parent.generation, serde_json::to_string(&FinalizationProof::Local { history_seq: entry.seq as u64 })?, entry.job.0],
+        )?;
+        if inserted != 0 {
+            event(
+                &tx,
+                &parent.id,
+                "workspace_deleted_finalization_recovered",
+                &entry.seq.to_string(),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub fn workspace_assessment(&self, scratch: &str) -> Result<Option<WorkspaceAssessment>> {
         let Some((op, workspace)) = self.scratch_operation(scratch)? else {
             return Ok(None);
@@ -523,6 +617,7 @@ impl Inventory {
     ) -> Result<WorkspaceAssessment> {
         let scratch = self.get(&workspace.scratch.id)?;
         let parent = self.get(&workspace.source.id)?;
+        let transferred = self.workspace_parent_transferred(&parent)?;
         let source = SourceGeneration {
             artifact: parent.id.clone(),
             generation: workspace.source.generation.clone(),
@@ -546,7 +641,7 @@ impl Inventory {
         {
             reasons.push("review_or_recovery_hold".into());
         }
-        if !scratch.owned || !parent.owned {
+        if !scratch.owned || (!parent.owned && !transferred) {
             reasons.push("ownership_unproven".into());
         }
         if !identity_valid {
@@ -565,10 +660,12 @@ impl Inventory {
         if !matches!(op.state.as_str(), "succeeded" | "failed") {
             reasons.push("transform_not_terminal".into());
         }
-        if !matches!(
-            parent.state.as_str(),
-            "completed" | "parked_failed" | "retained" | "deleted" | "source_gone"
-        ) {
+        if !transferred
+            && !matches!(
+                parent.state.as_str(),
+                "completed" | "parked_failed" | "retained" | "deleted" | "source_gone"
+            )
+        {
             reasons.push("source_not_finalized".into());
         }
         if parent.hold.is_some() {
@@ -599,7 +696,7 @@ impl Inventory {
             if !authorized {
                 reasons.push("source_deletion_evidence_missing".into());
             }
-        } else if !parent.terminal() && self.verify(&parent).is_err() {
+        } else if !transferred && !parent.terminal() && self.verify(&parent).is_err() {
             reasons.push("source_identity_changed".into());
         }
         let bytes = scratch.summary().1;
@@ -622,6 +719,13 @@ impl Inventory {
     /// One bounded cursor advances past protected records rather than letting
     /// one permanently held workspace starve the remainder of the inventory.
     pub fn reconcile_workspace_retirements(&self) -> Result<()> {
+        self.reconcile_workspace_retirements_with_history(None)
+    }
+
+    pub(super) fn reconcile_workspace_retirements_with_history(
+        &self,
+        history: Option<&crate::history::HistoryDb>,
+    ) -> Result<()> {
         let raws = {
             let db = self.db.lock().unwrap();
             let cursor = self.workspace_cursor.lock().unwrap().clone();
@@ -657,6 +761,24 @@ impl Inventory {
             else {
                 continue;
             };
+
+            // Revisit pre-upgrade transforms in the same bounded cursor sweep.
+            // A history entry cannot grant ownership or waive any scratch check.
+            if workspace.keep_provenance
+                && parent.generation == source.generation
+                && self.workspace_finalization(&source)?.is_none()
+            {
+                if let (Some(history), Some(job)) = (history, parent.job) {
+                    if let Some(entry) = history
+                        .deleted_artifact_completion(crate::JobId(job), &parent.id)
+                        .map_err(|error| {
+                            Error::Conflict(format!("deleted workspace history: {error}"))
+                        })?
+                    {
+                        self.record_deleted_workspace_finalization(&parent, &entry)?;
+                    }
+                }
+            }
 
             if let Some((outcome, FinalizationProof::Cluster { .. })) =
                 self.workspace_finalization(&source)?
@@ -955,12 +1077,17 @@ impl Inventory {
 mod tests {
     use super::*;
     fn fixture() -> (tempfile::TempDir, Arc<Inventory>, Workspace) {
+        fixture_with_delivery(false)
+    }
+    fn fixture_with_delivery(delivery: bool) -> (tempfile::TempDir, Arc<Inventory>, Workspace) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("processing");
         std::fs::create_dir(&root).unwrap();
         let inventory = Arc::new(Inventory::open(&temp.path().join("state")).unwrap());
         let path = root.join("job");
-        inventory.allocate(12, &root, &path).unwrap();
+        inventory
+            .allocate_for_delivery(12, &root, &path, delivery, delivery)
+            .unwrap();
         std::fs::write(path.join("original"), b"original").unwrap();
         let workspace = inventory.workspace(12, "par_repair", "abc").unwrap();
         std::fs::write(workspace.scratch.path.join("scratch"), b"reconstructed").unwrap();
@@ -980,6 +1107,275 @@ mod tests {
     }
     fn record(inventory: &Inventory, workspace: &Workspace) {
         inventory.db.lock().unwrap().execute("INSERT INTO workspace_finalizations(source,generation,outcome,proof,activated) VALUES(?1,?2,'SUCCESS',?3,1)", params![workspace.source.id, workspace.source.generation, serde_json::to_string(&FinalizationProof::Local {history_seq:1}).unwrap()]).unwrap();
+    }
+    fn delivered_fixture() -> (tempfile::TempDir, Arc<Inventory>, Workspace, Delivery) {
+        let (temp, inventory, workspace) = fixture_with_delivery(true);
+        terminal(&inventory, &workspace, "completed");
+        let delivery = inventory.create_delivery(12, true, None).unwrap();
+        (temp, inventory, workspace, delivery)
+    }
+    fn deleted_entry(workspace: &Workspace) -> crate::HistoryEntry {
+        serde_json::from_value(serde_json::json!({
+            "job": workspace.source.job.unwrap(), "name": "deleted job",
+            "status": "DELETED", "size": 8, "completed_at_unix": now(),
+            "final_dir": workspace.source.path,
+            "params": [["Artifact:Id", workspace.source.id]]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn new_delivery_finalization_retires_scratch_without_reclaiming_publication() {
+        let (_temp, inventory, workspace, delivery) = delivered_fixture();
+        inventory
+            .finalize_workspaces(
+                &source(&workspace),
+                "SUCCESS",
+                FinalizationProof::Local { history_seq: 1 },
+            )
+            .unwrap();
+        assert!(!workspace.scratch.path.exists());
+        assert_eq!(
+            inventory.get(&workspace.source.id).unwrap().state,
+            "transferred"
+        );
+        assert_eq!(inventory.delivery(&delivery.delivery_id).unwrap(), delivery);
+        assert_eq!(
+            std::fs::read(workspace.source.path.join("original")).unwrap(),
+            b"original"
+        );
+    }
+
+    #[test]
+    fn existing_delivered_scratch_retires_after_restart_and_consumer_move() {
+        let (temp, inventory, workspace, delivery) = delivered_fixture();
+        record(&inventory, &workspace); // receipt already present in the stuck backlog
+        let library = temp.path().join("consumer-library");
+        std::fs::rename(&workspace.source.path, &library).unwrap();
+        std::fs::write(library.join("original"), b"consumer-owned replacement").unwrap();
+        let consumer_identity = fs::identity(&std::fs::metadata(library.join("original")).unwrap());
+        drop(inventory);
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        inventory.tick().unwrap();
+        assert!(!workspace.scratch.path.exists());
+        assert_eq!(
+            inventory.get(&workspace.scratch.id).unwrap().state,
+            "deleted"
+        );
+        let persisted = inventory.delivery(&delivery.delivery_id).unwrap();
+        assert_eq!(persisted.files, delivery.files);
+        assert_eq!(persisted.manifest_digest, delivery.manifest_digest);
+        assert_eq!(persisted.publication_path, delivery.publication_path);
+        assert_eq!(
+            persisted.publication_generation,
+            delivery.publication_generation
+        );
+        assert_eq!(
+            std::fs::read(library.join("original")).unwrap(),
+            b"consumer-owned replacement"
+        );
+        assert_eq!(
+            fs::identity(&std::fs::metadata(library.join("original")).unwrap()),
+            consumer_identity
+        );
+    }
+
+    #[test]
+    fn transferred_workspace_requires_exact_delivery_and_preserves_keep_and_holds() {
+        for blocker in [
+            "missing_delivery",
+            "wrong_generation",
+            "source_keep",
+            "scratch_keep",
+            "scratch_hold",
+            "pending_completion",
+        ] {
+            let (_temp, inventory, workspace, delivery) = delivered_fixture();
+            record(&inventory, &workspace);
+            match blocker {
+                "missing_delivery" => {
+                    inventory
+                        .db
+                        .lock()
+                        .unwrap()
+                        .execute("DELETE FROM deliveries", [])
+                        .unwrap();
+                }
+                "wrong_generation" => {
+                    let mut wrong = delivery;
+                    wrong.publication_generation = "another-generation".into();
+                    inventory
+                        .db
+                        .lock()
+                        .unwrap()
+                        .execute(
+                            "UPDATE deliveries SET data=?1",
+                            [serde_json::to_string(&wrong).unwrap()],
+                        )
+                        .unwrap();
+                }
+                "pending_completion" => {
+                    inventory
+                        .db
+                        .lock()
+                        .unwrap()
+                        .execute("UPDATE workspace_finalizations SET activated=0", [])
+                        .unwrap();
+                }
+                _ => {
+                    let mut artifact = inventory
+                        .get(if blocker == "source_keep" {
+                            &workspace.source.id
+                        } else {
+                            &workspace.scratch.id
+                        })
+                        .unwrap();
+                    if blocker == "scratch_hold" {
+                        artifact.hold = Some("review: operator".into());
+                    } else {
+                        artifact.keep = true;
+                    }
+                    save_artifact(&inventory.db.lock().unwrap(), &artifact).unwrap();
+                }
+            }
+            inventory.tick().unwrap();
+            assert!(workspace.scratch.path.exists(), "{blocker}");
+            assert!(workspace.source.path.join("original").exists(), "{blocker}");
+        }
+    }
+
+    #[test]
+    fn legacy_deleted_workspace_backlog_replays_in_bounded_batches_after_restart() {
+        let (temp, inventory, first) = fixture();
+        let history_path = temp.path().join("history.sqlite");
+        let history = crate::history::HistoryDb::open(&history_path, None).unwrap();
+        let mut workspaces = vec![first];
+        for job in 13..43 {
+            let root = workspaces[0].source.root.clone();
+            let path = root.join(format!("job-{job}"));
+            inventory.allocate(job, &root, &path).unwrap();
+            std::fs::write(path.join("original"), b"original").unwrap();
+            let workspace = inventory.workspace(job, "par_repair", "abc").unwrap();
+            std::fs::write(workspace.scratch.path.join("scratch"), b"scratch").unwrap();
+            inventory.finish_workspace(&workspace).unwrap();
+            workspaces.push(workspace);
+        }
+        for workspace in &workspaces {
+            inventory
+                .finish(
+                    workspace.source.job.unwrap(),
+                    &workspace.source.path,
+                    &workspace.source.root,
+                    "retained",
+                )
+                .unwrap();
+            // Reproduce the old API: ordinary DELETED history, no generation
+            // param, no workspace_finalizations row and no future delete call.
+            history.record(&deleted_entry(workspace)).unwrap();
+        }
+        drop(inventory);
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        inventory.tick_with_history(Some(&history)).unwrap();
+        let remaining = workspaces
+            .iter()
+            .filter(|ws| ws.scratch.path.exists())
+            .count();
+        assert_eq!(remaining, workspaces.len() - 25);
+        inventory.tick_with_history(Some(&history)).unwrap();
+        for workspace in &workspaces {
+            assert!(!workspace.scratch.path.exists());
+            assert_eq!(
+                inventory.get(&workspace.scratch.id).unwrap().state,
+                "deleted"
+            );
+            assert_eq!(
+                std::fs::read(workspace.source.path.join("original")).unwrap(),
+                b"original"
+            );
+        }
+        // Receipts survive loss of visible history; replay is idempotent.
+        drop(history);
+        inventory.tick().unwrap();
+    }
+
+    #[test]
+    fn deleted_history_cannot_authorize_unrelated_or_live_workspace_cleanup() {
+        for blocker in [
+            "wrong_id",
+            "wrong_generation",
+            "wrong_path",
+            "predates_allocation",
+            "not_deleted",
+            "live_source",
+            "scratch_keep",
+            "review_hold",
+            "workers_active",
+        ] {
+            let (temp, inventory, workspace) = fixture();
+            terminal(&inventory, &workspace, "retained");
+            let mut entry = deleted_entry(&workspace);
+            let mut guard = None;
+            match blocker {
+                "wrong_id" => entry.params[0].1 = "unrelated-allocation".into(),
+                "wrong_generation" => entry
+                    .params
+                    .push(("Artifact:Generation".into(), "unrelated-generation".into())),
+                "wrong_path" => entry.final_dir = Some("/unrelated/path".into()),
+                "predates_allocation" => entry.completed_at_unix = workspace.source.created_at - 1,
+                "not_deleted" => entry.status = "SUCCESS".into(),
+                "live_source" => {
+                    terminal(&inventory, &workspace, "active");
+                }
+                "workers_active" => {
+                    guard = inventory.acquire_attempt_use(12).unwrap();
+                }
+                _ => {
+                    let mut scratch = inventory.get(&workspace.scratch.id).unwrap();
+                    if blocker == "scratch_keep" {
+                        scratch.keep = true;
+                    } else {
+                        scratch.hold = Some("review: operator".into());
+                    }
+                    save_artifact(&inventory.db.lock().unwrap(), &scratch).unwrap();
+                }
+            }
+            let history =
+                crate::history::HistoryDb::open(&temp.path().join("history.sqlite"), None).unwrap();
+            history.record(&entry).unwrap();
+            inventory.tick_with_history(Some(&history)).unwrap();
+            assert!(workspace.scratch.path.exists(), "{blocker}");
+            assert!(workspace.source.path.join("original").exists(), "{blocker}");
+            drop(guard);
+        }
+    }
+
+    #[test]
+    fn confirmed_deletion_replaces_pending_post_stamp_after_restart() {
+        let (temp, inventory, workspace) = fixture();
+        terminal(&inventory, &workspace, "retained");
+        inventory
+            .stage_workspace_finalization(
+                &source(&workspace),
+                "SUCCESS",
+                &FinalizationProof::Local { history_seq: 17 },
+            )
+            .unwrap();
+        let history =
+            crate::history::HistoryDb::open(&temp.path().join("history.sqlite"), None).unwrap();
+        history.record(&deleted_entry(&workspace)).unwrap();
+        drop(inventory);
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        inventory.tick_with_history(Some(&history)).unwrap();
+        assert!(!workspace.scratch.path.exists());
+        assert_eq!(
+            inventory
+                .workspace_finalization(&source(&workspace))
+                .unwrap()
+                .unwrap()
+                .0,
+            "DELETED"
+        );
+        assert!(workspace.source.path.join("original").exists());
     }
     #[test]
     fn processing_successor_requires_fresh_path_and_preserves_prior_custody() {

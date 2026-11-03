@@ -15,6 +15,56 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
+#[tokio::test]
+async fn startup_maintenance_retires_preexisting_deleted_workspace_without_api_action() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let processing = tmp.path().join("processing");
+    std::fs::create_dir(&processing).unwrap();
+    let inventory = nzbd_state::artifacts::Inventory::open(&state).unwrap();
+    let path = processing.join("old-job");
+    let source = inventory.allocate(12, &processing, &path).unwrap();
+    std::fs::write(path.join("original"), b"recoverable original").unwrap();
+    let workspace = inventory.workspace(12, "par_repair", "abc").unwrap();
+    std::fs::write(workspace.scratch.path.join("scratch"), b"obsolete scratch").unwrap();
+    inventory.finish_workspace(&workspace).unwrap();
+    inventory
+        .finish(12, &path, &processing, "retained")
+        .unwrap();
+    let history = std::sync::Arc::new(
+        nzbd_state::history::HistoryDb::open(&state.join("history.sqlite"), None).unwrap(),
+    );
+    let entry = serde_json::from_value(serde_json::json!({
+        "job": 12, "name": "old deleted job", "status": "DELETED", "size": 20,
+        "completed_at_unix": source.created_at, "final_dir": path,
+        "params": [["Artifact:Id", source.id]]
+    }))
+    .unwrap();
+    history.record(&entry).unwrap();
+    drop(inventory);
+
+    let mut cfg = EngineConfig::single_node(vec![], state, processing, Tuning::default(), None);
+    cfg.history = Some(history);
+    let engine = Engine::spawn(cfg).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while engine.artifacts().get(&workspace.scratch.id).unwrap().state != "deleted" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("startup maintenance must reclaim the old scratch without another delete request");
+    assert!(!workspace.scratch.path.exists());
+    assert_eq!(
+        engine.artifacts().get(&workspace.scratch.id).unwrap().state,
+        "deleted"
+    );
+    assert_eq!(
+        std::fs::read(path.join("original")).unwrap(),
+        b"recoverable original"
+    );
+    engine.shutdown().await;
+}
+
 fn dormant_torrent_job() -> nzbd_types::Job {
     nzbd_types::Job {
         id: JobId(77),

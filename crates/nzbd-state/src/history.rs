@@ -836,6 +836,20 @@ impl HistoryDb {
         .map(|entries| entries.into_iter().next())
     }
 
+    /// Indexed by job, but matched by the random allocation id as well: job
+    /// numbers and display names alone must never authorize scratch retirement.
+    pub(crate) fn deleted_artifact_completion(
+        &self,
+        job: crate::JobId,
+        artifact: &str,
+    ) -> Result<Option<HistoryEntry>, StateError> {
+        self.query(
+            &format!("SELECT {COLUMNS} FROM history WHERE job_id=?1 AND status='DELETED' AND EXISTS (SELECT 1 FROM json_each(history.params) WHERE json_extract(value,'$[0]')='Artifact:Id' AND json_extract(value,'$[1]')=?2) ORDER BY completed_at DESC,id DESC LIMIT 1"),
+            &[&job.0, &artifact],
+        )
+        .map(|entries| entries.into_iter().next())
+    }
+
     /// One page of the newest-first view: `limit` entries starting at
     /// `offset`.
     ///

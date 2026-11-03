@@ -2739,6 +2739,13 @@ impl Inventory {
     /// Count only daemon monotonic uptime observed while eligible. Reset the
     /// checkpoint before the transaction: a failed commit loses time safely.
     pub fn tick(&self) -> Result<()> {
+        self.tick_with_history(None)
+    }
+
+    /// History is used only to repair missing receipts for confirmed queue
+    /// deletions. Normal ownership, generation and payload deletion checks stay
+    /// in the inventory journal, independent of history retention.
+    pub fn tick_with_history(&self, history: Option<&crate::history::HistoryDb>) -> Result<()> {
         let enabled = self.settings()?.enabled;
         let mut due = Vec::new();
         {
@@ -2802,7 +2809,7 @@ impl Inventory {
         }
         self.run_due_deletes()?;
         self.reconcile_due_relocations()?;
-        self.reconcile_workspace_retirements()?;
+        self.reconcile_workspace_retirements_with_history(history)?;
         self.run_workspace_retirements()?;
         self.reconcile_recoveries()?;
         self.schedule_discovery()?;
