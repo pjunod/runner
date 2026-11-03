@@ -227,6 +227,10 @@ impl HistoryDb {
             ));
         }
         if self.sync.mode == HistoryMode::LocalOnly && !self.sync.dirty.load(Ordering::SeqCst) {
+            // A successful local writer can clear the transient dirty flag after
+            // interrupting replay. No repair remains, so retire the old failure
+            // without claiming that another reconciliation actually ran.
+            self.sync.progress.lock().unwrap().last_error = None;
             return Ok(());
         }
         if self
@@ -828,6 +832,11 @@ mod tests {
         db.conn.lock().unwrap().execute_batch("CREATE TRIGGER fail_insert BEFORE INSERT ON history BEGIN SELECT RAISE(FAIL,'injected'); END;").unwrap();
         assert!(db.record_seq_durable(&entry(2, 200)).is_err());
         assert!(db.sync_status().repair_pending);
+        due(&db);
+        assert!(db.refresh().is_err());
+        assert_eq!(db.sync_status().state, "failed");
+        assert!(db.sync_status().last_error.is_some());
+        assert!(db.sync_status().repair_pending);
         db.conn
             .lock()
             .unwrap()
@@ -839,7 +848,36 @@ mod tests {
         assert!(!db.sync_status().repair_pending);
         due(&db);
         db.refresh().unwrap();
-        assert_eq!(db.sync_status().passes, 2);
+        assert_eq!(
+            db.sync_status().passes,
+            3,
+            "startup, failed repair, successful repair"
+        );
+    }
+
+    #[test]
+    fn clean_local_history_retires_interrupted_replay_without_claiming_a_scan() {
+        let t = tempfile::tempdir().unwrap();
+        let db = local(t.path(), t.path());
+        let last_success = db.sync.progress.lock().unwrap().last_success;
+        let passes = db.sync_status().passes;
+        let generation = db.sync.generation.load(Ordering::SeqCst);
+        db.record(&entry(1, 100)).unwrap();
+        let conflict = db.replay_checkpoint(true, generation).unwrap_err();
+        // The worker stores this result after the successful local writer has
+        // already cleared its transient dirty flag.
+        db.sync.progress.lock().unwrap().last_error = Some(conflict.to_string());
+        assert_eq!(db.sync_status().state, "failed");
+        assert!(!db.sync_status().repair_pending);
+
+        db.refresh().unwrap();
+
+        let status = db.sync_status();
+        assert_eq!(status.state, "idle");
+        assert!(status.last_error.is_none());
+        assert_eq!(status.passes, passes);
+        assert_eq!(db.sync.progress.lock().unwrap().last_success, last_success);
+        assert_eq!(db.count_filtered(true).unwrap(), 1);
     }
 
     #[test]
