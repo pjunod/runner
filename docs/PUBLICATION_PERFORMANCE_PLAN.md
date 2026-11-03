@@ -1,7 +1,7 @@
 # Publication performance — root cause and proposed fix
 
-**Status:** reviewed proposal; Astra findings addressed; implementation and
-deployment not started · **Written:** 2026-11-03 (America/New_York) · **Branch:**
+**Status:** implementation candidate; Astra PR review pending; unit tests not
+run; deployment not started · **Written:** 2026-11-03 (America/New_York) · **Branch:**
 `codex/runner-publication-performance`
 
 Companion to [the file lifecycle contract](FILE_LIFECYCLE_PLAN.md) and
@@ -468,8 +468,8 @@ CRC fingerprinting are useful optimizations to preserve.
 | Root cause and plan | Drafted | Source-linked evidence, explicit proof boundaries, and tests defined. |
 | Astra design review | Complete; findings addressed | Seven corrections recorded below; follow-up review found no further material design blockers after the diagram/extraction qualifications recorded below. |
 | Broader I/O audit | Complete | Six findings source-checked; scope and validation recorded in §6. |
-| Rename/copy/publication correction | Not started | §5.1 integrity and read-budget checks pass. |
-| Cleanup scheduling and Move timing | Not started | Blocked/due selection and all completion paths pass regressions. |
+| Rename/copy/publication correction | Candidate implemented; untested | §5.1 integrity and read-budget checks pass. |
+| Cleanup scheduling and Move timing | Candidate implemented; untested | Blocked/due selection and all completion paths pass regressions. |
 | Integration checks and controlled measurements | Not started | Results and remaining limits recorded; required CI green. |
 | Deployment and observation | Not started | Qualified build identified on nuc3 and §5.2 checks recorded. |
 
@@ -494,6 +494,23 @@ and cleanup independently after verified custody commit, and §5.1 limits the
 zero-copy extraction requirement to eligible immutable paths. With those
 corrections Astra judged the plan ready to implement.
 
-This document records a proposed change. Runtime corrections, Rust tests,
-benchmarks, and deployment have not started. Documentation link validation and
-whitespace checks are separate from those implementation gates.
+The implementation candidate carries the copy source digest into final
+publication, makes journal-owned rename primitives metadata-only with owner
+verification, combines PAR MD5/SHA capture for filename restoration, schedules
+cleanup through durable claims, and closes Move before terminal snapshots.
+Read-budget, corruption, restore replay, cleanup deadline/restart/fairness,
+and final-history regressions are written but have not run. Compilation and
+focused Clippy checks are the pre-review checks; unit tests wait for Astra's
+PR review and correction of its findings, as requested.
+
+**Extraction isolation exception:** current extraction workspaces retain
+independent output while the job may perform subsequent naming/repair work.
+The candidate keeps those copies rather than creating shared writable inodes
+without a complete workspace/ctime contract. The shared copy helper now hashes
+while copying and performs one final readback, reducing its three payload
+reads to two. Automatic hard-link extraction publication is deferred under
+§3.3's independent-output exception; this candidate does not claim zero writes
+for that path. The broader writer/torrent follow-ups in §6 remain separate.
+
+Controlled measurements, required CI, merge, and deployment remain pending.
+Documentation validation and static checks are not unit-test results.

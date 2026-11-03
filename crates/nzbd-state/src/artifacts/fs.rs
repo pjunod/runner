@@ -616,6 +616,18 @@ pub fn available_bytes(_: &File) -> Result<u64> {
 /// Atomic publication must never replace an unrelated empty directory.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn rename_exclusive(from: &Path, to: &Path) -> Result<()> {
+    rename_exclusive_impl(from, to, false)
+}
+
+/// Compatibility for callers without an owning content journal. Native rename
+/// remains metadata-only; the link fallback verifies content once at each edge.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn rename_exclusive_verified(from: &Path, to: &Path) -> Result<()> {
+    rename_exclusive_impl(from, to, true)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rename_exclusive_impl(from: &Path, to: &Path, verify_content: bool) -> Result<()> {
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
@@ -697,7 +709,7 @@ pub fn rename_exclusive(from: &Path, to: &Path) -> Result<()> {
         if !input.metadata()?.is_file() {
             return Err(error.into());
         }
-        let original_digest = digest_file(&input)?;
+        let original_digest = verify_content.then(|| digest_file(&input)).transpose()?;
         input.sync_all()?;
         if unsafe {
             libc::linkat(
@@ -716,9 +728,7 @@ pub fn rename_exclusive(from: &Path, to: &Path) -> Result<()> {
             // Resume only the two-name state left by link-before-unlink.
             // Equal bytes in a different inode do not authorize deletion.
             let existing = open_at(&target, Path::new(to.file_name().unwrap()), false)?;
-            if !rename_identity_matches(&original, &identity(&existing.metadata()?))
-                || digest_file(&existing)? != original_digest
-            {
+            if !rename_identity_matches(&original, &identity(&existing.metadata()?)) {
                 return Err(link_error.into());
             }
         }
@@ -727,8 +737,6 @@ pub fn rename_exclusive(from: &Path, to: &Path) -> Result<()> {
         let current = open_at(&source, name, false)?;
         if !rename_identity_matches(&original, &identity(&linked.metadata()?))
             || !rename_identity_matches(&original, &identity(&current.metadata()?))
-            || digest_file(&linked)? != original_digest
-            || digest_file(&current)? != original_digest
         {
             return Err(Error::Conflict(
                 "source changed during exclusive file rename; both names retained for review"
@@ -736,6 +744,16 @@ pub fn rename_exclusive(from: &Path, to: &Path) -> Result<()> {
             ));
         }
         unlink(&source, name, false)?;
+        if let Some(expected) = original_digest {
+            let final_file = open_at(&target, Path::new(to.file_name().unwrap()), false)?;
+            if !rename_identity_matches(&original, &identity(&final_file.metadata()?))
+                || digest_file(&final_file)? != expected
+            {
+                return Err(Error::Conflict(
+                    "renamed content changed; target retained for review".into(),
+                ));
+            }
+        }
     }
     target.sync_all()?;
     source.sync_all()?;
@@ -755,12 +773,13 @@ fn digest_file(file: &File) -> Result<String> {
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let count = input.read(&mut buffer)?;
+        crate::fileops::payload_read(count);
         if count == 0 {
             break;
         }
         digest.update(&buffer[..count]);
     }
-    if !rename_identity_matches(&before, &identity(&file.metadata()?)) {
+    if before != identity(&file.metadata()?) {
         return Err(Error::Conflict(
             "file changed while hashing rename input".into(),
         ));
@@ -794,7 +813,13 @@ mod exclusive_tests {
             fs::write(&from, b"payload").unwrap();
             let before = identity(&fs::metadata(&from).unwrap());
             RENAME_FAILURE.with(|v| v.set(Some(code)));
+            crate::fileops::PAYLOAD_READ_BYTES.with(|total| total.set(0));
             rename_exclusive(&from, &to).unwrap();
+            assert_eq!(
+                crate::fileops::PAYLOAD_READ_BYTES.with(|total| total.get()),
+                0,
+                "namespace primitive must not scan payload"
+            );
             assert!(!from.exists());
             let after = identity(&fs::metadata(&to).unwrap());
             assert!(before.same_object(&after));

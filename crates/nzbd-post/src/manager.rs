@@ -3886,6 +3886,7 @@ async fn process_job_ctx_from_inner(
                         result.map_err(|e| PostError::Subprocess(e.to_string()))
                     })
                     .await;
+                stages.finish().await;
                 match moved {
                     Ok(result) => {
                         tracing::info!(
@@ -4442,10 +4443,23 @@ async fn process_job_ctx_from_inner(
                         };
                         publish.map_err(PostError::from)
                     })
-                    .await?;
+                    .await;
+                stages.finish().await;
+                let published = published?;
                 final_dir = Some(published.published_path.to_string_lossy().into_owned());
             }
         }
+        // The selected publication starts after `fin` was exported. Preserve
+        // accumulated terminal parameters, but take the closed attempt timeline
+        // before either the worker stamp, Delivery, or history freezes it.
+        let timing = engine
+            .export_job(job_id)
+            .await
+            .map_err(|e| PostError::Subprocess(e.to_string()))?
+            .ok_or_else(|| {
+                PostError::Subprocess("job vanished before final timing snapshot".into())
+            })?;
+        fin.stages = timing.stages;
         if let Some(source) = crate::attempt::current().and_then(|control| control.source.clone()) {
             fin.params
                 .retain(|(key, _)| key != "Artifact:Id" && key != "Artifact:Generation");
@@ -8062,6 +8076,21 @@ mod decision_tests {
             assert_eq!(
                 self.history.get(JobId(41)).unwrap().unwrap().status,
                 "SUCCESS"
+            );
+            let history = self.history.get(JobId(41)).unwrap().unwrap();
+            let moves: Vec<_> = history
+                .stages
+                .iter()
+                .filter(|span| span.stage == PostStage::Move)
+                .collect();
+            assert_eq!(
+                moves.len(),
+                1,
+                "selected publication must survive the terminal snapshot"
+            );
+            assert!(
+                moves[0].ms.is_some(),
+                "history must freeze a closed Move span"
             );
         }
     }
