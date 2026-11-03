@@ -378,6 +378,137 @@ async fn insufficient_parity_records_failure_and_retains_requested_originals() {
     engine.shutdown().await;
 }
 
+/// The legacy cleanup timeout is re-armed on boot and an ordinary manager
+/// pass completes the failed repair without an operator retry.
+#[tokio::test]
+async fn legacy_repair_timeout_recovers_automatically_and_records_terminal_failure() {
+    if !require_tool("par2") {
+        return;
+    }
+    for keep in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = spawn_engine(tmp.path()).await;
+        let dir = tmp.path().join("dest/hopeless");
+        std::fs::create_dir_all(tmp.path().join("dest")).unwrap();
+        engine
+            .artifacts()
+            .allocate_for_delivery_with_keep(2301, &tmp.path().join("dest"), &dir, true, true, keep)
+            .unwrap();
+        let data: Vec<u8> = (0..60_000u32).map(|i| ((i * 13) % 249) as u8).collect();
+        std::fs::write(dir.join("payload.bin"), &data).unwrap();
+        par2_create(&dir, 1, &["payload.bin"]);
+        let mut bad = data;
+        bad[8_192..49_152].fill(0);
+        std::fs::write(dir.join("payload.bin"), &bad).unwrap();
+        let mut files = vec![file_entry(1, "payload.bin", Some(crc(&bad)), false)];
+        files.extend(par2_entries(&dir, 2));
+        let mut job = completed_job(2301, "hopeless", files);
+        job.params
+            .push(("*Runner:LifecycleEligible".into(), "1".into()));
+        if keep {
+            job.params
+                .push(("*Runner:KeepOnFailure".into(), "1".into()));
+        }
+        engine
+            .artifacts()
+            .finish(2301, &dir, &tmp.path().join("dest"), "active")
+            .unwrap();
+        engine.import_job(job, false, false).await.unwrap();
+        assert!(engine
+            .hold_job(
+                JobId(2301),
+                nzbd_types::HoldCause::PostFailure,
+                "par_repair",
+                "subprocess failed: read live Keep setting: engine is shutting down",
+            )
+            .await
+            .unwrap());
+        assert!(engine.shutdown().await);
+
+        let engine = spawn_engine(tmp.path()).await;
+        let recovered = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if let Ok(Some(job)) = engine.export_job(JobId(2301)).await {
+                    break job.control().unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("startup verifies the persisted source before release");
+        assert_eq!(recovered.cause, "engine_unavailable");
+        assert_eq!(recovered.retry_policy, "scheduled_retry");
+        assert!(recovered.next_retry_at_unix.is_some());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if engine.snapshot().jobs.iter().any(|job| {
+                    job.id == JobId(2301)
+                        && job.status == JobStatus::PostQueued
+                        && job
+                            .control
+                            .as_ref()
+                            .is_some_and(|control| control.lifecycle == "running")
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("recovery releases the legacy hold without an operator");
+        let hist = history(tmp.path());
+        let cancel = CancellationToken::new();
+        let tracker = TaskTracker::new();
+        spawn_post_manager(
+            engine.clone(),
+            PostConfig {
+                failure_action: FailureAction::Delete,
+                ..PostConfig::default()
+            },
+            hist.clone(),
+            tmp.path().join("dest"),
+            None,
+            cancel.clone(),
+            &tracker,
+        );
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if hist.get(JobId(2301)).unwrap().is_some()
+                    && engine
+                        .snapshot()
+                        .jobs
+                        .iter()
+                        .all(|job| job.id != JobId(2301))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("failed repair must leave the queue without an operator retry: jobs={:?}, history={:?}", engine.snapshot().jobs, hist.list(10).unwrap()));
+        let entry = hist.get(JobId(2301)).unwrap().unwrap();
+        assert_eq!(entry.status, "PAR_FAILURE");
+        assert!(entry
+            .params
+            .iter()
+            .any(|(key, value)| key == "Failure:Reason"
+                && value.contains("could not be reconstructed")));
+        assert_eq!(
+            dir.exists(),
+            keep,
+            "disposition must honor the live Keep setting"
+        );
+        if keep {
+            assert_eq!(std::fs::read(dir.join("payload.bin")).unwrap(), bad);
+        }
+        cancel.cancel();
+        tracker.close();
+        tracker.wait().await;
+        assert!(engine.shutdown().await);
+    }
+}
+
 /// `failure_action = park` moves the corpse off the tree the importer
 /// watches, intact, and the row points at where it went. `= none` is the
 /// old behaviour and stays available for an operator who wants the

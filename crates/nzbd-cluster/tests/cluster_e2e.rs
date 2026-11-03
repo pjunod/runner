@@ -296,7 +296,9 @@ impl Node {
     /// heartbeats and its API all stop.
     async fn kill(self) {
         self.serve_cancel.cancel();
-        self.runtime.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(60), self.runtime.shutdown())
+            .await
+            .expect("cluster shutdown must join even after quorum loss");
         self.serve_task.abort();
         let _ = self.serve_task.await;
     }
