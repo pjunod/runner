@@ -1460,7 +1460,10 @@ fn resumed_relocation_does_not_restore_artifact_after_concurrent_delete() {
 
     let reopened = Arc::new(Inventory::open(&tmp.path().join("state")).unwrap());
     let gate = Arc::new((Barrier::new(2), Barrier::new(2)));
-    *relocation::COPY_GATE.lock().unwrap() = Some((expected_source_identity, gate.clone()));
+    relocation::COPY_GATE
+        .lock()
+        .unwrap()
+        .push((expected_source_identity.clone(), gate.clone()));
     let worker_inventory = reopened.clone();
     let worker = std::thread::spawn(move || worker_inventory.reconcile_relocations());
     gate.0.wait();
@@ -1484,7 +1487,10 @@ fn resumed_relocation_does_not_restore_artifact_after_concurrent_delete() {
     }
     gate.1.wait();
     worker.join().unwrap().unwrap();
-    *relocation::COPY_GATE.lock().unwrap() = None;
+    relocation::COPY_GATE
+        .lock()
+        .unwrap()
+        .retain(|(identity, _)| !identity.same_object(&expected_source_identity));
 
     let artifact = reopened.get(&source_artifact.id).unwrap();
     assert_eq!(artifact.state, "deleted");
@@ -2867,7 +2873,10 @@ fn keep_enabled_between_source_lookup_and_unlink_retains_failed_incidental_bytes
         .identity
         .unwrap();
     let gate = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
-    *relocation::COPY_GATE.lock().unwrap() = Some((identity, gate.clone()));
+    relocation::COPY_GATE
+        .lock()
+        .unwrap()
+        .push((identity, gate.clone()));
     let worker_db = db.clone();
     let worker =
         std::thread::spawn(move || worker_db.retire_delivery_source(&delivery.delivery_id));
@@ -3180,24 +3189,30 @@ fn unavailable_legacy_enrollment_preserves_existing_association_and_controls() {
 
 #[test]
 fn completed_relocation_retirement_requires_released_exact_generation() {
-    let (_temporary, inventory, root) = fixture();
-    let inventory = Arc::new(inventory);
-    let source_path = root.join("generation-retirement-source");
-    inventory
-        .allocate_for_delivery(84, &root, &source_path, true, false)
-        .unwrap();
-    std::fs::write(source_path.join("episode.mkv"), b"verified publication").unwrap();
-    let source = inventory.finish(84, &source_path, &root, "active").unwrap();
-    let use_guard = inventory.acquire_attempt_use(84).unwrap().unwrap();
-    let generation = use_guard.source().clone();
-    let published_root = root
-        .parent()
-        .unwrap()
-        .join("completed-generation-retirement");
-    std::fs::create_dir(&published_root).unwrap();
-    let published_path = published_root.join("published");
-    let publication = inventory
-        .publish_selected_checked(
+    for with_delivery in [false, true] {
+        let (_temporary, inventory, root) = fixture();
+        let inventory = Arc::new(inventory);
+        let source_path = root.join("generation-retirement-source");
+        inventory
+            .allocate_for_delivery(84, &root, &source_path, true, with_delivery)
+            .unwrap();
+        std::fs::write(source_path.join("episode.mkv"), b"verified publication").unwrap();
+        let source = inventory.finish(84, &source_path, &root, "active").unwrap();
+        let use_guard = inventory.acquire_attempt_use(84).unwrap().unwrap();
+        let generation = use_guard.source().clone();
+        let published_root = root
+            .parent()
+            .unwrap()
+            .join("completed-generation-retirement");
+        std::fs::create_dir(&published_root).unwrap();
+        let published_path = published_root.join("published");
+        let publish = if with_delivery {
+            Inventory::publish_selected_for_delivery_checked
+        } else {
+            Inventory::publish_selected_checked
+        };
+        let publication = publish(
+            &inventory,
             84,
             &published_path,
             source.files.clone(),
@@ -3213,32 +3228,54 @@ fn completed_relocation_retirement_requires_released_exact_generation() {
             &|| Ok(()),
         )
         .unwrap();
-    let retired_source_id = format!("source-{}", publication.operation_id);
-    assert!(inventory.retire_completed_relocations(&generation).is_err());
-    assert!(source_path.join("episode.mkv").exists());
+        let retired_source_id = format!("source-{}", publication.operation_id);
+        assert!(inventory.retire_completed_relocations(&generation).is_err());
+        assert!(source_path.join("episode.mkv").exists());
 
-    drop(use_guard);
-    inventory
-        .retire_completed_relocations(&SourceGeneration {
-            artifact: generation.artifact.clone(),
-            generation: "another-generation".into(),
-        })
-        .unwrap();
-    assert!(source_path.join("episode.mkv").exists());
-    assert_ne!(inventory.get(&retired_source_id).unwrap().state, "deleted");
+        let delivery = with_delivery.then(|| {
+            inventory
+                .create_delivery(84, true, Some("release-custody"))
+                .unwrap()
+        });
+        if let Some(delivery) = &delivery {
+            let pending = inventory
+                .retire_delivery_source(&delivery.delivery_id)
+                .unwrap();
+            assert_eq!(pending.source_cleanup.status, "retry");
+            assert!(pending.source_cleanup.next_retry_at.unwrap() > now());
+        }
+        drop(use_guard);
+        inventory
+            .retire_completed_relocations(&SourceGeneration {
+                artifact: generation.artifact.clone(),
+                generation: "another-generation".into(),
+            })
+            .unwrap();
+        assert!(source_path.join("episode.mkv").exists());
+        assert_ne!(inventory.get(&retired_source_id).unwrap().state, "deleted");
 
-    inventory.retire_completed_relocations(&generation).unwrap();
-    assert!(!source_path.exists());
-    assert_eq!(inventory.get(&retired_source_id).unwrap().state, "deleted");
-    let published = inventory.for_job(84).unwrap().unwrap();
-    let descriptor = inventory.verify(&published).unwrap();
-    assert_eq!(fs::manifest(&descriptor, 100_000).unwrap(), published.files);
-    assert_eq!(
-        std::fs::read(published_path.join("episode.mkv")).unwrap(),
-        b"verified publication"
-    );
+        inventory.retire_completed_relocations(&generation).unwrap();
+        assert!(!source_path.exists());
+        if let Some(delivery) = &delivery {
+            assert_eq!(
+                inventory
+                    .delivery(&delivery.delivery_id)
+                    .unwrap()
+                    .source_cleanup
+                    .status,
+                "succeeded"
+            );
+        }
+        assert_eq!(inventory.get(&retired_source_id).unwrap().state, "deleted");
+        let published = inventory.for_job(84).unwrap().unwrap();
+        let descriptor = inventory.verify(&published).unwrap();
+        assert_eq!(fs::manifest(&descriptor, 100_000).unwrap(), published.files);
+        assert_eq!(
+            std::fs::read(published_path.join("episode.mkv")).unwrap(),
+            b"verified publication"
+        );
+    }
 }
-
 #[test]
 fn empty_retained_failed_source_is_disposed_but_files_and_keep_are_not() {
     // Field report 2026-11-02: health failures retained empty directories

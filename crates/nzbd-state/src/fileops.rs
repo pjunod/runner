@@ -5,6 +5,18 @@ use std::fs::File;
 use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 use std::path::{Component, Path};
 
+#[cfg(test)]
+thread_local! { pub(crate) static PAYLOAD_READ_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+thread_local! { static BEFORE_COPY_READBACK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
+#[inline]
+pub(crate) fn payload_read(bytes: usize) {
+    #[cfg(test)]
+    PAYLOAD_READ_BYTES.with(|total| total.set(total.get().saturating_add(bytes as u64)));
+    #[cfg(not(test))]
+    let _ = bytes;
+}
+
 pub fn open_directory(path: &Path) -> Result<File> {
     fs::open_dir(path)
 }
@@ -122,22 +134,26 @@ pub fn copy_publish_checked(
     use sha2::{Digest, Sha256};
     use std::io::{Read, Seek, Write};
     let mut input = open(source)?;
-    let identity = fs::identity(&input.metadata()?);
+    let identity = fs::identity_for_file(&input)?;
     let hash = |file: &mut File| -> Result<Vec<u8>> {
+        let before = fs::identity_for_file(file)?;
+        file.rewind()?;
         let mut h = Sha256::new();
         let mut buf = [0; 65536];
         loop {
             checkpoint()?;
             let n = file.read(&mut buf)?;
+            payload_read(n);
             if n == 0 {
                 break;
             }
             h.update(&buf[..n]);
         }
-        file.rewind()?;
+        if fs::identity_for_file(file)? != before {
+            return Err(Error::Conflict("copy input changed while hashing".into()));
+        }
         Ok(h.finalize().to_vec())
     };
-    let expected = hash(&mut input)?;
     let parent = fs::open_dir(
         target
             .parent()
@@ -148,21 +164,40 @@ pub fn copy_publish_checked(
             .file_name()
             .ok_or_else(|| Error::Conflict("missing publication name".into()))?,
     );
-    if let Ok(mut existing) = fs::open_at(&parent, basename, false) {
-        if hash(&mut existing)? == expected {
-            return Ok(());
+    match fs::open_at(&parent, basename, false) {
+        Ok(mut existing) => {
+            let existing_identity = fs::identity_for_file(&existing)?;
+            let expected = hash(&mut input)?;
+            if hash(&mut existing)? == expected
+                && fs::identity_for_file(&input)? == identity
+                && fs::identity_for_file(&open(target)?)? == existing_identity
+                && fs::identity_for_file(&open(source)?)? == identity
+            {
+                return Ok(());
+            }
+            return Err(Error::Conflict(
+                "publication collision requires review".into(),
+            ));
         }
-        return Err(Error::Conflict(
-            "publication collision requires review".into(),
-        ));
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
     }
     #[cfg(unix)]
     {
+        // Key the private attempt by its exact source identity, rather than
+        // prehashing the entire source just to name a temporary file.
         let key = format!(
             "{:x}",
-            Sha256::digest([target.as_os_str().as_bytes(), &expected].concat())
+            Sha256::digest(
+                [
+                    target.as_os_str().as_bytes(),
+                    &serde_json::to_vec(&identity)?
+                ]
+                .concat()
+            )
         );
-        let tmp = std::ffi::CString::new(format!(".runner-publish-{key}")).unwrap();
+        let tmp_name = format!(".runner-publish-{key}");
+        let tmp = std::ffi::CString::new(tmp_name.as_str()).unwrap();
         let final_name = std::ffi::CString::new(basename.as_os_str().as_bytes())
             .map_err(|_| Error::Conflict("invalid publication name".into()))?;
         let fd = unsafe {
@@ -174,38 +209,44 @@ pub fn copy_publish_checked(
             )
         };
         use std::os::fd::FromRawFd;
-        let mut output = if fd < 0 {
+        let (output, expected) = if fd < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() != std::io::ErrorKind::AlreadyExists {
                 return Err(e.into());
             }
-            // A previous owned operation may have finished its deterministic
-            // temp. An incomplete one requires review, never another copy.
-            let mut previous = fs::open_at(&parent, Path::new(tmp.to_str().unwrap()), false)?;
+            // Restart is conservative: independently validate a previous temp.
+            let mut previous = fs::open_at(&parent, Path::new(&tmp_name), false)?;
+            let expected = hash(&mut input)?;
             if hash(&mut previous)? != expected {
                 return Err(Error::Conflict(
                     "incomplete publication checkpoint requires review".into(),
                 ));
             }
-            previous
+            (previous, expected)
         } else {
             let mut output = unsafe { File::from_raw_fd(fd) };
+            let mut digest = Sha256::new();
+            let mut count = 0u64;
             let mut buffer = [0; 65536];
             loop {
                 checkpoint()?;
                 let n = input.read(&mut buffer)?;
+                payload_read(n);
                 if n == 0 {
                     break;
                 }
                 output.write_all(&buffer[..n])?;
+                digest.update(&buffer[..n]);
+                count += n as u64;
+            }
+            if count != identity.bytes || fs::identity_for_file(&input)? != identity {
+                return Err(Error::Conflict(
+                    "publication source changed during copy".into(),
+                ));
             }
             output.sync_all()?;
-            output.rewind()?;
-            output
+            (output, digest.finalize().to_vec())
         };
-        if hash(&mut output)? != expected || fs::identity(&input.metadata()?) != identity {
-            return Err(Error::Conflict("publication source or copy changed".into()));
-        }
         checkpoint()?;
         if unsafe {
             libc::linkat(
@@ -220,16 +261,30 @@ pub fn copy_publish_checked(
             return Err(std::io::Error::last_os_error().into());
         }
         fs::sync_directory(&parent)?;
-        let published = fs::open_at(&parent, basename, false)?;
-        let temporary = fs::open_at(&parent, Path::new(tmp.to_str().unwrap()), false)?;
-        if fs::identity(&published.metadata()?) == fs::identity(&output.metadata()?)
-            && fs::identity(&temporary.metadata()?) == fs::identity(&output.metadata()?)
+        let mut published = fs::open_at(&parent, basename, false)?;
+        let temporary = fs::open_at(&parent, Path::new(&tmp_name), false)?;
+        let object = fs::identity_for_file(&output)?;
+        if !object.same_object(&fs::identity_for_file(&published)?)
+            || !object.same_object(&fs::identity_for_file(&temporary)?)
         {
-            fs::unlink(&parent, Path::new(tmp.to_str().unwrap()), false)?;
-            fs::sync_directory(&parent)?;
+            return Err(Error::Conflict("copy publication identity changed".into()));
         }
-        // Original workspace and deterministic temp remain until its custody
-        // journal acknowledges publication. No name-only cleanup is permitted.
+        // The source is retained. Verify the final name after our last
+        // namespace mutation so link/unlink ctime changes do not cause scans.
+        fs::unlink(&parent, Path::new(&tmp_name), false)?;
+        fs::sync_directory(&parent)?;
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_COPY_READBACK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+        let verified_identity = fs::identity_for_file(&published)?;
+        if hash(&mut published)? != expected
+            || fs::identity_for_file(&input)? != identity
+            || fs::identity_for_file(&open(target)?)? != verified_identity
+            || fs::identity_for_file(&open(source)?)? != identity
+        {
+            return Err(Error::Conflict("publication source or copy changed".into()));
+        }
         Ok(())
     }
     #[cfg(not(unix))]
@@ -239,7 +294,22 @@ pub fn copy_publish_checked(
 }
 
 pub fn rename_exclusive(source: &Path, target: &Path) -> Result<()> {
-    fs::rename_exclusive(source, target)
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        fs::rename_exclusive_verified(source, target)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        fs::rename_exclusive(source, target)
+    }
+}
+
+/// Content evidence belongs to the descriptor captured by its producer, never
+/// to a pathname recaptured after hashing.
+#[derive(Clone, Debug)]
+pub struct ContentProof {
+    pub identity: crate::artifacts::Identity,
+    pub sha256: String,
 }
 
 /// Open/create a stable writer leaf beneath a no-follow parent descriptor.
@@ -276,5 +346,70 @@ pub fn writer(path: &Path, create: bool) -> Result<File> {
     {
         let _ = (parent, create);
         Err(Error::Conflict("anchored writer unavailable".into()))
+    }
+}
+
+#[cfg(test)]
+mod copy_budget_tests {
+    use super::*;
+
+    #[test]
+    fn final_readback_rejects_replaced_ancestor_even_when_old_descriptor_is_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        std::fs::write(&source, b"original").unwrap();
+        let parent = tmp.path().join("destination");
+        std::fs::create_dir(&parent).unwrap();
+        let target = parent.join("media");
+        let parked = tmp.path().join("parked");
+        let replacement = target.clone();
+        BEFORE_COPY_READBACK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(&parent, &parked).unwrap();
+                std::fs::create_dir(&parent).unwrap();
+                std::fs::write(&replacement, b"replaced").unwrap();
+            }))
+        });
+        assert!(copy_publish_checked(&source, &target, &|| Ok(())).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+        assert_eq!(std::fs::read(&target).unwrap(), b"replaced");
+    }
+
+    #[test]
+    fn fresh_copy_reads_each_source_and_destination_byte_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        let bytes = vec![19; 3 * 65536 + 17];
+        std::fs::write(&source, &bytes).unwrap();
+        PAYLOAD_READ_BYTES.with(|total| total.set(0));
+        copy_publish_checked(&source, &target, &|| Ok(())).unwrap();
+        assert_eq!(
+            PAYLOAD_READ_BYTES.with(|total| total.get()),
+            bytes.len() as u64 * 2
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        assert!(source.exists());
+        copy_publish_checked(&source, &target, &|| Ok(())).unwrap();
+        std::fs::write(&target, vec![7; bytes.len()]).unwrap();
+        assert!(copy_publish_checked(&source, &target, &|| Ok(())).is_err());
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn final_copy_readback_rejects_same_length_destination_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        std::fs::write(&source, vec![19; 65536]).unwrap();
+        let changed = std::cell::Cell::new(false);
+        let result = copy_publish_checked(&source, &target, &|| {
+            if target.exists() && !changed.replace(true) {
+                std::fs::write(&target, vec![7; 65536])?;
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(source.exists());
     }
 }
