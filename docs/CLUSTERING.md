@@ -243,6 +243,19 @@ Authentication, stale-token checks, invalid configuration, and transaction
 conflicts still reject the operation they protect; they are correctness
 boundaries, not feature gates.
 
+Quorum-commit health requires the local node to have joined the committed
+voter set as well as a successful linearizable quorum read. A learner that
+can forward reads is still unready. During takeover, control reconciliation
+reads actor-stamped queue metadata while payload recovery remains fenced;
+pending payload verification must not restart authority adoption repeatedly.
+Shutdown revokes cluster work and closes control streams before joining
+background tasks, so a pending quorum request cannot block the stop of a
+minority node. Accepted Raft writes drain through control shutdown, and owned
+filesystem workers are still joined before the engine closes.
+Mutation admission checks quorum before waiting for reconciliation and bounds
+that lock wait to two seconds. A lost quorum or busy reconciliation returns
+503 before the mutation handler runs.
+
 ## Configuration checklist
 
 Before enabling, normally verify:

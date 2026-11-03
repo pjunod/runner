@@ -33,6 +33,13 @@ pub mod tools;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PostError {
+    /// Preserve control-plane errors so a timeout is not treated as bad input.
+    #[error("{operation}: {source}")]
+    Engine {
+        operation: &'static str,
+        #[source]
+        source: nzbd_engine::EngineError,
+    },
     /// The stage already persisted its authoritative control fact.
     #[error("post-processing held")]
     Held,

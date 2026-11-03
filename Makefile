@@ -198,6 +198,7 @@ fast-check-rust: ## Reviewed merge candidate: compile/lint Rust and run bounded 
 	$(CARGO) fmt --all --check
 	$(CARGO) check --workspace --all-targets --locked
 	$(CARGO) clippy --workspace --all-targets --locked -- -D warnings
+	$(CARGO) test --manifest-path vendor/hiqlite/Cargo.toml --target-dir "$${CARGO_TARGET_DIR:-$(CURDIR)/target}" --locked --no-default-features --features sqlite --lib api_stream_stop_watch_ignores_live_updates_and_observes_terminal_states
 	$(CARGO) test --locked -p nzbd-cluster --lib
 	$(CARGO) test --locked -p nzbd-cluster --test cluster_e2e -- --test-threads=1
 
@@ -217,8 +218,11 @@ fast-check-startup: ## Startup recovery writer, admission, enrollment, and daemo
 	@status=0; \
 	$(CARGO) test --locked -p nzbd-engine --lib writer::tests || status=$$?; \
 	$(CARGO) test --locked -p nzbd-engine --lib recovery:: || status=$$?; \
+	$(CARGO) test --locked -p nzbd-engine --lib owner_deadline_tests || status=$$?; \
 	$(CARGO) test --locked -p nzbd-engine --lib owner:: -- --skip torrent_ --skip seed_policy_ || status=$$?; \
 	$(CARGO) test --locked -p nzbd-post --lib admission_tests || status=$$?; \
+	$(CARGO) test --locked -p nzbd-post --lib terminal_reads_retry_timeouts_and_use_the_live_keep_setting || status=$$?; \
+	$(CARGO) test --locked -p nzbd-post --test pp_pipeline legacy_repair_timeout_recovers_automatically_and_records_terminal_failure || status=$$?; \
 	$(CARGO) test --locked -p nzbd-state --test enrollment || status=$$?; \
 	$(CARGO) test --locked -p nzbd --bin nzbd || status=$$?; \
 	$(CARGO) test --locked -p nzbd --test daemon -- --test-threads=1 || status=$$?; \
