@@ -660,7 +660,7 @@ async fn handle_failed_job(
     last_disposition: &mut HashMap<JobId, tokio::time::Instant>,
     force_retry: bool,
 ) -> bool {
-    if gate.as_ref().is_some_and(|claim| !claim(job)) {
+    if force_retry && gate.as_ref().is_some_and(|claim| !claim(job)) {
         return false;
     }
     let admission = match engine.begin_post_admission(job).await {
@@ -692,7 +692,7 @@ async fn handle_failed_job(
         force_retry,
     )
     .await;
-    let authorized = admitted_gate.as_ref().is_none_or(|claim| claim(job));
+    let authorized = !force_retry || admitted_gate.as_ref().is_none_or(|claim| claim(job));
     if let Err(error) = engine.end_post_admission(admission).await {
         tracing::warn!(job=job.0,%error,"failed-job cleanup custody release remains pending");
         return false;

@@ -586,3 +586,32 @@ published destination once; journal-owned primitive renames read no payload.
 A linked publication cleanup that changes ctime retains the additional verified
 refresh described in §3.2. No live nuc3 performance claim is made by these tests.
 Required CI and merge remain pending; production deployment is not yet performed.
+
+
+### 7.5 Broader integration qualification limit
+
+The additional `failure_regressions` integration target passed all six tests.
+The full legacy `pp_pipeline` target is not green on base `ea8a402b`: 34 of 38
+tests fail there, primarily on asynchronous import verification and processing
+admission assumptions. The candidate reports three passed and 35 failed. Its
+additional final-stamp failure is also reproduced on unchanged base code:
+three isolated repeats pass twice and fail once, confirming an existing race
+between history visibility, fault injection, and admission release. Baseline receipts are retained at
+`/private/tmp/runner-publication-baseline-integration.log` and
+`/private/tmp/runner-publication-baseline-final-stamp-{0,1,2}.log`. Candidate and base
+were tested with the same required external tools and isolated build slot.
+
+An experimental fixture-only correction resolved many of those failures but
+exposed additional existing manager and receipt assumptions. That broader test
+repair is excluded from this publication change; its source is retained at
+`/private/tmp/runner-publication-integration-fixture-experiment.rs`. The explicit
+RetryNow wrapper's additional gate checks are limited to forced requests so
+normal automatic processing retains its original gate order. Astra cleared
+that final correction before the final post-processing rerun.
+
+These baseline failures do not establish a new publication integrity regression,
+but they prevent claiming full integration qualification or deploying this
+candidate. The final affected post unit rerun passes all 119 tests; the six targeted
+failure regressions also pass. The requested merge still requires the
+repository's required CI checks to pass. Live nuc3 measurements and deployment
+remain separate pending work.
