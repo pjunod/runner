@@ -647,14 +647,39 @@ async fn commit_control_mutation(
     if (safe && !compat_mutation) || !shared.view.borrow().is_me {
         return next.run(request).await;
     }
-    let _serial = shared.mutation_serial.lock().await;
+    // Reject a lost quorum before waiting behind a background reconciliation
+    // that may itself be awaiting that quorum. No mutation has run yet.
+    let healthy = match &shared.control {
+        Some(control) => control.is_healthy().await,
+        None => false,
+    };
+    if !healthy {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "replicated control quorum is unavailable; mutation not accepted"
+            })),
+        )
+            .into_response();
+    }
+    let Ok(_serial) =
+        tokio::time::timeout(Duration::from_secs(2), shared.mutation_serial.lock()).await
+    else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "control reconciliation is busy; mutation not accepted"})),
+        ).into_response();
+    };
     if !shared.authority_ready() {
         let review = match &shared.control {
-            Some(control) => control
-                .delivery_meta("admission_migration_review")
-                .await
-                .ok()
-                .flatten(),
+            Some(control) => tokio::time::timeout(
+                Duration::from_secs(2),
+                control.delivery_meta("admission_migration_review"),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten(),
             None => None,
         };
         return (

@@ -252,6 +252,9 @@ Shutdown revokes cluster work and closes control streams before joining
 background tasks, so a pending quorum request cannot block the stop of a
 minority node. Accepted Raft writes drain through control shutdown, and owned
 filesystem workers are still joined before the engine closes.
+Mutation admission checks quorum before waiting for reconciliation and bounds
+that lock wait to two seconds. A lost quorum or busy reconciliation returns
+503 before the mutation handler runs.
 
 ## Configuration checklist
 
