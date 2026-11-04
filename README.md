@@ -130,6 +130,7 @@ workspace retirement, repair, and qualification work specified by the
 | [docs/INSTALL.md](docs/INSTALL.md) | Release binaries, Docker, Homebrew, building from source, musl static builds |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | The complete annotated `nzbd.toml` reference |
 | [docs/PUBLICATION_PERFORMANCE_PLAN.md](docs/PUBLICATION_PERFORMANCE_PLAN.md) | Slow rename/publication root causes, integrity-preserving fixes, and qualification before deployment |
+| [docs/INTEGRATION_RECOVERY_STATUS.md](docs/INTEGRATION_RECOVERY_STATUS.md) | Baseline integration repairs, script-output custody, and the deployment qualification record |
 | [docs/USAGE.md](docs/USAGE.md) | CLI, web UI, connecting the *arr apps, RSS feeds + filter language, extension scripts, deobfuscation |
 | [docs/MOBILE.md](docs/MOBILE.md) | Building the iPhone/iPad/Android app, connecting it to runner, and its exact control/security boundaries |
 | [docs/MOBILE_QUEUE_PARITY_PLAN.md](docs/MOBILE_QUEUE_PARITY_PLAN.md) | Reviewed mobile torrent grouping and controls implementation plan |

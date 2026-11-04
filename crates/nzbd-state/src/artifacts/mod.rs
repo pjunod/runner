@@ -1706,6 +1706,27 @@ impl Inventory {
     pub fn discover(&self, root: &Path, path: &Path, active: bool) -> Result<Artifact> {
         self.discover_record(root, path, active)
     }
+    /// Observe a script-selected result without associating it with a job or
+    /// granting ownership. Existing discoveries must still name the captured
+    /// directory and remain unowned and unassociated at this boundary.
+    pub fn observe_external_output(&self, root: &Path, path: &Path) -> Result<Artifact> {
+        let observed = self.discover(root, path, false)?;
+        if observed.owned || observed.job.is_some() {
+            return Err(Error::Conflict(
+                "external output is already owned or associated with a job".into(),
+            ));
+        }
+        self.verify(&observed)?;
+        let _guard = self.mutation_guard()?;
+        self.check_payload_capture(&observed)?;
+        let current = self.get(&observed.id)?;
+        if current.owned || current.job.is_some() {
+            return Err(Error::Conflict(
+                "external output ownership changed during observation".into(),
+            ));
+        }
+        Ok(current)
+    }
     fn discover_unlocked(&self, root: &Path, path: &Path) -> Result<Artifact> {
         self.discover_record(root, path, false)
     }

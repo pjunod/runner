@@ -1,7 +1,9 @@
 # Publication performance — root cause and proposed fix
 
-**Status:** implementation candidate; Astra PR review pending; unit tests not
-run; deployment not started · **Written:** 2026-11-03 (America/New_York) · **Branch:**
+**Status:** implementation merged in [PR #270](https://github.com/pjunod/runner/pull/270);
+Astra findings addressed and required CI green. Remaining baseline qualification
+and rollout are tracked in [integration recovery](INTEGRATION_RECOVERY_STATUS.md).
+**Written:** 2026-11-03 (America/New_York) · **Branch:**
 `codex/runner-publication-performance`
 
 Companion to [the file lifecycle contract](FILE_LIFECYCLE_PLAN.md) and

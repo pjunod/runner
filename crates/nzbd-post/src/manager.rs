@@ -4539,43 +4539,68 @@ async fn process_job_ctx_from_inner(
             } else {
                 "retained"
             };
-            // Script-selected or legacy moved output is visible, but never
-            // inherits deletion authority solely from a returned path.
+            // A script may select an external path, but that is not a
+            // relocation or proof that Runner owns the returned bytes. Keep
+            // the admitted source associated with the job and its terminal
+            // receipt; record the external result independently.
             let inventory = engine.artifacts();
-            if inventory
-                .for_job(job_id.0)
-                .ok()
-                .flatten()
-                .is_none_or(|a| a.path != path)
-            {
-                // A script-selected external output does not erase custody
-                // of the completed owned processing source or its scratch.
-                if let Some(control) = crate::attempt::current() {
-                    if let Some(source) = &control.source {
-                        let original = inventory
-                            .get(&source.artifact)
-                            .map_err(|e| PostError::Subprocess(e.to_string()))?;
-                        if original.generation == source.generation
-                            && original.job == Some(job_id.0)
-                            && matches!(original.state.as_str(), "active" | "transitioning")
-                        {
-                            inventory
-                                .finish(job_id.0, &original.path, &original.root, "retained")
-                                .map_err(|e| PostError::Subprocess(e.to_string()))?;
-                        }
+            let final_path = path.to_path_buf();
+            let final_root = path.parent().unwrap_or(dest_dir).to_path_buf();
+            let final_inventory = inventory.clone();
+            let (artifact, external_output) = crate::attempt::current()
+                .expect("processing control")
+                .blocking(move |control| {
+                    let current = final_inventory
+                        .for_job(job_id.0)?
+                        .ok_or(nzbd_state::artifacts::Error::NotFound)?;
+                    if current.path == final_path {
+                        return final_inventory
+                            .finish(job_id.0, &final_path, &final_root, state)
+                            .map(|artifact| (artifact, None))
+                            .map_err(PostError::from);
                     }
-                }
-                inventory
-                    .register_legacy_active(job_id.0, path.parent().unwrap_or(dest_dir), path)
-                    .map_err(|e| {
-                        PostError::Subprocess(format!("external result inventory: {e}"))
+                    let source = control.source.as_ref().ok_or_else(|| {
+                        PostError::Subprocess(
+                            "external output lacks its admitted source generation".into(),
+                        )
                     })?;
+                    if current.id != source.artifact
+                        || current.generation != source.generation
+                        || current.job != Some(job_id.0)
+                    {
+                        return Err(PostError::Subprocess(
+                            "external output source association changed".into(),
+                        ));
+                    }
+                    let output =
+                        final_inventory.observe_external_output(&final_root, &final_path)?;
+                    control.checkpoint()?;
+                    // Preserve the operator's Keep choice. Retained sources do
+                    // not expire automatically; adding Keep would also prevent
+                    // retirement of independently verified private scratch.
+                    let retained = final_inventory.finish(
+                        job_id.0,
+                        &current.path,
+                        &current.root,
+                        "retained",
+                    )?;
+                    Ok((retained, Some(output)))
+                })
+                .await?;
+            set_param(&mut fin.params, "Artifact:Id", artifact.id.clone());
+            set_param(
+                &mut fin.params,
+                "Artifact:Generation",
+                artifact.generation.clone(),
+            );
+            if let Some(output) = external_output {
+                set_param(&mut fin.params, "Artifact:ExternalOutputId", output.id);
+                set_param(
+                    &mut fin.params,
+                    "Artifact:ExternalOutputGeneration",
+                    output.generation,
+                );
             }
-            let artifact = inventory
-                .finish(job_id.0, path, path.parent().unwrap_or(dest_dir), state)
-                .map_err(PostError::from)?;
-            fin.params.retain(|(k, _)| k != "Artifact:Id");
-            fin.params.push(("Artifact:Id".into(), artifact.id.clone()));
             if (outcome == PpFinal::Success || has_durable_salvage)
                 && job.delivery_lifecycle
                 && artifact.owned

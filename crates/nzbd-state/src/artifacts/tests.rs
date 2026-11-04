@@ -3311,3 +3311,40 @@ fn empty_retained_failed_source_is_disposed_but_files_and_keep_are_not() {
     assert!(kept.exists(), "an explicit Keep is never overridden");
     assert_eq!(db.get(&kept_artifact.id).unwrap().state, "retained");
 }
+
+#[test]
+fn external_output_observation_never_adopts_owned_associated_or_replaced_paths() {
+    let (_tmp, inventory, root) = fixture();
+    let source = root.join("owned-source");
+    let owned = inventory
+        .allocate_for_delivery(810, &root, &source, true, false)
+        .unwrap();
+    assert!(inventory.observe_external_output(&root, &source).is_err());
+    assert!(inventory.get(&owned.id).unwrap().owned);
+
+    let result = root.join("external-output");
+    std::fs::create_dir(&result).unwrap();
+    let observed = inventory.observe_external_output(&root, &result).unwrap();
+    assert!(!observed.owned);
+    assert_eq!(observed.job, None);
+    inventory
+        .register_legacy_active(811, &root, &result)
+        .unwrap();
+    assert!(inventory.observe_external_output(&root, &result).is_err());
+    assert_eq!(inventory.for_job(811).unwrap().unwrap().id, observed.id);
+
+    let replaced = root.join("replaced-output");
+    std::fs::create_dir(&replaced).unwrap();
+    let captured = inventory.observe_external_output(&root, &replaced).unwrap();
+    std::fs::rename(&replaced, root.join("original-output")).unwrap();
+    std::fs::create_dir(&replaced).unwrap();
+    std::fs::write(replaced.join("foreign.bin"), b"foreign bytes").unwrap();
+    assert!(inventory.observe_external_output(&root, &replaced).is_err());
+    let unchanged = inventory.get(&captured.id).unwrap();
+    assert_eq!(unchanged.identity, captured.identity);
+    assert!(!unchanged.owned);
+    assert_eq!(
+        std::fs::read(replaced.join("foreign.bin")).unwrap(),
+        b"foreign bytes"
+    );
+}
