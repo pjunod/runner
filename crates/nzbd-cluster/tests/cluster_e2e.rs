@@ -755,7 +755,21 @@ async fn leader_retries_authority_adoption_after_snapshot_repair() {
         .unwrap();
     add_job(&node.url, "repaired", post.nzb.as_bytes()).await;
     wait_for("scheduling after snapshot repair", 20, || {
-        get_json(&node.url, "/api/v1/jobs")["jobs"][0]["status"] == "completed"
+        let (code, body) = http(&node.url, "GET", "/api/v1/jobs", b"");
+        let value: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|error| panic!("jobs after snapshot repair: {code}: {body}: {error}"));
+        if code == 503 {
+            assert!(
+                value == serde_json::json!({"error": "leadership is changing; retry"})
+                    || value == serde_json::json!({"error": "no leader elected yet; retry"}),
+                "jobs after snapshot repair: {code}: {body}"
+            );
+            // Election gaps are not queue observations. Keep the original
+            // deadline and require a real successful completion response.
+            return false;
+        }
+        assert_eq!(code, 200, "jobs after snapshot repair: {body}");
+        value["jobs"][0]["status"] == "completed"
     })
     .await;
 
@@ -911,10 +925,25 @@ async fn article_ranges_use_two_workers_and_one_authoritative_assembly() {
     add_job(&leader.url, "ranged", post.nzb.as_bytes()).await;
     let assembled = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            if get_json(&leader.url, "/api/v1/jobs")["jobs"][0]["status"] == "completed"
-                && tmp.path().join("complete/ranged/range.bin").is_file()
-            {
-                break;
+            let (code, body) = http(&leader.url, "GET", "/api/v1/jobs", b"");
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|error| {
+                panic!("jobs during range assembly: {code}: {body}: {error}")
+            });
+            if code == 503 {
+                assert!(
+                    value == serde_json::json!({"error": "leadership is changing; retry"})
+                        || value == serde_json::json!({"error": "no leader elected yet; retry"}),
+                    "jobs during range assembly: {code}: {body}"
+                );
+                // Election gaps are not queue observations. Keep the original
+                // deadline and require a real successful completion response.
+            } else {
+                assert_eq!(code, 200, "jobs during range assembly: {body}");
+                if value["jobs"][0]["status"] == "completed"
+                    && tmp.path().join("complete/ranged/range.bin").is_file()
+                {
+                    break;
+                }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -2621,8 +2650,8 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
         verified_paused(&authority.runtime.engine, nzbd_types::JobId(job_id as u32)).await;
     }
     // Reconciliation can start another verification after the readiness
-    // observation above. Retry only an empty transient 503 while the exact
-    // job still resolves to Paused; never replay an accepted Resume.
+    // observation above. Retry only this job's exact pre-handler verification
+    // refusal while it still resolves to Paused; never replay an accepted Resume.
     let resume_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         let (code, body) = http(
@@ -2634,7 +2663,18 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
         if code == 200 {
             break;
         }
-        assert!(code == 503 && body.is_empty(), "Resume: {code}: {body}");
+        let expected = serde_json::json!({
+            "error": "queue_projection_unavailable",
+            "detail": format!("export queue projection for job {job_id}: file lifecycle: job verification or writer retirement is still in progress; retry later"),
+        });
+        assert!(
+            code == 503
+                && serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .as_ref()
+                    == Some(&expected),
+            "Resume: {code}: {body}"
+        );
         assert!(
             tokio::time::Instant::now() < resume_deadline,
             "Resume remained blocked by verification"

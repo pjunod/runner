@@ -8,6 +8,32 @@ pub struct SourceGeneration {
     pub generation: String,
 }
 
+/// Metadata authority to revisit one already-requested failed deletion.
+/// This is not evidence that any payload bytes remain valid or readable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedCleanupProof {
+    job: u32,
+    source: SourceGeneration,
+    root: PathBuf,
+    path: PathBuf,
+    operation: String,
+    request: String,
+}
+impl FailedCleanupProof {
+    pub fn job(&self) -> u32 {
+        self.job
+    }
+    pub fn source(&self) -> &SourceGeneration {
+        &self.source
+    }
+    pub fn operation_id(&self) -> &str {
+        &self.operation
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// Clones share one registered use, which remains live until the last actual
 /// worker exits. Dropping an async join handle does not release worker custody.
 #[derive(Clone)]
@@ -85,6 +111,121 @@ pub struct StagedCompletion {
 }
 
 impl Inventory {
+    /// Inspect only durable cleanup metadata. In particular, a partially
+    /// deleted generation must never pass through ordinary payload recovery.
+    pub fn failed_cleanup_proof(&self, job: u32) -> Result<Option<FailedCleanupProof>> {
+        let _coordinator = self.mutation_guard()?;
+        let Some(artifact) = self.for_job(job)? else {
+            return Ok(None);
+        };
+        let operation = match self.operation(&format!("failed-delete-{}", artifact.id)) {
+            Ok(operation) => operation,
+            Err(Error::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let proof = FailedCleanupProof {
+            job,
+            source: SourceGeneration {
+                artifact: artifact.id,
+                generation: artifact.generation,
+            },
+            root: artifact.root,
+            path: artifact.path,
+            operation: operation.id,
+            request: operation.request,
+        };
+        self.failed_cleanup_binding(&proof)?;
+        Ok(Some(proof))
+    }
+
+    /// Revalidate the immutable operation binding without granting payload
+    /// export, processing custody, or permission to create a deletion request.
+    pub fn validate_failed_cleanup_proof(&self, proof: &FailedCleanupProof) -> Result<()> {
+        let _coordinator = self.mutation_guard()?;
+        self.failed_cleanup_binding(proof).map(|_| ())
+    }
+
+    // Caller holds the mutation coordinator. Retry state/deadlines may evolve;
+    // the selected job, generation, namespace and deletion request may not.
+    fn failed_cleanup_binding(&self, proof: &FailedCleanupProof) -> Result<(Artifact, Operation)> {
+        let artifact = self.for_job(proof.job)?.ok_or(Error::NotFound)?;
+        let operation = self.operation(&proof.operation)?;
+        let request: DeleteRequest = serde_json::from_str(&operation.request)?;
+        let exact_request = matches!(request,
+            DeleteRequest::Scoped((ref id, _, 0, false, ref generation))
+                if id == &artifact.id && generation == &artifact.generation);
+        if artifact.id != proof.source.artifact
+            || artifact.generation != proof.source.generation
+            || artifact.job != Some(proof.job)
+            || artifact.root != proof.root
+            || artifact.path != proof.path
+            || !artifact.owned
+            || !matches!(
+                artifact.state.as_str(),
+                "retained" | "deleting" | "delete_failed" | "deleted" | "source_gone"
+            )
+            || operation.id != format!("failed-delete-{}", artifact.id)
+            || operation.artifact != artifact.id
+            || operation.kind != "delete"
+            || operation.request != proof.request
+            || !matches!(
+                operation.state.as_str(),
+                "queued" | "running" | "retry" | "succeeded" | "cancelled" | "review"
+            )
+            || !exact_request
+        {
+            return Err(Error::Conflict(
+                "failed cleanup source or deletion binding changed".into(),
+            ));
+        }
+        Ok((artifact, operation))
+    }
+
+    /// Resume only the proven journal. The private reservation prevents other
+    /// workers from acquiring this generation until the actual executor exits.
+    /// All deletion policy, deadline and filesystem checks stay in that executor.
+    pub fn replay_failed_cleanup(
+        self: &Arc<Self>,
+        proof: &FailedCleanupProof,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> Result<Operation> {
+        checkpoint()?;
+        let custody = {
+            let _coordinator = self.mutation_guard()?;
+            checkpoint()?;
+            let (artifact, operation) = self.failed_cleanup_binding(proof)?;
+            if matches!(
+                operation.state.as_str(),
+                "succeeded" | "cancelled" | "review"
+            ) || operation.not_before > now()
+                || operation.next_retry > now()
+            {
+                return Ok(operation);
+            }
+            if self.artifact_in_use(&artifact)? {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+            }
+            self.workspace_uses
+                .lock()
+                .unwrap()
+                .insert((artifact.id.clone(), artifact.generation.clone()), 1);
+            AttemptUse(Arc::new(UseLease {
+                inventory: self.clone(),
+                source: proof.source.clone(),
+            }))
+        };
+        let check = || {
+            checkpoint()?;
+            // execute_delete_with_use first calls this under its coordinator:
+            // a policy edit between reservation and execution cannot substitute
+            // another request. Later checks can only refuse the same operation.
+            self.failed_cleanup_binding(proof)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            Ok(())
+        };
+        self.execute_delete_with_use(&proof.operation, Some((&custody, &check)))
+    }
+
     pub fn acquire_attempt_use(self: &Arc<Self>, job: u32) -> Result<Option<AttemptUse>> {
         self.acquire_attempt_use_checked(job, &|| Ok(()))
     }
@@ -1122,6 +1263,188 @@ mod tests {
             "params": [["Artifact:Id", workspace.source.id]]
         }))
         .unwrap()
+    }
+
+    fn partial_failed_cleanup() -> (
+        tempfile::TempDir,
+        Arc<Inventory>,
+        PathBuf,
+        FailedCleanupProof,
+    ) {
+        let (temp, inventory, workspace) = fixture();
+        let path = workspace.source.path.clone();
+        std::fs::write(path.join("survivor"), b"still owned").unwrap();
+        inventory
+            .finish(12, &path, &workspace.source.root, "active")
+            .unwrap();
+        assert!(inventory.failed_cleanup_proof(12).unwrap().is_none());
+        let custody = inventory.acquire_attempt_use(12).unwrap().unwrap();
+        DELETE_FAIL_AFTER.with(|counter| counter.set(Some(1)));
+        let operation = inventory
+            .delete_failed_payload(&custody, 12, &|| Ok(()))
+            .unwrap();
+        assert_eq!(operation.state, "retry");
+        assert_eq!(operation.attempts, 1);
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 1);
+        drop(custody);
+        let proof = inventory.failed_cleanup_proof(12).unwrap().unwrap();
+        (temp, inventory, path, proof)
+    }
+
+    #[test]
+    fn failed_cleanup_replays_partial_deletion_after_restart_without_processing_authority() {
+        let (temp, inventory, path, proof) = partial_failed_cleanup();
+        assert!(inventory.acquire_attempt_use(12).is_err());
+        assert!(inventory.acquire_terminal_use(12, &|| Ok(())).is_err());
+        let before = inventory.operation(proof.operation_id()).unwrap();
+        let deferred = inventory.replay_failed_cleanup(&proof, &|| Ok(())).unwrap();
+        assert_eq!(
+            serde_json::to_value(&deferred).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert!(path.exists());
+        inventory.close().unwrap();
+        drop(inventory);
+
+        let inventory = Arc::new(Inventory::open(&temp.path().join("state")).unwrap());
+        assert_eq!(inventory.failed_cleanup_proof(12).unwrap().unwrap(), proof);
+        inventory.validate_failed_cleanup_proof(&proof).unwrap();
+        // Model expiry of the real retry deadline, preserving its authorization.
+        let mut due = inventory.operation(proof.operation_id()).unwrap();
+        due.next_retry = 0;
+        save_operation(&inventory.db.lock().unwrap(), &due).unwrap();
+        let completed = inventory.replay_failed_cleanup(&proof, &|| Ok(())).unwrap();
+        assert_eq!(completed.id, before.id);
+        assert_eq!(completed.request, before.request);
+        assert_eq!(completed.attempts, 2);
+        assert_eq!(completed.state, "succeeded");
+        assert!(!path.exists());
+        assert_eq!(
+            inventory.get(&proof.source.artifact).unwrap().state,
+            "deleted"
+        );
+        inventory.validate_failed_cleanup_proof(&proof).unwrap();
+        assert_eq!(
+            inventory
+                .replay_failed_cleanup(&proof, &|| Ok(()))
+                .unwrap()
+                .attempts,
+            2
+        );
+    }
+
+    #[test]
+    fn failed_cleanup_replay_preserves_keep_hold_deadline_and_live_custody_checks() {
+        let (_temp, inventory, path, proof) = partial_failed_cleanup();
+        let mut due = inventory.operation(proof.operation_id()).unwrap();
+        due.next_retry = 0;
+        save_operation(&inventory.db.lock().unwrap(), &due).unwrap();
+        let artifact = inventory.get(&proof.source.artifact).unwrap();
+        let kept = inventory
+            .retention(&artifact.id, artifact.revision, true, None)
+            .unwrap();
+        inventory.validate_failed_cleanup_proof(&proof).unwrap();
+        assert!(inventory.replay_failed_cleanup(&proof, &|| Ok(())).is_err());
+        let mut artifact = inventory
+            .retention(&kept.id, kept.revision, false, None)
+            .unwrap();
+        artifact.hold = Some("review: test".into());
+        save_artifact(&inventory.db.lock().unwrap(), &artifact).unwrap();
+        assert!(inventory.replay_failed_cleanup(&proof, &|| Ok(())).is_err());
+        artifact.hold = None;
+        save_artifact(&inventory.db.lock().unwrap(), &artifact).unwrap();
+        let reader = inventory
+            .reserve_reconciliation(std::slice::from_ref(&artifact))
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(inventory.replay_failed_cleanup(&proof, &|| Ok(())),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        drop(reader);
+        assert!(inventory
+            .replay_failed_cleanup(&proof, &|| Err(std::io::ErrorKind::Interrupted.into()))
+            .is_err());
+        assert_eq!(
+            inventory.operation(proof.operation_id()).unwrap().attempts,
+            1
+        );
+        assert_eq!(std::fs::read_dir(path).unwrap().count(), 1);
+        assert!(!inventory.processing_in_use(12).unwrap());
+    }
+
+    #[test]
+    fn failed_cleanup_proof_rejects_changed_or_legacy_authority_and_never_creates_intent() {
+        let (_temp, inventory, _path, proof) = partial_failed_cleanup();
+        let original = inventory.operation(proof.operation_id()).unwrap();
+        for alteration in ["generation", "legacy", "automatic", "artifact", "kind"] {
+            let mut operation = original.clone();
+            match alteration {
+                "generation" => {
+                    operation.request = serde_json::to_string(&(
+                        &proof.source.artifact,
+                        1u64,
+                        0u64,
+                        false,
+                        "other-generation",
+                    ))
+                    .unwrap()
+                }
+                "legacy" => {
+                    operation.request =
+                        serde_json::to_string(&(&proof.source.artifact, 1u64, 0u64, false)).unwrap()
+                }
+                "automatic" => {
+                    operation.request = serde_json::to_string(&(
+                        &proof.source.artifact,
+                        1u64,
+                        0u64,
+                        true,
+                        &proof.source.generation,
+                    ))
+                    .unwrap()
+                }
+                "artifact" => operation.artifact = "another-source".into(),
+                "kind" => operation.kind = "prune".into(),
+                _ => unreachable!(),
+            }
+            save_operation(&inventory.db.lock().unwrap(), &operation).unwrap();
+            assert!(
+                inventory.validate_failed_cleanup_proof(&proof).is_err(),
+                "{alteration}"
+            );
+            assert!(inventory.failed_cleanup_proof(12).is_err(), "{alteration}");
+        }
+        save_operation(&inventory.db.lock().unwrap(), &original).unwrap();
+        let mut changed = inventory.get(&proof.source.artifact).unwrap();
+        changed.job = Some(99);
+        save_artifact(&inventory.db.lock().unwrap(), &changed).unwrap();
+        assert!(inventory.validate_failed_cleanup_proof(&proof).is_err());
+        assert!(inventory.failed_cleanup_proof(12).unwrap().is_none());
+        assert_eq!(
+            serde_json::to_value(inventory.operation(proof.operation_id()).unwrap()).unwrap(),
+            serde_json::to_value(original).unwrap()
+        );
+    }
+
+    #[test]
+    fn failed_cleanup_replay_rejects_replaced_survivors_without_adopting_them() {
+        let (_temp, inventory, path, proof) = partial_failed_cleanup();
+        let survivor = std::fs::read_dir(&path)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::remove_file(&survivor).unwrap();
+        std::fs::write(&survivor, b"replacement must remain").unwrap();
+        let mut due = inventory.operation(proof.operation_id()).unwrap();
+        due.next_retry = 0;
+        save_operation(&inventory.db.lock().unwrap(), &due).unwrap();
+        let operation = inventory.replay_failed_cleanup(&proof, &|| Ok(())).unwrap();
+        assert_eq!(operation.state, "review");
+        assert_eq!(std::fs::read(survivor).unwrap(), b"replacement must remain");
+        assert!(inventory.acquire_attempt_use(12).is_err());
     }
 
     #[test]

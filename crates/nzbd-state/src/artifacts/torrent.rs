@@ -2192,6 +2192,7 @@ mod tests {
             if !checked.get() && f.inventory.operation("torrent-copy-job-2").is_ok() {
                 checked.set(true);
                 let before = f.inventory.operation("torrent-copy-job-2").unwrap().request;
+                let retry_started = now();
                 assert!(
                     matches!(f.inventory.cleanup_torrent_copy_stages(2,&||Ok(())),Err(Error::Io(ref error)) if error.kind()==std::io::ErrorKind::WouldBlock)
                 );
@@ -2202,7 +2203,7 @@ mod tests {
                 let status = f.inventory.operation("torrent-stage-status-job-2").unwrap();
                 assert_eq!(status.state, "retry");
                 assert_eq!(status.attempts, 1);
-                assert!((30..=35).contains(&(status.next_retry - now())));
+                assert!((retry_started + 30..=now() + 35).contains(&status.next_retry));
                 let mut status = status;
                 let mut details: StageCleanupStatus =
                     serde_json::from_str(&status.request).unwrap();
@@ -2211,12 +2212,14 @@ mod tests {
                 status.request = serde_json::to_string(&details).unwrap();
                 save_operation(&f.inventory.db.lock().unwrap(), &status).unwrap();
                 for base in [60, 120, 300] {
+                    let retry_started = now();
                     assert!(f
                         .inventory
                         .cleanup_torrent_copy_stages(2, &|| Ok(()))
                         .is_err());
                     let status = f.inventory.operation("torrent-stage-status-job-2").unwrap();
-                    assert!((base..=base + base / 10 + 1).contains(&(status.next_retry - now())));
+                    assert!((retry_started + base..=now() + base + base / 10 + 1)
+                        .contains(&status.next_retry));
                     let details: StageCleanupStatus =
                         serde_json::from_str(&status.request).unwrap();
                     assert_eq!(details.blocked_since, Some(first_blocked));

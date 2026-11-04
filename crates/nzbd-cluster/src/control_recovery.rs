@@ -2,15 +2,17 @@
 use crate::control::ControlStore;
 use hiqlite::{params, Row};
 use nzbd_types::{Job, JobStatus};
+use std::collections::{HashMap, HashSet};
 
 /// Progress is not operator intent. Keep file identities/pauses/source params,
 /// while allowing validated segment completion and measured timing to advance.
 pub(crate) fn business_intent(job: &Job) -> Result<Vec<u8>, String> {
-    let mut params = job
-        .params
-        .iter()
-        .filter(|(key, _)| {
-            key != nzbd_types::CONTROL_PARAM
+    serialize_business_intent(job, business_params(job).collect())
+}
+
+fn business_params(job: &Job) -> impl Iterator<Item = &(String, String)> {
+    job.params.iter().filter(|(key, _)| {
+        key != nzbd_types::CONTROL_PARAM
                 // Verified file proof/generation belongs to the observing
                 // node's recovery lane, not operator or source intent. The
                 // exact file descriptor and custody checks remain below.
@@ -24,8 +26,13 @@ pub(crate) fn business_intent(job: &Job) -> Result<Vec<u8>, String> {
                         | "*Runner:LifecycleTiming"
                         | "*Recovery:journal-loading"
                 )
-        })
-        .collect::<Vec<_>>();
+    })
+}
+
+fn serialize_business_intent(
+    job: &Job,
+    mut params: Vec<&(String, String)>,
+) -> Result<Vec<u8>, String> {
     params.sort();
     let files = job
         .files
@@ -64,6 +71,34 @@ pub(crate) fn business_intent(job: &Job) -> Result<Vec<u8>, String> {
     ))
     .map_err(|e| e.to_string())
 }
+/// Accepted journal replay can learn a publication length before that value
+/// exists in replicated intent. This enrichment is recovery evidence, not a
+/// new operator edit. An existing durable length must still match exactly.
+pub(crate) fn source_intent_matches(local: &Job, durable: &Job) -> Result<bool, String> {
+    let file_ids: HashSet<_> = local.files.iter().map(|file| file.id.0).collect();
+    let durable_keys: HashSet<_> = durable.params.iter().map(|(key, _)| key.as_str()).collect();
+    let mut local_key_counts = HashMap::new();
+    for (key, _) in &local.params {
+        *local_key_counts.entry(key.as_str()).or_insert(0_usize) += 1;
+    }
+    let params = business_params(local)
+        .filter(|(key, value)| {
+            let learned_size = key
+                .strip_prefix("*File:size:")
+                .and_then(|id| id.parse::<u32>().ok())
+                .is_some_and(|id| {
+                    key == &format!("*File:size:{id}")
+                        && file_ids.contains(&id)
+                        && value.parse::<u64>().is_ok_and(|size| size > 0)
+                        && local_key_counts.get(key.as_str()) == Some(&1)
+                        && !durable_keys.contains(key.as_str())
+                });
+            !learned_size
+        })
+        .collect();
+    Ok(serialize_business_intent(local, params)? == business_intent(durable)?)
+}
+
 pub(crate) fn grant_intent_matches(local: &Job, durable: &Job) -> Result<bool, String> {
     Ok(!local
         .params
@@ -73,7 +108,7 @@ pub(crate) fn grant_intent_matches(local: &Job, durable: &Job) -> Result<bool, S
         && !matches!(durable.status, JobStatus::Paused | JobStatus::Deleted)
         && durable.status == local.status
         && durable.control() == local.control()
-        && business_intent(local)? == business_intent(durable)?)
+        && source_intent_matches(local, durable)?)
 }
 struct IntentRow {
     data: String,
@@ -157,7 +192,7 @@ pub(crate) async fn reconcile(shared: &crate::leader::LeaderShared) -> Result<()
             restore_current = true;
             continue;
         };
-        if business_intent(&local)? != business_intent(&durable)? {
+        if !source_intent_matches(&local, &durable)? {
             // New operator/source intent wins, including an uncommitted local
             // operator edit. Never infer automatic authority from revisions.
             restore_current = true;
@@ -456,7 +491,7 @@ pub(crate) async fn projection(shared: &crate::leader::LeaderShared) -> Result<V
             if let Some(marker) = nzbd_engine::automatic_control::transition(current) {
                 if durable.control() == marker.base_control
                     && durable.status == marker.base_status
-                    && business_intent(current)? == business_intent(&durable)?
+                    && source_intent_matches(current, &durable)?
                 {
                     durable.set_control(&marker.result_control);
                     durable.status = marker.result_status;

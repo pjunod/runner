@@ -1722,6 +1722,16 @@ fn first_run_setup_wizard_writes_config_and_reloads() {
         }
     }
 
+    // Auth is installed before the backend finishes loading. Wait for its
+    // explicit readiness acknowledgement before asserting backend endpoints.
+    wait_healthy_authenticated(
+        &daemon,
+        &api_addr,
+        Duration::from_secs(20),
+        Some("nzbd:wizard-pw"),
+    )
+    .unwrap_or_else(|cause| panic!("{cause}"));
+
     // The written file exists and round-trips the strict parser.
     let text = std::fs::read_to_string(&cfg_path).unwrap();
     let cfg = nzbd_config::Config::from_toml(&text).unwrap();
@@ -1866,14 +1876,27 @@ bind = "{api_addr}"
             std::fs::read_to_string(&daemon_log_path)
                 .unwrap_or_else(|error| format!("could not read daemon log: {error}"))
         );
-        let published = std::fs::read_dir(&completed_root)
-            .ok()
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path().join("cli demo.mkv"))
-            .find(|path| std::fs::read(path).is_ok_and(|got| got == data));
+        // A directory scan can see a private generation before publication
+        // renames it. Follow the durable completion's advertised path instead.
+        let (code, body) = http(&api_addr, "GET", "/api/v1/history", b"");
+        assert_eq!(code, 200);
+        let history: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let published = history["entries"].as_array().and_then(|entries| {
+            entries
+                .iter()
+                .filter(|entry| entry["status"] == "SUCCESS")
+                .filter_map(|entry| entry["final_dir"].as_str())
+                .map(|path| PathBuf::from(path).join("cli demo.mkv"))
+                .find(|path| std::fs::read(path).is_ok_and(|got| got == data))
+        });
         if let Some(path) = published {
+            assert_eq!(
+                std::fs::canonicalize(path.parent().unwrap())
+                    .unwrap()
+                    .parent(),
+                Some(std::fs::canonicalize(&completed_root).unwrap().as_path()),
+                "advertised completion is inside the configured completed root"
+            );
             break path;
         }
         // `nzbd status` keeps answering while we wait (CLI liveness check).
@@ -2576,20 +2599,39 @@ fn health_transition_bounds_silent_http_and_tls_handshakes() {
     for scheme in ["http", "https"] {
         let listener = bind_listener("127.0.0.1:0").unwrap();
         let url = format!("{scheme}://{}", listener.local_addr().unwrap());
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
         let held = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
+            accepted_tx.send(Instant::now()).unwrap();
             std::thread::sleep(Duration::from_secs(3));
             drop(stream);
         });
-        let start = Instant::now();
-        let result =
-            child_output(Command::new(env!("CARGO_BIN_EXE_nzbd")).args(["health", "--url", &url]))
-                .unwrap();
+        // Cargo's debug subprocess startup can take seconds on macOS. The
+        // silent-peer contract starts once the actual connection is accepted;
+        // keep startup bounded separately and retain the three-second check.
+        let mut child = spawn_child(
+            Command::new(env!("CARGO_BIN_EXE_nzbd"))
+                .args(["health", "--url", &url])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
+        let start = match accepted_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(start) => start,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("health command did not connect within startup budget: {error}");
+            }
+        };
+        let result = child.wait_with_output().unwrap();
         assert!(!result.status.success());
         assert!(
             start.elapsed() < Duration::from_secs(3),
-            "{scheme} probe exceeded total budget: {:?}",
-            start.elapsed()
+            "{scheme} connected probe exceeded total budget: {:?}; stderr={}",
+            start.elapsed(),
+            String::from_utf8_lossy(&result.stderr)
         );
         held.join().unwrap();
     }

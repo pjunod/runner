@@ -1658,7 +1658,9 @@ fn wall_clock_alone_never_expires_a_payload_and_keep_resets_elapsed_time() {
     let a = db.get(&a.id).unwrap();
     assert_eq!(a.eligible_seconds, 50);
     let kept = db.retention(&a.id, a.revision, true, None).unwrap();
+    let release_started = now();
     let released = db.retention(&a.id, kept.revision, false, None).unwrap();
+    let release_finished = now();
     db.clocks.lock().unwrap().insert(
         a.id.clone(),
         (a.revision, Instant::now() - Duration::from_secs(500)),
@@ -1669,7 +1671,7 @@ fn wall_clock_alone_never_expires_a_payload_and_keep_resets_elapsed_time() {
         0,
         "old checkpoint cannot count held time"
     );
-    assert!(released.deadline.unwrap() >= now() + 99);
+    assert!((release_started + 100..=release_finished + 100).contains(&released.deadline.unwrap()));
 }
 #[test]
 fn restore_quarantines_pending_deletion_and_retention() {
@@ -1821,11 +1823,13 @@ fn retention_preview_is_atomic_and_never_shortens_elapsed_eligibility() {
     assert_eq!(db.get(&a.id).unwrap().retention_seconds, 7 * 86400);
     db.retention(&a.id, kept.revision, false, None).unwrap();
     let p = db.preview_retention(1).unwrap();
+    let apply_started = now();
     db.apply_retention(&p.id).unwrap();
+    let apply_finished = now();
     let a = db.get(&a.id).unwrap();
     assert_eq!(a.retention_seconds, 86400);
     assert_eq!(a.eligible_seconds, 0);
-    assert!(a.deadline.unwrap() >= now() + 86399);
+    assert!((apply_started + 86400..=apply_finished + 86400).contains(&a.deadline.unwrap()));
 }
 #[test]
 fn relocation_refuses_existing_destination_and_commits_identity_after_rename() {
@@ -3310,4 +3314,41 @@ fn empty_retained_failed_source_is_disposed_but_files_and_keep_are_not() {
     assert_eq!(db.get(&populated_artifact.id).unwrap().state, "retained");
     assert!(kept.exists(), "an explicit Keep is never overridden");
     assert_eq!(db.get(&kept_artifact.id).unwrap().state, "retained");
+}
+
+#[test]
+fn external_output_observation_never_adopts_owned_associated_or_replaced_paths() {
+    let (_tmp, inventory, root) = fixture();
+    let source = root.join("owned-source");
+    let owned = inventory
+        .allocate_for_delivery(810, &root, &source, true, false)
+        .unwrap();
+    assert!(inventory.observe_external_output(&root, &source).is_err());
+    assert!(inventory.get(&owned.id).unwrap().owned);
+
+    let result = root.join("external-output");
+    std::fs::create_dir(&result).unwrap();
+    let observed = inventory.observe_external_output(&root, &result).unwrap();
+    assert!(!observed.owned);
+    assert_eq!(observed.job, None);
+    inventory
+        .register_legacy_active(811, &root, &result)
+        .unwrap();
+    assert!(inventory.observe_external_output(&root, &result).is_err());
+    assert_eq!(inventory.for_job(811).unwrap().unwrap().id, observed.id);
+
+    let replaced = root.join("replaced-output");
+    std::fs::create_dir(&replaced).unwrap();
+    let captured = inventory.observe_external_output(&root, &replaced).unwrap();
+    std::fs::rename(&replaced, root.join("original-output")).unwrap();
+    std::fs::create_dir(&replaced).unwrap();
+    std::fs::write(replaced.join("foreign.bin"), b"foreign bytes").unwrap();
+    assert!(inventory.observe_external_output(&root, &replaced).is_err());
+    let unchanged = inventory.get(&captured.id).unwrap();
+    assert_eq!(unchanged.identity, captured.identity);
+    assert!(!unchanged.owned);
+    assert_eq!(
+        std::fs::read(replaced.join("foreign.bin")).unwrap(),
+        b"foreign bytes"
+    );
 }

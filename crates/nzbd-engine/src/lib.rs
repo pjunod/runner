@@ -708,6 +708,15 @@ pub struct PostAdmission {
     pub cancellation: CancellationToken,
 }
 
+/// Permission to resume an existing failed-source deletion. This grants no
+/// verified payload reads, download progress, repair or publication authority.
+#[derive(Clone, Debug)]
+pub struct FailedCleanupAdmission {
+    pub admission: PostAdmission,
+    pub job: nzbd_types::Job,
+    pub cleanup: nzbd_state::artifacts::FailedCleanupProof,
+}
+
 /// Cloneable handle to a running engine.
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -773,6 +782,29 @@ impl EngineHandle {
     ) -> Result<Option<PostAdmission>, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send(QueueCommand::BeginPostAdmission { job, reply })
+            .await?;
+        owner_reply(rx).await
+    }
+
+    /// Acquire metadata-only replay permission as the current queue authority.
+    /// Worker cleanup requires a separate current-grant capability.
+    pub async fn begin_failed_cleanup_admission(
+        &self,
+        job: JobId,
+    ) -> Result<Option<FailedCleanupAdmission>, EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(QueueCommand::BeginFailedCleanupAdmission { job, reply })
+            .await?;
+        owner_reply(rx).await
+    }
+
+    pub async fn failed_cleanup_metadata(&self) -> Result<Option<nzbd_types::Job>, EngineError> {
+        let admission = self
+            .post_scope
+            .clone()
+            .ok_or_else(|| EngineError::Lifecycle("failed cleanup scope is absent".into()))?;
+        let (reply, rx) = oneshot::channel();
+        self.send(QueueCommand::FailedCleanupMetadata { admission, reply })
             .await?;
         owner_reply(rx).await
     }
@@ -2217,14 +2249,25 @@ impl EngineHandle {
         self.send(QueueCommand::ExportJob { job, reply: tx })
             .await?;
         let result = owner_reply(rx).await?.map(|job| *job);
-        if result.is_none()
-            && self
-                .recovery_document()
-                .await?
-                .jobs
-                .iter()
-                .any(|record| record.id == job)
-        {
+        if result.is_none() {
+            // Cleanup scopes deliberately cannot read the full recovery
+            // document. Their explicit metadata capability still distinguishes
+            // a fenced row from an absent job without granting payload export.
+            let cleanup_exists = if self.post_scope.is_some() {
+                self.failed_cleanup_metadata().await?.is_some()
+            } else {
+                false
+            };
+            let exists = cleanup_exists
+                || self
+                    .recovery_document()
+                    .await?
+                    .jobs
+                    .iter()
+                    .any(|record| record.id == job);
+            if !exists {
+                return Ok(None);
+            }
             return Err(EngineError::Lifecycle(
                 "job verification or writer retirement is still in progress; retry later".into(),
             ));
@@ -2292,7 +2335,7 @@ impl EngineHandle {
         }
         self.roundtrip_bool(|reply| QueueCommand::RemoveJobSilent {
             job,
-            accepted_context: None,
+            retirement: None,
             reply,
         })
         .await
@@ -2306,9 +2349,31 @@ impl EngineHandle {
         job: JobId,
         context: nzbd_state::artifacts::WorkerControlContext,
     ) -> Result<bool, EngineError> {
+        if self.post_scope.is_some() {
+            return Ok(false);
+        }
         self.roundtrip_bool(|reply| QueueCommand::RemoveJobSilent {
             job,
-            accepted_context: Some(context),
+            retirement: Some(owner::WorkerRetirement::Accepted(context)),
+            reply,
+        })
+        .await
+    }
+
+    /// Revoke only the exact imported worker grant after its execution has
+    /// stopped. Shared resume journals survive expiry/cancellation; same-ID
+    /// successors remain protected through the durable retirement barrier.
+    pub async fn retire_worker_job(
+        &self,
+        job: JobId,
+        context: nzbd_state::artifacts::WorkerControlContext,
+    ) -> Result<bool, EngineError> {
+        if self.post_scope.is_some() {
+            return Ok(false);
+        }
+        self.roundtrip_bool(|reply| QueueCommand::RemoveJobSilent {
+            job,
+            retirement: Some(owner::WorkerRetirement::Revoked(context)),
             reply,
         })
         .await
@@ -2786,12 +2851,15 @@ mod hold_probe_tests {
         tokio::task::spawn_blocking(move || gate.wait())
             .await
             .unwrap();
-        for _ in 0..100 {
-            if probes.lock().unwrap().is_empty() {
-                break;
+        // The barrier partner can return before the original blocking task
+        // drops its lease. Await that actual release, not a count of yields.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !probes.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("finished blocking probe must release its singleflight lease");
         assert!(timeout.is_err());
         assert!(second.unwrap_err().contains("previous probe"));
         assert!(probes.lock().unwrap().is_empty());

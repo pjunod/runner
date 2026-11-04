@@ -662,6 +662,12 @@ async fn commit_control_mutation(
         )
             .into_response();
     }
+    // Catalog acceptance/retry has its own serialized replicated CAS. Keep
+    // quorum, proxy, authentication and authority checks, but do not attach
+    // an unrelated queue projection transaction after the receipt commits.
+    if delivery::is_catalog_mutation(&request) {
+        return next.run(request).await;
+    }
     let Ok(_serial) =
         tokio::time::timeout(Duration::from_secs(2), shared.mutation_serial.lock()).await
     else {
@@ -714,7 +720,14 @@ async fn commit_control_mutation(
         Ok(jobs) => jobs,
         Err(error) => {
             tracing::error!(%error, "could not capture queue projection before mutation");
-            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "queue_projection_unavailable",
+                    "detail": error,
+                })),
+            )
+                .into_response();
         }
     };
     let mut affected_ids: Vec<u64> = before.keys().copied().collect();

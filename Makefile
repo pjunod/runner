@@ -222,7 +222,7 @@ fast-check-startup: ## Startup recovery writer, admission, enrollment, and daemo
 	$(CARGO) test --locked -p nzbd-engine --lib owner:: -- --skip torrent_ --skip seed_policy_ || status=$$?; \
 	$(CARGO) test --locked -p nzbd-post --lib admission_tests || status=$$?; \
 	$(CARGO) test --locked -p nzbd-post --lib terminal_reads_retry_timeouts_and_use_the_live_keep_setting || status=$$?; \
-	$(CARGO) test --locked -p nzbd-post --test pp_pipeline legacy_repair_timeout_recovers_automatically_and_records_terminal_failure || status=$$?; \
+	$(CARGO) test --locked -p nzbd-post --test pp_pipeline --test failure_regressions || status=$$?; \
 	$(CARGO) test --locked -p nzbd-state --test enrollment || status=$$?; \
 	$(CARGO) test --locked -p nzbd --bin nzbd || status=$$?; \
 	$(CARGO) test --locked -p nzbd --test daemon -- --test-threads=1 || status=$$?; \

@@ -513,6 +513,24 @@ async fn manager_task(
             }
             Some(cmd) = control.recv() => match cmd {
                 ManagerCommand::RetryNow { job, reply } => {
+                    // Failed cleanup can retain a verification fence over
+                    // partially deleted bytes. Its public summary is only a
+                    // routing hint; the owner must issue exact cleanup custody.
+                    // Legacy failed rows can carry that same deletion proof,
+                    // and a cleanup fence need not have a running verifier.
+                    let cleanup = engine.snapshot().jobs.iter().find(|row| {
+                        row.id == job && !row.pp_done
+                            && (row.status == JobStatus::Failed || row.verification.is_some())
+                            && row.failed_cleanup.as_ref().is_some_and(|cleanup| cleanup.attempts > 0)
+                    }).cloned();
+                    if let Some(row) = cleanup {
+                        let result = if handle_failed_job(
+                            &engine, &cfg, &history, &dest_dir, &gate, job,
+                            row.name, row.health, &mut last_disposition, true,
+                        ).await { Ok(()) } else { Err(RestartPostError::NotReady) };
+                        let _ = reply.send(result);
+                        continue;
+                    }
                     let result = match engine.export_job(job).await {
                         Err(_) => Err(RestartPostError::Closed),
                         Ok(None) => Err(RestartPostError::NotFound),
@@ -663,11 +681,18 @@ async fn handle_failed_job(
     if force_retry && gate.as_ref().is_some_and(|claim| !claim(job)) {
         return false;
     }
-    let admission = match engine.begin_post_admission(job).await {
-        Ok(Some(admission)) => admission,
-        Ok(None) => return false,
+    let (admission, cleanup) = match engine.begin_failed_cleanup_admission(job).await {
+        Ok(Some(scope)) => (scope.admission, Some(scope.cleanup)),
+        Ok(None) => match engine.begin_post_admission(job).await {
+            Ok(Some(admission)) => (admission, None),
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(job=job.0,%error,"failed-job cleanup awaits owner admission");
+                return false;
+            }
+        },
         Err(error) => {
-            tracing::warn!(job=job.0,%error,"failed-job cleanup awaits owner admission");
+            tracing::warn!(job=job.0,%error,"failed-job deletion replay awaits exact cleanup admission");
             return false;
         }
     };
@@ -690,6 +715,7 @@ async fn handle_failed_job(
         health,
         last_disposition,
         force_retry,
+        cleanup,
     )
     .await;
     let authorized = !force_retry || admitted_gate.as_ref().is_none_or(|claim| claim(job));
@@ -712,11 +738,20 @@ async fn handle_failed_job_admitted(
     health: u16,
     last_disposition: &mut HashMap<JobId, tokio::time::Instant>,
     force_retry: bool,
+    cleanup: Option<nzbd_state::artifacts::FailedCleanupProof>,
 ) {
     // Below critical health: no PP; record history and stamp so the retire
     // sweep moves the job out. Cluster disk admission gates this whole
     // operation because FailureAction::Park can copy across filesystems.
-    let mut exported = engine.export_job(job).await.ok().flatten();
+    let cleanup_only = cleanup.is_some();
+    let mut exported = if cleanup_only {
+        engine.failed_cleanup_metadata().await.ok().flatten()
+    } else {
+        engine.export_job(job).await.ok().flatten()
+    };
+    if exported.is_none() {
+        return;
+    }
     if exported.as_ref().is_some_and(pp_done) {
         return; // already handled (event/rescan overlap)
     }
@@ -774,7 +809,9 @@ async fn handle_failed_job_admitted(
         .as_ref()
         .map(|j| matches!(j.kind, nzbd_types::JobKind::Url) && j.files.is_empty())
         .unwrap_or(false);
-    let mut durable_delivery = if exported.as_ref().is_some_and(|job| job.delivery_lifecycle) {
+    let mut durable_delivery = if !cleanup_only
+        && exported.as_ref().is_some_and(|job| job.delivery_lifecycle)
+    {
         let inventory = engine.artifacts();
         match tokio::task::spawn_blocking(move || inventory.delivery_for_job(job.0)).await {
             Ok(Ok(delivery)) => delivery,
@@ -792,7 +829,7 @@ async fn handle_failed_job_admitted(
     } else {
         None
     };
-    if durable_delivery.is_none() {
+    if !cleanup_only && durable_delivery.is_none() {
         if let Some(row) = exported.as_ref().filter(|row| {
             row.delivery_lifecycle
                 && row.params.iter().any(|(key, value)| {
@@ -827,7 +864,12 @@ async fn handle_failed_job_admitted(
     }
     // Deletion is durable before history/stamp finalization. Replay must not
     // try to diagnose the now-absent source tree.
-    let source_deleted = match engine.artifacts().for_job(job.0) {
+    let source = if let Some(proof) = &cleanup {
+        engine.artifacts().get(&proof.source().artifact).map(Some)
+    } else {
+        engine.artifacts().for_job(job.0)
+    };
+    let source_deleted = match source {
         Ok(source) => source.is_some_and(|source| source.state == "deleted"),
         Err(error) => {
             record_failed_cleanup_retry(engine, job, error.to_string()).await;
@@ -837,9 +879,9 @@ async fn handle_failed_job_admitted(
     let mut early_archive_assessment = EarlyArchiveAssessment::default();
     let salvage = match (
         durable_delivery,
-        exported
-            .as_ref()
-            .filter(|j| j.lifecycle_eligible() && !fetch_failure && !source_deleted),
+        exported.as_ref().filter(|j| {
+            !cleanup_only && j.lifecycle_eligible() && !fetch_failure && !source_deleted
+        }),
     ) {
         (Some(delivery), _) => Some(FailedSalvage {
             published_path: PathBuf::from(&delivery.publication_path),
@@ -965,33 +1007,34 @@ async fn handle_failed_job_admitted(
         "FAILURE/HEALTH"
     };
     let keep_on_failure = exported.as_ref().is_some_and(job_keeps_failed_source);
-    let failed_source_assessment = if salvage.is_none() && !fetch_failure && !source_deleted {
-        match exported.as_ref().filter(|row| row.lifecycle_eligible()) {
-            Some(row) => {
-                let row = row.clone();
-                let inventory = engine.artifacts();
-                let archive_assessment = early_archive_assessment.clone();
-                match tokio::task::spawn_blocking(move || {
-                    failed_source_recovery(&inventory, &row, &archive_assessment)
-                })
-                .await
-                {
-                    Ok(Ok(assessment)) => Some(assessment),
-                    Ok(Err(error)) => {
-                        record_failed_cleanup_retry(engine, job, error).await;
-                        return;
-                    }
-                    Err(error) => {
-                        record_failed_cleanup_retry(engine, job, error.to_string()).await;
-                        return;
+    let failed_source_assessment =
+        if !cleanup_only && salvage.is_none() && !fetch_failure && !source_deleted {
+            match exported.as_ref().filter(|row| row.lifecycle_eligible()) {
+                Some(row) => {
+                    let row = row.clone();
+                    let inventory = engine.artifacts();
+                    let archive_assessment = early_archive_assessment.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        failed_source_recovery(&inventory, &row, &archive_assessment)
+                    })
+                    .await
+                    {
+                        Ok(Ok(assessment)) => Some(assessment),
+                        Ok(Err(error)) => {
+                            record_failed_cleanup_retry(engine, job, error).await;
+                            return;
+                        }
+                        Err(error) => {
+                            record_failed_cleanup_retry(engine, job, error.to_string()).await;
+                            return;
+                        }
                     }
                 }
+                None => None,
             }
-            None => None,
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     let recoverable_failed_source =
         failed_source_assessment
             .as_ref()
@@ -1039,18 +1082,45 @@ async fn handle_failed_job_admitted(
         match exported.as_ref() {
             Some(j) if !j.files.is_empty() => {
                 let dir_name = nzbd_engine::queue::job_dir_name(j);
-                let source = dest_dir.join(&dir_name);
-                let observed = dispose_failed(
-                    engine.artifacts(),
-                    &failure_cfg,
-                    job,
-                    &source,
-                    dest_dir,
-                    &dir_name,
-                    "local",
-                )
-                .await;
-                match canonical_failed_disposition(&failure_cfg, dest_dir, &dir_name, &source) {
+                let source = if let Some(proof) = &cleanup {
+                    proof.path().to_path_buf()
+                } else {
+                    dest_dir.join(&dir_name)
+                };
+                let observed = if cleanup_only && source_deleted {
+                    Disposition {
+                        note: "deleted".into(),
+                        files_at: None,
+                    }
+                } else if let Some(proof) = &cleanup {
+                    replay_failed_disposition(
+                        engine.artifacts(),
+                        &failure_cfg,
+                        proof.clone(),
+                        source.clone(),
+                        gate.clone(),
+                    )
+                    .await
+                } else {
+                    dispose_failed(
+                        engine.artifacts(),
+                        &failure_cfg,
+                        job,
+                        &source,
+                        dest_dir,
+                        &dir_name,
+                        "local",
+                    )
+                    .await
+                };
+                let canonical = if cleanup_only {
+                    (observed.note == "deleted"
+                        || failure_cfg.failure_action != FailureAction::Delete)
+                        .then(|| observed.clone())
+                } else {
+                    canonical_failed_disposition(&failure_cfg, dest_dir, &dir_name, &source)
+                };
+                match canonical {
                     Some(committed) => Some(committed),
                     None => {
                         // A stale authority must never spend the retry budget. In
@@ -1303,7 +1373,10 @@ async fn handle_failed_job_admitted(
     } else if recoverable_failed_source.is_some() || disposition.is_some() {
         fail_params.push(("Artifact:Custody".into(), "runner_owned".into()));
     }
-    if salvage.is_none() && disposition.as_ref().is_some_and(|d| d.files_at.is_some()) {
+    if !cleanup_only
+        && salvage.is_none()
+        && disposition.as_ref().is_some_and(|d| d.files_at.is_some())
+    {
         // A retained failed source remains addressable in Resolve after the
         // queue row is retired. Record its exact artifact generation rather
         // than asking the consumer to infer ownership from a path.
@@ -1370,7 +1443,23 @@ async fn handle_failed_job_admitted(
             .unwrap_or_default(),
         seq: 0,
     };
-    if let Some(path) = entry.final_dir.as_deref().filter(|_| salvage.is_none()) {
+    if let Some(proof) = &cleanup {
+        entry
+            .params
+            .retain(|(key, _)| key != "Artifact:Id" && key != "Artifact:Generation");
+        entry
+            .params
+            .push(("Artifact:Id".into(), proof.source().artifact.clone()));
+        entry.params.push((
+            "Artifact:Generation".into(),
+            proof.source().generation.clone(),
+        ));
+    }
+    if let Some(path) = entry
+        .final_dir
+        .as_deref()
+        .filter(|_| !cleanup_only && salvage.is_none())
+    {
         let path = Path::new(path);
         let state = if entry
             .params
@@ -1440,6 +1529,16 @@ async fn handle_failed_job_admitted(
     }
     let h = history.clone();
     let record = entry.clone();
+    if cleanup_only
+        && engine
+            .failed_cleanup_metadata()
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        return;
+    }
     let (history_seq, entry) =
         match tokio::task::spawn_blocking(move || h.record_seq_durable(&record)).await {
             Ok(Ok(recorded)) => recorded,
@@ -2139,7 +2238,10 @@ async fn scan_queue(
         // mode the leader sweep retires (the gate stays out of hygiene).
         if gate.is_none()
             && j.pp_done
-            && matches!(j.status, JobStatus::Completed | JobStatus::Failed)
+            && (matches!(j.status, JobStatus::Completed | JobStatus::Failed)
+                || j.failed_cleanup
+                    .as_ref()
+                    .is_some_and(|cleanup| cleanup.attempts > 0))
         {
             if active.contains_key(&j.id) {
                 continue;
@@ -2154,7 +2256,13 @@ async fn scan_queue(
             }
             continue;
         }
-        if !j.pp_done && j.status == JobStatus::Failed && claim(j.id) {
+        if !j.pp_done
+            && (j.status == JobStatus::Failed
+                || j.failed_cleanup
+                    .as_ref()
+                    .is_some_and(|cleanup| cleanup.attempts > 0))
+            && claim(j.id)
+        {
             handle_failed_job(
                 engine,
                 cfg,
@@ -2334,11 +2442,45 @@ async fn reconcile_stamped_completion(
     if pending.is_empty() {
         return Ok(());
     }
-    let current = engine
-        .export_job(job)
+    let cleanup = engine
+        .begin_failed_cleanup_admission(job)
         .await
-        .map_err(|e| PostError::Subprocess(e.to_string()))?
-        .ok_or_else(|| PostError::Subprocess("terminal job stamp vanished".into()))?;
+        .map_err(|error| PostError::Subprocess(error.to_string()))?;
+    let scoped = cleanup
+        .as_ref()
+        .map(|scope| engine.for_post_admission(&scope.admission));
+    let result = reconcile_stamped_records(
+        scoped.as_ref().unwrap_or(engine),
+        history,
+        job,
+        pending,
+        cleanup.is_some(),
+    )
+    .await;
+    if let Some(scope) = cleanup {
+        engine
+            .end_post_admission(scope.admission)
+            .await
+            .map_err(|error| PostError::Subprocess(error.to_string()))?;
+    }
+    result
+}
+
+async fn reconcile_stamped_records(
+    engine: &EngineHandle,
+    history: &Arc<HistoryDb>,
+    job: JobId,
+    pending: Vec<nzbd_state::artifacts::StagedCompletion>,
+    cleanup_only: bool,
+) -> Result<(), PostError> {
+    let inventory = engine.artifacts();
+    let current = if cleanup_only {
+        engine.failed_cleanup_metadata().await
+    } else {
+        engine.export_job(job).await
+    }
+    .map_err(|e| PostError::Subprocess(e.to_string()))?
+    .ok_or_else(|| PostError::Subprocess("terminal job stamp vanished".into()))?;
     let stamped_outcome = current
         .params
         .iter()
@@ -2380,10 +2522,10 @@ async fn reconcile_stamped_completion(
             }
             inventory
                 .confirm_stamped_finalization(&receipt)
-                .map_err(|e| PostError::Subprocess(e.to_string()))?;
-            inventory
-                .finalize_workspaces(&receipt.source, &receipt.outcome, receipt.proof)
                 .map_err(|e| PostError::Subprocess(e.to_string()))
+            // Durable activation is the replay acknowledgement. Inventory
+            // maintenance independently checks custody and retires scratch;
+            // a concurrent reconciliation lease must not delay queue hygiene.
         })
         .await
         .map_err(|e| PostError::Subprocess(e.to_string()))??;
@@ -4539,43 +4681,68 @@ async fn process_job_ctx_from_inner(
             } else {
                 "retained"
             };
-            // Script-selected or legacy moved output is visible, but never
-            // inherits deletion authority solely from a returned path.
+            // A script may select an external path, but that is not a
+            // relocation or proof that Runner owns the returned bytes. Keep
+            // the admitted source associated with the job and its terminal
+            // receipt; record the external result independently.
             let inventory = engine.artifacts();
-            if inventory
-                .for_job(job_id.0)
-                .ok()
-                .flatten()
-                .is_none_or(|a| a.path != path)
-            {
-                // A script-selected external output does not erase custody
-                // of the completed owned processing source or its scratch.
-                if let Some(control) = crate::attempt::current() {
-                    if let Some(source) = &control.source {
-                        let original = inventory
-                            .get(&source.artifact)
-                            .map_err(|e| PostError::Subprocess(e.to_string()))?;
-                        if original.generation == source.generation
-                            && original.job == Some(job_id.0)
-                            && matches!(original.state.as_str(), "active" | "transitioning")
-                        {
-                            inventory
-                                .finish(job_id.0, &original.path, &original.root, "retained")
-                                .map_err(|e| PostError::Subprocess(e.to_string()))?;
-                        }
+            let final_path = path.to_path_buf();
+            let final_root = path.parent().unwrap_or(dest_dir).to_path_buf();
+            let final_inventory = inventory.clone();
+            let (artifact, external_output) = crate::attempt::current()
+                .expect("processing control")
+                .blocking(move |control| {
+                    let current = final_inventory
+                        .for_job(job_id.0)?
+                        .ok_or(nzbd_state::artifacts::Error::NotFound)?;
+                    if current.path == final_path {
+                        return final_inventory
+                            .finish(job_id.0, &final_path, &final_root, state)
+                            .map(|artifact| (artifact, None))
+                            .map_err(PostError::from);
                     }
-                }
-                inventory
-                    .register_legacy_active(job_id.0, path.parent().unwrap_or(dest_dir), path)
-                    .map_err(|e| {
-                        PostError::Subprocess(format!("external result inventory: {e}"))
+                    let source = control.source.as_ref().ok_or_else(|| {
+                        PostError::Subprocess(
+                            "external output lacks its admitted source generation".into(),
+                        )
                     })?;
+                    if current.id != source.artifact
+                        || current.generation != source.generation
+                        || current.job != Some(job_id.0)
+                    {
+                        return Err(PostError::Subprocess(
+                            "external output source association changed".into(),
+                        ));
+                    }
+                    let output =
+                        final_inventory.observe_external_output(&final_root, &final_path)?;
+                    control.checkpoint()?;
+                    // Preserve the operator's Keep choice. Retained sources do
+                    // not expire automatically; adding Keep would also prevent
+                    // retirement of independently verified private scratch.
+                    let retained = final_inventory.finish(
+                        job_id.0,
+                        &current.path,
+                        &current.root,
+                        "retained",
+                    )?;
+                    Ok((retained, Some(output)))
+                })
+                .await?;
+            set_param(&mut fin.params, "Artifact:Id", artifact.id.clone());
+            set_param(
+                &mut fin.params,
+                "Artifact:Generation",
+                artifact.generation.clone(),
+            );
+            if let Some(output) = external_output {
+                set_param(&mut fin.params, "Artifact:ExternalOutputId", output.id);
+                set_param(
+                    &mut fin.params,
+                    "Artifact:ExternalOutputGeneration",
+                    output.generation,
+                );
             }
-            let artifact = inventory
-                .finish(job_id.0, path, path.parent().unwrap_or(dest_dir), state)
-                .map_err(PostError::from)?;
-            fin.params.retain(|(k, _)| k != "Artifact:Id");
-            fin.params.push(("Artifact:Id".into(), artifact.id.clone()));
             if (outcome == PpFinal::Success || has_durable_salvage)
                 && job.delivery_lifecycle
                 && artifact.owned
@@ -6164,6 +6331,48 @@ pub struct Disposition {
 /// Apply a terminal failure disposition through the ownership journal.
 /// Missing paths, failed copies and incomplete deletion retain a visible
 /// record; only a durable deletion result can report that no files remain.
+async fn replay_failed_disposition(
+    inventory: Arc<nzbd_state::artifacts::Inventory>,
+    cfg: &PostConfig,
+    proof: nzbd_state::artifacts::FailedCleanupProof,
+    source: PathBuf,
+    gate: PpGate,
+) -> Disposition {
+    if cfg.failure_action != FailureAction::Delete {
+        return Disposition {
+            note: "retained by current failure disposition".into(),
+            files_at: Some(source),
+        };
+    }
+    let cancel = CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    let result = tokio::task::spawn_blocking(move || {
+        let checkpoint = || {
+            if cancel.is_cancelled()
+                || gate
+                    .as_ref()
+                    .is_some_and(|claim| !claim(JobId(proof.job())))
+            {
+                Err(std::io::ErrorKind::Interrupted.into())
+            } else {
+                Ok(())
+            }
+        };
+        inventory.replay_failed_cleanup(&proof, &checkpoint)
+    })
+    .await;
+    match result {
+        Ok(Ok(operation)) if operation.state == "succeeded" => Disposition {
+            note: "deleted".into(),
+            files_at: None,
+        },
+        other => Disposition {
+            note: format!("checked deletion pending: {other:?}"),
+            files_at: Some(source),
+        },
+    }
+}
+
 async fn dispose_failed(
     inventory: Arc<nzbd_state::artifacts::Inventory>,
     cfg: &PostConfig,
@@ -7451,10 +7660,33 @@ mod decision_tests {
             vec![("monarr-transfer".into(), "failed-archive-token".into())],
         );
         request.delivery_lifecycle = true;
-        let assessed =
-            extract_complete_failed_archives(&engine, &PostConfig::default(), &request, &None)
-                .await
-                .unwrap();
+        // Own the source throughout extraction and commit, as the real stage
+        // pipeline does. Startup inventory reconciliation can still be joining.
+        let ctx = PpCtx::default();
+        let attempt = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match crate::attempt::AttemptControl::new(&engine, &ctx, request.id).await {
+                    Err(PostError::Subprocess(reason))
+                        if reason
+                            == "previous processing or allocation workers have not quiesced" =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    other => break other.unwrap(),
+                }
+            }
+        })
+        .await
+        .expect("archive fixture must acquire exact source custody after startup joins");
+        let assessed = crate::attempt::CURRENT
+            .scope(attempt.clone(), async {
+                extract_complete_failed_archives(&engine, &PostConfig::default(), &request, &None)
+                    .await
+            })
+            .await;
+        attempt.finish_filesystem_work().await.unwrap();
+        drop(attempt);
+        let assessed = assessed.unwrap();
         let completed = temp.path().join("completed");
         let salvage = salvage_failed_delivery(
             &inventory,

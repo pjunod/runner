@@ -1019,18 +1019,22 @@ mod tests {
         );
         let jittered = url_storage_retry_deadline(&identity, 0, now, 0, None);
         assert!((now + 30..=now + 33).contains(&jittered));
+        // Persistence may cross a wall-clock second. Measure the retry floor
+        // before scheduling, rather than moving it forward after the write.
+        let first_started = super::super::now();
         let first = store
             .schedule_storage_retry(&identity, "destination full")
             .unwrap();
-        assert!(first.next_retry_at >= super::super::now() + 30);
+        assert!(first.next_retry_at >= first_started + 30);
         drop(store);
         let store = UrlResolutionStore::open(temporary.path()).unwrap();
         assert_eq!(store.retry(&identity).unwrap().unwrap().attempts, 1);
+        let second_started = super::super::now();
         let second = store
             .schedule_storage_retry(&identity, "still full")
             .unwrap();
         assert_eq!(second.blocked_since, first.blocked_since);
-        assert!(second.next_retry_at >= super::super::now() + 60);
+        assert!(second.next_retry_at >= second_started + 60);
         let source = store.path(&identity, "source").unwrap();
         let mut bytes = std::fs::read(&source).unwrap();
         bytes[77] ^= 1;

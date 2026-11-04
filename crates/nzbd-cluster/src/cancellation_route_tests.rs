@@ -224,6 +224,7 @@ async fn explicit_delete_waits_remote_join_before_owner_seal_and_physical_cleanu
             job_incarnation: incarnation.clone(),
             job_revision: revision,
             control_revision: revision,
+            context: context.clone(),
             deadline: tokio::time::Instant::now() + Duration::from_secs(60),
             cancel: cancel.clone(),
             pp_ready: false,

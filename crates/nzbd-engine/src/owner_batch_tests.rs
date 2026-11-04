@@ -117,6 +117,53 @@ async fn pump_idle(owner: &mut Owner, messages: &mut mpsc::Receiver<EngineMsg>) 
 }
 
 #[tokio::test]
+async fn acknowledged_recovery_drains_same_root_backlog_without_owner_ticks() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut owner, _adapter, mut messages) = owner_fixture(&temp);
+    pump_idle(&mut owner, &mut messages).await;
+    let root = temp.path().join("payloads");
+    std::fs::create_dir_all(&root).unwrap();
+    for id in 1..=20 {
+        let allocation = owner
+            .artifacts
+            .allocate(id, &root, &root.join(format!("backlog-{id}")))
+            .unwrap();
+        owner.allocation_cache.insert(JobId(id), allocation);
+        owner.state.jobs.push(pending_job(id, FileId(id)));
+        owner.queue_verification(JobId(id));
+    }
+    owner.start_verifications();
+    // Only real joined worker results and persistence acknowledgements drive
+    // this loop. No periodic tick or explicit next-worker call is supplied.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !owner.verification.is_empty() {
+            assert!(owner.verification_roots.len() <= 1);
+            assert!(
+                owner
+                    .verification
+                    .values()
+                    .filter(|state| state.running)
+                    .count()
+                    <= 1
+            );
+            owner.on_msg(messages.recv().await.expect("recovery result channel"));
+        }
+    })
+    .await
+    .expect("same-root backlog drains on durable recovery acknowledgements");
+    assert_eq!(owner.state.jobs.len(), 20);
+    assert!(owner.state.jobs.iter().all(|job| {
+        job.files[0].segments[0].state == SegmentState::Pending && !job.files[0].finalized
+    }));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        owner.drain_shutdown_results(&mut messages),
+    )
+    .await
+    .expect("all worker custody drains before removing fixture roots");
+}
+
+#[tokio::test]
 async fn same_root_verification_yields_to_resumed_job_after_publishing_progress() {
     let temp = tempfile::tempdir().unwrap();
     let (mut owner, _adapter, mut messages) = owner_fixture(&temp);

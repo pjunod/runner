@@ -807,12 +807,11 @@ async fn editqueue(
                 }
                 done
             }
-            "GroupSetCategory" => {
-                edit_job(state, id, |j| {
-                    j.category = (!text.is_empty()).then(|| text.clone());
-                })
+            "GroupSetCategory" => state
+                .engine
+                .set_category(id, (!text.is_empty()).then(|| text.clone()))
                 .await
-            }
+                .unwrap_or(false),
             "GroupSetParameter" => match text.split_once('=') {
                 Some((k, _)) if k.starts_with('*') => false,
                 Some((k, v)) => {
@@ -1176,6 +1175,7 @@ mod tests {
     use nzbd_engine::{Engine, EngineConfig, Tuning};
 
     async fn test_state(tmp: &tempfile::TempDir) -> CompatState {
+        std::fs::create_dir_all(tmp.path().join("dest")).unwrap();
         let engine = Engine::spawn(EngineConfig::single_node(
             vec![],
             tmp.path().join("state"),
@@ -1199,6 +1199,19 @@ mod tests {
             scan_notify: None,
             feeds: None,
         }
+    }
+
+    async fn export_fixture_job(engine: &EngineHandle, id: JobId) -> nzbd_types::Job {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match engine.export_job(id).await {
+                    Err(nzbd_engine::EngineError::Lifecycle(reason))
+                        if reason == "job verification or writer retirement is still in progress; retry later" =>
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                    result => return result.unwrap().unwrap(),
+                }
+            }
+        }).await.expect("fixture payload verification must complete")
     }
 
     const NZB: &str = r#"<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
@@ -1335,6 +1348,7 @@ mod tests {
             .unwrap();
         assert_eq!(r, json!(true));
 
+        let before_forbidden = state.engine.export_job(id).await.unwrap().unwrap().params;
         let forbidden = dispatch(
             &state,
             "editqueue",
@@ -1344,10 +1358,10 @@ mod tests {
         .unwrap();
         assert_eq!(forbidden, json!(false));
         let job = state.engine.export_job(id).await.unwrap().unwrap();
-        assert!(!job
-            .params
-            .iter()
-            .any(|(key, _)| key == "*Runner:LifecycleEligible"));
+        assert_eq!(
+            job.params, before_forbidden,
+            "reserved parameters cannot be changed by compat clients"
+        );
 
         // Set a parameter then a category, verify via export.
         let r = dispatch(
@@ -1366,7 +1380,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r, json!(true));
-        let job = state.engine.export_job(id).await.unwrap().unwrap();
+        let job = export_fixture_job(&state.engine, id).await;
         assert!(job
             .params
             .iter()

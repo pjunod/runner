@@ -621,6 +621,23 @@ fn decode_delivery_segment(raw: &str) -> Result<String, String> {
     String::from_utf8(value).map_err(|_| "delivery identity is not valid UTF-8".into())
 }
 
+/// These two mutations commit only the replicated Delivery catalog. They do
+/// not change queue intent and must not re-adopt a local payload projection.
+pub(crate) fn is_catalog_mutation(request: &axum::extract::Request) -> bool {
+    if request.method() != axum::http::Method::POST {
+        return false;
+    }
+    let Some(relative) = request.uri().path().strip_prefix("/api/v1/deliveries/") else {
+        return false;
+    };
+    let Some((id, action)) = relative.split_once('/') else {
+        return false;
+    };
+    matches!(action, "accept" | "source-cleanup/retry")
+        && !id.is_empty()
+        && decode_delivery_segment(id).is_ok()
+}
+
 pub(crate) async fn serve_cluster_delivery(
     axum::extract::State(shared): axum::extract::State<std::sync::Arc<crate::leader::LeaderShared>>,
     request: axum::extract::Request,
@@ -1328,6 +1345,30 @@ mod tests {
     use super::*;
     use sha2::Digest;
     use std::{collections::HashMap, time::Duration};
+    #[test]
+    fn catalog_mutation_excludes_other_routes_and_malformed_ids() {
+        for (method, path, expected) in [
+            ("POST", "/api/v1/deliveries/exact%3Aid/accept", true),
+            (
+                "POST",
+                "/api/v1/deliveries/exact/source-cleanup/retry",
+                true,
+            ),
+            ("DELETE", "/api/v1/deliveries/exact/accept", false),
+            ("POST", "/api/v1/deliveries/exact/accept/extra", false),
+            ("POST", "/api/v1/deliveries/exact/unknown", false),
+            ("POST", "/api/v1/deliveries//accept", false),
+            ("POST", "/api/v1/deliveries/bad%2Fid/accept", false),
+            ("POST", "/api/v1/jobs/7", false),
+        ] {
+            let request = hyper::Request::builder()
+                .method(method)
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(is_catalog_mutation(&request), expected, "{method} {path}");
+        }
+    }
     fn record(instance: &str, id: &str) -> ClusterDelivery {
         let delivery:Delivery=serde_json::from_value(json!({
             "protocolVersion":1,"sequence":0,"status":"ready","deliveryId":id,"publicationGeneration":"generation",
@@ -1915,6 +1956,9 @@ mod tests {
         store.commit_delivery(&encoded).await.unwrap();
         let client = crate::http::ClusterClient::new("secret".into());
         let acceptance=json!({"protocolVersion":1,"publicationGeneration":"generation","manifestDigest":"digest","consumerReceiptId":"encoded-consumer"}).to_string();
+        // Queue reconciliation may be blocked by unrelated payload custody.
+        // The receipt lane must remain independent while preserving its CAS.
+        let queue_serial = runtime.leader_shared.mutation_serial.lock().await;
         for (method, action, body) in [
             ("GET", "", String::new()),
             ("POST", "/accept", acceptance),
@@ -1938,6 +1982,35 @@ mod tests {
                 "encoded {method} {action}"
             );
         }
+        let response = client
+            .forward(
+                &format!("http://{address}"),
+                hyper::Request::post("/api/v1/deliveries/encoded%3Asha256%3Areceipt/accept")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "protocolVersion":1,"publicationGeneration":"wrong-generation",
+                            "manifestDigest":"digest","consumerReceiptId":"encoded-consumer"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            store
+                .cluster_delivery("encoded:sha256:receipt")
+                .await
+                .unwrap()
+                .unwrap()
+                .delivery
+                .consumer_receipt_id
+                .as_deref(),
+            Some("encoded-consumer")
+        );
+        drop(queue_serial);
         for id in ["bad%ZZ", "bad%2Fsegment", "bad%FF"] {
             let response = client
                 .forward(
