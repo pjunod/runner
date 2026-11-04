@@ -7385,7 +7385,7 @@ async fn naming_expectations_require_current_writer_and_durable_finalization() {
                 final_path: Some(path.clone()),
                 combined_crc: Some(crc32fast::hash(bytes)),
                 identity: Some(identity),
-                naming: Some(naming),
+                naming: Some(Box::new(naming)),
             },
         });
         if replace_pending {

@@ -6007,7 +6007,7 @@ impl Owner {
                 ..
             } = fact
             {
-                self.artifacts.discard_writer_naming(naming);
+                self.artifacts.discard_writer_naming(*naming);
             }
             return;
         }
@@ -6144,7 +6144,7 @@ impl Owner {
             } => {
                 if !ok {
                     if let Some(naming) = naming {
-                        self.artifacts.discard_writer_naming(naming);
+                        self.artifacts.discard_writer_naming(*naming);
                     }
                     self.on_writer_finalized(job, file, false, final_path, combined_crc);
                     return;
@@ -6179,7 +6179,7 @@ impl Owner {
                         || owner.state.job(job).is_none()
                     {
                         if let Some(naming) = naming {
-                            owner.artifacts.discard_writer_naming(naming);
+                            owner.artifacts.discard_writer_naming(*naming);
                         }
                         return;
                     }
@@ -6191,16 +6191,16 @@ impl Owner {
                                     file.0,
                                     generation,
                                     &allocation,
-                                    naming,
+                                    *naming,
                                 );
                             } else {
-                                owner.artifacts.discard_writer_naming(naming);
+                                owner.artifacts.discard_writer_naming(*naming);
                             }
                         }
                         owner.on_writer_finalized(job, file, true, final_path, combined_crc);
                     } else {
                         if let Some(naming) = naming {
-                            owner.artifacts.discard_writer_naming(naming);
+                            owner.artifacts.discard_writer_naming(*naming);
                         }
                         if let Some(entry) = owner.state.file_mut(job, file) {
                             entry.finalized = false;

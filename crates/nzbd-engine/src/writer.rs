@@ -71,7 +71,7 @@ pub(crate) enum WriterFact {
         final_path: Option<PathBuf>,
         combined_crc: Option<u32>,
         identity: Option<Identity>,
-        naming: Option<nzbd_state::artifacts::writer_naming::PublishedProducerRead>,
+        naming: Option<Box<nzbd_state::artifacts::writer_naming::PublishedProducerRead>>,
     },
     Error {
         error: String,
@@ -615,7 +615,7 @@ async fn writer_task(
                                 final_path: Some(final_path.clone()),
                                 combined_crc,
                                 identity: Some(identity),
-                                naming,
+                                naming: naming.map(Box::new),
                             })
                             .await;
                     }

@@ -13,7 +13,7 @@ fn packet(kind: &[u8; 16], body: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&[37; 16]);
     out.extend_from_slice(kind);
     out.extend_from_slice(body);
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
     let len = out.len() as u64;
@@ -103,12 +103,23 @@ async fn await_download(
 async fn real_writers_feed_134_renames_with_one_destination_pass() {
     let temporary = tempfile::tempdir().unwrap();
     let mut files: Vec<_> = (0..134)
-        .map(|i| (format!("restored-{i:03}.bin"), prng_bytes(13000 + i, 32768)))
+        .map(|i| {
+            (
+                format!("restored-{i:03}.bin"),
+                prng_bytes(13001 + 2 * i, 32768),
+            )
+        })
         .collect();
     // Equal prefixes with distinct full digests must still choose distinct names.
     files[0].1[..16384].fill(9);
     files[1].1[..16384].fill(9);
-    files[2].1 = prng_bytes(13002, 131_123);
+    files[2].1 = prng_bytes(13005, 131_123);
+    // prng_bytes normalizes seeds with `| 1`; adjacent seeds are not unique.
+    let unique: std::collections::HashSet<[u8; 16]> = files
+        .iter()
+        .map(|(_, bytes)| Md5::digest(bytes).into())
+        .collect();
+    assert_eq!(unique.len(), 134, "each catalog entry must match one file");
     let par = catalog(&files);
     let mut inputs = vec![("index.par2".to_owned(), par.clone())];
     inputs.extend((0..9).map(|index| (format!("index.vol{index:02}+01.par2"), par.clone())));
