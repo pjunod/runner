@@ -258,12 +258,9 @@ impl LeaderShared {
     pub(crate) async fn engine_projection(&self) -> Result<HashMap<u64, nzbd_types::Job>, String> {
         let mut jobs = HashMap::new();
         for summary in &self.engine.snapshot().jobs {
-            if let Some(job) = self
-                .engine
-                .export_job(summary.id)
-                .await
-                .map_err(|error| format!("export queue projection: {error}"))?
-            {
+            if let Some(job) = self.engine.export_job(summary.id).await.map_err(|error| {
+                format!("export queue projection for job {}: {error}", summary.id.0)
+            })? {
                 jobs.insert(u64::from(job.id.0), job);
             }
         }
@@ -1436,6 +1433,35 @@ async fn work_reject(
     }
 }
 
+struct HeartbeatIntent {
+    status: String,
+    revision: i64,
+}
+impl From<&mut hiqlite::Row<'_>> for HeartbeatIntent {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            status: row.get("status"),
+            revision: row.get("revision"),
+        }
+    }
+}
+async fn heartbeat_job_intent(
+    control: &ControlStore,
+    job: JobId,
+) -> Result<Option<(JobStatus, u64)>, String> {
+    let row = control.client.query_consistent_map::<HeartbeatIntent, _>(
+        "SELECT json_quote(json_extract(intent_json,'$.status')) AS status,revision FROM control_jobs WHERE job_id=?1 AND deleted=0",
+        hiqlite::params!(i64::from(job.0)),
+    ).await.map_err(|error| error.to_string())?.into_iter().next();
+    row.map(|row| {
+        Ok((
+            serde_json::from_str(&row.status).map_err(|error| error.to_string())?,
+            u64::try_from(row.revision).map_err(|error| error.to_string())?,
+        ))
+    })
+    .transpose()
+}
+
 async fn work_heartbeat(
     State(s): State<Arc<LeaderShared>>,
     headers: HeaderMap,
@@ -1520,19 +1546,26 @@ async fn work_heartbeat(
             cancel.push(lp.lease_id.clone());
             continue;
         }
-        let authoritative = s.engine.export_job(lp.job).await.ok().flatten();
-        let control_identity = match &s.control {
-            Some(control) => control.job_identity(lp.job.0.into()).await.ok().flatten(),
+        // Renewal continues an existing exact lease. Unrelated local payload
+        // recovery is not an operator revocation; use the durable status and
+        // revision together, without exporting unverified local file evidence.
+        let intent = match &s.control {
+            Some(control) => match heartbeat_job_intent(control, lp.job).await {
+                Ok(intent) => intent,
+                Err(error) => {
+                    tracing::debug!(job = lp.job.0, lease = %lp.lease_id, %error,
+                        "heartbeat cannot read current durable intent");
+                    None
+                }
+            },
             None => None,
         };
-        let runnable = authoritative
-            .as_ref()
-            .is_some_and(|job| !matches!(job.status, JobStatus::Paused | JobStatus::Deleted));
-        if !runnable
-            || control_identity
-                .as_ref()
-                .is_none_or(|(_, revision)| *revision != lp.job_revision)
-        {
+        if !intent.is_some_and(|(status, revision)| {
+            !matches!(status, JobStatus::Paused | JobStatus::Deleted) && revision == lp.job_revision
+        }) {
+            tracing::debug!(job = lp.job.0, lease = %lp.lease_id,
+                expected_revision = lp.job_revision, current_intent = ?intent,
+                "heartbeat refuses renewal without current runnable authority");
             cancel.push(lp.lease_id.clone());
             continue;
         }
@@ -3269,6 +3302,234 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(String::from_utf8(body).unwrap().contains("committed"));
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn heartbeat_renews_durable_intent_without_exporting_recovering_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = SharedLayout::new(temp.path(), "leader").unwrap();
+        let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ClusterConfig {
+            cluster_id: "test".into(),
+            node_name: "leader".into(),
+            shared_dir: temp.path().to_path_buf(),
+            advertise_url: "http://leader.invalid".into(),
+            secret: "secret".into(),
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            pp_slots: 0,
+            lease_interval: std::time::Duration::from_millis(100),
+            takeover_after: std::time::Duration::from_secs(2),
+            worker_ttl: std::time::Duration::from_secs(30),
+            control_dir: temp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: raft.local_addr().unwrap().to_string(),
+            control_api_bind: api.local_addr().unwrap().to_string(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
+            disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
+        };
+        drop(raft);
+        drop(api);
+        let control = ControlStore::start(&cfg).await.unwrap();
+        let engine = Engine::spawn(EngineConfig::single_node(
+            Vec::new(),
+            temp.path().join("engine"),
+            temp.path().join("offline"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let (_view, view) = watch::channel(LeaderView {
+            record: Some(LeaderRecord {
+                epoch: 1,
+                node: "leader".into(),
+                api_url: "http://leader.invalid".into(),
+                seq: 1,
+            }),
+            is_me: true,
+        });
+        let shared = LeaderShared::new(
+            engine.clone(),
+            layout,
+            temp.path().join("offline"),
+            cfg,
+            Vec::new(),
+            view,
+            LeaderDurability::new(Some(control.clone()), None, "leader-boot".into()),
+        );
+        shared.authority_ready.store(true, Ordering::Release);
+        let mut job = test_job(77);
+        job.files.push(nzbd_types::FileEntry {
+            id: nzbd_types::FileId(77),
+            subject: "payload".into(),
+            filename: "payload.bin".into(),
+            filename_confirmed: true,
+            is_par2: false,
+            paused: false,
+            groups: Vec::new(),
+            date: None,
+            segments: vec![nzbd_types::Segment {
+                message_id: "payload@example".into(),
+                number: 1,
+                size: 100,
+                state: nzbd_types::SegmentState::Done {
+                    offset: 0,
+                    len: 100,
+                    crc: 1,
+                },
+            }],
+            crc32: None,
+            finalized: true,
+        });
+        engine.import_job(job.clone(), false, false).await.unwrap();
+        assert!(matches!(
+            engine.export_job(job.id).await,
+            Err(nzbd_engine::EngineError::Lifecycle(_))
+        ));
+        control
+            .seed_job(
+                77,
+                "heartbeat-incarnation",
+                &serde_json::to_string(&job).unwrap(),
+            )
+            .await
+            .unwrap();
+        let LeaseClaim::Acquired(token) = control
+            .acquire(
+                "work/job/77/download",
+                "test",
+                77,
+                "heartbeat-incarnation",
+                "worker",
+                "worker-boot",
+                "download",
+                "{}",
+                1,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("fresh heartbeat lease")
+        };
+        let lease_id = format!("{}@{}", token.resource, token.fence);
+        shared.leases.lock().unwrap().insert(
+            lease_id.clone(),
+            LeaseInfo {
+                job: job.id,
+                node: "worker".into(),
+                kind: LeaseKind::Download,
+                token: token.clone(),
+                job_revision: 1,
+                control_revision: 1,
+                last_hb: Instant::now(),
+            },
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(SECRET_HEADER, "secret".parse().unwrap());
+        let request = |token, revision| HeartbeatRequest {
+            node: "worker".into(),
+            budget_ack: None,
+            leases: vec![LeaseProgress {
+                lease_id: lease_id.clone(),
+                token,
+                job: job.id,
+                kind: LeaseKind::Download,
+                job_revision: revision,
+                control_revision: revision,
+                stats: Default::default(),
+            }],
+        };
+        let response = work_heartbeat(
+            State(shared.clone()),
+            headers.clone(),
+            Json(request(token, 1)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let renewed: HeartbeatResponse = serde_json::from_slice(&body).unwrap();
+        assert!(renewed.cancel.is_empty());
+        assert_eq!(renewed.renewed.len(), 1);
+        let renewed_token = renewed.renewed[0].clone();
+        assert!(
+            matches!(
+                engine.export_job(job.id).await,
+                Err(nzbd_engine::EngineError::Lifecycle(_))
+            ),
+            "renewal must not turn recovery metadata into verified export"
+        );
+
+        job.priority += 1;
+        assert!(matches!(
+            control
+                .apply_command(
+                    "heartbeat-new-intent",
+                    77,
+                    1,
+                    r#"{"op":"priority"}"#,
+                    &serde_json::to_string(&job).unwrap(),
+                    false,
+                )
+                .await
+                .unwrap(),
+            MutationOutcome::Applied { .. }
+        ));
+        let response = work_heartbeat(
+            State(shared.clone()),
+            headers.clone(),
+            Json(request(renewed_token.clone(), 1)),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let refused: HeartbeatResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(refused.cancel, vec![lease_id.clone()]);
+        assert!(
+            refused.renewed.is_empty(),
+            "new durable intent revokes the old grant"
+        );
+
+        let revision = control.job_identity(77).await.unwrap().unwrap().1;
+        job.status = JobStatus::Paused;
+        control
+            .apply_command(
+                "heartbeat-paused",
+                77,
+                revision,
+                r#"{"op":"pause"}"#,
+                &serde_json::to_string(&job).unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+        // Even a request claiming the new revision cannot renew paused work.
+        let revision = control.job_identity(77).await.unwrap().unwrap().1;
+        let response = work_heartbeat(
+            State(shared.clone()),
+            headers,
+            Json(request(renewed_token, revision)),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let refused: HeartbeatResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(refused.cancel, vec![lease_id]);
+        assert!(refused.renewed.is_empty());
+        engine.shutdown().await;
+        control.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

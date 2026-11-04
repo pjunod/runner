@@ -171,6 +171,14 @@ pub(crate) enum QueueCommand {
         job: JobId,
         reply: oneshot::Sender<Option<crate::PostAdmission>>,
     },
+    BeginFailedCleanupAdmission {
+        job: JobId,
+        reply: oneshot::Sender<Option<crate::FailedCleanupAdmission>>,
+    },
+    FailedCleanupMetadata {
+        admission: crate::PostAdmission,
+        reply: oneshot::Sender<Option<Job>>,
+    },
     EndPostAdmission {
         admission: crate::PostAdmission,
         reply: oneshot::Sender<()>,
@@ -855,6 +863,13 @@ pub(crate) enum EngineMsg {
 // Owner
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PostRollback {
+    generation: u64,
+    control_revision: Option<u64>,
+    in_flight: bool,
+}
+
 pub(crate) struct Owner {
     state: QueueState,
     admission_adoption: Option<HashSet<String>>,
@@ -871,7 +886,9 @@ pub(crate) struct Owner {
     control_epochs: HashMap<JobId, u64>,
     post_admissions: HashMap<JobId, u64>,
     post_cancellations: HashMap<JobId, CancellationToken>,
+    failed_cleanup_admissions: HashMap<JobId, nzbd_state::artifacts::FailedCleanupProof>,
     record_transitions: HashSet<JobId>,
+    post_rollbacks: HashMap<JobId, PostRollback>,
     projection_transition: bool,
     startup_reconciliation: HashMap<PathBuf, transitions::StartupRoot>,
     startup_snapshot: Arc<nzbd_state::artifacts::StartupReconciliation>,
@@ -966,6 +983,8 @@ pub(crate) struct Owner {
     /// queue record; rates and peers live here so snapshot traffic does not
     /// rewrite the queue once per second.
     torrent_progress: HashMap<JobId, crate::backend::TransferProgress>,
+    /// An operator rate edit fences asynchronous authority-load rollback.
+    speed_limit_revision: u64,
     applied_usenet_limit: Option<Option<u64>>,
     applied_torrent_limit: Option<Option<u64>>,
     history: Option<Arc<nzbd_state::history::HistoryDb>>,
@@ -1249,7 +1268,9 @@ impl Owner {
                     seg_number: rec.segment_number,
                 };
                 if rec.file_size > 0 {
-                    file_sizes.insert(rec.file, rec.file_size);
+                    if let Some(size) = merge_replayed_size(&mut state, &rec) {
+                        file_sizes.insert(rec.file, size);
+                    }
                 }
                 if let Some(seg) = state.segment_mut(r) {
                     if !matches!(seg.state, SegmentState::Done { .. }) {
@@ -1354,7 +1375,9 @@ impl Owner {
             control_epochs: HashMap::new(),
             post_admissions: HashMap::new(),
             post_cancellations: HashMap::new(),
+            failed_cleanup_admissions: HashMap::new(),
             record_transitions: HashSet::new(),
+            post_rollbacks: HashMap::new(),
             projection_transition: false,
             startup_reconciliation: HashMap::new(),
             startup_snapshot,
@@ -1397,6 +1420,7 @@ impl Owner {
             seed_clock_unix: HashMap::new(),
             backend_started: HashSet::new(),
             torrent_progress: HashMap::new(),
+            speed_limit_revision: fresh_epoch(),
             applied_usenet_limit: None,
             applied_torrent_limit: None,
             history,
@@ -1750,6 +1774,18 @@ impl Owner {
             } => self.on_verification_result(job, generation, *result),
             EngineMsg::ScopedCommand { admission, command } => {
                 if self.post_scope_current(&admission) {
+                    if self.failed_cleanup_admissions.contains_key(&admission.job)
+                        && !matches!(
+                            command.as_ref(),
+                            QueueCommand::ImportJobIfPresent { .. }
+                                | QueueCommand::ApplyPostRecord { .. }
+                                | QueueCommand::FailedCleanupMetadata { .. }
+                                | QueueCommand::ExportJob { .. }
+                                | QueueCommand::EndPostAdmission { .. }
+                        )
+                    {
+                        return;
+                    }
                     match *command {
                         QueueCommand::ImportJobIfPresent {
                             job,
@@ -1795,7 +1831,15 @@ impl Owner {
                 }
             }
             EngineMsg::ScopedEvent { admission, event } => {
-                if self.post_scope_current(&admission) {
+                let cleanup_event = !self.failed_cleanup_admissions.contains_key(&admission.job)
+                    || (matches!(&event, Event::JobPpFinished { job, pp_status, .. }
+                            if *job == admission.job && pp_status.starts_with("FAILURE/"))
+                        && self.state.job(admission.job).is_some_and(|job| {
+                            job.params
+                                .iter()
+                                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                        }));
+                if self.post_scope_current(&admission) && cleanup_event {
                     self.emit(event);
                 }
             }
@@ -1945,6 +1989,7 @@ impl Owner {
             QueueCommand::ImportJob { job, .. } | QueueCommand::ImportJobIfPresent { job, .. } => {
                 Some(job.id)
             }
+            QueueCommand::RemoveJobSilent { job, .. } if self.state.job(*job).is_none() => None,
             QueueCommand::RemoveJobSilent { job, .. } | QueueCommand::Delete { job, .. } => {
                 Some(*job)
             }
@@ -2012,7 +2057,8 @@ impl Owner {
                     let busy = self.retiring_writers.contains_key(&id)
                         || self.post_admissions.contains_key(&id)
                         || self.allocating_jobs.contains(&id)
-                        || self.record_transitions.contains(&id)
+                        || (self.record_transitions.contains(&id)
+                            && !self.settled_post_rollback(id))
                         || self.pending_control_revisions.contains_key(&id)
                         || self
                             .verification
@@ -2415,6 +2461,7 @@ impl Owner {
                 let allowed = !self.cancel.is_cancelled()
                     && self.state.job(job).is_some_and(|j| {
                         !j.held()
+                            && !transitions::failed_cleanup_only(j)
                             && matches!(
                                 j.status,
                                 JobStatus::Completed
@@ -2424,6 +2471,8 @@ impl Owner {
                             )
                     })
                     && !self.post_admissions.contains_key(&job)
+                    && !self.record_transitions.contains(&job)
+                    && !self.projection_transition
                     && !self.pending_control_commits.contains(&job)
                     && !self.verification.contains_key(&job)
                     && !self.retiring_writers.contains_key(&job);
@@ -2513,8 +2562,29 @@ impl Owner {
                     }
                 });
             }
+            QueueCommand::BeginFailedCleanupAdmission { job, reply } => {
+                self.begin_failed_cleanup_admission_then(job, move |owner, admission| {
+                    if let Err(Some(scope)) = reply.send(admission) {
+                        owner.failed_cleanup_admissions.remove(&scope.admission.job);
+                        owner.post_admissions.remove(&scope.admission.job);
+                        if let Some(cancel) = owner.post_cancellations.remove(&scope.admission.job)
+                        {
+                            cancel.cancel();
+                        }
+                        owner.drain_replacements();
+                    }
+                });
+            }
+            QueueCommand::FailedCleanupMetadata { admission, reply } => {
+                let record = (self.post_scope_current(&admission)
+                    && self.failed_cleanup_admissions.contains_key(&admission.job))
+                .then(|| self.state.job(admission.job).cloned())
+                .flatten();
+                let _ = reply.send(record);
+            }
             QueueCommand::EndPostAdmission { admission, reply } => {
                 if self.post_admissions.get(&admission.job) == Some(&admission.generation) {
+                    self.failed_cleanup_admissions.remove(&admission.job);
                     self.post_admissions.remove(&admission.job);
                     if let Some(cancel) = self.post_cancellations.remove(&admission.job) {
                         cancel.cancel();
@@ -2940,7 +3010,9 @@ impl Owner {
                             source_generation: None,
                         };
                         self.state.url_admission_receipts.push(receipt.clone());
-                        self.unaccepted_admissions.insert(token.clone(), receipt);
+                        if self.persist_guard.is_some() {
+                            self.unaccepted_admissions.insert(token.clone(), receipt);
+                        }
                         let token = token.clone();
                         let generation = fresh_epoch();
                         self.job_epochs.insert(id, generation);
@@ -3030,6 +3102,15 @@ impl Owner {
                     }
                     j.params.extend(params);
                     j.delivery_lifecycle = nzbd_types::has_delivery_intent(&j.params);
+                    if let Some(token) = request_token.as_deref() {
+                        // Public consumer identity can change across authority
+                        // adoption; the fetch origin remains bound to this
+                        // storage installation for its complete lifetime.
+                        j.params.push((
+                            "*URL:AdmissionGeneration".into(),
+                            url_admission_generation(id, token, &self.artifacts.installation),
+                        ));
+                    }
                 }
                 let name = self.name_from_requestor(id, true).unwrap_or(name);
                 if let (Some(token), Some(fingerprint)) =
@@ -3054,7 +3135,9 @@ impl Owner {
                         source_generation: None,
                     };
                     self.state.url_admission_receipts.push(receipt.clone());
-                    self.unaccepted_admissions.insert(token.clone(), receipt);
+                    if self.persist_guard.is_some() {
+                        self.unaccepted_admissions.insert(token.clone(), receipt);
+                    }
                 }
                 let generation = fresh_epoch();
                 self.job_epochs.insert(id, generation);
@@ -3755,6 +3838,16 @@ impl Owner {
                             let current = owner.control_epochs.get(&job) == Some(&generation)
                                 && owner.job_epochs.get(&job) == Some(&scope_generation);
                             if (!persistent || committed) && current {
+                                // The empty fence has no writer acknowledgement
+                                // task to clear it. Its durable quiesce commit
+                                // is the complete retirement boundary.
+                                if writers.is_empty()
+                                    && !owner.retirement_epochs.contains_key(&job)
+                                    && owner.retiring_writers.get(&job).is_some_and(Vec::is_empty)
+                                {
+                                    owner.retiring_writers.remove(&job);
+                                    owner.drain_replacements();
+                                }
                                 owner.publish_now();
                                 let _ = reply.send(Ok(writers));
                             } else {
@@ -4211,6 +4304,7 @@ impl Owner {
                 bytes_per_sec,
                 reply,
             } => {
+                self.speed_limit_revision = fresh_epoch();
                 self.state.speed_limit_bps = bytes_per_sec;
                 self.applied_usenet_limit = None;
                 self.applied_torrent_limit = None;
@@ -4322,8 +4416,15 @@ impl Owner {
                             _ => false,
                         });
                 let exportable = !self.verification.contains_key(&job)
+                    && !self
+                        .state
+                        .job(job)
+                        .is_some_and(transitions::failed_cleanup_only)
                     && !self.retiring_writers.contains_key(&job)
                     && !self.pending_control_revisions.contains_key(&job)
+                    && !self.post_rollbacks.contains_key(&job)
+                    && !self.failed_cleanup_admissions.contains_key(&job)
+                    && !self.projection_transition
                     && !replacement_pending;
                 let result = if exportable {
                     self.state.job(job).cloned().map(Box::new)
@@ -4454,7 +4555,7 @@ impl Owner {
                 });
             }
             QueueCommand::AdoptReplicatedAuthority { jobs, reply } => {
-                self.replace_projection_then(jobs, move |_, result| {
+                self.replace_projection_then(jobs, None, move |_, result| {
                     let _ = reply.send(result);
                 });
             }
@@ -5410,6 +5511,10 @@ impl Owner {
             return false;
         };
         let record = self.state.jobs.remove(index);
+        if self.post_rollbacks.remove(&job).is_some() {
+            self.record_transitions.remove(&job);
+            self.pending_control_commits.remove(&job);
+        }
         self.job_epochs.insert(job, fresh_epoch());
         if let Some(state) = self.verification.remove(&job) {
             state.cancel.cancel();
@@ -5563,7 +5668,9 @@ impl Owner {
                         continue;
                     }
                     if record.file_size > 0 {
-                        owner.file_sizes.insert(record.file, record.file_size);
+                        if let Some(size) = merge_replayed_size(&mut owner.state, &record) {
+                            owner.file_sizes.insert(record.file, size);
+                        }
                     }
                     let reference = SegRef {
                         job,
@@ -5619,6 +5726,7 @@ impl Owner {
         callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
     ) {
         let state_dir = self.state_dir.clone();
+        let speed_revision = self.speed_limit_revision;
         self.io_then(
             move || SnapshotStore::open(&state_dir)?.load(),
             move |owner, result| {
@@ -5633,6 +5741,7 @@ impl Owner {
                     }
                 };
                 let mut jobs = owner.state.jobs.clone();
+                let mut adopted_speed = None;
                 if let Some(state) = recovered {
                     // The first cluster authority may boot without loading the
                     // shared queue. Preserve retired admissions for the one-time
@@ -5667,6 +5776,7 @@ impl Owner {
                     owner.state.next_job_id = owner.state.next_job_id.max(state.next_job_id);
                     owner.state.next_file_id = owner.state.next_file_id.max(state.next_file_id);
                     owner.state.download_paused = state.download_paused;
+                    adopted_speed = Some(state.speed_limit_bps);
                     for job in state.jobs {
                         if !jobs.iter().any(|current| current.id == job.id) {
                             jobs.push(job);
@@ -5687,7 +5797,7 @@ impl Owner {
                 }
                 owner.persistence_fenced = false;
                 owner.persist = true;
-                owner.replace_projection_then(jobs, move |owner, result| {
+                owner.replace_projection_then(jobs, adopted_speed.map(|speed| (speed_revision, speed)), move |owner, result| {
                     if was_fenced && result.is_err() {
                         owner.persistence_fenced = true;
                         owner.persist = false;
@@ -5718,6 +5828,14 @@ impl Owner {
         let is_blocked = move |id: ServerId| blocked_now.contains(&id);
 
         let mut excluded = self.delegated.clone();
+        for job in self
+            .state
+            .jobs
+            .iter()
+            .filter(|job| transitions::failed_cleanup_only(job))
+        {
+            excluded.insert(job.id, "failed cleanup metadata only".into());
+        }
         for job in self
             .verification
             .keys()
@@ -5843,6 +5961,10 @@ impl Owner {
     fn on_scoped_writer(&mut self, job: JobId, file: FileId, generation: u64, fact: WriterFact) {
         if self.writer_epochs.get(&file) != Some(&generation)
             || self.state.job(job).is_none()
+            || self
+                .state
+                .job(job)
+                .is_some_and(transitions::failed_cleanup_only)
             || self.verification.contains_key(&job)
         {
             return;
@@ -7799,7 +7921,8 @@ impl Owner {
                         || self.retiring_writers.contains_key(&job.id)
                         || self.post_admissions.contains_key(&job.id)
                         || self.allocating_jobs.contains(&job.id)
-                        || self.record_transitions.contains(&job.id)
+                        || (self.record_transitions.contains(&job.id)
+                            && !self.settled_post_rollback(job.id))
                         || self.pending_control_revisions.contains_key(&job.id)
                         || self
                             .verification
@@ -8272,6 +8395,7 @@ impl Owner {
         self.owner_heartbeat
             .store(unix_now() as u64, std::sync::atomic::Ordering::Relaxed);
         self.drain_replacements();
+        self.persist_post_rollbacks_then(|_| {});
         self.retry_payload_recoveries();
         self.start_verifications();
         let tick_started = Instant::now();
@@ -9229,7 +9353,10 @@ impl Owner {
                     || self.pending_control_commits.contains(&j.id)
                 {
                     summary.ready = false;
-                    if j.status != JobStatus::Paused && !j.held() {
+                    if j.status != JobStatus::Paused
+                        && !j.held()
+                        && !transitions::failed_cleanup_only(j)
+                    {
                         summary.status = JobStatus::Queued;
                     }
                 }
@@ -9445,6 +9572,30 @@ impl Owner {
     fn bump_epoch(&self) {
         self.epoch_tx.send_modify(|v| *v += 1);
     }
+}
+
+/// Accepted journal replay carries the expected publication length into the
+/// durable row used by payload verification, without replacing prior evidence.
+fn merge_replayed_size(state: &mut QueueState, record: &JournalRecord) -> Option<u64> {
+    let job = state.job_mut(record.job)?;
+    if !job.files.iter().any(|file| {
+        file.id == record.file
+            && file
+                .segments
+                .iter()
+                .any(|segment| segment.number == record.segment_number)
+    }) {
+        return None;
+    }
+    let key = format!("*File:size:{}", record.file.0);
+    if let Some((_, size)) = job.params.iter().find(|(name, _)| name == &key) {
+        return size.parse().ok().filter(|size| *size > 0);
+    }
+    if record.file_size > 0 {
+        job.params.push((key, record.file_size.to_string()));
+        return Some(record.file_size);
+    }
+    None
 }
 
 /// Replay retains unknown evidence; only matching incarnation provenance can

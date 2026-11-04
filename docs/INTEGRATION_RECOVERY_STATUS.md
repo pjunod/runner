@@ -1,6 +1,6 @@
 # Integration qualification — verified fixtures and safe script results
 
-**Status:** candidate implemented; Astra review and full qualification pending ·
+**Status:** candidate under qualification; baseline recovery defects being corrected ·
 **Written:** 2026-11-03 (America/New_York) · **Branch:**
 `codex/baseline-integration-recovery`
 
@@ -28,6 +28,38 @@ The fixture correction alone reaches 36 passes out of 39, leaving the script
 association conflict and two readiness/cleanup acknowledgement failures.
 The candidate adds a Keep-preservation variant and negative external-output
 ownership/association/path-replacement coverage.
+
+The first unrestricted whole-workspace run completed with seven failing
+targets: daemon, integration events, cluster fairness, compatibility units,
+engine units, engine end-to-end, and the post-processing pipeline. This is
+the full failure roster, including failures outside the original pipeline.
+
+| Additional cause | Correction and retained evidence |
+|---|---|
+| API authentication becomes active before backend readiness | Poll the explicit backend-ready state before backend endpoint assertions. Event daemons use independent ephemeral monitor ports. |
+| Same-root recovery starts one verifier per one-second tick | Start the next eligible verifier after the completed worker joins and its evidence is durably acknowledged. A 20-job regression drives real acknowledgements without periodic ticks and preserves pending-byte and concurrency assertions. |
+| Accepted journal ranges lose declared publication size across adoption/restart | Persist nonzero declared size only for an accepted matching file/segment; retain existing expected-size evidence. Verify real CRC ranges and publication after fold and restart. |
+| Standalone URL admissions accumulate an external-authority pending index | Index unaccepted admissions only when an external persistence guard is configured; retain stable private source-generation identity separately from public consumer metadata. |
+| Authority adoption omits the speed limit | Include the recovered limit in the projection transaction, preserve newer operator revisions, and restore the prior limit before persisting a failed adoption's rollback. Assert both memory and disk outcomes. |
+| Quiescing a source with no writer handles leaves an empty retirement fence | Release that exact empty fence only after its durable quiesce acknowledgement; retain real writer joins and the paused state. |
+| A failed terminal write and failed rollback can leave a permanent admission fence | Keep the fence until a matching restored-record snapshot is durably acknowledged; qualify automatic retry after storage recovers. |
+| A released rollback fence does not notify waiting admissions | Notify the owner epoch only after durable release; test the public admission waiter across failed writes and storage recovery. |
+| Terminal receipt activation also waits for independent scratch cleanup | Require exact stamp/history/generation agreement and durable receipt activation, then let inventory maintenance perform its separate checked retirement. |
+| Restart treats a partially deleted failed source as a new processing input | Admit only replay of its exact existing generation-bound deletion journal. Keep ordinary payload export, repair, salvage, and publication fenced; allow only failure metadata/history/stamp updates. Persist that classification through a terminal stamp and restart until queue retirement. |
+
+Engine fixtures must await only the explicit export-busy condition, use real
+inventory paths and worker contexts, and bound event receives. A payload
+import is not a download-completion event. Reserved-parameter tests compare
+the actual before/after metadata because new admissions already carry their
+own lifecycle marker.
+
+The failed-cleanup capability does not certify surviving bytes. It preserves
+the existing operation's request and retry deadline; the existing executor
+still checks Keep, holds, current ownership, root identity, active workers,
+and the surviving manifest before unlinking. A successful deletion receipt
+can replay metadata after the path is gone. Replaced files remain untouched.
+The integration fixture keeps its permissions fault active across restarts
+and inspects cleanup metadata separately from verified payload export.
 
 ## Custody — FINALDIR reports output without transferring authority
 

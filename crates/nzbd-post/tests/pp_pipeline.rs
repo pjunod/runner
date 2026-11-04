@@ -143,7 +143,7 @@ impl FixtureImport for EngineHandle {
                     result => return result,
                 }
             }
-        }).await.expect("fixture verification must settle")
+        }).await.unwrap_or_else(|error| panic!("fixture verification must settle: {error}; snapshot={:?}; source={:?}", self.snapshot(), self.artifacts().for_job(job.0)))
     }
     async fn import_fixture_job(
         &self,
@@ -398,9 +398,7 @@ async fn check_script_external_result(keep: bool) {
     );
     assert_eq!(inventory.for_job(1).unwrap().unwrap().id, original.id);
     drop(lease);
-    let workspace = inventory
-        .workspace(1, "par_repair", "external-result-proof")
-        .unwrap();
+    let workspace = inventory.workspace(1, "par_repair", "abc123").unwrap();
     std::fs::write(workspace.scratch.path.join("scratch"), b"temporary output").unwrap();
     inventory.finish_workspace(&workspace).unwrap();
 
@@ -1363,11 +1361,69 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
 
     const ATTEMPTS_PARAM: &str = "*PP:failure-disposition-attempts";
 
+    // This path deliberately does not expose partially deleted Done ranges
+    // through verified export. Inspect metadata only for retry/stamp assertions.
+    async fn cleanup_metadata(engine: &EngineHandle) -> Option<Job> {
+        engine
+            .recovery_document()
+            .await
+            .unwrap()
+            .jobs
+            .into_iter()
+            .find(|job| job.id == JobId(95))
+    }
+    fn cleanup_evidence(engine: &EngineHandle) -> String {
+        let inventory = engine.artifacts();
+        let source = inventory.for_job(95).unwrap().unwrap();
+        serde_json::to_string(
+            &inventory
+                .operation(&format!("failed-delete-{}", source.id))
+                .unwrap(),
+        )
+        .unwrap()
+    }
+    async fn cleanup_ready(engine: &EngineHandle) {
+        let evidence = cleanup_evidence(engine);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(scope) = engine
+                    .begin_failed_cleanup_admission(JobId(95))
+                    .await
+                    .unwrap()
+                {
+                    let scoped = engine.for_post_admission(&scope.admission);
+                    assert!(matches!(
+                        scoped.export_job(JobId(95)).await,
+                        Err(nzbd_engine::EngineError::Lifecycle(_))
+                    ));
+                    assert_eq!(
+                        scoped
+                            .failed_cleanup_metadata()
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .status,
+                        JobStatus::Failed
+                    );
+                    engine.end_post_admission(scope.admission).await.unwrap();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("exact terminal cleanup admission becomes ready after restart");
+        assert_eq!(
+            cleanup_evidence(engine),
+            evidence,
+            "admission cannot change deletion intent or its retry deadline"
+        );
+    }
+
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("dest/undeletable");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("partial.bin"), b"known bad bytes").unwrap();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
     let config = PostConfig {
         failure_action: FailureAction::Delete,
         ..PostConfig::default()
@@ -1377,6 +1433,20 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
     let engine = spawn_engine(tmp.path()).await;
     let cancel = CancellationToken::new();
     let tracker = TaskTracker::new();
+    let mut job = completed_job(
+        95,
+        "undeletable",
+        vec![file_entry(1, "partial.bin", None, false)],
+    );
+    job.status = JobStatus::Failed;
+    engine
+        .import_fixture_job(tmp.path(), job, false, false)
+        .await
+        .unwrap();
+
+    // Recovery must first verify/enroll the fixture. Make only the subsequent
+    // destructive disposition fail, rather than blocking initial recovery.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
     spawn_post_manager(
         engine.clone(),
         config.clone(),
@@ -1386,30 +1456,21 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
         cancel.clone(),
         &tracker,
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let mut job = completed_job(
-        95,
-        "undeletable",
-        vec![file_entry(1, "partial.bin", None, false)],
-    );
-    job.status = JobStatus::Failed;
-    engine
-        .import_fixture_job(tmp.path(), job, false, true)
-        .await
-        .unwrap();
+    engine.emit(nzbd_engine::Event::JobFinished {
+        job: JobId(95),
+        name: "undeletable".into(),
+        status: JobStatus::Failed,
+        health: 0,
+    });
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let attempts = engine
-            .export_fixture_job(JobId(95))
-            .await
-            .unwrap()
-            .and_then(|job| {
-                job.params
-                    .into_iter()
-                    .find(|(key, _)| key == ATTEMPTS_PARAM)
-                    .map(|(_, value)| value)
-            });
+        let attempts = cleanup_metadata(&engine).await.and_then(|job| {
+            job.params
+                .into_iter()
+                .find(|(key, _)| key == ATTEMPTS_PARAM)
+                .map(|(_, value)| value)
+        });
         if attempts.as_deref() == Some("1") {
             break;
         }
@@ -1423,16 +1484,16 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
     cancel.cancel();
     tracker.close();
     tracker.wait().await;
+    let recovery_operation = cleanup_evidence(&engine);
     engine.shutdown().await;
 
+    // Permissions remain read-only across restart. Cleanup metadata admission
+    // must not require ordinary processing or a replacement payload manifest.
     let recovered = spawn_engine(tmp.path()).await;
+    cleanup_ready(&recovered).await;
     // Exactly one attempt: the import's `JobFinished` event and the manager's
     // startup scan both observe this row, but they are one retry occasion.
-    let durable = recovered
-        .export_fixture_job(JobId(95))
-        .await
-        .unwrap()
-        .unwrap();
+    let durable = cleanup_metadata(&recovered).await.unwrap();
     assert!(
         durable
             .params
@@ -1441,6 +1502,8 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
         "one occasion must spend one attempt (durable params: {:?})",
         durable.params
     );
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    assert_eq!(cleanup_evidence(&recovered), recovery_operation);
     let cancel2 = CancellationToken::new();
     let tracker2 = TaskTracker::new();
     spawn_post_manager(
@@ -1455,16 +1518,12 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let attempts = recovered
-            .export_fixture_job(JobId(95))
-            .await
-            .unwrap()
-            .and_then(|job| {
-                job.params
-                    .into_iter()
-                    .find(|(key, _)| key == ATTEMPTS_PARAM)
-                    .map(|(_, value)| value)
-            });
+        let attempts = cleanup_metadata(&recovered).await.and_then(|job| {
+            job.params
+                .into_iter()
+                .find(|(key, _)| key == ATTEMPTS_PARAM)
+                .map(|(_, value)| value)
+        });
         if attempts.as_deref() == Some("2") {
             break;
         }
@@ -1478,6 +1537,7 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
     cancel2.cancel();
     tracker2.close();
     tracker2.wait().await;
+    let recovery_operation = cleanup_evidence(&recovered);
     recovered.shutdown().await;
 
     // Third occasion — again a restart, so each attempt is a distinct one.
@@ -1485,6 +1545,8 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
     // driving them with extra `JobFinished` emits would model one occasion as
     // several and is exactly the miscount this bound is meant to resist.)
     let recovered = spawn_engine(tmp.path()).await;
+    cleanup_ready(&recovered).await;
+    assert_eq!(cleanup_evidence(&recovered), recovery_operation);
     let cancel3 = CancellationToken::new();
     let tracker3 = TaskTracker::new();
     spawn_post_manager(
@@ -1499,15 +1561,11 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let stamped = recovered
-            .export_fixture_job(JobId(95))
-            .await
-            .unwrap()
-            .is_some_and(|job| {
-                job.params
-                    .iter()
-                    .any(|(key, value)| key == PP_DONE_PARAM && value == "FAILURE/HEALTH")
-            });
+        let stamped = cleanup_metadata(&recovered).await.is_some_and(|job| {
+            job.params
+                .iter()
+                .any(|(key, value)| key == PP_DONE_PARAM && value == "FAILURE/HEALTH")
+        });
         if stamped && hist.list(10).unwrap().len() == 1 {
             break;
         }
@@ -1527,7 +1585,10 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
     assert!(row.params.iter().any(|(key, value)| {
         key == "Failure:Files" && value.starts_with("checked deletion pending:")
     }));
-    assert!(dir.join("partial.bin").is_file());
+    assert_eq!(
+        std::fs::read(dir.join("partial.bin")).unwrap(),
+        b"known bad bytes"
+    );
 
     // A finish event models another rescan finding the same queue row. The
     // terminal stamp must make this a no-op: no fourth attempt or history row.
@@ -1538,11 +1599,7 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
         health: 0,
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let terminal = recovered
-        .export_fixture_job(JobId(95))
-        .await
-        .unwrap()
-        .unwrap();
+    let terminal = cleanup_metadata(&recovered).await.unwrap();
     assert!(terminal
         .params
         .iter()
@@ -2232,7 +2289,21 @@ async fn failed_final_stamp_commit_rolls_back_live_state_and_retries_once() {
         injected.load(Ordering::Acquire),
         "the final-stamp fault must fire"
     );
-    let unstamped = engine.export_fixture_job(JobId(94)).await.unwrap().unwrap();
+    assert!(matches!(
+        engine.export_job(JobId(94)).await,
+        Err(nzbd_engine::EngineError::Lifecycle(_))
+    ));
+    // Inspect metadata only while failed rollback persistence keeps public
+    // payload export fenced. This does not grant processing custody.
+    let unstamped = engine
+        .recovery_document()
+        .await
+        .unwrap()
+        .jobs
+        .into_iter()
+        .find(|job| job.id == JobId(94))
+        .unwrap();
+    assert_eq!(unstamped.status, JobStatus::Failed);
     assert!(unstamped
         .params
         .iter()
@@ -2240,6 +2311,18 @@ async fn failed_final_stamp_commit_rolls_back_live_state_and_retries_once() {
     assert!(!unstamped.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
 
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // Recovery must durably acknowledge the restored row before the next
+    // observation can acquire processing custody. Readable metadata alone
+    // does not mean a failed rollback's admission fence has been released.
+    let admission = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine.wait_post_admission(JobId(94), &cancel),
+    )
+    .await
+    .expect("restored storage releases the durable rollback fence")
+    .unwrap()
+    .expect("failed row remains eligible for processing");
+    engine.end_post_admission(admission).await.unwrap();
     engine.emit(nzbd_engine::Event::JobFinished {
         job: JobId(94),
         name: "final-stamp-full".into(),
@@ -2265,7 +2348,11 @@ async fn failed_final_stamp_commit_rolls_back_live_state_and_retries_once() {
         if stamped && finished == 1 {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline);
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "retry did not settle: stamped={stamped}, finished={finished}, snapshot={:?}",
+            engine.snapshot()
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -3706,7 +3793,9 @@ async fn terminal_stamp_receipt_gap_replays_after_restart_without_reprocessing()
     {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "terminal receipt was not replayed"
+            "terminal receipt was not replayed: snapshot={:?}, receipts={:?}",
+            recovered.snapshot(),
+            recovered.artifacts().staged_completions(1201)
         );
         tokio::task::yield_now().await;
     }

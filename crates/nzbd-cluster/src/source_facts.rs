@@ -8,7 +8,10 @@ pub(crate) fn bind_owned(shared: &LeaderShared, job: &mut Job) -> Result<bool, S
         .params
         .iter()
         .any(|(key, _)| key == AUTHORITY_COPY_PARAM)
-        || job.params.iter().any(|(key, _)| key == "*PP_DONE")
+        || job
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
     {
         return Ok(false);
     }

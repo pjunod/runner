@@ -708,6 +708,15 @@ pub struct PostAdmission {
     pub cancellation: CancellationToken,
 }
 
+/// Permission to resume an existing failed-source deletion. This grants no
+/// verified payload reads, download progress, repair or publication authority.
+#[derive(Clone, Debug)]
+pub struct FailedCleanupAdmission {
+    pub admission: PostAdmission,
+    pub job: nzbd_types::Job,
+    pub cleanup: nzbd_state::artifacts::FailedCleanupProof,
+}
+
 /// Cloneable handle to a running engine.
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -773,6 +782,29 @@ impl EngineHandle {
     ) -> Result<Option<PostAdmission>, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send(QueueCommand::BeginPostAdmission { job, reply })
+            .await?;
+        owner_reply(rx).await
+    }
+
+    /// Acquire metadata-only replay permission as the current queue authority.
+    /// Worker cleanup requires a separate current-grant capability.
+    pub async fn begin_failed_cleanup_admission(
+        &self,
+        job: JobId,
+    ) -> Result<Option<FailedCleanupAdmission>, EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(QueueCommand::BeginFailedCleanupAdmission { job, reply })
+            .await?;
+        owner_reply(rx).await
+    }
+
+    pub async fn failed_cleanup_metadata(&self) -> Result<Option<nzbd_types::Job>, EngineError> {
+        let admission = self
+            .post_scope
+            .clone()
+            .ok_or_else(|| EngineError::Lifecycle("failed cleanup scope is absent".into()))?;
+        let (reply, rx) = oneshot::channel();
+        self.send(QueueCommand::FailedCleanupMetadata { admission, reply })
             .await?;
         owner_reply(rx).await
     }

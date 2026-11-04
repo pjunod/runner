@@ -246,6 +246,13 @@ async fn wait_for(mut condition: impl FnMut() -> bool, description: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn mixed_worker_grants_post_while_fast_downloads_keep_slots_and_backlog_available() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "nzbd_cluster=info,nzbd_engine=warn".into()),
+        )
+        .with_test_writer()
+        .try_init();
     let tmp = tempfile::tempdir().unwrap();
     let payload = prng_bytes(9201, 16_000);
     let post = build_post("fairness", &[("payload.mkv", payload)], 20_000);
@@ -281,29 +288,47 @@ async fn mixed_worker_grants_post_while_fast_downloads_keep_slots_and_backlog_av
             if status == 201 {
                 break;
             }
-            assert_eq!(status, 503, "admission failed: {body}");
+            assert_eq!(
+                status,
+                503,
+                "admission failed at seed {index}: {body}; snapshot={:?}",
+                authority.runtime.engine.snapshot()
+            );
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "admission stayed unavailable: {body}"
+                "admission stayed unavailable at seed {index}: {body}; snapshot={:?}",
+                authority.runtime.engine.snapshot()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
     let worker = start_node(tmp.path(), "mixed", true, provider.port(), seen.clone()).await;
     let history_path = tmp.path().join(".nzbd-cluster/history/history.mixed.jsonl");
-    wait_for(
-        || {
-            let history = std::fs::read_to_string(&history_path).unwrap_or_default();
-            history
-                .lines()
-                .filter(|line| line.contains("\"SUCCESS\""))
-                .count()
-                >= 3
-                && provider.total_hits() >= 8
-        },
-        "three actual remote post-processing successes under mixed load",
-    )
-    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        let history = std::fs::read_to_string(&history_path);
+        let successes = history
+            .as_ref()
+            .map(|history| {
+                history
+                    .lines()
+                    .filter(|line| line.contains("\"SUCCESS\""))
+                    .count()
+            })
+            .unwrap_or(0);
+        if successes >= 3 && provider.total_hits() >= 8 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out: three actual remote post-processing successes under mixed load; successes={successes}, provider_hits={}, history_path={history_path:?}, history={history:?}, authority={:?}, worker={:?}, polls={:?}",
+            provider.total_hits(),
+            authority.runtime.engine.snapshot(),
+            worker.runtime.engine.snapshot(),
+            seen.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     let backlog = authority
         .runtime
         .engine

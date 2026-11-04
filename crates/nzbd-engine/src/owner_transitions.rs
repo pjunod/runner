@@ -184,12 +184,144 @@ pub(super) fn allocate_imported_payload(
 
 fn needs_payload(job: &Job) -> bool {
     job.torrent.is_none()
+        && !failed_cleanup_only(job)
         && !job.files.is_empty()
         && !job
             .params
             .iter()
             .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
         && job.status != JobStatus::Deleted
+}
+
+pub(super) fn failed_cleanup_only(job: &Job) -> bool {
+    job.params
+        .iter()
+        .any(|(key, _)| key == "*Recovery:failed-cleanup")
+}
+
+fn failed_cleanup_marker(proof: &nzbd_state::artifacts::FailedCleanupProof) -> String {
+    serde_json::to_string(&(
+        proof.source().artifact.as_str(),
+        proof.source().generation.as_str(),
+        proof.operation_id(),
+    ))
+    .unwrap()
+}
+
+fn failed_cleanup_marker_matches(
+    job: &Job,
+    proof: &nzbd_state::artifacts::FailedCleanupProof,
+) -> bool {
+    let markers = job
+        .params
+        .iter()
+        .filter(|(key, _)| key == "*Recovery:failed-cleanup")
+        .collect::<Vec<_>>();
+    markers.is_empty() || (markers.len() == 1 && markers[0].1 == failed_cleanup_marker(proof))
+}
+
+fn failed_cleanup_record(job: &Job) -> bool {
+    job.kind == JobKind::Nzb
+        && job.status == JobStatus::Failed
+        && !job.held()
+        && job
+            .params
+            .iter()
+            .filter(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+            .all(|(_, value)| failed_cleanup_only(job) && value.starts_with("FAILURE/"))
+        && ["*PP:failure-at", "*PP:failure-disposition-attempts"]
+            .iter()
+            .all(|name| {
+                job.params
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .and_then(|(_, value)| value.parse::<u64>().ok())
+                    .is_some_and(|value| value > 0)
+            })
+}
+
+fn cleanup_metadata_key(key: &str) -> bool {
+    matches!(
+        key,
+        nzbd_types::PP_DONE_PARAM
+            | "*PP:history-seq"
+            | "*PP:failure-disposition-attempts"
+            | "*PP:failed-cleanup-next-retry"
+            | "*PP:failed-cleanup-blocked-since"
+            | "*PP:failed-cleanup-last-error"
+            | "Failure:Stage"
+            | "Failure:Reason"
+            | "Failure:KeepOnFailure"
+            | "Failure:Files"
+            | "Artifact:Id"
+            | "Artifact:Generation"
+            | "Artifact:Custody"
+            | "*PP:selected-publication-outcome"
+            | "*PP:selected-publication-failure-cause"
+    )
+}
+
+fn cleanup_update_matches(
+    previous: &Job,
+    candidate: &Job,
+    proof: &nzbd_state::artifacts::FailedCleanupProof,
+) -> bool {
+    if previous.status != JobStatus::Failed
+        || candidate.status != JobStatus::Failed
+        || candidate
+            .params
+            .iter()
+            .any(|(key, value)| key == nzbd_types::PP_DONE_PARAM && !value.starts_with("FAILURE/"))
+    {
+        return false;
+    }
+    if candidate
+        .params
+        .iter()
+        .any(|(key, value)| match key.as_str() {
+            "Artifact:Id" => value != &proof.source().artifact,
+            "Artifact:Generation" => value != &proof.source().generation,
+            "Artifact:Custody" => !matches!(
+                value.as_str(),
+                "runner_owned" | "kept_by_user" | "deleted_by_runner"
+            ),
+            "*PP:selected-publication-outcome" | "*PP:selected-publication-failure-cause" => {
+                !previous.params.contains(&(key.clone(), value.clone()))
+            }
+            _ => false,
+        })
+    {
+        return false;
+    }
+    let attempts = |row: &Job| {
+        row.params
+            .iter()
+            .find(|(key, _)| key == "*PP:failure-disposition-attempts")
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+    };
+    if !attempts(previous)
+        .zip(attempts(candidate))
+        .is_some_and(|(old, new)| new >= old)
+    {
+        return false;
+    }
+    let mut previous = previous.clone();
+    let mut candidate = candidate.clone();
+    candidate.category = previous.category.clone();
+    candidate.priority = previous.priority;
+    candidate
+        .params
+        .retain(|(key, _)| key != nzbd_types::CONTROL_PARAM);
+    previous
+        .params
+        .retain(|(key, _)| key != nzbd_types::CONTROL_PARAM);
+    previous
+        .params
+        .retain(|(key, _)| !cleanup_metadata_key(key));
+    candidate
+        .params
+        .retain(|(key, _)| !cleanup_metadata_key(key));
+    serde_json::to_value(previous).ok() == serde_json::to_value(candidate).ok()
 }
 fn preserve_user_intent(old: &mut Job, current: &Job) {
     old.category = current.category.clone();
@@ -292,6 +424,105 @@ pub(super) struct StartupRoot {
 }
 
 impl Owner {
+    pub(super) fn begin_failed_cleanup_admission_then(
+        &mut self,
+        job: JobId,
+        callback: impl FnOnce(&mut Owner, Option<crate::FailedCleanupAdmission>) + Send + 'static,
+    ) {
+        if self.cancel.is_cancelled()
+            || !self.persist
+            || self.persistence_fenced
+            || !self.state.job(job).is_some_and(failed_cleanup_record)
+            || self.post_admissions.contains_key(&job)
+            || self.allocating_jobs.contains(&job)
+            || self.pending_control_commits.contains(&job)
+            || self.record_transitions.contains(&job)
+            || self.projection_transition
+            || self.retiring_writers.contains_key(&job)
+            || self
+                .verification
+                .get(&job)
+                .is_some_and(|state| state.running)
+            || self.state.job(job).is_some_and(|record| {
+                record.files.iter().any(|file| {
+                    self.pending_writer_birth.contains_key(&file.id)
+                        || self
+                            .writers
+                            .get(&file.id)
+                            .is_some_and(|writer| !*writer.stopped.borrow())
+                })
+            })
+        {
+            callback(self, None);
+            return;
+        }
+        let generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+        let control_revision = self.control_epochs.get(&job).copied();
+        self.record_transitions.insert(job);
+        self.pending_control_commits.insert(job);
+        let inventory = self.artifacts.clone();
+        self.io_then(
+            move || inventory.failed_cleanup_proof(job.0).map_err(failure),
+            move |owner, proof| {
+                owner.record_transitions.remove(&job);
+                owner.pending_control_commits.remove(&job);
+                let proof = match proof {
+                    Ok(Some(proof))
+                        if owner.job_epochs.get(&job) == Some(&generation)
+                            && owner.control_epochs.get(&job).copied() == control_revision
+                            && owner.state.job(job).is_some_and(failed_cleanup_record)
+                            && owner
+                                .state
+                                .job(job)
+                                .is_some_and(|row| failed_cleanup_marker_matches(row, &proof))
+                            && !owner.cancel.is_cancelled()
+                            && owner.persist
+                            && !owner.persistence_fenced
+                            && !owner.post_admissions.contains_key(&job)
+                            && owner.persist_guard.as_ref().is_none_or(|guard| guard()) =>
+                    {
+                        proof
+                    }
+                    _ => {
+                        owner.drain_replacements();
+                        callback(owner, None);
+                        return;
+                    }
+                };
+                let cancellation = owner.cancel.child_token();
+                let files = owner
+                    .state
+                    .job(job)
+                    .unwrap()
+                    .files
+                    .iter()
+                    .map(|file| file.id)
+                    .collect::<Vec<_>>();
+                for file in files {
+                    owner.writer_epochs.remove(&file);
+                    owner.writers.remove(&file);
+                }
+                let admission = crate::PostAdmission {
+                    job,
+                    generation,
+                    cancellation: cancellation.clone(),
+                };
+                owner.post_admissions.insert(job, generation);
+                owner.post_cancellations.insert(job, cancellation);
+                owner.failed_cleanup_admissions.insert(job, proof.clone());
+                let row = owner.state.job(job).unwrap().clone();
+                callback(
+                    owner,
+                    Some(crate::FailedCleanupAdmission {
+                        admission,
+                        job: row,
+                        cleanup: proof,
+                    }),
+                );
+            },
+        );
+    }
+
     pub(super) fn materialize_generation_then(
         &mut self,
         request: GenerationMaterialization,
@@ -461,6 +692,67 @@ impl Owner {
     pub(super) fn apply_post_record_proven(
         &mut self,
         admission: crate::PostAdmission,
+        candidate: Job,
+        require_snapshot: bool,
+        completion_proof: Option<nzbd_state::artifacts::WorkerCompletionProof>,
+        callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
+    ) {
+        if let Some(proof) = self.failed_cleanup_admissions.get(&admission.job).cloned() {
+            let inventory = self.artifacts.clone();
+            let custody = candidate
+                .params
+                .iter()
+                .find(|(key, _)| key == "Artifact:Custody")
+                .map(|(_, value)| value.clone());
+            self.io_then(
+                move || {
+                    inventory
+                        .validate_failed_cleanup_proof(&proof)
+                        .map_err(failure)?;
+                    let source = inventory.get(&proof.source().artifact).map_err(failure)?;
+                    if custody.as_deref() == Some("deleted_by_runner")
+                        && !matches!(source.state.as_str(), "deleted" | "source_gone")
+                    {
+                        return Err(failure("failed cleanup source deletion is not recorded"));
+                    }
+                    if custody.as_deref() == Some("kept_by_user")
+                        && !source.keep
+                        && !source.keep_on_failure
+                    {
+                        return Err(failure(
+                            "failed cleanup source has no user retention choice",
+                        ));
+                    }
+                    Ok(())
+                },
+                move |owner, validated| {
+                    if validated.is_err() {
+                        callback(owner, false);
+                        return;
+                    }
+                    owner.apply_post_record_proven_ready(
+                        admission,
+                        candidate,
+                        require_snapshot,
+                        completion_proof,
+                        callback,
+                    );
+                },
+            );
+        } else {
+            self.apply_post_record_proven_ready(
+                admission,
+                candidate,
+                require_snapshot,
+                completion_proof,
+                callback,
+            );
+        }
+    }
+
+    fn apply_post_record_proven_ready(
+        &mut self,
+        admission: crate::PostAdmission,
         mut candidate: Job,
         require_snapshot: bool,
         completion_proof: Option<nzbd_state::artifacts::WorkerCompletionProof>,
@@ -493,6 +785,23 @@ impl Owner {
             callback(self, false);
             return;
         };
+        if let Some(proof) = self.failed_cleanup_admissions.get(&admission.job) {
+            if completion_proof.is_some() || !cleanup_update_matches(&previous, &candidate, proof) {
+                callback(self, false);
+                return;
+            }
+            candidate
+                .params
+                .retain(|(key, _)| key != nzbd_types::CONTROL_PARAM);
+            if let Some(control) = previous.control() {
+                candidate.set_control(&control);
+            }
+            set_owner_param(
+                &mut candidate.params,
+                "*Recovery:failed-cleanup",
+                Some(failed_cleanup_marker(proof)),
+            );
+        }
         if previous.kind != candidate.kind
             || job_dir_name(&previous) != job_dir_name(&candidate)
             || previous
@@ -558,23 +867,27 @@ impl Owner {
                 callback(owner, true);
                 return;
             }
-            if owner.job_epochs.get(&job) == Some(&lifetime) {
-                if let Some(current) = owner.state.job(job).cloned() {
-                    let mut restore = previous;
-                    preserve_intent_changes(&mut restore, &current, &provisional);
-                    *owner.state.job_mut(job).unwrap() = restore;
-                }
+            // The record transition still excludes replacements. Deferred
+            // removal/adoption may invalidate the admission's epoch, but the
+            // provisional row must still be rolled back before they run.
+            if let Some(current) = owner.state.job(job).cloned() {
+                let mut restore = previous;
+                preserve_intent_changes(&mut restore, &current, &provisional);
+                *owner.state.job_mut(job).unwrap() = restore;
+                owner.post_rollbacks.insert(
+                    job,
+                    PostRollback {
+                        generation: owner.job_epochs.get(&job).copied().unwrap_or(lifetime),
+                        control_revision: owner.control_epochs.get(&job).copied(),
+                        in_flight: false,
+                    },
+                );
                 owner.dirty = true;
-                owner.persist_then(move |owner, restored| {
-                    if restored {
-                        owner.pending_control_commits.remove(&job);
-                    }
-                    owner.record_transitions.remove(&job);
-                    owner.drain_replacements();
-                    owner.publish_now();
+                owner.persist_post_rollbacks_then(move |owner| {
                     callback(owner, false);
                 });
             } else {
+                owner.pending_control_commits.remove(&job);
                 owner.record_transitions.remove(&job);
                 owner.drain_replacements();
                 callback(owner, false);
@@ -582,12 +895,99 @@ impl Owner {
         });
     }
 
+    /// Failed rollback writes retain their operational fence until a later
+    /// snapshot acknowledges the restored row. Batch all waiting rows into
+    /// one document, and never enqueue another retry while one is in flight.
+    pub(super) fn persist_post_rollbacks_then(
+        &mut self,
+        callback: impl FnOnce(&mut Owner) + Send + 'static,
+    ) {
+        if self.projection_transition
+            || self.persistence_fenced
+            || (!self.persist && !self.worker_mode)
+        {
+            callback(self);
+            return;
+        }
+        let waiting = self
+            .post_rollbacks
+            .iter()
+            .filter_map(|(job, rollback)| (!rollback.in_flight).then_some(*job))
+            .collect::<Vec<_>>();
+        let mut dispatched = Vec::new();
+        for job in waiting {
+            let Some(generation) = self
+                .job_epochs
+                .get(&job)
+                .copied()
+                .filter(|_| self.state.job(job).is_some())
+            else {
+                self.post_rollbacks.remove(&job);
+                self.record_transitions.remove(&job);
+                self.pending_control_commits.remove(&job);
+                continue;
+            };
+            let fence = PostRollback {
+                generation,
+                control_revision: self.control_epochs.get(&job).copied(),
+                in_flight: true,
+            };
+            self.post_rollbacks.insert(job, fence);
+            dispatched.push((job, fence));
+        }
+        if dispatched.is_empty() {
+            callback(self);
+            return;
+        }
+        self.persist_then(move |owner, committed| {
+            let mut released = false;
+            for (job, fence) in dispatched {
+                if owner.post_rollbacks.get(&job) != Some(&fence) {
+                    continue;
+                }
+                let current = owner.job_epochs.get(&job) == Some(&fence.generation)
+                    && owner.control_epochs.get(&job).copied() == fence.control_revision;
+                if committed && current {
+                    owner.post_rollbacks.remove(&job);
+                    owner.record_transitions.remove(&job);
+                    owner.pending_control_commits.remove(&job);
+                    released = true;
+                } else if let Some(rollback) = owner.post_rollbacks.get_mut(&job) {
+                    rollback.in_flight = false;
+                }
+            }
+            owner.drain_replacements();
+            owner.publish_now();
+            if released {
+                owner.bump_epoch();
+            }
+            callback(owner);
+        });
+    }
+
+    pub(super) fn settled_post_rollback(&self, job: JobId) -> bool {
+        self.post_rollbacks
+            .get(&job)
+            .is_some_and(|rollback| !rollback.in_flight)
+    }
+
+    /// Authority replacement can supersede a failed local rollback, but only
+    /// its own durable acknowledgment can release the inherited barriers.
+    fn clear_post_rollback_barriers(&mut self) {
+        for (job, _) in self.post_rollbacks.drain() {
+            self.record_transitions.remove(&job);
+            self.pending_control_commits.remove(&job);
+        }
+    }
+
     pub(super) fn finish_post_admission(
         &mut self,
         admission: crate::PostAdmission,
         callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
     ) {
-        if !self.post_scope_current(&admission) {
+        if !self.post_scope_current(&admission)
+            || self.failed_cleanup_admissions.contains_key(&admission.job)
+        {
             callback(self, false);
             return;
         }
@@ -792,7 +1192,7 @@ impl Owner {
             callback(self, Err(failure("replacement target no longer exists")));
             return;
         }
-        if require_snapshot && !self.persist && !self.worker_mode {
+        if require_snapshot && !self.persist {
             callback(
                 self,
                 Err(failure("replacement requires durable queue ownership")),
@@ -986,11 +1386,15 @@ impl Owner {
     pub(super) fn replace_projection_then(
         &mut self,
         mut jobs: Vec<Job>,
+        adopted_speed: Option<(u64, Option<u64>)>,
         callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
     ) {
         if !self.post_admissions.is_empty()
             || !self.allocating_jobs.is_empty()
-            || !self.record_transitions.is_empty()
+            || self
+                .record_transitions
+                .iter()
+                .any(|job| !self.settled_post_rollback(*job))
             || self.projection_transition
             || !self.retiring_writers.is_empty()
             || self.verification.values().any(|state| state.running)
@@ -1015,6 +1419,13 @@ impl Owner {
             );
             return;
         }
+        let previous_speed = self.state.speed_limit_bps;
+        let speed_revision = adopted_speed
+            .filter(|(revision, _)| *revision == self.speed_limit_revision)
+            .map(|(revision, speed)| {
+                self.state.speed_limit_bps = speed;
+                revision
+            });
         self.projection_transition = true;
         let previous = self.state.jobs.clone();
         let old_delegated = std::mem::take(&mut self.delegated);
@@ -1078,12 +1489,22 @@ impl Owner {
                 .iter()
                 .all(|(job, epoch)| owner.job_epochs.get(job) == Some(epoch));
             if !current {
-                owner.projection_transition = false;
-                owner.drain_replacements();
-                callback(owner, Err(failure("authority projection was superseded")));
+                if speed_revision == Some(owner.speed_limit_revision) {
+                    owner.state.speed_limit_bps = previous_speed;
+                }
+                owner.persist_then(move |owner, _| {
+                    owner.projection_transition = false;
+                    owner.drain_replacements();
+                    callback(owner, Err(failure("authority projection was superseded")));
+                });
                 return;
             }
             if !committed {
+                // Restore rate intent before serializing the rollback snapshot.
+                // A later operator edit owns its own revision and survives.
+                if speed_revision == Some(owner.speed_limit_revision) {
+                    owner.state.speed_limit_bps = previous_speed;
+                }
                 let mut restored = previous;
                 for old in &mut restored {
                     if let Some((current, provisional)) = owner
@@ -1118,6 +1539,7 @@ impl Owner {
                 }
                 owner.persist_then(move |owner, restored| {
                     if restored {
+                        owner.clear_post_rollback_barriers();
                         for (job, _) in &fence {
                             owner.pending_control_commits.remove(job);
                         }
@@ -1129,6 +1551,9 @@ impl Owner {
                     owner.projection_transition = false;
                     owner.drain_replacements();
                     owner.publish_now();
+                    if restored {
+                        owner.bump_epoch();
+                    }
                     callback(
                         owner,
                         Err(failure(
@@ -1138,7 +1563,14 @@ impl Owner {
                 });
                 return;
             }
+            if speed_revision.is_some() {
+                owner.applied_usenet_limit = None;
+                owner.applied_torrent_limit = None;
+                let rate = owner.shared.load().download_rate_bps;
+                owner.rebalance_download_budget(rate);
+            }
             owner.projection_transition = false;
+            owner.clear_post_rollback_barriers();
             for (job, _) in &fence {
                 owner.pending_control_commits.remove(job);
             }

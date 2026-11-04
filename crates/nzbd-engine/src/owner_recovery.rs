@@ -387,7 +387,7 @@ impl Owner {
         let Some(current) = self.state.job(job) else {
             return;
         };
-        if current.torrent.is_some() {
+        if current.torrent.is_some() || super::transitions::failed_cleanup_only(current) {
             return;
         }
         let total_bytes = done_bytes(current);
@@ -457,6 +457,7 @@ impl Owner {
             .filter_map(|(position, job)| {
                 let state = self.verification.get(&job.id)?;
                 (!state.running
+                    && !super::transitions::failed_cleanup_only(job)
                     && state.phase != "saving"
                     && state.phase != "loading"
                     && !state.review_required
@@ -862,6 +863,10 @@ impl Owner {
                 for file in finalize{owner.send_finalize(job,file);}
                 owner.check_job_complete(job);
             }
+            // The reader has joined and its evidence is durably acknowledged.
+            // Fill its freed root slot now; waiting for the one-second owner
+            // tick adds a second per queued job after authority adoption.
+            owner.start_verifications();
         });
     }
 }

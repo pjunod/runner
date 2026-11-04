@@ -54,7 +54,8 @@ pub use worker_controls::{
     WORKER_CONTROL_CONTEXT_PARAM,
 };
 pub use workspace_lifecycle::{
-    AttemptUse, FinalizationProof, SourceGeneration, StagedCompletion, WorkspaceAssessment,
+    AttemptUse, FailedCleanupProof, FinalizationProof, SourceGeneration, StagedCompletion,
+    WorkspaceAssessment,
 };
 
 #[cfg(test)]
