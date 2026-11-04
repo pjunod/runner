@@ -493,13 +493,18 @@ impl Engine {
         let shutdown_complete = owner.shutdown_complete.clone();
         {
             let inventory = artifacts.clone();
+            let history = cfg.history.clone();
             let stop = cancel.clone();
             tracker.spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(30));
                 loop {
                     tokio::select! { _ = stop.cancelled() => break, _ = interval.tick() => {} }
                     let inventory = inventory.clone();
-                    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || inventory.tick()).await
+                    let history = history.clone();
+                    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || {
+                        inventory.tick_with_history(history.as_deref())
+                    })
+                    .await
                     {
                         tracing::error!(error = %e, "file lifecycle maintenance failed");
                     }

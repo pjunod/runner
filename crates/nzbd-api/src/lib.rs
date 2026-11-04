@@ -1231,6 +1231,11 @@ async fn park_snapshot(st: &ApiState, job: JobId) -> Option<Parked> {
         // both would make the choice ambiguous on the way back.
         params.retain(|(k, _)| k != "*URL");
     }
+    if let Ok(Some(artifact)) = st.engine.artifacts().for_job(job.0) {
+        params.retain(|(key, _)| key != "Artifact:Id" && key != "Artifact:Generation");
+        params.push(("Artifact:Id".into(), artifact.id));
+        params.push(("Artifact:Generation".into(), artifact.generation));
+    }
     Some(Parked {
         entry: nzbd_state::HistoryEntry {
             job,
@@ -1262,18 +1267,22 @@ async fn park_snapshot(st: &ApiState, job: JobId) -> Option<Parked> {
 /// the delete, so history can never claim a job that is still queued.
 async fn park_write(st: &ApiState, mut parked: Parked) -> bool {
     if let Ok(Some(a)) = st.engine.artifacts().for_job(parked.entry.job.0) {
-        parked.entry.params.retain(|(k, _)| k != "Artifact:Id");
-        parked
-            .entry
-            .params
-            .push(("Artifact:Id".into(), a.id.clone()));
-        if !a.terminal() {
+        // Keep the identity captured before deletion; a reused queue number
+        // must not attach the old DELETED receipt to a successor allocation.
+        if !a.terminal()
+            && parked
+                .entry
+                .params
+                .iter()
+                .any(|(key, value)| key == "Artifact:Id" && value == &a.id)
+        {
             parked.entry.final_dir = Some(a.path.to_string_lossy().into_owned());
         }
     }
     let Some(db) = st.history.clone() else {
         return false;
     };
+    let inventory = st.engine.artifacts();
     let job = parked.entry.job;
     tokio::task::spawn_blocking(move || {
         if let Some(bytes) = &parked.nzb {
@@ -1282,8 +1291,14 @@ async fn park_write(st: &ApiState, mut parked: Parked) -> bool {
                 return false;
             }
         }
-        match db.record(&parked.entry) {
-            Ok(()) => true,
+        match db.record_seq_durable(&parked.entry) {
+            Ok((sequence, mut entry)) => {
+                entry.seq = sequence;
+                if let Err(error) = inventory.finalize_deleted_workspaces(&entry) {
+                    tracing::warn!(job = job.0, %error, "deleted job scratch awaits maintenance replay");
+                }
+                true
+            }
             Err(e) => {
                 tracing::warn!(job = job.0, error = %e, "could not write the DELETED history entry");
                 db.drop_spool(job);
@@ -3608,6 +3623,14 @@ mod tests {
             .add_nzb("huge", huge.as_bytes(), None, 0)
             .await
             .unwrap();
+        // Scope simulated headroom to this exact payload directory. A fixed
+        // 256 GB request does not exceed real free space on every test host.
+        #[cfg(unix)]
+        let _capacity_limit = nzbd_state::capacity::inject_available_test_limit(
+            &engine.artifacts().for_job(big.0).unwrap().unwrap().path,
+            2 * 1024 * 1024 * 1024,
+        )
+        .unwrap();
         engine
             .hold_job(
                 big,
@@ -3979,6 +4002,15 @@ mod tests {
             .await
             .unwrap();
         let old_id = body_json(added).await["id"].as_u64().unwrap();
+        let inventory = engine.artifacts();
+        let allocation = inventory.for_job(old_id as u32).unwrap().unwrap();
+        let path = allocation.path;
+        std::fs::write(path.join("original"), b"recoverable original").unwrap();
+        let workspace = inventory
+            .workspace(old_id as u32, "par_repair", "de1e7e")
+            .unwrap();
+        std::fs::write(workspace.scratch.path.join("scratch"), b"obsolete scratch").unwrap();
+        inventory.finish_workspace(&workspace).unwrap();
         let deleted = app
             .clone()
             .oneshot(
@@ -3991,6 +4023,20 @@ mod tests {
         assert_eq!(deleted.status(), StatusCode::OK);
         assert_eq!(body_json(deleted).await["parked"], true);
         assert_eq!(db.list_filtered(10, true).unwrap()[0].status, "DELETED");
+        assert!(!workspace.scratch.path.exists());
+        assert_eq!(
+            inventory.get(&workspace.scratch.id).unwrap().state,
+            "deleted"
+        );
+        assert_eq!(
+            std::fs::read(path.join("original")).unwrap(),
+            b"recoverable original"
+        );
+        let deleted_entry = db.get(JobId(old_id as u32)).unwrap().unwrap();
+        assert!(deleted_entry.params.contains(&(
+            "Artifact:Generation".into(),
+            workspace.source.generation.clone()
+        )));
 
         let requeued = app
             .clone()
