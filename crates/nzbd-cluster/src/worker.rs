@@ -3764,7 +3764,42 @@ mod tests {
         accept_worker_retirement(&engine, &request, &response)
             .await
             .unwrap();
-        assert!(!workspace.scratch.path.exists());
+        // Receipt activation does not wait for independent inventory cleanup.
+        // Drive real reconciliation and require its exact durable retirement.
+        let inventory = engine.artifacts();
+        let retirement = format!("retire-{}", workspace.scratch.generation);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let retired = loop {
+            let maintenance = inventory.clone();
+            tokio::task::spawn_blocking(move || maintenance.tick())
+                .await
+                .unwrap()
+                .unwrap();
+            let operation = inventory.operation(&retirement).ok();
+            if let Some(operation) = operation.filter(|operation| operation.state == "succeeded") {
+                assert_eq!(
+                    inventory.get(&workspace.scratch.id).unwrap().state,
+                    "deleted"
+                );
+                assert!(!workspace.scratch.path.exists());
+                break operation;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "checked retirement did not finish: {:?}",
+                inventory.operation(&retirement)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        let proof: serde_json::Value = serde_json::from_str(&retired.request).unwrap();
+        assert_eq!(proof["source"]["artifact"], source.id);
+        assert_eq!(proof["source"]["generation"], source.generation);
+        assert_eq!(proof["scratch"]["artifact"], workspace.scratch.id);
+        assert_eq!(proof["scratch"]["generation"], workspace.scratch.generation);
+        assert_eq!(proof["outcome"], "SUCCESS");
+        assert_eq!(proof["proof"]["kind"], "cluster");
+        assert_eq!(proof["proof"]["receipt"], request.receipt_id);
+        assert_eq!(proof["proof"]["accepted_at_ms"], 10);
         assert!(source.path.join("payload").exists());
         accept_worker_retirement(&engine, &request, &response)
             .await

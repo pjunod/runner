@@ -41,12 +41,13 @@ physical disk traffic is lower.
 | Lease expiry/cancellation can block unrelated heartbeat renewals while waiting for writer/post joins | [worker.rs](../crates/nzbd-cluster/src/worker.rs) and [EngineHandle::retire_worker_job](../crates/nzbd-engine/src/lib.rs): renewal is separated from tracked join/retirement work. Exact revoked-grant retirement preserves foreign resume journals; accepted completion remains a separate compaction decision. Durable stop receipts replace execution watches only after actual joins. | Implemented; final combined qualification and runtime evidence tracked in PR #272. |
 | Ready Post results wait behind download completions | [worker.rs](../crates/nzbd-cluster/src/worker.rs): independent fresh/replay lane turns and within-kind rotation preserve progress for both classes, immutable requests and the single copy/verification lane. Outbox header work is bounded and full decoding is limited to the selected request. | Implemented candidate; final qualification tracked in PR #272. |
 | Heartbeats repeatedly persist unchanged provider-budget state | [leader.rs](../crates/nzbd-cluster/src/leader.rs) advances semantic revisions and skips confirmed durable writes; [control.rs](../crates/nzbd-cluster/src/control.rs) requires exact current issuer authority and checks duplicate-write postconditions. Uncommitted, stale or superseded commands are withheld. | Implemented candidate; final qualification tracked in PR #272. |
+| Source reconciliation waits for unrelated bound rows to verify | [source_facts.rs](../crates/nzbd-cluster/src/source_facts.rs) queries durable candidate IDs before checked export. Pending candidates remain ineligible, and scheduler assignments consume capacity only after checked readiness and actual actor acceptance. | Implemented candidate; final qualification tracked in PR #272. |
 
 ## Ranked follow-ups
 
 | Rank | Trigger | Remaining amplification or contention | Smallest useful fix |
 |---|---|---|---|
-| 1 | An accepted completion restores the authority queue | Projection replacement discards allocation/cache and verification tickets for all payload jobs; source reconciliation then waits for the entire verified queue. Unchanged jobs repeat recovery work after unrelated completions. | Design job-level readiness or conservative proof reuse with fresh exact source identity/generation checks. Every source fact must still use checked export and guarded intent CAS; metadata alone cannot grant payload authority. |
+| 1 | An accepted completion restores the authority queue | Projection replacement discards allocation/cache and verification tickets for all payload jobs. Unchanged jobs repeat recovery work after unrelated completions; candidate routing now lets independently verified work progress. | Design conservative proof reuse with fresh exact source identity/generation checks. Every source fact and grant must still use checked export and guarded intent CAS; metadata alone cannot grant payload authority. |
 | 2 | Large extracted output committed from staging on the same filesystem | Extraction still copies every file through `copy_publish_checked`: approximately `2S` reads and `S` writes after this branch's generic helper improvement. Staging remains independently writable and retained through later naming/repair, so current copy semantics are required. | Investigate an exclusive consume boundary before adding a metadata move/link path. Prove no later independent writes or staging-retention requirement, and preserve collision/crash replay checks; otherwise retain the verified copy. |
 | 3 | Writer finalizes a large file with a combined CRC | A synchronous full-file CRC scan runs inside an async writer future, occupying a Tokio runtime worker for the scan duration. | Move the necessary CRC validation to an owned bounded blocking/payload lane; keep actual worker completion and descriptor lifetime tracked. |
 | 4 | PAR workspace prepares matched data or recovery companions | Cached PAR fingerprints are followed by SHA-256 copy/readback and then independent MD5 scans of the copied data; companion preparation also reads the source again for MD5. | Compute required MD5 alongside the existing copy/readback stream and return digest evidence bound to exact identities, instead of rescanning unchanged input/output. |
@@ -58,10 +59,12 @@ physical disk traffic is lower.
 
 **Evidence:** [projection replacement](../crates/nzbd-engine/src/owner_transitions.rs)
 invalidates epochs, allocation cache and verification tickets for payload rows.
-[Source reconciliation](../crates/nzbd-cluster/src/source_facts.rs) requires a
-checked export of the complete queue before scheduler admission. Consequently,
-an unrelated pending verification can prevent already-verified work from being
-scheduled. Accepted completions repeatedly restore that projection.
+[Source reconciliation](../crates/nzbd-cluster/src/source_facts.rs) previously
+required a checked export of the complete queue before scheduler admission.
+Candidate-ID routing now excludes already-bound/stamped rows without copying
+their payload descriptors, postpones busy candidates and retains checked
+export/CAS for new bindings and grants. Accepted completions still repeatedly
+restore the complete projection and restart unchanged jobs' recovery work.
 
 The local fairness trace at `2c13010` also showed a ready Post completion waiting
 about 16.6 seconds behind seven download completions. Completion-lane ordering

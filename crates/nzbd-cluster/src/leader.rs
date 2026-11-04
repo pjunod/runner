@@ -3060,16 +3060,32 @@ async fn selected_result_has_delivery(control: &ControlStore, job: JobId) -> Res
     ).await.map(|rows|rows.into_iter().next().is_some_and(|row|row.0)).map_err(|error|error.to_string())
 }
 
+async fn checked_schedule_job(
+    s: &LeaderShared,
+    summary: &nzbd_engine::JobSummary,
+) -> Option<nzbd_types::Job> {
+    if summary.verification.is_some() {
+        return None;
+    }
+    match s.engine.export_job(summary.id).await {
+        Ok(Some(job)) if job.status == summary.status => Some(job),
+        _ => None,
+    }
+}
+
 async fn schedule(s: &Arc<LeaderShared>) {
     let _serial = s.mutation_serial.lock().await;
     if let Err(error) = crate::control_recovery::reconcile(s).await {
         tracing::warn!(%error,"scheduler awaits automatic control replication");
         return;
     }
-    if let Err(error) = crate::source_facts::reconcile(s).await {
-        tracing::warn!(%error,"scheduler awaits durable source custody");
-        return;
-    }
+    let source_pending = match crate::source_facts::reconcile(s).await {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(%error,"scheduler awaits durable source custody");
+            return;
+        }
+    };
     let mut requires_delivery = HashSet::new();
     let durable_status: HashMap<JobId, JobStatus> = match &s.control {
         Some(control) => match control.load_jobs().await {
@@ -3102,16 +3118,21 @@ async fn schedule(s: &Arc<LeaderShared>) {
     {
         for summary in snap.jobs.iter().filter(|job| {
             job.assigned_node.is_none()
+                && !source_pending.contains(&job.id)
                 && matches!(job.status, JobStatus::Queued)
                 && durable_status.get(&job.id) == Some(&JobStatus::Queued)
         }) {
-            if let Ok(Some(job)) = s.engine.export_job(summary.id).await {
-                if crate::range::is_split_candidate(&job) {
-                    split_jobs.insert(summary.id);
-                    let _ = s
+            if let Some(job) = checked_schedule_job(s, summary).await {
+                if !job.held() && crate::range::is_split_candidate(&job) {
+                    if !s
                         .engine
                         .set_delegated(summary.id, Some(crate::range::RANGE_ASSIGNEE.into()))
-                        .await;
+                        .await
+                        .is_ok_and(|accepted| accepted)
+                    {
+                        continue;
+                    }
+                    split_jobs.insert(summary.id);
                     tracing::info!(
                         job = summary.id.0,
                         "reserved job for article-range distribution"
@@ -3126,9 +3147,28 @@ async fn schedule(s: &Arc<LeaderShared>) {
     // jobs PP'd remotely (imported stamped via work/complete) and locally.
     for j in snap.jobs.iter() {
         if j.pp_done
+            && !source_pending.contains(&j.id)
             && matches!(j.status, JobStatus::Completed | JobStatus::Failed)
             && durable_status.get(&j.id) == Some(&j.status)
         {
+            let Some(checked) = checked_schedule_job(s, j).await else {
+                continue;
+            };
+            let Some(control) = &s.control else { continue };
+            let Ok(Some((durable, revision, _))) = control.current_job_intent(j.id.0).await else {
+                continue;
+            };
+            if !checked
+                .params
+                .iter()
+                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                || checked.status != durable.status
+                || checked.control() != durable.control()
+                || !crate::control_recovery::source_intent_matches(&checked, &durable)
+                    .unwrap_or(false)
+            {
+                continue;
+            }
             // Main's durable materialization can expose PP_DONE locally
             // before complete_operation commits its Delivery. Retirement must
             // not tombstone that still-selected result in the intervening gap.
@@ -3144,22 +3184,20 @@ async fn schedule(s: &Arc<LeaderShared>) {
             }
             let committed = match &s.control {
                 Some(control) => {
-                    match control.job_revision_fences_for(&[u64::from(j.id.0)]).await {
-                        Ok(fences) => control
-                            .commit_job_delta_guarded_with_removals(
-                                &[(u64::from(j.id.0), None)],
-                                &fences,
-                                &[],
-                                Some(s.authority_identity()),
-                                &std::collections::BTreeMap::from([(
-                                    j.id.0,
-                                    crate::cancellation::RemovalMode::CompletedRetirement,
-                                )]),
-                            )
-                            .await
-                            .is_ok(),
-                        Err(_) => false,
-                    }
+                    let fences = HashMap::from([(u64::from(j.id.0), revision)]);
+                    control
+                        .commit_job_delta_guarded_with_removals(
+                            &[(u64::from(j.id.0), None)],
+                            &fences,
+                            &[],
+                            Some(s.authority_identity()),
+                            &std::collections::BTreeMap::from([(
+                                j.id.0,
+                                crate::cancellation::RemovalMode::CompletedRetirement,
+                            )]),
+                        )
+                        .await
+                        .is_ok()
                 }
                 None => false,
             };
@@ -3248,10 +3286,20 @@ async fn schedule(s: &Arc<LeaderShared>) {
     // lease and private generation.
     for job in snap.jobs.iter() {
         if job.assigned_node.is_some()
+            || source_pending.contains(&job.id)
             || split_jobs.contains(&job.id)
             || !matches!(job.status, JobStatus::Queued)
             || durable_status.get(&job.id) != Some(&JobStatus::Queued)
         {
+            continue;
+        }
+        if !download_targets.iter().any(|target| target.1 > 0) {
+            break;
+        }
+        let Some(checked) = checked_schedule_job(s, job).await else {
+            continue;
+        };
+        if checked.held() {
             continue;
         }
         download_targets.sort_by(|left, right| {
@@ -3262,12 +3310,16 @@ async fn schedule(s: &Arc<LeaderShared>) {
         let Some(slot) = download_targets.iter_mut().find(|target| target.1 > 0) else {
             break; // everyone is saturated
         };
-        slot.1 -= 1;
-        slot.2 += 1;
         let node = slot.0.clone();
-        if !slot.4 {
+        if !slot.4
+            && s.engine
+                .set_delegated(job.id, Some(node.clone()))
+                .await
+                .is_ok_and(|accepted| accepted)
+        {
+            slot.1 -= 1;
+            slot.2 += 1;
             tracing::info!(job = job.id.0, %node, "delegating job by weighted load");
-            let _ = s.engine.set_delegated(job.id, Some(node)).await;
         }
     }
 
@@ -3310,6 +3362,7 @@ async fn schedule(s: &Arc<LeaderShared>) {
 
     for job in snap.jobs.iter() {
         if !matches!(job.status, JobStatus::Completed)
+            || source_pending.contains(&job.id)
             || durable_status.get(&job.id) != Some(&JobStatus::Completed)
             || job.pp_done
             || job.assigned_node.is_some()
@@ -3319,11 +3372,27 @@ async fn schedule(s: &Arc<LeaderShared>) {
         let Some(slot) = pp_targets.iter_mut().find(|target| target.1 > 0) else {
             break;
         };
-        slot.1 -= 1;
-        slot.3 += 1;
+        let Some(checked) = checked_schedule_job(s, job).await else {
+            continue;
+        };
+        if checked.held()
+            || checked
+                .params
+                .iter()
+                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+        {
+            continue;
+        }
         let node = slot.0.clone();
-        tracing::info!(job = job.id.0, %node, "assigning post-processing");
-        let _ = s.engine.set_delegated(job.id, Some(node)).await;
+        if s.engine
+            .set_delegated(job.id, Some(node.clone()))
+            .await
+            .is_ok_and(|accepted| accepted)
+        {
+            slot.1 -= 1;
+            slot.3 += 1;
+            tracing::info!(job = job.id.0, %node, "assigning post-processing");
+        }
     }
 }
 
@@ -3384,6 +3453,294 @@ mod tests {
             torrent: None,
             stages: Vec::new(),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scheduler_progresses_verified_jobs_beside_unbound_and_terminal_fenced_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ClusterConfig {
+            cluster_id: "per-job-custody".into(),
+            node_name: "authority".into(),
+            shared_dir: temp.path().join("shared"),
+            advertise_url: "http://127.0.0.1:1".into(),
+            secret: "secret".into(),
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            pp_slots: 0,
+            lease_interval: std::time::Duration::from_millis(100),
+            takeover_after: std::time::Duration::from_secs(1),
+            worker_ttl: std::time::Duration::from_secs(30),
+            control_dir: temp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: raft.local_addr().unwrap().to_string(),
+            control_api_bind: api.local_addr().unwrap().to_string(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
+            disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
+        };
+        drop(raft);
+        drop(api);
+        let dest = temp.path().join("dest");
+        let runtime = crate::ClusterRuntime::start(
+            cfg,
+            Vec::new(),
+            Tuning {
+                min_free_disk_bytes: 0,
+                ..Default::default()
+            },
+            dest.clone(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !runtime.leader_shared.authority_ready() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let shared = &runtime.leader_shared;
+        let control = runtime.control.as_ref().unwrap();
+        let serial = shared.mutation_serial.lock().await;
+        let inventory = runtime.engine.artifacts();
+        let mut blocked = test_job(1);
+        blocked.name = "blocked".into();
+        blocked.dir_name = "blocked".into();
+        blocked.status = JobStatus::Queued;
+        inventory
+            .allocate_for_delivery(1, &dest, &dest.join("blocked"), false, false)
+            .unwrap();
+        let payload = b"actual complete bytes without expected publication length";
+        std::fs::write(dest.join("blocked/payload.bin"), payload).unwrap();
+        blocked.files.push(nzbd_types::FileEntry {
+            id: nzbd_types::FileId(1),
+            subject: "payload".into(),
+            filename: "payload.bin".into(),
+            filename_confirmed: true,
+            is_par2: false,
+            paused: false,
+            groups: Vec::new(),
+            date: None,
+            crc32: Some(crc32fast::hash(payload)),
+            finalized: true,
+            segments: vec![nzbd_types::Segment {
+                message_id: "blocked@example".into(),
+                number: 1,
+                size: payload.len() as u32,
+                state: nzbd_types::SegmentState::Done {
+                    offset: 0,
+                    len: payload.len() as u32,
+                    crc: crc32fast::hash(payload),
+                },
+            }],
+        });
+        let mut ready = test_job(2);
+        ready.status = JobStatus::Queued;
+        ready.name = "ready".into();
+        ready.dir_name = "ready".into();
+        inventory
+            .allocate_for_delivery(2, &dest, &dest.join("ready"), false, false)
+            .unwrap();
+        let mut terminal = test_job(3);
+        terminal.status = JobStatus::Failed;
+        terminal.name = "fenced-terminal".into();
+        terminal.dir_name = "fenced-terminal".into();
+        terminal.params = vec![
+            (nzbd_types::PP_DONE_PARAM.into(), "FAILURE/HEALTH".into()),
+            (
+                "*Recovery:failed-cleanup".into(),
+                "[\"missing-source\",\"missing-generation\",\"missing-operation\"]".into(),
+            ),
+        ];
+        let mut post = test_job(4);
+        post.name = "ready-post".into();
+        post.dir_name = "ready-post".into();
+        inventory
+            .allocate_for_delivery(4, &dest, &dest.join("ready-post"), false, false)
+            .unwrap();
+        let rows = vec![blocked, ready, terminal, post];
+        control
+            .commit_job_delta(
+                &rows
+                    .iter()
+                    .map(|job| (u64::from(job.id.0), Some(job.clone())))
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        runtime
+            .engine
+            .adopt_replicated_authority(rows)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let snapshot = runtime.engine.snapshot();
+            if snapshot
+                .jobs
+                .iter()
+                .find(|job| job.id == JobId(1))
+                .is_some_and(|job| {
+                    job.verification.as_ref().is_some_and(|proof| {
+                        proof.reason.as_deref() == Some("expected publication size is not recorded")
+                    })
+                })
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "real incomplete publication evidence must remain blocked: {snapshot:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(matches!(
+            runtime.engine.export_job(JobId(1)).await,
+            Err(nzbd_engine::EngineError::Lifecycle(_))
+        ));
+        let blocked_before = control.current_job_intent(1).await.unwrap().unwrap();
+        let pending = crate::source_facts::reconcile(shared).await.unwrap();
+        assert!(pending.contains(&JobId(1)));
+        for id in [2, 4] {
+            let (bound, _, _) = control.current_job_intent(id).await.unwrap().unwrap();
+            assert!(
+                bound
+                    .params
+                    .iter()
+                    .any(|(key, _)| key == crate::delivery::AUTHORITY_COPY_PARAM),
+                "ready owned source must get its real guarded custody binding"
+            );
+        }
+        assert_eq!(
+            control.current_job_intent(1).await.unwrap().unwrap().1,
+            blocked_before.1
+        );
+        assert!(!control
+            .current_job_intent(1)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .params
+            .iter()
+            .any(|(key, _)| key == crate::delivery::AUTHORITY_COPY_PARAM));
+        // The binding CAS restores the whole projection. Observe actual
+        // export readiness before this test asks for a single scheduling pass.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for id in [2, 4] {
+                loop {
+                    match runtime.engine.export_job(JobId(id)).await {
+                        Ok(Some(_)) => break,
+                        Err(nzbd_engine::EngineError::Lifecycle(reason))
+                            if reason == "job verification or writer retirement is still in progress; retry later" => {
+                                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                            }
+                        other => panic!("ready source {id} must survive binding projection: {other:?}"),
+                    }
+                }
+            }
+        }).await.expect("bound sources must become checked-export ready within five seconds");
+        drop(serial);
+        let worker = NodeRecord {
+            lifecycle_protocol: LIFECYCLE_PROTOCOL,
+            name: "worker".into(),
+            api_url: "http://worker.invalid".into(),
+            download: true,
+            post_process: true,
+            max_download_jobs: 1,
+            download_weight: 1,
+            pp_weight: 1,
+            active_download_jobs: 0,
+            disk_guard_capable: true,
+            disk_low: false,
+            disk_guard_free_bytes: None,
+            disk_guard_label: None,
+            disk_guard_path: None,
+            disk_guard_write_latched: false,
+            disk_guard_all_roots_known: true,
+            pp_slots: 1,
+            rate_bps: 0,
+            seq: 1,
+        };
+        shared
+            .layout
+            .write_json(&shared.layout.node_file("worker"), &worker)
+            .unwrap();
+        schedule(shared).await;
+        let snapshot = runtime.engine.snapshot();
+        for id in [2, 4] {
+            assert_eq!(
+                snapshot
+                    .jobs
+                    .iter()
+                    .find(|job| job.id == JobId(id))
+                    .unwrap()
+                    .assigned_node
+                    .as_deref(),
+                Some("worker")
+            );
+        }
+        for id in [1, 3] {
+            assert!(snapshot
+                .jobs
+                .iter()
+                .find(|job| job.id == JobId(id))
+                .unwrap()
+                .assigned_node
+                .is_none());
+            assert!(matches!(
+                runtime.engine.export_job(JobId(id)).await,
+                Err(nzbd_engine::EngineError::Lifecycle(_))
+            ));
+            assert!(
+                control.current_job_intent(id).await.unwrap().is_some(),
+                "metadata-only terminal stamp cannot authorize a tombstone"
+            );
+        }
+        assert_eq!(
+            std::fs::read(dest.join("blocked/payload.bin")).unwrap(),
+            payload
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(SECRET_HEADER, "secret".parse().unwrap());
+        let response = work_poll(
+            State(shared.clone()),
+            headers,
+            Json(PollRequest {
+                lifecycle_protocol: LIFECYCLE_PROTOCOL,
+                node: "worker".into(),
+                owner_incarnation: "worker-boot".into(),
+                storage_instance_id: "worker-storage".into(),
+                start_ordering: 1,
+                free_download_slots: 1,
+                free_pp_slots: 1,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: PollResponse = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), MAX_RPC_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response.grants.len(), 1);
+        assert_eq!(response.grants[0].job.id, JobId(4));
+        assert_eq!(response.grants[0].kind, LeaseKind::Post);
+        assert!(control
+            .current_lease("work/job/1/download")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(runtime.shutdown().await);
     }
 
     #[test]

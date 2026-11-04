@@ -60,6 +60,7 @@ the full failure roster, including failures outside the original pipeline.
 | A hold fixture cancels its own unfinished import recovery | Await the verified imported input before installing the hold; retain the later custody-probe expiry injection and all refusal/source assertions. |
 | Direct archive fixture lacks source custody during terminal commit | Hold a real processing attempt across extraction and commit, join its workers, then release custody before salvage assertions. |
 | A mailbox barrier can run before the manager's startup scan | Signal the real skipped scan through the fixture gate, then drain it through the mailbox. Retry only explicit NotReady within the original budget while proving no attempt, stamp, history or journal mutation occurred. |
+| Source reconciliation blocks all scheduling on unrelated queue verification | Query only durable candidate IDs without an existing source binding/stamp. Each new binding still needs checked export, current intent and guarded CAS. Busy candidates remain ineligible; assignments require checked readiness and consume capacity only after actual actor acceptance. |
 
 Engine fixtures must await only the explicit export-busy condition, use real
 inventory paths and worker contexts, and bound event receives. A payload
@@ -104,6 +105,14 @@ snapshot cannot acknowledge a newer in-memory revision. Exact duplicate
 readback handles a lost acknowledgement; a conflicting/newer durable row or a
 stale issuer refuses the command. Expired holders are removed from pending
 targets before promotion so a later handoff cannot wait forever for their ACK.
+Source reconciliation no longer exports every bound row just to discover that
+its source fact already exists. Candidate IDs are routing metadata; they grant
+no payload authority. Known recovering candidates remain pending for that
+scheduling pass, and every new binding and actual grant retains checked
+export. Terminal retirement requires a checked row matching durable source,
+control, status and stamp, its exact inspected revision, and the existing
+selected-Delivery guard. Whole-queue re-verification during authority projection
+replacement remains a separate optimization; this correction reuses no proof.
 See the [independent I/O audit](IO_EFFICIENCY_AUDIT.md) for remaining cost
 investigations; those follow-ups are outside this qualification fix.
 
