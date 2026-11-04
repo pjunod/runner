@@ -2,15 +2,17 @@
 use crate::control::ControlStore;
 use hiqlite::{params, Row};
 use nzbd_types::{Job, JobStatus};
+use std::collections::{HashMap, HashSet};
 
 /// Progress is not operator intent. Keep file identities/pauses/source params,
 /// while allowing validated segment completion and measured timing to advance.
 pub(crate) fn business_intent(job: &Job) -> Result<Vec<u8>, String> {
-    let mut params = job
-        .params
-        .iter()
-        .filter(|(key, _)| {
-            key != nzbd_types::CONTROL_PARAM
+    serialize_business_intent(job, business_params(job).collect())
+}
+
+fn business_params(job: &Job) -> impl Iterator<Item = &(String, String)> {
+    job.params.iter().filter(|(key, _)| {
+        key != nzbd_types::CONTROL_PARAM
                 // Verified file proof/generation belongs to the observing
                 // node's recovery lane, not operator or source intent. The
                 // exact file descriptor and custody checks remain below.
@@ -24,8 +26,13 @@ pub(crate) fn business_intent(job: &Job) -> Result<Vec<u8>, String> {
                         | "*Runner:LifecycleTiming"
                         | "*Recovery:journal-loading"
                 )
-        })
-        .collect::<Vec<_>>();
+    })
+}
+
+fn serialize_business_intent(
+    job: &Job,
+    mut params: Vec<&(String, String)>,
+) -> Result<Vec<u8>, String> {
     params.sort();
     let files = job
         .files
@@ -68,26 +75,28 @@ pub(crate) fn business_intent(job: &Job) -> Result<Vec<u8>, String> {
 /// exists in replicated intent. This enrichment is recovery evidence, not a
 /// new operator edit. An existing durable length must still match exactly.
 pub(crate) fn source_intent_matches(local: &Job, durable: &Job) -> Result<bool, String> {
-    let mut comparable = local.clone();
-    comparable.params.retain(|(key, value)| {
-        let learned_size = key
-            .strip_prefix("*File:size:")
-            .and_then(|id| id.parse::<u32>().ok())
-            .is_some_and(|id| {
-                key == &format!("*File:size:{id}")
-                    && local.files.iter().any(|file| file.id.0 == id)
-                    && value.parse::<u64>().is_ok_and(|size| size > 0)
-                    && local
-                        .params
-                        .iter()
-                        .filter(|(existing, _)| existing == key)
-                        .count()
-                        == 1
-                    && !durable.params.iter().any(|(existing, _)| existing == key)
-            });
-        !learned_size
-    });
-    Ok(business_intent(&comparable)? == business_intent(durable)?)
+    let file_ids: HashSet<_> = local.files.iter().map(|file| file.id.0).collect();
+    let durable_keys: HashSet<_> = durable.params.iter().map(|(key, _)| key.as_str()).collect();
+    let mut local_key_counts = HashMap::new();
+    for (key, _) in &local.params {
+        *local_key_counts.entry(key.as_str()).or_insert(0_usize) += 1;
+    }
+    let params = business_params(local)
+        .filter(|(key, value)| {
+            let learned_size = key
+                .strip_prefix("*File:size:")
+                .and_then(|id| id.parse::<u32>().ok())
+                .is_some_and(|id| {
+                    key == &format!("*File:size:{id}")
+                        && file_ids.contains(&id)
+                        && value.parse::<u64>().is_ok_and(|size| size > 0)
+                        && local_key_counts.get(key.as_str()) == Some(&1)
+                        && !durable_keys.contains(key.as_str())
+                });
+            !learned_size
+        })
+        .collect();
+    Ok(serialize_business_intent(local, params)? == business_intent(durable)?)
 }
 
 pub(crate) fn grant_intent_matches(local: &Job, durable: &Job) -> Result<bool, String> {

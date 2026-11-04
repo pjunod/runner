@@ -3273,6 +3273,8 @@ mod tests {
             paused: false,
             groups: Vec::new(),
             date: None,
+            crc32: None,
+            finalized: false,
             segments: vec![nzbd_types::Segment {
                 message_id: "payload@example".into(),
                 number: 1,
