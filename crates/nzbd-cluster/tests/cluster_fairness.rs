@@ -248,8 +248,9 @@ async fn wait_for(mut condition: impl FnMut() -> bool, description: &str) {
 async fn mixed_worker_grants_post_while_fast_downloads_keep_slots_and_backlog_available() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "nzbd_cluster=info,nzbd_engine=warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "nzbd_cluster=info,nzbd_cluster::leader=debug,nzbd_engine=warn".into()
+            }),
         )
         .with_test_writer()
         .try_init();
