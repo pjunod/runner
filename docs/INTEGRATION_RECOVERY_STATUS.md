@@ -181,7 +181,11 @@ The URL retry persistence fixture also compared its stored deadline with a
 new wall-clock reading after the write. Crossing a second could falsely move
 its expected minimum forward. Capture each scheduling start before the write;
 retain the same 30/60-second floors, deterministic jitter bounds, persistence
-and checksum-corruption assertions. No retry policy or clock behavior changes.
+and checksum-corruption assertions. The torrent staging-cleanup fixture uses
+the same before/after clock bounds for its existing 30/60/120/300-second retry
+floors and jitter maxima. The matching retention-reset and writer-error retry
+fixtures also measure their deadlines around the actual scheduling call,
+preserving their original durations. No retry policy or clock behavior changes.
 
 The hold-probe timeout fixture counted 100 async yields after releasing a
 blocking-thread barrier. That did not acknowledge the original thread's lease

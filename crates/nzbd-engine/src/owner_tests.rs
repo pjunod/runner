@@ -2989,6 +2989,7 @@ async fn storage_errno_writer_error_schedules_itself() {
         .starts_with("Automatic retry 1"));
 
     // Still broken: held again, one step further out, same outage start.
+    let retry_started = unix_now();
     assert!(owner.hold_job(
         JobId(1),
         HoldCause::StorageUnavailable,
@@ -2998,7 +2999,7 @@ async fn storage_errno_writer_error_schedules_itself() {
     pump(&mut owner, &mut messages).await;
     let again = owner.state.jobs[0].control().unwrap();
     assert_eq!(again.retry_attempt, 2);
-    assert!(again.next_retry_at_unix.unwrap() >= unix_now() + 59);
+    assert!(again.next_retry_at_unix.unwrap() >= retry_started + 60);
     assert_eq!(again.blocked_since_unix, held.blocked_since_unix);
 
     // A refusal pushes it out again and says why.

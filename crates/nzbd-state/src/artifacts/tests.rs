@@ -1658,7 +1658,9 @@ fn wall_clock_alone_never_expires_a_payload_and_keep_resets_elapsed_time() {
     let a = db.get(&a.id).unwrap();
     assert_eq!(a.eligible_seconds, 50);
     let kept = db.retention(&a.id, a.revision, true, None).unwrap();
+    let release_started = now();
     let released = db.retention(&a.id, kept.revision, false, None).unwrap();
+    let release_finished = now();
     db.clocks.lock().unwrap().insert(
         a.id.clone(),
         (a.revision, Instant::now() - Duration::from_secs(500)),
@@ -1669,7 +1671,7 @@ fn wall_clock_alone_never_expires_a_payload_and_keep_resets_elapsed_time() {
         0,
         "old checkpoint cannot count held time"
     );
-    assert!(released.deadline.unwrap() >= now() + 99);
+    assert!((release_started + 100..=release_finished + 100).contains(&released.deadline.unwrap()));
 }
 #[test]
 fn restore_quarantines_pending_deletion_and_retention() {
@@ -1821,11 +1823,13 @@ fn retention_preview_is_atomic_and_never_shortens_elapsed_eligibility() {
     assert_eq!(db.get(&a.id).unwrap().retention_seconds, 7 * 86400);
     db.retention(&a.id, kept.revision, false, None).unwrap();
     let p = db.preview_retention(1).unwrap();
+    let apply_started = now();
     db.apply_retention(&p.id).unwrap();
+    let apply_finished = now();
     let a = db.get(&a.id).unwrap();
     assert_eq!(a.retention_seconds, 86400);
     assert_eq!(a.eligible_seconds, 0);
-    assert!(a.deadline.unwrap() >= now() + 86399);
+    assert!((apply_started + 86400..=apply_finished + 86400).contains(&a.deadline.unwrap()));
 }
 #[test]
 fn relocation_refuses_existing_destination_and_commits_identity_after_rename() {
