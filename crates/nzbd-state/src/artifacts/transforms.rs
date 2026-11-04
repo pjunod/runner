@@ -231,6 +231,12 @@ impl Inventory {
                 || matches!(scratch.state.as_str(), "deleting" | "delete_failed")
                 || pending
                 || op.state == "failed"
+                // A completed repair is immutable publication evidence. A
+                // restarted pipeline may need to verify/repair this set again,
+                // but cannot append attempts to that successful operation.
+                || (op.kind == "par_repair"
+                    && op.state == "succeeded"
+                    && workspace.published_files.is_some())
             {
                 key = format!("{logical_key}-{}", id(&self.db.lock().unwrap())?);
             } else {
@@ -2091,6 +2097,55 @@ mod tests {
         assert_eq!(
             std::fs::read(reused.scratch.path.join("repaired.bin")).unwrap(),
             b"verified output"
+        );
+    }
+
+    #[test]
+    fn restarting_completed_repair_preserves_proof_and_allocates_fresh_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("downloads");
+        std::fs::create_dir(&root).unwrap();
+        let state = temp.path().join("state");
+        let inventory = Inventory::open(&state).unwrap();
+        let source = root.join("job");
+        inventory.allocate(5, &root, &source).unwrap();
+        std::fs::write(source.join("episode.mkv"), b"verified repaired media").unwrap();
+        let mut first = inventory.workspace(5, "par_repair", "abc").unwrap();
+        let attempt = inventory.begin_workspace_attempt(&mut first).unwrap();
+        std::fs::write(attempt.join("proof-input"), b"retained scratch").unwrap();
+        inventory
+            .finish_repair_workspace(&first, &["episode.mkv".into()])
+            .unwrap();
+        let completed = inventory.operation(&first.operation_id).unwrap();
+        drop(inventory);
+
+        let inventory = Inventory::open(&state).unwrap();
+        inventory.reconcile_startup(&[5]).unwrap();
+        inventory.validate_post_retry(5).unwrap();
+        let mut retry = inventory.workspace(5, "par_repair", "abc").unwrap();
+        let retry_attempt = inventory.begin_workspace_attempt(&mut retry).unwrap();
+        assert_ne!(first.operation_id, retry.operation_id);
+        assert_ne!(attempt, retry_attempt);
+        assert_eq!(
+            std::fs::read(attempt.join("proof-input")).unwrap(),
+            b"retained scratch"
+        );
+        assert_eq!(
+            inventory.operation(&first.operation_id).unwrap().request,
+            completed.request
+        );
+        assert_eq!(
+            inventory.operation(&first.operation_id).unwrap().state,
+            "succeeded"
+        );
+        let (_, verified) = inventory.verified_transform_evidence(5).unwrap();
+        assert!(verified.contains("episode.mkv"));
+        assert_eq!(
+            inventory
+                .workspace(5, "par_repair", "abc")
+                .unwrap()
+                .operation_id,
+            retry.operation_id
         );
     }
 

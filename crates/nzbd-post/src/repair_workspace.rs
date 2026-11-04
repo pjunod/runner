@@ -651,6 +651,15 @@ mod tests {
             VerifyResult::Intact
         );
         assert_eq!(std::fs::read(&payload).unwrap(), bytes);
+        // Restart all stages after the repair already published its output.
+        // The old successful journal must not prevent a fresh tool attempt.
+        assert_eq!(
+            repair(&inventory, 4, &set, &tool, &[], &mut restored)
+                .await
+                .unwrap(),
+            VerifyResult::Intact
+        );
+        assert_eq!(std::fs::read(&payload).unwrap(), bytes);
         assert!(
             set.par_paths.iter().all(|p| p.exists()),
             "sources keep their original PAR names"
