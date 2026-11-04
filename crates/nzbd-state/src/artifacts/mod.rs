@@ -30,6 +30,7 @@ mod transforms;
 mod url_resolutions;
 mod worker_controls;
 mod worker_stops;
+pub mod writer_naming;
 pub use url_resolutions::{
     url_source_identity, url_storage_retry_deadline, UrlFileReservation, UrlResolutionFault,
     UrlResolutionRecord, UrlResolutionStore, UrlStorageRetry,
@@ -358,6 +359,9 @@ pub struct ListPage {
 }
 
 pub struct Inventory {
+    writer_naming: Mutex<std::collections::VecDeque<writer_naming::NamingEvidence>>,
+    naming_leases: Mutex<std::collections::HashMap<(u32, u32), writer_naming::NamingLease>>,
+    retired_naming: Mutex<Vec<writer_naming::ProducerRead>>,
     db: Mutex<Connection>,
     allocation_uses: Mutex<std::collections::HashSet<u32>>,
     reconciliation_uses: Mutex<std::collections::HashSet<(String, String)>>,
@@ -765,6 +769,9 @@ impl Inventory {
         fs::sync_directory(&fs::open_dir(state_dir)?)?;
         let worker_session = id(&db)?;
         Ok(Self {
+            writer_naming: Mutex::new(std::collections::VecDeque::new()),
+            naming_leases: Mutex::new(std::collections::HashMap::new()),
+            retired_naming: Mutex::new(Vec::new()),
             db: Mutex::new(db),
             allocation_uses: Mutex::new(std::collections::HashSet::new()),
             reconciliation_uses: Mutex::new(std::collections::HashSet::new()),
@@ -812,8 +819,13 @@ impl Inventory {
     /// Called only after the engine's writers and maintenance tasks finish.
     /// Old API handles retain read access but cannot mutate a restarted daemon.
     pub fn close(&self) -> Result<()> {
-        let _guard = self.mutation.lock().unwrap();
-        if !self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        let first_close = {
+            let _guard = self.mutation.lock().unwrap();
+            !self.closed.swap(true, std::sync::atomic::Ordering::AcqRel)
+        };
+        self.invalidate_all_writer_naming();
+        self.drain_writer_naming();
+        if first_close {
             self._process_lock.unlock()?;
         }
         Ok(())
@@ -2477,6 +2489,7 @@ impl Inventory {
         save_operation(&tx, &op)?;
         event(&tx, key, "delete_requested", request_id)?;
         tx.commit()?;
+        self.invalidate_source_writer_naming(&a.id, &a.generation);
         Ok(op)
     }
     pub fn cancel_delete(&self, key: &str) -> Result<Operation> {
@@ -2782,6 +2795,7 @@ impl Inventory {
     /// deletions. Normal ownership, generation and payload deletion checks stay
     /// in the inventory journal, independent of history retention.
     pub fn tick_with_history(&self, history: Option<&crate::history::HistoryDb>) -> Result<()> {
+        self.drain_writer_naming();
         let enabled = self.settings()?.enabled;
         let mut due = Vec::new();
         {

@@ -5545,6 +5545,7 @@ impl Owner {
             return false;
         };
         let record = self.state.jobs.remove(index);
+        self.artifacts.invalidate_writer_naming(job.0);
         if self.post_rollbacks.remove(&job).is_some() {
             self.record_transitions.remove(&job);
             self.pending_control_commits.remove(&job);
@@ -6001,6 +6002,13 @@ impl Owner {
                 .is_some_and(transitions::failed_cleanup_only)
             || self.verification.contains_key(&job)
         {
+            if let WriterFact::Finalized {
+                naming: Some(naming),
+                ..
+            } = fact
+            {
+                self.artifacts.discard_writer_naming(*naming);
+            }
             return;
         }
         match fact {
@@ -6132,12 +6140,17 @@ impl Owner {
                 final_path,
                 combined_crc,
                 identity,
+                naming,
             } => {
                 if !ok {
+                    if let Some(naming) = naming {
+                        self.artifacts.discard_writer_naming(*naming);
+                    }
                     self.on_writer_finalized(job, file, false, final_path, combined_crc);
                     return;
                 }
                 let proof_key = format!("*File:proof:{}", file.0);
+                let naming_allocation = self.allocation_cache.get(&job).cloned();
                 if let Some(record) = self.state.job_mut(job) {
                     if let Some(identity) = identity {
                         if let Some((_, raw)) =
@@ -6165,11 +6178,30 @@ impl Owner {
                     if owner.writer_epochs.get(&file) != Some(&generation)
                         || owner.state.job(job).is_none()
                     {
+                        if let Some(naming) = naming {
+                            owner.artifacts.discard_writer_naming(*naming);
+                        }
                         return;
                     }
                     if committed {
+                        if let Some(naming) = naming {
+                            if let Some(allocation) = naming_allocation {
+                                owner.artifacts.remember_writer_naming(
+                                    job.0,
+                                    file.0,
+                                    generation,
+                                    &allocation,
+                                    *naming,
+                                );
+                            } else {
+                                owner.artifacts.discard_writer_naming(*naming);
+                            }
+                        }
                         owner.on_writer_finalized(job, file, true, final_path, combined_crc);
                     } else {
+                        if let Some(naming) = naming {
+                            owner.artifacts.discard_writer_naming(*naming);
+                        }
                         if let Some(entry) = owner.state.file_mut(job, file) {
                             entry.finalized = false;
                         }
@@ -7748,6 +7780,7 @@ impl Owner {
         }
         self.writers.remove(&file);
         self.writer_epochs.remove(&file);
+        self.artifacts.invalidate_writer_naming_file(job.0, file.0);
         if let Err(error) = self.ensure_allocation(job, false) {
             tracing::warn!(job=job.0,%error,"writer allocation unavailable");
             return closed();
@@ -7761,6 +7794,7 @@ impl Owner {
         let Some(entry) = record.files.iter().find(|entry| entry.id == file) else {
             return closed();
         };
+        let collect_naming = !entry.is_par2 && record.files.iter().any(|file| file.is_par2);
         let proven = entry
             .segments
             .iter()
@@ -7850,6 +7884,10 @@ impl Owner {
                 generation,
                 proven,
                 expected_identity,
+                collect_naming,
+                naming_inventory: collect_naming.then(|| owner.artifacts.clone()),
+                #[cfg(test)]
+                naming_test_hook: None,
             };
             let writer = spawn_writer_scoped(
                 &owner.tracker,

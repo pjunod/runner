@@ -1252,6 +1252,7 @@ impl Owner {
             self.writers.remove(&file.id);
         }
         let old_allocation = self.allocation_cache.remove(&job);
+        self.artifacts.invalidate_writer_naming(job.0);
         if preserve_publication {
             if let Some(allocation) = old_allocation.as_ref() {
                 self.allocation_cache.insert(job, allocation.clone());
@@ -1420,6 +1421,7 @@ impl Owner {
             return;
         }
         let previous_speed = self.state.speed_limit_bps;
+        self.artifacts.invalidate_all_writer_naming();
         let speed_revision = adopted_speed
             .filter(|(revision, _)| *revision == self.speed_limit_revision)
             .map(|(revision, speed)| {
