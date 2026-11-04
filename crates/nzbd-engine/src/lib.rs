@@ -2851,12 +2851,15 @@ mod hold_probe_tests {
         tokio::task::spawn_blocking(move || gate.wait())
             .await
             .unwrap();
-        for _ in 0..100 {
-            if probes.lock().unwrap().is_empty() {
-                break;
+        // The barrier partner can return before the original blocking task
+        // drops its lease. Await that actual release, not a count of yields.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !probes.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("finished blocking probe must release its singleflight lease");
         assert!(timeout.is_err());
         assert!(second.unwrap_err().contains("previous probe"));
         assert!(probes.lock().unwrap().is_empty());

@@ -183,6 +183,12 @@ its expected minimum forward. Capture each scheduling start before the write;
 retain the same 30/60-second floors, deterministic jitter bounds, persistence
 and checksum-corruption assertions. No retry policy or clock behavior changes.
 
+The hold-probe timeout fixture counted 100 async yields after releasing a
+blocking-thread barrier. That did not acknowledge the original thread's lease
+drop. It now waits at most two seconds for actual singleflight removal,
+preserving the original probe timeout, duplicate refusal and fresh-probe
+assertions. The production probe and its lease lifetime remain unchanged.
+
 ## Deployment — qualify the exact revision on nuc3
 
 The actual service checkout is `/opt/noirr/runner`; the media inventory's
