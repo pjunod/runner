@@ -467,6 +467,7 @@ impl Inventory {
             ) {
                 Ok(true) => None,
                 Ok(false) => Some("source retirement remains pending".to_string()),
+                Err(Error::CleanupBlocked(reason)) => Some(reason),
                 Err(Error::Conflict(reason))
                     if reason.starts_with("blocked:")
                         || reason.starts_with(

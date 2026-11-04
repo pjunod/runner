@@ -343,6 +343,21 @@ impl ControlStore {
         // mutation: a minority can retain a stale leader view after losing
         // its peers. Force a linearizable quorum round trip so callers fail
         // closed until a majority has acknowledged the current term.
+        let Ok(metrics) = self.client.metrics_db().await else {
+            return false;
+        };
+        // A learner can forward a successful quorum read before joining the
+        // fixed voter set. That is not evidence this voter can survive a peer
+        // loss; wait for its own committed membership before advertising ready.
+        if metrics.running_state.is_err()
+            || metrics.state.is_learner()
+            || !metrics
+                .membership_config
+                .voter_ids()
+                .any(|id| id == metrics.id)
+        {
+            return false;
+        }
         tokio::time::timeout(Duration::from_secs(2), self.client.db_quorum_watermark())
             .await
             .is_ok_and(|result| result.is_ok())

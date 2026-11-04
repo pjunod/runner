@@ -253,6 +253,10 @@ pub enum EngineError {
     OwnershipLost,
     #[error("engine is shutting down")]
     Closed,
+    /// The owner may still apply an issued command after this deadline.
+    /// Callers must reconcile mutations rather than assume they were cancelled.
+    #[error("engine request timed out while {0}")]
+    Timeout(&'static str),
 }
 
 /// Behavioral knobs, defaulting to NZBGet's values (ARCHITECTURE.md §3.3).
@@ -770,7 +774,7 @@ impl EngineHandle {
         let (reply, rx) = oneshot::channel();
         self.send(QueueCommand::BeginPostAdmission { job, reply })
             .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
     /// Wait for the current lifetime's verified PP custody. Queue changes
     /// wake retries; cancellation never drops an issued admission request.
@@ -814,7 +818,7 @@ impl EngineHandle {
     pub async fn recovery_document(&self) -> Result<nzbd_state::QueueSnapshotDoc, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send(QueueCommand::RecoveryDocument { reply }).await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
     pub async fn remove_orphan_torrent_source(&self, job: JobId) -> Result<bool, EngineError> {
         self.roundtrip_bool(|reply| QueueCommand::RemoveOrphanTorrentSource { job, reply })
@@ -886,10 +890,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        owner_reply(rx)
-            .await
-            .map_err(|_| EngineError::Closed)?
-            .map_err(EngineError::State)
+        owner_reply(rx).await?.map_err(EngineError::State)
     }
 
     pub async fn commit_torrent_admission(
@@ -988,10 +989,7 @@ impl EngineHandle {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::CancelTorrentAdmission { job, reply: tx })
             .await?;
-        owner_reply(rx)
-            .await
-            .map_err(|_| EngineError::Closed)?
-            .map_err(EngineError::State)
+        owner_reply(rx).await?.map_err(EngineError::State)
     }
     /// Parse and enqueue an NZB. Parsing happens on the caller's task so a
     /// large or hostile NZB never stalls the queue owner.
@@ -1078,7 +1076,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
 
     /// Background NZB download for a URL job. Shutdown-aware: an in-flight
@@ -1503,10 +1501,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        owner_reply(rx)
-            .await
-            .map_err(|_| EngineError::Closed)?
-            .map_err(EngineError::State)
+        owner_reply(rx).await?.map_err(EngineError::State)
     }
 
     pub async fn pause_job(&self, job: JobId) -> Result<bool, EngineError> {
@@ -1695,7 +1690,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
 
     /// Capacity/quota release: the owner's probe backoff, then an admission
@@ -2041,7 +2036,7 @@ impl EngineHandle {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::SetMaxActiveDownloads { n, reply: tx })
             .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
 
     // -- cluster operations (used by nzbd-cluster; harmless elsewhere) ------
@@ -2390,7 +2385,7 @@ impl EngineHandle {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::SetServerConnectionCaps { caps, reply: tx })
             .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
 
     /// Become the queue authority (cluster leader took office).
@@ -2398,10 +2393,7 @@ impl EngineHandle {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::AdoptAuthority { reply: tx })
             .await?;
-        owner_reply(rx)
-            .await
-            .map_err(|_| EngineError::Closed)?
-            .map_err(EngineError::State)
+        owner_reply(rx).await?.map_err(EngineError::State)
     }
 
     pub async fn adopt_replicated_authority(
@@ -2436,7 +2428,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
 
     /// Persist an automatic retry schedule only while the observed hold still owns this job.
@@ -2555,7 +2547,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
 
     /// Lock-free snapshot of the queue (never blocks the engine).
@@ -2626,7 +2618,7 @@ impl EngineHandle {
             self.cmd_tx.send(self.command_message(cmd)),
         )
         .await
-        .map_err(|_| EngineError::Closed)?
+        .map_err(|_| EngineError::Timeout("waiting to enqueue a command"))?
         .map_err(|_| EngineError::Closed)
     }
 
@@ -2636,7 +2628,7 @@ impl EngineHandle {
     ) -> Result<bool, EngineError> {
         let (tx, rx) = oneshot::channel();
         self.send(make(tx)).await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
 
     async fn roundtrip_unit(
@@ -2645,7 +2637,7 @@ impl EngineHandle {
     ) -> Result<(), EngineError> {
         let (tx, rx) = oneshot::channel();
         self.send(make(tx)).await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
 }
 
@@ -2654,7 +2646,7 @@ impl EngineHandle {
 async fn owner_reply<T>(reply: oneshot::Receiver<T>) -> Result<T, EngineError> {
     tokio::time::timeout(Duration::from_secs(10), reply)
         .await
-        .map_err(|_| EngineError::Closed)?
+        .map_err(|_| EngineError::Timeout("waiting for the owner reply"))?
         .map_err(|_| EngineError::Closed)
 }
 
@@ -2695,6 +2687,73 @@ fn validate_torrent_tags(tags: &[String]) -> Result<(), EngineError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod owner_deadline_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn owner_reply_distinguishes_timeout_from_closed_channel() {
+        let (reply, rx) = oneshot::channel::<bool>();
+        let error = owner_reply(rx).await.unwrap_err();
+        assert!(matches!(error, EngineError::Timeout(_)));
+        assert!(error.to_string().contains("timed out"));
+        assert!(!error.to_string().contains("shutting down"));
+        assert!(
+            reply.send(true).is_err(),
+            "a late reply is not an acknowledgement"
+        );
+
+        let (reply, rx) = oneshot::channel::<bool>();
+        drop(reply);
+        assert!(matches!(owner_reply(rx).await, Err(EngineError::Closed)));
+
+        let (reply, rx) = oneshot::channel();
+        reply.send(true).unwrap();
+        assert!(owner_reply(rx).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn public_requests_preserve_enqueue_and_reply_deadlines() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut handle = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            temp.path().join("state"),
+            temp.path().join("dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        assert!(handle.shutdown().await);
+        tokio::time::pause();
+        for full in [false, true] {
+            let (sender, receiver) = mpsc::channel(1);
+            handle.cmd_tx = sender;
+            if full {
+                let (reply, _rx) = oneshot::channel();
+                assert!(handle
+                    .cmd_tx
+                    .send(handle.command_message(QueueCommand::ExportJob {
+                        job: JobId(1),
+                        reply,
+                    }))
+                    .await
+                    .is_ok());
+            }
+            let error = handle.adopt_authority().await.unwrap_err();
+            assert!(matches!(error, EngineError::Timeout(_)), "{error}");
+            assert!(error
+                .to_string()
+                .contains(if full { "enqueue" } else { "owner reply" }));
+            drop(receiver);
+            assert!(matches!(
+                handle.adopt_authority().await,
+                Err(EngineError::Closed)
+            ));
+        }
+    }
 }
 
 #[cfg(test)]

@@ -437,7 +437,19 @@ pub(crate) async fn projection(shared: &crate::leader::LeaderShared) -> Result<V
         .control
         .as_ref()
         .ok_or("replicated control unavailable")?;
-    let local = shared.engine_projection().await?;
+    // Adoption needs only the actor-stamped control metadata. Payload export
+    // is deliberately fenced during recovery; requiring it here can restart
+    // adoption on every pass and starve the pending recovery work.
+    // Source authority is still checked by reconcile/source_valid before CAS.
+    let local = shared
+        .engine
+        .recovery_document()
+        .await
+        .map_err(|error| format!("read control projection metadata: {error}"))?
+        .jobs
+        .into_iter()
+        .map(|job| (u64::from(job.id.0), job))
+        .collect::<std::collections::HashMap<_, _>>();
     let mut jobs = Vec::new();
     for (mut durable, _, _) in control.load_jobs().await? {
         if let Some(current) = local.get(&u64::from(durable.id.0)) {

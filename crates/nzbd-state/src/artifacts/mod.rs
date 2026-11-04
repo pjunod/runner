@@ -70,6 +70,10 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    CleanupBlocked(String),
+    #[error("{reason}")]
+    CleanupRetry { next_retry: i64, reason: String },
     #[error("artifact not found")]
     NotFound,
 }
@@ -716,6 +720,9 @@ impl Inventory {
             "UPDATE deliveries SET cleanup_status='retry',cleanup_error='previous cleanup worker interrupted',cleanup_next_retry_at=unixepoch() WHERE cleanup_status='running'",
             [],
         )?;
+        // Only this process holds the inventory lock. Recover abandoned
+        // non-Delivery claims through the same serialized journal format.
+        interrupted.execute("UPDATE operations SET data=json_set(data,'$.request',(json_set(json_extract(data,'$.request'),'$.cleanup.state','retry','$.cleanup.next_retry',0) || '')) WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.cleanup.state')='running'", [])?;
         interrupted.commit()?;
         let schema: String =
             db.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| {
@@ -1963,6 +1970,9 @@ impl Inventory {
                 "fresh retention period"
             },
         )?;
+        if !keep {
+            Self::wake_relocation_cleanup(&tx, &a.id, &a.generation)?;
+        }
         tx.commit()?;
         Ok(a)
     }
@@ -2160,6 +2170,9 @@ impl Inventory {
             }
             save_artifact(&tx, &artifact)?;
             if !keep {
+                if !existing_only {
+                    Self::wake_relocation_cleanup(&tx, &artifact.id, &artifact.generation)?;
+                }
                 // Read the mutable cleanup columns directly. The serialized
                 // Delivery is the immutable receipt snapshot and may lag a
                 // worker's latest cleanup status.
@@ -2238,6 +2251,7 @@ impl Inventory {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         save_artifact(&tx, &artifact)?;
+        Self::wake_relocation_cleanup(&tx, &artifact.id, &artifact.generation)?;
         event(&tx, artifact_id, "failure_assessment", disposition)?;
         tx.commit()?;
         Ok(artifact)
@@ -2282,6 +2296,7 @@ impl Inventory {
         a.deadline = Some(now().saturating_add(a.retention_seconds as i64));
         a.revision += 1;
         save_artifact(&self.db.lock().unwrap(), &a)?;
+        Self::wake_relocation_cleanup(&self.db.lock().unwrap(), &a.id, &a.generation)?;
         Ok(a)
     }
 
@@ -2581,16 +2596,15 @@ impl Inventory {
             save_operation(&self.db.lock().unwrap(), &op)?;
             return Ok(op);
         }
-        if (self.artifact_in_use(&a)? && !self.authorized_processing_use(&a, use_guard))
-            || (a.keep && !explicit_cancellation)
-            || a.hold.is_some()
-            || !a.owned
-        {
+        if self.artifact_in_use(&a)? && !self.authorized_processing_use(&a, use_guard) {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+        }
+        if (a.keep && !explicit_cancellation) || a.hold.is_some() || !a.owned {
             return Err(Error::Conflict("payload acquired a hold".into()));
         }
         _lease = self
             .reserve_reconciliation_locked(std::slice::from_ref(&a), use_guard, &guard)?
-            .ok_or_else(|| Error::Conflict("deletion custody is already active".into()))?;
+            .ok_or_else(|| Error::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)))?;
         op.state = "running".into();
         op.attempts += 1;
         a.state = "deleting".into();

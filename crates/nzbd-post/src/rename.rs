@@ -57,10 +57,19 @@ fn files_of(dir: &Path) -> Vec<PathBuf> {
 }
 
 pub(crate) fn full_md5(path: &Path) -> Option<[u8; 16]> {
+    read_content_digests(path, false).map(|(md5, _)| md5)
+}
+
+fn read_content_digests(
+    path: &Path,
+    capture_sha: bool,
+) -> Option<([u8; 16], nzbd_state::fileops::ContentProof)> {
     let mut file = nzbd_state::fileops::open(path).ok()?;
     let before = crate::fingerprint::FileStamp::of(&file.metadata().ok()?);
+    let identity = nzbd_state::fileops::identity(&file).ok()?;
     let mut read_bytes = 0;
     let mut digest = Md5::new();
+    let mut sha256 = sha2::Sha256::new();
     let mut buf = [0; 65536];
     loop {
         crate::attempt::checkpoint().ok()?;
@@ -71,6 +80,9 @@ pub(crate) fn full_md5(path: &Path) -> Option<[u8; 16]> {
         }
         read_bytes += n as u64;
         digest.update(&buf[..n]);
+        if capture_sha {
+            sha256.update(&buf[..n]);
+        }
     }
     if read_bytes != before.length
         || crate::fingerprint::FileStamp::of(&file.metadata().ok()?) != before
@@ -78,7 +90,16 @@ pub(crate) fn full_md5(path: &Path) -> Option<[u8; 16]> {
     {
         return None;
     }
-    Some(digest.finalize().into())
+    if nzbd_state::fileops::identity(&file).ok()? != identity {
+        return None;
+    }
+    Some((
+        digest.finalize().into(),
+        nzbd_state::fileops::ContentProof {
+            identity,
+            sha256: format!("{:x}", sha256.finalize()),
+        },
+    ))
 }
 
 fn create_parents(root: &Path, target: &Path) -> std::io::Result<()> {
@@ -173,12 +194,14 @@ pub fn par_rename_owned(
             let Some(catalog) = wanted.get(&hash) else {
                 continue;
             };
-            let full = full_md5(&p);
+            let capture_sha =
+                custody.is_some() && catalog.iter().any(|file| set.root.join(&file.name) != p);
+            let full = read_content_digests(&p, capture_sha);
             let matches: Vec<_> = catalog
                 .iter()
                 .filter(|f| {
                     std::fs::metadata(&p).is_ok_and(|m| m.len() == f.length)
-                        && full == Some(f.md5_full)
+                        && full.as_ref().is_some_and(|(md5, _)| *md5 == f.md5_full)
                 })
                 .collect();
             if matches.len() != 1 {
@@ -195,13 +218,15 @@ pub fn par_rename_owned(
             create_parents(&set.root, target.parent().unwrap())?;
             crate::attempt::checkpoint()?;
             if let Some((inventory, job)) = custody {
-                inventory.restore_file(job, &p, &target).map_err(|e| {
-                    PostError::Subprocess(format!(
-                        "par rename {} to {}: {e}",
-                        p.display(),
-                        target.display()
-                    ))
-                })?;
+                inventory
+                    .restore_file_with_proof(job, &p, &target, &full.as_ref().unwrap().1)
+                    .map_err(|e| {
+                        PostError::Subprocess(format!(
+                            "par rename {} to {}: {e}",
+                            p.display(),
+                            target.display()
+                        ))
+                    })?;
                 renames.push((p, target));
             } else if let Some(pair) = safe_rename(&p, target)? {
                 renames.push(pair);

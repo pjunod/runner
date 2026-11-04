@@ -110,6 +110,14 @@ fn restart_refreshes_hardlink_identity_after_source_unlink() {
     drop(inventory);
 
     let reopened = Inventory::open(&temp.path().join("state")).unwrap();
+    // This injected I/O failure is a durable scheduled retry, not an actual
+    // process kill. Restart must preserve its deadline; advance it explicitly.
+    let mut operation = reopened.operation(&relocation.operation_id).unwrap();
+    let mut movement: serde_json::Value = serde_json::from_str(&operation.request).unwrap();
+    assert!(movement["cleanup"]["next_retry"].as_i64().unwrap() > now());
+    movement["cleanup"]["next_retry"] = 0.into();
+    operation.request = serde_json::to_string(&movement).unwrap();
+    save_operation(&reopened.db.lock().unwrap(), &operation).unwrap();
     reopened.reconcile_relocations().unwrap();
     let artifact = reopened.for_job(91).unwrap().unwrap();
     let observed = fs::manifest(&fs::open_dir(&target).unwrap(), 100_000).unwrap();

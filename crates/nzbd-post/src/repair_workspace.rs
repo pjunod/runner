@@ -443,16 +443,22 @@ impl RepairSession {
             }
             let output = root.join(relative);
             let expected = &outputs[&output];
-            nzbd_state::fileops::copy_publish_checked(&output, &target, &|| {
-                crate::attempt::checkpoint()?;
-                if !fingerprint::stamp(&output).is_ok_and(|stamp| &stamp == expected) {
-                    return Err(std::io::Error::other(
-                        "validated PAR output changed before publication",
-                    ));
-                }
-                Ok(())
-            })
+            if !fingerprint::stamp(&output).is_ok_and(|stamp| &stamp == expected) {
+                return Err(PostError::Subprocess(
+                    "validated PAR output changed before publication".into(),
+                ));
+            }
+            nzbd_state::fileops::copy_publish_checked(
+                &output,
+                &target,
+                &crate::attempt::checkpoint,
+            )
             .map_err(state_error)?;
+            if !fingerprint::stamp(&output).is_ok_and(|stamp| &stamp == expected) {
+                return Err(PostError::Subprocess(
+                    "validated PAR output changed during publication".into(),
+                ));
+            }
         }
         let verified_output_paths = self
             .set

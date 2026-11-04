@@ -10,6 +10,7 @@ fn digest_open(file: &mut File) -> Result<String> {
     let mut buffer = [0; 64 * 1024];
     loop {
         let n = file.read(&mut buffer)?;
+        crate::fileops::payload_read(n);
         if n == 0 {
             break;
         }
@@ -527,12 +528,19 @@ impl Inventory {
         let root = fs::open_dir(&workspace.source.path)?;
         let original = fs::open_relative(&root, relative)?;
         let original_identity = fs::identity_for_file(&original)?;
-        if original_identity != entry.identity {
+        let replay_digest = workspace.retained_digests.get(relative);
+        if original_identity != entry.identity
+            && !(replay_digest.is_some()
+                && rename_transition_matches(&entry.identity, &original_identity))
+        {
             return Err(Error::Conflict("original identity changed".into()));
         }
         // Hash through a stable descriptor before taking the global mutation
         // guard. Large media files must not block unrelated custody controls.
         let digest = digest_open(&mut original.try_clone()?)?;
+        if replay_digest.is_some_and(|expected| *expected != digest) {
+            return Err(Error::Conflict("retained original content changed".into()));
+        }
         let current = self.get(&workspace.source.id)?;
         if current.generation != workspace.source.generation
             || current.path != workspace.source.path
@@ -565,15 +573,31 @@ impl Inventory {
                 .get(relative)
                 .ok_or_else(|| Error::Conflict("retained original proof missing".into()))?;
             if rename_transition_matches(&entry.identity, &observed)
-                && digest_open(&mut old.try_clone()?)? == *expected_digest
+                && observed.same_object(&original_identity)
+                && digest == *expected_digest
             {
+                fs::rename_exclusive(
+                    &workspace.source.path.join(relative),
+                    &workspace.source.path.join(&backup),
+                )?;
+                let final_file = fs::open_relative(&root, &backup)?;
+                let final_identity = fs::identity_for_file(&final_file)?;
+                if !rename_transition_matches(&entry.identity, &final_identity)
+                    || digest_open(&mut final_file.try_clone()?)? != *expected_digest
+                    || fs::identity_for_file(&final_file)? != final_identity
+                    || crate::fileops::identity(&crate::fileops::open(
+                        &workspace.source.path.join(&backup),
+                    )?)? != final_identity
+                {
+                    return Err(Error::Conflict("retained replay content changed".into()));
+                }
                 if let Some(captured) = workspace
                     .source
                     .files
                     .iter_mut()
                     .find(|f| f.path == relative)
                 {
-                    captured.identity = observed;
+                    captured.identity = final_identity;
                 }
                 workspace.retained.insert(relative.into(), backup);
                 op.request = serde_json::to_string(workspace)?;
@@ -583,7 +607,9 @@ impl Inventory {
             return Err(Error::Conflict("retained original identity changed".into()));
         }
         workspace.retained.insert(relative.into(), backup.clone());
-        workspace.retained_digests.insert(relative.into(), digest);
+        workspace
+            .retained_digests
+            .insert(relative.into(), digest.clone());
         op.request = serde_json::to_string(workspace)?;
         self.save_transform_progress(&op, &previous, &captures)?;
         previous = op.clone();
@@ -593,7 +619,13 @@ impl Inventory {
         )?;
         let renamed = fs::open_relative(&root, &backup)?;
         let observed = fs::identity_for_file(&renamed)?;
-        if !rename_transition_matches(&entry.identity, &observed) {
+        if !rename_transition_matches(&entry.identity, &observed)
+            || digest_open(&mut renamed.try_clone()?)? != digest
+            || fs::identity_for_file(&renamed)? != observed
+            || crate::fileops::identity(&crate::fileops::open(
+                &workspace.source.path.join(&backup),
+            )?)? != observed
+        {
             return Err(Error::Conflict(
                 "retained original changed during rename".into(),
             ));
@@ -1201,6 +1233,26 @@ impl Inventory {
 impl Inventory {
     /// Journal an intact file's identity before restoring a catalog path.
     pub fn restore_file(&self, job: u32, from: &Path, to: &Path) -> Result<()> {
+        self.restore_file_inner(job, from, to, None)
+    }
+
+    pub fn restore_file_with_proof(
+        &self,
+        job: u32,
+        from: &Path,
+        to: &Path,
+        proof: &crate::fileops::ContentProof,
+    ) -> Result<()> {
+        self.restore_file_inner(job, from, to, Some(proof))
+    }
+
+    fn restore_file_inner(
+        &self,
+        job: u32,
+        from: &Path,
+        to: &Path,
+        proof: Option<&crate::fileops::ContentProof>,
+    ) -> Result<()> {
         use sha2::{Digest, Sha256};
         let mut source = self.for_job(job)?.ok_or(Error::NotFound)?;
         let original = source.clone();
@@ -1224,7 +1276,15 @@ impl Inventory {
         let identity = fs::identity_for_file(&file)?;
         // Keep the potentially large content pass outside the global mutation
         // lock, then revalidate the exact source generation and identity.
-        let digest = digest_open(&mut file.try_clone()?)?;
+        let digest = match proof {
+            Some(proof) if proof.identity == identity => proof.sha256.clone(),
+            Some(_) => {
+                return Err(Error::Conflict(
+                    "restore fingerprint identity changed".into(),
+                ))
+            }
+            None => digest_open(&mut file.try_clone()?)?,
+        };
         let current = self.for_job(job)?.ok_or(Error::NotFound)?;
         if current.id != source.id
             || current.generation != source.generation
@@ -1285,7 +1345,11 @@ impl Inventory {
         fs::rename_exclusive(from, to)?;
         let observed = fs::open_relative(&root, &new.to_string_lossy())?;
         let observed_identity = fs::identity_for_file(&observed)?;
-        if !rename_transition_matches(&identity, &observed_identity) {
+        if !rename_transition_matches(&identity, &observed_identity)
+            || digest_open(&mut observed.try_clone()?)? != digest
+            || fs::identity_for_file(&observed)? != observed_identity
+            || crate::fileops::identity(&crate::fileops::open(to)?)? != observed_identity
+        {
             return Err(Error::Conflict("restore identity changed".into()));
         }
         source.files = fs::manifest(&root, 100_000)?;
@@ -1474,10 +1538,15 @@ impl Inventory {
                     };
                     match (before, after) {
                         (Ok(_), Ok(_))
-                            if before_identity.as_ref() == Some(&identity)
-                                && after_identity.as_ref().is_some_and(|observed| {
-                                    rename_transition_matches(&identity, observed)
-                                })
+                            if before_identity.as_ref().is_some_and(|observed| {
+                                rename_transition_matches(&identity, observed)
+                            }) && after_identity.as_ref().is_some_and(|observed| {
+                                rename_transition_matches(&identity, observed)
+                            }) && before_identity
+                                .as_ref()
+                                .zip(after_identity.as_ref())
+                                .is_some_and(|(a, b)| a.same_object(b))
+                                && before_digest.as_deref() == Some(digest.as_str())
                                 && after_digest.as_deref() == Some(digest.as_str()) =>
                         {
                             fs::rename_exclusive(&source.path.join(&old), &source.path.join(&new))?;
@@ -1503,6 +1572,17 @@ impl Inventory {
                                 "interrupted restore has ambiguous identities".into(),
                             ));
                         }
+                    }
+                    let final_file = fs::open_relative(&root, &new.to_string_lossy())?;
+                    let final_identity = fs::identity_for_file(&final_file)?;
+                    if !rename_transition_matches(&identity, &final_identity)
+                        || digest_open(&mut final_file.try_clone()?)? != digest
+                        || fs::identity_for_file(&final_file)? != final_identity
+                        || crate::fileops::identity(&crate::fileops::open(
+                            &source.path.join(&new),
+                        )?)? != final_identity
+                    {
+                        return Err(Error::Conflict("restore replay content changed".into()));
                     }
                     let files = fs::manifest(&root, 100_000)?;
                     let _coordinator = self.mutation_guard()?;
@@ -1711,6 +1791,84 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_reuses_captured_proof_and_verifies_final_inode_once() {
+        use sha2::{Digest, Sha256};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("processing");
+        std::fs::create_dir(&root).unwrap();
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        let source = root.join("job");
+        inventory.allocate(5, &root, &source).unwrap();
+        let bytes = vec![11; 131073];
+        let from = source.join("obfuscated");
+        let to = source.join("episode.mkv");
+        std::fs::write(&from, &bytes).unwrap();
+        let input = crate::fileops::open(&from).unwrap();
+        let proof = crate::fileops::ContentProof {
+            identity: fs::identity_for_file(&input).unwrap(),
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        };
+        crate::fileops::PAYLOAD_READ_BYTES.with(|n| n.set(0));
+        fs::RENAME_FAILURE.with(|failure| failure.set(Some(libc::EINVAL)));
+        inventory
+            .restore_file_with_proof(5, &from, &to, &proof)
+            .unwrap();
+        assert_eq!(
+            crate::fileops::PAYLOAD_READ_BYTES.with(|n| n.get()),
+            bytes.len() as u64
+        );
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(to).unwrap(), bytes);
+    }
+
+    #[test]
+    fn restore_replay_accepts_journaled_two_name_ctime_transition() {
+        use sha2::{Digest, Sha256};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("processing");
+        std::fs::create_dir(&root).unwrap();
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        let path = root.join("job");
+        inventory
+            .allocate_for_delivery(5, &root, &path, true, false)
+            .unwrap();
+        std::fs::write(path.join("old"), b"original").unwrap();
+        let source = inventory.refresh_for_delivery(5).unwrap();
+        let identity = source
+            .files
+            .iter()
+            .find(|f| f.path == "old")
+            .unwrap()
+            .identity
+            .clone();
+        let op = Operation {
+            id: "interrupted-restore".into(),
+            artifact: source.id.clone(),
+            kind: "par_restore".into(),
+            state: "running".into(),
+            request: serde_json::to_string(&(
+                source.clone(),
+                PathBuf::from("old"),
+                PathBuf::from("new"),
+                identity,
+                format!("{:x}", Sha256::digest(b"original")),
+            ))
+            .unwrap(),
+            created_at: now(),
+            not_before: 0,
+            attempts: 1,
+            next_retry: 0,
+            error: None,
+        };
+        save_operation(&inventory.db.lock().unwrap(), &op).unwrap();
+        std::fs::hard_link(path.join("old"), path.join("new")).unwrap();
+        inventory.reconcile_transforms().unwrap();
+        assert_eq!(inventory.operation(&op.id).unwrap().state, "succeeded");
+        assert!(!path.join("old").exists());
+        assert_eq!(std::fs::read(path.join("new")).unwrap(), b"original");
+    }
     #[test]
     fn startup_preserves_transform_scratch_custody_and_protections() {
         let temp = tempfile::tempdir().unwrap();

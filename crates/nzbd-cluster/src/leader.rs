@@ -4709,6 +4709,29 @@ mod tests {
                 .is_none(),
             "late proof cannot resurrect explicit removal"
         );
+        // A reconciler can retain this lock while a quorum request is pending.
+        // Admission must reject promptly, without running the mutation handler.
+        let serial = shared.mutation_serial.lock().await;
+        let before = runtime.engine.export_job(JobId(93)).await.unwrap().unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.forward(
+                &format!("http://{address}"),
+                hyper::Request::post("/api/v1/jobs/93/actions/pause")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("mutation admission cannot wait indefinitely for reconciliation")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let refusal = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&refusal).contains("reconciliation is busy"));
+        let after = runtime.engine.export_job(JobId(93)).await.unwrap().unwrap();
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.control(), before.control());
+        drop(serial);
         serve.abort();
         let _ = serve.await;
         runtime.shutdown().await;
