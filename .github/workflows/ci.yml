@@ -88,7 +88,12 @@ jobs:
       # cluster tests (election, failover, reclaim), and the whole-daemon
       # CLI/compat test that boots the real binary.
       - name: cargo test
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --exclude nzbd-cluster
+      # Match fast-check-rust's cluster fixture isolation. Each scenario still
+      # runs its real workers and Raft nodes concurrently, with unchanged
+      # compressed lease deadlines and integrity/failover assertions.
+      - name: complete cluster tests and doctests
+        run: cargo test --locked -p nzbd-cluster -- --test-threads=1
 
   msrv:
     name: MSRV check (1.95)

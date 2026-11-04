@@ -151,6 +151,22 @@ The startup fast lane now runs the complete pipeline and failure-regression
 targets, so the previously hidden failures cannot return behind one passing
 filtered test.
 
+Full qualification runs `cargo test --locked --workspace --exclude nzbd-cluster`
+and then `cargo test --locked -p nzbd-cluster -- --test-threads=1`. Together
+these commands include every workspace unit, integration and documentation
+target. The cluster invocation matches `fast-check-rust`'s existing isolation
+policy: independent fixtures take turns, while each fixture's actual workers,
+Raft nodes, failover behavior, lease deadlines and integrity assertions retain
+their original concurrency and checks.
+
+The parallel full run at `c2d9358` showed two independent cluster authorities
+demoting within 230 ms, an article refetch and a READY timeout; the focused
+range scenario passed with all 96 single-fetch assertions. This supports
+isolating time-compressed fixtures from shared-host scheduling and I/O
+pressure, but does not identify the exact delayed renewal phase or establish
+a production lease fix. Preserve those failed receipts as stress evidence.
+Any recurrence in the isolated qualification remains a deployment blocker.
+
 ## Deployment — qualify the exact revision on nuc3
 
 The actual service checkout is `/opt/noirr/runner`; the media inventory's
