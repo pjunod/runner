@@ -1445,6 +1445,42 @@ async fn failed_cleanup_operator_retries_resume_durable_budget_across_restart() 
             "admission cannot change deletion intent or its retry deadline"
         );
     }
+    async fn operator_retry(
+        manager: &nzbd_post::manager::PostManagerHandle,
+        engine: &EngineHandle,
+        history: &HistoryDb,
+        spent: u32,
+    ) {
+        let evidence = cleanup_evidence(engine);
+        let spent = spent.to_string();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                match manager.retry_now(JobId(95)).await {
+                    Ok(()) => break,
+                    Err(nzbd_post::manager::RestartPostError::NotReady) => {
+                        // A previous admission probe cannot reserve future owner
+                        // readiness. Retry only a refusal that spent no attempt.
+                        let row = cleanup_metadata(engine).await.unwrap();
+                        assert!(
+                            row.params
+                                .iter()
+                                .any(|(key, value)| { key == ATTEMPTS_PARAM && value == &spent }),
+                            "a refused retry must not spend the durable budget: {:?}",
+                            row.params
+                        );
+                        assert!(!row.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
+                        assert!(history.list(10).unwrap().is_empty());
+                        assert_eq!(cleanup_evidence(engine), evidence);
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    other => panic!("unexpected cleanup retry result: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("operator retry and refusal checks must finish within the original budget");
+    }
 
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("dest/undeletable");
@@ -1543,17 +1579,28 @@ async fn failed_cleanup_operator_retries_resume_durable_budget_across_restart() 
     let tracker2 = TaskTracker::new();
     let claim2 = Arc::new(AtomicBool::new(false));
     let gate2 = claim2.clone();
+    let scanned2 = Arc::new(tokio::sync::Notify::new());
+    let scan2 = scanned2.clone();
     let manager2 = spawn_post_manager(
         recovered.clone(),
         config.clone(),
         hist.clone(),
         tmp.path().join("dest"),
-        Some(Arc::new(move |_| gate2.load(Ordering::SeqCst))),
+        Some(Arc::new(move |job| {
+            let claimed = gate2.load(Ordering::SeqCst);
+            if job == JobId(95) && !claimed {
+                scan2.notify_one();
+            }
+            claimed
+        })),
         cancel2.clone(),
         &tracker2,
     );
-    // Hold the claim until the manager serves its control mailbox so startup
-    // scan and the explicit operator command cannot become two occasions.
+    // Observe the real skipped startup scan, then drain its handler through
+    // the mailbox. A mailbox reply alone can win select before the first scan.
+    tokio::time::timeout(Duration::from_secs(5), scanned2.notified())
+        .await
+        .expect("second manager must observe the unclaimed startup row");
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), manager2.retry_now(JobId(u32::MAX)))
             .await
@@ -1571,10 +1618,7 @@ async fn failed_cleanup_operator_retries_resume_durable_budget_across_restart() 
         "automatic retry must still be scheduled"
     );
     claim2.store(true, Ordering::SeqCst);
-    tokio::time::timeout(Duration::from_secs(5), manager2.retry_now(JobId(95)))
-        .await
-        .expect("second operator retry must finish")
-        .unwrap();
+    operator_retry(&manager2, &recovered, &hist, 1).await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -1610,15 +1654,26 @@ async fn failed_cleanup_operator_retries_resume_durable_budget_across_restart() 
     let tracker3 = TaskTracker::new();
     let claim3 = Arc::new(AtomicBool::new(false));
     let gate3 = claim3.clone();
+    let scanned3 = Arc::new(tokio::sync::Notify::new());
+    let scan3 = scanned3.clone();
     let manager3 = spawn_post_manager(
         recovered.clone(),
         config,
         hist.clone(),
         tmp.path().join("dest"),
-        Some(Arc::new(move |_| gate3.load(Ordering::SeqCst))),
+        Some(Arc::new(move |job| {
+            let claimed = gate3.load(Ordering::SeqCst);
+            if job == JobId(95) && !claimed {
+                scan3.notify_one();
+            }
+            claimed
+        })),
         cancel3.clone(),
         &tracker3,
     );
+    tokio::time::timeout(Duration::from_secs(5), scanned3.notified())
+        .await
+        .expect("third manager must observe the unclaimed startup row");
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), manager3.retry_now(JobId(u32::MAX)))
             .await
@@ -1636,10 +1691,7 @@ async fn failed_cleanup_operator_retries_resume_durable_budget_across_restart() 
         "automatic retry must still be scheduled"
     );
     claim3.store(true, Ordering::SeqCst);
-    tokio::time::timeout(Duration::from_secs(5), manager3.retry_now(JobId(95)))
-        .await
-        .expect("third operator retry must finish")
-        .unwrap();
+    operator_retry(&manager3, &recovered, &hist, 2).await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {

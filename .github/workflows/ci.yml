@@ -38,7 +38,10 @@ jobs:
             echo "release build unexpectedly accepted missing signing credentials"
             exit 1
           fi
-          grep -F "Android release signing is not configured" "$RUNNER_TEMP/release-signing.log"
+          if ! grep -F "Android release signing is not configured" "$RUNNER_TEMP/release-signing.log"; then
+            cat "$RUNNER_TEMP/release-signing.log"
+            exit 1
+          fi
       - name: release signing accepts and attaches an external upload key
         working-directory: mobile/android
         env:

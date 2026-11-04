@@ -1,8 +1,8 @@
 # Runner I/O audit — redundant work beyond completed-folder publication
 
 **Status:** reviewed source findings; follow-ups are not implemented · **Written:**
-2026-11-04 UTC · **Baseline:** `ea8a402b` · **Rechecked:** `7e4adb7` plus
-worker-retirement candidate. Final qualification and rollout evidence is tracked
+2026-11-04 UTC · **Baseline:** `ea8a402b` · **Rechecked:** `2c13010` and the
+integration recovery candidate. Final qualification and rollout evidence is tracked
 in [PR #272](https://github.com/pjunod/runner/pull/272).
 
 Companion to [PUBLICATION_PERFORMANCE_PLAN.md](PUBLICATION_PERFORMANCE_PLAN.md)
@@ -39,17 +39,49 @@ physical disk traffic is lower.
 | Blocked source cleanup was retried without respecting its existing backoff/review state | Artifact cleanup scheduling and typed failed-cleanup replay now retain exact deletion intent, Keep and generation checks. Cleanup-only metadata never grants verified payload export, repair or publication authority. | Implemented; pending final combined qualification. |
 | Move phases lacked useful timings | Post-processing records move wait/work timing; copy/rename work can be distinguished from scheduling delays. | Implemented; root owns final observation after deploy. |
 | Lease expiry/cancellation can block unrelated heartbeat renewals while waiting for writer/post joins | [worker.rs](../crates/nzbd-cluster/src/worker.rs) and [EngineHandle::retire_worker_job](../crates/nzbd-engine/src/lib.rs): renewal is separated from tracked join/retirement work. Exact revoked-grant retirement preserves foreign resume journals; accepted completion remains a separate compaction decision. Durable stop receipts replace execution watches only after actual joins. | Implemented; final combined qualification and runtime evidence tracked in PR #272. |
+| Ready Post results wait behind download completions | [worker.rs](../crates/nzbd-cluster/src/worker.rs): independent fresh/replay lane turns and within-kind rotation preserve progress for both classes, immutable requests and the single copy/verification lane. Outbox header work is bounded and full decoding is limited to the selected request. | Implemented candidate; final qualification tracked in PR #272. |
+| Heartbeats repeatedly persist unchanged provider-budget state | [leader.rs](../crates/nzbd-cluster/src/leader.rs) advances semantic revisions and skips confirmed durable writes; [control.rs](../crates/nzbd-cluster/src/control.rs) requires exact current issuer authority and checks duplicate-write postconditions. Uncommitted, stale or superseded commands are withheld. | Implemented candidate; final qualification tracked in PR #272. |
 
 ## Ranked follow-ups
 
 | Rank | Trigger | Remaining amplification or contention | Smallest useful fix |
 |---|---|---|---|
-| 1 | Large extracted output committed from staging on the same filesystem | Extraction still copies every file through `copy_publish_checked`: approximately `2S` reads and `S` writes after this branch's generic helper improvement. Staging remains independently writable and retained through later naming/repair, so current copy semantics are required. | Investigate an exclusive consume boundary before adding a metadata move/link path. Prove no later independent writes or staging-retention requirement, and preserve collision/crash replay checks; otherwise retain the verified copy. |
-| 2 | Writer finalizes a large file with a combined CRC | A synchronous full-file CRC scan runs inside an async writer future, occupying a Tokio runtime worker for the scan duration. | Move the necessary CRC validation to an owned bounded blocking/payload lane; keep actual worker completion and descriptor lifetime tracked. |
-| 3 | PAR workspace prepares matched data or recovery companions | Cached PAR fingerprints are followed by SHA-256 copy/readback and then independent MD5 scans of the copied data; companion preparation also reads the source again for MD5. | Compute required MD5 alongside the existing copy/readback stream and return digest evidence bound to exact identities, instead of rescanning unchanged input/output. |
-| 4 | Fresh torrent donor copy and publication | Copy is independently checked against donor before and after namespace publication; the fresh path can read donor about `3S` and destination about `2S`, excluding optional torrent piece verification. | Keep the independent donor copy, but carry the verified staged digest and anchored identity across the metadata-only publication boundary; independently revalidate on actual replay/mutation. |
-| 5 | Very large number of segments in one file | Writer checks each new extent against a vector with both `contains` and an overlap scan. Work grows quadratically with range count. | Index segment identity separately and use an ordered interval structure for overlap checks, preserving duplicate acknowledgment and conflict behavior. |
-| 6 | Many immutable generation files streamed between cluster workers | `copy_generation_tree` performs `std::fs::copy` and then a complete destination SHA-256 pass before syncing. | Fuse copy and manifest hashing while retaining a separate destination readback only where the custody contract requires it. Benchmark first: some second reads are intentional integrity evidence. |
+| 1 | An accepted completion restores the authority queue | Projection replacement discards allocation/cache and verification tickets for all payload jobs; source reconciliation then waits for the entire verified queue. Unchanged jobs repeat recovery work after unrelated completions. | Design job-level readiness or conservative proof reuse with fresh exact source identity/generation checks. Every source fact must still use checked export and guarded intent CAS; metadata alone cannot grant payload authority. |
+| 2 | Large extracted output committed from staging on the same filesystem | Extraction still copies every file through `copy_publish_checked`: approximately `2S` reads and `S` writes after this branch's generic helper improvement. Staging remains independently writable and retained through later naming/repair, so current copy semantics are required. | Investigate an exclusive consume boundary before adding a metadata move/link path. Prove no later independent writes or staging-retention requirement, and preserve collision/crash replay checks; otherwise retain the verified copy. |
+| 3 | Writer finalizes a large file with a combined CRC | A synchronous full-file CRC scan runs inside an async writer future, occupying a Tokio runtime worker for the scan duration. | Move the necessary CRC validation to an owned bounded blocking/payload lane; keep actual worker completion and descriptor lifetime tracked. |
+| 4 | PAR workspace prepares matched data or recovery companions | Cached PAR fingerprints are followed by SHA-256 copy/readback and then independent MD5 scans of the copied data; companion preparation also reads the source again for MD5. | Compute required MD5 alongside the existing copy/readback stream and return digest evidence bound to exact identities, instead of rescanning unchanged input/output. |
+| 5 | Fresh torrent donor copy and publication | Copy is independently checked against donor before and after namespace publication; the fresh path can read donor about `3S` and destination about `2S`, excluding optional torrent piece verification. | Keep the independent donor copy, but carry the verified staged digest and anchored identity across the metadata-only publication boundary; independently revalidate on actual replay/mutation. |
+| 6 | Very large number of segments in one file | Writer checks each new extent against a vector with both `contains` and an overlap scan. Work grows quadratically with range count. | Index segment identity separately and use an ordered interval structure for overlap checks, preserving duplicate acknowledgment and conflict behavior. |
+| 7 | Many immutable generation files streamed between cluster workers | `copy_generation_tree` performs `std::fs::copy` and then a complete destination SHA-256 pass before syncing. | Fuse copy and manifest hashing while retaining a separate destination readback only where the custody contract requires it. Benchmark first: some second reads are intentional integrity evidence. |
+
+### Authority restoration repeats queue-wide payload recovery
+
+**Evidence:** [projection replacement](../crates/nzbd-engine/src/owner_transitions.rs)
+invalidates epochs, allocation cache and verification tickets for payload rows.
+[Source reconciliation](../crates/nzbd-cluster/src/source_facts.rs) requires a
+checked export of the complete queue before scheduler admission. Consequently,
+an unrelated pending verification can prevent already-verified work from being
+scheduled. Accepted completions repeatedly restore that projection.
+
+The local fairness trace at `2c13010` also showed a ready Post completion waiting
+about 16.6 seconds behind seven download completions. Completion-lane ordering
+can remove that starvation while retaining bounded download progress and one
+copy/verification operation at a time. Queue-wide recovery amplification is a
+separate follow-up; it is not a measured production filesystem benchmark.
+
+**Integrity boundary:** preserve earned local verification only when exact
+source binding, file/range/finalization state, generation and fresh anchored
+identity still agree. A business-intent comparison alone is insufficient.
+Alternatively reconcile checked job exports individually, skip only explicit
+busy rows, and carry binding/readiness into grant eligibility so a skipped
+unbound row cannot acquire authority later in the same scheduling pass. Retain
+all existing guarded CAS and ownership checks.
+
+**Validation:** count verification work and control round trips after one job
+completes in a large settled queue. Block recovery for an unrelated row and
+prove eligible work progresses without allowing that blocked row to start.
+Exercise changed bytes/inodes/generations, operator revision changes, failed
+persistence, cancellation and authority replacement before any proof reuse.
 
 ### Extraction staging still copies same-filesystem files
 

@@ -6165,6 +6165,12 @@ async fn checked_release_public_api_refuses_expiry_after_custody_probe() {
     std::fs::write(path.join("payload.bin"), b"retained processing source").unwrap();
     inventory.finish(94, &path, &destination, "active").unwrap();
     engine.import_job(row, false, false).await.unwrap();
+    // This test expires authority during the later custody probe, not during
+    // import recovery. Establish the verified input before installing its hold.
+    export_job_ready_for_test(&engine, JobId(94))
+        .await
+        .unwrap()
+        .unwrap();
     engine
         .hold_job(
             JobId(94),

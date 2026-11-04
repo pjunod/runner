@@ -55,6 +55,11 @@ the full failure roster, including failures outside the original pipeline.
 | Operator retry routes legacy cleanup through fenced payload export | Route failed cleanup summaries to owner admission even for the legacy cohort or an idle verifier. Exact proof-bound cleanup custody remains the authority; ordinary payload export stays fenced. |
 | Slow retirement or connection-budget drain blocks healthy lease renewal | Revoke authority immediately, retain capacity while tracked workers join, and retire only the original grant context. Serialize actual budget drains separately; heartbeat submission does not wait for them, while new grant admission still does. |
 | Completion preflight rejects the saved token after a healthy renewal | Accept only predecessor tokens of the same owner/incarnation/resource/fence at preflight, matching the existing renewable publication transaction. Preserve immutable outbox/result identity; the transaction still checks current expiry, terminal state and exact job intent. |
+| Ready Post completion waits behind fast download results | Alternate Post and download attempts independently for fresh results and durable replay; rotate retries within each lane. Retain one copy/verification operation at a time and replay without requiring a live lease. Bound outbox lookahead and decode only the selected full descriptor. |
+| Every heartbeat writes unchanged provider-budget state | Advance revision only on semantic handoff changes; serialize and deduplicate confirmed durable writes. Changed commands require exact saved state, current node command/generation, and live issuer fencing before issuance. |
+| A hold fixture cancels its own unfinished import recovery | Await the verified imported input before installing the hold; retain the later custody-probe expiry injection and all refusal/source assertions. |
+| Direct archive fixture lacks source custody during terminal commit | Hold a real processing attempt across extraction and commit, join its workers, then release custody before salvage assertions. |
+| A mailbox barrier can run before the manager's startup scan | Signal the real skipped scan through the fixture gate, then drain it through the mailbox. Retry only explicit NotReady within the original budget while proving no attempt, stamp, history or journal mutation occurred. |
 
 Engine fixtures must await only the explicit export-busy condition, use real
 inventory paths and worker contexts, and bound event receives. A payload
@@ -86,6 +91,19 @@ renewals. The existing final publication transaction already selects the
 latest live token of the exact same fenced operation. Align the preflight
 with that contract; future tokens, another owner/fence, changed job revision,
 expired current authority, and conflicting immutable results remain rejected.
+The detailed trace then isolated completion ordering: a ready Post result
+waited about 16.6 seconds behind seven download results, keeping its scarce
+slot occupied. Independent fresh/replay turns bound progress for both classes;
+one blocked receipt cannot force every fresh turn back to downloads. A
+bounded rotating header scan replaces full outbox sorting and repeated full-job
+decoding. Only the selected immutable request is fully decoded for submission.
+
+Provider-budget persistence is deduplicated at the application boundary, not
+by issuing repeated Raft writes whose SQL happens to make no change. An old
+snapshot cannot acknowledge a newer in-memory revision. Exact duplicate
+readback handles a lost acknowledgement; a conflicting/newer durable row or a
+stale issuer refuses the command. Expired holders are removed from pending
+targets before promotion so a later handoff cannot wait forever for their ACK.
 See the [independent I/O audit](IO_EFFICIENCY_AUDIT.md) for remaining cost
 investigations; those follow-ups are outside this qualification fix.
 

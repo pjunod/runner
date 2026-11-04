@@ -13,7 +13,7 @@ use nzbd_engine::{EngineHandle, MirrorStats};
 use nzbd_post::manager::{process_job_ctx, PpCtx};
 use nzbd_types::{JobId, JobStatus, ServerDef};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -94,6 +94,54 @@ impl ActiveLeases {
     }
 }
 type BudgetReceipt = Arc<Mutex<Option<BudgetAck>>>;
+
+/// A ready Post releases a scarce PP slot. Alternate attempts between that
+/// lane and downloads, and rotate within each lane even after a failed RPC.
+/// Durable outbox replay remains eligible after its live lease disappears.
+struct CompletionOrder {
+    // Separate turns prevent a repeatedly failed pending Post from forcing
+    // every subsequent fresh-ready selection back onto downloads.
+    prefer_post: [bool; 2],
+    ready_after: [String; 2],
+    pending_after: [String; 2],
+    scan: OutboxScan,
+}
+impl Default for CompletionOrder {
+    fn default() -> Self {
+        Self {
+            prefer_post: [true, true],
+            ready_after: Default::default(),
+            pending_after: Default::default(),
+            scan: OutboxScan::default(),
+        }
+    }
+}
+impl CompletionOrder {
+    fn rank<'a>(&self, kind: LeaseKind, key: &'a str, pending: bool) -> (bool, bool, &'a str) {
+        let post = kind == LeaseKind::Post;
+        let after = if pending {
+            &self.pending_after
+        } else {
+            &self.ready_after
+        };
+        (
+            post != self.prefer_post[usize::from(pending)],
+            key <= after[usize::from(post)].as_str(),
+            key,
+        )
+    }
+
+    fn attempted(&mut self, kind: LeaseKind, key: &str, pending: bool) {
+        let post = kind == LeaseKind::Post;
+        self.prefer_post[usize::from(pending)] = !post;
+        let after = if pending {
+            &mut self.pending_after
+        } else {
+            &mut self.ready_after
+        };
+        after[usize::from(post)] = key.to_owned();
+    }
+}
 
 #[derive(Clone)]
 struct BudgetCommand {
@@ -363,13 +411,14 @@ pub fn spawn_worker(
         let view = view.clone();
         let cancel = cancel.clone();
         tracker.spawn(async move {
+            let mut completion_order = CompletionOrder::default();
             loop {
                 if cancel.is_cancelled(){break;}
                 let current=view.borrow().clone();
                 if !current.is_me {
                     if let Some(url)=current.leader_url().map(str::to_owned) {
-                        replay_completion_outbox(&cfg,&engine,&client,&active,&pp,&url).await;
-                        report_completions(&cfg,&engine,&client,&active,&pp,&url,&dest_dir,&retirement_tracker,&cancel).await;
+                        replay_completion_outbox(&cfg,&engine,&client,&active,&pp,&url,&mut completion_order).await;
+                        report_completions(&cfg,&engine,&client,&active,&pp,&url,&dest_dir,&retirement_tracker,&cancel,&mut completion_order).await;
                     }
                 }
                 tokio::select!{ _=cancel.cancelled()=>break,_=tokio::time::sleep(cfg.lease_interval)=>{} }
@@ -731,9 +780,10 @@ async fn report_completions(
     dest_dir: &std::path::Path,
     tracker: &TaskTracker,
     shutdown: &CancellationToken,
+    order: &mut CompletionOrder,
 ) {
     let snapshot = engine.snapshot();
-    let finished: Vec<(String, LeaseState)> = active
+    let mut finished: Vec<(String, LeaseState)> = active
         .lock()
         .unwrap()
         .iter()
@@ -751,6 +801,11 @@ async fn report_completions(
         })
         .map(|(id, st)| (id.clone(), st.clone()))
         .collect();
+    finished.sort_by(|(left_id, left), (right_id, right)| {
+        order
+            .rank(left.kind, left_id, false)
+            .cmp(&order.rank(right.kind, right_id, false))
+    });
 
     for (lease_id, lease) in finished {
         if active
@@ -780,6 +835,7 @@ async fn report_completions(
         {
             continue;
         }
+        order.attempted(lease.kind, &lease_id, false);
         if lease.kind == LeaseKind::Segment && job.status != JobStatus::Completed {
             reject_remote_grant(cfg, client, leader_url, &lease_id, &lease.token).await;
             for (id, state) in revoke_leases(active, |id, state| {
@@ -851,6 +907,23 @@ struct PendingCompletion {
     kind: LeaseKind,
     request: CompleteRequest,
 }
+
+#[derive(serde::Deserialize)]
+struct PendingHeader {
+    kind: LeaseKind,
+    request: RequestHeader,
+}
+#[derive(serde::Deserialize)]
+struct RequestHeader {
+    node: String,
+    receipt_id: String,
+}
+#[derive(Default)]
+struct OutboxScan {
+    entries: Option<std::fs::ReadDir>,
+    deferred: Option<PathBuf>,
+    headers: std::collections::VecDeque<(PathBuf, PendingHeader)>,
+}
 fn completion_path(cfg: &ClusterConfig, request: &CompleteRequest) -> PathBuf {
     use sha2::{Digest, Sha256};
     cfg.control_dir.join("completion-outbox").join(format!(
@@ -900,6 +973,100 @@ fn remove_completion(cfg: &ClusterConfig, request: &CompleteRequest) -> Result<(
         .and_then(|directory| directory.sync_all())
         .map_err(|e| e.to_string())
 }
+fn next_pending_completion(
+    directory: &Path,
+    node: &str,
+    order: &mut CompletionOrder,
+) -> Option<PendingCompletion> {
+    if order.scan.entries.is_none() {
+        order.scan.entries = std::fs::read_dir(directory).ok();
+    }
+    let mut remaining = MAX_RPC_BYTES;
+    for _ in 0..32 {
+        if order.scan.headers.len() == 128 {
+            break;
+        }
+        let path = match order.scan.deferred.take() {
+            Some(path) => path,
+            None => match order.scan.entries.as_mut()?.next() {
+                Some(Ok(entry)) => entry.path(),
+                Some(Err(_)) => continue,
+                None => {
+                    order.scan.entries = None;
+                    break;
+                }
+            },
+        };
+        if path.extension().is_none_or(|extension| extension != "json")
+            || order.scan.headers.iter().any(|(cached, _)| *cached == path)
+        {
+            continue;
+        }
+        let Ok(metadata) = path.metadata() else {
+            continue;
+        };
+        if metadata.len() > MAX_RPC_BYTES as u64 {
+            continue;
+        }
+        let bytes = metadata.len() as usize;
+        if bytes > remaining {
+            order.scan.deferred = Some(path);
+            break;
+        }
+        remaining -= bytes;
+        // Ignore the full job while decoding only the small routing header.
+        // Read no more than the inspected length if the file changes.
+        let header = std::fs::File::open(&path).ok().and_then(|file| {
+            use std::io::Read;
+            serde_json::from_reader::<_, PendingHeader>(std::io::BufReader::new(
+                file.take(bytes as u64),
+            ))
+            .ok()
+        });
+        let Some(header) = header else { continue };
+        if header.request.node != node
+            || header.request.node.len() > 256
+            || header.request.receipt_id.len() > 4096
+        {
+            continue;
+        }
+        order.scan.headers.push_back((path, header));
+    }
+    let index = order
+        .scan
+        .headers
+        .iter()
+        .enumerate()
+        .min_by(|(_, (_, left)), (_, (_, right))| {
+            order
+                .rank(left.kind, &left.request.receipt_id, true)
+                .cmp(&order.rank(right.kind, &right.request.receipt_id, true))
+        })
+        .map(|(index, _)| index)?;
+    // Never evict unseen headers. Attempted receipts stay on disk for the next
+    // directory cycle, after this cycle's unattempted backlog gets its turn.
+    let (path, header) = order.scan.headers.remove(index)?;
+    order.attempted(header.kind, &header.request.receipt_id, true);
+    // Decode one full immutable request under the existing size cap. Recheck
+    // its header; replacement never inherits cached routing classification.
+    path.metadata()
+        .ok()
+        .filter(|metadata| metadata.len() <= MAX_RPC_BYTES as u64)
+        .and_then(|_| std::fs::File::open(&path).ok())
+        .and_then(|file| {
+            use std::io::Read;
+            serde_json::from_reader::<_, PendingCompletion>(std::io::BufReader::new(
+                file.take(MAX_RPC_BYTES as u64),
+            ))
+            .ok()
+        })
+        .filter(|pending| {
+            pending.kind == header.kind
+                && pending.request.node == node
+                && pending.request.receipt_id == header.request.receipt_id
+        })
+}
+
 async fn replay_completion_outbox(
     cfg: &ClusterConfig,
     engine: &EngineHandle,
@@ -907,33 +1074,23 @@ async fn replay_completion_outbox(
     active: &ActiveLeases,
     pp: &Option<PpSetup>,
     leader_url: &str,
+    order: &mut CompletionOrder,
 ) {
-    let Ok(entries) = std::fs::read_dir(cfg.control_dir.join("completion-outbox")) else {
+    let directory = cfg.control_dir.join("completion-outbox");
+    let node = cfg.node_name.clone();
+    let mut scan_order = std::mem::take(order);
+    // Decoding bounded durable descriptors must not occupy a heartbeat worker.
+    // The completion task owns and joins this read-only scan before moving on.
+    let Ok((pending, scan_order)) = tokio::task::spawn_blocking(move || {
+        let pending = next_pending_completion(&directory, &node, &mut scan_order);
+        (pending, scan_order)
+    })
+    .await
+    else {
         return;
     };
-    for entry in entries.flatten().take(32) {
-        if entry
-            .path()
-            .extension()
-            .is_none_or(|extension| extension != "json")
-        {
-            continue;
-        }
-        if entry
-            .metadata()
-            .map_or(true, |metadata| metadata.len() > MAX_RPC_BYTES as u64)
-        {
-            continue;
-        }
-        let Some(pending) = std::fs::read(entry.path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<PendingCompletion>(&bytes).ok())
-        else {
-            continue;
-        };
-        if pending.request.node != cfg.node_name {
-            continue;
-        }
+    *order = scan_order;
+    if let Some(pending) = pending {
         if submit_completion(
             cfg,
             engine,
@@ -947,7 +1104,6 @@ async fn replay_completion_outbox(
         {
             let _ = remove_completion(cfg, &pending.request);
         }
-        break;
     }
 }
 async fn submit_completion(
@@ -2440,6 +2596,161 @@ mod tests {
             revision: 1,
             expires_at_unix_ms: i64::MAX,
         }
+    }
+
+    #[test]
+    fn ready_post_and_failed_outbox_attempts_alternate_with_download_progress() {
+        let mut order = CompletionOrder::default();
+        let mut ready: Vec<_> = (0..8)
+            .map(|id| (LeaseKind::Download, format!("download-{id}")))
+            .collect();
+        ready.extend([
+            (LeaseKind::Post, "post-a".into()),
+            (LeaseKind::Post, "post-b".into()),
+        ]);
+        let mut seen = std::collections::HashSet::new();
+        // Keep every candidate present, modeling failed attempts. Neither a
+        // failed first Post nor an endless download backlog monopolizes IO.
+        for turn in 0..32 {
+            ready.sort_by(|(a_kind, a), (b_kind, b)| {
+                order
+                    .rank(*a_kind, a, false)
+                    .cmp(&order.rank(*b_kind, b, false))
+            });
+            let (kind, key) = &ready[0];
+            assert_eq!(*kind == LeaseKind::Post, turn % 2 == 0);
+            seen.insert(key.clone());
+            order.attempted(*kind, key, false);
+        }
+        assert_eq!(seen.len(), 10);
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut original = HashMap::new();
+        for (index, (kind, key)) in ready.iter().enumerate() {
+            let request = CompleteRequest {
+                lifecycle_protocol: LIFECYCLE_PROTOCOL,
+                node: "worker".into(),
+                lease_id: key.clone(),
+                token: test_token(),
+                expected_job_revision: 1,
+                result_id: key.clone(),
+                result_ref: "/retained-result".into(),
+                receipt_id: key.clone(),
+                job: queued_test_job(),
+            };
+            let bytes =
+                serde_json::to_vec(&serde_json::json!({"kind":kind,"request":request})).unwrap();
+            let path = directory.path().join(format!("{index}.json"));
+            std::fs::write(&path, &bytes).unwrap();
+            original.insert(path, bytes);
+        }
+        let mut order = CompletionOrder::default();
+        let mut seen = std::collections::HashSet::new();
+        let mut fresh_seen = std::collections::HashSet::new();
+        for turn in 0..32 {
+            let pending = next_pending_completion(directory.path(), "worker", &mut order).unwrap();
+            assert_eq!(pending.kind == LeaseKind::Post, turn % 2 == 0);
+            seen.insert(pending.request.receipt_id.clone());
+            order.attempted(pending.kind, &pending.request.receipt_id, true);
+            // Production runs replay then fresh-ready selection. Failed
+            // pending Posts must not reset the ready lane's turn each loop.
+            ready.sort_by(|(a_kind, a), (b_kind, b)| {
+                order
+                    .rank(*a_kind, a, false)
+                    .cmp(&order.rank(*b_kind, b, false))
+            });
+            let (kind, key) = &ready[0];
+            assert_eq!(*kind == LeaseKind::Post, turn % 2 == 0);
+            fresh_seen.insert(key.clone());
+            order.attempted(*kind, key, false);
+        }
+        assert_eq!(
+            seen.len(),
+            10,
+            "failed pending receipts rotate without needing a live lease"
+        );
+        assert_eq!(
+            fresh_seen.len(),
+            10,
+            "fresh Post and download progress survive failed outbox replay"
+        );
+        for (path, bytes) in original {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                bytes,
+                "selection cannot change immutable outbox requests"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_outbox_cursor_visits_every_retained_receipt_and_skips_malformed_turns() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..256 {
+            let kind = if index % 16 == 0 {
+                LeaseKind::Post
+            } else {
+                LeaseKind::Download
+            };
+            let request = CompleteRequest {
+                lifecycle_protocol: LIFECYCLE_PROTOCOL,
+                node: "worker".into(),
+                lease_id: format!("lease-{index}"),
+                token: test_token(),
+                expected_job_revision: 1,
+                result_id: format!("result-{index}"),
+                result_ref: "/retained".into(),
+                receipt_id: format!("receipt-{index:04}"),
+                job: queued_test_job(),
+            };
+            std::fs::write(
+                directory.path().join(format!("{index:04}.json")),
+                serde_json::to_vec(&serde_json::json!({"kind":kind,"request":request})).unwrap(),
+            )
+            .unwrap();
+        }
+        let mut order = CompletionOrder::default();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1024 {
+            if let Some(pending) = next_pending_completion(directory.path(), "worker", &mut order) {
+                seen.insert(pending.request.receipt_id);
+            }
+            assert!(order.scan.headers.len() < 128);
+            if seen.len() == 256 {
+                break;
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            256,
+            "retained failures larger than the header cache must all get a turn"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 256);
+
+        let malformed = tempfile::tempdir().unwrap();
+        std::fs::write(
+            malformed.path().join("bad-post.json"),
+            br#"{"kind":"post","request":{"node":"worker","receipt_id":"bad-post","job":null}}"#,
+        )
+        .unwrap();
+        let download = std::fs::read(directory.path().join("0001.json")).unwrap();
+        std::fs::write(malformed.path().join("good-download.json"), download).unwrap();
+        let mut order = CompletionOrder::default();
+        assert!(
+            next_pending_completion(malformed.path(), "worker", &mut order).is_none(),
+            "the selected malformed Post must not become a request"
+        );
+        assert_eq!(
+            order.scan.headers.len(),
+            1,
+            "unselected job bodies are not decoded"
+        );
+        let next = next_pending_completion(malformed.path(), "worker", &mut order).unwrap();
+        assert_eq!(
+            next.kind,
+            LeaseKind::Download,
+            "failed body validation consumes its preferred turn"
+        );
     }
 
     #[derive(Clone)]

@@ -39,7 +39,7 @@ struct LeaseInfo {
     last_hb: Instant,
 }
 
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct BudgetHandoff {
     revision: u64,
     generation: u64,
@@ -47,6 +47,31 @@ struct BudgetHandoff {
     commands: HashMap<String, HashMap<String, u16>>,
     pending_target: Option<HashMap<String, HashMap<String, u16>>>,
     awaiting_shrink: HashSet<String>,
+}
+
+/// Serialize the actual writes, not just their SQL effects. A successful old
+/// snapshot never acknowledges a newer handoff that changed while IO ran.
+async fn persist_budget_snapshot<F, Fut>(
+    budgets: &Mutex<BudgetHandoff>,
+    durable: &tokio::sync::Mutex<u64>,
+    save: F,
+) -> Result<u64, String>
+where
+    F: FnOnce(u64, String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut durable = durable.lock().await;
+    let snapshot = {
+        let state = budgets.lock().unwrap();
+        if state.revision <= *durable {
+            return Ok(*durable);
+        }
+        state.clone()
+    };
+    let json = serde_json::to_string(&snapshot).map_err(|error| error.to_string())?;
+    save(snapshot.revision, json).await?;
+    *durable = snapshot.revision;
+    Ok(*durable)
 }
 
 type CompletionReply = (StatusCode, Vec<u8>);
@@ -137,6 +162,7 @@ pub struct LeaderShared {
     /// Node liveness by observed seq progression: name → (seq, last change).
     node_seen: Mutex<HashMap<String, (u64, Instant)>>,
     budgets: Mutex<BudgetHandoff>,
+    budget_durable_revision: tokio::sync::Mutex<u64>,
     /// Serializes externally acknowledged queue mutations and publication
     /// commits. The engine is speculative until replicated control accepts
     /// the exact request-local delta.
@@ -214,6 +240,7 @@ impl LeaderShared {
             leases: Mutex::new(HashMap::new()),
             node_seen: Mutex::new(HashMap::new()),
             budgets: Mutex::new(BudgetHandoff::default()),
+            budget_durable_revision: tokio::sync::Mutex::new(0),
             mutation_serial: tokio::sync::Mutex::new(()),
             delivery_serial: tokio::sync::Mutex::new(()),
             authority_ready: AtomicBool::new(false),
@@ -507,9 +534,14 @@ impl LeaderShared {
     /// Return the only safe command for a node. Reductions are issued first;
     /// increases remain withheld until every prior holder reports that all of
     /// its connection tasks observed the shrink between NNTP batches.
-    fn budget_command(&self, node: &str, ack: Option<&BudgetAck>) -> (u64, HashMap<String, u16>) {
+    fn budget_command(
+        &self,
+        node: &str,
+        ack: Option<&BudgetAck>,
+    ) -> (u64, u64, HashMap<String, u16>) {
         let target = self.budget_target();
         let mut state = self.budgets.lock().unwrap();
+        let before = state.clone();
 
         if let Some(ack) = ack {
             if ack.cluster_generation == state.generation && ack.drained {
@@ -576,43 +608,86 @@ impl LeaderShared {
                 .map(|server| (server.name.clone(), 0))
                 .collect()
         });
-        state.revision = state.revision.saturating_add(1).max(1);
-        (state.generation, command)
-    }
-
-    async fn persist_budget_state(&self) {
-        let Some(control) = &self.control else { return };
-        let (revision, json) = {
-            let state = self.budgets.lock().unwrap();
-            (state.revision, serde_json::to_string(&*state))
-        };
-        let Ok(json) = json else { return };
-        if let Err(error) = control
-            .save_budget_state(&self.cfg.cluster_id, revision, &json)
-            .await
-        {
-            tracing::warn!(%error, "provider budget state was not persisted");
+        if *state != before {
+            state.revision = state.revision.saturating_add(1).max(1);
         }
+        (state.revision, state.generation, command)
     }
 
-    async fn restore_budget_state(&self) {
-        let Some(control) = &self.control else { return };
-        match control.load_budget_state(&self.cfg.cluster_id).await {
-            Ok(Some(json)) => match serde_json::from_str(&json) {
-                Ok(state) => *self.budgets.lock().unwrap() = state,
-                Err(error) => {
-                    tracing::error!(%error, "replicated provider budget state is invalid")
-                }
+    async fn persist_budget_state(&self) -> Result<u64, String> {
+        let control = self
+            .control
+            .as_ref()
+            .ok_or("replicated control unavailable")?;
+        let issuer = self.authority_identity();
+        persist_budget_snapshot(
+            &self.budgets,
+            &self.budget_durable_revision,
+            |revision, json| async move {
+                control
+                    .save_budget_state(&self.cfg.cluster_id, revision, &json, issuer)
+                    .await
             },
-            Ok(None) => {}
-            Err(error) => tracing::warn!(%error, "provider budget state could not be restored"),
+        )
+        .await
+    }
+
+    async fn restore_budget_state(&self) -> Result<(), String> {
+        let control = self
+            .control
+            .as_ref()
+            .ok_or("replicated control unavailable")?;
+        let epoch = self.epoch();
+        let mut durable = self.budget_durable_revision.lock().await;
+        let before = self.budgets.lock().unwrap().clone();
+        let restored = control
+            .load_budget_state(&self.cfg.cluster_id)
+            .await?
+            .map(|json| {
+                serde_json::from_str::<BudgetHandoff>(&json).map_err(|error| error.to_string())
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let mut state = self.budgets.lock().unwrap();
+        if !self.is_leader() || self.epoch() != epoch || *state != before {
+            return Err("budget authority changed during durable restore; retry".into());
         }
+        *durable = restored.revision;
+        *state = restored;
+        Ok(())
+    }
+
+    fn budget_command_is_current(
+        &self,
+        epoch: u64,
+        generation: u64,
+        node: &str,
+        command: &HashMap<String, u16>,
+    ) -> bool {
+        if !self.is_leader() || self.epoch() != epoch {
+            return false;
+        }
+        let state = self.budgets.lock().unwrap();
+        state.generation == generation
+            && match state.commands.get(node) {
+                Some(current) => current == command,
+                None => {
+                    command
+                        == &self
+                            .servers
+                            .iter()
+                            .map(|server| (server.name.clone(), 0))
+                            .collect()
+                }
+            }
     }
 
     async fn apply_local_budgets(&self) {
         let by_id = self.servers.iter().map(|s| (s.id, 0u16)).collect();
         let _ = self.engine.set_server_budgets(by_id).await;
-        self.persist_budget_state().await;
+        if let Err(error) = self.persist_budget_state().await {
+            tracing::warn!(%error, "provider budget state was not persisted");
+        }
     }
 
     /// A holder that stopped acknowledging a shrink keeps its capacity
@@ -630,13 +705,20 @@ impl LeaderShared {
             return;
         }
         let mut state = self.budgets.lock().unwrap();
+        let before = state.clone();
         state.grants.remove(node);
         state.commands.remove(node);
         state.awaiting_shrink.remove(node);
+        if let Some(target) = state.pending_target.as_mut() {
+            target.remove(node);
+        }
         if state.pending_target.is_some() && state.awaiting_shrink.is_empty() {
             state.generation = state.generation.saturating_add(1);
             state.grants = state.pending_target.take().unwrap();
             state.commands = state.grants.clone();
+        }
+        if *state != before {
+            state.revision = state.revision.saturating_add(1).max(1);
         }
     }
 
@@ -774,8 +856,24 @@ impl LeaderShared {
                 last_hb: Instant::now(),
             },
         );
-        let (budget_generation, server_budgets) = self.budget_command(node, None);
-        self.persist_budget_state().await;
+        if !self.is_leader() || self.epoch() != issuer_fence {
+            return None;
+        }
+        let (budget_revision, budget_generation, server_budgets) = self.budget_command(node, None);
+        match self.persist_budget_state().await {
+            Ok(revision)
+                if revision >= budget_revision
+                    && self.budget_command_is_current(
+                        issuer_fence,
+                        budget_generation,
+                        node,
+                        &server_budgets,
+                    ) => {}
+            outcome => {
+                tracing::warn!(job=job.id.0, error=?outcome.err(), "grant awaits durable current provider budget");
+                return None;
+            }
+        }
         Some(Grant {
             lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
             lease_id,
@@ -1477,8 +1575,9 @@ async fn work_heartbeat(
         return authority_not_ready();
     }
 
-    let (budget_generation, server_budgets) = s.budget_command(&req.node, req.budget_ack.as_ref());
-    s.persist_budget_state().await;
+    let epoch = s.epoch();
+    let (budget_revision, budget_generation, server_budgets) =
+        s.budget_command(&req.node, req.budget_ack.as_ref());
     let mut cancel = Vec::new();
     let mut renewed = Vec::new();
     let mut accepted_progress = HashMap::new();
@@ -1612,11 +1711,31 @@ async fn work_heartbeat(
             cancel.push(lp.lease_id.clone());
         }
     }
+    // Existing lease renewals do not wait behind an unrelated capacity write.
+    // A failed write withholds the new command; it never fabricates a drain or
+    // increases capacity from state that a successor cannot recover.
+    let server_budgets = match s.persist_budget_state().await {
+        Ok(revision)
+            if revision >= budget_revision
+                && s.budget_command_is_current(
+                    epoch,
+                    budget_generation,
+                    &req.node,
+                    &server_budgets,
+                ) =>
+        {
+            Some(server_budgets)
+        }
+        outcome => {
+            tracing::warn!(error=?outcome.err(), "heartbeat withholds uncommitted provider budget");
+            None
+        }
+    };
     Json(HeartbeatResponse {
         cancel,
         renewed,
         controls,
-        server_budgets: Some(server_budgets),
+        server_budgets,
         budget_generation,
         post_fetch_budgeted: true,
     })
@@ -2307,7 +2426,11 @@ pub fn spawn_leader_task(
                 // New leases arrive via worker heartbeats or fresh grants.
                 shared.authority_ready.store(false, Ordering::Release);
                 shared.leases.lock().unwrap().clear();
-                shared.restore_budget_state().await;
+                if let Err(error) = shared.restore_budget_state().await {
+                    tracing::warn!(%error, "provider budget restore awaits stable authority");
+                    tokio::time::sleep(shared.cfg.lease_interval).await;
+                    continue;
+                }
             }
             if is_leader && !authority_ready {
                 // Retry a refused adoption while this node remains leader.
@@ -4391,7 +4514,220 @@ mod tests {
             1,
             "a one-connection account cannot issue one connection per executor"
         );
+        let (revision, generation, command) = shared.budget_command("worker-a", None);
+        for _ in 0..100 {
+            assert_eq!(
+                shared.budget_command("worker-a", None),
+                (revision, generation, command.clone())
+            );
+        }
+        let mut third = shared.leases.lock().unwrap()["pp-b"].clone();
+        third.node = "worker-c".into();
+        shared.leases.lock().unwrap().insert("pp-c".into(), third);
+        let (shrinking_revision, shrinking_generation, newcomer) =
+            shared.budget_command("worker-c", None);
+        assert!(shrinking_revision > revision);
+        assert!(shrinking_generation > generation);
+        assert!(
+            newcomer.values().all(|cap| *cap == 0),
+            "new capacity waits for both real drains"
+        );
+        let ack = BudgetAck {
+            cluster_generation: shrinking_generation,
+            engine_generation: 7,
+            drained: true,
+        };
+        let (first_ack_revision, first_ack_generation, _) =
+            shared.budget_command("worker-a", Some(&ack));
+        assert!(first_ack_revision > shrinking_revision);
+        assert_eq!(first_ack_generation, shrinking_generation);
+        assert_eq!(
+            shared.budget_command("worker-a", Some(&ack)).0,
+            first_ack_revision,
+            "replayed acknowledgment is not a new durable change"
+        );
+        let (last_ack_revision, grown_generation, _) =
+            shared.budget_command("worker-b", Some(&ack));
+        assert!(last_ack_revision > first_ack_revision);
+        assert!(grown_generation > shrinking_generation);
+        let (_, _, captured_command) = shared.budget_command("worker-c", None);
+        assert!(captured_command["provider"] > 0);
+        assert!(shared.budget_command_is_current(
+            shared.epoch(),
+            grown_generation,
+            "worker-c",
+            &captured_command
+        ));
+        shared.leases.lock().unwrap().remove("pp-c");
+        shared.retire_expired_budget_holder("worker-c");
+        assert_eq!(shared.budgets.lock().unwrap().generation, grown_generation);
+        assert!(
+            !shared.budget_command_is_current(
+                shared.epoch(),
+                grown_generation,
+                "worker-c",
+                &captured_command
+            ),
+            "same-generation retirement cannot issue a captured old expansion"
+        );
+        let retired_revision = shared.budgets.lock().unwrap().revision;
+        assert!(retired_revision > last_ack_revision);
+        shared.retire_expired_budget_holder("worker-c");
+        assert_eq!(shared.budgets.lock().unwrap().revision, retired_revision);
+
+        // Expiry during a shrink must not resurrect the retired holder when
+        // the pending target is promoted, or wait forever for its drain ACK.
+        let mut third = shared.leases.lock().unwrap()["pp-b"].clone();
+        third.node = "worker-c".into();
+        shared
+            .leases
+            .lock()
+            .unwrap()
+            .insert("pp-c".into(), third.clone());
+        shared.budget_command("worker-c", None);
+        third.node = "worker-d".into();
+        shared.leases.lock().unwrap().insert("pp-d".into(), third);
+        shared.budget_command("worker-d", None);
+        assert!(shared
+            .budgets
+            .lock()
+            .unwrap()
+            .awaiting_shrink
+            .contains("worker-b"));
+        shared.retire_expired_budget_holder("worker-b");
+        assert!(
+            shared
+                .budgets
+                .lock()
+                .unwrap()
+                .awaiting_shrink
+                .contains("worker-b"),
+            "a live lease still reserves its old capacity"
+        );
+        shared.leases.lock().unwrap().remove("pp-b");
+        shared.retire_expired_budget_holder("worker-b");
+        assert!(!shared
+            .budgets
+            .lock()
+            .unwrap()
+            .pending_target
+            .as_ref()
+            .unwrap()
+            .contains_key("worker-b"));
+        shared.leases.lock().unwrap().remove("pp-c");
+        shared.retire_expired_budget_holder("worker-c");
+        {
+            let state = shared.budgets.lock().unwrap();
+            assert!(state.pending_target.is_none());
+            assert!(state.awaiting_shrink.is_empty());
+            assert!(!state.commands.contains_key("worker-b"));
+            assert!(!state.commands.contains_key("worker-c"));
+        }
+        let (_, _, survivor) = shared.budget_command("worker-d", None);
+        assert_eq!(survivor["provider"], 4);
+        assert!(shared.budgets.lock().unwrap().awaiting_shrink.is_empty());
         engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn budget_persistence_coalesces_writes_without_acknowledging_unsaved_changes() {
+        let budgets = Arc::new(Mutex::new(BudgetHandoff::default()));
+        let durable = Arc::new(tokio::sync::Mutex::new(0));
+        assert_eq!(
+            persist_budget_snapshot(&budgets, &durable, |_, _| async {
+                panic!("empty state needs no Raft write")
+            })
+            .await
+            .unwrap(),
+            0
+        );
+        budgets.lock().unwrap().revision = 1;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first = {
+            let budgets = budgets.clone();
+            let durable = durable.clone();
+            tokio::spawn(async move {
+                persist_budget_snapshot(&budgets, &durable, |revision, json| async move {
+                    assert_eq!(revision, 1);
+                    assert_eq!(
+                        serde_json::from_str::<BudgetHandoff>(&json)
+                            .unwrap()
+                            .revision,
+                        1
+                    );
+                    entered_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    Ok(())
+                })
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let mut state = budgets.lock().unwrap();
+            state.revision = 2;
+            state.generation = 1;
+        }
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), first)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            *durable.lock().await,
+            1,
+            "saving R must not acknowledge R+1"
+        );
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let save = |revision, json: String| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                assert_eq!(revision, 2);
+                assert_eq!(
+                    serde_json::from_str::<BudgetHandoff>(&json)
+                        .unwrap()
+                        .generation,
+                    1
+                );
+                Ok(())
+            }
+        };
+        let (left, right) = tokio::join!(
+            persist_budget_snapshot(&budgets, &durable, save),
+            persist_budget_snapshot(&budgets, &durable, save),
+        );
+        assert_eq!(left.unwrap(), 2);
+        assert_eq!(right.unwrap(), 2);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "concurrent unchanged snapshots issue one write"
+        );
+        budgets.lock().unwrap().revision = 3;
+        assert!(persist_budget_snapshot(&budgets, &durable, |_, _| async {
+            Err("injected durable write failure".into())
+        })
+        .await
+        .is_err());
+        assert_eq!(*durable.lock().await, 2);
+        assert_eq!(
+            persist_budget_snapshot(&budgets, &durable, |revision, _| async move {
+                assert_eq!(revision, 3);
+                Ok(())
+            })
+            .await
+            .unwrap(),
+            3,
+            "the failed revision remains retryable"
+        );
     }
 
     #[tokio::test]

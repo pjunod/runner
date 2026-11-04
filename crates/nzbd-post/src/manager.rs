@@ -7660,10 +7660,33 @@ mod decision_tests {
             vec![("monarr-transfer".into(), "failed-archive-token".into())],
         );
         request.delivery_lifecycle = true;
-        let assessed =
-            extract_complete_failed_archives(&engine, &PostConfig::default(), &request, &None)
-                .await
-                .unwrap();
+        // Own the source throughout extraction and commit, as the real stage
+        // pipeline does. Startup inventory reconciliation can still be joining.
+        let ctx = PpCtx::default();
+        let attempt = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match crate::attempt::AttemptControl::new(&engine, &ctx, request.id).await {
+                    Err(PostError::Subprocess(reason))
+                        if reason
+                            == "previous processing or allocation workers have not quiesced" =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    other => break other.unwrap(),
+                }
+            }
+        })
+        .await
+        .expect("archive fixture must acquire exact source custody after startup joins");
+        let assessed = crate::attempt::CURRENT
+            .scope(attempt.clone(), async {
+                extract_complete_failed_archives(&engine, &PostConfig::default(), &request, &None)
+                    .await
+            })
+            .await;
+        attempt.finish_filesystem_work().await.unwrap();
+        drop(attempt);
+        let assessed = assessed.unwrap();
         let completed = temp.path().join("completed");
         let salvage = salvage_failed_delivery(
             &inventory,
