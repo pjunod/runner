@@ -7886,6 +7886,8 @@ impl Owner {
                 expected_identity,
                 collect_naming,
                 naming_inventory: collect_naming.then(|| owner.artifacts.clone()),
+                #[cfg(test)]
+                naming_test_hook: None,
             };
             let writer = spawn_writer_scoped(
                 &owner.tracker,

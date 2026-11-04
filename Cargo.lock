@@ -2790,6 +2790,7 @@ dependencies = [
  "md-5",
  "nzbd-engine",
  "nzbd-nserv",
+ "nzbd-nzb",
  "nzbd-par2",
  "nzbd-state",
  "nzbd-types",

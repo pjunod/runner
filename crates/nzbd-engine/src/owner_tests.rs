@@ -7331,7 +7331,12 @@ fn failed_receipt_settles_when_its_source_is_gone() {
 #[tokio::test]
 async fn naming_expectations_require_current_writer_and_durable_finalization() {
     use nzbd_state::artifacts::writer_naming::{verify_producer_read, NamingCandidate};
-    for (current, durable) in [(false, true), (true, false), (true, true)] {
+    for (current, durable, replace_pending) in [
+        (false, true, false),
+        (true, false, false),
+        (true, true, true),
+        (true, true, false),
+    ] {
         let allowed = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let gate = allowed.clone();
         let (_temp, mut owner, _adapter, mut messages) = control_test_owner_with_persistence(
@@ -7383,6 +7388,13 @@ async fn naming_expectations_require_current_writer_and_durable_finalization() {
                 naming: Some(naming),
             },
         });
+        if replace_pending {
+            // The completion was accepted, but its durable acknowledgement has
+            // not been delivered to the owner. A replacement wins that race.
+            assert!(!owner.persistence_callbacks.is_empty());
+            owner.writer_epochs.insert(FileId(10), 100);
+            owner.artifacts.invalidate_writer_naming_file(1, 10);
+        }
         pump(&mut owner, &mut messages).await;
         let found = owner.artifacts.take_writer_naming(
             1,
@@ -7394,7 +7406,7 @@ async fn naming_expectations_require_current_writer_and_durable_finalization() {
         );
         assert_eq!(
             found.len(),
-            usize::from(current && durable),
+            usize::from(current && durable && !replace_pending),
             "only matching durable completion admits naming evidence"
         );
         if !current || !durable {

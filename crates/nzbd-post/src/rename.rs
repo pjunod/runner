@@ -191,24 +191,26 @@ pub fn naming_candidates(
     job: &nzbd_types::Job,
     dir: &Path,
 ) -> Vec<nzbd_state::artifacts::writer_naming::NamingCandidate> {
+    let mut generations = std::collections::HashMap::new();
+    let mut publications = std::collections::HashMap::new();
+    for (key, value) in &job.params {
+        if let Some(file) = key.strip_prefix("*File:generation:") {
+            generations.entry(file).or_insert(value);
+        } else if let Some(file) = key.strip_prefix("*File:publication:") {
+            publications.entry(file).or_insert(value);
+        }
+    }
     job.files
         .iter()
         .filter_map(|file| {
             if !file.finalized || file.crc32.is_none() || file.is_par2 {
                 return None;
             }
-            let generation = job
-                .params
-                .iter()
-                .find(|(key, _)| key == &format!("*File:generation:{}", file.id.0))?
-                .1
-                .parse()
-                .ok()?;
-            let name = job
-                .params
-                .iter()
-                .find(|(key, _)| key == &format!("*File:publication:{}", file.id.0))
-                .map_or(file.filename.as_str(), |(_, name)| name.as_str());
+            let file_key = file.id.0.to_string();
+            let generation = generations.get(file_key.as_str())?.parse().ok()?;
+            let name = publications
+                .get(file_key.as_str())
+                .map_or(file.filename.as_str(), |name| name.as_str());
             let relative = crate::namespace::relative(name).ok()?;
             Some(nzbd_state::artifacts::writer_naming::NamingCandidate {
                 file: file.id.0,

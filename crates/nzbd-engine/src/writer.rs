@@ -51,6 +51,8 @@ pub(crate) struct WriterScope {
     pub expected_identity: Option<Identity>,
     pub collect_naming: bool,
     pub naming_inventory: Option<std::sync::Arc<nzbd_state::artifacts::Inventory>>,
+    #[cfg(test)]
+    pub naming_test_hook: Option<std::sync::Arc<dyn Fn(&'static str) + Send + Sync>>,
 }
 
 #[derive(Debug)]
@@ -197,14 +199,20 @@ impl Reporter {
                     ok,
                     final_path,
                     combined_crc,
+                    naming,
                     ..
-                } => EngineMsg::WriterFinalized {
-                    job: self.job,
-                    file: self.file,
-                    ok,
-                    final_path,
-                    combined_crc,
-                },
+                } => {
+                    if naming.is_some() {
+                        let _ = tokio::task::spawn_blocking(move || drop(naming)).await;
+                    }
+                    EngineMsg::WriterFinalized {
+                        job: self.job,
+                        file: self.file,
+                        ok,
+                        final_path,
+                        combined_crc,
+                    }
+                }
                 WriterFact::Error { error } => EngineMsg::WriterError {
                     job: self.job,
                     file: self.file,
@@ -217,7 +225,23 @@ impl Reporter {
                 },
             }
         };
-        self.tx.send(message).await.is_ok()
+        match self.tx.send(message).await {
+            Ok(()) => true,
+            Err(error) => {
+                if let EngineMsg::ScopedWriter {
+                    fact:
+                        WriterFact::Finalized {
+                            naming: Some(naming),
+                            ..
+                        },
+                    ..
+                } = error.0
+                {
+                    let _ = tokio::task::spawn_blocking(move || drop(naming)).await;
+                }
+                false
+            }
+        }
     }
     async fn error(&self, error: impl ToString) {
         self.send(WriterFact::Error {
@@ -568,14 +592,18 @@ async fn writer_task(
                         collect_naming: scope.collect_naming,
                         naming_inventory: scope.naming_inventory.clone(),
                         cancellation: stop.clone(),
+                        #[cfg(test)]
+                        naming_test_hook: scope.naming_test_hook.clone(),
                     },
                 )
                 .await;
                 if stop.is_cancelled() {
-                    if let (Ok((_, Some(naming))), Some(inventory)) =
-                        (result, scope.naming_inventory.as_ref())
-                    {
-                        inventory.discard_writer_naming(naming);
+                    if let Ok((_, Some(naming))) = result {
+                        if let Some(inventory) = scope.naming_inventory.as_ref() {
+                            inventory.discard_writer_naming(naming);
+                        } else {
+                            let _ = tokio::task::spawn_blocking(move || drop(naming)).await;
+                        }
                     }
                     return;
                 }
@@ -624,6 +652,8 @@ struct FinalizeOptions {
     collect_naming: bool,
     naming_inventory: Option<std::sync::Arc<nzbd_state::artifacts::Inventory>>,
     cancellation: tokio_util::sync::CancellationToken,
+    #[cfg(test)]
+    naming_test_hook: Option<std::sync::Arc<dyn Fn(&'static str) + Send + Sync>>,
 }
 
 /// The writer owns and joins this worker before publishing its stopped fact.
@@ -640,6 +670,8 @@ async fn verify_complete(
     let cancel = options.cancellation.clone();
     let collect = options.collect_naming;
     let inventory = options.naming_inventory.clone();
+    #[cfg(test)]
+    let hook = options.naming_test_hook.clone();
     tokio::task::spawn_blocking(move || {
         if let Some(inventory) = inventory {
             inventory.prepare_writer_naming();
@@ -652,19 +684,30 @@ async fn verify_complete(
             require_valid(&path, 0, 0, crc, Some(&expected))?;
             return Ok(None);
         }
-        nzbd_state::artifacts::writer_naming::verify_producer_read(
+        let result = nzbd_state::artifacts::writer_naming::verify_producer_read(
             file,
             size,
             crc,
             collect,
             &|| {
+                #[cfg(test)]
+                if let Some(hook) = &hook {
+                    hook("scan");
+                }
                 if cancel.is_cancelled() {
                     Err(std::io::ErrorKind::Interrupted.into())
                 } else {
                     Ok(())
                 }
             },
-        )
+        );
+        #[cfg(test)]
+        if result.as_ref().is_ok_and(|naming| naming.is_some()) {
+            if let Some(hook) = &hook {
+                hook("after_crc");
+            }
+        }
+        result
     })
     .await
     .map_err(std::io::Error::other)?
@@ -744,39 +787,61 @@ async fn finalize(
     } else {
         None
     };
-    if options.cancellation.is_cancelled() {
-        return Err(std::io::ErrorKind::Interrupted.into());
-    }
-    // Keep the writer descriptor alive while checking path and publishing.
-    let source = nzbd_state::fileops::open(part).map_err(std::io::Error::other)?;
-    if recovery::capture_identity(&source).map_err(std::io::Error::other)? != identity {
-        return Err(identity_error());
-    }
-    match nzbd_state::fileops::link(part, final_path) {
-        Ok(()) => {}
-        Err(nzbd_state::artifacts::Error::Io(error))
-            if error.kind() == std::io::ErrorKind::AlreadyExists =>
-        {
-            let target = nzbd_state::fileops::open(final_path).map_err(std::io::Error::other)?;
-            let target_identity =
-                recovery::capture_identity(&target).map_err(std::io::Error::other)?;
-            if !target_identity.same_object(&identity)
-                || target_identity.bytes != identity.bytes
-                || target_identity.modified != identity.modified
-            {
-                return Err(identity_error());
-            }
+    let publication = async {
+        if options.cancellation.is_cancelled() {
+            return Err(std::io::ErrorKind::Interrupted.into());
         }
-        Err(error) => return Err(std::io::Error::other(error)),
+        // Keep the writer descriptor alive while checking path and publishing.
+        let source = nzbd_state::fileops::open(part).map_err(std::io::Error::other)?;
+        if recovery::capture_identity(&source).map_err(std::io::Error::other)? != identity {
+            return Err(identity_error());
+        }
+        match nzbd_state::fileops::link(part, final_path) {
+            Ok(()) => {}
+            Err(nzbd_state::artifacts::Error::Io(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                let target =
+                    nzbd_state::fileops::open(final_path).map_err(std::io::Error::other)?;
+                let target_identity =
+                    recovery::capture_identity(&target).map_err(std::io::Error::other)?;
+                if !target_identity.same_object(&identity)
+                    || target_identity.bytes != identity.bytes
+                    || target_identity.modified != identity.modified
+                {
+                    return Err(identity_error());
+                }
+            }
+            Err(error) => return Err(std::io::Error::other(error)),
+        }
+        if let Some(parent) = final_path.parent() {
+            File::open(parent).await?.sync_all().await?;
+        }
+        tokio::fs::remove_file(part).await?;
+        if let Some(parent) = part.parent() {
+            File::open(parent).await?.sync_all().await?;
+        }
+        let identity = file_identity(out.as_ref().unwrap()).await?;
+        Ok::<_, std::io::Error>(identity)
     }
-    if let Some(parent) = final_path.parent() {
-        File::open(parent).await?.sync_all().await?;
-    }
-    tokio::fs::remove_file(part).await?;
-    if let Some(parent) = part.parent() {
-        File::open(parent).await?.sync_all().await?;
-    }
-    let identity = file_identity(out.as_ref().unwrap()).await?;
+    .await;
+    let identity = match publication {
+        Ok(identity) => identity,
+        Err(error) => {
+            // Even an optional read handle can block in close on the source
+            // filesystem. Join its disposal before reporting writer quiescence.
+            tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some(hook) = &options.naming_test_hook {
+                    hook("dispose");
+                }
+                drop(naming);
+            })
+            .await
+            .map_err(std::io::Error::other)?;
+            return Err(error);
+        }
+    };
     let naming = publish_naming(naming, final_path, &identity).await;
     drop(out.take());
     Ok((identity, naming))
@@ -833,6 +898,181 @@ pub(crate) fn validate_range_checked(
 mod tests {
     use super::*;
     use tokio::sync::mpsc::channel;
+
+    async fn naming_writer_event(events: &mut mpsc::Receiver<EngineMsg>) -> Option<EngineMsg> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("writer must report within the fixture deadline")
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_publication_failure_join_naming_workers_before_stopped() {
+        for boundary in ["scan", "after_crc", "collision"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let tracker = TaskTracker::new();
+            let (tx, mut events) = channel(8);
+            let (entered_tx, mut entered) = tokio::sync::mpsc::unbounded_channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let blocked = std::sync::Mutex::new(blocked);
+            let hook = std::sync::Arc::new(move |stage| {
+                let wait = match boundary {
+                    "scan" => stage == "scan",
+                    "after_crc" => matches!(stage, "after_crc" | "dispose"),
+                    _ => stage == "dispose",
+                };
+                if wait {
+                    entered_tx.send(stage).unwrap();
+                    blocked.lock().unwrap().recv().unwrap();
+                }
+            });
+            let mut writer = spawn_writer_scoped(
+                &tracker,
+                JobId(1),
+                FileId(2),
+                tmp.path().into(),
+                "done".into(),
+                tx,
+                WriterScope {
+                    collect_naming: true,
+                    naming_test_hook: Some(hook),
+                    ..Default::default()
+                },
+            );
+            let bytes = b"mandatory CRC and optional naming";
+            writer
+                .tx
+                .send(WriteCmd::Segment {
+                    seg_number: 1,
+                    offset: 0,
+                    data: bytes.to_vec(),
+                    crc: crc32fast::hash(bytes),
+                    file_size: bytes.len() as u64,
+                    server: ServerId(1),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                naming_writer_event(&mut events).await,
+                Some(EngineMsg::ScopedWriter {
+                    fact: WriterFact::Written { .. },
+                    ..
+                })
+            ));
+            if boundary == "collision" {
+                std::fs::write(tmp.path().join("done"), b"unrelated existing destination").unwrap();
+            }
+            writer
+                .tx
+                .send(WriteCmd::Finalize {
+                    file_size: bytes.len() as u64,
+                    combined_crc: Some(crc32fast::hash(bytes)),
+                })
+                .await
+                .unwrap();
+            let stage = tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stage,
+                if boundary == "collision" {
+                    "dispose"
+                } else {
+                    boundary
+                }
+            );
+            if boundary != "collision" {
+                writer.stop.cancel();
+            }
+            // This current-thread runtime can still run while the worker is
+            // blocked. Cancellation alone cannot announce writer quiescence.
+            tokio::task::yield_now().await;
+            assert!(!*writer.stopped.borrow());
+            release.send(()).unwrap();
+            if boundary == "after_crc" {
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
+                        .await
+                        .unwrap(),
+                    Some("dispose")
+                );
+                assert!(!*writer.stopped.borrow());
+                release.send(()).unwrap();
+            }
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                writer.stopped.wait_for(|done| *done),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                std::fs::read(tmp.path().join(".runner-file-2.part")).unwrap(),
+                bytes
+            );
+            if boundary == "collision" {
+                assert_eq!(
+                    std::fs::read(tmp.path().join("done")).unwrap(),
+                    b"unrelated existing destination"
+                );
+            } else {
+                assert!(!tmp.path().join("done").exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_without_combined_crc_publishes_without_naming_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tracker = TaskTracker::new();
+        let (tx, mut events) = channel(8);
+        let writer = spawn_writer_scoped(
+            &tracker,
+            JobId(1),
+            FileId(2),
+            tmp.path().into(),
+            "done".into(),
+            tx,
+            WriterScope {
+                collect_naming: true,
+                ..Default::default()
+            },
+        );
+        writer
+            .tx
+            .send(WriteCmd::Segment {
+                seg_number: 1,
+                offset: 0,
+                data: b"data".to_vec(),
+                crc: crc32fast::hash(b"data"),
+                file_size: 4,
+                server: ServerId(1),
+            })
+            .await
+            .unwrap();
+        naming_writer_event(&mut events).await.unwrap();
+        writer
+            .tx
+            .send(WriteCmd::Finalize {
+                file_size: 4,
+                combined_crc: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            naming_writer_event(&mut events).await,
+            Some(EngineMsg::ScopedWriter {
+                fact: WriterFact::Finalized {
+                    ok: true,
+                    naming: None,
+                    combined_crc: None,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(tmp.path().join("done")).unwrap(), b"data");
+    }
 
     /// Writes segments out of order with a gap, finalizes, and checks the
     /// assembled bytes (gap zero-filled, exact final size, `.part` renamed).

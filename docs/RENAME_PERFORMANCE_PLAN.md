@@ -177,6 +177,15 @@ yield successful restore, verified-source promotion or consumer publication.
 
 ## 5. Tests, merge and rollout
 
+Astra's first complete implementation review on 2026-11-04 requested joined
+descriptor disposal on every post-CRC error path and stronger async-boundary
+coverage. Corrections also preindex naming parameters rather than repeatedly
+scanning them. Qualification must cover a blocked real writer scan, cancellation
+after CRC, publication collision, replacement while a durable acknowledgement
+is pending, and conservative fallback when no producer evidence is available.
+The real download fixture includes known paused PAR recovery volumes and a
+multi-segment file. Review these corrections before executing modified units.
+
 ```bash
 export CARGO_TARGET_DIR=/private/tmp/lifecycle-build-20261101/runner
 cargo fmt --all -- --check
