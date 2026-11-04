@@ -44,11 +44,13 @@ pub struct WriterHandle {
     pub generation: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct WriterScope {
     pub generation: u64,
     pub proven: Vec<ProvenRange>,
     pub expected_identity: Option<Identity>,
+    pub collect_naming: bool,
+    pub naming_inventory: Option<std::sync::Arc<nzbd_state::artifacts::Inventory>>,
 }
 
 #[derive(Debug)]
@@ -67,6 +69,7 @@ pub(crate) enum WriterFact {
         final_path: Option<PathBuf>,
         combined_crc: Option<u32>,
         identity: Option<Identity>,
+        naming: Option<nzbd_state::artifacts::writer_naming::PublishedProducerRead>,
     },
     Error {
         error: String,
@@ -521,6 +524,7 @@ async fn writer_task(
                                 final_path: Some(part_path.clone()),
                                 combined_crc: None,
                                 identity: Some(identity),
+                                naming: None,
                             })
                             .await;
                     }
@@ -558,18 +562,32 @@ async fn writer_task(
                     &final_path,
                     &mut out,
                     &expected,
-                    file_size,
-                    combined_crc,
+                    FinalizeOptions {
+                        file_size,
+                        combined_crc,
+                        collect_naming: scope.collect_naming,
+                        naming_inventory: scope.naming_inventory.clone(),
+                        cancellation: stop.clone(),
+                    },
                 )
                 .await;
+                if stop.is_cancelled() {
+                    if let (Ok((_, Some(naming))), Some(inventory)) =
+                        (result, scope.naming_inventory.as_ref())
+                    {
+                        inventory.discard_writer_naming(naming);
+                    }
+                    return;
+                }
                 match result {
-                    Ok(identity) => {
+                    Ok((identity, naming)) => {
                         report
                             .send(WriterFact::Finalized {
                                 ok: true,
                                 final_path: Some(final_path.clone()),
                                 combined_crc,
                                 identity: Some(identity),
+                                naming,
                             })
                             .await;
                     }
@@ -600,15 +618,86 @@ fn require_valid(
     }
 }
 
+struct FinalizeOptions {
+    file_size: u64,
+    combined_crc: Option<u32>,
+    collect_naming: bool,
+    naming_inventory: Option<std::sync::Arc<nzbd_state::artifacts::Inventory>>,
+    cancellation: tokio_util::sync::CancellationToken,
+}
+
+/// The writer owns and joins this worker before publishing its stopped fact.
+/// Naming digests share the mandatory CRC pass; publication still follows CRC.
+async fn verify_complete(
+    path: &Path,
+    identity: &Identity,
+    size: u64,
+    crc: u32,
+    options: &FinalizeOptions,
+) -> std::io::Result<Option<nzbd_state::artifacts::writer_naming::ProducerRead>> {
+    let path = path.to_owned();
+    let expected = identity.clone();
+    let cancel = options.cancellation.clone();
+    let collect = options.collect_naming;
+    let inventory = options.naming_inventory.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Some(inventory) = inventory {
+            inventory.prepare_writer_naming();
+        }
+        let file = nzbd_state::fileops::open(&path).map_err(std::io::Error::other)?;
+        if recovery::capture_identity(&file).map_err(std::io::Error::other)? != expected {
+            return Err(identity_error());
+        }
+        if size == 0 {
+            require_valid(&path, 0, 0, crc, Some(&expected))?;
+            return Ok(None);
+        }
+        nzbd_state::artifacts::writer_naming::verify_producer_read(
+            file,
+            size,
+            crc,
+            collect,
+            &|| {
+                if cancel.is_cancelled() {
+                    Err(std::io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+async fn publish_naming(
+    naming: Option<nzbd_state::artifacts::writer_naming::ProducerRead>,
+    path: &Path,
+    identity: &Identity,
+) -> Option<nzbd_state::artifacts::writer_naming::PublishedProducerRead> {
+    let naming = naming?;
+    let path = path.to_owned();
+    let identity = identity.clone();
+    // Optional locator checks and rejected descriptor closure stay off Tokio.
+    tokio::task::spawn_blocking(move || naming.published(&path, &identity))
+        .await
+        .ok()
+        .flatten()
+}
+
 async fn finalize(
     dir: &Path,
     part: &Path,
     final_path: &Path,
     out: &mut Option<File>,
     expected: &Option<Identity>,
-    file_size: u64,
-    combined_crc: Option<u32>,
-) -> std::io::Result<Identity> {
+    options: FinalizeOptions,
+) -> std::io::Result<(
+    Identity,
+    Option<nzbd_state::artifacts::writer_naming::PublishedProducerRead>,
+)> {
+    let file_size = options.file_size;
+    let combined_crc = options.combined_crc;
     if out.is_none() {
         match nzbd_state::fileops::writer(part, false) {
             Ok(file) => *out = Some(File::from_std(file)),
@@ -626,10 +715,13 @@ async fn finalize(
                     return Err(identity_error());
                 }
                 if let Some(crc) = combined_crc {
-                    return require_valid(final_path, 0, file_size, crc, Some(&identity));
+                    let naming =
+                        verify_complete(final_path, &identity, file_size, crc, &options).await?;
+                    let naming = publish_naming(naming, final_path, &identity).await;
+                    return Ok((identity, naming));
                 }
                 if expected.is_some() {
-                    return Ok(identity);
+                    return Ok((identity, None));
                 }
                 return Err(identity_error());
             }
@@ -647,8 +739,13 @@ async fn finalize(
     if file_size > 0 && identity.bytes != file_size {
         return Err(identity_error());
     }
-    if let Some(crc) = combined_crc {
-        require_valid(part, 0, file_size, crc, Some(&identity))?;
+    let naming = if let Some(crc) = combined_crc {
+        verify_complete(part, &identity, file_size, crc, &options).await?
+    } else {
+        None
+    };
+    if options.cancellation.is_cancelled() {
+        return Err(std::io::ErrorKind::Interrupted.into());
     }
     // Keep the writer descriptor alive while checking path and publishing.
     let source = nzbd_state::fileops::open(part).map_err(std::io::Error::other)?;
@@ -680,8 +777,9 @@ async fn finalize(
         File::open(parent).await?.sync_all().await?;
     }
     let identity = file_identity(out.as_ref().unwrap()).await?;
+    let naming = publish_naming(naming, final_path, &identity).await;
     drop(out.take());
-    Ok(identity)
+    Ok((identity, naming))
 }
 
 #[cfg(test)]
@@ -1265,6 +1363,7 @@ mod tests {
                     crc: 42,
                 }],
                 expected_identity: Some(identity),
+                ..WriterScope::default()
             },
         );
         for (seg_number, crc) in [(2, 42), (1, 43)] {

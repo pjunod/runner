@@ -384,6 +384,7 @@ impl Owner {
     }
 
     pub(super) fn queue_verification(&mut self, job: JobId) {
+        self.artifacts.invalidate_writer_naming(job.0);
         let Some(current) = self.state.job(job) else {
             return;
         };

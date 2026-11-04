@@ -1,6 +1,6 @@
 # Rename performance — reuse producer reads and keep verified commits
 
-**Status:** proposed for Astra review · **Written:** 2026-11-04
+**Status:** implementation candidate; plan approved by Astra · **Written:** 2026-11-04
 (America/New_York) · **Base:** `01750d85` · **Branch:** `codex/rename-performance`
 
 Companion to [publication performance](PUBLICATION_PERFORMANCE_PLAN.md) and
@@ -58,6 +58,15 @@ jobs or worker transport. No complete CRC/coverage means no naming evidence
 and no extra scan. Only data files in jobs with known PAR metadata collect
 optional digests; other jobs retain CRC-only work. This moves digest CPU
 into an existing required read; it does not remove all hashing CPU.
+
+Implementation interfaces are in
+[writer_naming](../crates/nzbd-state/src/artifacts/writer_naming.rs):
+`verify_producer_read` issues an opaque `ProducerRead`; `published` checks a
+separate locator; `remember_writer_naming` admits an owner allocation snapshot
+after durable acknowledgement; `take_writer_naming` consumes current file
+scopes. `restore_file_expected` retains the existing final SHA/journal
+boundary. Installation performs no filesystem or database I/O on the owner;
+fresh validation and retired-descriptor closure run on existing blocking lanes.
 
 ### 2.2 Exact admission and bounded descriptor lifetime
 

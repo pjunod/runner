@@ -25,6 +25,39 @@ fn digest_open(file: &mut File) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn digest_open_observed(
+    file: &mut File,
+    checkpoint: &dyn Fn() -> std::io::Result<()>,
+    scanned: &dyn Fn(u64),
+) -> Result<(String, u64)> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek};
+    checkpoint()?;
+    let before = fs::identity_for_file(file)?;
+    file.rewind()?;
+    let mut digest = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buffer = [0; 65536];
+    loop {
+        checkpoint()?;
+        let n = file.read(&mut buffer)?;
+        crate::fileops::payload_read(n);
+        scanned(n as u64);
+        if n == 0 {
+            break;
+        }
+        bytes += n as u64;
+        digest.update(&buffer[..n]);
+    }
+    checkpoint()?;
+    if fs::identity_for_file(file)? != before || bytes != before.bytes {
+        return Err(Error::Conflict(
+            "file changed while verifying owned rename".into(),
+        ));
+    }
+    Ok((format!("{:x}", digest.finalize()), bytes))
+}
+
 fn rename_transition_matches(before: &Identity, after: &Identity) -> bool {
     before.same_object(after) && before.bytes == after.bytes && before.modified == after.modified
 }
@@ -1230,12 +1263,24 @@ impl Inventory {
     }
 }
 
+enum RestoreContent<'a> {
+    Source(Option<&'a crate::fileops::ContentProof>),
+    Expected(&'a writer_naming::NamingEvidence),
+}
+
 impl Inventory {
     /// Journal an intact file's identity before restoring a catalog path.
     pub fn restore_file(&self, job: u32, from: &Path, to: &Path) -> Result<()> {
-        self.restore_file_inner(job, from, to, None)
+        self.restore_file_inner(
+            job,
+            from,
+            to,
+            RestoreContent::Source(None),
+            &|| Ok(()),
+            &|_| {},
+        )
+        .map(|_| ())
     }
-
     pub fn restore_file_with_proof(
         &self,
         job: u32,
@@ -1243,17 +1288,71 @@ impl Inventory {
         to: &Path,
         proof: &crate::fileops::ContentProof,
     ) -> Result<()> {
-        self.restore_file_inner(job, from, to, Some(proof))
+        self.restore_file_with_proof_observed(job, from, to, proof, &|| Ok(()), &|_| {})
+            .map(|_| ())
     }
-
+    pub fn restore_file_with_proof_observed(
+        &self,
+        job: u32,
+        from: &Path,
+        to: &Path,
+        proof: &crate::fileops::ContentProof,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+        scanned: &dyn Fn(u64),
+    ) -> Result<writer_naming::RestoreMetrics> {
+        self.restore_file_inner(
+            job,
+            from,
+            to,
+            RestoreContent::Source(Some(proof)),
+            checkpoint,
+            scanned,
+        )
+    }
+    pub fn restore_file_expected(
+        &self,
+        job: u32,
+        from: &Path,
+        to: &Path,
+        expected: &writer_naming::NamingEvidence,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+        scanned: &dyn Fn(u64),
+    ) -> Result<writer_naming::RestoreMetrics> {
+        self.restore_file_inner(
+            job,
+            from,
+            to,
+            RestoreContent::Expected(expected),
+            checkpoint,
+            scanned,
+        )
+    }
     fn restore_file_inner(
         &self,
         job: u32,
         from: &Path,
         to: &Path,
-        proof: Option<&crate::fileops::ContentProof>,
-    ) -> Result<()> {
+        content: RestoreContent<'_>,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+        scanned: &dyn Fn(u64),
+    ) -> Result<writer_naming::RestoreMetrics> {
         use sha2::{Digest, Sha256};
+        let expected_token = match &content {
+            RestoreContent::Expected(token) => Some(*token),
+            _ => None,
+        };
+        let check = || -> std::io::Result<()> {
+            checkpoint()?;
+            if expected_token.is_some_and(|token| !token.live()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "producer naming expectation was revoked",
+                ));
+            }
+            Ok(())
+        };
+        check()?;
+        let mut metrics = writer_naming::RestoreMetrics::default();
         let mut source = self.for_job(job)?.ok_or(Error::NotFound)?;
         let original = source.clone();
         let _lease = self
@@ -1276,14 +1375,24 @@ impl Inventory {
         let identity = fs::identity_for_file(&file)?;
         // Keep the potentially large content pass outside the global mutation
         // lock, then revalidate the exact source generation and identity.
-        let digest = match proof {
-            Some(proof) if proof.identity == identity => proof.sha256.clone(),
-            Some(_) => {
-                return Err(Error::Conflict(
-                    "restore fingerprint identity changed".into(),
-                ))
+        let digest = match content {
+            RestoreContent::Expected(expected) => {
+                if expected.job() != job || !self.naming_candidate_matches(expected, from) {
+                    return Err(Error::Conflict(
+                        "producer naming expectation no longer matches source".into(),
+                    ));
+                }
+                expected.expected_sha().to_owned()
             }
-            None => digest_open(&mut file.try_clone()?)?,
+            RestoreContent::Source(proof) => match proof {
+                Some(proof) if proof.identity == identity => proof.sha256.clone(),
+                Some(_) => {
+                    return Err(Error::Conflict(
+                        "restore fingerprint identity changed".into(),
+                    ))
+                }
+                None => digest_open(&mut file.try_clone()?)?,
+            },
         };
         let current = self.for_job(job)?.ok_or(Error::NotFound)?;
         if current.id != source.id
@@ -1323,6 +1432,8 @@ impl Inventory {
             next_retry: 0,
             error: None,
         };
+        check()?;
+        let journal_started = Instant::now();
         {
             let _coordinator = self.mutation_guard()?;
             self.check_payload_capture(&original)?;
@@ -1338,23 +1449,37 @@ impl Inventory {
             }
             save_operation(&self.db.lock().unwrap(), &op)?;
         }
+        metrics.journal_ms += journal_started.elapsed().as_millis() as u64;
         let previous = op.clone();
+        check()?;
+        let namespace_started = Instant::now();
         if let Some(parent) = new.parent() {
             crate::fileops::parents(&source.path, parent)?;
         }
         fs::rename_exclusive(from, to)?;
         let observed = fs::open_relative(&root, &new.to_string_lossy())?;
         let observed_identity = fs::identity_for_file(&observed)?;
+        metrics.namespace_ms = namespace_started.elapsed().as_millis() as u64;
+        let readback_started = Instant::now();
+        let (observed_digest, bytes) =
+            digest_open_observed(&mut observed.try_clone()?, &check, scanned)?;
+        metrics.readback_ms = readback_started.elapsed().as_millis() as u64;
+        metrics.readback_bytes = bytes;
         if !rename_transition_matches(&identity, &observed_identity)
-            || digest_open(&mut observed.try_clone()?)? != digest
+            || observed_digest != digest
             || fs::identity_for_file(&observed)? != observed_identity
             || crate::fileops::identity(&crate::fileops::open(to)?)? != observed_identity
         {
             return Err(Error::Conflict("restore identity changed".into()));
         }
+        check()?;
+        let manifest_started = Instant::now();
         source.files = fs::manifest(&root, 100_000)?;
+        metrics.manifest_ms = manifest_started.elapsed().as_millis() as u64;
         source.revision += 1;
         op.state = "succeeded".into();
+        check()?;
+        let journal_started = Instant::now();
         let _coordinator = self.mutation_guard()?;
         self.check_payload_capture(&original)?;
         let current = self.operation(&previous.id)?;
@@ -1367,8 +1492,10 @@ impl Inventory {
         let tx = db.transaction()?;
         save_artifact(&tx, &source)?;
         save_operation(&tx, &op)?;
+        check()?;
         tx.commit()?;
-        Ok(())
+        metrics.journal_ms += journal_started.elapsed().as_millis() as u64;
+        Ok(metrics)
     }
 }
 

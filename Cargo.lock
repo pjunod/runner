@@ -2832,8 +2832,10 @@ dependencies = [
 name = "nzbd-state"
 version = "0.2.0"
 dependencies = [
+ "crc32fast",
  "flate2",
  "libc",
+ "md-5",
  "nzbd-types",
  "rusqlite",
  "serde",

@@ -1172,6 +1172,7 @@ async fn failed_cleanup_scope_grants_only_exact_failure_metadata() {
             final_path: Some(source.path.join("payload.bin")),
             combined_crc: Some(7),
             identity: None,
+            naming: None,
         },
     });
     assert!(
@@ -7325,4 +7326,81 @@ fn failed_receipt_settles_when_its_source_is_gone() {
     assert!(refresh_url_admission_custody(&mut receipt, &inventory));
     assert_eq!(receipt.custody_state, "deleted_by_runner");
     assert_eq!(receipt.source_cleanup_status.as_deref(), Some("removed"));
+}
+
+#[tokio::test]
+async fn naming_expectations_require_current_writer_and_durable_finalization() {
+    use nzbd_state::artifacts::writer_naming::{verify_producer_read, NamingCandidate};
+    for (current, durable) in [(false, true), (true, false), (true, true)] {
+        let allowed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let gate = allowed.clone();
+        let (_temp, mut owner, _adapter, mut messages) = control_test_owner_with_persistence(
+            true,
+            Some(Arc::new(move || {
+                gate.load(std::sync::atomic::Ordering::Acquire)
+            })),
+        );
+        pump(&mut owner, &mut messages).await;
+        owner.state.jobs.push(pending_job(1));
+        allocate_for_test(&mut owner, &mut messages, JobId(1), true).await;
+        let allocation = owner.artifacts.for_job(1).unwrap().unwrap();
+        let path = allocation.path.join("payload.bin");
+        let bytes = b"CRC-validated producer bytes";
+        std::fs::write(&path, bytes).unwrap();
+        let reader = nzbd_state::fileops::open(&path).unwrap();
+        let identity = nzbd_state::fileops::identity(&reader).unwrap();
+        let naming = verify_producer_read(
+            reader,
+            bytes.len() as u64,
+            crc32fast::hash(bytes),
+            true,
+            &|| Ok(()),
+        )
+        .unwrap()
+        .unwrap()
+        .published(&path, &identity)
+        .unwrap();
+        let record = owner.state.job_mut(JobId(1)).unwrap();
+        record
+            .params
+            .push(("*File:generation:10".into(), "99".into()));
+        record.files[0].segments[0].state = SegmentState::Done {
+            offset: 0,
+            len: bytes.len() as u32,
+            crc: crc32fast::hash(bytes),
+        };
+        owner.writer_epochs.insert(FileId(10), 99);
+        allowed.store(durable, std::sync::atomic::Ordering::Release);
+        owner.on_msg(EngineMsg::ScopedWriter {
+            job: JobId(1),
+            file: FileId(10),
+            generation: if current { 99 } else { 98 },
+            fact: WriterFact::Finalized {
+                ok: true,
+                final_path: Some(path.clone()),
+                combined_crc: Some(crc32fast::hash(bytes)),
+                identity: Some(identity),
+                naming: Some(naming),
+            },
+        });
+        pump(&mut owner, &mut messages).await;
+        let found = owner.artifacts.take_writer_naming(
+            1,
+            &[NamingCandidate {
+                file: 10,
+                writer_generation: 99,
+                path,
+            }],
+        );
+        assert_eq!(
+            found.len(),
+            usize::from(current && durable),
+            "only matching durable completion admits naming evidence"
+        );
+        if !current || !durable {
+            assert!(!owner.state.job(JobId(1)).unwrap().files[0].finalized);
+        }
+        drop(found);
+        owner.artifacts.prepare_writer_naming();
+    }
 }

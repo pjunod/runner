@@ -6,7 +6,7 @@
 //! recording the outcome in history and stamping the job so restarts never
 //! re-process. Stage parallelism follows `PostStrategy`.
 
-use crate::rename::{par_rename_owned, rar_rename_owned};
+use crate::rename::{naming_candidates, par_rename_owned_with_candidates, rar_rename_owned};
 use crate::script::{discover, ScriptHost};
 use crate::tools::{archive_input_set, detect_archives, Extractors, Par2Tool};
 use crate::{par2, DownloadEvidence, PostError, RepairResult, VerifyResult};
@@ -3594,10 +3594,19 @@ async fn process_job_ctx_from_inner(
         stages.enter(PostStage::ParRename).await;
         let rename_dir = dir.clone();
         let inventory = engine.artifacts();
-        renames = crate::attempt::current()
+        let candidates = naming_candidates(&job, &rename_dir);
+        let outcome = crate::attempt::current()
             .expect("processing control")
-            .blocking(move |_| par_rename_owned(&rename_dir, Some((&inventory, job_id.0))))
+            .blocking(move |_| {
+                par_rename_owned_with_candidates(
+                    &rename_dir,
+                    Some((&inventory, job_id.0)),
+                    &candidates,
+                )
+            })
             .await?;
+        tracing::info!(job = job_id.0, metrics = ?outcome.metrics, "PAR naming work");
+        renames = outcome.renames;
     }
     let rename_map: std::collections::HashMap<PathBuf, PathBuf> = renames.into_iter().collect();
 

@@ -979,6 +979,7 @@ impl Inventory {
         let mut lease = self
             .reserve_processing_mutation(std::slice::from_ref(&source))?
             .ok_or_else(|| Error::Conflict("source namespace custody has not quiesced".into()))?;
+        self.invalidate_writer_naming(job);
         // A committed generation is stable even when its physical path differs
         // from the caller's ordinary destination. Revalidate before reuse.
         let completed = {
@@ -1514,6 +1515,7 @@ impl Inventory {
                 ));
             }
         }
+        self.invalidate_source_writer_naming(&source.artifact, &source.generation);
         let ids = {
             let db = self.db.lock().unwrap();
             let mut statement = db.prepare("SELECT id FROM operations WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.id')=?1 AND json_extract(json_extract(data,'$.request'),'$.source.generation')=?2 AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup_done'),0)=0 ORDER BY rowid")?;
@@ -2316,6 +2318,7 @@ impl Inventory {
                 "source retirement is not authorized for this delivery cohort".into(),
             ));
         }
+        self.invalidate_source_writer_naming(artifact_id, generation);
         let ids = {
             let db = self.db.lock().unwrap();
             let mut statement = db.prepare(
