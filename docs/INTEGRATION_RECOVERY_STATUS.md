@@ -2,7 +2,7 @@
 
 **Status:** implemented; review, qualification and rollout evidence tracked in
 [PR #272](https://github.com/pjunod/runner/pull/272) ·
-**Written:** 2026-11-03 (America/New_York) · **Branch:**
+**Written:** 2026-11-03 · **Updated:** 2026-11-04 (America/New_York) · **Branch:**
 `codex/baseline-integration-recovery`
 
 Companion to [publication performance](PUBLICATION_PERFORMANCE_PLAN.md) and
@@ -166,6 +166,22 @@ isolating time-compressed fixtures from shared-host scheduling and I/O
 pressure, but does not identify the exact delayed renewal phase or establish
 a production lease fix. Preserve those failed receipts as stress evidence.
 Any recurrence in the isolated qualification remains a deployment blocker.
+
+The diagnostic Linux run at `c2d9358` completed three real Post jobs, then
+failed the observer's two-eligible-polls assertion. Existing leader debug logs
+show the corresponding job repeatedly refused by checked export because
+verification or writer retirement was in progress. The observer therefore
+checks readiness around the actual request, retaining returned Post grants
+as positive evidence. It skips only the exact known busy result; unexpected
+observer errors fail qualification. The three completions, original 45-second
+window, competing download capacity, backlog and two-eligible-poll assertions
+remain unchanged.
+
+The URL retry persistence fixture also compared its stored deadline with a
+new wall-clock reading after the write. Crossing a second could falsely move
+its expected minimum forward. Capture each scheduling start before the write;
+retain the same 30/60-second floors, deterministic jitter bounds, persistence
+and checksum-corruption assertions. No retry policy or clock behavior changes.
 
 ## Deployment — qualify the exact revision on nuc3
 

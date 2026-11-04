@@ -8,9 +8,10 @@ use axum::response::Response;
 use nzbd_cluster::{ClusterConfig, ClusterRuntime, ControlPeer};
 use nzbd_engine::{EngineHandle, Tuning};
 use nzbd_nserv::{build_post, prng_bytes, NservBuilder};
-use nzbd_types::{CertLevel, JobStatus, ServerDef, ServerId, TlsMode};
+use nzbd_types::{CertLevel, JobId, JobStatus, ServerDef, ServerId, TlsMode};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -28,7 +29,46 @@ struct PollObservation {
     granted_kinds: Vec<String>,
 }
 
-type Observations = Arc<Mutex<Vec<PollObservation>>>;
+#[derive(Debug, Default)]
+struct ObservationLog {
+    polls: Vec<PollObservation>,
+    errors: Vec<String>,
+}
+type Observations = Arc<Mutex<ObservationLog>>;
+
+async fn checked_post_candidates(
+    engine: &EngineHandle,
+    node: &str,
+    observations: &Observations,
+) -> HashSet<JobId> {
+    let snapshot = engine.snapshot();
+    let mut ready = HashSet::new();
+    for summary in snapshot.jobs.iter().filter(|job| {
+        matches!(job.status, JobStatus::Completed)
+            && !job.pp_done
+            && job.assigned_node.as_deref() == Some(node)
+    }) {
+        match engine.export_job(summary.id).await {
+            Ok(Some(job)) => {
+                if matches!(job.status, JobStatus::Completed)
+                    && !job.params.iter().any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                {
+                    ready.insert(job.id);
+                }
+            }
+            Ok(None) => {} // The candidate left the queue before the read.
+            Err(nzbd_engine::EngineError::Lifecycle(reason))
+                if reason == "job verification or writer retirement is still in progress; retry later" => {}
+            Err(error) => {
+                let error = format!("observe PP readiness for job {}: {error}", summary.id.0);
+                // Connection-task panics need not propagate to the test task.
+                observations.lock().unwrap().errors.push(error.clone());
+                panic!("{error}");
+            }
+        }
+    }
+    ready
+}
 
 async fn observe_poll(
     request: Request,
@@ -49,31 +89,35 @@ async fn observe_poll(
         .iter()
         .filter(|job| matches!(job.status, JobStatus::Queued))
         .count();
-    let eligible_post_jobs = snapshot
-        .jobs
-        .iter()
-        .filter(|job| {
-            matches!(job.status, JobStatus::Completed)
-                && !job.pp_done
-                && job.assigned_node.as_deref() == Some(node)
-        })
-        .count();
+    // A published Completed summary can precede an in-flight projection's
+    // verification fence. The real grant path requires checked export too.
+    let ready_before = checked_post_candidates(&engine, node, &observations).await;
     let response = next.run(Request::from_parts(parts, Body::from(body))).await;
     let (parts, body) = response.into_parts();
     let body = to_bytes(body, 32 * 1024 * 1024).await.unwrap();
     if parts.status.is_success() {
         let value: Value = serde_json::from_slice(&body).unwrap();
+        let ready_after = checked_post_candidates(&engine, node, &observations).await;
+        let mut eligible: HashSet<_> = ready_before.intersection(&ready_after).copied().collect();
+        // Do not count a transient recovery block as a bypass. A returned
+        // Post grant is itself positive evidence even if its row changed
+        // while the request was running.
+        for grant in value["grants"].as_array().unwrap() {
+            if grant["kind"] == "post" {
+                eligible.insert(serde_json::from_value(grant["job"]["id"].clone()).unwrap());
+            }
+        }
         let granted_kinds = value["grants"]
             .as_array()
             .unwrap()
             .iter()
             .map(|grant| grant["kind"].as_str().unwrap().to_string())
             .collect();
-        observations.lock().unwrap().push(PollObservation {
+        observations.lock().unwrap().polls.push(PollObservation {
             free_download_slots: poll["free_download_slots"].as_u64().unwrap(),
             free_pp_slots: poll["free_pp_slots"].as_u64().unwrap(),
             queued_backlog,
-            eligible_post_jobs,
+            eligible_post_jobs: eligible.len(),
             granted_kinds,
         });
     }
@@ -342,9 +386,15 @@ async fn mixed_worker_grants_post_while_fast_downloads_keep_slots_and_backlog_av
     worker.stop().await;
     authority.stop().await;
     let observed = seen.lock().unwrap();
+    assert!(
+        observed.errors.is_empty(),
+        "poll observer failed: {:?}",
+        observed.errors
+    );
+    let observed = &observed.polls;
     eprintln!(
         "actual mixed poll observations: {}",
-        serde_json::to_string(&*observed).unwrap()
+        serde_json::to_string(observed).unwrap()
     );
     assert!(
         hits >= 8,
