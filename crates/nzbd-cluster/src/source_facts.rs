@@ -65,8 +65,7 @@ pub(crate) async fn reconcile(shared: &LeaderShared) -> Result<(), String> {
         let Some((mut durable, revision, _)) = control.current_job_intent(local.id.0).await? else {
             continue;
         };
-        if crate::control_recovery::business_intent(&local)?
-            != crate::control_recovery::business_intent(&durable)?
+        if !crate::control_recovery::source_intent_matches(&local, &durable)?
             || local.control() != durable.control()
             || local.status != durable.status
         {

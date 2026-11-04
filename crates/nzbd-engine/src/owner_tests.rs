@@ -1047,6 +1047,10 @@ async fn failed_cleanup_scope_grants_only_exact_failure_metadata() {
         "cleanup cannot enter normal PP or download states"
     );
     let mut candidate = original.clone();
+    let mut other = pending_job(2);
+    other.files.clear();
+    other.status = JobStatus::Completed;
+    owner.state.jobs.push(other);
     candidate.params.extend([
         ("Artifact:Id".into(), source.id.clone()),
         ("Artifact:Generation".into(), source.generation.clone()),
@@ -1111,6 +1115,27 @@ async fn failed_cleanup_scope_grants_only_exact_failure_metadata() {
         .await
         .unwrap()
         .unwrap();
+    assert!(
+        matches!(
+            restarted
+                .for_post_admission(&replay.admission)
+                .export_job(JobId(1))
+                .await,
+            Err(crate::EngineError::Lifecycle(_))
+        ),
+        "cleanup-scoped export reports its fence without reading the whole recovery document"
+    );
+    assert!(restarted.export_job(JobId(2)).await.unwrap().is_some());
+    assert!(
+        matches!(
+            restarted
+                .for_post_admission(&replay.admission)
+                .export_job(JobId(2))
+                .await,
+            Err(crate::EngineError::Lifecycle(_))
+        ),
+        "cleanup scope cannot export another job's verified payload record"
+    );
     let metadata = restarted
         .for_post_admission(&replay.admission)
         .failed_cleanup_metadata()

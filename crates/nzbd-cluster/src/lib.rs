@@ -662,6 +662,12 @@ async fn commit_control_mutation(
         )
             .into_response();
     }
+    // Catalog acceptance/retry has its own serialized replicated CAS. Keep
+    // quorum, proxy, authentication and authority checks, but do not attach
+    // an unrelated queue projection transaction after the receipt commits.
+    if delivery::is_catalog_mutation(&request) {
+        return next.run(request).await;
+    }
     let Ok(_serial) =
         tokio::time::timeout(Duration::from_secs(2), shared.mutation_serial.lock()).await
     else {

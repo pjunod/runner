@@ -64,6 +64,32 @@ pub(crate) fn business_intent(job: &Job) -> Result<Vec<u8>, String> {
     ))
     .map_err(|e| e.to_string())
 }
+/// Accepted journal replay can learn a publication length before that value
+/// exists in replicated intent. This enrichment is recovery evidence, not a
+/// new operator edit. An existing durable length must still match exactly.
+pub(crate) fn source_intent_matches(local: &Job, durable: &Job) -> Result<bool, String> {
+    let mut comparable = local.clone();
+    comparable.params.retain(|(key, value)| {
+        let learned_size = key
+            .strip_prefix("*File:size:")
+            .and_then(|id| id.parse::<u32>().ok())
+            .is_some_and(|id| {
+                key == &format!("*File:size:{id}")
+                    && local.files.iter().any(|file| file.id.0 == id)
+                    && value.parse::<u64>().is_ok_and(|size| size > 0)
+                    && local
+                        .params
+                        .iter()
+                        .filter(|(existing, _)| existing == key)
+                        .count()
+                        == 1
+                    && !durable.params.iter().any(|(existing, _)| existing == key)
+            });
+        !learned_size
+    });
+    Ok(business_intent(&comparable)? == business_intent(durable)?)
+}
+
 pub(crate) fn grant_intent_matches(local: &Job, durable: &Job) -> Result<bool, String> {
     Ok(!local
         .params
@@ -73,7 +99,7 @@ pub(crate) fn grant_intent_matches(local: &Job, durable: &Job) -> Result<bool, S
         && !matches!(durable.status, JobStatus::Paused | JobStatus::Deleted)
         && durable.status == local.status
         && durable.control() == local.control()
-        && business_intent(local)? == business_intent(durable)?)
+        && source_intent_matches(local, durable)?)
 }
 struct IntentRow {
     data: String,
@@ -157,7 +183,7 @@ pub(crate) async fn reconcile(shared: &crate::leader::LeaderShared) -> Result<()
             restore_current = true;
             continue;
         };
-        if business_intent(&local)? != business_intent(&durable)? {
+        if !source_intent_matches(&local, &durable)? {
             // New operator/source intent wins, including an uncommitted local
             // operator edit. Never infer automatic authority from revisions.
             restore_current = true;
@@ -456,7 +482,7 @@ pub(crate) async fn projection(shared: &crate::leader::LeaderShared) -> Result<V
             if let Some(marker) = nzbd_engine::automatic_control::transition(current) {
                 if durable.control() == marker.base_control
                     && durable.status == marker.base_status
-                    && business_intent(current)? == business_intent(&durable)?
+                    && source_intent_matches(current, &durable)?
                 {
                     durable.set_control(&marker.result_control);
                     durable.status = marker.result_status;

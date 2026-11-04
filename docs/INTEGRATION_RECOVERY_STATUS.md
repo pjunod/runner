@@ -1,6 +1,7 @@
-# Integration qualification — verified fixtures and safe script results
+# Integration recovery — custody, admission, and publication
 
-**Status:** candidate under qualification; baseline recovery defects being corrected ·
+**Status:** implemented; review, qualification and rollout evidence tracked in
+[PR #272](https://github.com/pjunod/runner/pull/272) ·
 **Written:** 2026-11-03 (America/New_York) · **Branch:**
 `codex/baseline-integration-recovery`
 
@@ -39,6 +40,7 @@ the full failure roster, including failures outside the original pipeline.
 | API authentication becomes active before backend readiness | Poll the explicit backend-ready state before backend endpoint assertions. Event daemons use independent ephemeral monitor ports. |
 | Same-root recovery starts one verifier per one-second tick | Start the next eligible verifier after the completed worker joins and its evidence is durably acknowledged. A 20-job regression drives real acknowledgements without periodic ticks and preserves pending-byte and concurrency assertions. |
 | Accepted journal ranges lose declared publication size across adoption/restart | Persist nonzero declared size only for an accepted matching file/segment; retain existing expected-size evidence. Verify real CRC ranges and publication after fold and restart. |
+| Newly learned size is mistaken for changed replicated intent | Permit only a unique, positive, canonical local-only size for an existing file ID when comparing recovery agreement. Existing durable size conflicts and guarded-write hashes remain exact. |
 | Standalone URL admissions accumulate an external-authority pending index | Index unaccepted admissions only when an external persistence guard is configured; retain stable private source-generation identity separately from public consumer metadata. |
 | Authority adoption omits the speed limit | Include the recovered limit in the projection transaction, preserve newer operator revisions, and restore the prior limit before persisting a failed adoption's rollback. Assert both memory and disk outcomes. |
 | Quiescing a source with no writer handles leaves an empty retirement fence | Release that exact empty fence only after its durable quiesce acknowledgement; retain real writer joins and the paused state. |
@@ -46,6 +48,7 @@ the full failure roster, including failures outside the original pipeline.
 | A released rollback fence does not notify waiting admissions | Notify the owner epoch only after durable release; test the public admission waiter across failed writes and storage recovery. |
 | Terminal receipt activation also waits for independent scratch cleanup | Require exact stamp/history/generation agreement and durable receipt activation, then let inventory maintenance perform its separate checked retirement. |
 | Restart treats a partially deleted failed source as a new processing input | Admit only replay of its exact existing generation-bound deletion journal. Keep ordinary payload export, repair, salvage, and publication fenced; allow only failure metadata/history/stamp updates. Persist that classification through a terminal stamp and restart until queue retirement. |
+| Delivery acceptance commits, then fails an unrelated queue transaction | Keep the replicated catalog's authentication, quorum, authority and generation CAS; bypass queue projection only for its two exact acceptance/retry routes. |
 
 Engine fixtures must await only the explicit export-busy condition, use real
 inventory paths and worker contexts, and bound event receives. A payload
@@ -80,14 +83,14 @@ stays live. Generic legacy-enrollment custody checks remain unchanged.
 
 ## Qualification — require actual execution before deployment
 
-| Gate | State |
+| Gate | Required evidence |
 |---|---|
-| Focused all-target compilation and Clippy | Passed before final review |
-| Astra review of the complete candidate | Pending |
-| Full workspace tests with required PAR2/7z tools and local-server access | Pending |
-| Full post-processing target in the normal startup CI lane | Added; execution pending |
-| Required CI and merge | Pending |
-| Qualified rollout and observed runtime | Pending |
+| All-target compilation and Clippy | Run against the frozen reviewed candidate |
+| Astra review of the complete candidate | Complete before final unit execution; independently review Astra-authored changes |
+| Full workspace tests with required PAR2/7z tools and local-server access | Zero failed targets; report existing ignored fixtures explicitly |
+| Full post-processing target in the normal startup CI lane | Execute complete pipeline and failure-regression targets |
+| Required CI and merge | Qualify the current PR head and protected-base combination |
+| Qualified rollout and observed runtime | Record exact build identity, readiness, restart count, and preserved rollback material |
 
 Run the full workspace suite using the existing isolated build slot, outside
 the sandbox that refuses loopback listeners. A passing command has zero failed

@@ -3260,6 +3260,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn grant_allows_learned_journal_size_without_relaxing_durable_source_intent() {
+        let mut durable = test_job(77);
+        durable.status = JobStatus::Queued;
+        durable.files.push(nzbd_types::FileEntry {
+            id: nzbd_types::FileId(77),
+            subject: "payload".into(),
+            filename: "payload.bin".into(),
+            filename_confirmed: true,
+            is_par2: false,
+            paused: false,
+            groups: Vec::new(),
+            date: None,
+            segments: vec![nzbd_types::Segment {
+                message_id: "payload@example".into(),
+                number: 1,
+                size: 100,
+                state: nzbd_types::SegmentState::Pending,
+            }],
+        });
+        let mut local = durable.clone();
+        local.params.push(("*File:size:77".into(), "100".into()));
+        // The exact hash still distinguishes new evidence for guarded writes.
+        assert_ne!(
+            crate::control_recovery::business_intent(&local).unwrap(),
+            crate::control_recovery::business_intent(&durable).unwrap()
+        );
+        assert!(crate::control_recovery::grant_intent_matches(&local, &durable).unwrap());
+        assert!(!crate::control_recovery::source_intent_matches(&durable, &local).unwrap());
+        for (key, value) in [
+            ("*File:size:78", "100"),
+            ("*File:size:077", "100"),
+            ("*File:size:77", "0"),
+            ("*File:size:77", "bad"),
+        ] {
+            let mut invalid = durable.clone();
+            invalid.params.push((key.into(), value.into()));
+            assert!(!crate::control_recovery::source_intent_matches(&invalid, &durable).unwrap());
+        }
+        let mut duplicate = local.clone();
+        duplicate
+            .params
+            .push(("*File:size:77".into(), "101".into()));
+        assert!(!crate::control_recovery::source_intent_matches(&duplicate, &durable).unwrap());
+        let mut changed_source = local.clone();
+        changed_source.files[0].segments[0].message_id = "other@example".into();
+        assert!(!crate::control_recovery::grant_intent_matches(&changed_source, &durable).unwrap());
+        let mut changed_intent = local.clone();
+        changed_intent.priority += 1;
+        assert!(!crate::control_recovery::grant_intent_matches(&changed_intent, &durable).unwrap());
+        durable.params.push(("*File:size:77".into(), "101".into()));
+        assert!(!crate::control_recovery::grant_intent_matches(&local, &durable).unwrap());
+        durable.params.last_mut().unwrap().1 = "100".into();
+        assert!(crate::control_recovery::grant_intent_matches(&local, &durable).unwrap());
+    }
+
     #[tokio::test]
     async fn completion_request_timeout_joins_one_whole_operation() {
         use std::sync::atomic::{AtomicUsize, Ordering};

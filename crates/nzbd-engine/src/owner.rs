@@ -1775,6 +1775,14 @@ impl Owner {
             EngineMsg::ScopedCommand { admission, command } => {
                 if self.post_scope_current(&admission) {
                     if self.failed_cleanup_admissions.contains_key(&admission.job)
+                        && matches!(command.as_ref(), QueueCommand::ExportJob { .. })
+                    {
+                        if let QueueCommand::ExportJob { reply, .. } = *command {
+                            let _ = reply.send(None);
+                        }
+                        return;
+                    }
+                    if self.failed_cleanup_admissions.contains_key(&admission.job)
                         && !matches!(
                             command.as_ref(),
                             QueueCommand::ImportJobIfPresent { .. }

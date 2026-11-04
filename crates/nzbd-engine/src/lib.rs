@@ -2249,14 +2249,25 @@ impl EngineHandle {
         self.send(QueueCommand::ExportJob { job, reply: tx })
             .await?;
         let result = owner_reply(rx).await?.map(|job| *job);
-        if result.is_none()
-            && self
-                .recovery_document()
-                .await?
-                .jobs
-                .iter()
-                .any(|record| record.id == job)
-        {
+        if result.is_none() {
+            // Cleanup scopes deliberately cannot read the full recovery
+            // document. Their explicit metadata capability still distinguishes
+            // a fenced row from an absent job without granting payload export.
+            let cleanup_exists = if self.post_scope.is_some() {
+                self.failed_cleanup_metadata().await?.is_some()
+            } else {
+                false
+            };
+            let exists = cleanup_exists
+                || self
+                    .recovery_document()
+                    .await?
+                    .jobs
+                    .iter()
+                    .any(|record| record.id == job);
+            if !exists {
+                return Ok(None);
+            }
             return Err(EngineError::Lifecycle(
                 "job verification or writer retirement is still in progress; retry later".into(),
             ));
