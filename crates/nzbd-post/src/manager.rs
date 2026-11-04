@@ -516,8 +516,11 @@ async fn manager_task(
                     // Failed cleanup can retain a verification fence over
                     // partially deleted bytes. Its public summary is only a
                     // routing hint; the owner must issue exact cleanup custody.
+                    // Legacy failed rows can carry that same deletion proof,
+                    // and a cleanup fence need not have a running verifier.
                     let cleanup = engine.snapshot().jobs.iter().find(|row| {
-                        row.id == job && row.lifecycle_eligible && !row.pp_done && row.verification.is_some()
+                        row.id == job && !row.pp_done
+                            && (row.status == JobStatus::Failed || row.verification.is_some())
                             && row.failed_cleanup.as_ref().is_some_and(|cleanup| cleanup.attempts > 0)
                     }).cloned();
                     if let Some(row) = cleanup {

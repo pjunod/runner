@@ -901,6 +901,212 @@ async fn explicit_authority_adoption_recovers_a_guard_fenced_post_rollback() {
 }
 
 #[tokio::test]
+async fn stale_worker_retirement_cannot_cancel_a_successors_custody() {
+    let (_temporary, mut owner, _adapter, mut messages) =
+        control_test_owner_with_persistence(false, None);
+    pump(&mut owner, &mut messages).await;
+    let old = nzbd_state::artifacts::WorkerControlContext {
+        lease_id: "old-grant".into(),
+        job_incarnation: "incarnation".into(),
+        job_revision: 1,
+        control_revision: 1,
+        epoch: 7,
+    };
+    let mut current = old.clone();
+    current.lease_id = "successor-grant".into();
+    current.job_revision = 2;
+    let mut job = pending_job(1);
+    job.files.clear();
+    job.params.push((
+        nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+        serde_json::to_string(&current).unwrap(),
+    ));
+    owner.state.jobs.push(job);
+    owner.job_epochs.insert(JobId(1), 17);
+    owner.control_epochs.insert(JobId(1), 23);
+    let custody = CancellationToken::new();
+    owner.post_admissions.insert(JobId(1), 17);
+    owner.post_cancellations.insert(JobId(1), custody.clone());
+    for retirement in [
+        WorkerRetirement::Revoked(old.clone()),
+        WorkerRetirement::Accepted(old),
+    ] {
+        let (reply, rejected) = oneshot::channel();
+        owner.on_command(QueueCommand::RemoveJobSilent {
+            job: JobId(1),
+            retirement: Some(retirement),
+            reply,
+        });
+        assert!(!tokio::time::timeout(Duration::from_secs(1), rejected)
+            .await
+            .expect("stale retirement must reject before waiting for successor custody")
+            .unwrap());
+        assert!(!custody.is_cancelled());
+        assert_eq!(owner.control_epochs.get(&JobId(1)), Some(&23));
+        assert!(owner.deferred_replacements.is_empty());
+        assert!(owner.retiring_writers.is_empty());
+        assert_eq!(
+            nzbd_state::artifacts::WorkerControlContext::for_job(
+                owner.state.job(JobId(1)).unwrap()
+            ),
+            Some(current.clone())
+        );
+    }
+}
+
+#[tokio::test]
+async fn deferred_worker_retirement_rechecks_context_after_successor_import() {
+    let (_temporary, mut owner, _adapter, mut messages) =
+        control_test_owner_with_persistence(false, None);
+    pump(&mut owner, &mut messages).await;
+    let old = nzbd_state::artifacts::WorkerControlContext {
+        lease_id: "old-grant".into(),
+        job_incarnation: "incarnation".into(),
+        job_revision: 1,
+        control_revision: 1,
+        epoch: 7,
+    };
+    let mut job = pending_job(1);
+    job.files.clear();
+    job.status = JobStatus::Completed;
+    job.params.push((
+        nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+        serde_json::to_string(&old).unwrap(),
+    ));
+    owner.state.jobs.push(job.clone());
+    allocate_for_test(&mut owner, &mut messages, JobId(1), true).await;
+    owner.artifacts.bind_worker_context(1, &old).unwrap();
+    let (reply, admitted) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginPostAdmission {
+        job: JobId(1),
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    let admission = admitted.await.unwrap().unwrap();
+    let mut successor = old.clone();
+    successor.lease_id = "successor-grant".into();
+    successor.job_revision += 1;
+    job.params
+        .retain(|(key, _)| key != nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM);
+    job.params.push((
+        nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+        serde_json::to_string(&successor).unwrap(),
+    ));
+    let (reply, imported) = oneshot::channel();
+    owner.on_command(QueueCommand::ImportJob {
+        job: Box::new(job),
+        preparation: None,
+        authority: crate::imports::ImportAuthority(Arc::new(|| true)),
+        emit_finished: false,
+        reply,
+    });
+    let (reply, retired) = oneshot::channel();
+    owner.on_command(QueueCommand::RemoveJobSilent {
+        job: JobId(1),
+        retirement: Some(WorkerRetirement::Revoked(old)),
+        reply,
+    });
+    assert_eq!(owner.deferred_replacements.len(), 2);
+    let (reply, ended) = oneshot::channel();
+    owner.on_command(QueueCommand::EndPostAdmission { admission, reply });
+    ended.await.unwrap();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(1), retired)
+            .await
+            .expect(
+                "deferred stale retirement must reject without waiting for successor persistence"
+            )
+            .unwrap(),
+        "deferred old retirement must reject before waiting on successor persistence"
+    );
+    pump(&mut owner, &mut messages).await;
+    imported.await.unwrap().unwrap();
+    assert_eq!(
+        nzbd_state::artifacts::WorkerControlContext::for_job(owner.state.job(JobId(1)).unwrap()),
+        Some(successor)
+    );
+    assert!(owner.retirement_epochs.is_empty());
+}
+
+#[tokio::test]
+async fn revoked_worker_retirement_preserves_journal_for_the_next_grant() {
+    let temporary = tempfile::tempdir().unwrap();
+    let state = temporary.path().join("state");
+    let destination = temporary.path().join("dest");
+    std::fs::create_dir(&destination).unwrap();
+    let mut config = crate::EngineConfig::single_node(
+        Vec::new(),
+        state.clone(),
+        destination,
+        Tuning::default(),
+        None,
+    );
+    config.persist_queue = false;
+    let engine = crate::Engine::spawn(config).await.unwrap();
+    let context = nzbd_state::artifacts::WorkerControlContext {
+        lease_id: "expired-grant".into(),
+        job_incarnation: "incarnation".into(),
+        job_revision: 1,
+        control_revision: 1,
+        epoch: 7,
+    };
+    let mut job = pending_job(1);
+    job.params.push((
+        nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+        serde_json::to_string(&context).unwrap(),
+    ));
+    engine.import_job(job.clone(), false, false).await.unwrap();
+    export_job_ready_for_test(&engine, job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let source = engine.artifacts().for_job(1).unwrap().unwrap();
+    std::fs::write(source.path.join(".runner-file-10.part"), [7; 100]).unwrap();
+    let record = JournalRecord {
+        job: job.id,
+        file: FileId(10),
+        segment_number: 1,
+        offset: 0,
+        len: 100,
+        crc32: crc32fast::hash(&[7; 100]),
+        file_size: 100,
+    };
+    let mut journal = JobJournals::open(&state, "expired-worker").unwrap();
+    journal.append(&record).unwrap();
+    journal.sync().unwrap();
+    drop(journal);
+    assert!(engine
+        .retire_worker_job(job.id, context.clone())
+        .await
+        .unwrap());
+    let mut successor = context;
+    successor.lease_id = "successor-grant".into();
+    successor.job_revision += 1;
+    job.params
+        .retain(|(key, _)| key != nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM);
+    job.params.push((
+        nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+        serde_json::to_string(&successor).unwrap(),
+    ));
+    // Import must cross the real durable retirement barrier, then earn Done
+    // again by folding and checking the retained journal against actual bytes.
+    engine.import_job(job.clone(), true, false).await.unwrap();
+    let resumed = export_job_ready_for_test(&engine, job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        resumed.files[0].segments[0].state,
+        SegmentState::Done { len: 100, .. }
+    ));
+    assert_eq!(
+        nzbd_state::artifacts::WorkerControlContext::for_job(&resumed),
+        Some(successor)
+    );
+    assert!(engine.shutdown().await);
+}
+
+#[tokio::test]
 async fn failed_cleanup_scope_grants_only_exact_failure_metadata() {
     let (_temporary, mut owner, _adapter, mut messages) = control_test_owner();
     pump(&mut owner, &mut messages).await;

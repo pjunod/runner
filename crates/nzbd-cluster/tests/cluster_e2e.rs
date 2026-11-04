@@ -755,7 +755,21 @@ async fn leader_retries_authority_adoption_after_snapshot_repair() {
         .unwrap();
     add_job(&node.url, "repaired", post.nzb.as_bytes()).await;
     wait_for("scheduling after snapshot repair", 20, || {
-        get_json(&node.url, "/api/v1/jobs")["jobs"][0]["status"] == "completed"
+        let (code, body) = http(&node.url, "GET", "/api/v1/jobs", b"");
+        let value: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|error| panic!("jobs after snapshot repair: {code}: {body}: {error}"));
+        if code == 503 {
+            assert!(
+                value == serde_json::json!({"error": "leadership is changing; retry"})
+                    || value == serde_json::json!({"error": "no leader elected yet; retry"}),
+                "jobs after snapshot repair: {code}: {body}"
+            );
+            // Election gaps are not queue observations. Keep the original
+            // deadline and require a real successful completion response.
+            return false;
+        }
+        assert_eq!(code, 200, "jobs after snapshot repair: {body}");
+        value["jobs"][0]["status"] == "completed"
     })
     .await;
 

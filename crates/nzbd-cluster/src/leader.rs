@@ -1726,7 +1726,10 @@ async fn complete_operation(s: Arc<LeaderShared>, req: CompleteRequest) -> Respo
     };
     if info.node != req.node
         || info.job != job_id
-        || info.token != req.token
+        // Sealing/outbox persistence can span a heartbeat. The atomic
+        // publish_result_renewable transaction below selects the current live
+        // token for this exact grant; renewal never changes its result identity.
+        || !heartbeat_token_can_advance(&req.token, &info.token)
         || info.job_revision != req.expected_job_revision
     {
         return (
@@ -3591,7 +3594,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn slow_actual_completion_survives_caller_drop_and_lease_renewal() {
+    async fn slow_actual_completion_accepts_prior_renewal_and_survives_caller_drop() {
         let tmp = tempfile::tempdir().unwrap();
         let layout = SharedLayout::new(tmp.path(), "leader").unwrap();
         let mut cfg = ClusterConfig {
@@ -3757,12 +3760,53 @@ mod tests {
         };
         let mut headers = HeaderMap::new();
         headers.insert(SECRET_HEADER, "secret".parse().unwrap());
+        // The immutable outbox was sealed with the original token, but a
+        // healthy heartbeat renewed it before the first completion arrived.
+        let before_submit = control
+            .renew(&token, std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        shared
+            .leases
+            .lock()
+            .unwrap()
+            .get_mut(&request.lease_id)
+            .unwrap()
+            .token = before_submit.clone();
+        for change in 0..7 {
+            let mut invalid = request.clone();
+            match change {
+                0 => invalid.token.owner_incarnation = "another-worker-boot".into(),
+                1 => invalid.token.fence += 1,
+                2 => invalid.token.revision = before_submit.revision + 1,
+                3 => invalid.token.expires_at_unix_ms = before_submit.expires_at_unix_ms + 1,
+                4 => invalid.expected_job_revision += 1,
+                5 => invalid.token.resource = "another-grant".into(),
+                _ => invalid.token.owner_node_id = "another-worker".into(),
+            }
+            let refused = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                work_complete(State(shared.clone()), headers.clone(), Json(invalid)),
+            )
+            .await
+            .expect("unrelated or future token must reject before payload verification");
+            assert_eq!(
+                refused.status(),
+                StatusCode::CONFLICT,
+                "invalid token case {change}"
+            );
+        }
         let first = tokio::spawn(work_complete(
             State(shared.clone()),
             headers.clone(),
             Json(request.clone()),
         ));
-        gate.entered.acquire().await.unwrap().forget();
+        tokio::time::timeout(std::time::Duration::from_secs(3), gate.entered.acquire())
+            .await
+            .expect("same-grant predecessor must reach real generation verification")
+            .unwrap()
+            .forget();
         let other = tmp.path().join(".nzbd-cluster/generations/conflicting");
         std::fs::create_dir_all(other.join("files")).unwrap();
         let other_payload = b"conflicting payload";
@@ -3801,7 +3845,7 @@ mod tests {
         gate.entered.acquire().await.unwrap().forget();
         first.abort(); // Simulate network deadline while bulk verification owns work.
         let renewed = control
-            .renew(&token, std::time::Duration::from_secs(60))
+            .renew(&before_submit, std::time::Duration::from_secs(60))
             .await
             .unwrap()
             .unwrap();
@@ -3819,7 +3863,7 @@ mod tests {
             .token = renewed.clone();
         let retry = tokio::spawn(work_complete(
             State(shared.clone()),
-            headers,
+            headers.clone(),
             Json(request.clone()),
         ));
         gate.release.add_permits(1);
@@ -3854,6 +3898,22 @@ mod tests {
             &stale,
             LeaseKind::Download
         ));
+        // The original immutable request also replays from durable evidence
+        // after both the active lease and process-local result cache are gone.
+        assert!(!shared
+            .leases
+            .lock()
+            .unwrap()
+            .contains_key(&request.lease_id));
+        shared.completion_operations.entries.lock().unwrap().clear();
+        *shared.verification_gate.lock().unwrap() = None;
+        let replay = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            work_complete(State(shared.clone()), headers, Json(request.clone())),
+        )
+        .await
+        .expect("accepted original token must replay its exact durable receipt");
+        assert_eq!(replay.status(), StatusCode::OK);
         // A newer Delete wins after durable selection and materialization,
         // before READY/current queue projection, including restart recovery.
         *shared.verification_gate.lock().unwrap() = None;

@@ -28,6 +28,8 @@ pub struct LeaseState {
     pub job_incarnation: String,
     pub job_revision: u64,
     pub control_revision: u64,
+    /// Original imported identity; heartbeat revisions never rewrite it.
+    pub context: nzbd_state::artifacts::WorkerControlContext,
     /// Conservative process-local deadline. Failed HTTP calls never move it.
     pub deadline: Instant,
     /// Revokes owned PP subprocesses immediately when authority is lost.
@@ -46,6 +48,7 @@ pub struct ActiveLeases {
     states: Arc<Mutex<HashMap<String, LeaseState>>>,
     admissions: Arc<Mutex<HashMap<String, watch::Receiver<bool>>>>,
     operations: Arc<Mutex<HashMap<String, watch::Receiver<bool>>>>,
+    retiring: Arc<Mutex<HashMap<String, LeaseKind>>>,
 }
 impl std::ops::Deref for ActiveLeases {
     type Target = Mutex<HashMap<String, LeaseState>>;
@@ -67,14 +70,21 @@ impl ActiveLeases {
     }
     pub(crate) async fn join_execution(&self, id: &str) -> Result<bool, String> {
         let admission = self.admissions.lock().unwrap().get(id).cloned();
+        let mut observed = admission.is_some();
+        if let Some(mut joined) = admission {
+            joined
+                .wait_for(|done| *done)
+                .await
+                .map_err(|_| "admission stop acknowledgment lost; retain for review".to_owned())?;
+        }
+        // Admission may install the execution operation before acknowledging.
         let operation = self.operations.lock().unwrap().get(id).cloned();
-        let observed = admission.is_some() || operation.is_some();
-        for mut joined in admission.into_iter().chain(operation) {
-            if !*joined.borrow() {
-                joined.wait_for(|done| *done).await.map_err(|_| {
-                    "execution stop acknowledgment lost; retain for review".to_owned()
-                })?;
-            }
+        observed |= operation.is_some();
+        if let Some(mut joined) = operation {
+            joined
+                .wait_for(|done| *done)
+                .await
+                .map_err(|_| "execution stop acknowledgment lost; retain for review".to_owned())?;
         }
         Ok(observed)
     }
@@ -84,6 +94,248 @@ impl ActiveLeases {
     }
 }
 type BudgetReceipt = Arc<Mutex<Option<BudgetAck>>>;
+
+#[derive(Clone)]
+struct BudgetCommand {
+    sequence: u64,
+    generation: u64,
+    budgets: HashMap<String, u16>,
+}
+
+/// One tracked application lane; heartbeat submits without waiting for drains.
+#[derive(Clone)]
+struct BudgetLane {
+    commands: watch::Sender<Option<BudgetCommand>>,
+    applied: watch::Receiver<(u64, bool)>,
+    receipt: BudgetReceipt,
+    cancel: CancellationToken,
+}
+impl BudgetLane {
+    fn spawn(
+        engine: EngineHandle,
+        servers: Vec<ServerDef>,
+        cancel: CancellationToken,
+        tracker: &TaskTracker,
+    ) -> Self {
+        Self::spawn_with_apply(cancel, tracker, move |command| {
+            let engine = engine.clone();
+            let by_id = budgets_by_id(&servers, &command.budgets);
+            async move {
+                if by_id.is_empty() {
+                    return Ok(None);
+                }
+                engine
+                    .set_server_budgets(by_id)
+                    .await
+                    .map(|receipt| {
+                        Some(BudgetAck {
+                            cluster_generation: command.generation,
+                            engine_generation: receipt.generation,
+                            drained: receipt.drained,
+                        })
+                    })
+                    .map_err(|error| error.to_string())
+            }
+        })
+    }
+
+    fn spawn_with_apply<F, Fut>(
+        cancel: CancellationToken,
+        tracker: &TaskTracker,
+        mut apply: F,
+    ) -> Self
+    where
+        F: FnMut(BudgetCommand) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<Option<BudgetAck>, String>> + Send + 'static,
+    {
+        let (commands, mut pending) = watch::channel::<Option<BudgetCommand>>(None);
+        let (complete, applied) = watch::channel((0, true));
+        let receipt: BudgetReceipt = Default::default();
+        let published = receipt.clone();
+        let shutdown = cancel.clone();
+        tracker.spawn(async move {
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    result = pending.changed() => if result.is_err() { break; },
+                }
+                let command = pending.borrow_and_update().clone();
+                let Some(command) = command else {
+                    continue;
+                };
+                let sequence = command.sequence;
+                // Never abort a real drain: its acknowledgement and shutdown
+                // ownership stay tied to the actual engine operation.
+                let ok = match apply(command).await {
+                    Ok(ack) => {
+                        let drained = ack.as_ref().is_none_or(|ack| ack.drained);
+                        if let Some(ack) = ack {
+                            *published.lock().unwrap() = Some(ack);
+                        }
+                        drained
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "connection budget application failed");
+                        false
+                    }
+                };
+                complete.send_replace((sequence, ok));
+            }
+        });
+        Self {
+            commands,
+            applied,
+            receipt,
+            cancel: shutdown,
+        }
+    }
+
+    fn submit(&self, budgets: &HashMap<String, u16>, generation: u64) -> u64 {
+        let mut sequence = 0;
+        self.commands.send_if_modified(|pending| {
+            if let Some(current) = pending {
+                sequence = current.sequence;
+                if generation < current.generation {
+                    return false;
+                }
+                let (completed, ok) = *self.applied.borrow();
+                if generation == current.generation
+                    && budgets == &current.budgets
+                    && (completed < current.sequence || ok)
+                {
+                    return false;
+                }
+            }
+            sequence += 1;
+            *pending = Some(BudgetCommand {
+                sequence,
+                generation,
+                budgets: budgets.clone(),
+            });
+            true
+        });
+        sequence
+    }
+
+    async fn apply(&self, budgets: &HashMap<String, u16>, generation: u64) -> bool {
+        if self.cancel.is_cancelled() {
+            return false;
+        }
+        let sequence = self.submit(budgets, generation);
+        let mut applied = self.applied.clone();
+        applied
+            .wait_for(|(completed, _)| *completed >= sequence)
+            .await
+            .is_ok_and(|result| result.1)
+    }
+
+    fn park(&self) {
+        let generation = self
+            .commands
+            .borrow()
+            .as_ref()
+            .map(|command| command.generation)
+            .unwrap_or(0);
+        self.submit(&HashMap::new(), generation);
+    }
+}
+
+fn held_slots(active: &ActiveLeases) -> (u32, u32) {
+    let states = active.lock().unwrap();
+    let retiring = active.retiring.lock().unwrap();
+    states
+        .values()
+        .map(|state| state.kind)
+        .chain(retiring.values().copied())
+        .fold((0, 0), |(download, post), kind| match kind {
+            LeaseKind::Post => (download, post + 1),
+            _ => (download + 1, post),
+        })
+}
+
+/// Transfer slots atomically before any caller can poll for more work.
+fn revoke_leases(
+    active: &ActiveLeases,
+    mut revoke: impl FnMut(&str, &LeaseState) -> bool,
+) -> Vec<(String, LeaseState)> {
+    let mut states = active.lock().unwrap();
+    let mut retiring = active.retiring.lock().unwrap();
+    let ids: Vec<_> = states
+        .iter()
+        .filter(|(id, state)| revoke(id, state))
+        .map(|(id, _)| id.clone())
+        .collect();
+    ids.into_iter()
+        .filter_map(|id| {
+            states.remove(&id).map(|state| {
+                state.cancel.cancel();
+                retiring.insert(id.clone(), state.kind);
+                (id, state)
+            })
+        })
+        .collect()
+}
+
+fn retire_lease(
+    engine: &EngineHandle,
+    active: &ActiveLeases,
+    tracker: &TaskTracker,
+    shutdown: &CancellationToken,
+    lease_id: String,
+    state: LeaseState,
+) {
+    state.cancel.cancel();
+    let shutdown = shutdown.clone();
+    let engine = engine.clone();
+    let active = active.clone();
+    tracker.spawn(async move {
+        if let Err(error) = active.join_execution(&lease_id).await {
+            tracing::error!(%lease_id, %error, "worker retirement retains unjoined custody");
+            return;
+        }
+        if state.kind != LeaseKind::Assemble {
+            let mut delay = std::time::Duration::from_millis(100);
+            loop {
+                match engine.retire_worker_job(state.job, state.context.clone()).await {
+                    Ok(_) => break,
+                    Err(error) => {
+                        tracing::warn!(%lease_id, %error, "worker retirement awaits owner acknowledgement");
+                        if matches!(error, nzbd_engine::EngineError::Closed) || shutdown.is_cancelled() { return; }
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return,
+                            _ = tokio::time::sleep(delay) => {},
+                        }
+                        delay = (delay * 2).min(std::time::Duration::from_secs(1));
+                    }
+                }
+            }
+        }
+        // Replace the execution watches with an exact durable stopped receipt
+        // before forgetting them. This also covers expiry before engine import,
+        // when no actor writer observation exists yet. This does not compact
+        // the shared article journal; only accepted completion may do that.
+        let mut delay = std::time::Duration::from_millis(100);
+        loop {
+            match compact_joined_grant(&engine, &active, state.job, &state.context).await {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(%lease_id, %error, "worker retirement awaits durable stopped receipt");
+                    if shutdown.is_cancelled() { return; }
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = tokio::time::sleep(delay) => {},
+                    }
+                    delay = (delay * 2).min(std::time::Duration::from_secs(1));
+                }
+            }
+        }
+        active.forget_joined(&lease_id);
+        active.retiring.lock().unwrap().remove(&lease_id);
+    });
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_worker(
@@ -99,7 +351,7 @@ pub fn spawn_worker(
     cancel: CancellationToken,
     tracker: &TaskTracker,
 ) {
-    let budget_receipt = Arc::new(Mutex::new(None));
+    let budgets = BudgetLane::spawn(engine.clone(), servers.clone(), cancel.clone(), tracker);
     {
         let cfg = cfg.clone();
         let engine = engine.clone();
@@ -107,6 +359,7 @@ pub fn spawn_worker(
         let active = active.clone();
         let pp = pp.clone();
         let dest_dir = dest_dir.clone();
+        let retirement_tracker = tracker.clone();
         let view = view.clone();
         let cancel = cancel.clone();
         tracker.spawn(async move {
@@ -116,7 +369,7 @@ pub fn spawn_worker(
                 if !current.is_me {
                     if let Some(url)=current.leader_url().map(str::to_owned) {
                         replay_completion_outbox(&cfg,&engine,&client,&active,&pp,&url).await;
-                        report_completions(&cfg,&engine,&client,&active,&pp,&url,&dest_dir).await;
+                        report_completions(&cfg,&engine,&client,&active,&pp,&url,&dest_dir,&retirement_tracker,&cancel).await;
                     }
                 }
                 tokio::select!{ _=cancel.cancelled()=>break,_=tokio::time::sleep(cfg.lease_interval)=>{} }
@@ -125,30 +378,30 @@ pub fn spawn_worker(
     }
     {
         let cfg = cfg.clone();
-        let servers = servers.clone();
         let engine = engine.clone();
         let view = view.clone();
         let client = client.clone();
         let active = active.clone();
-        let receipt = budget_receipt.clone();
+        let budgets = budgets.clone();
+        let retirement_tracker = tracker.clone();
         let cancel = cancel.clone();
         tracker.spawn(async move {
             loop {
                 if cancel.is_cancelled(){break;}
-                expire_local_leases(&engine,&servers,&active,&receipt).await;
+                expire_local_leases(&engine,&active,&budgets,&retirement_tracker);
                 let current=view.borrow().clone();
                 if current.is_me {
-                    let cancelled:Vec<_>=active.lock().unwrap().drain().map(|(_,state)|state).collect();
-                    for state in cancelled {state.cancel.cancel();}
+                    let cancelled=revoke_leases(&active, |_,_| true);
+                    for (id,state) in cancelled {retire_lease(&engine,&active,&retirement_tracker,&cancel,id,state);}
                 }else if let Some(url)=current.leader_url().map(str::to_owned) {
-                    heartbeat_and_cancel(&cfg,&servers,&engine,&client,&active,&receipt,&url).await;
+                    heartbeat_and_cancel(&cfg,&engine,&client,&active,&budgets,&retirement_tracker,&url).await;
                 }
                 tokio::select!{_=cancel.cancelled()=>break,_=tokio::time::sleep(cfg.lease_interval)=>{}}
             }
             // Pending CRC preparation and held PP are also owned work. Joiners
             // can finish only after their exact authority is visibly revoked.
-            let cancelled:Vec<_>=active.lock().unwrap().drain().map(|(_,state)|state).collect();
-            for state in cancelled {state.cancel.cancel();let _=engine.remove_job_silent(state.job).await;}
+            let cancelled=revoke_leases(&active, |_,_| true);
+            for (id,state) in cancelled {retire_lease(&engine,&active,&retirement_tracker,&cancel,id,state);}
         });
     }
     // Recovery probes can touch slow storage. They never occupy heartbeat or
@@ -179,7 +432,7 @@ pub fn spawn_worker(
             let current=view.borrow().clone();
             if !current.is_me {
                 if let Some(url)=current.leader_url().map(str::to_owned) {
-                    poll_for_work(&cfg,&servers,&engine,&client,&active,&pp,&dest_dir,&work_tracker,&url,&owner_incarnation,&budget_receipt).await;
+                    poll_for_work(&cfg,&engine,&client,&active,&pp,&dest_dir,&work_tracker,&url,&owner_incarnation,&budgets).await;
                 }
             }
             tokio::select!{_=cancel.cancelled()=>break,_=tokio::time::sleep(cfg.lease_interval)=>{}}
@@ -380,11 +633,11 @@ async fn accept_worker_retirement(
 
 async fn heartbeat_and_cancel(
     cfg: &ClusterConfig,
-    servers: &[ServerDef],
     engine: &EngineHandle,
     client: &ClusterClient,
     active: &ActiveLeases,
-    budget_receipt: &BudgetReceipt,
+    budgets: &BudgetLane,
+    tracker: &TaskTracker,
     leader_url: &str,
 ) {
     let leases: Vec<LeaseProgress> = active
@@ -404,7 +657,7 @@ async fn heartbeat_and_cancel(
     let req = HeartbeatRequest {
         node: cfg.node_name.clone(),
         leases,
-        budget_ack: budget_receipt.lock().unwrap().clone(),
+        budget_ack: budgets.receipt.lock().unwrap().clone(),
     };
     match client
         .post_json::<_, HeartbeatResponse>(leader_url, "/cluster/v1/work/heartbeat", &req)
@@ -420,7 +673,18 @@ async fn heartbeat_and_cancel(
             {
                 let mut leases = active.lock().unwrap();
                 for (lease_id, state) in leases.iter_mut() {
-                    if let Some(next) = renewed_by_resource.get(&state.token.resource) {
+                    if let Some(next) =
+                        renewed_by_resource
+                            .get(&state.token.resource)
+                            .filter(|next| {
+                                state.deadline > Instant::now()
+                                    && !state.cancel.is_cancelled()
+                                    && next.owner_node_id == state.token.owner_node_id
+                                    && next.owner_incarnation == state.token.owner_incarnation
+                                    && next.fence == state.token.fence
+                                    && next.revision >= state.token.revision
+                            })
+                    {
                         state.token = next.clone();
                         state.deadline = conservative_deadline(cfg);
                     }
@@ -430,14 +694,12 @@ async fn heartbeat_and_cancel(
                 }
             }
             for lease_id in resp.cancel {
-                let st = active.lock().unwrap().remove(&lease_id);
-                if let Some(st) = st {
-                    st.cancel.cancel();
+                for (lease_id, st) in revoke_leases(active, |id, _| id == lease_id) {
                     tracing::info!(job = st.job.0, %lease_id, "lease cancelled by leader");
-                    let _ = engine.remove_job_silent(st.job).await;
+                    retire_lease(engine, active, tracker, &budgets.cancel, lease_id, st);
                 }
             }
-            if let Some(budgets) = resp.server_budgets {
+            if let Some(target) = resp.server_budgets {
                 let (has_download, has_post) = {
                     let leases = active.lock().unwrap();
                     (
@@ -448,23 +710,9 @@ async fn heartbeat_and_cancel(
                     )
                 };
                 if has_post && pp_budget_must_park(post_fetch_budgeted, has_download) {
-                    apply_budgets(
-                        engine,
-                        servers,
-                        &HashMap::new(),
-                        resp.budget_generation,
-                        budget_receipt,
-                    )
-                    .await;
+                    budgets.submit(&HashMap::new(), resp.budget_generation);
                 } else {
-                    apply_budgets(
-                        engine,
-                        servers,
-                        &budgets,
-                        resp.budget_generation,
-                        budget_receipt,
-                    )
-                    .await;
+                    budgets.submit(&target, resp.budget_generation);
                 }
             }
         }
@@ -472,6 +720,7 @@ async fn heartbeat_and_cancel(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn report_completions(
     cfg: &ClusterConfig,
     engine: &EngineHandle,
@@ -480,6 +729,8 @@ async fn report_completions(
     pp: &Option<PpSetup>,
     leader_url: &str,
     dest_dir: &std::path::Path,
+    tracker: &TaskTracker,
+    shutdown: &CancellationToken,
 ) {
     let snapshot = engine.snapshot();
     let finished: Vec<(String, LeaseState)> = active
@@ -502,6 +753,18 @@ async fn report_completions(
         .collect();
 
     for (lease_id, lease) in finished {
+        if active
+            .admissions
+            .lock()
+            .unwrap()
+            .get(&lease_id)
+            .is_some_and(|joined| !*joined.borrow())
+        {
+            continue;
+        }
+        if !lease_authority(active, &lease_id, &lease)() {
+            continue;
+        }
         let job_id = lease.job;
         tracing::debug!(node=%cfg.node_name,job=job_id.0,%lease_id,"sealing durable completion");
         let job = if let Some(job) = lease.ready_job.as_deref().cloned() {
@@ -512,10 +775,18 @@ async fn report_completions(
             };
             job
         };
+        if nzbd_state::artifacts::WorkerControlContext::for_job(&job).as_ref()
+            != Some(&lease.context)
+        {
+            continue;
+        }
         if lease.kind == LeaseKind::Segment && job.status != JobStatus::Completed {
             reject_remote_grant(cfg, client, leader_url, &lease_id, &lease.token).await;
-            active.lock().unwrap().remove(&lease_id);
-            let _ = engine.remove_job_silent(job_id).await;
+            for (id, state) in revoke_leases(active, |id, state| {
+                id == lease_id && state.context == lease.context
+            }) {
+                retire_lease(engine, active, tracker, shutdown, id, state);
+            }
             continue;
         }
         let sealed = match seal_generation(cfg, dest_dir, &job, &lease, engine.artifacts()).await {
@@ -907,10 +1178,7 @@ pub(crate) async fn cancel_and_join_execution(
     {
         let states = active.lock().unwrap();
         if let Some(state) = states.get(&context.lease_id) {
-            if state.job_incarnation != context.job_incarnation
-                || state.job_revision != context.job_revision
-                || state.control_revision != context.control_revision
-            {
+            if &state.context != context {
                 return Err("worker grant intent changed before cancellation".into());
             }
             state.cancel.cancel();
@@ -994,7 +1262,6 @@ async fn record_published_pp_history(
 #[allow(clippy::too_many_arguments)]
 async fn poll_for_work(
     cfg: &ClusterConfig,
-    servers: &[ServerDef],
     engine: &EngineHandle,
     client: &ClusterClient,
     active: &ActiveLeases,
@@ -1003,23 +1270,10 @@ async fn poll_for_work(
     tracker: &TaskTracker,
     leader_url: &str,
     owner_incarnation: &str,
-    budget_receipt: &BudgetReceipt,
+    budgets: &BudgetLane,
 ) {
     let disk_low = engine.snapshot().disk_low;
-    let (dl_held, pp_held) = {
-        let a = active.lock().unwrap();
-        (
-            a.values()
-                .filter(|s| {
-                    matches!(
-                        s.kind,
-                        LeaseKind::Download | LeaseKind::Segment | LeaseKind::Assemble
-                    )
-                })
-                .count() as u32,
-            a.values().filter(|s| s.kind == LeaseKind::Post).count() as u32,
-        )
-    };
+    let (dl_held, pp_held) = held_slots(active);
     let free_dl = if cfg.download && !disk_low {
         cfg.max_download_jobs.saturating_sub(dl_held)
     } else {
@@ -1053,15 +1307,31 @@ async fn poll_for_work(
         }
     };
     for mut grant in resp.grants {
+        {
+            let states = active.lock().unwrap();
+            if states.contains_key(&grant.lease_id)
+                || active
+                    .retiring
+                    .lock()
+                    .unwrap()
+                    .contains_key(&grant.lease_id)
+            {
+                continue;
+            }
+        }
         let (admission_done, admission_joined) = watch::channel(false);
         active
             .admissions
             .lock()
             .unwrap()
             .insert(grant.lease_id.clone(), admission_joined);
+        let mut registered = false;
+        let mut admitted = false;
+        let retiring_id = grant.lease_id.clone();
+        let retiring_token = grant.token.clone();
+        let job_id = grant.job.id;
         async {
 
-        let job_id = grant.job.id;
         if grant.job.delivery_lifecycle && grant.lifecycle_protocol < LIFECYCLE_PROTOCOL {
             tracing::warn!(
                 job = job_id.0,
@@ -1074,14 +1344,23 @@ async fn poll_for_work(
             reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token).await;
             return;
         }
-        {
-            let context = nzbd_state::artifacts::WorkerControlContext {
+        let context = nzbd_state::artifacts::WorkerControlContext {
                 lease_id: grant.lease_id.clone(),
                 job_incarnation: grant.job_incarnation.clone(),
                 job_revision: grant.job_revision,
                 control_revision: grant.control_revision,
                 epoch: grant.epoch,
             };
+        let lease_state = LeaseState {
+            job: job_id, kind: grant.kind, token: grant.token.clone(),
+            job_incarnation: grant.job_incarnation.clone(), job_revision: grant.job_revision,
+            control_revision: grant.control_revision, context: context.clone(),
+            deadline: conservative_deadline(cfg), cancel: budgets.cancel.child_token(),
+            pp_ready: grant.kind == LeaseKind::Post && grant.job.params.iter().any(|(key, _)| key == nzbd_types::PP_DONE_PARAM),
+            ready_job: None,
+        };
+        let authority = lease_authority(active, &grant.lease_id, &lease_state);
+        {
             grant
                 .job
                 .params
@@ -1101,6 +1380,12 @@ async fn poll_for_work(
                 storage_instance_id:engine.artifacts().installation.clone(),removal_revision:None,
                 authority_source_json:grant.job.params.iter().find(|(key,_)|key==crate::delivery::AUTHORITY_COPY_PARAM).map(|(_,value)|value.clone()),start_ordered:true,
             };
+            {
+                let mut leases = active.lock().unwrap();
+                if leases.contains_key(&grant.lease_id) || active.retiring.lock().unwrap().contains_key(&grant.lease_id) { return; }
+                leases.insert(grant.lease_id.clone(), lease_state.clone());
+                registered = true;
+            }
             let inventory=engine.artifacts();
             if let Err(error)=tokio::task::spawn_blocking(move||inventory.begin_worker_grant(&request)).await.map_err(|error|error.to_string()).and_then(|result|result.map_err(|error|error.to_string())) {
                 tracing::warn!(job=job_id.0,%error,"durable grant start refused");reject_remote_grant(cfg,client,leader_url,&grant.lease_id,&grant.token).await;return;
@@ -1141,238 +1426,76 @@ async fn poll_for_work(
                 }
             }
         }
+        if !authority() { return; }
         match grant.kind {
             LeaseKind::Download => {
                 tracing::info!(job = job_id.0, lease = %grant.lease_id, "download lease received");
-                apply_budgets(
-                    engine,
-                    servers,
-                    &grant.server_budgets,
-                    grant.budget_generation,
-                    budget_receipt,
-                )
-                .await;
-                // Register before the off-actor CRC preparation so the
-                // independent control lane renews/cancels this exact grant.
-                let lease_id = grant.lease_id.clone();
-                let original_token = grant.token.clone();
-                let expected_job = grant.job_revision;
-                let expected_control = grant.control_revision;
-                active.lock().unwrap().insert(
-                    lease_id.clone(),
-                    LeaseState {
-                        job: job_id,
-                        kind: LeaseKind::Download,
-                        token: grant.token.clone(),
-                        job_incarnation: grant.job_incarnation,
-                        job_revision: expected_job,
-                        control_revision: expected_control,
-                        deadline: conservative_deadline(cfg),
-                        cancel: CancellationToken::new(),
-                        pp_ready: false,
-                        ready_job: None,
-                    },
-                );
+                if !budgets.apply(&grant.server_budgets, grant.budget_generation).await || !authority() { return; }
+                #[cfg(test)]
                 let checkpoint = {
-                    let active = active.clone();
-                    let lease_id = lease_id.clone();
-                    let token = original_token.clone();
-                    #[cfg(test)]
+                    let authority = authority.clone();
                     let test_node = cfg.node_name.clone();
-                    Arc::new(move || {
-                        #[cfg(test)]
-                        crc_tests::checkpoint(&test_node, job_id);
-                        active.lock().unwrap().get(&lease_id).is_some_and(|state| {
-                            state.job == job_id
-                                && state.job_revision == expected_job
-                                && state.control_revision == expected_control
-                                && state.token.resource == token.resource
-                                && state.token.owner_node_id == token.owner_node_id
-                                && state.token.owner_incarnation == token.owner_incarnation
-                                && state.token.fence == token.fence
-                                && state.token.revision >= token.revision
-                                && state.deadline > Instant::now()
-                                && !state.cancel.is_cancelled()
-                        })
-                    })
+                    Arc::new(move || { crc_tests::checkpoint(&test_node, job_id); authority() }) as Arc<dyn Fn() -> bool + Send + Sync>
                 };
-                let imported = engine
-                    .import_job_checked(grant.job, true, false, checkpoint)
-                    .await;
+                #[cfg(not(test))]
+                let checkpoint = authority.clone();
+                let imported = engine.import_job_checked(grant.job, true, false, checkpoint).await;
                 #[cfg(test)]
                 crc_tests::record_result(&cfg.node_name, job_id, imported.is_ok());
-                if imported.is_err() || engine.snapshot().disk_low {
-                    let removed = {
-                        let mut leases = active.lock().unwrap();
-                        if leases.get(&lease_id).is_some_and(|state| {
-                            state.token.fence == original_token.fence
-                                && state.token.owner_incarnation == original_token.owner_incarnation
-                        }) {
-                            leases.remove(&lease_id)
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(state) = removed {
-                        state.cancel.cancel();
-                        let _ = engine.remove_job_silent(job_id).await;
-                        reject_remote_grant(cfg, client, leader_url, &lease_id, &state.token).await;
-                    }
-                }
+                admitted = imported.is_ok() && authority() && !engine.snapshot().disk_low;
             }
             LeaseKind::Post => {
                 let Some(setup) = pp else { return };
                 tracing::info!(job = job_id.0, lease = %grant.lease_id, "pp lease received");
+                let has_download = active.lock().unwrap().values().any(|lease| lease.kind == LeaseKind::Download);
                 if grant.post_fetch_budgeted {
-                    apply_budgets(
-                        engine,
-                        servers,
-                        &grant.server_budgets,
-                        grant.budget_generation,
-                        budget_receipt,
-                    )
-                    .await;
-                } else if !active
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .any(|lease| lease.kind == LeaseKind::Download)
-                {
-                    // Old leaders sent an empty PP grant and did not count PP
-                    // in heartbeat budgets. Keep a PP-only recovery lane
-                    // parked. A concurrent Download lease is safe: the old
-                    // leader already counts this node through that lease.
-                    apply_budgets(
-                        engine,
-                        servers,
-                        &HashMap::new(),
-                        grant.budget_generation,
-                        budget_receipt,
-                    )
-                    .await;
-                }
-                if let Err(error) = prepare_pp_attempt(
-                    engine.artifacts(),
-                    dest_dir,
-                    &mut grant.job,
-                    grant.token.fence,
-                )
-                .await
-                {
+                    if !budgets.apply(&grant.server_budgets, grant.budget_generation).await { return; }
+                } else if !has_download && !budgets.apply(&HashMap::new(), grant.budget_generation).await { return; }
+                if !authority() { return; }
+                if let Err(error) = prepare_pp_attempt(engine.artifacts(), dest_dir, &mut grant.job, grant.token.fence).await {
                     tracing::warn!(job = job_id.0, %error, "private PP attempt could not be prepared");
-                    reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
-                        .await;
                     return;
                 }
-                let restored_ready = grant
-                    .job
-                    .params
-                    .iter()
-                    .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM);
-                if engine.import_job(grant.job, false, false).await.is_ok() {
-                    if engine.snapshot().disk_low {
-                        let _ = engine.remove_job_silent(job_id).await;
-                        reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
-                            .await;
-                        return;
-                    }
-                    active.lock().unwrap().insert(
-                        grant.lease_id.clone(),
-                        LeaseState {
-                            job: job_id,
-                            kind: LeaseKind::Post,
-                            token: grant.token.clone(),
-                            job_incarnation: grant.job_incarnation,
-                            job_revision: grant.job_revision,
-                            control_revision: grant.control_revision,
-                            deadline: conservative_deadline(cfg),
-                            cancel: CancellationToken::new(),
-                            pp_ready: restored_ready,
-                            ready_job: None,
-                        },
-                    );
+                if !authority() { return; }
+                let restored_ready = grant.job.params.iter().any(|(key, _)| key == nzbd_types::PP_DONE_PARAM);
+                if engine.import_job_checked(grant.job, false, false, authority.clone()).await.is_ok()
+                    && authority() && !engine.snapshot().disk_low {
+                    admitted = true;
                     if !restored_ready {
-                        run_pp_lease(
-                            engine.clone(),
-                            setup.clone(),
-                            dest_dir.to_path_buf(),
-                            active.clone(),
-                            grant.lease_id,
-                            job_id,
-                            tracker,
-                            cfg.node_name.clone(),
-                            client.clone(),
-                            leader_url.to_string(),
-                        );
+                        run_pp_lease(engine.clone(), setup.clone(), dest_dir.to_path_buf(), active.clone(),
+                            grant.lease_id, job_id, tracker, budgets.cancel.clone(), cfg.node_name.clone(), client.clone(), leader_url.to_string());
                     }
                 }
             }
             LeaseKind::Segment => {
                 tracing::info!(job = job_id.0, lease = %grant.lease_id, "article-range lease received");
-                apply_budgets(
-                    engine,
-                    servers,
-                    &grant.server_budgets,
-                    grant.budget_generation,
-                    budget_receipt,
-                )
-                .await;
-                if engine.import_job(grant.job, false, false).await.is_ok() {
-                    active.lock().unwrap().insert(
-                        grant.lease_id,
-                        LeaseState {
-                            job: job_id,
-                            kind: LeaseKind::Segment,
-                            token: grant.token,
-                            job_incarnation: grant.job_incarnation,
-                            job_revision: grant.job_revision,
-                            control_revision: grant.control_revision,
-                            deadline: conservative_deadline(cfg),
-                            cancel: CancellationToken::new(),
-                            pp_ready: false,
-                            ready_job: None,
-                        },
-                    );
-                }
+                if !budgets.apply(&grant.server_budgets, grant.budget_generation).await || !authority() { return; }
+                admitted = engine.import_job_checked(grant.job, false, false, authority.clone()).await.is_ok()
+                    && authority() && !engine.snapshot().disk_low;
             }
             LeaseKind::Assemble => {
-                let Ok(scope) = serde_json::from_value::<crate::range::AssembleScope>(grant.scope)
-                else {
-                    reject_remote_grant(cfg, client, leader_url, &grant.lease_id, &grant.token)
-                        .await;
-                    return;
-                };
-                let lease_id = grant.lease_id.clone();
-                let token = grant.token.clone();
-                let fence = token.fence;
-                active.lock().unwrap().insert(
-                    lease_id.clone(),
-                    LeaseState {
-                        job: job_id,
-                        kind: LeaseKind::Assemble,
-                        token,
-                        job_incarnation: grant.job_incarnation,
-                        job_revision: grant.job_revision,
-                        control_revision: grant.control_revision,
-                        deadline: conservative_deadline(cfg),
-                        cancel: CancellationToken::new(),
-                        pp_ready: false,
-                        ready_job: None,
-                    },
-                );
-                run_assembly(
-                    grant.job,
-                    scope,
-                    dest_dir.to_path_buf(),
-                    fence,
-                    active.clone(),
-                    lease_id,
-                    tracker,
-                );
+                let Ok(scope) = serde_json::from_value::<crate::range::AssembleScope>(grant.scope) else { return; };
+                if !authority() { return; }
+                admitted = true;
+                run_assembly(grant.job, scope, dest_dir.to_path_buf(), grant.token.fence, active.clone(), grant.lease_id, tracker);
             }
         }
         }.await;
-        let _ = admission_done.send(true);
+        if registered && !admitted {
+            for (id, state) in revoke_leases(active, |id, state| {
+                id == retiring_id
+                    && state.token.fence == retiring_token.fence
+                    && state.token.owner_incarnation == retiring_token.owner_incarnation
+            }) {
+                retire_lease(engine, active, tracker, &budgets.cancel, id, state);
+            }
+            // Failed admission must lose authority before its join is visible
+            // to the completion lane. Retirement waits this actual join.
+            let _ = admission_done.send(true);
+            reject_remote_grant(cfg, client, leader_url, &retiring_id, &retiring_token).await;
+        } else {
+            let _ = admission_done.send(true);
+        }
     }
 }
 
@@ -1456,6 +1579,7 @@ fn run_pp_lease(
     lease_id: String,
     job_id: JobId,
     tracker: &TaskTracker,
+    shutdown: CancellationToken,
     node: String,
     client: ClusterClient,
     leader_url: String,
@@ -1466,13 +1590,19 @@ fn run_pp_lease(
     for rule in &mut setup.post.categories {
         rule.dest_dir = None;
     }
+    let retirement_tracker = tracker.clone();
     active.clone().spawn_operation(tracker,lease_id.clone(),async move {
         let Some(initial) = active.lock().unwrap().get(&lease_id).cloned() else {
             return;
         };
+        let retirement_context = initial.context.clone();
+        let retire_current = || {
+            for (id, state) in revoke_leases(&active, |id, state| id == lease_id && state.context == retirement_context) {
+                retire_lease(&engine, &active, &retirement_tracker, &shutdown, id, state);
+            }
+        };
         if engine.snapshot().disk_low {
-            active.lock().unwrap().remove(&lease_id);
-            let _ = engine.remove_job_silent(job_id).await;
+            retire_current();
             let req = RejectRequest {
                 node,
                 lease_id: lease_id.clone(),
@@ -1491,9 +1621,7 @@ fn run_pp_lease(
             Ok(Some(admission)) => admission,
             result => {
                 tracing::debug!(job=job_id.0, lease=%lease_id, ?result, "PP owner admission ended before processing");
-                if active.lock().unwrap().remove(&lease_id).is_some() {
-                    let _ = engine.remove_job_silent(job_id).await;
-                }
+                retire_current();
                 return;
             }
         };
@@ -1635,7 +1763,7 @@ fn run_pp_lease(
             }
         }
         if let Err(error)=engine.end_post_admission(admission).await{tracing::warn!(job=job_id.0,%error,"PP custody release remains pending");}
-        if active.lock().unwrap().remove(&lease_id).is_some(){let _=engine.remove_job_silent(job_id).await;}
+        retire_current();
 
     });
 }
@@ -2261,63 +2389,21 @@ fn conservative_deadline(cfg: &ClusterConfig) -> Instant {
         )
 }
 
-async fn expire_local_leases(
+fn expire_local_leases(
     engine: &EngineHandle,
-    servers: &[ServerDef],
     active: &ActiveLeases,
-    budget_receipt: &BudgetReceipt,
+    budgets: &BudgetLane,
+    tracker: &TaskTracker,
 ) {
-    let expired: Vec<_> = {
-        let now = Instant::now();
-        let mut leases = active.lock().unwrap();
-        let ids: Vec<_> = leases
-            .iter()
-            .filter(|(_, state)| state.deadline <= now)
-            .map(|(id, _)| id.clone())
-            .collect();
-        ids.into_iter()
-            .filter_map(|id| leases.remove(&id).map(|state| (id, state)))
-            .collect()
-    };
+    let now = Instant::now();
+    let expired = revoke_leases(active, |_, state| state.deadline <= now);
     let had_expired = !expired.is_empty();
     for (lease_id, state) in expired {
-        state.cancel.cancel();
         tracing::warn!(job = state.job.0, %lease_id, "local lease deadline expired; cancelling work");
-        let _ = engine.remove_job_silent(state.job).await;
+        retire_lease(engine, active, tracker, &budgets.cancel, lease_id, state);
     }
     if had_expired && active.lock().unwrap().is_empty() {
-        let generation = budget_receipt
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|receipt| receipt.cluster_generation)
-            .unwrap_or_default();
-        apply_budgets(engine, servers, &HashMap::new(), generation, budget_receipt).await;
-    }
-}
-
-async fn apply_budgets(
-    engine: &EngineHandle,
-    servers: &[ServerDef],
-    by_name: &HashMap<String, u16>,
-    cluster_generation: u64,
-    budget_receipt: &BudgetReceipt,
-) {
-    // Missing is zero, not "keep whatever the previous leader granted".
-    // Old leaders send an empty map on PP grants; failing closed is what
-    // keeps a rolling-upgrade PP worker inside the account connection cap.
-    let by_id = budgets_by_id(servers, by_name);
-    if !by_id.is_empty() {
-        match engine.set_server_budgets(by_id).await {
-            Ok(receipt) => {
-                *budget_receipt.lock().unwrap() = Some(BudgetAck {
-                    cluster_generation,
-                    engine_generation: receipt.generation,
-                    drained: receipt.drained,
-                });
-            }
-            Err(error) => tracing::warn!(%error, "connection budget application failed"),
-        }
+        budgets.park();
     }
 }
 
@@ -2428,6 +2514,13 @@ mod tests {
             job_incarnation: "original-job".into(),
             job_revision: 4,
             control_revision: 4,
+            context: nzbd_state::artifacts::WorkerControlContext {
+                lease_id: "same-id".into(),
+                job_incarnation: "original-job".into(),
+                job_revision: 4,
+                control_revision: 4,
+                epoch: 1,
+            },
             deadline: Instant::now() + std::time::Duration::from_secs(30),
             cancel: CancellationToken::new(),
             pp_ready: false,
@@ -2622,6 +2715,506 @@ mod tests {
         engine.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocked_retirement_and_budget_drain_do_not_starve_healthy_heartbeats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        let mut config = EngineConfig::single_node(
+            Vec::new(),
+            tmp.path().join("state"),
+            dest,
+            Tuning {
+                min_free_disk_bytes: 0,
+                ..Default::default()
+            },
+            None,
+        );
+        config.persist_queue = false;
+        let engine = Engine::spawn(config).await.unwrap();
+        let context = nzbd_state::artifacts::WorkerControlContext {
+            lease_id: "expired".into(),
+            job_incarnation: "job-incarnation".into(),
+            job_revision: 1,
+            control_revision: 1,
+            epoch: 7,
+        };
+        let mut job = queued_test_job();
+        job.status = JobStatus::Completed;
+        job.params.push((
+            nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+            serde_json::to_string(&context).unwrap(),
+        ));
+        engine.import_job(job, false, false).await.unwrap();
+        let admission = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.wait_post_admission(JobId(77), &CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let shutdown = CancellationToken::new();
+        let tracker = TaskTracker::new();
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let drain = Arc::new(tokio::sync::Semaphore::new(0));
+        let applied_targets = Arc::new(Mutex::new(Vec::new()));
+        let budgets = BudgetLane::spawn_with_apply(shutdown.clone(), &tracker, {
+            let entered = entered.clone();
+            let drain = drain.clone();
+            let applied_targets = applied_targets.clone();
+            let engine = engine.clone();
+            move |command| {
+                let entered = entered.clone();
+                let drain = drain.clone();
+                let applied_targets = applied_targets.clone();
+                let engine = engine.clone();
+                async move {
+                    applied_targets
+                        .lock()
+                        .unwrap()
+                        .push((command.generation, command.budgets.clone()));
+                    entered.add_permits(1);
+                    drain.acquire().await.unwrap().forget();
+                    // The lane must wait for this actual engine acknowledgement,
+                    // including when a controlled drain has not yet completed.
+                    let actual = engine
+                        .set_server_budgets(HashMap::new())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok(Some(BudgetAck {
+                        cluster_generation: command.generation,
+                        engine_generation: actual.generation,
+                        drained: actual.drained,
+                    }))
+                }
+            }
+        });
+        let first = HashMap::from([("provider".into(), 4)]);
+        budgets.submit(&first, 1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let active = ActiveLeases::default();
+        let expired_cancel = CancellationToken::new();
+        active.lock().unwrap().insert(
+            "expired".into(),
+            LeaseState {
+                job: JobId(77),
+                kind: LeaseKind::Post,
+                token: test_token(),
+                job_incarnation: context.job_incarnation.clone(),
+                job_revision: 1,
+                control_revision: 1,
+                context,
+                deadline: Instant::now() - std::time::Duration::from_millis(1),
+                cancel: expired_cancel.clone(),
+                pp_ready: false,
+                ready_job: None,
+            },
+        );
+        let mut healthy_token = test_token();
+        healthy_token.resource = "healthy".into();
+        let original_deadline = Instant::now() + std::time::Duration::from_secs(2);
+        active.lock().unwrap().insert(
+            "healthy".into(),
+            LeaseState {
+                job: JobId(78),
+                kind: LeaseKind::Download,
+                token: healthy_token,
+                job_incarnation: "healthy-job".into(),
+                job_revision: 1,
+                control_revision: 1,
+                context: nzbd_state::artifacts::WorkerControlContext {
+                    lease_id: "healthy".into(),
+                    job_incarnation: "healthy-job".into(),
+                    job_revision: 1,
+                    control_revision: 1,
+                    epoch: 7,
+                },
+                deadline: original_deadline,
+                cancel: CancellationToken::new(),
+                pp_ready: false,
+                ready_job: None,
+            },
+        );
+        expire_local_leases(&engine, &active, &budgets, &tracker);
+        assert!(expired_cancel.is_cancelled());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            admission.cancellation.cancelled(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            active.retiring.lock().unwrap().len(),
+            1,
+            "actual PP custody still occupies its slot"
+        );
+        assert_eq!(
+            held_slots(&active),
+            (1, 1),
+            "revoked but unjoined PP cannot advertise a free slot"
+        );
+        let seen = Arc::new(AtomicUsize::new(0));
+        let observed = seen.clone();
+        let app = Router::new().route(
+            "/cluster/v1/work/heartbeat",
+            post(move |Json(req): Json<HeartbeatRequest>| {
+                let observed = observed.clone();
+                async move {
+                    assert_eq!(req.leases.len(), 1);
+                    assert_eq!(req.leases[0].lease_id, "healthy");
+                    assert!(
+                        req.budget_ack.is_none(),
+                        "no receipt before actual drain acknowledgement"
+                    );
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let mut token = req.leases[0].token.clone();
+                    token.revision += 1;
+                    Json(HeartbeatResponse {
+                        cancel: Vec::new(),
+                        renewed: vec![token],
+                        controls: HashMap::new(),
+                        server_budgets: Some(HashMap::from([("provider".into(), 1)])),
+                        budget_generation: 2,
+                        post_fetch_budgeted: true,
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cfg = ClusterConfig {
+            cluster_id: "test".into(),
+            node_name: "worker".into(),
+            shared_dir: tmp.path().into(),
+            advertise_url: "http://worker.invalid".into(),
+            secret: "secret".into(),
+            coordinator: false,
+            priority: 0,
+            download: true,
+            max_download_jobs: 1,
+            post_process: true,
+            pp_slots: 1,
+            lease_interval: std::time::Duration::from_millis(100),
+            takeover_after: std::time::Duration::from_secs(2),
+            worker_ttl: std::time::Duration::from_secs(2),
+            control_dir: tmp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: "127.0.0.1:1".into(),
+            control_api_bind: "127.0.0.1:2".into(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
+            disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
+        };
+        let client = ClusterClient::new("secret".into());
+        for _ in 0..8 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                heartbeat_and_cancel(&cfg, &engine, &client, &active, &budgets, &tracker, &url),
+            )
+            .await
+            .expect("healthy renewal must not wait for another lease's retirement or budget drain");
+            expire_local_leases(&engine, &active, &budgets, &tracker);
+            assert_eq!(active.retiring.lock().unwrap().len(), 1);
+            assert!(active.lock().unwrap()["healthy"].deadline > Instant::now());
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        assert!(Instant::now() > original_deadline);
+        assert_eq!(seen.load(Ordering::SeqCst), 8);
+        assert!(budgets.receipt.lock().unwrap().is_none());
+        assert_eq!(applied_targets.lock().unwrap().len(), 1);
+        // Older grants cannot re-expand a newer target. Equal-generation
+        // local parking is ordered, and the latest target is applied once.
+        budgets.submit(&HashMap::from([("provider".into(), 8)]), 1);
+        budgets.park();
+        let target = HashMap::from([("provider".into(), 1)]);
+        let applied = budgets.apply(&target, 2);
+        tokio::pin!(applied);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut applied)
+                .await
+                .is_err()
+        );
+        drain.add_permits(2);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), &mut applied)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            applied_targets.lock().unwrap().as_slice(),
+            &[(1, first.clone()), (2, target.clone())]
+        );
+        assert!(budgets
+            .receipt
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ack| ack.cluster_generation == 2 && ack.drained));
+        engine.end_post_admission(admission).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !active.retiring.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("slot releases only after real owner retirement acknowledgement");
+        assert!(engine
+            .recovery_document()
+            .await
+            .unwrap()
+            .jobs
+            .iter()
+            .all(|job| job.id != JobId(77)));
+        shutdown.cancel();
+        tracker.close();
+        tokio::time::timeout(std::time::Duration::from_secs(3), tracker.wait())
+            .await
+            .unwrap();
+        server.abort();
+        assert!(engine.shutdown().await);
+    }
+
+    #[tokio::test]
+    async fn expiry_before_import_preserves_a_durable_stop_receipt_and_resume_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state");
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        let mut config = EngineConfig::single_node(
+            Vec::new(),
+            state_dir.clone(),
+            dest,
+            Tuning {
+                min_free_disk_bytes: 0,
+                ..Default::default()
+            },
+            None,
+        );
+        config.persist_queue = false;
+        let engine = Engine::spawn(config).await.unwrap();
+        let context = nzbd_state::artifacts::WorkerControlContext {
+            lease_id: "expired-before-import".into(),
+            job_incarnation: "job-incarnation".into(),
+            job_revision: 1,
+            control_revision: 1,
+            epoch: 7,
+        };
+        let inventory = engine.artifacts();
+        let mut request = nzbd_state::artifacts::WorkerStopRequest {
+            job: 77,
+            context: context.clone(),
+            owner_incarnation: "worker-boot".into(),
+            storage_instance_id: inventory.installation.clone(),
+            removal_revision: None,
+            authority_source_json: None,
+            start_ordered: true,
+        };
+        inventory.begin_worker_grant(&request).unwrap();
+        let record = nzbd_state::JournalRecord {
+            job: JobId(77),
+            file: nzbd_types::FileId(77),
+            segment_number: 1,
+            offset: 0,
+            len: 4,
+            crc32: crc32fast::hash(b"kept"),
+            file_size: 4,
+        };
+        let mut journals =
+            nzbd_state::JobJournals::open(&state_dir, "expired-before-import").unwrap();
+        journals.append(&record).unwrap();
+        journals.sync().unwrap();
+        drop(journals);
+        let active = ActiveLeases::default();
+        let (done, joined) = watch::channel(false);
+        active
+            .admissions
+            .lock()
+            .unwrap()
+            .insert(context.lease_id.clone(), joined);
+        active.lock().unwrap().insert(
+            context.lease_id.clone(),
+            LeaseState {
+                job: JobId(77),
+                kind: LeaseKind::Post,
+                token: test_token(),
+                job_incarnation: context.job_incarnation.clone(),
+                job_revision: 1,
+                control_revision: 1,
+                context: context.clone(),
+                deadline: Instant::now() - std::time::Duration::from_millis(1),
+                cancel: CancellationToken::new(),
+                pp_ready: false,
+                ready_job: None,
+            },
+        );
+        let tracker = TaskTracker::new();
+        let shutdown = CancellationToken::new();
+        let budgets = BudgetLane::spawn(engine.clone(), Vec::new(), shutdown.clone(), &tracker);
+        expire_local_leases(&engine, &active, &budgets, &tracker);
+        assert_eq!(held_slots(&active), (0, 1));
+        assert!(inventory
+            .prepare_worker_stop(&request)
+            .unwrap()
+            .receipt
+            .is_none());
+        done.send_replace(true);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !active.retiring.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("joined pre-import grant must persist stop evidence");
+        assert!(
+            !active.join_execution(&context.lease_id).await.unwrap(),
+            "volatile watches have been compacted"
+        );
+        // A later exact authority removal must find durable evidence even
+        // though no queue job ever existed and no sealed completion was made.
+        request.removal_revision = Some(2);
+        let receipt = inventory
+            .prepare_worker_stop(&request)
+            .unwrap()
+            .receipt
+            .expect("actual join survives a later cancellation request");
+        assert_eq!(receipt.context, context);
+        assert!(engine.recovery_document().await.unwrap().jobs.is_empty());
+        let resumed = nzbd_state::JobJournals::replay_all(&state_dir).unwrap();
+        assert!(resumed.iter().any(|saved| saved.job == record.job
+            && saved.file == record.file
+            && saved.segment_number == record.segment_number
+            && saved.crc32 == record.crc32));
+        shutdown.cancel();
+        tracker.close();
+        tokio::time::timeout(std::time::Duration::from_secs(3), tracker.wait())
+            .await
+            .unwrap();
+        assert!(engine.shutdown().await);
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_budget_drain_and_wakes_pending_admission() {
+        let tracker = TaskTracker::new();
+        let shutdown = CancellationToken::new();
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let budgets = BudgetLane::spawn_with_apply(shutdown.clone(), &tracker, {
+            let entered = entered.clone();
+            let release = release.clone();
+            let calls = calls.clone();
+            move |command| {
+                let entered = entered.clone();
+                let release = release.clone();
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    entered.add_permits(1);
+                    release.acquire().await.unwrap().forget();
+                    Ok(Some(BudgetAck {
+                        cluster_generation: command.generation,
+                        engine_generation: 1,
+                        drained: true,
+                    }))
+                }
+            }
+        });
+        budgets.submit(&HashMap::new(), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let target = HashMap::from([("provider".into(), 1)]);
+        let admission = budgets.apply(&target, 2);
+        tokio::pin!(admission);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut admission)
+                .await
+                .is_err()
+        );
+        shutdown.cancel();
+        tracker.close();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), tracker.wait())
+                .await
+                .is_err(),
+            "shutdown must retain ownership of the in-flight drain"
+        );
+        assert!(budgets.receipt.lock().unwrap().is_none());
+        release.add_permits(1);
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(1), admission)
+                .await
+                .unwrap(),
+            "unapplied pending grant must wake refused after shutdown"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), tracker.wait())
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            budgets
+                .receipt
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .cluster_generation,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn joining_admission_waits_for_the_operation_it_installs() {
+        let active = ActiveLeases::default();
+        let tracker = TaskTracker::new();
+        let (done, joined) = watch::channel(false);
+        active
+            .admissions
+            .lock()
+            .unwrap()
+            .insert("late-operation".into(), joined);
+        let joining = active.join_execution("late-operation");
+        tokio::pin!(joining);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut joining)
+                .await
+                .is_err()
+        );
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        active.spawn_operation(&tracker, "late-operation".into(), {
+            let release = release.clone();
+            async move {
+                release.acquire().await.unwrap().forget();
+            }
+        });
+        done.send_replace(true);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut joining)
+                .await
+                .is_err(),
+            "admission acknowledgement is not its execution join"
+        );
+        release.add_permits(1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), joining)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        tracker.close();
+        tracker.wait().await;
+    }
+
     #[tokio::test]
     async fn suspended_pp_lease_past_deadline_revokes_its_subprocess_owner() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2645,6 +3238,13 @@ mod tests {
                 job_incarnation: "job-incarnation".into(),
                 job_revision: 1,
                 control_revision: 1,
+                context: nzbd_state::artifacts::WorkerControlContext {
+                    lease_id: "expired".into(),
+                    job_incarnation: "job-incarnation".into(),
+                    job_revision: 1,
+                    control_revision: 1,
+                    epoch: 1,
+                },
                 deadline: Instant::now() - std::time::Duration::from_millis(1),
                 cancel: cancel.clone(),
                 pp_ready: false,
@@ -2652,10 +3252,16 @@ mod tests {
             },
         );
 
-        expire_local_leases(&engine, &[], &active, &Arc::new(Mutex::new(None))).await;
+        let tracker = TaskTracker::new();
+        let shutdown = CancellationToken::new();
+        let budgets = BudgetLane::spawn(engine.clone(), Vec::new(), shutdown.clone(), &tracker);
+        expire_local_leases(&engine, &active, &budgets, &tracker);
 
         assert!(active.lock().unwrap().is_empty());
         assert!(cancel.is_cancelled());
+        shutdown.cancel();
+        tracker.close();
+        tracker.wait().await;
         engine.shutdown().await;
     }
 
@@ -2751,11 +3357,11 @@ mod tests {
         let active: ActiveLeases = Default::default();
         let tracker = TaskTracker::new();
         let dest = tmp.path().join("dest");
-        let budget_receipt: BudgetReceipt = Default::default();
+        let shutdown = CancellationToken::new();
+        let budgets = BudgetLane::spawn(engine.clone(), Vec::new(), shutdown.clone(), &tracker);
 
         let poll = poll_for_work(
             &cfg,
-            &[],
             &engine,
             &client,
             &active,
@@ -2764,7 +3370,7 @@ mod tests {
             &tracker,
             &leader_url,
             "test-incarnation",
-            &budget_receipt,
+            &budgets,
         );
         let transition = async {
             let _ = state.poll_seen.acquire().await.unwrap();
@@ -2782,6 +3388,7 @@ mod tests {
         assert!(active.lock().unwrap().is_empty());
         assert!(engine.export_job(JobId(77)).await.unwrap().is_none());
 
+        shutdown.cancel();
         tracker.close();
         tracker.wait().await;
         server.abort();

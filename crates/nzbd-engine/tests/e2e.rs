@@ -1383,30 +1383,15 @@ async fn missing_articles_finish_download_but_keep_partial_private() {
         .add_nzb("damaged", post.nzb.as_bytes(), None, 0)
         .await
         .unwrap();
-    for _ in 0..1200 {
-        if engine
-            .snapshot()
-            .jobs
-            .iter()
-            .any(|j| j.id == job && j.status == JobStatus::Completed)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // Completion publishes the durable snapshot before emitting this event.
+    // Waiting for the matching event avoids observing the publish/emit window.
+    let (status, _) = wait_finished(&mut rx, job, 12).await;
+    assert_eq!(status, JobStatus::Completed);
     let snap = engine.snapshot();
     let held = snap.jobs.iter().find(|j| j.id == job).unwrap();
     assert_eq!(held.status, JobStatus::Completed);
     assert!(held.control.is_none());
     assert!(!held.ready && !held.pp_done);
-    let mut finished = false;
-    while let Ok(event) = rx.try_recv() {
-        finished |= matches!(event, Event::JobFinished {job: id, ..} if id == job);
-    }
-    assert!(
-        finished,
-        "ordinary missing articles must reach a terminal download verdict"
-    );
     let exported = engine.export_ready(job).await.unwrap().unwrap();
     let file = &exported.files[0];
     let got = std::fs::read(

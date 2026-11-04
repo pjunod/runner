@@ -49,6 +49,12 @@ the full failure roster, including failures outside the original pipeline.
 | Terminal receipt activation also waits for independent scratch cleanup | Require exact stamp/history/generation agreement and durable receipt activation, then let inventory maintenance perform its separate checked retirement. |
 | Restart treats a partially deleted failed source as a new processing input | Admit only replay of its exact existing generation-bound deletion journal. Keep ordinary payload export, repair, salvage, and publication fenced; allow only failure metadata/history/stamp updates. Persist that classification through a terminal stamp and restart until queue retirement. |
 | Delivery acceptance commits, then fails an unrelated queue transaction | Keep the replicated catalog's authentication, quorum, authority and generation CAS; bypass queue projection only for its two exact acceptance/retry routes. |
+| Completion fixtures read between snapshot publication and event emission | Await the matching bounded completion event before asserting the terminal snapshot and partial private bytes. |
+| Snapshot-repair polling treats documented election gaps as queue observations | Retry only the two exact read-only election responses within the original deadline; require a real successful Completed response. |
+| Failed-cleanup restart fixture assumes startup observation is a distinct completed retry | Prove the legacy cohort, retry metadata and exact deletion journal survive restart, then exercise explicit operator retry occasions after the manager is serving. Retry deadlines and payload fences remain unchanged. |
+| Operator retry routes legacy cleanup through fenced payload export | Route failed cleanup summaries to owner admission even for the legacy cohort or an idle verifier. Exact proof-bound cleanup custody remains the authority; ordinary payload export stays fenced. |
+| Slow retirement or connection-budget drain blocks healthy lease renewal | Revoke authority immediately, retain capacity while tracked workers join, and retire only the original grant context. Serialize actual budget drains separately; heartbeat submission does not wait for them, while new grant admission still does. |
+| Completion preflight rejects the saved token after a healthy renewal | Accept only predecessor tokens of the same owner/incarnation/resource/fence at preflight, matching the existing renewable publication transaction. Preserve immutable outbox/result identity; the transaction still checks current expiry, terminal state and exact job intent. |
 
 Engine fixtures must await only the explicit export-busy condition, use real
 inventory paths and worker contexts, and bound event receives. A payload
@@ -63,6 +69,25 @@ and the surviving manifest before unlinking. A successful deletion receipt
 can replay metadata after the path is gone. Replaced files remain untouched.
 The integration fixture keeps its permissions fault active across restarts
 and inspects cleanup metadata separately from verified payload export.
+It requires three distinct retry occasions, one terminal history row, no fourth
+attempt, and preservation of the original leftover bytes. Restart alone does
+not bypass the scheduled automatic retry deadline.
+
+The fairness regression uses a two-second lease with a conservative local
+deadline of 1.9 seconds. Retirement and budget owner replies can take ten
+seconds, so awaiting either inside heartbeat can expire unrelated healthy
+work. The correction separates execution lanes while retaining actual join
+acknowledgements, durable generation barriers, and truthful drain receipts.
+An expired grant retains its resume journal; only accepted completion permits
+its compaction. A delayed retirement cannot cancel a successor's custody.
+Healthy renewals also exposed a contradictory completion preflight: it required
+full token equality even though saved immutable completions predate later
+renewals. The existing final publication transaction already selects the
+latest live token of the exact same fenced operation. Align the preflight
+with that contract; future tokens, another owner/fence, changed job revision,
+expired current authority, and conflicting immutable results remain rejected.
+See the [independent I/O audit](IO_EFFICIENCY_AUDIT.md) for remaining cost
+investigations; those follow-ups are outside this qualification fix.
 
 ## Custody — FINALDIR reports output without transferring authority
 

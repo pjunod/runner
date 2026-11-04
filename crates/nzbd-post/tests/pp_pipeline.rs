@@ -1351,15 +1351,16 @@ async fn health_action_delete_removes_files() {
     engine.shutdown().await;
 }
 
-/// A local disposition error must not leave a failed queue row warning on
-/// every rescan forever. The attempt count is part of the durable queue row,
-/// so a daemon restart consumes the remaining budget instead of resetting it.
+/// Operator retry occasions after restart resume the legacy disposition
+/// budget. Restart must preserve the existing deletion journal and deadlines.
 #[cfg(unix)]
 #[tokio::test]
-async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() {
+async fn failed_cleanup_operator_retries_resume_durable_budget_across_restart() {
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     const ATTEMPTS_PARAM: &str = "*PP:failure-disposition-attempts";
+    const NEXT_RETRY_PARAM: &str = "*PP:failed-cleanup-next-retry";
 
     // This path deliberately does not expose partially deleted Done ranges
     // through verified export. Inspect metadata only for retry/stamp assertions.
@@ -1371,6 +1372,18 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
             .jobs
             .into_iter()
             .find(|job| job.id == JobId(95))
+    }
+    fn retry_deadline(job: &Job) -> Option<i64> {
+        job.params
+            .iter()
+            .find(|(key, _)| key == NEXT_RETRY_PARAM)
+            .and_then(|(_, value)| value.parse().ok())
+    }
+    fn unix_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
     }
     fn cleanup_evidence(engine: &EngineHandle) -> String {
         let inventory = engine.artifacts();
@@ -1413,6 +1426,19 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
         })
         .await
         .expect("exact terminal cleanup admission becomes ready after restart");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !engine.snapshot().jobs.iter().any(|row| {
+                row.id == JobId(95)
+                    && row
+                        .failed_cleanup
+                        .as_ref()
+                        .is_some_and(|cleanup| cleanup.attempts > 0)
+            }) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("startup scan must observe the recovered cleanup summary");
         assert_eq!(
             cleanup_evidence(engine),
             evidence,
@@ -1465,18 +1491,20 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let attempts = cleanup_metadata(&engine).await.and_then(|job| {
+        let committed = cleanup_metadata(&engine).await.is_some_and(|job| {
             job.params
-                .into_iter()
-                .find(|(key, _)| key == ATTEMPTS_PARAM)
-                .map(|(_, value)| value)
+                .iter()
+                .any(|(key, value)| key == ATTEMPTS_PARAM && value == "1")
+                && (!job.lifecycle_eligible()
+                    || retry_deadline(&job).is_some_and(|at| at > unix_now()))
         });
-        if attempts.as_deref() == Some("1") {
+        if committed {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the first failed disposition attempt was not persisted"
+            "the first failed disposition attempt was not persisted: {:?}",
+            cleanup_metadata(&engine).await
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -1484,6 +1512,7 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
     cancel.cancel();
     tracker.close();
     tracker.wait().await;
+    let first_retry = retry_deadline(&cleanup_metadata(&engine).await.unwrap());
     let recovery_operation = cleanup_evidence(&engine);
     engine.shutdown().await;
 
@@ -1494,6 +1523,12 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
     // Exactly one attempt: the import's `JobFinished` event and the manager's
     // startup scan both observe this row, but they are one retry occasion.
     let durable = cleanup_metadata(&recovered).await.unwrap();
+    assert_eq!(retry_deadline(&durable), first_retry);
+    assert!(
+        !durable.lifecycle_eligible(),
+        "legacy retry policy changed across restart: {:?}",
+        durable.params
+    );
     assert!(
         durable
             .params
@@ -1506,15 +1541,40 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
     assert_eq!(cleanup_evidence(&recovered), recovery_operation);
     let cancel2 = CancellationToken::new();
     let tracker2 = TaskTracker::new();
-    spawn_post_manager(
+    let claim2 = Arc::new(AtomicBool::new(false));
+    let gate2 = claim2.clone();
+    let manager2 = spawn_post_manager(
         recovered.clone(),
         config.clone(),
         hist.clone(),
         tmp.path().join("dest"),
-        None,
+        Some(Arc::new(move |_| gate2.load(Ordering::SeqCst))),
         cancel2.clone(),
         &tracker2,
     );
+    // Hold the claim until the manager serves its control mailbox so startup
+    // scan and the explicit operator command cannot become two occasions.
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), manager2.retry_now(JobId(u32::MAX)))
+            .await
+            .expect("second manager must serve its control mailbox"),
+        Err(nzbd_post::manager::RestartPostError::NotFound)
+    ));
+    let before_retry = cleanup_metadata(&recovered).await.unwrap();
+    assert!(before_retry
+        .params
+        .iter()
+        .any(|(key, value)| key == ATTEMPTS_PARAM && value == "1"));
+    assert_eq!(retry_deadline(&before_retry), first_retry);
+    assert!(
+        first_retry.is_none_or(|at| at > unix_now()),
+        "automatic retry must still be scheduled"
+    );
+    claim2.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(5), manager2.retry_now(JobId(95)))
+        .await
+        .expect("second operator retry must finish")
+        .unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -1537,27 +1597,49 @@ async fn permanently_undeletable_failed_job_retires_after_durable_retry_bound() 
     cancel2.cancel();
     tracker2.close();
     tracker2.wait().await;
+    let second_retry = retry_deadline(&cleanup_metadata(&recovered).await.unwrap());
     let recovery_operation = cleanup_evidence(&recovered);
     recovered.shutdown().await;
 
-    // Third occasion — again a restart, so each attempt is a distinct one.
-    // (Un-restarted, the remaining attempts arrive on the next 30s rescans;
-    // driving them with extra `JobFinished` emits would model one occasion as
-    // several and is exactly the miscount this bound is meant to resist.)
+    // The third occasion is another explicit operator command after restart,
+    // with the same claim barrier preventing a duplicate startup occasion.
     let recovered = spawn_engine(tmp.path()).await;
     cleanup_ready(&recovered).await;
     assert_eq!(cleanup_evidence(&recovered), recovery_operation);
     let cancel3 = CancellationToken::new();
     let tracker3 = TaskTracker::new();
-    spawn_post_manager(
+    let claim3 = Arc::new(AtomicBool::new(false));
+    let gate3 = claim3.clone();
+    let manager3 = spawn_post_manager(
         recovered.clone(),
         config,
         hist.clone(),
         tmp.path().join("dest"),
-        None,
+        Some(Arc::new(move |_| gate3.load(Ordering::SeqCst))),
         cancel3.clone(),
         &tracker3,
     );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), manager3.retry_now(JobId(u32::MAX)))
+            .await
+            .expect("third manager must serve its control mailbox"),
+        Err(nzbd_post::manager::RestartPostError::NotFound)
+    ));
+    let before_retry = cleanup_metadata(&recovered).await.unwrap();
+    assert!(before_retry
+        .params
+        .iter()
+        .any(|(key, value)| key == ATTEMPTS_PARAM && value == "2"));
+    assert_eq!(retry_deadline(&before_retry), second_retry);
+    assert!(
+        second_retry.is_none_or(|at| at > unix_now()),
+        "automatic retry must still be scheduled"
+    );
+    claim3.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(5), manager3.retry_now(JobId(95)))
+        .await
+        .expect("third operator retry must finish")
+        .unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {

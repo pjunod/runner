@@ -150,6 +150,20 @@ pub(crate) struct GenerationMaterialization {
     pub emit_finished: bool,
 }
 
+#[derive(Debug)]
+pub(crate) enum WorkerRetirement {
+    Revoked(nzbd_state::artifacts::WorkerControlContext),
+    Accepted(nzbd_state::artifacts::WorkerControlContext),
+}
+
+impl WorkerRetirement {
+    fn context(&self) -> &nzbd_state::artifacts::WorkerControlContext {
+        match self {
+            Self::Revoked(context) | Self::Accepted(context) => context,
+        }
+    }
+}
+
 /// External commands (wrapped by `EngineHandle` methods).
 #[derive(Debug)]
 pub(crate) enum QueueCommand {
@@ -461,7 +475,7 @@ pub(crate) enum QueueCommand {
     /// history or events — the executor-side handoff cleanup.
     RemoveJobSilent {
         job: JobId,
-        accepted_context: Option<nzbd_state::artifacts::WorkerControlContext>,
+        retirement: Option<WorkerRetirement>,
         reply: oneshot::Sender<bool>,
     },
     /// Mark a job as executing on another node: the local scheduler skips
@@ -1945,6 +1959,14 @@ impl Owner {
     }
 
     fn on_command(&mut self, cmd: QueueCommand) {
+        // Rejection must precede every busy-path cancellation, writer stop or
+        // deferral: an old grant cannot revoke custody belonging to its successor.
+        if self.stale_worker_retirement(&cmd) {
+            if let QueueCommand::RemoveJobSilent { reply, .. } = cmd {
+                let _ = reply.send(false);
+            }
+            return;
+        }
         let pending_job = match &cmd {
             QueueCommand::Pause { job, .. }
             | QueueCommand::Resume { job, .. }
@@ -4443,21 +4465,25 @@ impl Owner {
             }
             QueueCommand::RemoveJobSilent {
                 job,
-                accepted_context,
+                retirement,
                 reply,
             } => {
-                let accepted = accepted_context.as_ref().is_some_and(|expected| {
+                let current = retirement.as_ref().is_some_and(|expected| {
                     self.state.job(job).is_some_and(|record| {
                         nzbd_state::artifacts::WorkerControlContext::for_job(record).as_ref()
-                            == Some(expected)
+                            == Some(expected.context())
                     })
                 });
-                if accepted_context.is_some() && !accepted {
+                if retirement.is_some() && !current {
                     // A delayed completion must not retire another grant's journal.
                     let _ = reply.send(false);
                 } else {
-                    let _ = reply
-                        .send(self.remove_job_silent_with_journal(job, self.persist || accepted));
+                    let compact = match retirement {
+                        Some(WorkerRetirement::Accepted(_)) => true,
+                        Some(WorkerRetirement::Revoked(_)) => false,
+                        None => self.persist,
+                    };
+                    let _ = reply.send(self.remove_job_silent_with_journal(job, compact));
                 }
             }
             QueueCommand::SetDelegated { job, node, reply } => {
@@ -5124,7 +5150,7 @@ impl Owner {
                     let (reply, _) = oneshot::channel();
                     self.on_command(QueueCommand::RemoveJobSilent {
                         job: id,
-                        accepted_context: None,
+                        retirement: None,
                         reply,
                     });
                 }
@@ -7909,6 +7935,20 @@ impl Owner {
         });
     }
 
+    fn stale_worker_retirement(&self, command: &QueueCommand) -> bool {
+        match command {
+            QueueCommand::RemoveJobSilent {
+                job,
+                retirement: Some(retirement),
+                ..
+            } => self.state.job(*job).is_none_or(|record| {
+                nzbd_state::artifacts::WorkerControlContext::for_job(record).as_ref()
+                    != Some(retirement.context())
+            }),
+            _ => false,
+        }
+    }
+
     fn drain_replacements(&mut self) {
         if self.cancel.is_cancelled() || self.projection_transition {
             return;
@@ -7918,6 +7958,10 @@ impl Owner {
             let Some(command) = self.deferred_replacements.pop_front() else {
                 break;
             };
+            if self.stale_worker_retirement(&command) {
+                self.on_command(command);
+                continue;
+            }
             if matches!(
                 &command,
                 QueueCommand::AdoptReplicatedAuthority { .. } | QueueCommand::AdoptAuthority { .. }

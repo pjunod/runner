@@ -2335,7 +2335,7 @@ impl EngineHandle {
         }
         self.roundtrip_bool(|reply| QueueCommand::RemoveJobSilent {
             job,
-            accepted_context: None,
+            retirement: None,
             reply,
         })
         .await
@@ -2349,9 +2349,31 @@ impl EngineHandle {
         job: JobId,
         context: nzbd_state::artifacts::WorkerControlContext,
     ) -> Result<bool, EngineError> {
+        if self.post_scope.is_some() {
+            return Ok(false);
+        }
         self.roundtrip_bool(|reply| QueueCommand::RemoveJobSilent {
             job,
-            accepted_context: Some(context),
+            retirement: Some(owner::WorkerRetirement::Accepted(context)),
+            reply,
+        })
+        .await
+    }
+
+    /// Revoke only the exact imported worker grant after its execution has
+    /// stopped. Shared resume journals survive expiry/cancellation; same-ID
+    /// successors remain protected through the durable retirement barrier.
+    pub async fn retire_worker_job(
+        &self,
+        job: JobId,
+        context: nzbd_state::artifacts::WorkerControlContext,
+    ) -> Result<bool, EngineError> {
+        if self.post_scope.is_some() {
+            return Ok(false);
+        }
+        self.roundtrip_bool(|reply| QueueCommand::RemoveJobSilent {
+            job,
+            retirement: Some(owner::WorkerRetirement::Revoked(context)),
             reply,
         })
         .await
