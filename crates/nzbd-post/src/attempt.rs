@@ -50,34 +50,54 @@ impl AttemptControl {
         ctx: &PpCtx,
         job: JobId,
     ) -> Result<Arc<Self>, PostError> {
-        let inventory = engine.artifacts();
         let cancel = ctx.cancel.child_token();
-        let acquire_cancel = cancel.clone();
-        let acquire_authority = ctx.commit_ok.clone();
-        let guard = ctx
-            .workers
-            .spawn_blocking(move || {
-                if acquire_cancel.is_cancelled() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "processing cancelled",
-                    )
-                    .into());
-                }
-                inventory.acquire_attempt_use_checked(job.0, &|| {
-                    if acquire_cancel.is_cancelled() || !acquire_authority() {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::Interrupted,
-                            "processing attempt no longer authorized",
-                        ))
-                    } else {
-                        Ok(())
-                    }
+        let mut waiting = false;
+        let guard = loop {
+            let inventory = engine.artifacts();
+            let acquire_cancel = cancel.clone();
+            let acquire_authority = ctx.commit_ok.clone();
+            let result = ctx
+                .workers
+                .spawn_blocking(move || {
+                    inventory.acquire_attempt_use_checked(job.0, &|| {
+                        if acquire_cancel.is_cancelled() || !acquire_authority() {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "processing attempt no longer authorized",
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    })
                 })
-            })
-            .await
-            .map_err(|e| PostError::Subprocess(e.to_string()))?
-            .map_err(|e| PostError::Subprocess(e.to_string()))?;
+                .await
+                .map_err(|e| PostError::Subprocess(e.to_string()))?;
+            match result {
+                Ok(guard) => break guard,
+                Err(nzbd_state::artifacts::Error::Io(error))
+                    if error.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    // A retiring writer or inventory reader is ordinary
+                    // contention, not a verdict on the payload. Keep the
+                    // replacement cancellable and wait for the real lease.
+                    if !waiting {
+                        tracing::info!(
+                            job = job.0,
+                            "post-processing waiting for current file workers to finish"
+                        );
+                        waiting = true;
+                    }
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "processing attempt cancelled while waiting for file workers",
+                        ).into()),
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                    }
+                }
+                Err(error) => return Err(PostError::Artifact(error)),
+            }
+        };
         let progress = RepairProgress {
             attempt_id: format!(
                 "{}:{}",
@@ -341,6 +361,57 @@ mod tests {
         assert!(!engine.artifacts().processing_in_use(4).unwrap());
         engine.shutdown().await;
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacement_waits_for_previous_worker_instead_of_failing_review() {
+        let (_temp, engine, _old_ctx, control) = fixture().await;
+        let ctx = PpCtx::default();
+        let replacement = tokio::spawn({
+            let engine = engine.clone();
+            let ctx = ctx.clone();
+            async move { AttemptControl::new(&engine, &ctx, JobId(4)).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !replacement.is_finished(),
+            "live worker custody should defer the replacement"
+        );
+        drop(control);
+        let replacement = tokio::time::timeout(std::time::Duration::from_secs(3), replacement)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(engine.artifacts().processing_in_use(4).unwrap());
+        drop(replacement);
+        assert!(!engine.artifacts().processing_in_use(4).unwrap());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacement_wait_is_cancellable_without_releasing_previous_worker() {
+        let (_temp, engine, _old_ctx, control) = fixture().await;
+        let ctx = PpCtx::default();
+        let replacement = tokio::spawn({
+            let engine = engine.clone();
+            let ctx = ctx.clone();
+            async move { AttemptControl::new(&engine, &ctx, JobId(4)).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!replacement.is_finished());
+        ctx.cancel.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), replacement)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(engine.artifacts().processing_in_use(4).unwrap());
+        drop(control);
+        assert!(!engine.artifacts().processing_in_use(4).unwrap());
+        engine.shutdown().await;
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_tool_is_killed_and_joined_before_worker_custody_releases() {

@@ -263,9 +263,11 @@ impl Inventory {
                 || self.reconciliation_in_use(&artifact)
                 || self.allocation_uses.lock().unwrap().contains(&job)
             {
-                return Err(Error::Conflict(
-                    "previous processing or allocation workers have not quiesced".into(),
-                ));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "processing files are still in use by a worker",
+                )
+                .into());
             }
             if artifact.hold.is_some()
                 || !matches!(
