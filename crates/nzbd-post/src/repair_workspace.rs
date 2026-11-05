@@ -31,6 +31,49 @@ pub(crate) struct RepairSession {
 fn state_error(error: nzbd_state::artifacts::Error) -> PostError {
     PostError::Artifact(error)
 }
+/// A completed set can resume without copying it into another tool workspace.
+/// Pending partial acquisitions still need the ordinary reconstruction path.
+pub(crate) fn published_repair_reusable(
+    inventory: &Arc<Inventory>,
+    job: u32,
+    set: &Par2Set,
+    partials: &[(PathBuf, String)],
+) -> Result<bool, PostError> {
+    if !partials.is_empty() {
+        return Ok(false);
+    }
+    let Some(source) = inventory.for_job(job).map_err(state_error)? else {
+        return Ok(false);
+    };
+    let token = set
+        .set_id
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let paths = set
+        .files
+        .iter()
+        .map(|file| {
+            let relative = crate::namespace::relative(&file.name)?;
+            set.root
+                .join(relative)
+                .strip_prefix(&source.path)
+                .map(|path| path.to_string_lossy().into_owned())
+                .map_err(|_| {
+                    PostError::Subprocess("PAR set is outside its processing source".into())
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    inventory
+        .repair_published(job, &token, &paths, crate::attempt::checkpoint, |bytes| {
+            if let Some(control) = crate::attempt::current() {
+                control.bytes(bytes);
+                control.file_done();
+            }
+        })
+        .map_err(state_error)
+}
+
 impl RepairSession {
     pub fn new(
         inventory: Arc<Inventory>,
@@ -497,13 +540,19 @@ pub async fn repair(
     let inventory = inventory.clone();
     let set = set.clone();
     let partials = partials.to_vec();
-    let mut session = tokio::task::spawn_blocking(move || {
+    let session = tokio::task::spawn_blocking(move || {
+        if published_repair_reusable(&inventory, job, &set, &partials)? {
+            return Ok(None);
+        }
         let mut session = RepairSession::new(inventory, job, set, partials)?;
         session.prepare(&HashSet::new())?;
-        Ok::<_, PostError>(session)
+        Ok::<_, PostError>(Some(session))
     })
     .await
     .map_err(|e| PostError::Subprocess(e.to_string()))??;
+    let Some(mut session) = session else {
+        return Ok(VerifyResult::Intact);
+    };
     let verified = match tool.verify_full(&session.main()).await {
         Ok(verified) => verified,
         Err(error) => {
@@ -651,10 +700,21 @@ mod tests {
             VerifyResult::Intact
         );
         assert_eq!(std::fs::read(&payload).unwrap(), bytes);
-        // Restart all stages after the repair already published its output.
-        // The old successful journal must not prevent a fresh tool attempt.
+        // A completed repair must be reused even when the tool cannot run.
+        // This also proves a retry does not need another full private copy.
+        let unavailable_tool = Par2Tool {
+            cmd: "/no-such-par2".into(),
+            timeout: std::time::Duration::from_secs(1),
+        };
+        assert!(!published_repair_reusable(
+            &inventory,
+            4,
+            &set,
+            &[(set.root.join("pending.part"), set.files[0].name.clone())]
+        )
+        .unwrap());
         assert_eq!(
-            repair(&inventory, 4, &set, &tool, &[], &mut restored)
+            repair(&inventory, 4, &set, &unavailable_tool, &[], &mut restored)
                 .await
                 .unwrap(),
             VerifyResult::Intact

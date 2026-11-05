@@ -3710,6 +3710,10 @@ async fn held_move_retry_reuses_a_verified_successful_extraction() {
         .await
         .unwrap());
     std::fs::remove_dir(&occupied).unwrap();
+    // This exact source directory has less than the admission safety floor.
+    // Reusing verified extraction output needs no additional source bytes.
+    let _headroom =
+        nzbd_state::capacity::inject_available_test_limit(&dir, 512 * 1024 * 1024).unwrap();
     // Re-extraction would fail: the successful transform must be reused.
     cfg.sevenzip_cmd = "/no-such-extractor".into();
     let cancel = CancellationToken::new();
