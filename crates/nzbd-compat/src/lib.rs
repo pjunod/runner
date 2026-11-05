@@ -984,7 +984,7 @@ async fn listfiles(state: &CompatState, params: &Value) -> Result<Value, (i64, &
 
 /// Delete a queue job the NZBGet way: it becomes a history entry.
 async fn delete_to_history(state: &CompatState, id: JobId, with_files: bool) -> bool {
-    let exported = state.engine.export_job(id).await.ok().flatten();
+    let exported = state.engine.queue_job_metadata(id).await.ok().flatten();
     let deleted = state
         .engine
         .delete_job(id, with_files)
