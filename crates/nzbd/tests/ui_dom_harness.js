@@ -1845,6 +1845,8 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
       "the download interlude remains in the post-processing section");
     eq(T.detailModel(fetchingDelayedPar, 1_542_000).recoverHidden, true,
       "recovery controls stay hidden while the backend rejects restarts");
+    eq(T.sectionOf(post("publication_verify")), "verifying", "final proof checks are verifying, not renaming");
+    eq(T.detailModel(post("publication_verify"), 1_542_000).st, "VERIFYING PUBLICATION", "final verification has its own label");
     // An unknown stage from a newer daemon must land in a visible section
     // rather than vanish between the buckets.
     eq(T.sectionOf(post("teleporting")), "post_queued",
@@ -1855,7 +1857,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     for (const st of ["queued", "downloading", "paused", "fetching", "post_queued"])
       ok(keys.has(T.sectionOf(job(1, { status: st }))), "section exists for " + st);
     for (const st of ["par_rename", "par_verify", "par_repair", "rar_rename",
-                      "unpack", "cleanup", "move", "post_unpack_rename", "script"])
+                      "unpack", "cleanup", "move", "post_unpack_rename", "script", "publication_verify"])
       ok(keys.has(T.sectionOf(post(st))), "section exists for stage " + st);
 
     // Only the download queue keeps its move controls: off it, the arrows
