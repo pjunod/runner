@@ -885,7 +885,68 @@ impl Inventory {
                 "completed repair journal changed during verification".into(),
             ));
         }
+        drop(_coordinator);
+        drop(_lease);
+        self.abandon_superseded_repairs(&source, &key, &mut checkpoint)?;
         Ok(true)
+    }
+
+    /// A cancelled retry may leave an unpublished private attempt behind.
+    /// Reusing a proven repair must close that attempt before publication,
+    /// without claiming its scratch bytes as output or deleting them.
+    fn abandon_superseded_repairs(
+        &self,
+        source: &Artifact,
+        logical_key: &str,
+        mut checkpoint: impl FnMut() -> std::io::Result<()>,
+    ) -> Result<()> {
+        let raws = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT data FROM operations WHERE artifact=?1 AND state IN ('running','queued','retry','review') ORDER BY rowid",
+            )?;
+            let rows = statement.query_map([&source.id], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut superseded = Vec::new();
+        for raw in raws {
+            checkpoint()?;
+            let operation: Operation = serde_json::from_str(&raw)?;
+            if operation.kind != "par_repair" || operation.state != "running" {
+                return Err(Error::Conflict(
+                    "another pending operation blocks repair reuse".into(),
+                ));
+            }
+            let workspace: Workspace = serde_json::from_str(&operation.request)?;
+            if workspace.logical_key.as_deref().unwrap_or(&operation.id) != logical_key
+                || workspace.source.id != source.id
+                || workspace.source.generation != source.generation
+                || workspace.source.path != source.path
+                || workspace.source.root != source.root
+                || workspace.published_files.is_some()
+                || !workspace.verified_output_paths.is_empty()
+                || !workspace.retained.is_empty()
+            {
+                return Err(Error::Conflict(
+                    "another repair generation blocks reuse".into(),
+                ));
+            }
+            superseded.push(workspace);
+        }
+        if superseded.is_empty() {
+            return if source.state == "active" {
+                Ok(())
+            } else {
+                Err(Error::Conflict(
+                    "source transition has no superseded repair attempt".into(),
+                ))
+            };
+        }
+        for workspace in superseded {
+            checkpoint()?;
+            self.abandon_repair_workspace(&workspace)?;
+        }
+        Ok(())
     }
 
     /// A successful extraction can be reused after a later stage fails. Names
@@ -2234,6 +2295,72 @@ mod tests {
         assert_eq!(
             std::fs::read(reused.scratch.path.join("repaired.bin")).unwrap(),
             b"verified output"
+        );
+    }
+
+    #[test]
+    fn completed_repair_reuse_closes_only_unpublished_retries_and_keeps_their_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("downloads");
+        std::fs::create_dir(&root).unwrap();
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        let source = root.join("job");
+        inventory
+            .allocate_for_delivery(5, &root, &source, true, false)
+            .unwrap();
+        std::fs::write(source.join("media.bin"), b"verified media").unwrap();
+        let completed = inventory.workspace(5, "par_repair", "abc").unwrap();
+        inventory
+            .finish_repair_workspace(&completed, &["media.bin".into()])
+            .unwrap();
+        let mut interrupted = inventory.workspace(5, "par_repair", "abc").unwrap();
+        let attempt = inventory.begin_workspace_attempt(&mut interrupted).unwrap();
+        std::fs::write(attempt.join("partial"), b"private partial").unwrap();
+        assert_eq!(
+            inventory.for_job(5).unwrap().unwrap().state,
+            "transitioning"
+        );
+        assert!(inventory.refresh_for_delivery(5).is_err());
+        assert!(inventory
+            .repair_published(5, "abc", &["media.bin".into()], || Ok(()), |_| {})
+            .unwrap());
+        assert_eq!(
+            inventory
+                .operation(&interrupted.operation_id)
+                .unwrap()
+                .state,
+            "failed"
+        );
+        assert_eq!(
+            inventory.operation(&completed.operation_id).unwrap().state,
+            "succeeded"
+        );
+        assert_eq!(
+            inventory.get(&interrupted.scratch.id).unwrap().state,
+            "retained"
+        );
+        assert_eq!(
+            std::fs::read(attempt.join("partial")).unwrap(),
+            b"private partial"
+        );
+        assert_eq!(inventory.refresh_for_delivery(5).unwrap().state, "active");
+
+        let matching = inventory.workspace(5, "par_repair", "abc").unwrap();
+        let unrelated = inventory.workspace(5, "par_repair", "def").unwrap();
+        assert!(inventory
+            .repair_published(5, "abc", &["media.bin".into()], || Ok(()), |_| {})
+            .is_err());
+        assert_eq!(
+            inventory.operation(&unrelated.operation_id).unwrap().state,
+            "running"
+        );
+        assert_eq!(
+            inventory.operation(&matching.operation_id).unwrap().state,
+            "running"
+        );
+        assert_eq!(
+            inventory.for_job(5).unwrap().unwrap().state,
+            "transitioning"
         );
     }
 
