@@ -85,6 +85,7 @@ fn digest_file_with_checkpoint(
     loop {
         checkpoint()?;
         let count = file.read(&mut buffer)?;
+        crate::fileops::payload_read(count);
         if count == 0 {
             break;
         }
@@ -96,6 +97,39 @@ fn digest_file_with_checkpoint(
         )));
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+// Only one validation call owns this cache. Reopening and checking the full
+// identity on every hit preserves changed-file detection between proof paths.
+type ProofDigests = std::collections::HashMap<String, (Identity, String)>;
+
+fn digest_file_once(
+    root: &File,
+    path: &str,
+    expected: &Identity,
+    digests: &mut ProofDigests,
+    checkpoint: &mut dyn FnMut() -> std::io::Result<()>,
+) -> Result<String> {
+    checkpoint()?;
+    let current = fs::open_relative(root, path)?;
+    if fs::identity_for_file(&current)? != *expected {
+        return Err(Error::Conflict(format!(
+            "transform output identity changed before digest: {path}"
+        )));
+    }
+    if let Some((identity, digest)) = digests.get(path) {
+        if identity == expected {
+            return Ok(digest.clone());
+        }
+    }
+    let digest = digest_file_with_checkpoint(root, path, expected, checkpoint)?;
+    if fs::identity_for_file(&fs::open_relative(root, path)?)? != *expected {
+        return Err(Error::Conflict(format!(
+            "transform output identity changed after digest: {path}"
+        )));
+    }
+    digests.insert(path.to_owned(), (expected.clone(), digest.clone()));
+    Ok(digest)
 }
 
 /// See [`Inventory::verified_custody_evidence`].
@@ -846,7 +880,8 @@ impl Inventory {
             .reserve_processing_mutation(std::slice::from_ref(&source))?
             .ok_or_else(|| Error::Conflict("custody evidence source remains in use".into()))?;
         let root = self.verify(&source)?;
-        let renamed = self.verified_renames(&source, &root, &mut checkpoint)?;
+        let mut digests = ProofDigests::new();
+        let renamed = self.verified_renames(&source, &root, &mut digests, &mut checkpoint)?;
         let raws = {
             let db = self.db.lock().unwrap();
             let mut statement = db.prepare(
@@ -948,10 +983,11 @@ impl Inventory {
                     if matches_identity {
                         checkpoint()?;
                         let matches_digest = proof.digest.as_deref().is_some_and(|expected| {
-                            digest_file_with_checkpoint(
+                            digest_file_once(
                                 &root,
                                 &path,
                                 &proof.identity,
+                                &mut digests,
                                 &mut checkpoint,
                             )
                             .is_ok_and(|actual| actual == expected)
@@ -986,10 +1022,11 @@ impl Inventory {
                 .any(|entry| entry.path == proof.path && entry.identity == proof.identity)
             {
                 checkpoint()?;
-                if digest_file_with_checkpoint(
+                if digest_file_once(
                     &root,
                     &proof.path,
                     &proof.identity,
+                    &mut digests,
                     &mut checkpoint,
                 )? == expected_digest
                 {
@@ -1037,8 +1074,9 @@ impl Inventory {
             .reserve_processing_mutation(std::slice::from_ref(&source))?
             .ok_or_else(|| Error::Conflict("custody evidence source remains in use".into()))?;
         let root = self.verify(&source)?;
+        let mut digests = ProofDigests::new();
         let result = self
-            .verified_renames(&source, &root, &mut checkpoint)?
+            .verified_renames(&source, &root, &mut digests, &mut checkpoint)?
             .into_iter()
             .map(|(old, rename)| (old, rename.current))
             .collect();
@@ -1053,6 +1091,7 @@ impl Inventory {
         &self,
         source: &Artifact,
         root: &File,
+        digests: &mut ProofDigests,
         mut checkpoint: impl FnMut() -> std::io::Result<()>,
     ) -> Result<std::collections::HashMap<String, VerifiedRename>> {
         let raws = {
@@ -1114,7 +1153,7 @@ impl Inventory {
             };
             if current.identity.directory
                 || !rename_transition_matches(original, &current.identity)
-                || digest_file_with_checkpoint(root, new, &current.identity, &mut checkpoint)?
+                || digest_file_once(root, new, &current.identity, digests, &mut checkpoint)?
                     != *expected_digest
             {
                 continue;
@@ -2097,6 +2136,81 @@ mod tests {
         assert_eq!(
             std::fs::read(reused.scratch.path.join("repaired.bin")).unwrap(),
             b"verified output"
+        );
+    }
+
+    #[test]
+    fn cached_digest_rechecks_identity_and_cancellation_before_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("payload");
+        std::fs::write(&path, b"original bytes").unwrap();
+        let root = fs::open_dir(temp.path()).unwrap();
+        let identity =
+            fs::identity_for_file(&fs::open_relative(&root, "payload").unwrap()).unwrap();
+        let mut cache = ProofDigests::new();
+        digest_file_once(&root, "payload", &identity, &mut cache, &mut || Ok(())).unwrap();
+        assert!(matches!(
+            digest_file_once(&root, "payload", &identity, &mut cache,
+                &mut || Err(std::io::ErrorKind::Interrupted.into())),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted
+        ));
+        std::fs::rename(&path, temp.path().join("retained")).unwrap();
+        std::fs::write(&path, b"original bytes").unwrap();
+        assert!(digest_file_once(&root, "payload", &identity, &mut cache, &mut || Ok(())).is_err());
+        assert_eq!(
+            std::fs::read(temp.path().join("retained")).unwrap(),
+            b"original bytes"
+        );
+        let replacement =
+            fs::identity_for_file(&fs::open_relative(&root, "payload").unwrap()).unwrap();
+        digest_file_once(&root, "payload", &replacement, &mut cache, &mut || Ok(())).unwrap();
+        std::fs::write(&path, b"modified bytes").unwrap();
+        assert!(
+            digest_file_once(&root, "payload", &replacement, &mut cache, &mut || Ok(())).is_err()
+        );
+    }
+
+    #[test]
+    fn custody_evidence_hashes_each_current_file_once_across_rename_and_repair_proofs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("downloads");
+        std::fs::create_dir(&root).unwrap();
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        let source = root.join("job");
+        inventory.allocate(5, &root, &source).unwrap();
+        let bytes = vec![23; 131073];
+        std::fs::write(source.join("original.mkv"), &bytes).unwrap();
+        // Two successful rename journals end at the current path. Both
+        // must keep their provenance without rereading the same object.
+        for (old, new) in [
+            ("original.mkv", "release.mkv"),
+            ("release.mkv", "intermediate.mkv"),
+            ("intermediate.mkv", "release.mkv"),
+        ] {
+            inventory
+                .restore_file(5, &source.join(old), &source.join(new))
+                .unwrap();
+        }
+        let workspace = inventory.workspace(5, "par_repair", "abc").unwrap();
+        inventory
+            .finish_repair_workspace(&workspace, &["release.mkv".into()])
+            .unwrap();
+        crate::fileops::PAYLOAD_READ_BYTES.with(|n| n.set(0));
+        let evidence = inventory.verified_custody_evidence(5, || Ok(())).unwrap();
+        assert_eq!(
+            evidence.restored.get("original.mkv").map(String::as_str),
+            Some("release.mkv")
+        );
+        assert!(evidence.verified_outputs.contains("release.mkv"));
+        assert_eq!(
+            crate::fileops::PAYLOAD_READ_BYTES.with(|n| n.get()),
+            bytes.len() as u64
+        );
+        // A new validation starts a new proof boundary and must read again.
+        inventory.verified_custody_evidence(5, || Ok(())).unwrap();
+        assert_eq!(
+            crate::fileops::PAYLOAD_READ_BYTES.with(|n| n.get()),
+            2 * bytes.len() as u64
         );
     }
 
