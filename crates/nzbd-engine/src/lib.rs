@@ -852,6 +852,16 @@ impl EngineHandle {
         self.send(QueueCommand::RecoveryDocument { reply }).await?;
         owner_reply(rx).await
     }
+    /// Queue metadata for control operations and deletion history. This does
+    /// not grant payload access or establish that downloaded bytes are valid.
+    pub async fn queue_job_metadata(&self, job: JobId) -> Result<Option<Job>, EngineError> {
+        Ok(self
+            .recovery_document()
+            .await?
+            .jobs
+            .into_iter()
+            .find(|record| record.id == job))
+    }
     pub async fn remove_orphan_torrent_source(&self, job: JobId) -> Result<bool, EngineError> {
         self.roundtrip_bool(|reply| QueueCommand::RemoveOrphanTorrentSource { job, reply })
             .await
@@ -1863,7 +1873,7 @@ impl EngineHandle {
             .find(|j| j.id == job)
             .is_some_and(|j| j.torrent_role == Some("seed"));
         let native = self
-            .export_job(job)
+            .queue_job_metadata(job)
             .await?
             .filter(torrent_acquisitions::is_acquisition);
         if native.is_some()

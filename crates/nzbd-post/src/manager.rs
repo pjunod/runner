@@ -3722,7 +3722,6 @@ async fn process_job_ctx_from_inner(
                 .iter()
                 .find(|(k, _)| k == "*Unpack:Password")
                 .map(|(_, v)| v.as_str());
-            let _capacity = nzbd_state::capacity::reserve(&dir, job.totals.size)?;
             // A retry that restarts before unpack meets volumes the final
             // deobfuscation pass already renamed. The extraction workspace is
             // keyed by archive path, so the renamed set would look new and be
@@ -3772,6 +3771,7 @@ async fn process_job_ctx_from_inner(
                     consumed_archive_paths.extend(workspace.input_paths.iter().cloned());
                     continue;
                 }
+                let _capacity = nzbd_state::capacity::reserve(&dir, job.totals.size)?;
                 let _workspace_capacity =
                     nzbd_state::capacity::reserve(&workspace.scratch.path, job.totals.size)?;
                 let attempt = engine
@@ -6114,11 +6114,30 @@ async fn repair_isolated_loop(
     let control = crate::attempt::current().expect("processing control");
     let inventory = engine.artifacts();
     let owned_partials = partials.to_vec();
-    let mut session = control
+    control
+        .phase(nzbd_engine::RepairPhase::Validating, set.files.len())
+        .await;
+    let session = control
         .blocking(move |_| {
+            if crate::repair_workspace::published_repair_reusable(
+                &inventory,
+                job_id.0,
+                &set,
+                &owned_partials,
+            )? {
+                return Ok(None);
+            }
             crate::repair_workspace::RepairSession::new(inventory, job_id.0, set, owned_partials)
+                .map(Some)
         })
         .await?;
+    let Some(mut session) = session else {
+        tracing::info!(
+            job = job_id.0,
+            "reusing completed PAR repair after output verification"
+        );
+        return Ok(true);
+    };
     let deadline = tokio::time::Instant::now() + cfg.par_fetch_timeout;
     #[cfg(test)]
     let (mut verified_calls, mut fetched_batches) = (0, 0);

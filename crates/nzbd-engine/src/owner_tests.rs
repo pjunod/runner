@@ -5210,6 +5210,86 @@ async fn orphan_receipt_discard_never_restores_or_changes_an_authoritative_id_co
 }
 
 #[tokio::test]
+async fn public_delete_cancels_pending_verification_and_retains_payload() {
+    let (_temporary, mut owner, adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    let mut row = pending_job(41);
+    row.status = JobStatus::Paused;
+    let source = owner.dest_dir.join(&row.dir_name);
+    let payload = source.join("payload.bin");
+    owner
+        .artifacts
+        .allocate_for_delivery(41, &owner.dest_dir, &source, true, false)
+        .unwrap();
+    std::fs::write(&payload, b"retained download").unwrap();
+    owner.state.jobs.push(row);
+    owner.queue_verification(JobId(41));
+    pump(&mut owner, &mut messages).await;
+    let cancellation = owner.verification[&JobId(41)].cancel.clone();
+    owner.publish_snapshot(0);
+    let tracker = owner.tracker.clone();
+    let engine = crate::EngineHandle {
+        artifacts: owner.artifacts.clone(),
+        url_resolutions: owner.url_resolutions.clone(),
+        url_dest_dir: owner.dest_dir.clone(),
+        import_state_dir: owner.state_dir.clone(),
+        url_history: owner.history.clone(),
+        url_outbox_external: owner.persist_guard.is_some(),
+        owner_persist_guard: owner.persist_guard.clone(),
+        native_seed_recovery_cursor: Default::default(),
+        hold_probes: Default::default(),
+        recovery_cursor: Default::default(),
+        cmd_tx: owner.engine_tx.clone(),
+        shared: owner.shared.clone(),
+        events: owner.events.clone(),
+        cancel: owner.cancel.clone(),
+        tracker: tracker.clone(),
+        backend_adapter: Arc::new(std::sync::Mutex::new(Some(adapter))),
+        budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
+        url_fetches: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        post_scope: None,
+        queue_changes: owner.epoch_tx.subscribe(),
+        owner_heartbeat: owner.owner_heartbeat.clone(),
+        shutdown_complete: owner.shutdown_complete.clone(),
+    };
+    let operation = tokio::spawn(async move {
+        // Payload export stays fenced; metadata is sufficient for delete/undo.
+        assert!(matches!(
+            engine.export_job(JobId(41)).await,
+            Err(crate::EngineError::Lifecycle(_))
+        ));
+        let metadata = engine.queue_job_metadata(JobId(41)).await.unwrap().unwrap();
+        assert_eq!(metadata.name, "job-41");
+        assert_eq!(metadata.files.len(), 1);
+        assert!(engine.delete_job(JobId(41), false).await.unwrap());
+        assert!(!engine.delete_job(JobId(41), false).await.unwrap());
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !operation.is_finished() {
+            tokio::select! {
+                Some(message) = messages.recv() => owner.on_msg(message),
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {},
+            }
+        }
+        operation.await.unwrap();
+    })
+    .await
+    .expect("public Delete must reach the owner while verification is pending");
+    pump(&mut owner, &mut messages).await;
+    assert!(cancellation.is_cancelled());
+    assert!(owner.state.job(JobId(41)).is_none());
+    assert!(!owner.verification.contains_key(&JobId(41)));
+    assert_eq!(std::fs::read(payload).unwrap(), b"retained download");
+    assert!(SnapshotStore::open(&owner.state_dir)
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap()
+        .jobs
+        .is_empty());
+}
+
+#[tokio::test]
 async fn automatic_hold_recovery_bounds_each_pass_and_rotates_all_due_jobs() {
     // This test drives each bounded pass itself. Start the genuine owner
     // after setup, without also starting Engine::spawn's periodic recovery

@@ -1206,7 +1206,7 @@ struct Parked {
 /// still has it; the caller only writes the record if the delete succeeded.
 async fn park_snapshot(st: &ApiState, job: JobId) -> Option<Parked> {
     st.history.as_ref()?;
-    let j = st.engine.export_job(job).await.ok().flatten()?;
+    let j = st.engine.queue_job_metadata(job).await.ok().flatten()?;
     let url = j
         .params
         .iter()

@@ -790,6 +790,104 @@ impl Inventory {
         self.finish_workspace_output(workspace, None, false)
     }
 
+    /// Reuse only the completed repair for this exact catalog and source
+    /// generation, with every expected output freshly proven at its current
+    /// path. Scratch retirement does not invalidate a published byte proof.
+    pub fn repair_published(
+        &self,
+        job: u32,
+        token: &str,
+        expected_paths: &[String],
+        mut checkpoint: impl FnMut() -> std::io::Result<()>,
+        mut verified: impl FnMut(u64),
+    ) -> Result<bool> {
+        checkpoint()?;
+        if expected_paths.is_empty()
+            || token.len() > 128
+            || !token.bytes().all(|c| c.is_ascii_hexdigit())
+        {
+            return Ok(false);
+        }
+        let source = self.for_job(job)?.ok_or(Error::NotFound)?;
+        if source.hold.is_some() || !matches!(source.state.as_str(), "active" | "transitioning") {
+            return Ok(false);
+        }
+        let key = format!("par_repair-{}-{}-{token}", source.id, source.generation);
+        let raw: Option<String> = self.db.lock().unwrap().query_row(
+            "SELECT data FROM operations WHERE artifact=?1 AND state='succeeded' AND json_extract(data,'$.kind')='par_repair' AND (id=?2 OR json_extract(json_extract(data,'$.request'),'$.logical_key')=?2) ORDER BY rowid DESC LIMIT 1",
+            params![source.id, key], |row| row.get(0),
+        ).optional()?;
+        let Some(raw) = raw else { return Ok(false) };
+        let operation: Operation = serde_json::from_str(&raw)?;
+        let workspace: Workspace = serde_json::from_str(&operation.request)?;
+        let paths: std::collections::HashSet<_> = expected_paths.iter().collect();
+        let Some(proofs) = workspace.published_files.as_ref() else {
+            return Ok(false);
+        };
+        if workspace.source.generation != source.generation
+            || workspace.source.id != source.id
+            || workspace.source.path != source.path
+            || workspace.source.root != source.root
+            || paths.len() != expected_paths.len()
+            || workspace.verified_output_paths.len() != paths.len()
+            || proofs.len() != paths.len()
+            || !paths
+                .iter()
+                .all(|path| workspace.verified_output_paths.contains(path))
+        {
+            return Ok(false);
+        }
+        let _lease = self
+            .reserve_processing_mutation(std::slice::from_ref(&source))?
+            .ok_or_else(|| Error::Conflict("repair proof source remains in use".into()))?;
+        let root = self.verify(&source)?;
+        let mut digests = ProofDigests::new();
+        let mut renamed = None;
+        for path in expected_paths {
+            checkpoint()?;
+            let Some(proof) = proofs
+                .iter()
+                .find(|entry| entry.path == *path && !entry.identity.directory)
+            else {
+                return Ok(false);
+            };
+            let Some(expected) = proof.digest.as_deref().filter(|digest| !digest.is_empty()) else {
+                return Ok(false);
+            };
+            let current = source.files.iter().find(|entry| entry.path == *path);
+            let intact = if current.is_some_and(|entry| entry.identity == proof.identity) {
+                digest_file_once(&root, path, &proof.identity, &mut digests, &mut checkpoint)?
+                    == expected
+            } else {
+                if renamed.is_none() {
+                    renamed = Some(self.verified_renames(
+                        &source,
+                        &root,
+                        &mut digests,
+                        &mut checkpoint,
+                    )?);
+                }
+                renamed.as_ref().unwrap().get(path).is_some_and(|rename| {
+                    rename.before == proof.identity && rename.digest == expected
+                })
+            };
+            if !intact {
+                return Ok(false);
+            }
+            verified(proof.identity.bytes);
+        }
+        checkpoint()?;
+        let _coordinator = self.mutation_guard()?;
+        self.check_payload_capture(&source)?;
+        let current = self.operation(&operation.id)?;
+        if current.state != "succeeded" || current.request != operation.request {
+            return Err(Error::Conflict(
+                "completed repair journal changed during verification".into(),
+            ));
+        }
+        Ok(true)
+    }
+
     /// A successful extraction can be reused after a later stage fails. Names
     /// may have been journal-renamed, but every output must retain its complete
     /// identity in the current owned manifest AND on disk.
@@ -2137,6 +2235,72 @@ mod tests {
             std::fs::read(reused.scratch.path.join("repaired.bin")).unwrap(),
             b"verified output"
         );
+    }
+
+    #[test]
+    fn completed_repair_reuse_requires_the_exact_catalog_generation_and_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("downloads");
+        std::fs::create_dir(&root).unwrap();
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        let source = root.join("job");
+        inventory.allocate(5, &root, &source).unwrap();
+        let bytes = vec![19; 131073];
+        std::fs::write(source.join("media.bin"), &bytes).unwrap();
+        let workspace = inventory.workspace(5, "par_repair", "abc").unwrap();
+        inventory
+            .finish_repair_workspace(&workspace, &["media.bin".into()])
+            .unwrap();
+        let paths = vec!["media.bin".into()];
+        let mut observed = 0;
+        assert!(inventory
+            .repair_published(5, "abc", &paths, || Ok(()), |n| observed += n)
+            .unwrap());
+        assert_eq!(observed, bytes.len() as u64);
+        assert!(!inventory
+            .repair_published(5, "def", &paths, || Ok(()), |_| {})
+            .unwrap());
+        assert!(!inventory
+            .repair_published(5, "abc", &["other.bin".into()], || Ok(()), |_| {})
+            .unwrap());
+        assert!(!inventory
+            .repair_published(
+                5,
+                "abc",
+                &["media.bin".into(), "media.bin".into()],
+                || Ok(()),
+                |_| {}
+            )
+            .unwrap());
+        let mut original = inventory.for_job(5).unwrap().unwrap();
+        let saved = original.clone();
+        original.generation = "another-generation".into();
+        save_artifact(&inventory.db.lock().unwrap(), &original).unwrap();
+        assert!(!inventory
+            .repair_published(5, "abc", &paths, || Ok(()), |_| {})
+            .unwrap());
+        save_artifact(&inventory.db.lock().unwrap(), &saved).unwrap();
+        let operation = inventory.operation(&workspace.operation_id).unwrap();
+        let mut changed = operation.clone();
+        let mut proof: Workspace = serde_json::from_str(&changed.request).unwrap();
+        proof.published_files.as_mut().unwrap()[0].digest = Some("0".repeat(64));
+        changed.request = serde_json::to_string(&proof).unwrap();
+        save_operation(&inventory.db.lock().unwrap(), &changed).unwrap();
+        assert!(!inventory
+            .repair_published(5, "abc", &paths, || Ok(()), |_| {})
+            .unwrap());
+        save_operation(&inventory.db.lock().unwrap(), &operation).unwrap();
+        inventory
+            .restore_file(5, &source.join("media.bin"), &source.join("release.mkv"))
+            .unwrap();
+        assert!(inventory
+            .repair_published(5, "abc", &paths, || Ok(()), |_| {})
+            .unwrap());
+        std::fs::write(source.join("release.mkv"), vec![20; bytes.len()]).unwrap();
+        assert!(!matches!(
+            inventory.repair_published(5, "abc", &paths, || Ok(()), |_| {}),
+            Ok(true)
+        ));
     }
 
     #[test]
