@@ -1803,7 +1803,7 @@ const STATUS_CLASS = {
 const STAGE_LABEL = {
   par_rename: "renaming", par_verify: "checking integrity", par_repair: "repairing",
   rar_rename: "renaming", unpack: "extracting", cleanup: "cleaning up",
-  move: "moving", post_unpack_rename: "renaming", script: "running scripts",
+  move: "moving", post_unpack_rename: "renaming", script: "running scripts", publication_verify: "verifying publication",
 };
 function statusName(st, stageOverride) {
   const stage = stageOverride || (st && st.post ? st.post.stage : null);
@@ -1894,7 +1894,7 @@ const SECTIONS = [
 ];
 const STAGE_SECTION = {
   par_rename: "renaming", rar_rename: "renaming", post_unpack_rename: "renaming",
-  par_verify: "verifying", par_repair: "repairing", unpack: "extracting",
+  par_verify: "verifying", publication_verify: "verifying", par_repair: "repairing", unpack: "extracting",
   cleanup: "cleaning", move: "moving", script: "scripting",
 };
 // Sections whose jobs are still in the download queue, so their position is
@@ -2769,7 +2769,7 @@ function pipelineModels(j, nowMs) {
 function recoveryMax(j) {
   if (j.pp_done) return "";
   if (j.control && j.control.lifecycle === "held" && ["unknown", "post_failure"].includes(j.control.cause)
-      && ["par_rename", "rar_rename", "par_verify", "par_repair", "unpack", "extract", "cleanup", "post_unpack_rename", "move"].includes(j.control.stage)) return "all";
+      && ["par_rename", "rar_rename", "par_verify", "par_repair", "unpack", "extract", "cleanup", "post_unpack_rename", "publication_verify", "move"].includes(j.control.stage)) return "all";
 
   // The open stage remains useful observability during a delayed-PAR
   // Queued/Downloading interlude, but the post manager deliberately rejects
@@ -2782,7 +2782,7 @@ function recoveryMax(j) {
   if (stage === "unpack") return "unpack";
   if (["cleanup", "post_unpack_rename"].includes(stage)) return "cleanup";
   if (stage === "move") return "move";
-  if (stage === "script") return "scripts";
+  if (["script", "publication_verify"].includes(stage)) return "scripts";
   if (j.status === "completed") return "all";
   if (j.status === "post_queued") return "all";
   return "";

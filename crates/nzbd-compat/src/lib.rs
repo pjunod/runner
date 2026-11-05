@@ -102,7 +102,9 @@ fn group_status(j: &JobSummary) -> &'static str {
         JobStatus::PostQueued => "PP_QUEUED",
         JobStatus::Post { stage } => match stage {
             nzbd_types::PostStage::ParRename | nzbd_types::PostStage::RarRename => "RENAMING",
-            nzbd_types::PostStage::ParVerify => "VERIFYING_SOURCES",
+            nzbd_types::PostStage::ParVerify | nzbd_types::PostStage::PublicationVerify => {
+                "VERIFYING_SOURCES"
+            }
             nzbd_types::PostStage::ParRepair => "REPAIRING",
             nzbd_types::PostStage::Unpack => "UNPACKING",
             nzbd_types::PostStage::Cleanup | nzbd_types::PostStage::Move => "MOVING",

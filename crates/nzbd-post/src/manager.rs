@@ -381,7 +381,7 @@ fn restart_limit(status: JobStatus) -> Option<RestartPoint> {
             PostStage::Unpack => RestartPoint::Unpack,
             PostStage::Cleanup | PostStage::PostUnpackRename => RestartPoint::Cleanup,
             PostStage::Move => RestartPoint::Move,
-            PostStage::Script => RestartPoint::Scripts,
+            PostStage::Script | PostStage::PublicationVerify => RestartPoint::Scripts,
         }),
         _ => None,
     }
@@ -4234,6 +4234,9 @@ async fn process_job_ctx_from_inner(
     }
     // Repair, extraction and scripts have all returned. Join their actual
     // workers before terminal disposition can move or delete the payload.
+    if job.lifecycle_eligible() {
+        stages.enter(PostStage::PublicationVerify).await;
+    }
     if let Some(control) = crate::attempt::current() {
         control.finish_filesystem_work().await?;
     }
@@ -4260,10 +4263,13 @@ async fn process_job_ctx_from_inner(
                 let evidence = evidence_inventory
                     .verified_custody_evidence(job_id.0, || control.checkpoint())
                     .map_err(PostError::from)?;
-                let direct =
-                    verified_direct_payload_paths(&job, &source, &evidence.restored, || {
-                        control.checkpoint()
-                    })?;
+                let direct = verified_direct_payload_paths_excluding(
+                    &job,
+                    &source,
+                    &evidence.restored,
+                    &evidence.consumed_inputs,
+                    || control.checkpoint(),
+                )?;
                 Ok::<_, PostError>((evidence.consumed_inputs, evidence.verified_outputs, direct))
             })
             .await?
@@ -4543,7 +4549,13 @@ async fn process_job_ctx_from_inner(
                     .map_err(PostError::from)?;
                 let mut diagnostics = match &assessed_inputs {
                     Some(diagnostics) => diagnostics.clone(),
-                    None => assess_file_inputs(&job, &source, &verified_payload_paths)?,
+                    None => publication_diagnostics(
+                        &job,
+                        &source,
+                        &consumed_archive_paths,
+                        &verified_payload_paths,
+                        &terminal_unusable_archive_paths,
+                    )?,
                 };
                 for path in &password_required_archive_paths {
                     diagnostics.insert(path.clone(), FileAssessment::Repairable(
@@ -5399,6 +5411,33 @@ enum FileAssessment {
     NoSignature,
 }
 
+fn publication_diagnostics(
+    job: &Job,
+    source: &Artifact,
+    consumed_archives: &std::collections::HashSet<String>,
+    verified_paths: &std::collections::HashSet<String>,
+    terminal_unusable_archives: &std::collections::HashSet<String>,
+) -> Result<std::collections::HashMap<String, FileAssessment>, PostError> {
+    let (_, outcomes) = select_delivery_payload(
+        &source.files,
+        consumed_archives,
+        verified_paths,
+        terminal_unusable_archives,
+        &Default::default(),
+    );
+    // Positive transform/direct proofs and explicitly disposable processing
+    // inputs need no recovery diagnosis. Any unproven payload, archive,
+    // sidecar or unknown sibling still receives the existing full assessment.
+    if outcomes.iter().all(|file| {
+        (file.outcome == "consumed" && consumed_archives.contains(&file.source_path))
+            || (file.outcome == "published" && verified_paths.contains(&file.source_path))
+            || (file.classification == "incidental" && file.outcome == "excluded_source_cleanup")
+    }) {
+        return Ok(Default::default());
+    }
+    assess_file_inputs(job, source, verified_paths)
+}
+
 fn assess_file_inputs(
     job: &Job,
     source: &Artifact,
@@ -5896,6 +5935,22 @@ fn verified_direct_payload_paths(
     job: &Job,
     source: &Artifact,
     restored_paths: &std::collections::HashMap<String, String>,
+    checkpoint: impl FnMut() -> std::io::Result<()>,
+) -> std::result::Result<std::collections::HashSet<String>, PostError> {
+    verified_direct_payload_paths_excluding(
+        job,
+        source,
+        restored_paths,
+        &Default::default(),
+        checkpoint,
+    )
+}
+
+fn verified_direct_payload_paths_excluding(
+    job: &Job,
+    source: &Artifact,
+    restored_paths: &std::collections::HashMap<String, String>,
+    consumed_inputs: &std::collections::HashSet<String>,
     mut checkpoint: impl FnMut() -> std::io::Result<()>,
 ) -> std::result::Result<std::collections::HashSet<String>, PostError> {
     let mut verified = std::collections::HashSet::new();
@@ -5926,6 +5981,11 @@ fn verified_direct_payload_paths(
         let actual_relative = restored_paths
             .get(&relative)
             .map_or(relative.as_str(), String::as_str);
+        // Fresh custody evidence already proved these archives were consumed
+        // by successful extraction. They are not direct publication payloads.
+        if consumed_inputs.contains(actual_relative) {
+            continue;
+        }
         let Some(entry) = source
             .files
             .iter()
@@ -9264,6 +9324,7 @@ mod decision_tests {
             (PostStage::PostUnpackRename, Cleanup),
             (PostStage::Move, Move),
             (PostStage::Script, Scripts),
+            (PostStage::PublicationVerify, Scripts),
         ] {
             assert_eq!(
                 restart_limit(JobStatus::Post { stage }),
@@ -10016,6 +10077,137 @@ mod decision_tests {
             Path::new("release.[proof].mkv"),
             "release.[proof]"
         ));
+    }
+
+    #[test]
+    fn resolved_publication_does_not_reopen_consumed_archives_for_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("downloads");
+        std::fs::create_dir(&root).unwrap();
+        let inventory = nzbd_state::artifacts::Inventory::open(&temp.path().join("state")).unwrap();
+        let mut source = inventory
+            .allocate_for_delivery(41, &root, &root.join("job"), true, true)
+            .unwrap();
+        // This helper runs after the positive proof pass. No payload files
+        // exist here: resolved inputs must not be opened again for diagnosis.
+        source.files = [
+            "movie.mkv",
+            "movie.jpg",
+            "release.part1.rar",
+            "release.par2",
+        ]
+        .into_iter()
+        .map(payload_entry)
+        .collect();
+        let request = job(Vec::new(), Vec::new());
+        let verified = ["movie.mkv".into(), "movie.jpg".into()]
+            .into_iter()
+            .collect();
+        let consumed = ["release.part1.rar".into()].into_iter().collect();
+        assert!(publication_diagnostics(
+            &request,
+            &source,
+            &consumed,
+            &verified,
+            &Default::default()
+        )
+        .unwrap()
+        .is_empty());
+        for sibling in ["unknown.bin", "other.mkv", "movie.en.srt", "other.rar"] {
+            source.files.push(payload_entry(sibling));
+            let result = publication_diagnostics(
+                &request,
+                &source,
+                &consumed,
+                &verified,
+                &Default::default(),
+            );
+            assert!(
+                result.is_err() || result.is_ok_and(|diagnostics| !diagnostics.is_empty()),
+                "{sibling} still needs diagnostics"
+            );
+            source.files.pop();
+        }
+        // A CRC-proven archive that has not been extracted still needs
+        // recovery assessment; download integrity alone is not consumption.
+        let mut archive_verified = verified.clone();
+        archive_verified.insert("release.part1.rar".into());
+        let result = publication_diagnostics(
+            &request,
+            &source,
+            &Default::default(),
+            &archive_verified,
+            &Default::default(),
+        );
+        assert!(result.is_err() || result.is_ok_and(|diagnostics| !diagnostics.is_empty()));
+    }
+
+    #[test]
+    fn final_crc_checks_skip_only_proven_consumed_inputs_and_check_direct_media() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("downloads");
+        std::fs::create_dir(&root).unwrap();
+        let inventory = nzbd_state::artifacts::Inventory::open(&temp.path().join("state")).unwrap();
+        let path = root.join("job");
+        inventory
+            .allocate_for_delivery(41, &root, &path, true, true)
+            .unwrap();
+        let archive = vec![7; 1024 * 1024];
+        let media = b"direct media";
+        std::fs::write(path.join("archive.rar"), &archive).unwrap();
+        std::fs::write(path.join("movie.mkv"), media).unwrap();
+        let source = inventory.finish(41, &path, &root, "active").unwrap();
+        let mut files = Vec::new();
+        for (id, name, bytes) in [
+            (1, "archive.bin", archive.as_slice()),
+            (2, "movie.mkv", media.as_slice()),
+        ] {
+            let mut entry = file(id, name, Some(crc32fast::hash(bytes)));
+            entry.segments = vec![Segment {
+                message_id: "part".into(),
+                number: 1,
+                size: bytes.len() as u32,
+                state: SegmentState::Done {
+                    offset: 0,
+                    len: bytes.len() as u32,
+                    crc: crc32fast::hash(bytes),
+                },
+            }];
+            files.push(entry);
+        }
+        let request = job(files, Vec::new());
+        let restored = [("archive.bin".into(), "archive.rar".into())]
+            .into_iter()
+            .collect();
+        let consumed = ["archive.rar".into()].into_iter().collect();
+        let mut reads = 0;
+        let checked = verified_direct_payload_paths_excluding(
+            &request,
+            &source,
+            &restored,
+            &consumed,
+            || {
+                reads += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(checked, ["movie.mkv".into()].into_iter().collect());
+        assert_eq!(
+            reads, 2,
+            "only the direct media read and EOF should be visited"
+        );
+        let mut all_reads = 0;
+        let checked = verified_direct_payload_paths(&request, &source, &restored, || {
+            all_reads += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(checked.contains("archive.rar"));
+        assert!(
+            all_reads > reads,
+            "unconsumed archives retain their CRC check"
+        );
     }
 
     #[test]

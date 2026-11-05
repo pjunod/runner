@@ -7,6 +7,7 @@ export type PostStage =
   | 'cleanup'
   | 'move'
   | 'post_unpack_rename'
+  | 'publication_verify'
   | 'script';
 
 export type JobStatus =

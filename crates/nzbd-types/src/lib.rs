@@ -442,6 +442,7 @@ pub enum PostStage {
     Move,
     PostUnpackRename,
     Script,
+    PublicationVerify,
 }
 
 impl PostStage {
@@ -459,12 +460,13 @@ impl PostStage {
             PostStage::Move => "move",
             PostStage::PostUnpackRename => "post_unpack_rename",
             PostStage::Script => "script",
+            PostStage::PublicationVerify => "publication_verify",
         }
     }
 
     /// Every variant, in pipeline order. Metrics exposition walks this, so
     /// a stage added above appears on `/metrics` without a second edit.
-    pub const ALL: [PostStage; 9] = [
+    pub const ALL: [PostStage; 10] = [
         PostStage::ParRename,
         PostStage::ParVerify,
         PostStage::ParRepair,
@@ -474,6 +476,7 @@ impl PostStage {
         PostStage::Move,
         PostStage::PostUnpackRename,
         PostStage::Script,
+        PostStage::PublicationVerify,
     ];
 }
 
