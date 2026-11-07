@@ -96,35 +96,19 @@ impl Owner {
             return;
         }
         self.pending_control_commits.insert(job);
-        // A queue row without `*PP:done` is a fresh attempt: a stamped row
-        // left by an earlier attempt of the same job id (a requeue or a
-        // post-processing restart) is history, not this attempt's terminal.
-        let fresh_attempt = self.state.job(job).is_some_and(|row| {
-            !row.params
-                .iter()
-                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
-        });
+        // Contract §2.1: a job's terminal row, once stored, is authoritative —
+        // a later attempt never replaces it; `record_terminal` returns the
+        // stored row and the chain resumes from its flags.
         let inventory = self.artifacts.clone();
         let history = history.or_else(|| self.history.clone());
         self.io_then(
             move || {
-                if fresh_attempt {
-                    if let Some(existing) = inventory
-                        .terminal(terminal.job)
-                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
-                    {
-                        if existing.markers_stamped {
-                            inventory.forget_terminal(terminal.job).map_err(|error| {
-                                nzbd_state::StateError::Corrupt(error.to_string())
-                            })?;
-                        }
-                    }
-                }
-                Ok(terminal::persist_terminal(
-                    &inventory,
-                    history.as_deref(),
-                    &terminal,
-                ))
+                let Some(history) = history else {
+                    return Ok(Err(TerminalError::Persistence(
+                        "no history store for the terminal".into(),
+                    )));
+                };
+                Ok(terminal::persist_terminal(&inventory, &history, &terminal))
             },
             move |owner, result| match result {
                 Ok(Ok(row)) => owner.stamp_terminal_then(row, callback),
@@ -255,7 +239,13 @@ impl Owner {
             return;
         }
         self.publish_now();
-        self.emit(terminal::event_for(&row));
+        let Some(event) = terminal::event_for(&row) else {
+            // Unreachable: the chain stamps only after the history step.
+            self.release_terminal(job);
+            callback(self, None);
+            return;
+        };
+        self.emit(event);
         let inventory = self.artifacts.clone();
         self.io_then(
             move || {

@@ -681,3 +681,107 @@ async fn retire_sweep_waits_for_salvage_and_open_intents() {
     tracker.wait().await;
     engine.shutdown().await;
 }
+
+/// Plan M1a / IMPL §5.6 (review #280-2): the `completed` terminal is
+/// recorded before the delivery row exists and before the source is
+/// retired. A crash right after the queue stamp leaves no delivery; the
+/// replayed event carries the publication, and the manager's sweep then
+/// creates exactly that delivery from the stamped markers.
+#[tokio::test]
+async fn completed_terminal_precedes_delivery_and_crash_repairs_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, _) = admitted_job(
+        &engine,
+        "ordered",
+        &[(
+            "Movie.2020.mkv",
+            Some(b"\x1a\x45\xdf\xa3 matroska".as_slice()),
+        )],
+        JobStatus::Completed,
+    )
+    .await;
+    let cfg = PostConfig {
+        completed_dir: Some(tmp.path().join("completed")),
+        deobfuscate_final: false,
+        ..PostConfig::default()
+    };
+    engine
+        .artifacts()
+        .inject_terminal_crash(job_id.0, TerminalStep::MarkersStamped);
+    let mut events = engine.subscribe();
+    let cancel = CancellationToken::new();
+    let admission = engine
+        .wait_post_admission(job_id, &cancel)
+        .await
+        .unwrap()
+        .expect("eligible for processing");
+    let scoped = engine.for_post_admission(&admission);
+    let outcome =
+        nzbd_post::manager::process_job(&scoped, &cfg, &history, &tmp.path().join("dest"), job_id)
+            .await;
+    engine.end_post_admission(admission).await.unwrap();
+    assert!(outcome.is_err(), "the chain stopped: {outcome:?}");
+    assert!(
+        engine
+            .artifacts()
+            .delivery_for_job(job_id.0)
+            .unwrap()
+            .is_none(),
+        "no delivery before the terminal is out"
+    );
+    let partial = engine.artifacts().terminal(job_id.0).unwrap().unwrap();
+    assert_eq!(partial.outcome, TerminalOutcome::Completed);
+    assert!(partial.markers_stamped && !partial.emitted);
+    engine.replay_terminals().await.unwrap();
+    let publication = loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("replayed terminal")
+            .unwrap();
+        if let Event::JobPpFinished {
+            job,
+            outcome,
+            publication,
+            ..
+        } = event
+        {
+            assert_eq!(job, job_id);
+            assert_eq!(outcome, TerminalOutcome::Completed);
+            break publication.expect("completed carries its publication");
+        }
+    };
+    let tracker = TaskTracker::new();
+    spawn_post_manager(
+        engine.clone(),
+        cfg,
+        history,
+        tmp.path().join("dest"),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let delivery = loop {
+        if let Some(delivery) = engine.artifacts().delivery_for_job(job_id.0).unwrap() {
+            break delivery;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "delivery repaired");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(delivery.manifest_digest, publication.manifest_digest);
+    assert_eq!(delivery.publication_generation, publication.generation);
+    assert_eq!(delivery.publication_path, publication.path);
+    assert_eq!(delivery.kind(), "completed");
+    while engine.snapshot().jobs.iter().any(|job| job.id == job_id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "retired once delivered"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+    engine.shutdown().await;
+}

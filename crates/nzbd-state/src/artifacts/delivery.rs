@@ -269,6 +269,36 @@ fn read_delivery(db: &Connection, id: &str) -> Result<Delivery> {
     Ok(delivery)
 }
 
+/// A publication whose delivery manifest has been read and digested but not
+/// yet committed (see [`Inventory::prepare_delivery`]).
+#[derive(Debug)]
+pub struct PreparedDelivery {
+    job: u32,
+    artifact: Artifact,
+    observed: Vec<super::FileEntry>,
+    pub publication_path: String,
+    existing_delivery: Option<Delivery>,
+    file_outcomes: Vec<DeliveryFileOutcome>,
+    source_artifact_id: String,
+    source_generation: String,
+    pub files: Vec<DeliveryFile>,
+    pub manifest_digest: String,
+    /// The publication's root is on another filesystem than its source's.
+    pub cross_volume: bool,
+}
+
+impl PreparedDelivery {
+    pub fn generation(&self) -> &str {
+        &self.artifact.generation
+    }
+    pub fn source_artifact_id(&self) -> &str {
+        &self.source_artifact_id
+    }
+    pub fn source_generation(&self) -> &str {
+        &self.source_generation
+    }
+}
+
 impl Inventory {
     pub(super) fn retry_delivery_cleanup(&self) -> Result<()> {
         let ids = {
@@ -372,6 +402,22 @@ impl Inventory {
         )
     }
 
+    /// Whether a delivery's publication sits on another filesystem than
+    /// its source did (`publication.cross_volume`, contract §2.1). Reported
+    /// only when both are observed; a retired source reads as not.
+    pub fn delivery_cross_volume(&self, delivery: &Delivery) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let publication = std::fs::metadata(&delivery.publication_path)
+            .ok()
+            .map(|meta| meta.dev());
+        let source = self
+            .get(&delivery.source_artifact_id)
+            .ok()
+            .and_then(|source| std::fs::metadata(&source.root).ok())
+            .map(|meta| meta.dev());
+        matches!((publication, source), (Some(a), Some(b)) if a != b)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_delivery_with_lifecycle_snapshot(
         &self,
@@ -385,23 +431,29 @@ impl Inventory {
         runner_stages: Option<DeliveryRunnerStages>,
         lifecycle_timing: Option<nzbd_types::LifecycleTiming>,
     ) -> Result<Delivery> {
-        if lifecycle_timing
-            .as_ref()
-            .is_some_and(|timing| !timing.valid())
-        {
-            return Err(Error::Conflict(
-                "invalid measured lifecycle snapshot".into(),
-            ));
-        }
-        if runner_stages.as_ref().is_some_and(|snapshot| {
-            snapshot.spans.len() > 128
-                || snapshot.node_id.is_empty()
-                || snapshot.node_id.len() > 256
-                || snapshot.clock_domain.is_empty()
-                || snapshot.clock_domain.len() > 256
-        }) {
-            return Err(Error::Conflict("invalid Runner stage snapshot".into()));
-        }
+        let prepared = self.prepare_delivery(job, admitted_for_delivery)?;
+        self.commit_prepared_delivery(
+            prepared,
+            request_token,
+            terminal_outcome,
+            failure_stage,
+            failure_cause,
+            keep_source_on_failure,
+            runner_stages,
+            lifecycle_timing,
+        )
+    }
+
+    /// Contract §2.1: everything a `completed` terminal's `publication`
+    /// needs — path, generation, the digested manifest, cross-volume — read
+    /// and hashed without writing anything, so the terminal is recorded
+    /// before the delivery row exists or the source is retired. The commit
+    /// re-checks the publication is unchanged and reuses the digests.
+    pub fn prepare_delivery(
+        &self,
+        job: u32,
+        admitted_for_delivery: bool,
+    ) -> Result<PreparedDelivery> {
         if !admitted_for_delivery {
             return Err(Error::Conflict(
                 "pre-existing job is exempt from automatic delivery lifecycle".into(),
@@ -452,6 +504,75 @@ impl Inventory {
             ));
         }
         let manifest_digest = manifest_digest(&files);
+        let cross_volume = {
+            use std::os::unix::fs::MetadataExt;
+            let publication_dev = root.metadata().ok().map(|meta| meta.dev());
+            let source_dev = self
+                .get(&source_artifact_id)
+                .ok()
+                .and_then(|source| std::fs::metadata(&source.root).ok())
+                .map(|meta| meta.dev());
+            matches!((publication_dev, source_dev), (Some(a), Some(b)) if a != b)
+        };
+        Ok(PreparedDelivery {
+            job,
+            artifact,
+            observed,
+            publication_path,
+            existing_delivery,
+            file_outcomes,
+            source_artifact_id,
+            source_generation,
+            files,
+            manifest_digest,
+            cross_volume,
+        })
+    }
+
+    /// The delivery row (and the publication's custody transfer) for a
+    /// prepared publication. Refuses if the publication changed since.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_prepared_delivery(
+        &self,
+        prepared: PreparedDelivery,
+        request_token: Option<&str>,
+        terminal_outcome: &str,
+        failure_stage: Option<&str>,
+        failure_cause: Option<&str>,
+        keep_source_on_failure: bool,
+        runner_stages: Option<DeliveryRunnerStages>,
+        lifecycle_timing: Option<nzbd_types::LifecycleTiming>,
+    ) -> Result<Delivery> {
+        if lifecycle_timing
+            .as_ref()
+            .is_some_and(|timing| !timing.valid())
+        {
+            return Err(Error::Conflict(
+                "invalid measured lifecycle snapshot".into(),
+            ));
+        }
+        if runner_stages.as_ref().is_some_and(|snapshot| {
+            snapshot.spans.len() > 128
+                || snapshot.node_id.is_empty()
+                || snapshot.node_id.len() > 256
+                || snapshot.clock_domain.is_empty()
+                || snapshot.clock_domain.len() > 256
+        }) {
+            return Err(Error::Conflict("invalid Runner stage snapshot".into()));
+        }
+        let PreparedDelivery {
+            job,
+            artifact,
+            observed,
+            publication_path,
+            existing_delivery,
+            file_outcomes,
+            source_artifact_id,
+            source_generation,
+            files,
+            manifest_digest,
+            cross_volume: _,
+        } = prepared;
         let id = format!("{}:{}", artifact.id, artifact.generation);
         let _guard = self.mutation_guard()?;
         let mut current = self.get(&artifact.id)?;

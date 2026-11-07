@@ -892,7 +892,7 @@ async fn assess_and_publish_salvage(
                     generation: delivery.publication_generation.clone(),
                     manifest_digest: delivery.manifest_digest.clone(),
                     files: u32::try_from(delivery.files.len()).unwrap_or(u32::MAX),
-                    cross_volume: false,
+                    cross_volume: engine.artifacts().delivery_cross_volume(&delivery),
                 };
                 if settle(nzbd_state::artifacts::SalvageOutcome::Published(
                     publication.clone(),
@@ -979,7 +979,10 @@ async fn assess_and_publish_salvage(
                     .as_ref()
                     .map(|delivery| u32::try_from(delivery.files.len()).unwrap_or(u32::MAX))
                     .unwrap_or(0),
-                cross_volume: false,
+                cross_volume: salvage
+                    .delivery
+                    .as_ref()
+                    .is_some_and(|delivery| engine.artifacts().delivery_cross_volume(delivery)),
             };
             if settle(nzbd_state::artifacts::SalvageOutcome::Published(
                 publication.clone(),
@@ -1665,7 +1668,7 @@ async fn scan_queue(
                         )
                         .await
                 }
-                Some(_) => true,
+                Some(_) => finish_stamped_delivery(engine, j.id).await,
             };
             if !settled || gate.is_some() {
                 continue;
@@ -2850,7 +2853,7 @@ async fn resume_durable_delivery(
         generation: delivery.publication_generation.clone(),
         manifest_digest: delivery.manifest_digest.clone(),
         files: u32::try_from(delivery.files.len()).unwrap_or(u32::MAX),
-        cross_volume: false,
+        cross_volume: engine.artifacts().delivery_cross_volume(&delivery),
     };
     let terminal = nzbd_engine::terminal::terminal_from_job(
         &job,
@@ -3950,6 +3953,14 @@ async fn process_job_ctx_from_inner(
             stages.close();
             return Ok(outcome);
         }
+        let mut pending_delivery: Option<PendingDelivery> = None;
+        let mut cross_volume = final_dir.as_deref().is_some_and(|path| {
+            use std::os::unix::fs::MetadataExt;
+            matches!(
+                (std::fs::metadata(path), std::fs::metadata(dest_dir)),
+                (Ok(a), Ok(b)) if a.dev() != b.dev()
+            )
+        });
         if let Some(path) = &final_dir {
             let path = Path::new(path);
             let state = "completed";
@@ -4035,67 +4046,48 @@ async fn process_job_ctx_from_inner(
                     .map(|(_, value)| value.clone());
                 let runner_stages = delivery_stage_snapshot(&inventory, &timing);
                 let lifecycle_timing = nzbd_engine::frozen_lifecycle_timing(&timing);
-                let delivery_inventory = inventory.clone();
-                let delivery = crate::attempt::current()
+                // Contract §2.1 / IMPL §5.6: read and digest the publication
+                // now, record the `completed` terminal carrying it, and only
+                // then create the delivery row and retire the source.
+                let prepare_inventory = inventory.clone();
+                let prepared = crate::attempt::current()
                     .expect("processing control")
                     .blocking(move |_| {
-                        delivery_inventory
-                            .create_delivery_with_lifecycle_snapshot(
-                                job_id.0,
-                                true,
-                                request_token.as_deref(),
-                                &terminal_outcome,
-                                failure_stage.as_deref(),
-                                failure_cause.as_deref(),
-                                false,
-                                runner_stages,
-                                lifecycle_timing,
-                            )
+                        prepare_inventory
+                            .prepare_delivery(job_id.0, true)
                             .map_err(PostError::from)
                     })
                     .await?;
-                fin.params
-                    .push(("Delivery:Id".into(), delivery.delivery_id.clone()));
-                fin.params
-                    .push(("Delivery:Custody".into(), "curator".into()));
-                fin.params.push((
-                    "Delivery:SourceArtifactId".into(),
-                    delivery.source_artifact_id.clone(),
-                ));
-                fin.params.push((
-                    "Delivery:SourceGeneration".into(),
-                    delivery.source_generation.clone(),
-                ));
-                fin.params
-                    .push(("Delivery:Path".into(), delivery.publication_path.clone()));
-                fin.params.push((
-                    "Delivery:Generation".into(),
-                    delivery.publication_generation,
-                ));
-                fin.params
-                    .push(("Delivery:ManifestDigest".into(), delivery.manifest_digest));
-                fin.params
-                    .push(("Delivery:Files".into(), delivery.files.len().to_string()));
-                let cleanup_id = delivery.delivery_id.clone();
-                let cleanup_inventory = inventory.clone();
-                let cleanup = crate::attempt::current()
-                    .expect("processing control")
-                    .blocking(move |_| {
-                        cleanup_inventory
-                            .retire_delivery_source(&cleanup_id)
-                            .map_err(PostError::from)
-                    })
-                    .await;
-                if let Err(error) = cleanup {
-                    tracing::warn!(job = job_id.0, %error,
-                        "delivery ready; source cleanup remains pending");
+                let delivery_id = format!("{}:{}", artifact.id, prepared.generation());
+                for (key, value) in [
+                    ("Delivery:Id", delivery_id.clone()),
+                    ("Delivery:Custody", "curator".into()),
+                    (
+                        "Delivery:SourceArtifactId",
+                        prepared.source_artifact_id().into(),
+                    ),
+                    (
+                        "Delivery:SourceGeneration",
+                        prepared.source_generation().into(),
+                    ),
+                    ("Delivery:Path", prepared.publication_path.clone()),
+                    ("Delivery:Generation", prepared.generation().into()),
+                    ("Delivery:ManifestDigest", prepared.manifest_digest.clone()),
+                    ("Delivery:Files", prepared.files.len().to_string()),
+                    ("Delivery:SourceCleanup", "pending".into()),
+                ] {
+                    fin.params.push((key.into(), value));
                 }
-                let cleanup_status = inventory
-                    .delivery(&delivery.delivery_id)
-                    .map(|current| current.source_cleanup.status)
-                    .unwrap_or_else(|_| "retry".into());
-                fin.params
-                    .push(("Delivery:SourceCleanup".into(), cleanup_status));
+                cross_volume = prepared.cross_volume;
+                pending_delivery = Some(PendingDelivery {
+                    prepared,
+                    request_token,
+                    terminal_outcome,
+                    failure_stage,
+                    failure_cause,
+                    runner_stages,
+                    lifecycle_timing,
+                });
             }
         }
         if !fin.params.iter().any(|(k, _)| k == "Artifact:Id") {
@@ -4129,7 +4121,7 @@ async fn process_job_ctx_from_inner(
         // Contract §2.1: the terminal row, the history row, the queue stamp
         // and `job_pp_finished` — in that order, replayed from the row after
         // a crash. The publication was committed above; the event carries it.
-        let publication = success_publication(&fin, final_dir.as_deref());
+        let publication = success_publication(&fin, final_dir.as_deref(), cross_volume);
         let live = read_post_job(job_id, "read live terminal row", || {
             engine.export_job(job_id)
         })
@@ -4161,13 +4153,18 @@ async fn process_job_ctx_from_inner(
                 message: None,
                 blames_release: false,
                 salvage: nzbd_state::artifacts::SalvageState::None,
-                keep_on_failure: false,
+                keep_on_failure: nzbd_engine::terminal::keeps_failed_source(&fin),
                 publication,
             },
             now(),
         );
         let recorded = record_pp_terminal(engine, history, terminal).await?;
-        let history_seq = recorded.history_seq.unwrap_or(0);
+        let history_seq = recorded
+            .history_seq
+            .ok_or_else(|| PostError::Subprocess("terminal recorded without history".into()))?;
+        if let Some(pending) = pending_delivery {
+            commit_delivery(engine, job_id, pending).await?;
+        }
         let completion = crate::attempt::current()
             .and_then(|control| control.source.clone())
             .map(|source| nzbd_state::artifacts::StagedCompletion {
@@ -4289,7 +4286,11 @@ async fn record_pp_terminal(
 
 /// The `publication` of a `completed` terminal (contract §2.1): the
 /// delivery record's when there is one, else the final directory.
-fn success_publication(job: &Job, final_dir: Option<&str>) -> Option<nzbd_types::Publication> {
+fn success_publication(
+    job: &Job,
+    final_dir: Option<&str>,
+    cross_volume: bool,
+) -> Option<nzbd_types::Publication> {
     let param = |key: &str| {
         job.params
             .iter()
@@ -4306,8 +4307,121 @@ fn success_publication(job: &Job, final_dir: Option<&str>) -> Option<nzbd_types:
         files: param("Delivery:Files")
             .and_then(|files| files.parse().ok())
             .unwrap_or(0),
-        cross_volume: false,
+        cross_volume,
     })
+}
+
+/// Contract §2.1 crash repair: a `completed` terminal is recorded before its
+/// delivery row. If the process stopped in between, the stamped
+/// `Delivery:*` markers name the delivery to create; create it from the
+/// still-owned publication (refusing if its digest changed) and retire the
+/// source. True once nothing is owed.
+async fn finish_stamped_delivery(engine: &EngineHandle, job: JobId) -> bool {
+    let Ok(Some(row)) = engine.export_job(job).await else {
+        return true;
+    };
+    let param = |key: &str| {
+        row.params
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+    };
+    let Some(delivery_id) = param("Delivery:Id") else {
+        return true;
+    };
+    let expected_digest = param("Delivery:ManifestDigest");
+    let request_token = nzbd_types::transfer_of(&row.params);
+    let terminal_outcome = param(PP_DONE_PARAM).unwrap_or_else(|| "SUCCESS".into());
+    let inventory = engine.artifacts();
+    let result = tokio::task::spawn_blocking(move || {
+        match inventory.delivery(&delivery_id) {
+            Ok(_) => {}
+            Err(nzbd_state::artifacts::Error::NotFound) => {
+                let prepared = inventory.prepare_delivery(job.0, true)?;
+                if expected_digest.as_deref() != Some(prepared.manifest_digest.as_str()) {
+                    return Err(nzbd_state::artifacts::Error::Conflict(
+                        "stamped publication changed before its delivery row".into(),
+                    ));
+                }
+                inventory.commit_prepared_delivery(
+                    prepared,
+                    request_token.as_deref(),
+                    &terminal_outcome,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
+        // Idempotent: a retired or retiring source answers its status.
+        let _ = inventory.retire_delivery_source(&delivery_id);
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(job = job.0, %error, "stamped completion's delivery remains pending");
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+/// A publication prepared before the terminal, committed after it.
+struct PendingDelivery {
+    prepared: nzbd_state::artifacts::PreparedDelivery,
+    request_token: Option<String>,
+    terminal_outcome: String,
+    failure_stage: Option<String>,
+    failure_cause: Option<String>,
+    runner_stages: Option<nzbd_state::artifacts::DeliveryRunnerStages>,
+    lifecycle_timing: Option<nzbd_types::LifecycleTiming>,
+}
+
+/// After the `completed` terminal: the delivery row (custody to Curator)
+/// and the source retirement. A crash before this is finished by
+/// [`finish_stamped_delivery`] from the stamped `Delivery:*` markers.
+async fn commit_delivery(
+    engine: &EngineHandle,
+    job_id: JobId,
+    pending: PendingDelivery,
+) -> Result<(), PostError> {
+    let inventory = engine.artifacts();
+    let delivery_inventory = inventory.clone();
+    let delivery = crate::attempt::current()
+        .expect("processing control")
+        .blocking(move |_| {
+            delivery_inventory
+                .commit_prepared_delivery(
+                    pending.prepared,
+                    pending.request_token.as_deref(),
+                    &pending.terminal_outcome,
+                    pending.failure_stage.as_deref(),
+                    pending.failure_cause.as_deref(),
+                    false,
+                    pending.runner_stages,
+                    pending.lifecycle_timing,
+                )
+                .map_err(PostError::from)
+        })
+        .await?;
+    let cleanup_id = delivery.delivery_id.clone();
+    let cleanup = crate::attempt::current()
+        .expect("processing control")
+        .blocking(move |_| {
+            inventory
+                .retire_delivery_source(&cleanup_id)
+                .map_err(PostError::from)
+        })
+        .await;
+    if let Err(error) = cleanup {
+        tracing::warn!(job = job_id.0, %error, "delivery ready; source cleanup remains pending");
+    }
+    Ok(())
 }
 
 /// Narrow the discovered post-processing scripts to a category's

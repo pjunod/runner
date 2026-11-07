@@ -1393,8 +1393,6 @@ async fn health_action_delete_removes_files() {
 #[cfg(unix)]
 #[tokio::test]
 async fn failed_job_is_not_stamped_when_durable_history_write_fails() {
-    use std::os::unix::fs::PermissionsExt;
-
     let tmp = tempfile::tempdir().unwrap();
     let portable = tmp.path().join("portable");
     std::fs::create_dir(&portable).unwrap();
@@ -1411,7 +1409,9 @@ async fn failed_job_is_not_stamped_when_durable_history_write_fails() {
     cfg.history = Some(hist.clone());
     let engine = Engine::spawn(cfg).await.expect("engine spawn");
     let log = portable.join("history.jsonl");
-    std::fs::set_permissions(&portable, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // A directory where the log goes: the append is refused even as root
+    // (a 0o555 parent is not, so the test used to pass only as non-root).
+    std::fs::create_dir(&log).unwrap();
     let mut events = engine.subscribe();
 
     let cancel = CancellationToken::new();
@@ -1453,7 +1453,7 @@ async fn failed_job_is_not_stamped_when_durable_history_write_fails() {
     assert_eq!(held.1.cause, "storage_unavailable");
     assert_eq!(held.1.stage, "persistence");
     assert!(!held.0.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
-    assert!(!log.exists(), "no durable JSONL record was possible");
+    assert!(!log.is_file(), "no durable JSONL record was possible");
     assert!(hist.list(10).unwrap().is_empty());
     let pending = engine.artifacts().terminal(92).unwrap().unwrap();
     assert!(pending.history_seq.is_none() && !pending.emitted);
@@ -1466,7 +1466,7 @@ async fn failed_job_is_not_stamped_when_durable_history_write_fails() {
 
     // Storage answers again: the row is replayed (boot and the tick do this)
     // and the event goes out with a real history cursor.
-    std::fs::set_permissions(&portable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::remove_dir(&log).unwrap();
     engine.replay_terminals().await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {

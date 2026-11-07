@@ -1255,6 +1255,18 @@ impl Owner {
                 .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?,
         );
         let journal = JobJournals::open(state_dir, journal_suffix)?;
+        // Contract §2.1: every terminal has a durable history row. The daemon
+        // always passes its store; an engine built without one (tests, tools)
+        // keeps a private one beside its queue, so no event carries a
+        // made-up `history_seq`.
+        let history = match history {
+            Some(history) => history,
+            None => Arc::new(nzbd_state::history::HistoryDb::open(
+                &state_dir.join("engine-history.sqlite"),
+                None,
+            )?),
+        };
+        let history = Some(history);
 
         let mut state = QueueState::default();
         let mut file_sizes = HashMap::new();

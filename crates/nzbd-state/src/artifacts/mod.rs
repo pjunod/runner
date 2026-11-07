@@ -17,7 +17,9 @@ pub use materialization::{
 };
 mod recovery;
 mod relocation;
-pub use delivery::{Delivery, DeliveryFile, DeliveryFileOutcome, DeliveryRunnerStages};
+pub use delivery::{
+    Delivery, DeliveryFile, DeliveryFileOutcome, DeliveryRunnerStages, PreparedDelivery,
+};
 pub use relocation::{RelocationResult, SelectedPublication};
 mod startup;
 mod terminals;

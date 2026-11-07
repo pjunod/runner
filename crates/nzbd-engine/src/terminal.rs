@@ -31,9 +31,6 @@ pub const KEEP_ON_FAILURE_PARAM: &str = "*Runner:KeepOnFailure";
 /// Stamped with the terminal: when the failure was recorded.
 pub const FAILURE_AT_PARAM: &str = "*PP:failure-at";
 pub const HISTORY_SEQ_PARAM: &str = "*PP:history-seq";
-/// The history incarnation when no history database is configured (an
-/// embedded engine in tests). The native daemon refuses to start without one.
-pub const NO_HISTORY_INCARNATION: &str = "none";
 
 /// Seed retirement is a lifecycle after the terminal; its holds never
 /// expire into a terminal.
@@ -262,7 +259,7 @@ impl std::fmt::Display for TerminalError {
 /// from the stored row's flags.
 pub fn persist_terminal(
     inventory: &Inventory,
-    history: Option<&HistoryDb>,
+    history: &HistoryDb,
     terminal: &JobTerminal,
 ) -> Result<JobTerminal, TerminalError> {
     let mut row = inventory
@@ -272,18 +269,12 @@ pub fn persist_terminal(
         return Err(TerminalError::InjectedCrash);
     }
     if row.history_seq.is_none() {
-        let (seq, incarnation) = match history {
-            Some(history) => {
-                let (seq, _) = history
-                    .record_seq_durable(&row.entry)
-                    .map_err(|error| TerminalError::Persistence(error.to_string()))?;
-                let incarnation = history
-                    .incarnation()
-                    .map_err(|error| TerminalError::Persistence(error.to_string()))?;
-                (seq, incarnation)
-            }
-            None => (0, NO_HISTORY_INCARNATION.to_string()),
-        };
+        let (seq, _) = history
+            .record_seq_durable(&row.entry)
+            .map_err(|error| TerminalError::Persistence(error.to_string()))?;
+        let incarnation = history
+            .incarnation()
+            .map_err(|error| TerminalError::Persistence(error.to_string()))?;
         let step = TerminalStep::HistoryWritten {
             seq,
             incarnation: incarnation.clone(),
@@ -333,10 +324,13 @@ pub fn queue_row_stamped(job: &Job, row: &JobTerminal) -> bool {
         })
 }
 
-/// Step 4: the one place `job_pp_finished` is built.
-pub fn event_for(row: &JobTerminal) -> Event {
+/// Step 4: the one place `job_pp_finished` is built. `None` until the
+/// history step has run: an event never carries a made-up cursor.
+pub fn event_for(row: &JobTerminal) -> Option<Event> {
     let entry = &row.entry;
-    Event::JobPpFinished {
+    let history_seq = row.history_seq?;
+    let history_incarnation = row.history_incarnation.clone()?;
+    Some(Event::JobPpFinished {
         job: entry.job,
         name: entry.name.clone(),
         category: entry.category.clone(),
@@ -360,12 +354,9 @@ pub fn event_for(row: &JobTerminal) -> Event {
         size_bytes: entry.size,
         health: entry.health,
         params: entry.params.clone(),
-        history_seq: row.history_seq.unwrap_or(0),
-        history_incarnation: row
-            .history_incarnation
-            .clone()
-            .unwrap_or_else(|| NO_HISTORY_INCARNATION.into()),
-    }
+        history_seq,
+        history_incarnation,
+    })
 }
 
 /// A pre-M1 history status string's reason, for rows that crashed before
