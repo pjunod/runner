@@ -50,7 +50,7 @@ pub struct JobSummary {
     pub control: Option<nzbd_types::JobControl>,
     /// Contract §2.3: the native status, `held` when the job is held (the
     /// persisted `status` stays `paused` until M6).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub status_projected: String,
     /// The curator transfer token (`params["monarr-transfer"]`).
     #[serde(skip_serializing_if = "Option::is_none")]

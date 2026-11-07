@@ -1892,9 +1892,21 @@ impl EngineHandle {
         &self,
         terminal: nzbd_state::artifacts::JobTerminal,
     ) -> Result<Option<nzbd_state::artifacts::JobTerminal>, EngineError> {
+        self.record_terminal_in(terminal, None).await
+    }
+
+    /// [`EngineHandle::record_terminal`] writing history to the producer's
+    /// own store (post-processing is handed one; in the daemon it is the
+    /// engine's).
+    pub async fn record_terminal_in(
+        &self,
+        terminal: nzbd_state::artifacts::JobTerminal,
+        history: Option<Arc<nzbd_state::history::HistoryDb>>,
+    ) -> Result<Option<nzbd_state::artifacts::JobTerminal>, EngineError> {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::RecordTerminal {
             terminal: Box::new(terminal),
+            history: history.map(TerminalHistory),
             reply: tx,
         })
         .await?;
@@ -2838,6 +2850,15 @@ impl EngineHandle {
         let (tx, rx) = oneshot::channel();
         self.send(make(tx)).await?;
         owner_reply(rx).await
+    }
+}
+
+/// A producer's own history store, carried on a terminal command.
+pub struct TerminalHistory(pub Arc<nzbd_state::history::HistoryDb>);
+
+impl std::fmt::Debug for TerminalHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TerminalHistory")
     }
 }
 

@@ -644,6 +644,9 @@ pub(crate) enum QueueCommand {
     /// Contract §2.1: run the terminal chain for a producer-built row.
     RecordTerminal {
         terminal: Box<nzbd_state::artifacts::JobTerminal>,
+        /// The producer's history store when it has its own (post-processing
+        /// is handed one); otherwise the engine's.
+        history: Option<crate::TerminalHistory>,
         reply: oneshot::Sender<Option<nzbd_state::artifacts::JobTerminal>>,
     },
     ReplayTerminals {
@@ -5064,15 +5067,24 @@ impl Owner {
                     }),
                 );
             }
-            QueueCommand::RecordTerminal { terminal, reply } => {
+            QueueCommand::RecordTerminal {
+                terminal,
+                history,
+                reply,
+            } => {
                 let job = JobId(terminal.job);
                 if self.terminals_in_flight.contains(&job) {
                     self.deferred_replacements
-                        .push_back(QueueCommand::RecordTerminal { terminal, reply });
+                        .push_back(QueueCommand::RecordTerminal {
+                            terminal,
+                            history,
+                            reply,
+                        });
                     return;
                 }
-                self.record_terminal_then(
+                self.record_terminal_with_then(
                     *terminal,
+                    history.map(|history| history.0),
                     Box::new(move |_, row| {
                         let _ = reply.send(row);
                     }),
@@ -7217,12 +7229,16 @@ impl Owner {
                 valid && end <= file_size
             });
         if !range_checkpoint && !valid_ranges {
-            self.fail_job_terminal(
+            // The partial's recorded coverage cannot be proven against an
+            // expected size. That is not contradictory evidence (contract
+            // §2.2 `identity`): verification re-checks the retained partial
+            // and reopens its invalid ranges for download, releasing this
+            // hold (`accepted_hold_rewrite`). Bounded by the hold deadline.
+            self.hold_job(
                 job,
-                nzbd_types::FailureReason::Identity,
-                None,
+                nzbd_types::HoldCause::StorageUnavailable,
                 "finalize",
-                "file coverage or expected size is unverified; partial retained",
+                crate::owner::COVERAGE_UNVERIFIED,
             );
             return;
         }
@@ -8676,6 +8692,7 @@ impl Owner {
             self.last_terminal_replay = Some(Instant::now());
             self.replay_terminals();
         }
+        self.convert_legacy_holds();
         self.persist_post_rollbacks_then(|_| {});
         self.retry_payload_recoveries();
         self.start_verifications();
@@ -9646,6 +9663,7 @@ impl Owner {
                     summary.ready = false;
                     if j.status != JobStatus::Paused
                         && !j.held()
+                        && !summary.pp_done
                         && !transitions::failed_cleanup_only(j)
                     {
                         summary.status = JobStatus::Queued;
@@ -10124,6 +10142,11 @@ pub(crate) fn unix_now() -> i64 {
 /// 2. The policy is re-derived; an automatic timed hold with no time is due
 ///    `now`.
 ///
+/// The hold message for a partial whose coverage cannot be proven; startup
+/// verification owns its exit.
+pub(crate) const COVERAGE_UNVERIFIED: &str =
+    "file coverage or expected size is unverified; partial retained";
+
 /// The revision moves so a client holding the old one re-reads.
 fn hold_retry_delay_with_jitter(job: JobId, attempt: u8, now: i64) -> i64 {
     let base = nzbd_types::hold_retry_delay_seconds(attempt);
@@ -10142,6 +10165,14 @@ pub(crate) fn rearmed_hold(
     // environmental all along; keep it a hold. Every other legacy terminal
     // cause is left for the boot conversion (`convert_legacy_holds`).
     if control.cause == "io" && crate::is_storage_unavailable(&control.message) {
+        cause = nzbd_types::HoldCause::StorageUnavailable;
+    }
+    // A pre-v2 unverified-coverage hold is a re-verification, not a
+    // contradiction: it keeps its verification exit (`COVERAGE_UNVERIFIED`).
+    if control.cause == "identity_conflict"
+        && control.stage == "finalize"
+        && control.message == COVERAGE_UNVERIFIED
+    {
         cause = nzbd_types::HoldCause::StorageUnavailable;
     }
     // Older builds called a control-request timeout a shutdown and turned

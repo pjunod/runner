@@ -2445,10 +2445,10 @@ async fn process_job_ctx_from(
     from: RestartPoint,
 ) -> Result<PpFinal, PostError> {
     if ctx.publish_history {
-        if let Some(result) = resume_durable_delivery(engine, job_id).await? {
+        if let Some(result) = resume_durable_delivery(engine, history, job_id).await? {
             return Ok(result);
         }
-        if let Some(result) = resume_committed_publication(engine, job_id).await? {
+        if let Some(result) = resume_committed_publication(engine, history, job_id).await? {
             return Ok(result);
         }
     }
@@ -2513,6 +2513,7 @@ async fn process_job_ctx_from(
 /// finish the same publication without rerunning extraction or scripts.
 async fn resume_committed_publication(
     engine: &EngineHandle,
+    history: &Arc<HistoryDb>,
     job_id: JobId,
 ) -> Result<Option<PpFinal>, PostError> {
     let Some(job) = engine
@@ -2530,7 +2531,7 @@ async fn resume_committed_publication(
     if resumed.is_none() {
         return Ok(None);
     }
-    resume_durable_delivery(engine, job_id).await
+    resume_durable_delivery(engine, history, job_id).await
 }
 
 fn delivery_stage_snapshot(
@@ -2612,6 +2613,7 @@ fn finish_committed_publication_receipt(
 /// publication path: Curator may already have imported and removed it.
 async fn resume_durable_delivery(
     engine: &EngineHandle,
+    history: &Arc<HistoryDb>,
     job_id: JobId,
 ) -> Result<Option<PpFinal>, PostError> {
     let Some(mut job) = engine
@@ -2754,7 +2756,7 @@ async fn resume_durable_delivery(
         },
         delivery.ready_at,
     );
-    record_pp_terminal(engine, terminal).await?;
+    record_pp_terminal(engine, history, terminal).await?;
     Ok(Some(final_outcome))
 }
 
@@ -3623,7 +3625,7 @@ async fn process_job_ctx_from_inner(
             return Ok(outcome);
         }
         let terminal = nzbd_engine::terminal::failed_terminal(&fin, reason, None, stage, &message);
-        record_pp_terminal(engine, terminal).await?;
+        record_pp_terminal(engine, history, terminal).await?;
         stages.close();
         return Ok(outcome);
     }
@@ -4037,7 +4039,7 @@ async fn process_job_ctx_from_inner(
             },
             now(),
         );
-        let recorded = record_pp_terminal(engine, terminal).await?;
+        let recorded = record_pp_terminal(engine, history, terminal).await?;
         let history_seq = recorded.history_seq.unwrap_or(0);
         let completion = crate::attempt::current()
             .and_then(|control| control.source.clone())
@@ -4142,9 +4144,13 @@ fn pp_failure(
 /// this attempt ends as handled.
 async fn record_pp_terminal(
     engine: &EngineHandle,
+    history: &Arc<HistoryDb>,
     terminal: nzbd_state::artifacts::JobTerminal,
 ) -> Result<nzbd_state::artifacts::JobTerminal, PostError> {
-    match engine.record_terminal(terminal).await {
+    match engine
+        .record_terminal_in(terminal, Some(history.clone()))
+        .await
+    {
         Ok(Some(row)) => Ok(row),
         Ok(None) => Err(PostError::Held),
         Err(source) => Err(PostError::Engine {
@@ -7502,7 +7508,9 @@ mod decision_tests {
         std::fs::remove_dir_all(&published).unwrap();
 
         assert_eq!(
-            resume_durable_delivery(&engine, JobId(41)).await.unwrap(),
+            resume_durable_delivery(&engine, &history, JobId(41))
+                .await
+                .unwrap(),
             Some(PpFinal::Success)
         );
         let entry = history.get(JobId(41)).unwrap().unwrap();
@@ -8344,7 +8352,9 @@ mod decision_tests {
         std::fs::remove_dir_all(&published).unwrap();
 
         assert_eq!(
-            resume_durable_delivery(&engine, JobId(42)).await.unwrap(),
+            resume_durable_delivery(&engine, &history, JobId(42))
+                .await
+                .unwrap(),
             Some(PpFinal::HealthFailure)
         );
         let entry = history.get(JobId(42)).unwrap().unwrap();

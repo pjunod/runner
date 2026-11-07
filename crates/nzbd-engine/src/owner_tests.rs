@@ -1787,7 +1787,7 @@ async fn intact_publication_clears_previous_private_repair_marker() {
 }
 
 #[tokio::test]
-async fn yenc_name_variations_keep_the_first_name_but_size_and_path_conflicts_hold() {
+async fn yenc_name_variations_keep_the_first_name_but_size_and_path_conflicts_fail_identity() {
     let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
     pump(&mut owner, &mut messages).await;
     for id in 1..=3 {
@@ -1804,16 +1804,38 @@ async fn yenc_name_variations_keep_the_first_name_but_size_and_path_conflicts_ho
         "first.bin"
     );
     owner.accept_file_metadata(JobId(1), file, "third-name", 101);
-    pump(&mut owner, &mut messages).await;
-    let control = owner.state.job(JobId(1)).unwrap().control().unwrap();
-    assert_eq!(control.cause, "identity_conflict");
-    assert_eq!(control.message, "conflicting yEnc declared size");
+    // Contract §2.2: self-contradicting yEnc metadata is the release's
+    // fault — a terminal `failed/identity`, blamed, never salvaged.
+    let terminal_of = |owner: &Owner, id: u32| owner.artifacts.terminal(id).unwrap();
+    for _ in 0..20 {
+        pump(&mut owner, &mut messages).await;
+        if terminal_of(&owner, 1).is_some_and(|t| t.emitted) {
+            break;
+        }
+    }
+    let terminal = terminal_of(&owner, 1).unwrap();
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Identity));
+    assert_eq!(
+        terminal.message.as_deref(),
+        Some("conflicting yEnc declared size")
+    );
+    assert!(terminal.blames_release);
+    assert_eq!(terminal.salvage, nzbd_state::artifacts::SalvageState::None);
+    assert_eq!(owner.state.job(JobId(1)).unwrap().status, JobStatus::Failed);
 
     for (id, name, size) in [(2, "../unsafe", 100), (3, "empty.bin", 0)] {
         let file = owner.state.job(JobId(id)).unwrap().files[0].id;
         owner.accept_file_metadata(JobId(id), file, name, size);
-        pump(&mut owner, &mut messages).await;
-        assert!(owner.state.job(JobId(id)).unwrap().held());
+        for _ in 0..20 {
+            pump(&mut owner, &mut messages).await;
+            if terminal_of(&owner, id).is_some_and(|t| t.emitted) {
+                break;
+            }
+        }
+        assert_eq!(
+            terminal_of(&owner, id).unwrap().reason,
+            Some(nzbd_types::FailureReason::Identity)
+        );
     }
 }
 
@@ -3062,10 +3084,11 @@ async fn storage_errno_writer_error_schedules_itself() {
     );
 }
 
-/// A digest or size mismatch fails the same way on every attempt: it
-/// waits for a person instead of re-checking a whole file forever.
+/// Contract §2.2: a digest or size mismatch fails the same way on every
+/// attempt, so it is not a hold — it is the job's terminal `failed/io`
+/// (parked, never the release's fault), recorded before anything else.
 #[tokio::test]
-async fn permanent_writer_error_waits_for_review() {
+async fn permanent_writer_error_is_a_terminal_io_failure() {
     let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
     pump(&mut owner, &mut messages).await;
     owner.state.jobs.push(pending_job(1));
@@ -3074,28 +3097,29 @@ async fn permanent_writer_error_waits_for_review() {
         file: FileId(10),
         error: "finalize: complete checkpoint digest differs".into(),
     });
-    pump(&mut owner, &mut messages).await;
-    let held = owner.state.jobs[0].control().unwrap();
-    assert_eq!(
-        (held.cause.as_str(), held.stage.as_str()),
-        ("io", "finalize")
-    );
-    assert_eq!(held.retry_policy, "review");
-    assert_eq!(held.next_retry_at_unix, None);
-    assert!(
-        owner
-            .retry_hold_proven(
-                JobId(1),
-                &held.revision,
-                RetryBy::Recovery,
-                false,
-                &Default::default()
-            )
-            .is_err(),
-        "the actor independently refuses automatic retries of permanent failures"
-    );
-    pump(&mut owner, &mut messages).await;
-    assert!(owner.state.jobs[0].held());
+    for _ in 0..20 {
+        pump(&mut owner, &mut messages).await;
+        if owner.state.jobs[0]
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+        {
+            break;
+        }
+    }
+    let job = &owner.state.jobs[0];
+    assert!(!job.held(), "a terminal is not a hold");
+    assert_eq!(job.status, JobStatus::Failed);
+    assert!(job
+        .params
+        .iter()
+        .any(|(key, value)| key == nzbd_types::PP_DONE_PARAM && value == "FAILURE/IO"));
+    let terminal = owner.artifacts.terminal(1).unwrap().unwrap();
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Io));
+    assert_eq!(terminal.stage.as_deref(), Some("finalize"));
+    assert!(!terminal.blames_release);
+    assert!(terminal.reason.unwrap().park_always());
+    assert!(terminal.emitted && terminal.markers_stamped);
 }
 
 #[tokio::test]
@@ -3577,12 +3601,13 @@ fn rearm_reclassifies_by_errno_and_derives_policy() {
         1000
     )
     .is_none());
-    // Policy this build changed: password_required used to claim resume_same_job.
+    // Policy this build changed: password_required retries on the ladder
+    // until its deadline (contract §2.3).
     assert_eq!(
         rearmed_hold(hold("password_required", "resume_same_job", "x"), 1000)
             .unwrap()
             .retry_policy,
-        "review"
+        "scheduled_retry"
     );
     // Capacity used to carry no time.
     assert_eq!(
@@ -4138,10 +4163,7 @@ async fn delayed_par_download_keeps_the_open_post_span() {
         "the post manager, not delayed download completion, closes verification"
     );
     assert!(
-        matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ),
+        no_completion_event(&mut events),
         "a delayed PAR fetch must not announce a second download completion"
     );
 }
@@ -4172,10 +4194,7 @@ async fn restarted_delayed_par_completion_recovers_from_the_persisted_open_span(
             stage: PostStage::ParVerify
         }
     );
-    assert!(matches!(
-        events.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    ));
+    assert!(no_completion_event(&mut events));
 }
 
 #[tokio::test]
@@ -4260,10 +4279,7 @@ async fn failed_recovery_articles_return_to_verification_instead_of_disposition(
             stage: PostStage::ParVerify
         }
     );
-    assert!(matches!(
-        events.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    ));
+    assert!(no_completion_event(&mut events));
 }
 
 #[tokio::test]
@@ -4291,10 +4307,7 @@ async fn recovery_write_failure_stays_owned_by_the_active_post_task() {
             stage: PostStage::ParVerify
         }
     );
-    assert!(matches!(
-        events.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    ));
+    assert!(no_completion_event(&mut events));
 }
 
 #[test]
@@ -7609,5 +7622,19 @@ async fn naming_expectations_require_current_writer_and_durable_finalization() {
         }
         drop(found);
         owner.artifacts.prepare_writer_naming();
+    }
+}
+
+/// No download-completion or terminal event was announced. `job_status_changed`
+/// (contract §2.4) fires on every published transition and is not a
+/// completion.
+fn no_completion_event(events: &mut broadcast::Receiver<Event>) -> bool {
+    loop {
+        match events.try_recv() {
+            Ok(Event::JobStatusChanged { .. }) => continue,
+            Ok(_) => return false,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(_) => return true,
+        }
     }
 }

@@ -47,7 +47,10 @@ impl Owner {
         message: &str,
         callback: TerminalCallback,
     ) -> bool {
+        // The same fences a hold respects: an automatic control transition
+        // still committing owns the job's next state.
         let refused = self.persistence_fenced
+            || self.automatic_control_pending(job)
             || self.terminals_in_flight.contains(&job)
             || self.state.job(job).is_none_or(|row| {
                 row.params
@@ -78,6 +81,15 @@ impl Owner {
         terminal: JobTerminal,
         callback: TerminalCallback,
     ) {
+        self.record_terminal_with_then(terminal, None, callback)
+    }
+
+    pub(super) fn record_terminal_with_then(
+        &mut self,
+        terminal: JobTerminal,
+        history: Option<Arc<nzbd_state::history::HistoryDb>>,
+        callback: TerminalCallback,
+    ) {
         let job = JobId(terminal.job);
         if self.persistence_fenced || !self.terminals_in_flight.insert(job) {
             callback(self, None);
@@ -93,7 +105,7 @@ impl Owner {
                 .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
         });
         let inventory = self.artifacts.clone();
-        let history = self.history.clone();
+        let history = history.or_else(|| self.history.clone());
         self.io_then(
             move || {
                 if fresh_attempt {
@@ -304,10 +316,23 @@ impl Owner {
     /// the terminal disposition the contract names for it — with the event —
     /// before any hold recovery runs.
     pub(super) fn convert_legacy_holds(&mut self) {
+        // Startup reconciliation queues payload verification first; until
+        // it has, a job cannot be told apart from one verification owns.
+        if !self.startup_roots_ready {
+            return;
+        }
         let legacy = self
             .state
             .jobs
             .iter()
+            // Startup verification owns a job until it settles (it may
+            // release a legacy hold whose bytes prove out); the tick
+            // converts whatever is still held afterwards.
+            .filter(|job| {
+                !self.verification.contains_key(&job.id)
+                    && !self.pending_control_commits.contains(&job.id)
+                    && !self.terminals_in_flight.contains(&job.id)
+            })
             .filter_map(|job| {
                 let control = job.control().filter(|c| c.lifecycle == "held")?;
                 let reason = nzbd_types::HoldCause::legacy_terminal(&control.cause)?;

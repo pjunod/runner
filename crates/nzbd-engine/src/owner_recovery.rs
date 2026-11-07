@@ -801,7 +801,13 @@ impl Owner {
         let needs_download = !verified.transformed
             && (!verified.invalid.is_empty() || !verified.reopen_finalize.is_empty());
         accepted_hold_rewrite(current, verified.post_retry_validated, needs_download);
-        if needs_download && !current.held() && current.status != JobStatus::Paused {
+        // A job whose terminal is recorded never re-enters the download
+        // queue (contract §2.1: the terminal is emitted once, never revised).
+        let terminal = current
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM);
+        if needs_download && !terminal && !current.held() && current.status != JobStatus::Paused {
             current.status = JobStatus::Queued;
         }
         recompute_job_totals(current);
@@ -853,7 +859,11 @@ impl Owner {
             }
             owner.allocation_cache.insert(job,verified.allocation);
             if verified.publication_repair {
-                owner.fail_job_terminal(job,nzbd_types::FailureReason::Identity,None,"finalize","legacy publication has proven invalid ranges");
+                // The retained partial is repairable by runner itself: the
+                // retry restores the download-owned partial for repair. It is
+                // retried on the ladder and bounded by the hold deadline
+                // (contract §2.3); it is not a terminal.
+                owner.hold_job(job,nzbd_types::HoldCause::StorageUnavailable,"finalize","legacy publication has proven invalid ranges; retry restores download-owned partial for repair");
                 owner.block_verification(job,VerificationFailure::conflict("corrupt download publication requires an explicit generation-safe repair transition",verified.checked_bytes));
                 owner.dirty=true;owner.publish_now();owner.bump_epoch();return;
             }
@@ -1469,20 +1479,32 @@ fn verify_job_batch(
     Ok(verified)
 }
 
+/// A pre-v2 hold whose bytes startup verification re-checks and releases
+/// when they prove out (not a terminal: the boot conversion leaves it).
+fn legacy_coverage_hold(control: &nzbd_types::JobControl) -> bool {
+    // `identity_conflict` is how a pre-v2 build wrote it.
+    matches!(
+        control.cause.as_str(),
+        "identity_conflict" | "storage_unavailable"
+    ) && control.stage == "finalize"
+        && control.message == super::COVERAGE_UNVERIFIED
+}
+
+fn legacy_rar_order_hold(control: &nzbd_types::JobControl) -> bool {
+    matches!(control.cause.as_str(), "unknown" | "post_failure")
+        && control.stage == "rar_rename"
+        && control.message
+            == "subprocess failed: RAR set lacks checked order/membership evidence; filenames preserved"
+}
+
 fn accepted_hold_rewrite(job: &mut Job, post_retry_validated: bool, needs_download: bool) {
     let Some(mut control) = job.control().filter(|control| {
         control.version == 1 && control.lifecycle == "held" && !control.manual_pause
     }) else {
         return;
     };
-    let finalize = control.cause == "identity_conflict"
-        && control.stage == "finalize"
-        && control.message == "file coverage or expected size is unverified; partial retained";
-    let rar = post_retry_validated
-        && matches!(control.cause.as_str(), "unknown" | "post_failure")
-        && control.stage == "rar_rename"
-        && control.message
-            == "subprocess failed: RAR set lacks checked order/membership evidence; filenames preserved";
+    let finalize = legacy_coverage_hold(&control);
+    let rar = post_retry_validated && legacy_rar_order_hold(&control);
     if !finalize && !rar {
         return;
     }
