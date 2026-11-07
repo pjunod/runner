@@ -76,6 +76,20 @@ import receipt arrives or the handoff is cancelled. See
 [FILE_LIFECYCLE_OPERATIONS.md §2](FILE_LIFECYCLE_OPERATIONS.md) for the
 whole recovery flow.
 
+**Held jobs.** A job stopped by its environment — storage not answering, a
+full disk, an exhausted quota, a missing extractor, a mount that came back
+empty, an archive waiting for a password — is **held**, not failed. The row
+says why, when the next automatic retry is, and when the hold runs out:
+`· fails as hold expired in 23h 10m unless it recovers`. Runner retries every
+hold on its own; **pause** stops the retries and the button becomes
+**retry**, which sends the job back to the step it stopped in. Nothing a
+release contains ever holds a job, and no hold waits for a person: a hold
+that outlives `[post] hold_deadline_secs` (a day; a week for passwords) fails
+with reason `hold_expired` and its files are parked, even while the queue is
+paused. A newer cause replaces the shown one and restarts the clock. Over the
+API and SSE these jobs read `status_projected: "held"` and emit
+`job_status_changed` on the way in and out.
+
 **Torrent lifecycle.** Ready torrents share in **Seeding** and move to
 **Completed** when seeding stops. An idle seed is still available to peers;
 zero upload speed does not put it back in Waiting. Metadata retrieval and
@@ -467,6 +481,14 @@ The per-job pipeline and its knobs are described in
   `post.scripts_dir` at your existing NZBGet scripts.
 - **Health actions**: failed-health jobs can be left (`none`), parked, or
   deleted from disk (`delete`), mirroring NZBGet's HealthCheck.
+- **Every failure has a reason.** History and `job_pp_finished` name one of
+  `health`, `fetch`, `par`, `unpack`, `script`, `publish`, `io`, `identity`
+  or `hold_expired`. The last four are Runner's or the environment's fault,
+  not the release's, so they are **always parked** in `failed_dir` whatever
+  `failure_action` says; a job with keep-on-failure is left in place. A
+  failed job whose bytes still hold something usable (one bad episode in a
+  season pack, a repairable PAR set) has that part published as a salvage
+  delivery before the rest is disposed of.
 
 ## History, duplicates, quotas
 

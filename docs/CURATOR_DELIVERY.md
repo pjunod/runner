@@ -14,8 +14,10 @@ History and `job_pp_finished` remain useful for observation, but neither owns
 handoff custody. A user can hide a history row, and a process can stop after
 publishing files but before recording history. Runner therefore writes one
 immutable delivery record for each publication generation. The record remains
-queryable by ID after acceptance; acceptance changes its receipt fields, not
-its identity or manifest. Pending-list scans omit accepted rows.
+queryable by ID for as long as it is retained. Since contract v2 (runner
+0.3.0) Runner keeps no acceptance state: `accept` answers 200 and changes
+nothing, and nothing in Runner (cluster included) waits on it. Rows accepted
+by an older build keep their `acceptedAt` and stay out of the default scan.
 
 The lifecycle is:
 
@@ -27,10 +29,10 @@ durable manifest + ready Delivery + target custody transfer (one DB commit)
       │                                  │
       │                                  └── source cleanup retries independently
       ▼
-Curator verifies manifest and persists acceptance
+Curator verifies the manifest and imports, keyed on its own transfer row
       │
       ▼
-Curator posts an idempotent acceptance receipt
+(optional) Curator posts accept — a 200 no-op kept for old consumers
 ```
 
 The ready commit changes the published artifact to `state="transferred"` and
@@ -65,6 +67,7 @@ to 50. The response shape is:
       "sequence": 23,
       "status": "ready",
       "deliveryId": "artifact-id:generation-id",
+      "kind": "completed",
       "publicationGeneration": "generation-id",
       "artifactId": "artifact-id",
       "sourceArtifactId": "source-relocation-id",
@@ -107,6 +110,11 @@ to 50. The response shape is:
   "cursorRule": "Rescan with after=0 each sweep, or durably persist every returned delivery before advancing the cursor."
 }
 ```
+
+`kind` is `completed` for a successful job's publication and `salvage` for
+the part of a failed job Runner could still verify and publish (contract
+§2.2). A salvage delivery carries the same manifest body — `manifestDigest`
+and `files` — as a completed one; Curator decides whether to import it.
 
 The server scans sequence rows, including accepted rows, and returns only
 unaccepted rows in `deliveries`. `nextCursor` is the last sequence scanned;
@@ -399,30 +407,20 @@ The canonical bytes after the prefix are:
 The expected manifest digest is
 `a0acee1d6757529c7deca3dc2ac2fa2f0b6e96db781d83b8d85d732cedd6459f`.
 
-## `POST /api/v1/deliveries/{deliveryId}/accept` records Curator's receipt
+## `POST /api/v1/deliveries/{deliveryId}/accept` is a 200 no-op
 
-Curator posts only after it has verified the manifest and durably recorded its
-mapping to the original transfer. Repeating the same receipt tuple is
-idempotent. A different receipt, generation, or digest for an accepted
-delivery returns `409 Conflict`.
+Contract v2 moved the "is this delivered?" decision to Curator's own transfer
+row, so Runner no longer records receipts. The route stays for consumers built
+against protocol 1: any body (including none) on an existing delivery answers
+`200` with the Delivery record unchanged — `acceptedAt` and
+`consumerReceiptId` stay as they were (null for rows Runner 0.3.0 produced). A
+delivery ID Runner does not know is `404`. Source cleanup, retention, and the
+cluster's publication bookkeeping never wait on this call.
 
 ```http
 POST /api/v1/deliveries/artifact-id%3Ageneration-id/accept
 Authorization: Bearer <configured Runner API token>
-Content-Type: application/json
-
-{
-  "protocolVersion": 1,
-  "publicationGeneration": "generation-id",
-  "manifestDigest": "lowercase-sha256-hex",
-  "consumerReceiptId": "curator-local-receipt-id"
-}
 ```
-
-The response is the Delivery record with `status="accepted"`, `acceptedAt`,
-and `consumerReceiptId` populated. This is a durable receipt, not a request to
-delete or move Curator files. The same configured Basic or Bearer API
-credentials protect this route; no separate recovery token is required.
 
 ## Source cleanup reports separately
 
@@ -478,10 +476,9 @@ as distinct queue admissions. `request-token-idempotency-v1` is advertised
 separately in `/api/v1/status.capabilities`; its lookup returns the durable
 admission receipt even after history and the queue row are cleared.
 
-`GET /api/v1/deliveries/{deliveryId}` returns the same record, whether ready or
-accepted, including current source-cleanup progress. Use it after acceptance
-when cleanup state needs refreshing; the collection endpoint intentionally
-omits accepted rows from pending discovery.
+`GET /api/v1/deliveries/{deliveryId}` returns the same record, including
+current source-cleanup progress and `kind`. The collection endpoint omits only
+rows an older build recorded as accepted.
 
 ## Cluster replay, bounded discovery, and timing
 

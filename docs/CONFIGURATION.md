@@ -358,7 +358,35 @@ failed_dir = "/data/usenet/failed"   # where "park" puts them; defaults to
 tool_timeout_secs = 3600
 script_timeout_secs = 3600
 par_fetch_timeout_secs = 600   # wait for delayed par files during repair
+hold_deadline_secs = 86400     # how long an environmental hold (storage down,
+                               # disk full, quota, missing tool, mount gone…)
+                               # may last before the job fails `hold_expired`
+password_hold_deadline_secs = 604800   # the same, for an archive waiting on
+                               # a password (a person has to act, so longer)
 ```
+
+**Failure disposition, by reason.** A failed job's files are disposed of
+after its terminal is recorded and after any salvage (the usable part of a
+failed job, published as a `kind: "salvage"` delivery) is settled. Precedence:
+
+1. `keep_on_failure` on the job — the files stay where they are.
+2. Reasons `publish`, `io`, `identity` and `hold_expired` are **always
+   parked**, whatever `failure_action` says. These failures are Runner's or the
+   environment's, not the release's, so the bytes are kept for recovery
+   (contract §2.6 default, "park-always").
+3. Everything else — `health`, `par`, `unpack`, `script`, `fetch` — follows
+   `failure_action`.
+
+Before 0.3.0, a job admitted by Curator (`monarr-delivery=1`) forced `delete`
+regardless of the setting. That override is gone; `failure_action` and the
+park-always list above are the whole rule.
+
+**Holds always end.** A hold is environmental only — the job's own content
+never holds it — and is retried automatically on the hold ladder. Each hold
+gets a deadline when it starts (`deadline_unix` and `deadline_in_s` in the
+job's `control`); a newer cause replaces the older one and restarts the clock.
+Past the deadline the job fails with reason `hold_expired` and is parked, even
+if the queue is paused. Seed-retirement holds on torrents carry no deadline.
 
 Failed-file disposition is retried before the terminal history row is written.
 A stable local error such as permission denied is attempted three times, then
