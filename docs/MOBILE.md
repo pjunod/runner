@@ -58,6 +58,15 @@ policy offers Seeding options directly. If a server refuses a restart with an
 ambiguous 404, the app refreshes that job before deciding whether to open
 options or report that it has left the queue.
 
+A held job's card (status **held**) shows three things: the cause and Runner's
+message (`out of space: storage full`), `retries paused` when you paused it,
+and `Fails as hold expired in 23h 10m unless it recovers`. Every hold is
+environmental and automatic, so the one button is **Pause retries** while
+Runner is retrying and **Retry** once you have paused it; there is no hold
+that waits for a person. The countdown comes from the daemon's
+`deadline_unix` (or, from an older daemon, `deadline_in_s`). The app has no
+Files tab; parked sources are in the browser UI.
+
 Missing files offers Re-download missing files. Failed torrents offer removal
 with the existing keep/delete-files choice. Disk holds explain automatic
 recovery when space is available; a resume button is not a disk-space remedy.

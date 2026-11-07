@@ -80,7 +80,11 @@ whole recovery flow.
 full disk, an exhausted quota, a missing extractor, a mount that came back
 empty, an archive waiting for a password — is **held**, not failed. The row
 says why, when the next automatic retry is, and when the hold runs out:
-`· fails as hold expired in 23h 10m unless it recovers`. Runner retries every
+`· storage unavailable: <Runner's message> … fails as hold expired in 23h 10m
+unless it recovers`. The cause is named first (storage unavailable, out of
+space, quota reached, allocation failed, mount unavailable, tool missing,
+engine unavailable, password required). The iPhone, iPad and Android app
+shows the same three lines on a held card, with the same pause/retry button. Runner retries every
 hold on its own; **pause** stops the retries and the button becomes
 **retry**, which sends the job back to the step it stopped in. Nothing a
 release contains ever holds a job, and no hold waits for a person: a hold
@@ -89,6 +93,16 @@ with reason `hold_expired` and its files are parked, even while the queue is
 paused. A newer cause replaces the shown one and restarts the clock. Over the
 API and SSE these jobs read `status_projected: "held"` and emit
 `job_status_changed` on the way in and out.
+
+**Parked sources in Files.** A failed job's folder shows state **failed ·
+parked** with a line saying why: the failure reason (`too few articles`,
+`fetch failed`, `PAR2 repair failed`, `unpack failed`, `script failed`,
+`publication failed`, `disk error`, `conflicting data`, `hold expired`), the
+assessment's text, and `salvage pending` while a salvage publication is still
+owed. The retention column gives its expiry (`expires <time>`), or `keep
+indefinitely` when keep is on. The same line is in the folder's details panel.
+The **Needs review** chip and "release review hold" belong to folders Runner
+found but did not write; no job is ever held for review.
 
 **Torrent lifecycle.** Ready torrents share in **Seeding** and move to
 **Completed** when seeding stops. An idle seed is still available to peers;
