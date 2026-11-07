@@ -1284,30 +1284,88 @@ async fn park_write(st: &ApiState, mut parked: Parked) -> bool {
     };
     let inventory = st.engine.artifacts();
     let job = parked.entry.job;
+    if let Some(bytes) = parked.nzb.clone() {
+        let spool = db.clone();
+        let spooled = tokio::task::spawn_blocking(move || spool.spool_nzb(job, &bytes)).await;
+        if !matches!(spooled, Ok(Ok(()))) {
+            tracing::warn!(job = job.0, "could not park the deleted job's NZB");
+            return false;
+        }
+    }
+    // Contract §2.2: an operator delete is a real terminal — `cancelled`,
+    // with the transfer — written through the one terminal chain, so the
+    // `DELETED` history row and `job_pp_finished{cancelled}` come from the
+    // same record. A job that already has its terminal (a failed row
+    // awaiting salvage or disposal) keeps it: no second terminal.
+    let terminal = cancelled_terminal(&parked.entry);
+    let recorded = match st.engine.record_terminal(terminal).await {
+        Ok(Some(row)) if row.outcome == nzbd_types::TerminalOutcome::Cancelled => {
+            Some(row.history_seq.unwrap_or(0))
+        }
+        Ok(Some(_)) => None,
+        Ok(None) | Err(_) => {
+            tracing::warn!(job = job.0, "could not record the cancelled terminal");
+            db.drop_spool(job);
+            return false;
+        }
+    };
     tokio::task::spawn_blocking(move || {
-        if let Some(bytes) = &parked.nzb {
-            if let Err(e) = db.spool_nzb(job, bytes) {
-                tracing::warn!(job = job.0, error = %e, "could not park the deleted job's NZB");
-                return false;
-            }
-        }
-        match db.record_seq_durable(&parked.entry) {
-            Ok((sequence, mut entry)) => {
-                entry.seq = sequence;
-                if let Err(error) = inventory.finalize_deleted_workspaces(&entry) {
-                    tracing::warn!(job = job.0, %error, "deleted job scratch awaits maintenance replay");
+        let sequence = match recorded {
+            Some(sequence) => sequence,
+            None => match db.record_seq_durable(&parked.entry) {
+                Ok((sequence, _)) => sequence,
+                Err(e) => {
+                    tracing::warn!(job = job.0, error = %e, "could not write the DELETED history entry");
+                    db.drop_spool(job);
+                    return false;
                 }
-                true
-            }
-            Err(e) => {
-                tracing::warn!(job = job.0, error = %e, "could not write the DELETED history entry");
-                db.drop_spool(job);
-                false
-            }
+            },
+        };
+        let mut entry = parked.entry;
+        entry.seq = sequence;
+        if let Err(error) = inventory.finalize_deleted_workspaces(&entry) {
+            tracing::warn!(job = job.0, %error, "deleted job scratch awaits maintenance replay");
         }
+        true
     })
     .await
     .unwrap_or(false)
+}
+
+/// The `cancelled` terminal for a deleted job's `DELETED` history entry.
+fn cancelled_terminal(entry: &nzbd_state::HistoryEntry) -> nzbd_state::artifacts::JobTerminal {
+    nzbd_state::artifacts::JobTerminal {
+        job: entry.job.0,
+        transfer: nzbd_types::transfer_of(&entry.params),
+        outcome: nzbd_types::TerminalOutcome::Cancelled,
+        reason: None,
+        fetch_cause: None,
+        stage: None,
+        message: Some("deleted by the operator".into()),
+        blames_release: false,
+        salvage: nzbd_state::artifacts::SalvageState::None,
+        keep_on_failure: false,
+        fetched: entry
+            .record
+            .as_ref()
+            .map(|record| nzbd_types::Fetched {
+                success_articles: u64::from(record.success_articles),
+                total_articles: u64::from(record.total_articles),
+                bytes: 0,
+            })
+            .unwrap_or_default(),
+        publication: None,
+        markers: Vec::new(),
+        entry: entry.clone(),
+        history_seq: None,
+        history_incarnation: None,
+        markers_stamped: false,
+        emitted: false,
+        disposal: None,
+        salvage_error: None,
+        created_at: 0,
+        updated_at: 0,
+    }
 }
 
 async fn job_action(
@@ -2217,75 +2275,86 @@ async fn get_history(
     let consumer = consumer_name(&headers);
     let now = unix_now();
     let entries = tokio::task::spawn_blocking(move || {
-        db.read_page(limit, offset, since).map(|(entries, total)| {
-            // Record the pull before decorating: this poll SAW these
-            // entries. Both shapes count — a `since_seq` catch-up walk is
-            // still the consumer reading them. A failure here is not worth
-            // failing the read over; the observation is diagnostic, the
-            // response is the job.
-            if consumer.is_some() {
-                let jobs: Vec<crate::JobId> = entries.iter().map(|e| e.job).collect();
-                if !jobs.is_empty() {
-                    let _ = db.mark_seen(&jobs, consumer.as_deref(), now);
-                }
-            }
-            // `can_requeue` is derived, not stored: it answers "is the
-            // requeue source still on this node?", which only a look at the
-            // spool (or the parked `*URL`) can honestly say.
-            //
-            // ONE directory listing for the page, not one `stat` per row:
-            // the spool lives beside the state dir, which on a network
-            // mount made this loop the bulk of a history read (250 ms for
-            // 179 rows, nuc3 2026-07-29).
-            let spooled = db.spooled_ids();
-            let entries = entries
-                .into_iter()
-                .map(|e| {
-                    let reason = history_requeue_refusal(&e);
-                    let can = reason.is_none()
-                        && (spooled.contains(&e.job.0)
-                            || e.params.iter().any(|(k, _)| k == "*URL"));
-                    let mut v = serde_json::to_value(&e).unwrap_or_else(|_| json!({}));
-                    if let Some(o) = v.as_object_mut() {
-                        o.insert(
-                            "torrent_role".into(),
-                            json!(e
-                                .record
-                                .as_ref()
-                                .and_then(|record| record.torrent_role.as_deref())),
-                        );
-                        o.insert(
-                            "seed_donor_job_id".into(),
-                            json!(e
-                                .record
-                                .as_ref()
-                                .and_then(|record| record.seed_donor_job_id)),
-                        );
-                        o.insert("can_requeue".into(), json!(can));
-                        o.insert("requeue_reason".into(), json!(reason));
-                        o.insert(
-                            "kind".into(),
-                            json!(e
-                                .record
-                                .as_ref()
-                                .map(|record| record.kind)
-                                .unwrap_or(nzbd_types::JobKind::Nzb)),
-                        );
+        db.read_page(limit, offset, since)
+            .map(|(entries, total)| {
+                // Record the pull before decorating: this poll SAW these
+                // entries. Both shapes count — a `since_seq` catch-up walk is
+                // still the consumer reading them. A failure here is not worth
+                // failing the read over; the observation is diagnostic, the
+                // response is the job.
+                if consumer.is_some() {
+                    let jobs: Vec<crate::JobId> = entries.iter().map(|e| e.job).collect();
+                    if !jobs.is_empty() {
+                        let _ = db.mark_seen(&jobs, consumer.as_deref(), now);
                     }
-                    v
-                })
-                .collect::<Vec<_>>();
-            (entries, total, db.sync_status())
-        })
+                }
+                // `can_requeue` is derived, not stored: it answers "is the
+                // requeue source still on this node?", which only a look at the
+                // spool (or the parked `*URL`) can honestly say.
+                //
+                // ONE directory listing for the page, not one `stat` per row:
+                // the spool lives beside the state dir, which on a network
+                // mount made this loop the bulk of a history read (250 ms for
+                // 179 rows, nuc3 2026-07-29).
+                let spooled = db.spooled_ids();
+                let entries = entries
+                    .into_iter()
+                    .map(|e| {
+                        let reason = history_requeue_refusal(&e);
+                        let can = reason.is_none()
+                            && (spooled.contains(&e.job.0)
+                                || e.params.iter().any(|(k, _)| k == "*URL"));
+                        let mut v = serde_json::to_value(&e).unwrap_or_else(|_| json!({}));
+                        if let Some(o) = v.as_object_mut() {
+                            o.insert(
+                                "torrent_role".into(),
+                                json!(e
+                                    .record
+                                    .as_ref()
+                                    .and_then(|record| record.torrent_role.as_deref())),
+                            );
+                            o.insert(
+                                "seed_donor_job_id".into(),
+                                json!(e
+                                    .record
+                                    .as_ref()
+                                    .and_then(|record| record.seed_donor_job_id)),
+                            );
+                            o.insert("can_requeue".into(), json!(can));
+                            o.insert("requeue_reason".into(), json!(reason));
+                            o.insert(
+                                "kind".into(),
+                                json!(e
+                                    .record
+                                    .as_ref()
+                                    .map(|record| record.kind)
+                                    .unwrap_or(nzbd_types::JobKind::Nzb)),
+                            );
+                        }
+                        v
+                    })
+                    .collect::<Vec<_>>();
+                (entries, total, db.sync_status())
+            })
+            .and_then(|(entries, total, sync)| {
+                // Contract §2.5: the cursor is `(incarnation, seq)`. A consumer
+                // whose stored incarnation differs, or whose cursor is below
+                // `retained_min_seq`, has lost continuity and must reconcile.
+                let continuity = (db.incarnation()?, db.head_seq()?, db.retained_min_seq()?);
+                Ok((entries, total, sync, continuity))
+            })
     })
     .await;
     match entries {
-        Ok(Ok((entries, total, sync))) => Json(json!({
+        Ok(Ok((entries, total, sync, (incarnation, head_seq, retained_min_seq)))) => Json(json!({
             "entries": entries,
             "total": total,
             "offset": offset,
             "limit": limit,
             "sync": sync,
+            "incarnation": incarnation,
+            "head_seq": head_seq,
+            "retained_min_seq": retained_min_seq,
         }))
         .into_response(),
         Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),

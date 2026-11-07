@@ -88,6 +88,29 @@ pub struct Delivery {
     pub source_cleanup: SourceCleanup,
 }
 
+impl Delivery {
+    /// Contract §2.5: `completed` for the success publication, `salvage` for
+    /// the verified partial output of a failed job (derived from the
+    /// immutable terminal outcome the row was written with).
+    pub fn kind(&self) -> &'static str {
+        if self.terminal_outcome.starts_with("SUCCESS") {
+            "completed"
+        } else {
+            "salvage"
+        }
+    }
+
+    /// The feed shape: the immutable row with its `kind`; `files` and
+    /// `manifestDigest` are the manifest body.
+    pub fn feed_value(&self) -> serde_json::Result<serde_json::Value> {
+        let mut value = serde_json::to_value(self)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("kind".into(), self.kind().into());
+        }
+        Ok(value)
+    }
+}
+
 fn default_terminal_outcome() -> String {
     "SUCCESS".into()
 }
@@ -612,7 +635,7 @@ impl Inventory {
             } else {
                 match read_delivery(&db, &id) {
                     Ok(delivery) if delivery.delivery_id == id && delivery.sequence == sequence => {
-                        serde_json::to_value(delivery)?
+                        delivery.feed_value()?
                     }
                     _ => stub("publication manifest is invalid; source retained for review"),
                 }

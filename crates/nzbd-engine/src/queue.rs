@@ -254,10 +254,20 @@ impl QueueState {
                     if let Some(stage) = param("Failure:Stage") {
                         receipt.failure_stage = Some(stage);
                     }
-                    receipt.failure_cause = param("Failure:Reason")
+                    // Since contract v2 `Failure:Reason` is the typed reason
+                    // and `Failure:Message` the human text.
+                    let typed = param("Failure:Reason")
+                        .filter(|value| nzbd_types::FailureReason::parse(value).is_some());
+                    receipt.failure_cause = param("Failure:Message")
+                        .or_else(|| param("Failure:Reason").filter(|_| typed.is_none()))
                         .or_else(|| param("*Failure:Reason"))
                         .or_else(|| param("Failure:Files"));
                     receipt.terminal_outcome = param(nzbd_types::PP_DONE_PARAM);
+                    receipt.failure_reason = typed;
+                    receipt.fetch_cause = param("Failure:FetchCause");
+                    receipt.blames_release =
+                        param("Failure:BlamesRelease").and_then(|value| value.parse().ok());
+                    receipt.salvage = param("Failure:Salvage");
                 }
                 // Once source custody is pinned to an artifact generation,
                 // its live preference is authoritative. Queue params are only
@@ -531,6 +541,10 @@ impl QueueState {
             publication_path: None,
             source_artifact_id: None,
             source_generation: None,
+            failure_reason: None,
+            fetch_cause: None,
+            blames_release: None,
+            salvage: None,
         });
         Ok(ManagedTorrentReservation {
             id,
@@ -1942,6 +1956,10 @@ mod tests {
             // overwrite this durable control preference.
             source_artifact_id: Some("pinned-source".into()),
             source_generation: Some("pinned-gen".into()),
+            failure_reason: None,
+            fetch_cause: None,
+            blames_release: None,
+            salvage: None,
         });
 
         state.sync_url_admission_receipts();

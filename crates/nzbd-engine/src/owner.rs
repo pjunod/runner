@@ -3096,6 +3096,10 @@ impl Owner {
                             publication_path: None,
                             source_artifact_id: None,
                             source_generation: None,
+                            failure_reason: None,
+                            fetch_cause: None,
+                            blames_release: None,
+                            salvage: None,
                         };
                         self.state.url_admission_receipts.push(receipt.clone());
                         if self.persist_guard.is_some() {
@@ -3221,6 +3225,10 @@ impl Owner {
                         publication_path: None,
                         source_artifact_id: None,
                         source_generation: None,
+                        failure_reason: None,
+                        fetch_cause: None,
+                        blames_release: None,
+                        salvage: None,
                     };
                     self.state.url_admission_receipts.push(receipt.clone());
                     if self.persist_guard.is_some() {

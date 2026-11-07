@@ -1232,10 +1232,12 @@ fn run(
     let startup_engine = Arc::new(std::sync::Mutex::new(None::<nzbd_engine::EngineHandle>));
     let cleanup_engine = startup_engine.clone();
     let result = runtime.block_on(async move {
-        // History is a queue-terminal dependency for torrents even when
-        // Usenet post-processing is disabled: payload disposition must be
-        // durable before a confirmed removal can leave the active queue.
-        let history_db = if cfg.post.enabled || cfg.torrent.enabled {
+        // History is part of every job's terminal (pipeline contract v2
+        // §2.1): health and fetch failures are recorded by the queue owner
+        // even with post-processing disabled, and `job_pp_finished` is only
+        // sent once its history row is durable. The daemon does not start
+        // without it — an unopenable history store is a startup error.
+        let history_db = {
             let state_dir = cfg.state_dir();
             Some(open_history(
                 &state_dir,
@@ -1244,8 +1246,6 @@ fn run(
                 history_retention(&cfg),
                 cfg.history.index_dir.as_deref(),
             )?)
-        } else {
-            None
         };
         let _history_worker = history_db.as_ref().map(|db| db.start_worker()).transpose()
             .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;

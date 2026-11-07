@@ -335,6 +335,9 @@ impl ControlStore {
         }
         Ok((rows, cursor))
     }
+    /// Test support only (removed with acceptance in M3): the production
+    /// `accept` route no longer records anything (contract §2.5).
+    #[cfg(test)]
     pub(crate) async fn accept_cluster_delivery(
         &self,
         id: &str,
@@ -574,14 +577,6 @@ struct Page {
     #[serde(default)]
     include_accepted: bool,
 }
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Acceptance {
-    protocol_version: u8,
-    publication_generation: String,
-    manifest_digest: String,
-    consumer_receipt_id: String,
-}
 
 fn decode_delivery_segment(raw: &str) -> Result<String, String> {
     if raw.len() > 12288 {
@@ -747,9 +742,11 @@ pub(crate) async fn serve_cluster_delivery(
     }
     let _serial = shared.delivery_serial.lock().await;
     let method = request.method().clone();
+    let uri = request.uri().clone();
+    drop(request);
     let result:Result<Value,(StatusCode,String)>=async {
         if path=="/api/v1/deliveries" && method==Method::GET {
-            let axum::extract::Query(page)=axum::extract::Query::<Page>::try_from_uri(request.uri()).map_err(|e|(StatusCode::BAD_REQUEST,e.to_string()))?;
+            let axum::extract::Query(page)=axum::extract::Query::<Page>::try_from_uri(&uri).map_err(|e|(StatusCode::BAD_REQUEST,e.to_string()))?;
             let limit=page.limit.unwrap_or(50);
             if page.after<0 || !(1..=100).contains(&limit) {return Err((StatusCode::BAD_REQUEST,"invalid delivery cursor or limit".into()));}
             let (values,cursor)=control.cluster_discovery_page(page.after,limit,page.include_accepted).await.map_err(|e|(StatusCode::SERVICE_UNAVAILABLE,e))?;
@@ -763,12 +760,11 @@ pub(crate) async fn serve_cluster_delivery(
         if method==Method::GET && action.is_empty() {return Ok(discovery_value(&record));}
         if method==Method::POST && action=="accept" {
             if record.cleanup_only {return Err((StatusCode::CONFLICT,"terminal cleanup has no consumer payload to accept".into()));}
-            let bytes=axum::body::to_bytes(request.into_body(),16384).await.map_err(|e|(StatusCode::BAD_REQUEST,e.to_string()))?;
-            let body:Acceptance=serde_json::from_slice(&bytes).map_err(|e|(StatusCode::BAD_REQUEST,e.to_string()))?;
-            if body.protocol_version!=1 {return Err((StatusCode::BAD_REQUEST,"unsupported delivery protocol version".into()));}
-            control.accept_cluster_delivery(&id,&body.publication_generation,&body.manifest_digest,&body.consumer_receipt_id).await.map_err(|e|(StatusCode::CONFLICT,e))?;
-            let current=control.cluster_delivery(&id).await.map_err(|e|(StatusCode::SERVICE_UNAVAILABLE,e))?.ok_or((StatusCode::NOT_FOUND,"delivery disappeared".into()))?;
-            return Ok(discovery_value(&current));
+            // Contract §2.5: there is no acceptance. For one release the
+            // route answers 200 with the unchanged row so an old curator's
+            // acknowledgement settles; nothing is recorded and retirement
+            // never waits on it.
+            return Ok(discovery_value(&record));
         }
         if method==Method::POST && action=="source-cleanup/retry" {
             let mut queued=false;

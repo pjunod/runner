@@ -1477,7 +1477,34 @@ async fn scan_queue(
 ) {
     let claim = |job: JobId| gate.as_ref().map(|f| f(job)).unwrap_or(true);
     let inventory = engine.artifacts();
-    for j in engine.snapshot().jobs.iter() {
+    let snapshot = engine.snapshot();
+    // Salvage and disposal are driven from `job_terminals`, not from queue
+    // status (contract §2.6): a terminal whose queue row is already gone
+    // still settles its obligations.
+    if gate.is_none() {
+        let queued = snapshot
+            .jobs
+            .iter()
+            .map(|job| job.id)
+            .collect::<std::collections::HashSet<_>>();
+        let lookup = inventory.clone();
+        let owed = tokio::task::spawn_blocking(move || {
+            let mut owed = lookup.pending_salvage()?;
+            owed.extend(lookup.pending_disposal()?);
+            Ok::<_, nzbd_state::artifacts::Error>(owed)
+        })
+        .await;
+        if let Ok(Ok(owed)) = owed {
+            for terminal in owed {
+                let job = JobId(terminal.job);
+                if !queued.contains(&job) {
+                    failure_followup(engine, cfg, dest_dir, gate, job, last_disposition, false)
+                        .await;
+                }
+            }
+        }
+    }
+    for j in snapshot.jobs.iter() {
         // Holds are released by the engine's recovery task (mount
         // re-observation, scheduled retries, storage) and by operator
         // retries; post-processing only runs what that leaves PostQueued.
