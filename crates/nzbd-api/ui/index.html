@@ -5252,12 +5252,13 @@ function fileHoldText(a) {
 /// Why a failed source is parked here: the typed reason, the assessment, and
 /// whether a salvage publication is still owed.
 function fileParkedText(a) {
-  if (a.state !== "parked_failed") return "";
+  // parked_failed is Runner's park; retained is a keep_on_failure source.
+  if (a.state !== "parked_failed" && !(a.state === "retained" && a.failure_reason)) return "";
   const parts = [];
   if (a.failure_reason) parts.push(FAILURE_REASONS[a.failure_reason] || a.failure_reason);
   if (a.failure_assessment && a.failure_assessment.reason) parts.push(a.failure_assessment.reason);
   if (a.salvage === "pending") parts.push("salvage pending");
-  return parts.length ? "Parked: " + parts.join(" · ") : "";
+  return parts.length ? (a.state === "retained" ? "Kept: " : "Parked: ") + parts.join(" · ") : "";
 }
 /// What will happen to the files, in one line.
 function fileRetentionText(a, earliest) {

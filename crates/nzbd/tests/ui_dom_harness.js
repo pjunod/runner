@@ -2495,6 +2495,10 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     eq(parked.parked, "Parked: unpack failed · archive is corrupt · salvage pending", "a parked source says why it is parked");
     ok(parked.ret.startsWith("expires "), "…and when it expires");
     eq(T.fileRowModel(entry("Plain", { state: "retained" })).parked, "", "only parked sources carry a reason");
+    const keptFailed = T.fileRowModel(entry("Kept.Fail", { state: "retained", owned: true, keep: true, hold: null, failure_reason: "par" }, 1, 1, true));
+    eq(keptFailed.parked, "Kept: PAR2 repair failed", "a keep-on-failure source says why it failed");
+    ok(T.fileDetailModel({ artifact: art("kf", { state: "retained", owned: true, hold: null, keep: true, failure_reason: "par", inspected_at: 1 }), files: [], total: 0, offset: 0, events: [], preview: null })
+      .facts.some(f => f[0] === "parked" && f[1] === "Kept: PAR2 repair failed"), "…and so does the details panel");
     const active = T.fileRowModel(entry("Live", { state: "active" }));
     eq(active.inspectHidden, true, "a folder still being written cannot be walked");
     eq(active.st, "downloading", "active reads as downloading");
