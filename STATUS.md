@@ -1,5 +1,96 @@
 # nzbd — Project Status
 
+## Pipeline contract v2 M1a — terminal first, typed at the source — 2026-11-07
+
+**Status:** built on `claude/pipeline-v2-m1a-runner` (runner 0.3.0), not merged,
+not deployed. Plan: `IMPL_RUNNER.md` §5 / `PIPELINE_REWRITE_PLAN.md` M1a.
+Curator M2 depends on this landing first.
+
+- **One terminal per job, durable before it is announced.** A new
+  `job_terminals` row in the artifacts DB, together with the job's salvage
+  obligation in one transaction. Then the history append, the queue-row
+  markers, and the single `job_pp_finished` built from that row. Each step is
+  flagged on the row and replayed at boot and every 30 s.
+  `inject_terminal_crash` (test-support) proves the replay produces one
+  history row and one event.
+- **Typed at the producer.** The closed `FailureReason` set is health · fetch
+  · par · unpack · script · publish · io · identity · hold_expired.
+  - `fetch` carries `FetchCause` gone/indexer_unavailable (`fetch::cause_of`).
+  - `blames_release` and `salvage_possible` are decided by the reason.
+  - Producers:
+    - A write failure is `io`, not `health`.
+    - yEnc and overlap conflicts are `identity`.
+    - A zero-article health failure never reaches post-processing.
+    - URL fetch failures are `fetch`.
+    - PP failures go through `pp_verdict`.
+    - Operator delete is `cancelled` and carries the transfer.
+- **Holds are environmental, automatic, and end.**
+  - `HoldCause` lost io, identity_conflict and post_failure.
+    `HoldPolicy::Review` and the first-cause lock are gone.
+  - Every hold gets `deadline_unix`/`deadline_in_s` from `[post]
+    hold_deadline_secs` (a day) or `password_hold_deadline_secs` (a week).
+    Past the deadline the job fails `hold_expired`, even when the queue is
+    paused.
+  - At boot, persisted legacy holds convert to the matching terminal. This
+    waits until startup verification has run.
+- **Salvage and disposal follow the terminal** (`failure_followup`). Salvage
+  publishes the verified part as a `kind: salvage` delivery and emits
+  `job_publication_ready`. Disposal precedence is keep_on_failure, then
+  park-always (publish/io/identity/hold_expired), then `failure_action`. A
+  failed queue row retires only once both have settled. keep_on_failure only
+  affects retention.
+- **R3:** a verified file with an unknown extension is sniffed (magic bytes,
+  then ffprobe), so obfuscated Matroska publishes. The payload list gains
+  m2ts/mts/vob/mpg/mpeg/iso/mka.
+- **Wire:**
+  - `job_pp_finished` has the full contract field set. The legacy names stay
+    until M6.
+  - New events: `job_status_changed` and `job_publication_ready`.
+  - `status_projected` ("held") and `transfer` in `/api/v1/jobs`.
+  - `/history` returns `incarnation`, `head_seq` and `retained_min_seq`.
+  - `/deliveries` rows return `kind`.
+  - `accept` is a 200 no-op, and the cluster no longer depends on it.
+  - The admission receipt has typed `failure_reason`, `fetch_cause`,
+    `blames_release` and `salvage`.
+- **Deleted:**
+  - `HoldPolicy::Review` and `automatic()`.
+  - The io/identity_conflict/post_failure causes.
+  - `Owner::retry_hold` (cfg(test)) and the first-cause lock.
+  - `post_hold_cause`, `handle_failed_job(_admitted)`, `failed_source_assessment` and
+    `FailedSourceAssessment`, `replay_failed_disposition`, and
+    `record_failed_cleanup_retry`.
+  - The lifecycle `FailureAction::Delete` override.
+  - The `DeliveryAcceptance` and cluster `Acceptance` bodies.
+  - Non-test Rust totals vs main: +2961 / −1391.
+- **Acceptance tests:**
+  - `crates/nzbd-post/tests/terminal_first.rs`: 6/6.
+  - Engine: `write_failure_is_io_not_health`,
+    `zero_article_health_failure_skips_pp_admission`,
+    `fetch_404_is_gone_fetch_503_exhausted_is_indexer_unavailable` (unit),
+    and `legacy_identity_conflict_hold_converts_at_boot`.
+  - API: `accept_answers_200_noop`,
+    `operator_delete_emits_cancelled_terminal_with_transfer` and
+    `old_curator_fixture_parses_new_event`.
+  - State: `rebuild_changes_incarnation`.
+- **Not built:**
+  - `cluster_terminal_releases_lease_once_disposes` (a multi-node e2e).
+  - `partial_torrent_is_io_with_salvage_pending` (needs a torrent fixture).
+  - The intents half of `retire_sweep_waits_for_salvage_and_open_intents`.
+  - `manifest_digest_golden_vector_unchanged` against
+    `.runner-manifest.json`, which is M3. The existing `a0acee1d…` vector
+    test still passes.
+  - The fetch test is a classifier unit test rather than two URL jobs.
+- **Not verified:**
+  - `cargo test --workspace` (the fast-lane rule forbids it).
+  - Runs with `NZBD_REQUIRE_TOOLS=1`.
+  - The cluster and torrent paths beyond `cargo check`/clippy.
+  - Deploy and live checks.
+  - Mobile still models `review` holds. That is harmless: an unknown policy
+    already offers Retry.
+- **Decisions for Paul:** park-always for publish/io/identity, the contract
+  default, which both reviewers recommend. It also applies to
+  `hold_expired`, since an expired hold is environmental.
+
 ## Empty failed sources retained "for recovery" — 2026-11-02
 
 **Status:** fixed on `codex/empty-failed-source`, paired with Curator
