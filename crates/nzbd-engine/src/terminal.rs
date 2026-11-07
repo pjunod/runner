@@ -302,9 +302,6 @@ pub fn persist_terminal(
 
 /// Step 3: apply the row's markers to the queue row.
 pub fn stamp_queue_row(job: &mut Job, row: &JobTerminal) {
-    job.params.retain(|(key, _)| {
-        key != "*PP:selected-publication-outcome" && key != "*PP:selected-publication-failure-cause"
-    });
     for (key, value) in &row.markers {
         set(&mut job.params, key, value.clone());
     }

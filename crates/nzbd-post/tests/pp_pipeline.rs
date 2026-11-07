@@ -6,7 +6,7 @@
 use nzbd_engine::{AddOpts, Engine, EngineConfig, EngineHandle, Tuning};
 use nzbd_post::manager::{
     process_job as process_job_unscoped, spawn_post_manager, FailureAction, PostConfig, PpFinal,
-    PpGate, RestartPoint, PP_DONE_PARAM,
+    RestartPoint, PP_DONE_PARAM,
 };
 use nzbd_state::history::HistoryDb;
 use nzbd_types::{
@@ -611,20 +611,31 @@ async fn legacy_repair_timeout_recovers_automatically_and_records_terminal_failu
             .artifacts()
             .finish(2301, &dir, &tmp.path().join("dest"), "active")
             .unwrap();
+        // A control persisted by a pre-v2 build: a `post_failure` review
+        // hold with no schedule.
+        job.set_control(&nzbd_types::JobControl {
+            version: 1,
+            revision: "1".into(),
+            lifecycle: "held".into(),
+            cause: "post_failure".into(),
+            stage: "par_repair".into(),
+            retry_policy: "review".into(),
+            message: "subprocess failed: read live Keep setting: engine is shutting down".into(),
+            instance: "legacy".into(),
+            previous_status: Some(JobStatus::Completed),
+            manual_pause: false,
+            retry_attempt: 0,
+            next_retry_at_unix: None,
+            blocked_since_unix: None,
+            released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
+        });
+        job.status = JobStatus::Paused;
         engine
             .import_fixture_job(tmp.path(), job, false, false)
             .await
             .unwrap();
-        assert!(engine
-            .hold_job(
-                JobId(2301),
-                // A control persisted by a pre-v2 build.
-                nzbd_types::HoldCause::Unrecognized("post_failure".into()),
-                "par_repair",
-                "subprocess failed: read live Keep setting: engine is shutting down",
-            )
-            .await
-            .unwrap());
         assert!(engine.shutdown().await);
 
         let engine = spawn_engine(tmp.path()).await;
@@ -694,7 +705,11 @@ async fn legacy_repair_timeout_recovers_automatically_and_records_terminal_failu
         assert!(entry
             .params
             .iter()
-            .any(|(key, value)| key == "Failure:Reason"
+            .any(|(key, value)| key == "Failure:Reason" && value == "par"));
+        assert!(entry
+            .params
+            .iter()
+            .any(|(key, value)| key == "Failure:Message"
                 && value.contains("could not be reconstructed")));
         assert_eq!(
             dir.exists(),
@@ -772,6 +787,25 @@ async fn insufficient_parity_obeys_failure_disposition() {
             .unwrap()
             .unwrap()
             .held());
+        // Contract §2.1/§2.6: the terminal is recorded first; disposal
+        // follows from the terminal row.
+        assert!(
+            dir.exists(),
+            "nothing touched the bytes before the terminal"
+        );
+        assert!(
+            nzbd_post::manager::follow_up_failure(
+                &engine,
+                &PostConfig {
+                    failure_action: action,
+                    failed_dir: Some(parked_root.clone()),
+                    ..PostConfig::default()
+                },
+                &tmp.path().join("dest"),
+                JobId(job_id),
+            )
+            .await
+        );
         let retained = if action == FailureAction::Park {
             parked_root.join("hopeless")
         } else {
@@ -1352,825 +1386,6 @@ async fn health_action_delete_removes_files() {
     engine.shutdown().await;
 }
 
-/// Operator retry occasions after restart resume the legacy disposition
-/// budget. Restart must preserve the existing deletion journal and deadlines.
-#[cfg(unix)]
-#[tokio::test]
-async fn failed_cleanup_operator_retries_resume_durable_budget_across_restart() {
-    use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    const ATTEMPTS_PARAM: &str = "*PP:failure-disposition-attempts";
-    const NEXT_RETRY_PARAM: &str = "*PP:failed-cleanup-next-retry";
-
-    // This path deliberately does not expose partially deleted Done ranges
-    // through verified export. Inspect metadata only for retry/stamp assertions.
-    async fn cleanup_metadata(engine: &EngineHandle) -> Option<Job> {
-        engine
-            .recovery_document()
-            .await
-            .unwrap()
-            .jobs
-            .into_iter()
-            .find(|job| job.id == JobId(95))
-    }
-    fn retry_deadline(job: &Job) -> Option<i64> {
-        job.params
-            .iter()
-            .find(|(key, _)| key == NEXT_RETRY_PARAM)
-            .and_then(|(_, value)| value.parse().ok())
-    }
-    fn unix_now() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
-    }
-    fn cleanup_evidence(engine: &EngineHandle) -> String {
-        let inventory = engine.artifacts();
-        let source = inventory.for_job(95).unwrap().unwrap();
-        serde_json::to_string(
-            &inventory
-                .operation(&format!("failed-delete-{}", source.id))
-                .unwrap(),
-        )
-        .unwrap()
-    }
-    async fn cleanup_ready(engine: &EngineHandle) {
-        let evidence = cleanup_evidence(engine);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(scope) = engine
-                    .begin_failed_cleanup_admission(JobId(95))
-                    .await
-                    .unwrap()
-                {
-                    let scoped = engine.for_post_admission(&scope.admission);
-                    assert!(matches!(
-                        scoped.export_job(JobId(95)).await,
-                        Err(nzbd_engine::EngineError::Lifecycle(_))
-                    ));
-                    assert_eq!(
-                        scoped
-                            .failed_cleanup_metadata()
-                            .await
-                            .unwrap()
-                            .unwrap()
-                            .status,
-                        JobStatus::Failed
-                    );
-                    engine.end_post_admission(scope.admission).await.unwrap();
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("exact terminal cleanup admission becomes ready after restart");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !engine.snapshot().jobs.iter().any(|row| {
-                row.id == JobId(95)
-                    && row
-                        .failed_cleanup
-                        .as_ref()
-                        .is_some_and(|cleanup| cleanup.attempts > 0)
-            }) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("startup scan must observe the recovered cleanup summary");
-        assert_eq!(
-            cleanup_evidence(engine),
-            evidence,
-            "admission cannot change deletion intent or its retry deadline"
-        );
-    }
-    async fn operator_retry(
-        manager: &nzbd_post::manager::PostManagerHandle,
-        engine: &EngineHandle,
-        history: &HistoryDb,
-        spent: u32,
-    ) {
-        let evidence = cleanup_evidence(engine);
-        let spent = spent.to_string();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        tokio::time::timeout_at(deadline, async {
-            loop {
-                match manager.retry_now(JobId(95)).await {
-                    Ok(()) => break,
-                    Err(nzbd_post::manager::RestartPostError::NotReady) => {
-                        // A previous admission probe cannot reserve future owner
-                        // readiness. Retry only a refusal that spent no attempt.
-                        let row = cleanup_metadata(engine).await.unwrap();
-                        assert!(
-                            row.params
-                                .iter()
-                                .any(|(key, value)| { key == ATTEMPTS_PARAM && value == &spent }),
-                            "a refused retry must not spend the durable budget: {:?}",
-                            row.params
-                        );
-                        assert!(!row.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
-                        assert!(history.list(10).unwrap().is_empty());
-                        assert_eq!(cleanup_evidence(engine), evidence);
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
-                    other => panic!("unexpected cleanup retry result: {other:?}"),
-                }
-            }
-        })
-        .await
-        .expect("operator retry and refusal checks must finish within the original budget");
-    }
-
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("dest/undeletable");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("partial.bin"), b"known bad bytes").unwrap();
-    let config = PostConfig {
-        failure_action: FailureAction::Delete,
-        ..PostConfig::default()
-    };
-    let hist = history(tmp.path());
-
-    let engine = spawn_engine(tmp.path()).await;
-    let cancel = CancellationToken::new();
-    let tracker = TaskTracker::new();
-    let mut job = completed_job(
-        95,
-        "undeletable",
-        vec![file_entry(1, "partial.bin", None, false)],
-    );
-    job.status = JobStatus::Failed;
-    engine
-        .import_fixture_job(tmp.path(), job, false, false)
-        .await
-        .unwrap();
-
-    // Recovery must first verify/enroll the fixture. Make only the subsequent
-    // destructive disposition fail, rather than blocking initial recovery.
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    spawn_post_manager(
-        engine.clone(),
-        config.clone(),
-        hist.clone(),
-        tmp.path().join("dest"),
-        None,
-        cancel.clone(),
-        &tracker,
-    );
-    engine.emit(nzbd_engine::Event::JobFinished {
-        job: JobId(95),
-        name: "undeletable".into(),
-        status: JobStatus::Failed,
-        health: 0,
-    });
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let committed = cleanup_metadata(&engine).await.is_some_and(|job| {
-            job.params
-                .iter()
-                .any(|(key, value)| key == ATTEMPTS_PARAM && value == "1")
-                && (!job.lifecycle_eligible()
-                    || retry_deadline(&job).is_some_and(|at| at > unix_now()))
-        });
-        if committed {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the first failed disposition attempt was not persisted: {:?}",
-            cleanup_metadata(&engine).await
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(hist.list(10).unwrap().is_empty());
-    cancel.cancel();
-    tracker.close();
-    tracker.wait().await;
-    let first_retry = retry_deadline(&cleanup_metadata(&engine).await.unwrap());
-    let recovery_operation = cleanup_evidence(&engine);
-    engine.shutdown().await;
-
-    // Permissions remain read-only across restart. Cleanup metadata admission
-    // must not require ordinary processing or a replacement payload manifest.
-    let recovered = spawn_engine(tmp.path()).await;
-    cleanup_ready(&recovered).await;
-    // Exactly one attempt: the import's `JobFinished` event and the manager's
-    // startup scan both observe this row, but they are one retry occasion.
-    let durable = cleanup_metadata(&recovered).await.unwrap();
-    assert_eq!(retry_deadline(&durable), first_retry);
-    assert!(
-        !durable.lifecycle_eligible(),
-        "legacy retry policy changed across restart: {:?}",
-        durable.params
-    );
-    assert!(
-        durable
-            .params
-            .iter()
-            .any(|(key, value)| key == ATTEMPTS_PARAM && value == "1"),
-        "one occasion must spend one attempt (durable params: {:?})",
-        durable.params
-    );
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    assert_eq!(cleanup_evidence(&recovered), recovery_operation);
-    let cancel2 = CancellationToken::new();
-    let tracker2 = TaskTracker::new();
-    let claim2 = Arc::new(AtomicBool::new(false));
-    let gate2 = claim2.clone();
-    let scanned2 = Arc::new(tokio::sync::Notify::new());
-    let scan2 = scanned2.clone();
-    let manager2 = spawn_post_manager(
-        recovered.clone(),
-        config.clone(),
-        hist.clone(),
-        tmp.path().join("dest"),
-        Some(Arc::new(move |job| {
-            let claimed = gate2.load(Ordering::SeqCst);
-            if job == JobId(95) && !claimed {
-                scan2.notify_one();
-            }
-            claimed
-        })),
-        cancel2.clone(),
-        &tracker2,
-    );
-    // Observe the real skipped startup scan, then drain its handler through
-    // the mailbox. A mailbox reply alone can win select before the first scan.
-    tokio::time::timeout(Duration::from_secs(5), scanned2.notified())
-        .await
-        .expect("second manager must observe the unclaimed startup row");
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(5), manager2.retry_now(JobId(u32::MAX)))
-            .await
-            .expect("second manager must serve its control mailbox"),
-        Err(nzbd_post::manager::RestartPostError::NotFound)
-    ));
-    let before_retry = cleanup_metadata(&recovered).await.unwrap();
-    assert!(before_retry
-        .params
-        .iter()
-        .any(|(key, value)| key == ATTEMPTS_PARAM && value == "1"));
-    assert_eq!(retry_deadline(&before_retry), first_retry);
-    assert!(
-        first_retry.is_none_or(|at| at > unix_now()),
-        "automatic retry must still be scheduled"
-    );
-    claim2.store(true, Ordering::SeqCst);
-    operator_retry(&manager2, &recovered, &hist, 1).await;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let attempts = cleanup_metadata(&recovered).await.and_then(|job| {
-            job.params
-                .into_iter()
-                .find(|(key, _)| key == ATTEMPTS_PARAM)
-                .map(|(_, value)| value)
-        });
-        if attempts.as_deref() == Some("2") {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the restart did not resume the durable disposition budget"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(hist.list(10).unwrap().is_empty());
-    cancel2.cancel();
-    tracker2.close();
-    tracker2.wait().await;
-    let second_retry = retry_deadline(&cleanup_metadata(&recovered).await.unwrap());
-    let recovery_operation = cleanup_evidence(&recovered);
-    recovered.shutdown().await;
-
-    // The third occasion is another explicit operator command after restart,
-    // with the same claim barrier preventing a duplicate startup occasion.
-    let recovered = spawn_engine(tmp.path()).await;
-    cleanup_ready(&recovered).await;
-    assert_eq!(cleanup_evidence(&recovered), recovery_operation);
-    let cancel3 = CancellationToken::new();
-    let tracker3 = TaskTracker::new();
-    let claim3 = Arc::new(AtomicBool::new(false));
-    let gate3 = claim3.clone();
-    let scanned3 = Arc::new(tokio::sync::Notify::new());
-    let scan3 = scanned3.clone();
-    let manager3 = spawn_post_manager(
-        recovered.clone(),
-        config,
-        hist.clone(),
-        tmp.path().join("dest"),
-        Some(Arc::new(move |job| {
-            let claimed = gate3.load(Ordering::SeqCst);
-            if job == JobId(95) && !claimed {
-                scan3.notify_one();
-            }
-            claimed
-        })),
-        cancel3.clone(),
-        &tracker3,
-    );
-    tokio::time::timeout(Duration::from_secs(5), scanned3.notified())
-        .await
-        .expect("third manager must observe the unclaimed startup row");
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(5), manager3.retry_now(JobId(u32::MAX)))
-            .await
-            .expect("third manager must serve its control mailbox"),
-        Err(nzbd_post::manager::RestartPostError::NotFound)
-    ));
-    let before_retry = cleanup_metadata(&recovered).await.unwrap();
-    assert!(before_retry
-        .params
-        .iter()
-        .any(|(key, value)| key == ATTEMPTS_PARAM && value == "2"));
-    assert_eq!(retry_deadline(&before_retry), second_retry);
-    assert!(
-        second_retry.is_none_or(|at| at > unix_now()),
-        "automatic retry must still be scheduled"
-    );
-    claim3.store(true, Ordering::SeqCst);
-    operator_retry(&manager3, &recovered, &hist, 2).await;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let stamped = cleanup_metadata(&recovered).await.is_some_and(|job| {
-            job.params
-                .iter()
-                .any(|(key, value)| key == PP_DONE_PARAM && value == "FAILURE/HEALTH")
-        });
-        if stamped && hist.list(10).unwrap().len() == 1 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the permanent disposition failure never reached history"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    let row = hist.list(10).unwrap().remove(0);
-    assert_eq!(
-        row.final_dir.as_deref(),
-        Some(dir.to_string_lossy().as_ref()),
-        "history must name the leftover files that require operator cleanup"
-    );
-    assert!(row.params.iter().any(|(key, value)| {
-        key == "Failure:Files" && value.starts_with("checked deletion pending:")
-    }));
-    assert_eq!(
-        std::fs::read(dir.join("partial.bin")).unwrap(),
-        b"known bad bytes"
-    );
-
-    // A finish event models another rescan finding the same queue row. The
-    // terminal stamp must make this a no-op: no fourth attempt or history row.
-    recovered.emit(nzbd_engine::Event::JobFinished {
-        job: JobId(95),
-        name: "undeletable".into(),
-        status: JobStatus::Failed,
-        health: 0,
-    });
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let terminal = cleanup_metadata(&recovered).await.unwrap();
-    assert!(terminal
-        .params
-        .iter()
-        .any(|(key, value)| key == ATTEMPTS_PARAM && value == "3"));
-    assert_eq!(hist.list(10).unwrap().len(), 1);
-
-    cancel3.cancel();
-    tracker3.close();
-    tracker3.wait().await;
-    recovered.shutdown().await;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-}
-
-/// Regression (#107): the queue scan and a `JobFinished` event routinely
-/// observe the *same* still-retryable failed row — a retryable row carries no
-/// `*PP:done` stamp, so the overlap guard cannot collapse them. Counting both
-/// spends two of the three attempts in one instant, which contradicts
-/// ARCHITECTURE.md §9 ("immediately, then on the next two 30-second rescans",
-/// ~60s) and silently halves the operator's retry window.
-///
-/// Ordering here is forced, not slept on: job 95 is in the queue before the
-/// manager starts, so the startup scan is its first observation, and job 96 is
-/// imported *after* that scan so its own event is always a first observation.
-/// The manager awaits each `JobFinished` arm before receiving the next, so job
-/// 96's attempt landing proves job 95's duplicate event was already handled.
-#[cfg(unix)]
-#[tokio::test]
-async fn one_failed_row_seen_by_both_scan_and_event_spends_one_attempt() {
-    use std::os::unix::fs::PermissionsExt;
-
-    const ATTEMPTS_PARAM: &str = "*PP:failure-disposition-attempts";
-
-    let attempts = |engine: EngineHandle, job: u32| async move {
-        engine
-            .export_fixture_job(JobId(job))
-            .await
-            .unwrap()
-            .and_then(|job| {
-                job.params
-                    .into_iter()
-                    .find(|(key, _)| key == ATTEMPTS_PARAM)
-                    .map(|(_, value)| value)
-            })
-    };
-
-    let tmp = tempfile::tempdir().unwrap();
-    let undeletable = |name: &str| {
-        let dir = tmp.path().join("dest").join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("partial.bin"), b"known bad bytes").unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        dir
-    };
-    let dir_a = undeletable("seen-twice");
-    let dir_b = undeletable("barrier");
-
-    let config = PostConfig {
-        failure_action: FailureAction::Delete,
-        ..PostConfig::default()
-    };
-    let hist = history(tmp.path());
-    let engine = spawn_engine(tmp.path()).await;
-
-    // In the queue *before* the manager exists: the startup scan is this
-    // row's first observation, and no event was ever emitted for it.
-    let mut job = completed_job(
-        95,
-        "seen-twice",
-        vec![file_entry(1, "partial.bin", None, false)],
-    );
-    job.status = JobStatus::Failed;
-    engine
-        .import_fixture_job(tmp.path(), job, false, false)
-        .await
-        .unwrap();
-
-    let cancel = CancellationToken::new();
-    let tracker = TaskTracker::new();
-    spawn_post_manager(
-        engine.clone(),
-        config,
-        hist.clone(),
-        tmp.path().join("dest"),
-        None,
-        cancel.clone(),
-        &tracker,
-    );
-
-    // These two waits are pure liveness — they poll for a step to happen, and
-    // the bound only decides how long a genuinely stuck manager hangs before
-    // reporting. Neither carries any part of the claim under test, which is
-    // the *count* asserted below. 10s rather than this file's usual 5s
-    // because instrumentation widens exactly these windows (#107), and a
-    // deadline that fires early would redden the fail-closed Coverage gate
-    // without anything being wrong.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while attempts(engine.clone(), 95).await.as_deref() != Some("1") {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the startup scan never made the first disposition attempt"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    // Imported after that scan, so job 96 is unobserved until its own event.
-    let mut barrier = completed_job(
-        96,
-        "barrier",
-        vec![file_entry(2, "partial.bin", None, false)],
-    );
-    barrier.status = JobStatus::Failed;
-    engine
-        .import_fixture_job(tmp.path(), barrier, false, false)
-        .await
-        .unwrap();
-
-    // The duplicate observation of job 95, then the barrier.
-    engine.emit(nzbd_engine::Event::JobFinished {
-        job: JobId(95),
-        name: "seen-twice".into(),
-        status: JobStatus::Failed,
-        health: 0,
-    });
-    engine.emit(nzbd_engine::Event::JobFinished {
-        job: JobId(96),
-        name: "barrier".into(),
-        status: JobStatus::Failed,
-        health: 0,
-    });
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while attempts(engine.clone(), 96).await.as_deref() != Some("1") {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the barrier job's own first observation was dropped"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    assert_eq!(
-        attempts(engine.clone(), 95).await.as_deref(),
-        Some("1"),
-        "the scan and the event are one retry occasion, not two attempts"
-    );
-    assert!(
-        hist.list(10).unwrap().is_empty(),
-        "no row may retire while its budget is unspent"
-    );
-
-    cancel.cancel();
-    tracker.close();
-    tracker.wait().await;
-    engine.shutdown().await;
-    for dir in [dir_a, dir_b] {
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-}
-
-/// Regression (#107): the debounce above stands for a *spent* attempt, so it
-/// may only be recorded once the increment reaches the queue snapshot.
-/// `import_job_if_present` deliberately reports `false` and restores the
-/// previous row when persistence fails, and an attempt that never became
-/// durable has cost the operator nothing — suppressing the next observation
-/// for half a rescan period would delete a retry that was never made, against
-/// the adjacent rule that a retry after a failed commit stays immediate.
-///
-/// The failure injected is an ordinary state-volume I/O error: the queue
-/// snapshot directory is unwritable across the startup scan, so every commit
-/// in it fails. Ordering is forced rather than slept on — the scan awaits each
-/// failed row in turn, so the gate being consulted for the barrier row (96)
-/// proves row 95's whole pass has already returned with its commit refused.
-#[cfg(unix)]
-#[tokio::test]
-async fn an_uncommitted_attempt_does_not_debounce_the_next_observation() {
-    use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    const ATTEMPTS_PARAM: &str = "*PP:failure-disposition-attempts";
-    const FAILURE_AT_PARAM: &str = "*PP:failure-at";
-
-    let attempts = |engine: EngineHandle, job: u32| async move {
-        engine
-            .export_fixture_job(JobId(job))
-            .await
-            .unwrap()
-            .and_then(|job| {
-                job.params
-                    .into_iter()
-                    .find(|(key, _)| key == ATTEMPTS_PARAM)
-                    .map(|(_, value)| value)
-            })
-    };
-
-    let tmp = tempfile::tempdir().unwrap();
-    let undeletable = |name: &str| {
-        let dir = tmp.path().join("dest").join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("partial.bin"), b"known bad bytes").unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        dir
-    };
-    let dir_a = undeletable("commit-refused");
-    let dir_b = undeletable("barrier");
-
-    let hist = history(tmp.path());
-    let engine = spawn_engine(tmp.path()).await;
-
-    // Both rows already carry the finalization key, so each pass reaches its
-    // counter commit instead of returning at the earlier `*PP:failure-at` one.
-    for (id, name) in [(95u32, "commit-refused"), (96, "barrier")] {
-        let mut job = completed_job(id, name, vec![file_entry(id, "partial.bin", None, false)]);
-        job.status = JobStatus::Failed;
-        job.params.push((FAILURE_AT_PARAM.into(), "1000".into()));
-        engine
-            .import_fixture_job(tmp.path(), job, false, false)
-            .await
-            .unwrap();
-    }
-
-    // The state volume stops accepting writes. `save_snapshot` reports the
-    // I/O error and leaves persistence intact, which is exactly the
-    // "restored the old row, spent nothing" case.
-    let state = tmp.path().join("state");
-    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-    let barrier_seen = Arc::new(AtomicUsize::new(0));
-    let seen = barrier_seen.clone();
-    let gate: PpGate = Some(Arc::new(move |job: JobId| {
-        if job == JobId(96) {
-            seen.fetch_add(1, Ordering::AcqRel);
-        }
-        true
-    }));
-
-    let config = PostConfig {
-        failure_action: FailureAction::Delete,
-        ..PostConfig::default()
-    };
-    let cancel = CancellationToken::new();
-    let tracker = TaskTracker::new();
-    spawn_post_manager(
-        engine.clone(),
-        config,
-        hist.clone(),
-        tmp.path().join("dest"),
-        gate,
-        cancel.clone(),
-        &tracker,
-    );
-
-    // Pure liveness, as elsewhere in this file: the bound only decides how
-    // long a stuck manager hangs before saying so.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while barrier_seen.load(Ordering::Acquire) == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the startup scan never reached the barrier row"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert_eq!(
-        attempts(engine.clone(), 95).await,
-        None,
-        "a counter that never committed must not appear on the durable row"
-    );
-
-    // The state volume comes back, and the row is observed again well inside
-    // the debounce window.
-    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
-    engine.emit(nzbd_engine::Event::JobFinished {
-        job: JobId(95),
-        name: "commit-refused".into(),
-        status: JobStatus::Failed,
-        health: 0,
-    });
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while attempts(engine.clone(), 95).await.as_deref() != Some("1") {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "an attempt that never committed suppressed the retry that replaces it"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(
-        hist.list(10).unwrap().is_empty(),
-        "no row may retire while its budget is unspent"
-    );
-
-    cancel.cancel();
-    tracker.close();
-    tracker.wait().await;
-    engine.shutdown().await;
-    for dir in [dir_a, dir_b] {
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-}
-
-/// Losing authority after a cross-filesystem park must not let the stale
-/// finalizer stamp or announce the job. The already-moved tree is an
-/// idempotence witness for the next authority's startup scan.
-#[tokio::test]
-async fn failed_park_losing_admission_after_move_is_fenced_and_retried() {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-    let tmp = tempfile::tempdir().unwrap();
-    let engine = spawn_engine(tmp.path()).await;
-    let dir = tmp.path().join("dest/held-failure");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("partial.bin"), b"known bad bytes").unwrap();
-    let parked_root = tmp.path().join("failed");
-    let hist = history(tmp.path());
-    let admitted = Arc::new(AtomicBool::new(false));
-    let admitted_for_gate = admitted.clone();
-    let gate_checks = Arc::new(AtomicUsize::new(0));
-    let gate_checks_for_gate = gate_checks.clone();
-    let gate: PpGate = Some(Arc::new(move |_| {
-        admitted_for_gate.load(Ordering::Acquire)
-            || gate_checks_for_gate.fetch_add(1, Ordering::AcqRel) <= 3
-    }));
-    let config = PostConfig {
-        failure_action: FailureAction::Park,
-        failed_dir: Some(parked_root.clone()),
-        ..PostConfig::default()
-    };
-
-    let cancel = CancellationToken::new();
-    let tracker = TaskTracker::new();
-    spawn_post_manager(
-        engine.clone(),
-        config.clone(),
-        hist.clone(),
-        tmp.path().join("dest"),
-        gate.clone(),
-        cancel.clone(),
-        &tracker,
-    );
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let mut job = completed_job(
-        91,
-        "held-failure",
-        vec![file_entry(1, "partial.bin", None, false)],
-    );
-    job.status = JobStatus::Failed;
-    engine
-        .import_fixture_job(tmp.path(), job, false, true)
-        .await
-        .unwrap();
-    // Wait for the fence to be *reached* rather than assuming a fixed budget
-    // covers reaching it (#107). Getting there means a cross-filesystem park
-    // move plus a durable history write — real filesystem work — and a 200ms
-    // sleep asserted only that a loaded machine finishes both in time, which
-    // it does not: this failed 55 of 64 runs of an oversubscribed suite.
-    //
-    // The ordering claim is untouched, and it is what the assertions below
-    // still state. `handle_failed_job` consults the gate again *after*
-    // `record_seq_durable` and before the terminal stamp, so "history written
-    // and the fence closed" is precisely the window in which a stale
-    // finalizer would wrongly stamp — waiting for that state tests the fence
-    // at its decision point instead of hoping the clock lands inside it.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let checks = gate_checks.load(Ordering::Acquire);
-        let recorded = hist.list(10).unwrap().len();
-        if checks >= 5 && recorded == 1 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the park never reached the post-history fence \
-             (gate checks: {checks}, history rows: {recorded})"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(!dir.exists(), "the move finished before authority changed");
-    assert!(
-        parked_root.join("held-failure/partial.bin").is_file(),
-        "the external side effect remains visible"
-    );
-    assert_eq!(hist.list(10).unwrap().len(), 1);
-    assert!(!engine
-        .export_fixture_job(JobId(91))
-        .await
-        .unwrap()
-        .unwrap()
-        .params
-        .iter()
-        .any(|(key, _)| key == PP_DONE_PARAM));
-    cancel.cancel();
-    tracker.close();
-    tracker.wait().await;
-
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    admitted.store(true, Ordering::Release);
-    let cancel2 = CancellationToken::new();
-    let tracker2 = TaskTracker::new();
-    spawn_post_manager(
-        engine.clone(),
-        config,
-        hist.clone(),
-        tmp.path().join("dest"),
-        gate,
-        cancel2.clone(),
-        &tracker2,
-    );
-    let target = parked_root.join("held-failure/partial.bin");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let stamped = engine
-            .export_fixture_job(JobId(91))
-            .await
-            .unwrap()
-            .is_some_and(|job| job.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
-        if target.is_file() && stamped && hist.list(10).unwrap().len() == 1 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "recovered failed park was not finalized"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(!dir.exists());
-    assert_eq!(hist.list(10).unwrap().len(), 1, "one logical completion");
-    let portable = std::fs::read_to_string(tmp.path().join("history.jsonl")).unwrap();
-    assert!(portable.lines().count() >= 1);
-    assert!(
-        portable.lines().all(|line| line.contains("held-failure")),
-        "cross-node retries may duplicate a physical line, but never its logical key"
-    );
-    cancel2.cancel();
-    tracker2.close();
-    tracker2.wait().await;
-    engine.shutdown().await;
-}
-
 /// `*PP:done` is a retirement instruction, so it may be committed only after
 /// the authoritative JSONL history append succeeds. A full state volume must
 /// leave the failed queue row recoverable and retry it once history storage is
@@ -2181,13 +1396,23 @@ async fn failed_job_is_not_stamped_when_durable_history_write_fails() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempfile::tempdir().unwrap();
-    let engine = spawn_engine(tmp.path()).await;
     let portable = tmp.path().join("portable");
     std::fs::create_dir(&portable).unwrap();
     let hist =
         Arc::new(HistoryDb::open(&tmp.path().join("history.sqlite"), Some(&portable)).unwrap());
+    // The daemon shape: the engine and post-processing share one history.
+    let mut cfg = EngineConfig::single_node(
+        vec![],
+        tmp.path().join("state"),
+        tmp.path().join("dest"),
+        Tuning::default(),
+        None,
+    );
+    cfg.history = Some(hist.clone());
+    let engine = Engine::spawn(cfg).await.expect("engine spawn");
     let log = portable.join("history.jsonl");
     std::fs::set_permissions(&portable, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let mut events = engine.subscribe();
 
     let cancel = CancellationToken::new();
     let tracker = TaskTracker::new();
@@ -2210,34 +1435,39 @@ async fn failed_job_is_not_stamped_when_durable_history_write_fails() {
         .import_fixture_job(tmp.path(), job, false, true)
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let retained = engine.export_fixture_job(JobId(92)).await.unwrap().unwrap();
-    assert!(!retained.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
+    // Contract §2.1: write-then-emit. The terminal row lands; the history
+    // append cannot, so the job holds storage_unavailable on `persistence`
+    // and nothing is stamped or announced.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let held = loop {
+        let row = engine.export_fixture_job(JobId(92)).await.unwrap().unwrap();
+        if let Some(control) = row.control().filter(|c| c.lifecycle == "held") {
+            break (row, control);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no persistence hold"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(held.1.cause, "storage_unavailable");
+    assert_eq!(held.1.stage, "persistence");
+    assert!(!held.0.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
     assert!(!log.exists(), "no durable JSONL record was possible");
-    assert!(
-        hist.list(10).unwrap().is_empty(),
-        "failed portable append must roll back the derived SQLite row"
-    );
-    cancel.cancel();
-    tracker.close();
-    tracker.wait().await;
+    assert!(hist.list(10).unwrap().is_empty());
+    let pending = engine.artifacts().terminal(92).unwrap().unwrap();
+    assert!(pending.history_seq.is_none() && !pending.emitted);
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, nzbd_engine::Event::JobPpFinished { .. }),
+            "no terminal event before history is durable"
+        );
+    }
 
+    // Storage answers again: the row is replayed (boot and the tick do this)
+    // and the event goes out with a real history cursor.
     std::fs::set_permissions(&portable, std::fs::Permissions::from_mode(0o700)).unwrap();
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    let cancel2 = CancellationToken::new();
-    let tracker2 = TaskTracker::new();
-    spawn_post_manager(
-        engine.clone(),
-        PostConfig {
-            failure_action: FailureAction::None,
-            ..PostConfig::default()
-        },
-        hist.clone(),
-        tmp.path().join("dest"),
-        None,
-        cancel2.clone(),
-        &tracker2,
-    );
+    engine.replay_terminals().await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let stamped = engine
@@ -2254,253 +1484,10 @@ async fn failed_job_is_not_stamped_when_durable_history_write_fails() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    let row = engine.artifacts().terminal(92).unwrap().unwrap();
+    assert!(row.history_seq.unwrap() > 0);
     assert_eq!(hist.list(10).unwrap().len(), 1);
-    assert_eq!(
-        std::fs::read_to_string(&log).unwrap().lines().count(),
-        1,
-        "the failed pre-write attempt leaves one durable portable completion"
-    );
-    cancel2.cancel();
-    tracker2.close();
-    tracker2.wait().await;
-    engine.shutdown().await;
-}
-
-/// The retry key itself is part of the queue's commit protocol. If queue.json
-/// cannot be replaced, no disposition or history append may happen; a restart
-/// from the last durable snapshot then finalizes once under a newly committed
-/// stable key.
-#[cfg(unix)]
-#[tokio::test]
-async fn failed_job_waits_for_failure_key_snapshot_commit_before_side_effects() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let state = tmp.path().join("state");
-    let engine = spawn_engine(tmp.path()).await;
-    let hist = history(&tmp.path().join("history"));
-    let mut job = completed_job(93, "snapshot-full", Vec::new());
-    job.status = JobStatus::Failed;
-    engine
-        .import_fixture_job(tmp.path(), job, false, true)
-        .await
-        .unwrap();
-    let durable_before = std::fs::read(state.join("queue.json")).unwrap();
-
-    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let cancel = CancellationToken::new();
-    let tracker = TaskTracker::new();
-    spawn_post_manager(
-        engine.clone(),
-        PostConfig {
-            failure_action: FailureAction::None,
-            ..PostConfig::default()
-        },
-        hist.clone(),
-        tmp.path().join("dest"),
-        None,
-        cancel.clone(),
-        &tracker,
-    );
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    assert!(hist.list(10).unwrap().is_empty());
-    let held = engine.export_fixture_job(JobId(93)).await.unwrap().unwrap();
-    assert!(!held.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
-    cancel.cancel();
-    tracker.close();
-    tracker.wait().await;
-
-    // Gracefully stop the test runtime, then restore the exact pre-attempt
-    // snapshot to model a crash that could only recover the last committed
-    // queue state.
-    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
-    engine.shutdown().await;
-    std::fs::write(state.join("queue.json"), durable_before).unwrap();
-
-    let recovered = spawn_engine(tmp.path()).await;
-    let recovered_job = recovered
-        .export_fixture_job(JobId(93))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!recovered_job
-        .params
-        .iter()
-        .any(|(key, _)| key == "*PP:failure-at" || key == PP_DONE_PARAM));
-    let cancel2 = CancellationToken::new();
-    let tracker2 = TaskTracker::new();
-    spawn_post_manager(
-        recovered.clone(),
-        PostConfig {
-            failure_action: FailureAction::None,
-            ..PostConfig::default()
-        },
-        hist.clone(),
-        tmp.path().join("dest"),
-        None,
-        cancel2.clone(),
-        &tracker2,
-    );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let stamped = recovered
-            .export_fixture_job(JobId(93))
-            .await
-            .unwrap()
-            .is_some_and(|job| job.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
-        if stamped {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "recovered failure did not finalize after queue storage recovered"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(hist.list(10).unwrap().len(), 1);
-    cancel2.cancel();
-    tracker2.close();
-    tracker2.wait().await;
-    recovered.shutdown().await;
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn failed_final_stamp_commit_rolls_back_live_state_and_retries_once() {
-    use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    let tmp = tempfile::tempdir().unwrap();
-    let state = tmp.path().join("state");
-    let engine = spawn_engine(tmp.path()).await;
-    let hist = history(&tmp.path().join("history"));
-    let mut events = engine.subscribe();
-    let injected = Arc::new(AtomicBool::new(false));
-    let injected_for_gate = injected.clone();
-    let history_for_gate = hist.clone();
-    let state_for_gate = state.clone();
-    let gate: PpGate = Some(Arc::new(move |job| {
-        if history_for_gate.get(job).unwrap().is_some()
-            && !injected_for_gate.swap(true, Ordering::AcqRel)
-        {
-            std::fs::set_permissions(&state_for_gate, std::fs::Permissions::from_mode(0o555))
-                .unwrap();
-        }
-        true
-    }));
-    let cancel = CancellationToken::new();
-    let tracker = TaskTracker::new();
-    let manager = spawn_post_manager(
-        engine.clone(),
-        PostConfig {
-            failure_action: FailureAction::None,
-            ..PostConfig::default()
-        },
-        hist.clone(),
-        tmp.path().join("dest"),
-        gate,
-        cancel.clone(),
-        &tracker,
-    );
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let mut job = completed_job(94, "final-stamp-full", Vec::new());
-    job.status = JobStatus::Failed;
-    engine
-        .import_fixture_job(tmp.path(), job, false, true)
-        .await
-        .unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while hist.list(10).unwrap().is_empty() {
-        assert!(tokio::time::Instant::now() < deadline);
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    // The manager serves this read-only absent-job request after the
-    // in-flight failed handler has released its processing admission.
-    assert!(matches!(
-        manager.retry_now(JobId(u32::MAX)).await,
-        Err(nzbd_post::manager::RestartPostError::NotFound)
-    ));
-    assert!(
-        injected.load(Ordering::Acquire),
-        "the final-stamp fault must fire"
-    );
-    assert!(matches!(
-        engine.export_job(JobId(94)).await,
-        Err(nzbd_engine::EngineError::Lifecycle(_))
-    ));
-    // Inspect metadata only while failed rollback persistence keeps public
-    // payload export fenced. This does not grant processing custody.
-    let unstamped = engine
-        .recovery_document()
-        .await
-        .unwrap()
-        .jobs
-        .into_iter()
-        .find(|job| job.id == JobId(94))
-        .unwrap();
-    assert_eq!(unstamped.status, JobStatus::Failed);
-    assert!(unstamped
-        .params
-        .iter()
-        .any(|(key, _)| key == "*PP:failure-at"));
-    assert!(!unstamped.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
-
-    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
-    // Recovery must durably acknowledge the restored row before the next
-    // observation can acquire processing custody. Readable metadata alone
-    // does not mean a failed rollback's admission fence has been released.
-    let admission = tokio::time::timeout(
-        Duration::from_secs(5),
-        engine.wait_post_admission(JobId(94), &cancel),
-    )
-    .await
-    .expect("restored storage releases the durable rollback fence")
-    .unwrap()
-    .expect("failed row remains eligible for processing");
-    engine.end_post_admission(admission).await.unwrap();
-    engine.emit(nzbd_engine::Event::JobFinished {
-        job: JobId(94),
-        name: "final-stamp-full".into(),
-        status: JobStatus::Failed,
-        health: 0,
-    });
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut finished = 0;
-    loop {
-        while let Ok(event) = events.try_recv() {
-            if matches!(
-                event,
-                nzbd_engine::Event::JobPpFinished { job: JobId(94), .. }
-            ) {
-                finished += 1;
-            }
-        }
-        let stamped = engine
-            .export_fixture_job(JobId(94))
-            .await
-            .unwrap()
-            .is_some_and(|job| job.params.iter().any(|(key, _)| key == PP_DONE_PARAM));
-        if stamped && finished == 1 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "retry did not settle: stamped={stamped}, finished={finished}, snapshot={:?}",
-            engine.snapshot()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    while let Ok(event) = events.try_recv() {
-        if matches!(
-            event,
-            nzbd_engine::Event::JobPpFinished { job: JobId(94), .. }
-        ) {
-            finished += 1;
-        }
-    }
-    assert_eq!(finished, 1);
-    assert_eq!(hist.list(10).unwrap().len(), 1);
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
     cancel.cancel();
     tracker.close();
     tracker.wait().await;
@@ -3074,6 +2061,40 @@ async fn failed_pack_salvages_verified_direct_media_and_excludes_invalid_archive
     .unwrap();
 
     assert_eq!(out, PpFinal::UnpackFailure);
+    // Contract §2.1: the terminal is recorded before any salvage.
+    let terminal = engine.artifacts().terminal(job_id.0).unwrap().unwrap();
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Unpack));
+    assert!(terminal.blames_release);
+    assert_eq!(
+        terminal.salvage,
+        nzbd_state::artifacts::SalvageState::Pending
+    );
+    assert!(engine
+        .artifacts()
+        .delivery_for_job(job_id.0)
+        .unwrap()
+        .is_none());
+    assert!(
+        nzbd_post::manager::follow_up_failure(
+            &engine,
+            &PostConfig {
+                failure_action: FailureAction::Delete,
+                ..PostConfig::default()
+            },
+            &tmp.path().join("dest"),
+            job_id,
+        )
+        .await
+    );
+    assert_eq!(
+        engine
+            .artifacts()
+            .terminal(job_id.0)
+            .unwrap()
+            .unwrap()
+            .salvage,
+        nzbd_state::artifacts::SalvageState::Published
+    );
     let delivery = engine
         .artifacts()
         .delivery_for_job(job_id.0)
@@ -3098,7 +2119,7 @@ async fn failed_pack_salvages_verified_direct_media_and_excludes_invalid_archive
     assert!(delivery
         .file_outcomes
         .iter()
-        .any(|file| file.source_path == "broken.zip" && file.outcome == "excluded_source_cleanup"));
+        .any(|file| file.source_path == "broken.zip" && file.outcome != "published"));
     engine.shutdown().await;
 }
 
@@ -3192,7 +2213,21 @@ async fn manager_salvages_verified_episode_from_failed_pack_before_history_retir
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "manager did not finish failed-pack salvage"
+            "manager did not finish failed-pack salvage: terminal={:?} job={:?} hist={}",
+            engine.artifacts().terminal(job_id.0).unwrap().map(|t| (
+                t.reason,
+                t.salvage,
+                t.emitted,
+                t.disposal,
+                t.salvage_error
+            )),
+            engine
+                .snapshot()
+                .jobs
+                .iter()
+                .find(|j| j.id == job_id)
+                .map(|j| (j.status, j.pp_done, j.control.clone())),
+            hist.list(10).unwrap().len()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
@@ -3208,9 +2243,10 @@ async fn manager_salvages_verified_episode_from_failed_pack_before_history_retir
     assert!(Path::new(&delivery.publication_path)
         .join("episode.mkv")
         .exists());
-    assert!(delivery.file_outcomes.iter().any(|file| {
-        file.source_path == "broken.zip" && file.outcome == "excluded_source_cleanup"
-    }));
+    assert!(delivery
+        .file_outcomes
+        .iter()
+        .any(|file| { file.source_path == "broken.zip" && file.outcome != "published" }));
 
     cancel.cancel();
     tracker.close();

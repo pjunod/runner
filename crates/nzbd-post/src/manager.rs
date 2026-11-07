@@ -462,17 +462,46 @@ async fn manager_task(
                         }
                     }
                     // A failed download's terminal is recorded by the owner
-                    // itself (contract §2.1); its salvage and disposal start
-                    // from `job_pp_finished` below.
+                    // itself (contract §2.1) before this advisory event; its
+                    // salvage and disposal start from `job_pp_finished`
+                    // below. A failed row with no stamp was failed by an
+                    // earlier build (or imported): record its terminal.
+                    JobStatus::Failed if claim(&gate, job) => {
+                        if let Ok(Some(row)) = engine.export_job(job).await {
+                            if !pp_done(&row) && !active.contains_key(&job) {
+                                let fetch = row.kind == nzbd_types::JobKind::Url && row.files.is_empty();
+                                let reason = if fetch {
+                                    nzbd_types::FailureReason::Fetch
+                                } else {
+                                    nzbd_types::FailureReason::Health
+                                };
+                                let _ = fail_job_in(
+                                    &engine, &history, job, reason,
+                                    fetch.then_some(nzbd_types::FetchCause::Gone),
+                                    reason.as_str(), "failed before its terminal was recorded",
+                                ).await;
+                            }
+                        }
+                    }
                     _ => {}
                 },
                 Ok(Event::JobPpFinished { job, outcome: nzbd_types::TerminalOutcome::Failed, .. })
                     if claim(&gate, job) =>
                 {
-                    failure_followup(
+                    if failure_followup(
                         &engine, &cfg, &dest_dir, &gate, job, &mut last_disposition, true,
                     )
-                    .await;
+                    .await
+                        && gate.is_none()
+                        && !active.contains_key(&job)
+                    {
+                        // Salvage settled and the source is disposed: the
+                        // row's history is final, retire it now.
+                        if reconcile_stamped_completion(&engine, &history, job).await.is_ok() {
+                            let _ = engine.remove_job_silent(job).await;
+                            last_disposition.remove(&job);
+                        }
+                    }
                 }
                 Ok(Event::JobDeleted { job }) => {
                     pending_restarts.remove(&job);
@@ -489,6 +518,27 @@ async fn manager_task(
                 // crashed tool attempt remains eligible for the next rescan
                 // instead of being remembered as active forever.
                 active.remove(&job);
+                // A post-processing failure's terminal went out while the
+                // attempt still held admission; its salvage and disposal run
+                // now that the attempt has released it, and the row retires
+                // once nothing is left to do.
+                if let Some(terminal) = load_terminal(&engine, job).await.filter(|terminal| {
+                    terminal.outcome == nzbd_types::TerminalOutcome::Failed && terminal.emitted
+                }) {
+                    let settled = terminal.disposal.is_some()
+                        || (claim(&gate, job)
+                            && failure_followup(
+                                &engine, &cfg, &dest_dir, &gate, job, &mut last_disposition, true,
+                            )
+                            .await);
+                    if settled
+                        && gate.is_none()
+                        && reconcile_stamped_completion(&engine, &history, job).await.is_ok()
+                    {
+                        let _ = engine.remove_job_silent(job).await;
+                        last_disposition.remove(&job);
+                    }
+                }
                 if let Some(from) = pending_restarts.remove(&job) {
                     let restartable = engine.snapshot().jobs.iter().any(|j| {
                         j.id == job
@@ -734,7 +784,7 @@ async fn failure_followup(
 async fn fail_and_follow_up(
     engine: &EngineHandle,
     cfg: &PostConfig,
-    _history: &Arc<HistoryDb>,
+    history: &Arc<HistoryDb>,
     dest_dir: &Path,
     gate: &PpGate,
     job: JobId,
@@ -743,16 +793,33 @@ async fn fail_and_follow_up(
     backoff: &mut HashMap<JobId, (u32, tokio::time::Instant)>,
     _force: bool,
 ) -> bool {
-    let _ = engine
-        .fail_job(
-            job,
-            nzbd_types::FailureReason::Health,
-            None,
-            "health",
-            "download health below critical",
-        )
-        .await;
+    if let Ok(Some(row)) = engine.export_job(job).await {
+        if !pp_done(&row) {
+            let terminal = nzbd_engine::terminal::failed_terminal(
+                &row,
+                nzbd_types::FailureReason::Health,
+                None,
+                "health",
+                "download health below critical",
+            );
+            let _ = engine
+                .record_terminal_in(terminal, Some(history.clone()))
+                .await;
+        }
+    }
     failure_followup(engine, cfg, dest_dir, gate, job, backoff, true).await
+}
+
+/// Run a failed job's salvage and disposal now (contract §2.2/§2.6), as
+/// the manager does on its `job_pp_finished`. Returns true once nothing is
+/// left to do.
+pub async fn follow_up_failure(
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    dest_dir: &Path,
+    job: JobId,
+) -> bool {
+    failure_followup(engine, cfg, dest_dir, &None, job, &mut HashMap::new(), true).await
 }
 
 async fn load_terminal(
@@ -805,6 +872,49 @@ async fn assess_and_publish_salvage(
             Some(error)
         }
     };
+    // A crash between a salvage publication's relocation and its delivery
+    // row (or a row an earlier build left mid-salvage) finishes that same
+    // publication from its durable journal instead of salvaging again.
+    if row
+        .params
+        .iter()
+        .any(|(key, _)| key == PP_SELECTED_OUTCOME_PARAM)
+    {
+        let inventory = engine.artifacts();
+        let committed = row.clone();
+        match tokio::task::spawn_blocking(move || {
+            finish_committed_publication_receipt(&inventory, &committed)
+        })
+        .await
+        {
+            Ok(Ok(Some(delivery))) => {
+                let publication = nzbd_types::Publication {
+                    path: delivery.publication_path.clone(),
+                    generation: delivery.publication_generation.clone(),
+                    manifest_digest: delivery.manifest_digest.clone(),
+                    files: u32::try_from(delivery.files.len()).unwrap_or(u32::MAX),
+                    cross_volume: false,
+                };
+                if settle(nzbd_state::artifacts::SalvageOutcome::Published(
+                    publication.clone(),
+                ))
+                .await
+                {
+                    engine.emit_publication_ready(job, publication);
+                }
+                return;
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                if let Some(error) = unsettled(error.to_string()).await {
+                    settle(nzbd_state::artifacts::SalvageOutcome::None { error: Some(error) })
+                        .await;
+                }
+                return;
+            }
+            Err(_) => return,
+        }
+    }
     let mut archive = EarlyArchiveAssessment::default();
     if terminal.reason == Some(nzbd_types::FailureReason::Health) {
         // A health failure never reached post-processing: repair what PAR can
@@ -928,7 +1038,14 @@ async fn dispose_failed_source(
             )
         }
     };
-    if row.files.is_empty() && row.torrent.is_none() {
+    let has_source = inventory
+        .for_job(job.0)
+        .ok()
+        .flatten()
+        .is_some_and(|artifact| !artifact.terminal() && artifact.path.exists())
+        || source.exists();
+    if !has_source {
+        // A fetch failure, or an attempt that never wrote a byte.
         return record("no payload".into()).await;
     }
     if terminal.salvage == nzbd_state::artifacts::SalvageState::Published
@@ -1570,15 +1687,16 @@ async fn scan_queue(
             } else {
                 nzbd_types::FailureReason::Health
             };
-            let _ = engine
-                .fail_job(
-                    j.id,
-                    reason,
-                    fetch_failure.then_some(nzbd_types::FetchCause::Gone),
-                    reason.as_str(),
-                    "failed before its terminal was recorded",
-                )
-                .await;
+            let _ = fail_job_in(
+                engine,
+                history,
+                j.id,
+                reason,
+                fetch_failure.then_some(nzbd_types::FetchCause::Gone),
+                reason.as_str(),
+                "failed before its terminal was recorded",
+            )
+            .await;
             continue;
         }
         let needs_pp = !j.pp_done
@@ -1942,7 +2060,7 @@ fn spawn_job(
                     // Contract §2.2: environmental errors hold (with their
                     // retry schedule and deadline in the same commit);
                     // everything else is the job's terminal failure.
-                    let _ = apply_pp_verdict(&engine, job, &e).await;
+                    let _ = apply_pp_verdict(&engine, &history, job, &e).await;
                     // PP writes as much as the downloader does — unpack,
                     // move, script output. An ENOSPC here is the same ground
                     // truth about the volume and must stop intake too, not
@@ -3041,15 +3159,16 @@ async fn process_job_ctx_from_inner(
                             .hold_job(job_id, HoldCause::StorageUnavailable, "extract", &detail)
                             .await;
                     } else {
-                        let _ = engine
-                            .fail_job(
-                                job_id,
-                                nzbd_types::FailureReason::Io,
-                                None,
-                                "unpack",
-                                &detail,
-                            )
-                            .await;
+                        let _ = fail_job_in(
+                            engine,
+                            history,
+                            job_id,
+                            nzbd_types::FailureReason::Io,
+                            None,
+                            "unpack",
+                            &detail,
+                        )
+                        .await;
                     }
                     return Err(PostError::Held);
                 }
@@ -3122,15 +3241,16 @@ async fn process_job_ctx_from_inner(
                             .hold_job(job_id, HoldCause::StorageUnavailable, "extract", &detail)
                             .await;
                     } else {
-                        let _ = engine
-                            .fail_job(
-                                job_id,
-                                nzbd_types::FailureReason::Io,
-                                None,
-                                "unpack",
-                                &detail,
-                            )
-                            .await;
+                        let _ = fail_job_in(
+                            engine,
+                            history,
+                            job_id,
+                            nzbd_types::FailureReason::Io,
+                            None,
+                            "unpack",
+                            &detail,
+                        )
+                        .await;
                     }
                     return Err(PostError::Held);
                 }
@@ -4565,18 +4685,58 @@ fn current_stage(engine: &EngineHandle, job: JobId) -> (Option<PostStage>, Strin
 
 /// Apply a post-processing error's verdict: hold it, or record the job's
 /// terminal failure. Returns whether the owner accepted it.
-async fn apply_pp_verdict(engine: &EngineHandle, job: JobId, error: &PostError) -> bool {
+async fn apply_pp_verdict(
+    engine: &EngineHandle,
+    history: &Arc<HistoryDb>,
+    job: JobId,
+    error: &PostError,
+) -> bool {
     let (stage, stage_name) = current_stage(engine, job);
     match pp_verdict(error, stage) {
         PpVerdict::Hold(cause) => engine
             .hold_job(job, cause, &stage_name, &error.to_string())
             .await
             .unwrap_or(false),
-        PpVerdict::Fail(reason) => engine
-            .fail_job(job, reason, None, &stage_name, &error.to_string())
+        PpVerdict::Fail(reason) => {
+            fail_job_in(
+                engine,
+                history,
+                job,
+                reason,
+                None,
+                &stage_name,
+                &error.to_string(),
+            )
             .await
-            .unwrap_or(false),
+        }
     }
+}
+
+/// Record a post-processing-side failed terminal (contract §2.1) with the
+/// manager's history store. False when the job is gone or already terminal.
+async fn fail_job_in(
+    engine: &EngineHandle,
+    history: &Arc<HistoryDb>,
+    job: JobId,
+    reason: nzbd_types::FailureReason,
+    fetch_cause: Option<nzbd_types::FetchCause>,
+    stage: &str,
+    message: &str,
+) -> bool {
+    let Ok(Some(row)) = engine.export_job(job).await else {
+        return false;
+    };
+    if pp_done(&row) {
+        return false;
+    }
+    let terminal =
+        nzbd_engine::terminal::failed_terminal(&row, reason, fetch_cause, stage, message);
+    matches!(
+        engine
+            .record_terminal_in(terminal, Some(history.clone()))
+            .await,
+        Ok(Some(_))
+    )
 }
 
 /// Source-relative spellings of `paths`, dropping any outside `dir`.
@@ -6508,7 +6668,7 @@ mod decision_tests {
             payload_entry("Proof/cover.jpg"),
             payload_entry("book.cbz"),
             payload_entry("book.djvu"),
-            payload_entry("unsupported.mpg"),
+            payload_entry("unsupported.xyz"),
             payload_entry("unverified.mp4"),
         ];
         let verified = [
@@ -6517,7 +6677,7 @@ mod decision_tests {
             "Sample/film.mkv".to_string(),
             "book.cbz".to_string(),
             "book.djvu".to_string(),
-            "unsupported.mpg".to_string(),
+            "unsupported.xyz".to_string(),
         ]
         .into_iter()
         .collect();
@@ -6552,7 +6712,7 @@ mod decision_tests {
             outcome("Proof/cover.jpg").outcome,
             "excluded_source_cleanup"
         );
-        assert_eq!(outcome("unsupported.mpg").outcome, "unsupported_review");
+        assert_eq!(outcome("unsupported.xyz").outcome, "unsupported_review");
         assert_eq!(outcome("unverified.mp4").outcome, "unverified_review");
     }
 
@@ -9190,10 +9350,11 @@ mod decision_tests {
         assert!(pp_done(&row));
         let entry = history.get(request.id).unwrap().unwrap();
         assert!(entry.final_dir.is_none());
-        assert!(entry
-            .params
-            .iter()
-            .any(|(key, value)| key == "Failure:Files" && value == "deleted"));
+        assert_eq!(entry.status, "FAILURE/HEALTH");
+        // Contract §2.6: disposal is recorded on the terminal row, after the
+        // history row; a source already deleted has nothing left to dispose.
+        let terminal = engine.artifacts().terminal(request.id.0).unwrap().unwrap();
+        assert!(terminal.disposal.is_some());
         assert!(!source.exists());
         engine.shutdown().await;
     }
@@ -9387,7 +9548,7 @@ mod decision_tests {
     }
 
     #[tokio::test]
-    async fn native_book_containers_publish_without_rename_or_extraction() {
+    async fn native_book_containers_and_sniffed_media_publish_without_rename_or_extraction() {
         let temp = tempfile::tempdir().unwrap();
         let downloads = temp.path().join("downloads");
         std::fs::create_dir(&downloads).unwrap();
@@ -9485,7 +9646,13 @@ mod decision_tests {
             PpFinal::Success
         );
         let delivery = inventory.delivery_for_job(41).unwrap().unwrap();
-        assert_eq!(delivery.files.len(), 3);
+        // R3 (contract §2.2): a verified file with no recognised extension
+        // is media by its bytes (Matroska EBML here) and publishes.
+        assert_eq!(delivery.files.len(), 4);
+        assert!(delivery
+            .files
+            .iter()
+            .any(|entry| entry.path == "opaque-media"));
         for (name, bytes) in payloads {
             assert_eq!(
                 std::fs::read(Path::new(&delivery.publication_path).join(name)).unwrap(),
@@ -9498,22 +9665,16 @@ mod decision_tests {
             .unwrap();
         assert!(outcomes
             .iter()
-            .any(|entry| entry.source_path == "opaque-media"
-                && entry.outcome == "unsupported_review"
-                && entry
-                    .reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("rename"))));
+            .any(|entry| entry.source_path == "opaque-media" && entry.outcome == "published"));
         inventory
             .retire_delivery_source(&delivery.delivery_id)
             .unwrap();
-        assert!(source.join("opaque-media").exists());
         assert!(!source.join("readme.txt").exists());
         assert!(!source.join("unmatched.srt").exists());
         engine.shutdown().await;
     }
     #[tokio::test]
-    async fn completed_junk_only_attempt_drains_owned_source() {
+    async fn completed_junk_only_attempt_is_a_parked_publish_failure() {
         let temp = tempfile::tempdir().unwrap();
         let downloads = temp.path().join("downloads");
         std::fs::create_dir(&downloads).unwrap();
@@ -9562,13 +9723,39 @@ mod decision_tests {
             .unwrap(),
             PpFinal::UnpackFailure
         );
-        assert!(!source.exists());
-        assert_eq!(inventory.for_job(41).unwrap().unwrap().state, "deleted");
+        // Contract §2.2: nothing publishable is `failed/publish`, recorded
+        // before anything touches the bytes, and always parked.
+        let terminal = inventory.terminal(41).unwrap().unwrap();
+        assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Publish));
+        assert!(!terminal.blames_release);
+        assert!(terminal.emitted);
+        assert!(source.exists(), "the terminal precedes disposal");
         let entry = history.get(JobId(41)).unwrap().unwrap();
+        assert_eq!(entry.status, "FAILURE/PUBLISH");
         assert!(entry.final_dir.is_none());
+        assert!(entry
+            .params
+            .iter()
+            .any(|(key, value)| key == "Failure:Reason" && value == "publish"));
         assert!(entry.params.iter().any(
-            |(key, value)| key == "Failure:Reason" && value.contains("no publishable payload")
+            |(key, value)| key == "Failure:Message" && value.contains("no publishable payload")
         ));
+        // `failure_action` is delete; publish parks anyway.
+        assert!(
+            failure_followup(
+                &engine,
+                &cfg,
+                &downloads,
+                &None,
+                JobId(41),
+                &mut HashMap::new(),
+                true,
+            )
+            .await
+        );
+        let disposal = inventory.terminal(41).unwrap().unwrap().disposal.unwrap();
+        assert!(!source.exists(), "{disposal}");
+        assert!(disposal.starts_with("parked at "), "{disposal}");
         engine.shutdown().await;
     }
     #[tokio::test]
