@@ -588,3 +588,96 @@ async fn terminal_crash_after_each_step_replays_once() {
         engine.shutdown().await;
     }
 }
+
+/// Contract §2.6 / plan M1a: a `pp_done` `PAR_FAILURE` row whose terminal
+/// owes salvage stays in the queue — salvage and disposal read it — until
+/// `job_publication_ready` has gone out and its source is disposed; only
+/// then does the manager's sweep retire it.
+/// (Open relocation intents are not exercised here: no fixture creates one
+/// on a failed row without a full cluster or publication crash.)
+#[tokio::test]
+async fn retire_sweep_waits_for_salvage_and_open_intents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, _) = admitted_job(
+        &engine,
+        "par-pack",
+        &[
+            ("Show.S01E01.mkv", Some(b"S01E01 bytes")),
+            ("Show.S01E02.mkv", None),
+        ],
+        JobStatus::Failed,
+    )
+    .await;
+    assert!(engine
+        .fail_job(
+            job_id,
+            FailureReason::Par,
+            None,
+            "par_repair",
+            "not enough recovery blocks"
+        )
+        .await
+        .unwrap());
+    let terminal = engine.artifacts().terminal(job_id.0).unwrap().unwrap();
+    assert_eq!(terminal.salvage, SalvageState::Pending);
+    assert!(
+        engine
+            .artifacts()
+            .disposal_allowed(job_id.0)
+            .unwrap()
+            .is_none(),
+        "an open salvage obligation blocks disposal"
+    );
+    let row = export(&engine, job_id).await.unwrap();
+    assert!(row
+        .params
+        .iter()
+        .any(|(key, value)| key == nzbd_types::PP_DONE_PARAM && value == "PAR_FAILURE"));
+    let mut events = engine.subscribe();
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    spawn_post_manager(
+        engine.clone(),
+        PostConfig {
+            completed_dir: Some(tmp.path().join("completed")),
+            failed_dir: Some(tmp.path().join("parked")),
+            failure_action: FailureAction::Delete,
+            ..PostConfig::default()
+        },
+        history,
+        tmp.path().join("dest"),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("job_publication_ready")
+            .unwrap();
+        if let Event::JobPublicationReady { job, .. } = event {
+            assert_eq!(job, job_id);
+            break;
+        }
+    }
+    assert!(
+        engine.snapshot().jobs.iter().any(|job| job.id == job_id),
+        "the row outlives the salvage it owes"
+    );
+    let terminal = wait_terminal(&engine, job_id, "disposal", |t| t.disposal.is_some()).await;
+    assert_eq!(terminal.salvage, SalvageState::Published);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while engine.snapshot().jobs.iter().any(|job| job.id == job_id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "retired once settled"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+    engine.shutdown().await;
+}
