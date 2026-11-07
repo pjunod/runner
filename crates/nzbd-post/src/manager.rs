@@ -1049,8 +1049,14 @@ async fn dispose_failed_source(
         return record("no payload".into()).await;
     }
     if terminal.salvage == nzbd_state::artifacts::SalvageState::Published
-        && action == FailureAction::Delete
+        && action != FailureAction::Delete
     {
+        // The job's newest artifact is now its salvage publication, which
+        // curator owns: nothing may relocate it. What remains of the source
+        // stays where it is, retained under runner's custody (park/keep).
+        return record("salvage published; source retained".into()).await;
+    }
+    if terminal.salvage == nzbd_state::artifacts::SalvageState::Published {
         // The salvage publication took the verified files; its delivery
         // retires what remains of the source.
         let delivery_inventory = inventory.clone();
@@ -4069,6 +4075,8 @@ async fn process_job_ctx_from_inner(
                 ));
                 fin.params
                     .push(("Delivery:ManifestDigest".into(), delivery.manifest_digest));
+                fin.params
+                    .push(("Delivery:Files".into(), delivery.files.len().to_string()));
                 let cleanup_id = delivery.delivery_id.clone();
                 let cleanup_inventory = inventory.clone();
                 let cleanup = crate::attempt::current()
@@ -7080,7 +7088,7 @@ mod decision_tests {
             .await
             .err()
             .expect("storage failure must enter retry lane");
-        assert!(error.contains("requires retry"));
+        assert!(error.contains("requires retry"), "{error}");
         assert!(source.join("episode.zip").exists());
         assert!(inventory.delivery_for_job(41).unwrap().is_none());
     }
