@@ -853,7 +853,7 @@ impl Owner {
             }
             owner.allocation_cache.insert(job,verified.allocation);
             if verified.publication_repair {
-                owner.hold_job(job,nzbd_types::HoldCause::IdentityConflict,"finalize","legacy publication has proven invalid ranges; Retry restores download-owned partial for repair");
+                owner.fail_job_terminal(job,nzbd_types::FailureReason::Identity,None,"finalize","legacy publication has proven invalid ranges");
                 owner.block_verification(job,VerificationFailure::conflict("corrupt download publication requires an explicit generation-safe repair transition",verified.checked_bytes));
                 owner.dirty=true;owner.publish_now();owner.bump_epoch();return;
             }

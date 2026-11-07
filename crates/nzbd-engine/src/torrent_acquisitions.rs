@@ -659,11 +659,11 @@ impl crate::EngineHandle {
                         operation.state
                     )
                 });
-                let cause = if operation.state == "retry" {
-                    crate::io_hold_cause(&message)
-                } else {
-                    nzbd_types::HoldCause::Io
-                };
+                // Seed retirement is a lifecycle after the job's terminal; it
+                // never ends the job. Anything that is not space is retried
+                // as storage (seed-retirement holds carry no deadline).
+                let cause = crate::io_hold_cause(&message)
+                    .unwrap_or(nzbd_types::HoldCause::StorageUnavailable);
                 self.hold_job_until(
                     id,
                     cause,
@@ -680,6 +680,7 @@ impl crate::EngineHandle {
                     nzbd_types::HoldCause::StorageUnavailable
                 } else {
                     crate::io_hold_cause(&error.to_string())
+                        .unwrap_or(nzbd_types::HoldCause::StorageUnavailable)
                 };
                 self.hold_job(id, cause, "torrent_seed_retire", &error.to_string())
                     .await?;
@@ -698,7 +699,7 @@ impl crate::EngineHandle {
             Ok(Err(error)) => {
                 self.hold_job(
                     id,
-                    nzbd_types::HoldCause::IdentityConflict,
+                    nzbd_types::HoldCause::StorageUnavailable,
                     "torrent_seed_retire",
                     &error.to_string(),
                 )

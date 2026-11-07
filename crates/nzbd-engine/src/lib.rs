@@ -24,6 +24,7 @@ mod hold_release;
 pub mod queue;
 pub mod rate;
 pub mod snapshot;
+pub mod terminal;
 pub mod torrent_acquisitions;
 pub mod torrent_runtime;
 pub mod volumes;
@@ -200,18 +201,24 @@ async fn bounded_probe_deadline<T: Send + 'static>(
     }
 }
 
-/// The hold cause for a failed write or filesystem step, by errno.
-pub fn io_hold_cause(msg: &str) -> nzbd_types::HoldCause {
+/// The param a failed URL resolution carries its typed fetch cause in.
+pub const FETCH_CAUSE_PARAM: &str = "*Fetch:Cause";
+
+/// The hold cause for a failed write or filesystem step, by errno — or
+/// `None` when the failure is not environmental (a digest or size mismatch,
+/// a missing file, a refused permission): that is a terminal
+/// `failed/io`, not a hold (contract §2.2).
+pub fn io_hold_cause(msg: &str) -> Option<nzbd_types::HoldCause> {
     if is_out_of_space(msg) {
-        if msg.to_lowercase().contains("quota") {
+        Some(if msg.to_lowercase().contains("quota") {
             nzbd_types::HoldCause::Quota
         } else {
             nzbd_types::HoldCause::Capacity
-        }
+        })
     } else if is_storage_unavailable(msg) {
-        nzbd_types::HoldCause::StorageUnavailable
+        Some(nzbd_types::HoldCause::StorageUnavailable)
     } else {
-        nzbd_types::HoldCause::Io
+        None
     }
 }
 
@@ -286,6 +293,25 @@ pub struct Tuning {
     /// health gate then parks/deletes per `[post] health_action`. Wired
     /// from `health_action != "none"`.
     pub health_abort: bool,
+    /// Contract §2.3: how long an environmental hold may last before the
+    /// hold-recovery task ends it `failed/hold_expired` (`[post]
+    /// hold_deadline_secs`).
+    pub hold_deadline: Duration,
+    /// The same for `password_required` holds (`[post]
+    /// password_hold_deadline_secs`).
+    pub password_hold_deadline: Duration,
+}
+
+impl Tuning {
+    /// Seconds a hold for `cause` may last before it expires.
+    pub fn hold_deadline_secs(&self, cause: &nzbd_types::HoldCause) -> i64 {
+        let deadline = if *cause == nzbd_types::HoldCause::PasswordRequired {
+            self.password_hold_deadline
+        } else {
+            self.hold_deadline
+        };
+        i64::try_from(deadline.as_secs()).unwrap_or(i64::MAX).max(1)
+    }
 }
 
 impl Default for Tuning {
@@ -303,6 +329,10 @@ impl Default for Tuning {
             monthly_quota_bytes: 0,
             quota_start_day: 1,
             health_abort: false,
+            hold_deadline: Duration::from_secs(nzbd_types::HOLD_DEADLINE_SECONDS_DEFAULT as u64),
+            password_hold_deadline: Duration::from_secs(
+                nzbd_types::PASSWORD_HOLD_DEADLINE_SECONDS_DEFAULT as u64,
+            ),
         }
     }
 }
@@ -1158,6 +1188,9 @@ impl EngineHandle {
                 tokio::select! { _ = handle.cancel.cancelled() => return, _ = tokio::time::sleep(Duration::from_secs(seconds)) => {} }
             }
             let mut failure = None;
+            // Contract §2.2: the fetcher types its own failure. A local
+            // storage refusal of the cached source has no fetch cause.
+            let mut fetch_cause: Option<nzbd_types::FetchCause> = None;
             let mut received = loop {
                 let store = handle.url_resolutions.clone(); let cached_origin = origin.clone();
                 match tokio::task::spawn_blocking(move || store.source(&cached_origin)).await {
@@ -1203,7 +1236,10 @@ impl EngineHandle {
                 match fetched {
                     Ok(bytes) => received = Some(bytes),
                     Err(crate::fetch::FetchError::Cancelled) => return,
-                    Err(error) => failure = Some(error.to_string()),
+                    Err(error) => {
+                        fetch_cause = Some(crate::fetch::cause_of(&error));
+                        failure = Some(error.to_string());
+                    }
                 }
             }
             if let Some(mut bytes) = received {
@@ -1215,7 +1251,7 @@ impl EngineHandle {
                     match tokio::task::spawn_blocking(move || { let result = store.cache_source(&source_origin, &candidate); (result, candidate) }).await {
                         Ok((Ok(_), _)) => break,
                         Ok((Err(nzbd_state::artifacts::Error::NotFound), _)) => return,
-                        Ok((Err(nzbd_state::artifacts::Error::Conflict(message)), _)) => { failure = Some(message); break; }
+                        Ok((Err(nzbd_state::artifacts::Error::Conflict(message)), _)) => { fetch_cause = Some(nzbd_types::FetchCause::Gone); failure = Some(message); break; }
                         Ok((Err(error), retained)) => {
                             bytes = retained;
                             if !handle.wait_url_storage_retry(&origin, &identity, &error.to_string(), &mut storage_retry).await { return; }
@@ -1226,16 +1262,19 @@ impl EngineHandle {
             }
             loop {
                 if handle.cancel.is_cancelled() { return; }
-                let prepared = match handle.prepare_url_resolution(&origin, failure.clone()).await {
+                let prepared = match handle.prepare_url_resolution(&origin, failure.clone(), fetch_cause).await {
                     Ok(prepared) => prepared,
                     Err(EngineError::OwnershipLost | EngineError::Closed) => return,
                     Err(EngineError::Lifecycle(message)) => {
                         // Size/identity/parse constraints are permanent for this
                         // input. Persist an actionable failed disposition once.
                         if failure.as_deref() == Some(&message) {
-                            let _ = handle.hold_job(id, nzbd_types::HoldCause::IdentityConflict, "url_fetch", &message).await;
-                            tracing::error!(job=id.0, %message, "URL source retained for review"); return;
+                            // The indexer's item itself is unusable (size,
+                            // identity or parse): a `fetch{gone}` terminal.
+                            let _ = handle.fail_job(id, nzbd_types::FailureReason::Fetch, Some(nzbd_types::FetchCause::Gone), "fetch", &message).await;
+                            tracing::error!(job=id.0, %message, "URL source is unusable; job failed"); return;
                         }
+                        fetch_cause = Some(nzbd_types::FetchCause::Gone);
                         failure = Some(message); continue;
                     }
                     Err(error) => {
@@ -1343,6 +1382,7 @@ impl EngineHandle {
         &self,
         origin: &Job,
         failure: Option<String>,
+        fetch_cause: Option<nzbd_types::FetchCause>,
     ) -> Result<nzbd_state::artifacts::UrlResolutionRecord, EngineError> {
         let store = self.url_resolutions.clone();
         let source_origin = origin.clone();
@@ -1428,7 +1468,10 @@ impl EngineHandle {
                 }
                 Err(error) => {
                     staging.jobs[0].status = nzbd_types::JobStatus::Failed;
-                    staging.jobs[0].params.extend([("Failure:Stage".into(), "url_fetch".into()), ("Failure:Reason".into(), error.chars().take(2048).collect())]);
+                    staging.jobs[0].params.extend([("Failure:Stage".into(), "fetch".into()), ("Failure:Reason".into(), error.chars().take(2048).collect())]);
+                    if let Some(cause) = fetch_cause {
+                        staging.jobs[0].params.push((FETCH_CAUSE_PARAM.into(), cause.as_str().into()));
+                    }
                 }
             }
             store.stage(&origin, &staging.jobs[0])
@@ -1492,7 +1535,9 @@ impl EngineHandle {
         };
         let source_identity = nzbd_state::artifacts::url_source_identity(&origin)
             .map_err(|error| EngineError::Lifecycle(error.to_string()))?;
-        let prepared = self.prepare_url_resolution(&origin, Some(error)).await?;
+        let prepared = self
+            .prepare_url_resolution(&origin, Some(error), None)
+            .await?;
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::CompleteUrlFetch {
             job,
@@ -1802,6 +1847,86 @@ impl EngineHandle {
     /// one every few seconds). Returns how many holds it released.
     pub async fn run_hold_recovery_pass(&self) -> Result<usize, EngineError> {
         hold_recovery::pass(self, true).await
+    }
+
+    /// Contract §2.3: end a hold that passed its deadline as
+    /// `failed/hold_expired`. False when the hold changed or is not due.
+    pub async fn expire_hold(&self, job: JobId, revision: String) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::ExpireHold {
+            job,
+            revision,
+            reply,
+        })
+        .await
+    }
+
+    /// End `job` as `failed/<reason>` (contract §2.2): the terminal record,
+    /// history, markers and `job_pp_finished` in that order. False when the
+    /// job is gone, already terminal, or its terminal is already in flight.
+    pub async fn fail_job(
+        &self,
+        job: JobId,
+        reason: nzbd_types::FailureReason,
+        fetch_cause: Option<nzbd_types::FetchCause>,
+        stage: &str,
+        message: &str,
+    ) -> Result<bool, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::FailJob {
+            job,
+            reason,
+            fetch_cause,
+            stage: stage.into(),
+            message: message.into(),
+            reply: tx,
+        })
+        .await?;
+        Ok(terminal_reply(rx).await?.is_some())
+    }
+
+    /// Record a terminal a producer outside the owner built (post-processing
+    /// success and failure, the operator delete). Returns the row once the
+    /// event has been emitted, or `None` when any step did not land (the row
+    /// is replayed).
+    pub async fn record_terminal(
+        &self,
+        terminal: nzbd_state::artifacts::JobTerminal,
+    ) -> Result<Option<nzbd_state::artifacts::JobTerminal>, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::RecordTerminal {
+            terminal: Box::new(terminal),
+            reply: tx,
+        })
+        .await?;
+        terminal_reply(rx).await
+    }
+
+    /// Replay unfinished terminal rows now (boot and the tick also do).
+    pub async fn replay_terminals(&self) -> Result<(), EngineError> {
+        self.roundtrip_unit(|reply| QueueCommand::ReplayTerminals { reply })
+            .await
+    }
+
+    /// Announce a salvage publication (contract §2.2). Not a terminal.
+    pub fn emit_publication_ready(&self, job: JobId, publication: nzbd_types::Publication) {
+        let transfer = self
+            .snapshot()
+            .jobs
+            .iter()
+            .find(|row| row.id == job)
+            .and_then(|row| row.transfer.clone())
+            .or_else(|| {
+                self.artifacts()
+                    .terminal(job.0)
+                    .ok()
+                    .flatten()
+                    .and_then(|t| t.transfer)
+            });
+        self.emit(Event::JobPublicationReady {
+            job,
+            transfer,
+            publication,
+        });
     }
 
     /// Move an automatic hold's next attempt out, recording why.
@@ -2716,6 +2841,14 @@ impl EngineHandle {
     }
 }
 
+/// A terminal chain can wait on two durable writes and a snapshot commit;
+/// bound the wait like any other control reply.
+async fn terminal_reply(
+    rx: oneshot::Receiver<Option<nzbd_state::artifacts::JobTerminal>>,
+) -> Result<Option<nzbd_state::artifacts::JobTerminal>, EngineError> {
+    owner_reply(rx).await
+}
+
 /// Bound control-plane waits independently of a storage worker's lifetime.
 /// A timeout does not cancel issued storage I/O or permit a replacement worker.
 async fn owner_reply<T>(reply: oneshot::Receiver<T>) -> Result<T, EngineError> {
@@ -2894,7 +3027,7 @@ mod out_of_space_tests {
             assert!(is_storage_unavailable(&msg), "{msg}");
             assert_eq!(
                 io_hold_cause(&msg),
-                nzbd_types::HoldCause::StorageUnavailable
+                Some(nzbd_types::HoldCause::StorageUnavailable)
             );
         }
         for no in [
@@ -2906,15 +3039,15 @@ mod out_of_space_tests {
             "finalize: complete checkpoint digest differs",
         ] {
             assert!(!is_storage_unavailable(no), "{no}");
-            assert_eq!(io_hold_cause(no), nzbd_types::HoldCause::Io, "{no}");
+            assert_eq!(io_hold_cause(no), None, "{no} is a terminal failed/io");
         }
         assert_eq!(
             io_hold_cause("No space left on device (os error 28)"),
-            nzbd_types::HoldCause::Capacity
+            Some(nzbd_types::HoldCause::Capacity)
         );
         assert_eq!(
             io_hold_cause("Disk quota exceeded (os error 122)"),
-            nzbd_types::HoldCause::Quota
+            Some(nzbd_types::HoldCause::Quota)
         );
     }
     use super::is_out_of_space;

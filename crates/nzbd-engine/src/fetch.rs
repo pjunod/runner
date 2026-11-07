@@ -227,6 +227,19 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Contract §2.2: why an exhausted fetch failed. The retried branch of
+/// [`retry_delay`] (429/503, I/O, timeouts, transport) ran out on an indexer
+/// that was unavailable; everything it does not retry (404/410/403 and the
+/// other non-retried statuses, a bad URL, a redirect loop) is the indexer
+/// answering for this item: `gone`.
+pub fn cause_of(error: &FetchError) -> nzbd_types::FetchCause {
+    if retry_delay(error, 0).is_some() {
+        nzbd_types::FetchCause::IndexerUnavailable
+    } else {
+        nzbd_types::FetchCause::Gone
+    }
+}
+
 fn retry_delay(error: &FetchError, retries: u32) -> Option<Duration> {
     match error {
         FetchError::HttpStatus {

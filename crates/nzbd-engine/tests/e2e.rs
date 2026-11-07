@@ -2232,14 +2232,13 @@ async fn public_resume_releases_allocation_and_identity_holds() {
     assert!(engine
         .hold_job(
             job,
-            nzbd_types::HoldCause::IdentityConflict,
+            nzbd_types::HoldCause::PasswordRequired,
             "extract",
-            "review required",
+            "password required",
         )
         .await
         .unwrap());
-    // A review hold never retries by itself, but an operator resume is
-    // always an exit (docs/HELD_JOBS_PLAN.md §4.6).
+    // An operator resume is always an exit (docs/HELD_JOBS_PLAN.md §4.6).
     assert!(engine.resume_job(job).await.unwrap());
     assert!(!engine.export_ready(job).await.unwrap().unwrap().held());
     engine.shutdown().await;
@@ -2281,6 +2280,8 @@ async fn legacy_coverage_hold_recovers_without_repeating_valid_articles() {
             next_retry_at_unix: None,
             blocked_since_unix: None,
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         });
         job.status = JobStatus::Paused;
         engine.import_ready(job, false, false).await.unwrap();
@@ -2345,6 +2346,8 @@ async fn stranded_storage_hold_recovers_after_restart_without_a_click() {
             next_retry_at_unix: None,
             blocked_since_unix: Some(1),
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         });
         job.status = JobStatus::Paused;
         engine.import_ready(job, false, false).await.unwrap();
@@ -2431,6 +2434,8 @@ async fn recovery_pass_releases_post_holds_through_custody_and_skips_review() {
             next_retry_at_unix: None,
             blocked_since_unix: Some(1),
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         });
         job.status = JobStatus::Paused;
         engine.import_ready(job, false, false).await.unwrap();

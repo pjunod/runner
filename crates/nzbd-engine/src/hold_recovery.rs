@@ -7,6 +7,11 @@
 //! refusal recorded on the job, so the row always says why it is still
 //! held and when it tries next.
 //!
+//! Every hold also has a deadline (contract §2.3, `[post]
+//! hold_deadline_secs`): a pass that finds one past it ends the job
+//! `failed/hold_expired` through the owner's terminal record — even when an
+//! operator paused the hold, because the clock keeps running.
+//!
 //! It runs off the owner loop: the custody check and the capacity probe
 //! touch the payload mount and run in `spawn_blocking` inside
 //! `release_hold`. It acts only while this engine is the queue authority,
@@ -59,12 +64,34 @@ pub(crate) async fn pass(
         return Ok(0);
     }
     let now = crate::owner::unix_now();
+    let expired = snapshot
+        .jobs
+        .iter()
+        .filter(|job| !snapshot.pending_automatic_controls.contains(&job.id))
+        .filter(|job| job.assigned_node.is_none())
+        .filter_map(|job| {
+            job.control
+                .as_ref()
+                .filter(|c| c.lifecycle == "held")
+                .filter(|c| c.deadline_unix.is_some_and(|deadline| deadline <= now))
+                .map(|c| (job.id, c.revision.clone()))
+        })
+        .collect::<Vec<_>>();
+    for (job, revision) in &expired {
+        if handle.expire_hold(*job, revision.clone()).await? {
+            tracing::warn!(
+                job = job.0,
+                "hold passed its deadline; job ended failed/hold_expired"
+            );
+        }
+    }
     let mut releases = tokio::task::JoinSet::new();
     let eligible = snapshot
         .jobs
         .iter()
         .filter(|job| !snapshot.pending_automatic_controls.contains(&job.id))
         .filter(|job| job.assigned_node.is_none())
+        .filter(|job| !expired.iter().any(|(id, _)| *id == job.id))
         .filter(|job| {
             job.kind != JobKind::Torrent
                 || job.torrent_role == Some("acquisition")
@@ -79,7 +106,6 @@ pub(crate) async fn pass(
                 .as_ref()
                 .filter(|c| c.lifecycle == "held" && !c.manual_pause)?;
             let due = match control.hold_cause().policy() {
-                HoldPolicy::Review => false,
                 HoldPolicy::ReobserveMount => reobserve,
                 HoldPolicy::ScheduledRetry | HoldPolicy::ResumeSameJob => {
                     control.next_retry_at_unix.is_some_and(|at| at <= now)

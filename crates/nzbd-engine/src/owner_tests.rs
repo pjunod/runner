@@ -2869,7 +2869,13 @@ async fn operator_retry(
 ) -> Result<(), String> {
     let control = owner.state.job(job).unwrap().control().unwrap();
     let custody_checked = control.post_side() && owner.artifacts.validate_post_retry(job.0).is_ok();
-    let result = owner.retry_hold(job, &control.revision, RetryBy::Operator, custody_checked);
+    let result = owner.retry_hold_proven(
+        job,
+        &control.revision,
+        RetryBy::Operator,
+        custody_checked,
+        &Default::default(),
+    );
     pump(owner, messages).await;
     result
 }
@@ -2882,22 +2888,40 @@ async fn post_hold_retry_checks_revision_custody_and_stage_then_persists() {
     job.dir_name = "pp".into();
     owner.state.jobs.push(job);
     allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
-    assert!(owner.hold_job(JobId(1), HoldCause::PostFailure, "unpack", "tool failed"));
+    assert!(owner.hold_job(JobId(1), HoldCause::MissingTool, "unpack", "tool failed"));
     pump(&mut owner, &mut messages).await;
     let revision = owner.state.jobs[0].control().unwrap().revision;
     assert!(owner
-        .retry_hold(JobId(1), "stale", RetryBy::Operator, true)
+        .retry_hold_proven(
+            JobId(1),
+            "stale",
+            RetryBy::Operator,
+            true,
+            &Default::default()
+        )
         .is_err());
     pump(&mut owner, &mut messages).await;
     assert!(
         owner
-            .retry_hold(JobId(1), &revision, RetryBy::Operator, false)
+            .retry_hold_proven(
+                JobId(1),
+                &revision,
+                RetryBy::Operator,
+                false,
+                &Default::default()
+            )
             .is_err(),
         "a post-side release needs its custody checked off-loop first"
     );
     pump(&mut owner, &mut messages).await;
     assert_eq!(
-        owner.retry_hold(JobId(1), &revision, RetryBy::Operator, true),
+        owner.retry_hold_proven(
+            JobId(1),
+            &revision,
+            RetryBy::Operator,
+            true,
+            &Default::default()
+        ),
         Ok(())
     );
     pump(&mut owner, &mut messages).await;
@@ -2972,7 +2996,13 @@ async fn storage_errno_writer_error_schedules_itself() {
     due.next_retry_at_unix = Some(0);
     owner.state.jobs[0].set_control(&due);
     assert_eq!(
-        owner.retry_hold(JobId(1), &held.revision, RetryBy::Recovery, false),
+        owner.retry_hold_proven(
+            JobId(1),
+            &held.revision,
+            RetryBy::Recovery,
+            false,
+            &Default::default()
+        ),
         Ok(())
     );
     pump(&mut owner, &mut messages).await;
@@ -3050,7 +3080,13 @@ async fn permanent_writer_error_waits_for_review() {
     assert_eq!(held.next_retry_at_unix, None);
     assert!(
         owner
-            .retry_hold(JobId(1), &held.revision, RetryBy::Recovery, false)
+            .retry_hold_proven(
+                JobId(1),
+                &held.revision,
+                RetryBy::Recovery,
+                false,
+                &Default::default()
+            )
             .is_err(),
         "the actor independently refuses automatic retries of permanent failures"
     );
@@ -3074,14 +3110,26 @@ async fn paused_hold_waits_for_the_operator_and_followers_never_auto_release() {
     c.manual_pause = true;
     owner.state.jobs[0].set_control(&c);
     assert!(owner
-        .retry_hold(JobId(1), &c.revision, RetryBy::Recovery, false)
+        .retry_hold_proven(
+            JobId(1),
+            &c.revision,
+            RetryBy::Recovery,
+            false,
+            &Default::default()
+        )
         .is_err());
     pump(&mut owner, &mut messages).await;
     owner.persist = false;
     c.manual_pause = false;
     owner.state.jobs[0].set_control(&c);
     assert_eq!(
-        owner.retry_hold(JobId(1), &c.revision, RetryBy::Recovery, false),
+        owner.retry_hold_proven(
+            JobId(1),
+            &c.revision,
+            RetryBy::Recovery,
+            false,
+            &Default::default()
+        ),
         Err("this node is not the queue authority".into())
     );
     pump(&mut owner, &mut messages).await;
@@ -3090,7 +3138,13 @@ async fn paused_hold_waits_for_the_operator_and_followers_never_auto_release() {
     c.retry_attempt = 4;
     owner.state.jobs[0].set_control(&c);
     assert_eq!(
-        owner.retry_hold(JobId(1), &c.revision, RetryBy::Operator, false),
+        owner.retry_hold_proven(
+            JobId(1),
+            &c.revision,
+            RetryBy::Operator,
+            false,
+            &Default::default()
+        ),
         Ok(())
     );
     pump(&mut owner, &mut messages).await;
@@ -3231,7 +3285,12 @@ async fn held_control_survives_only_owner_writes() {
     let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
     pump(&mut owner, &mut messages).await;
     owner.state.jobs.push(pending_job(1));
-    assert!(owner.hold_job(JobId(1), HoldCause::Io, "download_write", "digest differs"));
+    assert!(owner.hold_job(
+        JobId(1),
+        HoldCause::MountUnavailable,
+        "download_write",
+        "digest differs"
+    ));
     pump(&mut owner, &mut messages).await;
     let held = owner.state.jobs[0].control().unwrap();
     let mut row = owner.state.jobs[0].clone();
@@ -3283,7 +3342,13 @@ async fn rehold_after_release_routes_by_where_the_job_is_now() {
     due.next_retry_at_unix = Some(0);
     owner.state.jobs[0].set_control(&due);
     owner
-        .retry_hold(JobId(1), &first.revision, RetryBy::Recovery, false)
+        .retry_hold_proven(
+            JobId(1),
+            &first.revision,
+            RetryBy::Recovery,
+            false,
+            &Default::default(),
+        )
         .unwrap();
     pump(&mut owner, &mut messages).await;
     // The download finished; post-processing hits the dead mount.
@@ -3301,7 +3366,13 @@ async fn rehold_after_release_routes_by_where_the_job_is_now() {
     assert!(second.post_side(), "this hold happened in post-processing");
     assert!(
         owner
-            .retry_hold(JobId(1), &second.revision, RetryBy::Recovery, false)
+            .retry_hold_proven(
+                JobId(1),
+                &second.revision,
+                RetryBy::Recovery,
+                false,
+                &Default::default()
+            )
             .is_err(),
         "so its release must go through the custody check"
     );
@@ -3445,6 +3516,8 @@ fn rearm_reclassifies_by_errno_and_derives_policy() {
         next_retry_at_unix: None,
         blocked_since_unix: Some(1),
         released_at_unix: None,
+        deadline_in_s: None,
+        deadline_unix: None,
     };
     // #2181 exactly.
     let fixed = rearmed_hold(
@@ -3543,6 +3616,8 @@ async fn adopting_authority_rearms_holds() {
         next_retry_at_unix: None,
         blocked_since_unix: Some(1),
         released_at_unix: None,
+        deadline_in_s: None,
+        deadline_unix: None,
     });
     job.status = JobStatus::Paused;
     let mut doc_state = QueueState::default();
@@ -5316,6 +5391,8 @@ async fn automatic_hold_recovery_bounds_each_pass_and_rotates_all_due_jobs() {
             next_retry_at_unix: Some(0),
             blocked_since_unix: Some(0),
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         });
         let root = owner.dest_dir.clone();
         owner
@@ -6353,7 +6430,13 @@ async fn cluster_automatic_control_waits_for_exact_ack_and_operator_intent_is_no
         .contains(&base.id));
     assert!(!owner.reschedule_hold(base.id, &held.revision, "still unavailable"));
     assert!(owner
-        .retry_hold(base.id, &held.revision, RetryBy::Recovery, true)
+        .retry_hold_proven(
+            base.id,
+            &held.revision,
+            RetryBy::Recovery,
+            true,
+            &Default::default()
+        )
         .is_err());
     assert_eq!(
         transition(owner.state.job(base.id).unwrap())
@@ -6378,7 +6461,13 @@ async fn cluster_automatic_control_waits_for_exact_ack_and_operator_intent_is_no
     pump(&mut owner, &mut messages).await;
     assert!(result.await.unwrap());
     assert!(owner
-        .retry_hold(base.id, &held.revision, RetryBy::Recovery, true)
+        .retry_hold_proven(
+            base.id,
+            &held.revision,
+            RetryBy::Recovery,
+            true,
+            &Default::default()
+        )
         .is_ok());
     let released = transition(owner.state.job(base.id).unwrap()).unwrap();
     assert_eq!(released.base_control, Some(held.clone()));
@@ -6436,7 +6525,13 @@ async fn cluster_automatic_control_waits_for_exact_ack_and_operator_intent_is_no
     ));
     let held = owner.state.job(base.id).unwrap().control().unwrap();
     assert!(owner
-        .retry_hold(base.id, &held.revision, RetryBy::Operator, true)
+        .retry_hold_proven(
+            base.id,
+            &held.revision,
+            RetryBy::Operator,
+            true,
+            &Default::default()
+        )
         .is_ok());
     assert!(
         transition(owner.state.job(base.id).unwrap()).is_none(),

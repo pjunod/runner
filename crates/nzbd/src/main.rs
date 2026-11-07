@@ -343,6 +343,8 @@ fn engine_tuning(cfg: &nzbd_config::Config) -> Tuning {
         quota_start_day: cfg.queue.quota_start_day.clamp(1, 28),
         health_abort: nzbd_post::manager::FailureAction::parse(&cfg.post.failure_action)
             != nzbd_post::manager::FailureAction::None,
+        hold_deadline: Duration::from_secs(cfg.post.hold_deadline_secs.max(1)),
+        password_hold_deadline: Duration::from_secs(cfg.post.password_hold_deadline_secs.max(1)),
         ..Tuning::default()
     }
 }
