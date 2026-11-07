@@ -4740,6 +4740,9 @@ pub fn pp_verdict(error: &PostError, stage: Option<PostStage>) -> PpVerdict {
     if matches!(error, PostError::NothingPublishable(_)) {
         return PpVerdict::Fail(FailureReason::Publish);
     }
+    if matches!(error, PostError::Identity(_)) {
+        return PpVerdict::Fail(FailureReason::Identity);
+    }
     if matches!(error, PostError::ToolMissing(_)) {
         return PpVerdict::Hold(HoldCause::MissingTool);
     }

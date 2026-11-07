@@ -785,3 +785,83 @@ async fn completed_terminal_precedes_delivery_and_crash_repairs_it() {
     tracker.wait().await;
     engine.shutdown().await;
 }
+
+/// Review #280-3 / contract §2.2: post-processing evidence that disagrees
+/// with itself (an SFV naming one archive with two checksums) ends the job
+/// `failed/identity` — blamed on the release, nothing salvageable, parked.
+#[tokio::test]
+async fn self_contradicting_evidence_is_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, _) = admitted_job(
+        &engine,
+        "contradicting",
+        &[
+            (
+                "a8f3c91e",
+                Some(b"Rar!\x1a\x07\x00 obfuscated volume".as_slice()),
+            ),
+            (
+                "release.sfv",
+                Some(b"release.rar 11111111\nrelease.rar 22222222\n".as_slice()),
+            ),
+        ],
+        JobStatus::Completed,
+    )
+    .await;
+    let mut events = engine.subscribe();
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    spawn_post_manager(
+        engine.clone(),
+        PostConfig {
+            failure_action: FailureAction::Delete,
+            failed_dir: Some(tmp.path().join("parked")),
+            ..PostConfig::default()
+        },
+        history.clone(),
+        tmp.path().join("dest"),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("identity terminal")
+            .unwrap();
+        if let Event::JobPpFinished {
+            job,
+            outcome,
+            reason,
+            blames_release,
+            salvage,
+            pp_status,
+            ..
+        } = event
+        {
+            assert_eq!(job, job_id);
+            assert_eq!(outcome, TerminalOutcome::Failed);
+            assert_eq!(reason, Some(FailureReason::Identity));
+            assert!(blames_release);
+            assert_eq!(salvage, nzbd_types::Salvage::None);
+            assert_eq!(pp_status, "FAILURE/IDENTITY");
+            break;
+        }
+    }
+    let terminal = wait_terminal(&engine, job_id, "disposal", |t| t.disposal.is_some()).await;
+    assert_eq!(terminal.salvage, SalvageState::None);
+    assert!(
+        engine
+            .artifacts()
+            .delivery_for_job(job_id.0)
+            .unwrap()
+            .is_none(),
+        "nothing is salvaged from contradicting evidence"
+    );
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+    engine.shutdown().await;
+}

@@ -656,9 +656,7 @@ fn sfv_restore_archives(dir: &Path, custody: Custody<'_>) -> Renames {
                 .insert(target, crc)
                 .is_some_and(|prior| prior != crc)
             {
-                return Err(PostError::Subprocess(
-                    "conflicting SFV archive names".into(),
-                ));
+                return Err(PostError::Identity("conflicting SFV archive names".into()));
             }
         }
     }
