@@ -244,6 +244,16 @@ async fn unpack_failure_is_terminal_before_salvage() {
         .unwrap()
         .unwrap();
     assert_eq!(delivery.kind(), "salvage");
+    // The job now has both a source and Curator's publication; the
+    // settled obligation is on the source, by role (review of #282).
+    assert_ne!(delivery.source_artifact_id, delivery.artifact_id);
+    let source_row = engine
+        .artifacts()
+        .get(&delivery.source_artifact_id)
+        .unwrap();
+    let publication_row = engine.artifacts().get(&delivery.artifact_id).unwrap();
+    assert_eq!(source_row.salvage.as_deref(), Some("published"));
+    assert_eq!(publication_row.salvage, None);
     cancel.cancel();
     tracker.close();
     tracker.wait().await;

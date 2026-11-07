@@ -223,13 +223,28 @@ impl RawTerminal {
 }
 
 fn set_artifact_salvage(tx: &Connection, job: u32, salvage: SalvageState) -> Result<usize> {
-    // The job's current artifact: the newest row for it. A job may have
-    // several (a publication beside its source); the obligation is on the
-    // source, which is the one `for_job` answers.
+    // The obligation is on the job's *source*, chosen by role, not recency
+    // (review of #282). Once salvage publishes, the job's own artifact row
+    // is the publication Curator owns (`transferred`, a delivery's
+    // artifact) and the retained source is the delivery's
+    // `sourceArtifactId`, a row with no job column; before that, the source
+    // is the job's row that is not a publication.
     Ok(tx.execute(
-        "UPDATE artifacts SET data=json_set(data,'$.salvage',?2) WHERE id=(SELECT id FROM artifacts WHERE job=?1 ORDER BY updated_at DESC LIMIT 1)",
+        "UPDATE artifacts SET data=json_set(data,'$.salvage',?2) WHERE id=COALESCE(
+            (SELECT json_extract(d.data,'$.sourceArtifactId') FROM deliveries d JOIN artifacts p ON p.id=d.artifact WHERE p.job=?1 ORDER BY d.sequence DESC LIMIT 1),
+            (SELECT a.id FROM artifacts a WHERE a.job=?1 AND json_extract(a.data,'$.state')<>'transferred' AND a.id NOT IN (SELECT artifact FROM deliveries) ORDER BY a.updated_at DESC LIMIT 1))",
         rusqlite::params![job, salvage.as_str()],
-    )?)
+    )
+    .and_then(|updated| {
+        // A relocation keeps the job's artifact id on the publication, so
+        // the obligation written before it moved travels along; the
+        // publication owes nothing.
+        tx.execute(
+            "UPDATE artifacts SET data=json_remove(data,'$.salvage') WHERE job=?1 AND id IN (SELECT artifact FROM deliveries)",
+            [job],
+        )?;
+        Ok(updated)
+    })?)
 }
 
 impl Inventory {
