@@ -1,5 +1,18 @@
 # nzbd — Project Status
 
+## Pipeline contract v2 — M0 (contract in the repo) — 2026-11-07
+
+**Status:** in progress on `claude/pipeline-v2-m0-runner` · **Owner:** Claude
+(Opus builder session) · **PR:** not opened yet · **Plan:**
+`PIPELINE_REWRITE_PLAN.md` M0 (project doc).
+
+- Added [docs/PIPELINE_CONTRACT.md](docs/PIPELINE_CONTRACT.md), the r4
+  contract that the M1a/M1b/M3/M6 runner work builds to. When code and
+  contract disagree during the rewrite, the contract describes the target.
+- "Being replaced by" banner on `docs/INTEGRATION.md`; `CURATOR_DELIVERY.md`
+  and `HELD_JOBS_PLAN.md` marked superseded.
+- Docs only: no code, no version bump.
+
 ## Empty failed sources retained "for recovery" — 2026-11-02
 
 **Status:** fixed on `codex/empty-failed-source`, paired with Curator
