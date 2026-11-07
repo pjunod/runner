@@ -232,11 +232,13 @@ fn set_artifact_salvage(tx: &Connection, job: u32, salvage: SalvageState) -> Res
     )?)
 }
 
-/// Mirror the failure reason onto the job's source artifact (display only;
-/// `job_terminals` stays the authority).
+/// Mirror the failure reason onto the job's **source** artifact (display
+/// only; `job_terminals` stays the authority). The source is picked by role,
+/// not recency: a publication (state `transferred`, or any artifact a delivery
+/// row names as its published one) belongs to Curator and is never marked.
 fn set_artifact_failure_reason(tx: &Connection, job: u32, reason: FailureReason) -> Result<usize> {
     Ok(tx.execute(
-        "UPDATE artifacts SET data=json_set(data,'$.failure_reason',?2) WHERE id=(SELECT id FROM artifacts WHERE job=?1 ORDER BY updated_at DESC LIMIT 1)",
+        "UPDATE artifacts SET data=json_set(data,'$.failure_reason',?2) WHERE id=(SELECT id FROM artifacts WHERE job=?1 AND json_extract(data,'$.state')<>'transferred' AND id NOT IN (SELECT artifact FROM deliveries) ORDER BY updated_at DESC LIMIT 1)",
         rusqlite::params![job, reason.as_str()],
     )?)
 }
@@ -577,5 +579,34 @@ mod tests {
         let after = inventory.get(&artifact.id).unwrap();
         assert_eq!(after.failure_reason.as_deref(), Some("unpack"));
         assert_eq!(after.salvage.as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn failure_reason_skips_a_publication_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("processing");
+        std::fs::create_dir_all(&root).unwrap();
+        let inventory = Inventory::open(dir.path()).unwrap();
+        let source = inventory.allocate(11, &root, &root.join("job-11")).unwrap();
+        // A newer artifact for the same job that is a publication.
+        let publication = inventory
+            .allocate(12, &root, &root.join("job-11-pub"))
+            .unwrap();
+        {
+            let db = inventory.db.lock().unwrap();
+            db.execute(
+                "UPDATE artifacts SET job=11,data=json_set(data,'$.job',11,'$.state','transferred','$.owned',json('false')),updated_at=?2 WHERE id=?1",
+                rusqlite::params![publication.id, now() + 100],
+            )
+            .unwrap();
+        }
+        inventory
+            .record_terminal(&failed(11, SalvageState::None))
+            .unwrap();
+        assert_eq!(
+            inventory.get(&source.id).unwrap().failure_reason.as_deref(),
+            Some("unpack")
+        );
+        assert_eq!(inventory.get(&publication.id).unwrap().failure_reason, None);
     }
 }
