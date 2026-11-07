@@ -7083,7 +7083,17 @@ mod decision_tests {
             sevenzip_cmd: fake.to_string_lossy().into_owned(),
             ..PostConfig::default()
         };
-        let error = extract_complete_failed_archives(&engine, &cfg, &request, &None)
+        // Production runs every transform inside an admitted attempt, whose
+        // use fences the engine's artifact tick off the source. Without it
+        // the tick's workspace reconciliation (`reconcile_workspace_
+        // retirements_with_history`) can hold the source's lease exactly when
+        // the transform completes ("transform output remains in use"), which
+        // made this test fail about 1 run in 12 under a loaded suite.
+        let attempt = admitted_attempt(&engine, request.id).await;
+        let error = crate::attempt::CURRENT
+            .scope(attempt, async {
+                extract_complete_failed_archives(&engine, &cfg, &request, &None).await
+            })
             .await
             .err()
             .expect("storage failure must enter retry lane");
@@ -7393,7 +7403,11 @@ mod decision_tests {
             par2_cmd: fake.to_string_lossy().into_owned(),
             ..PostConfig::default()
         };
-        let failures = repair_failed_health_par_sets(&engine, &cfg, &request, &None)
+        let attempt = admitted_attempt(&engine, request.id).await;
+        let failures = crate::attempt::CURRENT
+            .scope(attempt, async {
+                repair_failed_health_par_sets(&engine, &cfg, &request, &None).await
+            })
             .await
             .expect("local repair failure must not block independent payload");
         assert!(failures.contains_key("episode-02.mkv"));
@@ -7553,6 +7567,32 @@ mod decision_tests {
             crc32,
             finalized: true,
         }
+    }
+
+    /// Own the job's source as the real stage pipeline does: an admitted
+    /// attempt fences the engine's artifact tick off it. Startup inventory
+    /// reconciliation can still be joining, which the attempt reports as
+    /// not quiesced.
+    async fn admitted_attempt(
+        engine: &nzbd_engine::EngineHandle,
+        job: JobId,
+    ) -> Arc<crate::attempt::AttemptControl> {
+        let ctx = PpCtx::default();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match crate::attempt::AttemptControl::new(engine, &ctx, job).await {
+                    Err(PostError::Subprocess(reason))
+                        if reason
+                            == "previous processing or allocation workers have not quiesced" =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    other => break other.unwrap(),
+                }
+            }
+        })
+        .await
+        .expect("fixture must acquire exact source custody after startup joins")
     }
 
     fn job(files: Vec<FileEntry>, params: Vec<(String, String)>) -> Job {
@@ -8239,7 +8279,12 @@ mod decision_tests {
             .import_fixture_job(request.clone(), false, false)
             .await
             .unwrap();
-        extract_complete_failed_archives(&engine, &PostConfig::default(), &request, &None)
+        let attempt = admitted_attempt(&engine, request.id).await;
+        crate::attempt::CURRENT
+            .scope(attempt, async {
+                extract_complete_failed_archives(&engine, &PostConfig::default(), &request, &None)
+                    .await
+            })
             .await
             .unwrap();
         let source_artifact = inventory.refresh_for_delivery(41).unwrap();
@@ -8363,7 +8408,12 @@ mod decision_tests {
             .import_fixture_job(request.clone(), false, false)
             .await
             .unwrap();
-        extract_complete_failed_archives(&engine, &PostConfig::default(), &request, &None)
+        let attempt = admitted_attempt(&engine, request.id).await;
+        crate::attempt::CURRENT
+            .scope(attempt, async {
+                extract_complete_failed_archives(&engine, &PostConfig::default(), &request, &None)
+                    .await
+            })
             .await
             .unwrap();
         let source_artifact = inventory.refresh_for_delivery(41).unwrap();
