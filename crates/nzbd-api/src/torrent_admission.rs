@@ -435,16 +435,18 @@ impl TorrentAdmissionService {
             // ends the acquisition rather than waiting on a review.
             _ => (None, None, true),
         };
-        let (cause, permanent) = match cause {
-            Some(cause) => (cause, permanent),
-            None => (nzbd_types::HoldCause::StorageUnavailable, true),
-        };
-        if permanent {
-            if self.engine.fail_native_torrent(id,None,"torrent_metadata".into(),"Torrent metadata is invalid or permanently unavailable; start a fresh Grab to change the source".into(),false).await.unwrap_or(false) {
-                self.drain_native_failure(id).await;
+        // Review #280-10: a cause that is not environmental never holds —
+        // the acquisition ends as a typed terminal instead.
+        let cause = match cause {
+            Some(cause) if !permanent => cause,
+            _ => {
+                let (reason, fetch_cause) = native_metadata_failure(error);
+                if self.engine.fail_native_torrent(id,None,reason,fetch_cause,"torrent_metadata".into(),format!("Torrent metadata is invalid or permanently unavailable ({error}); start a fresh Grab to change the source"),false).await.unwrap_or(false) {
+                    self.drain_native_failure(id).await;
+                }
+                return;
             }
-            return;
-        }
+        };
         let _ = self
             .engine
             .hold_job_until(
@@ -511,6 +513,8 @@ impl TorrentAdmissionService {
             .fail_native_torrent(
                 id,
                 donor,
+                nzbd_types::FailureReason::Io,
+                None,
                 stage,
                 "Torrent source is permanently unavailable; start a fresh Grab".into(),
                 cleanup_complete,
@@ -1324,7 +1328,7 @@ impl TorrentAdmissionService {
                     && !child.pp_done
                     && child.status != nzbd_types::JobStatus::Failed
                 {
-                    self.engine.fail_native_torrent(child.id,Some(seed.id),"torrent_source".into(),"Torrent seed failed before any selected file was completely hash-verified; start a fresh Grab".into(),false).await?;
+                    self.engine.fail_native_torrent(child.id,Some(seed.id),nzbd_types::FailureReason::Io,None,"torrent_source".into(),"Torrent seed failed before any selected file was completely hash-verified; start a fresh Grab".into(),false).await?;
                 }
             }
         }
@@ -3986,5 +3990,32 @@ mod tests {
         ))
         .is_input_error());
         assert!(AdmissionError::Encoding.is_input_error());
+    }
+}
+
+/// Contract §2.2 for a permanent metadata failure: a source URL the item's
+/// host answered 4xx for is `fetch{gone}` (the release is gone); a local
+/// read/write/state failure is `io`; metainfo that cannot be what it claims
+/// (unparseable, wrong info-hash, invalid) is `identity`.
+fn native_metadata_failure(
+    error: &AdmissionError,
+) -> (nzbd_types::FailureReason, Option<nzbd_types::FetchCause>) {
+    use nzbd_torrent::TorrentError;
+    use nzbd_types::{FailureReason, FetchCause};
+    match error {
+        AdmissionError::Torrent(TorrentError::TorrentSourceHttpStatus { status, .. })
+            if (400..500).contains(status) =>
+        {
+            (FailureReason::Fetch, Some(FetchCause::Gone))
+        }
+        AdmissionError::Torrent(
+            TorrentError::TorrentSourceRequestFailed { .. }
+            | TorrentError::TorrentSourceTimeout { .. }
+            | TorrentError::TorrentSourceRetry { .. }
+            | TorrentError::TorrentSourceHttpStatus { .. }
+            | TorrentError::MagnetMetadataTimeout,
+        ) => (FailureReason::Fetch, Some(FetchCause::IndexerUnavailable)),
+        AdmissionError::Torrent(_) => (FailureReason::Identity, None),
+        _ => (FailureReason::Io, None),
     }
 }

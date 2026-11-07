@@ -940,3 +940,55 @@ async fn unrecorded_terminal_is_retried_and_blocks_completion() {
     assert_eq!(finished, 1);
     engine.shutdown().await;
 }
+
+/// Plan M1a (e), contract §2.1: a torrent that stopped with a partially
+/// verified payload is `failed/io` with `salvage: pending` — no blame, the
+/// verified files owed to salvage. (The acquisition's completion command
+/// records exactly this terminal when its donor seed failed; building a real
+/// piece-verified torrent copy is out of reach for this fixture, so the job
+/// row is the acquisition's post-copy shape.)
+#[tokio::test]
+async fn partial_torrent_is_io_with_salvage_pending() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, _) = admitted_job(
+        &engine,
+        "partial-torrent",
+        &[("Show.S01E01.mkv", Some(b"verified piece".as_slice()))],
+        JobStatus::Failed,
+    )
+    .await;
+    let mut row = export(&engine, job_id).await.unwrap();
+    row.kind = nzbd_types::JobKind::Torrent;
+    for file in &mut row.files {
+        file.segments.clear(); // torrent files carry no articles
+    }
+    engine.import_job(row, false, false).await.unwrap();
+    assert!(engine
+        .fail_job(
+            job_id,
+            FailureReason::Io,
+            None,
+            "torrent_download",
+            "torrent stopped with a partially verified payload; hash-verified files are salvaged",
+        )
+        .await
+        .unwrap());
+    let terminal = engine.artifacts().terminal(job_id.0).unwrap().unwrap();
+    assert_eq!(terminal.reason, Some(FailureReason::Io));
+    assert!(!terminal.blames_release);
+    assert_eq!(terminal.salvage, SalvageState::Pending);
+    assert_eq!(
+        terminal.fetched.success_articles, 0,
+        "no articles: salvage is owed by kind"
+    );
+    assert_eq!(
+        history
+            .get_sequence(terminal.history_seq.unwrap())
+            .unwrap()
+            .unwrap()
+            .status,
+        "FAILURE/IO"
+    );
+    engine.shutdown().await;
+}

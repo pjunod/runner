@@ -165,6 +165,8 @@ impl Owner {
             QueueCommand::FailNativeTorrent {
                 job,
                 donor,
+                reason,
+                fetch_cause,
                 stage,
                 message,
                 cleanup_complete,
@@ -173,6 +175,7 @@ impl Owner {
                 self.fail_native_torrent_then(
                     job,
                     donor,
+                    (reason, fetch_cause),
                     stage,
                     message,
                     cleanup_complete,
@@ -510,7 +513,6 @@ impl Owner {
                         "Failure:Stage",
                         Some("torrent_download".into()),
                     );
-                    set_owner_param(&mut row.params,"Failure:Reason",Some("Torrent failed; hash-verified files were preserved for post-processing".into()));
                 }
                 self.dirty = true;
                 self.native_commit_then(before.into_iter().collect(), move |owner, ok| {
@@ -523,7 +525,24 @@ impl Owner {
                     let _ = owner.sync_managed_seed_keep(donor);
                     owner.publish_now();
                     owner.bump_epoch();
-                    let row = owner.state.job(job).unwrap();
+                    if donor_failed {
+                        // Contract §2.1: a torrent that stopped with a
+                        // partially verified payload is `failed/io`, salvage
+                        // pending — the hash-verified files are published by
+                        // salvage after the terminal, never processed as a
+                        // completed download.
+                        owner.fail_job_terminal(
+                            job,
+                            nzbd_types::FailureReason::Io,
+                            None,
+                            "torrent_download",
+                            PARTIAL_TORRENT_MESSAGE,
+                        );
+                    }
+                    let Some(row) = owner.state.job(job) else {
+                        let _ = reply.send(true);
+                        return;
+                    };
                     owner.emit(Event::JobFinished {
                         job,
                         status: row.status,
@@ -584,3 +603,7 @@ impl Owner {
         None
     }
 }
+
+/// The terminal message for a torrent that stopped part-verified.
+pub(crate) const PARTIAL_TORRENT_MESSAGE: &str =
+    "torrent stopped with a partially verified payload; hash-verified files are salvaged";
