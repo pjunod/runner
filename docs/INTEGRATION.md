@@ -1,5 +1,7 @@
 # Integration — nzbd's seams with monarr and plurx, and how to prove they work
 
+> **Being replaced by [PIPELINE_CONTRACT.md](PIPELINE_CONTRACT.md) — 2026-11-07.** The runner ↔ curator ↔ cinema seam is being rewritten as contract v2: one typed terminal `job_pp_finished` per job emitted before any disposal, holds only for environmental causes with a runner-enforced deadline, and no delivery acknowledgement. Where this page and the contract disagree, the contract describes the target; this page describes what is deployed until each milestone ships.
+
 Companion to [INTEGRATION_PLAN.md](INTEGRATION_PLAN.md) (the event/cursor
 contract and how it was built) — this is *what each seam does, where you look
 at it, and the exact command that proves it*. For connecting the classic *arr
