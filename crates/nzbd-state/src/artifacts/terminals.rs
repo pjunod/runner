@@ -410,14 +410,6 @@ impl Inventory {
             .filter(|t| t.emitted && t.salvage != SalvageState::Pending))
     }
 
-    /// Forget a terminal row once its job is gone for good (a requeue makes
-    /// the job id a fresh attempt).
-    pub fn forget_terminal(&self, job: u32) -> Result<()> {
-        let db = self.db.lock().unwrap();
-        db.execute("DELETE FROM job_terminals WHERE job=?1", [job])?;
-        Ok(())
-    }
-
     /// Test support: the next `record_terminal` replay for `job` stops right
     /// after `after`, as a crash there would.
     #[cfg(feature = "test-support")]

@@ -469,15 +469,9 @@ async fn manager_task(
                     JobStatus::Failed if claim(&gate, job) => {
                         if let Ok(Some(row)) = engine.export_job(job).await {
                             if !pp_done(&row) && !active.contains_key(&job) {
-                                let fetch = row.kind == nzbd_types::JobKind::Url && row.files.is_empty();
-                                let reason = if fetch {
-                                    nzbd_types::FailureReason::Fetch
-                                } else {
-                                    nzbd_types::FailureReason::Health
-                                };
+                                let (reason, fetch_cause) = unstamped_failure(&row);
                                 let _ = fail_job_in(
-                                    &engine, &history, job, reason,
-                                    fetch.then_some(nzbd_types::FetchCause::Gone),
+                                    &engine, &history, job, reason, fetch_cause,
                                     reason.as_str(), "failed before its terminal was recorded",
                                 ).await;
                             }
@@ -1689,22 +1683,19 @@ async fn scan_queue(
             // A failed row with no stamp is one an earlier build failed
             // before recording it, or one whose terminal is in flight (the
             // owner refuses a second). Record its terminal now.
-            let fetch_failure = j.kind == nzbd_types::JobKind::Url && j.files_total == 0;
-            let reason = if fetch_failure {
-                nzbd_types::FailureReason::Fetch
-            } else {
-                nzbd_types::FailureReason::Health
-            };
-            let _ = fail_job_in(
-                engine,
-                history,
-                j.id,
-                reason,
-                fetch_failure.then_some(nzbd_types::FetchCause::Gone),
-                reason.as_str(),
-                "failed before its terminal was recorded",
-            )
-            .await;
+            if let Ok(Some(row)) = engine.export_job(j.id).await {
+                let (reason, fetch_cause) = unstamped_failure(&row);
+                let _ = fail_job_in(
+                    engine,
+                    history,
+                    j.id,
+                    reason,
+                    fetch_cause,
+                    reason.as_str(),
+                    "failed before its terminal was recorded",
+                )
+                .await;
+            }
             continue;
         }
         let needs_pp = !j.pp_done
@@ -4828,6 +4819,36 @@ async fn apply_pp_verdict(
     }
 }
 
+/// The reason for a `Failed` row that carries no stamp (failed by an earlier
+/// build, or imported): what its own `Failure:Reason` / fetch-cause params
+/// say (review #280-8). Without them, a URL job with no files failed its
+/// fetch — with an unknown cause, which never blames the release — and
+/// anything else failed on health.
+fn unstamped_failure(row: &Job) -> (nzbd_types::FailureReason, Option<nzbd_types::FetchCause>) {
+    let param = |key: &str| {
+        row.params
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    };
+    let fetch_cause = param(nzbd_engine::FETCH_CAUSE_PARAM)
+        .or_else(|| param("Failure:FetchCause"))
+        .and_then(nzbd_types::FetchCause::parse);
+    let reason = param("Failure:Reason")
+        .and_then(nzbd_types::FailureReason::parse)
+        .unwrap_or(
+            if row.kind == nzbd_types::JobKind::Url && row.files.is_empty() {
+                nzbd_types::FailureReason::Fetch
+            } else {
+                nzbd_types::FailureReason::Health
+            },
+        );
+    let fetch_cause = (reason == nzbd_types::FailureReason::Fetch)
+        .then_some(fetch_cause)
+        .flatten();
+    (reason, fetch_cause)
+}
+
 /// Record a post-processing-side failed terminal (contract §2.1) with the
 /// manager's history store. False when the job is gone or already terminal.
 async fn fail_job_in(
@@ -6797,6 +6818,34 @@ mod decision_tests {
             Some(
                 "archive extraction failed after configured tools and available repair; no verified output remains"
             )
+        );
+    }
+
+    /// Review #280-8: an unstamped failed row's reason comes from its own
+    /// params; a fetch failure with no recorded cause never guesses `gone`.
+    #[test]
+    fn unstamped_failure_reads_params_instead_of_guessing_gone() {
+        use nzbd_types::{FailureReason, FetchCause};
+        let mut url = job(vec![], vec![]);
+        url.kind = JobKind::Url;
+        assert_eq!(unstamped_failure(&url), (FailureReason::Fetch, None));
+        url.params.push((
+            nzbd_engine::FETCH_CAUSE_PARAM.into(),
+            "indexer_unavailable".into(),
+        ));
+        assert_eq!(
+            unstamped_failure(&url),
+            (FailureReason::Fetch, Some(FetchCause::IndexerUnavailable))
+        );
+        assert!(!FailureReason::Fetch.blames_release(Some(FetchCause::IndexerUnavailable)));
+        let recorded = job(
+            vec![file(1, "episode.mkv", None)],
+            vec![("Failure:Reason".into(), "io".into())],
+        );
+        assert_eq!(unstamped_failure(&recorded), (FailureReason::Io, None));
+        assert_eq!(
+            unstamped_failure(&job(vec![file(1, "episode.mkv", None)], vec![])),
+            (FailureReason::Health, None)
         );
     }
 
