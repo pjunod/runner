@@ -2201,7 +2201,7 @@ function rowModel(j, ctx) {
   }
 
   if (hold) {
-    rest.push(" · " + (hold.message || "job on hold") + (hold.manual_pause ? " · retries paused" : ""));
+    rest.push(" · " + holdCauseLabel(hold.cause) + ": " + (hold.message || "job on hold") + (hold.manual_pause ? " · retries paused" : ""));
     if (hold.retry_policy === "reobserve_mount")
       rest.push(" · waiting for the configured storage source; Runner will resume when it returns");
     if (!hold.manual_pause && ["scheduled_retry", "resume_same_job"].includes(hold.retry_policy) && hold.blocked_since_unix != null) {
@@ -2211,8 +2211,9 @@ function rowModel(j, ctx) {
       if (hold.next_retry_at_unix != null)
         rest.push(" · next retry in " + fmtDur(Math.max(0, hold.next_retry_at_unix * 1000 - (ctx.nowMs || Date.now()))));
     }
-    if (hold.deadline_unix != null)
-      rest.push(" · fails as hold expired in " + fmtDur(Math.max(0, hold.deadline_unix * 1000 - (ctx.nowMs || Date.now()))) + " unless it recovers");
+    const left = holdDeadlineLeftMs(hold, ctx.nowMs || Date.now());
+    if (left != null)
+      rest.push(" · fails as hold expired in " + fmtDur(left) + " unless it recovers");
   }
   if (j.verification) rest.push(" · " + recoveryVerificationText(j));
   const shownSt = over || controlPendingLabel(j) || (hold ? "held" : j.verification && st !== "paused" ? "verifying" : acquisitionStatus(j) || st);
@@ -5218,6 +5219,28 @@ function filesStateModel(a) {
   return { label: m[0], cls: "st " + m[1] };
 }
 function fileIsTerminal(a) { return a.state === "deleted" || a.state === "source_gone"; }
+// Contract v2 §2.3: environmental causes only, so each has a plain name. A
+// cause a newer node wrote is shown as it came.
+const HOLD_CAUSES = {
+  storage_unavailable: "storage unavailable", capacity: "out of space", quota: "quota reached",
+  allocation: "allocation failed", mount_unavailable: "mount unavailable", missing_tool: "tool missing",
+  engine_unavailable: "engine unavailable", password_required: "password required",
+};
+function holdCauseLabel(cause) { return HOLD_CAUSES[cause] || cause || "held"; }
+// Time left on a hold. `deadline_unix` gives a live countdown against this
+// browser's clock; `deadline_in_s` is the server's own remaining time at its
+// last control write (hosts share no clock), used when no unix time came.
+function holdDeadlineLeftMs(hold, nowMs) {
+  if (hold.deadline_unix != null) return Math.max(0, hold.deadline_unix * 1000 - nowMs);
+  if (hold.deadline_in_s != null) return Math.max(0, hold.deadline_in_s * 1000);
+  return null;
+}
+// Why a source was parked (`Failure:Reason`, contract §2.2).
+const FAILURE_REASONS = {
+  health: "too few articles", fetch: "fetch failed", par: "PAR2 repair failed", unpack: "unpack failed",
+  script: "script failed", publish: "publication failed", io: "disk error", identity: "conflicting data",
+  hold_expired: "hold expired",
+};
 function fileHoldText(a) {
   if (!a.hold) return "";
   if (a.hold === "review") return "on review hold";
@@ -5225,6 +5248,16 @@ function fileHoldText(a) {
   if (a.hold === "review: relocation staging") return "Temporary copy from a move — preserved for review before cleanup.";
   if (a.hold.startsWith("recovery:")) return "Recovery handoff in progress — originals are protected until import or cancellation finishes.";
   return a.hold.startsWith("review") ? "on review hold — " + a.hold.slice(7).replace(/^:\s*/, "") : a.hold;
+}
+/// Why a failed source is parked here: the typed reason, the assessment, and
+/// whether a salvage publication is still owed.
+function fileParkedText(a) {
+  if (a.state !== "parked_failed") return "";
+  const parts = [];
+  if (a.failure_reason) parts.push(FAILURE_REASONS[a.failure_reason] || a.failure_reason);
+  if (a.failure_assessment && a.failure_assessment.reason) parts.push(a.failure_assessment.reason);
+  if (a.salvage === "pending") parts.push("salvage pending");
+  return parts.length ? "Parked: " + parts.join(" · ") : "";
 }
 /// What will happen to the files, in one line.
 function fileRetentionText(a, earliest) {
@@ -5262,6 +5295,7 @@ function fileRowModel(e) {
     name: fileBaseName(a.path), tip: a.path, sub: fileParent(a.path),
     st: st.label, stCls: st.cls,
     hold: fileHoldText(a),
+    parked: fileParkedText(a),
     err: a.error || "",
     files: e.measured ? String(e.files) : "—",
     size: e.measured ? fmtBytes(e.bytes) : "—",
@@ -5288,6 +5322,7 @@ function buildFileRowKind(d) {
   const td2 = d.append(tr, d.create("td"));
   c.st = d.append(td2, d.create("span", "st"));
   c.hold = d.append(td2, d.create("div", "hold"));
+  c.parked = d.append(td2, d.create("div", "hold"));
   c.err = d.append(td2, d.create("div", "err"));
   c.files = d.append(tr, d.create("td", "num"));
   c.size = d.append(tr, d.create("td", "num"));
@@ -5315,6 +5350,7 @@ function applyFileRowKind(tr, m, d) {
   w("st", m.st, v => d.text(c.st, v));
   w("stCls", m.stCls, v => d.cls(c.st, v));
   w("hold", m.hold, v => { d.text(c.hold, v); d.prop(c.hold, "hidden", !v); });
+  w("parked", m.parked, v => { d.text(c.parked, v); d.prop(c.parked, "hidden", !v); });
   w("err", m.err, v => { d.text(c.err, v); d.prop(c.err, "hidden", !v); });
   w("files", m.files, v => d.text(c.files, v));
   w("size", m.size, v => d.text(c.size, v));
@@ -5389,7 +5425,7 @@ function fileDetailModel(dt) {
   else if (a.hold && !terminal) note = "A hold pauses retention until it is released.";
   return {
     key: "fd" + a.id, kind: "fdetail", id: a.id,
-    sig: [a.id, a.revision, dt.offset, dt.total, dt.files.length, a.error || "", a.hold || "", a.keep, a.owned,
+    sig: [a.id, a.revision, dt.offset, dt.total, dt.files.length, a.error || "", a.hold || "", a.failure_reason || "", a.salvage || "", a.keep, a.owned,
           a.state, JSON.stringify(a.workspace_cleanup || null), [...sel].sort().join("\n"), selectingAll, measuring, deleting, dt.events.length, dt.preview ? dt.preview.text : "", a.inspected_at || 0,
           (dt.relocations || []).map(op => op.id + ":" + op.state).join(","),
           handoffs.map(h => h.id + ":" + h.state + ":" + h.error + ":" + h.cancelling).join(",")].join("|"),
@@ -5399,6 +5435,7 @@ function fileDetailModel(dt) {
       ["state", filesStateModel(a).label],
       ["ownership", a.owned ? "owned by Runner" : "not owned"],
       ["hold", fileHoldText(a) || "none"],
+      ...(fileParkedText(a) ? [["parked", fileParkedText(a)]] : []),
       ["files", measured ? String(fileCount) : "—"],
       ["size", measured ? fmtBytes(bytes) : "—"],
       ["measured", a.inspected_at ? fmtAgo(a.inspected_at) : measured ? "at completion" : "never"],

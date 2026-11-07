@@ -402,6 +402,9 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   ok(!heldRow.dRest.includes("needs review"), "no hold is a review item");
   const deadlined = T.rowModel(held, { mixedSection: false, nowMs: 3600 * 1000 });
   ok(deadlined.dRest.includes("fails as hold expired in"), "a hold shows its deadline");
+  ok(deadlined.dRest.includes("storage unavailable: conflicting yEnc"), "a hold names its cause before its message");
+  const relative = T.rowModel({ ...held, control: { ...held.control, deadline_unix: undefined, deadline_in_s: 7200 } }, { mixedSection: false });
+  ok(relative.dRest.includes("fails as hold expired in 2h"), "a hold with only deadline_in_s still shows its deadline");
   const legacyReview = T.rowModel({ ...held, control: { ...held.control, retry_policy: "review" } });
   eq(legacyReview.pauseLabel, "pause", "a policy from an older build is still an automatic hold");
   const storageHold = { ...held.control, cause: "storage_unavailable", stage: "download_write",
@@ -2487,6 +2490,11 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     ok(owned.ret.startsWith("expires "), `retention names the expiry (got ${owned.ret})`);
     const kept = T.fileRowModel(entry("Kept", { state: "retained", owned: true, keep: true, hold: null }, 1, 1, true));
     eq(kept.ret, "keep indefinitely", "keep reads as keep");
+    const parked = T.fileRowModel({ ...entry("Bad.Archive", { state: "parked_failed", owned: true, keep: false, hold: null,
+      failure_reason: "unpack", salvage: "pending", failure_assessment: { disposition: "unusable", reason: "archive is corrupt", assessedAt: 1 } }, 3, 100, true), earliest_expiry: 1790700000 });
+    eq(parked.parked, "Parked: unpack failed · archive is corrupt · salvage pending", "a parked source says why it is parked");
+    ok(parked.ret.startsWith("expires "), "…and when it expires");
+    eq(T.fileRowModel(entry("Plain", { state: "retained" })).parked, "", "only parked sources carry a reason");
     const active = T.fileRowModel(entry("Live", { state: "active" }));
     eq(active.inspectHidden, true, "a folder still being written cannot be walked");
     eq(active.st, "downloading", "active reads as downloading");
