@@ -1994,7 +1994,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        // Contract v2: accept is a 200 no-op whatever the body says, and
+        // records no receipt.
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
         assert_eq!(
             store
                 .cluster_delivery("encoded:sha256:receipt")
@@ -2004,7 +2006,7 @@ mod tests {
                 .delivery
                 .consumer_receipt_id
                 .as_deref(),
-            Some("encoded-consumer")
+            None
         );
         drop(queue_serial);
         for id in ["bad%ZZ", "bad%2Fsegment", "bad%FF"] {
