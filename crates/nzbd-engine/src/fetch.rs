@@ -356,6 +356,42 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    /// Contract §2.2 / plan M1 (l): the retried classes are an unavailable
+    /// indexer; what the fetcher does not retry is the indexer answering for
+    /// this item.
+    #[test]
+    fn fetch_404_is_gone_fetch_503_exhausted_is_indexer_unavailable() {
+        use nzbd_types::FetchCause;
+        let status = |code: u16| FetchError::HttpStatus {
+            status: hyper::StatusCode::from_u16(code).unwrap(),
+            retry_after: None,
+        };
+        for code in [404, 410, 403, 400, 500] {
+            assert_eq!(cause_of(&status(code)), FetchCause::Gone, "{code}");
+        }
+        for code in [429, 503] {
+            assert_eq!(
+                cause_of(&status(code)),
+                FetchCause::IndexerUnavailable,
+                "{code}"
+            );
+        }
+        assert_eq!(
+            cause_of(&FetchError::Timeout),
+            FetchCause::IndexerUnavailable
+        );
+        assert_eq!(
+            cause_of(&FetchError::TransientNetwork("reset".into())),
+            FetchCause::IndexerUnavailable
+        );
+        assert_eq!(cause_of(&FetchError::TooManyRedirects), FetchCause::Gone);
+        assert_eq!(cause_of(&FetchError::BadUrl("x".into())), FetchCause::Gone);
+        assert!(nzbd_types::FailureReason::Fetch.blames_release(Some(FetchCause::Gone)));
+        assert!(
+            !nzbd_types::FailureReason::Fetch.blames_release(Some(FetchCause::IndexerUnavailable))
+        );
+    }
     use super::*;
     use std::io::{Read as _, Write as _};
 

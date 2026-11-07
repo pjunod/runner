@@ -5409,16 +5409,6 @@ impl Owner {
                 owner.publish_now();
                 owner.emit(Event::UrlFetchResolved { job });
                 if failed {
-                    owner.emit(Event::JobFinished {
-                        job,
-                        name: owner
-                            .state
-                            .job(job)
-                            .map(|row| row.name.clone())
-                            .unwrap_or_default(),
-                        status: JobStatus::Failed,
-                        health: 0,
-                    });
                     // Contract §2.1: the fetcher's terminal, typed at its
                     // own site. Without a fetch cause the source failed
                     // locally (a storage refusal), which is `io`.
@@ -5441,7 +5431,27 @@ impl Owner {
                     } else {
                         nzbd_types::FailureReason::Io
                     };
-                    owner.fail_job_terminal(job, reason, cause, "fetch", &message);
+                    let name = owner
+                        .state
+                        .job(job)
+                        .map(|row| row.name.clone())
+                        .unwrap_or_default();
+                    // The advisory `job_finished` follows the terminal.
+                    owner.fail_job_terminal_then(
+                        job,
+                        reason,
+                        cause,
+                        "fetch",
+                        &message,
+                        Box::new(move |owner, _| {
+                            owner.emit(Event::JobFinished {
+                                job,
+                                name,
+                                status: JobStatus::Failed,
+                                health: 0,
+                            });
+                        }),
+                    );
                 }
                 owner.bump_epoch();
                 callback(owner, Ok(true));

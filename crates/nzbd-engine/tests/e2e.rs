@@ -1703,6 +1703,26 @@ async fn url_jobs_fetch_then_download() {
     let (status, _) = wait_finished(&mut rx, dead, 30).await;
     assert_eq!(status, JobStatus::Failed);
     dead_response.join().unwrap();
+    // Contract §2.2 / plan M1 (l): the fetcher types its own terminal. A
+    // 404 is the indexer answering for this item: `fetch{gone}`, blamed.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let terminal = loop {
+        if let Some(terminal) = engine
+            .artifacts()
+            .terminal(dead.0)
+            .unwrap()
+            .filter(|t| t.emitted)
+        {
+            break terminal;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no fetch terminal");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Fetch));
+    assert_eq!(terminal.fetch_cause, Some(nzbd_types::FetchCause::Gone));
+    assert!(terminal.blames_release);
+    assert_eq!(terminal.salvage, nzbd_state::artifacts::SalvageState::None);
+    assert_eq!(terminal.stage.as_deref(), Some("fetch"));
     engine.shutdown().await;
 }
 

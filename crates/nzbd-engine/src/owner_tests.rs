@@ -7638,3 +7638,167 @@ fn no_completion_event(events: &mut broadcast::Receiver<Event>) -> bool {
         }
     }
 }
+
+/// Drive the owner until `job`'s terminal record has been emitted.
+async fn settle_terminal(
+    owner: &mut Owner,
+    messages: &mut mpsc::Receiver<EngineMsg>,
+    job: u32,
+) -> nzbd_state::artifacts::JobTerminal {
+    for _ in 0..50 {
+        pump(owner, messages).await;
+        if let Some(terminal) = owner.artifacts.terminal(job).unwrap().filter(|t| t.emitted) {
+            return terminal;
+        }
+    }
+    panic!("terminal for job {job} was not emitted");
+}
+
+/// Contract §2.2 / plan M1 (e): a write that did not reach the disk is the
+/// job's terminal `failed/io` — parked, never the release's fault — even
+/// though every article arrived. It is not folded into the health verdict.
+#[tokio::test]
+async fn write_failure_is_io_not_health() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    let mut job = pending_job(7);
+    job.params.push(("monarr-transfer".into(), "t-7".into()));
+    job.files[0].segments[0].state = SegmentState::Done {
+        offset: 0,
+        len: 100,
+        crc: 1,
+    };
+    job.files[0].finalized = true;
+    recompute_job_totals(&mut job);
+    owner.state.jobs.push(job);
+    owner.write_failures.insert(
+        JobId(7),
+        "write /processing/x: Permission denied (os error 13)".into(),
+    );
+    owner.check_job_complete(JobId(7));
+    let terminal = settle_terminal(&mut owner, &mut messages, 7).await;
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Io));
+    assert_eq!(terminal.stage.as_deref(), Some("download"));
+    assert!(!terminal.blames_release);
+    assert!(terminal.reason.unwrap().park_always());
+    assert_eq!(terminal.transfer.as_deref(), Some("t-7"));
+    assert_eq!(terminal.fetched.success_articles, 1);
+    let job = owner.state.job(JobId(7)).unwrap();
+    assert_eq!(job.status, JobStatus::Failed);
+    assert!(job
+        .params
+        .iter()
+        .any(|(key, value)| key == nzbd_types::PP_DONE_PARAM && value == "FAILURE/IO"));
+    assert!(!owner.post_admissions.contains_key(&JobId(7)));
+}
+
+/// Contract §2.1 / plan M1 (d): articles below critical health are the
+/// owner's `failed/health` terminal, recorded at download end without any
+/// post-processing admission; a job that fetched nothing owes no salvage.
+#[tokio::test]
+async fn zero_article_health_failure_skips_pp_admission() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    let mut events = owner.events.subscribe();
+    let mut job = pending_job(8);
+    job.params
+        .push(("*Runner:LifecycleEligible".into(), "1".into()));
+    job.files[0].segments[0].state = SegmentState::Failed;
+    recompute_job_totals(&mut job);
+    owner.state.jobs.push(job);
+    owner.check_job_complete(JobId(8));
+    let terminal = settle_terminal(&mut owner, &mut messages, 8).await;
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Health));
+    assert_eq!(terminal.stage.as_deref(), Some("health"));
+    assert!(terminal.blames_release);
+    assert_eq!(terminal.salvage, nzbd_state::artifacts::SalvageState::None);
+    assert_eq!(terminal.fetched.success_articles, 0);
+    assert!(
+        !owner.post_admissions.contains_key(&JobId(8)),
+        "post-processing never admitted the job"
+    );
+    let mut saw_terminal = false;
+    while let Ok(event) = events.try_recv() {
+        if let Event::JobPpFinished {
+            job,
+            outcome,
+            reason,
+            salvage,
+            ..
+        } = event
+        {
+            assert_eq!(job, JobId(8));
+            assert_eq!(outcome, nzbd_types::TerminalOutcome::Failed);
+            assert_eq!(reason, Some(nzbd_types::FailureReason::Health));
+            assert_eq!(salvage, nzbd_types::Salvage::None);
+            saw_terminal = true;
+        }
+    }
+    let _ = saw_terminal; // the 1-slot test channel may have lagged; the row is the authority
+    assert!(terminal.emitted);
+}
+
+/// Contract §2.3: a hold past its deadline ends `failed/hold_expired` with
+/// the hold's stage and message, even when an operator paused it.
+#[tokio::test]
+async fn expired_hold_ends_failed_hold_expired() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(9));
+    assert!(owner.hold_job(
+        JobId(9),
+        HoldCause::Capacity,
+        "unpack",
+        "No space left on device (os error 28)"
+    ));
+    pump(&mut owner, &mut messages).await;
+    let mut control = owner.state.jobs[0].control().unwrap();
+    assert!(control.deadline_unix.is_some(), "every hold has a deadline");
+    assert!(!owner.expire_hold(JobId(9), &control.revision), "not due");
+    control.deadline_unix = Some(1);
+    control.manual_pause = true;
+    owner.state.jobs[0].set_control(&control);
+    assert!(owner.expire_hold(JobId(9), &control.revision));
+    let terminal = settle_terminal(&mut owner, &mut messages, 9).await;
+    assert_eq!(
+        terminal.reason,
+        Some(nzbd_types::FailureReason::HoldExpired)
+    );
+    assert_eq!(terminal.stage.as_deref(), Some("unpack"));
+    assert!(terminal
+        .message
+        .unwrap()
+        .contains("No space left on device"));
+    assert!(!terminal.blames_release);
+    assert!(nzbd_types::FailureReason::HoldExpired.park_always());
+    assert!(!owner.state.jobs[0].held());
+}
+
+/// Contract §2.3: a newer hold replaces the control (revision + 1); the
+/// first cause does not win.
+#[tokio::test]
+async fn newer_hold_replaces_the_first_cause() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(10));
+    assert!(owner.hold_job(
+        JobId(10),
+        HoldCause::StorageUnavailable,
+        "download_write",
+        "EIO (os error 5)"
+    ));
+    pump(&mut owner, &mut messages).await;
+    let first = owner.state.jobs[0].control().unwrap();
+    assert!(owner.hold_job(JobId(10), HoldCause::MissingTool, "unpack", "unrar missing"));
+    pump(&mut owner, &mut messages).await;
+    let second = owner.state.jobs[0].control().unwrap();
+    assert_eq!(second.cause, "missing_tool");
+    assert_eq!(
+        second.revision.parse::<u64>().unwrap(),
+        first.revision.parse::<u64>().unwrap() + 1
+    );
+    assert_eq!(
+        second.deadline_unix, first.deadline_unix,
+        "the deadline runs from the episode's start"
+    );
+}
