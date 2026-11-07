@@ -548,7 +548,6 @@ async fn recover_download_holds(
             .filter(|control| {
                 control.lifecycle == "held"
                     && !control.manual_pause
-                    && control.hold_cause().policy().automatic()
                     && (control
                         .next_retry_at_unix
                         .is_some_and(|deadline| deadline <= now)
@@ -1855,7 +1854,7 @@ fn run_pp_lease(
             // Restored checkpoints keep their original absolute deadline and
             // first blocked time. Heartbeats run independently while waiting.
             if let Some(control)=engine.export_job(job_id).await.ok().flatten().and_then(|job|job.control()).filter(|control|control.lifecycle=="held") {
-                if !control.hold_cause().policy().automatic() || control.manual_pause {
+                if control.manual_pause {
                     tokio::select!{_=initial.cancel.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_secs(1))=>{}}
                     continue;
                 }

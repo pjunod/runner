@@ -2397,9 +2397,9 @@ async fn worker_restart_regrant_preserves_retry_deadline_and_private_generation(
             );
         }
         worker.runtime.engine.snapshot().jobs.iter().any(|job| {
-            job.control.as_ref().is_some_and(|control| {
-                control.lifecycle == "held" && control.hold_cause().policy().automatic()
-            })
+            job.control
+                .as_ref()
+                .is_some_and(|control| control.lifecycle == "held")
         })
     })
     .await;
@@ -2451,9 +2451,9 @@ async fn worker_restart_regrant_preserves_retry_deadline_and_private_generation(
         20,
         || {
             restarted.runtime.engine.snapshot().jobs.iter().any(|job| {
-                job.control.as_ref().is_some_and(|control| {
-                    control.lifecycle == "held" && control.hold_cause().policy().automatic()
-                })
+                job.control
+                    .as_ref()
+                    .is_some_and(|control| control.lifecycle == "held")
             })
         },
     )

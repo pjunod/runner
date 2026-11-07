@@ -407,34 +407,37 @@ impl TorrentAdmissionService {
                 TorrentError::TorrentSourceRequestFailed { .. }
                 | TorrentError::TorrentSourceTimeout { .. }
                 | TorrentError::MagnetMetadataTimeout,
-            ) => (nzbd_types::HoldCause::StorageUnavailable, None, false),
+            ) => (Some(nzbd_types::HoldCause::StorageUnavailable), None, false),
             AdmissionError::Torrent(TorrentError::TorrentSourceRetry {
                 not_before_unix, ..
             }) => (
-                nzbd_types::HoldCause::StorageUnavailable,
+                Some(nzbd_types::HoldCause::StorageUnavailable),
                 *not_before_unix,
                 false,
             ),
             AdmissionError::Torrent(TorrentError::TorrentSourceHttpStatus { status, .. })
                 if *status >= 500 =>
             {
-                (nzbd_types::HoldCause::StorageUnavailable, None, false)
+                (Some(nzbd_types::HoldCause::StorageUnavailable), None, false)
             }
             AdmissionError::Io(error) => {
                 (nzbd_engine::io_hold_cause(&error.to_string()), None, false)
             }
             AdmissionError::Engine(nzbd_engine::EngineError::Lifecycle(message))
-                if nzbd_engine::io_hold_cause(message).policy().automatic() =>
+                if nzbd_engine::io_hold_cause(message).is_some() =>
             {
                 (nzbd_engine::io_hold_cause(message), None, false)
             }
             AdmissionError::State(nzbd_state::StateError::Io { source, .. }) => {
                 (nzbd_engine::io_hold_cause(&source.to_string()), None, false)
             }
-            AdmissionError::Engine(_) | AdmissionError::State(_) => {
-                (nzbd_types::HoldCause::IdentityConflict, None, false)
-            }
-            _ => (nzbd_types::HoldCause::Io, None, true),
+            // Contract §2.3: only environmental causes hold; anything else
+            // ends the acquisition rather than waiting on a review.
+            _ => (None, None, true),
+        };
+        let (cause, permanent) = match cause {
+            Some(cause) => (cause, permanent),
+            None => (nzbd_types::HoldCause::StorageUnavailable, true),
         };
         if permanent {
             if self.engine.fail_native_torrent(id,None,"torrent_metadata".into(),"Torrent metadata is invalid or permanently unavailable; start a fresh Grab to change the source".into(),false).await.unwrap_or(false) {
@@ -1252,15 +1255,16 @@ impl TorrentAdmissionService {
         if !nzbd_engine::torrent_acquisitions::is_managed_seed(&job) {
             return;
         }
+        // A managed seed runs after its terminal; its recovery is retried
+        // as storage (contract §2.1: seed retirement never ends the job).
         let mut cause = match error {
             AdmissionError::Io(error) => nzbd_engine::io_hold_cause(&error.to_string()),
-            AdmissionError::Engine(nzbd_engine::EngineError::Lifecycle(message))
-                if nzbd_engine::io_hold_cause(message).policy().automatic() =>
-            {
+            AdmissionError::Engine(nzbd_engine::EngineError::Lifecycle(message)) => {
                 nzbd_engine::io_hold_cause(message)
             }
-            _ => nzbd_types::HoldCause::IdentityConflict,
-        };
+            _ => None,
+        }
+        .unwrap_or(nzbd_types::HoldCause::StorageUnavailable);
         if matches!(
             error,
             AdmissionError::Torrent(nzbd_torrent::TorrentError::DuplicateEngineIdentity)
@@ -1291,31 +1295,15 @@ impl TorrentAdmissionService {
                 }
             }
         }
-        if self
+        let _ = self
             .engine
             .hold_job(
                 id,
-                cause.clone(),
+                cause,
                 stage,
                 "Native seed association or retirement requires recovery; payload source retained",
             )
-            .await
-            .unwrap_or(false)
-            && !cause.policy().automatic()
-        {
-            for child in &self.engine.snapshot().jobs {
-                if child.seed_donor_job_id == Some(id) && !child.pp_done {
-                    if let Ok(Some(row)) = self.engine.export_job(child.id).await {
-                        if !row.params.iter().any(|(key, value)| {
-                            key == nzbd_engine::torrent_acquisitions::COPY_COMPLETE_PARAM
-                                && value == "1"
-                        }) {
-                            let _ = self.engine.hold_job(row.id,cause.clone(),"torrent_source","The seed source requires review; retry the seed donor before this acquisition").await;
-                        }
-                    }
-                }
-            }
-        }
+            .await;
     }
 
     async fn advance_seed_retirement(&self, seed: &nzbd_types::Job) -> Result<(), AdmissionError> {
@@ -1345,7 +1333,17 @@ impl TorrentAdmissionService {
                 file.selected && file.length > 0 && file.downloaded_bytes >= file.length
             })
         {
-            self.engine.hold_job(seed.id,nzbd_types::HoldCause::PostFailure,"torrent_attach","Failed seed source has no current verified-file proof; retained for review or explicit removal").await?;
+            // Contract §2.1: a torrent that stops without a verified payload is
+            // terminal `failed/io`; its bytes are parked (salvage pending).
+            self.engine
+                .fail_job(
+                    seed.id,
+                    nzbd_types::FailureReason::Io,
+                    None,
+                    "torrent_attach",
+                    "Failed seed source has no current verified-file proof",
+                )
+                .await?;
             return Ok(());
         }
         if nzbd_engine::torrent_acquisitions::seed_retirement(seed).is_none() {
@@ -1410,7 +1408,6 @@ impl TorrentAdmissionService {
                             control.stage.as_str(),
                             "torrent_attach" | "torrent_seed_forget"
                         ) && !control.manual_pause
-                            && control.hold_cause().policy().automatic()
                             && control
                                 .next_retry_at_unix
                                 .is_some_and(|at| at <= unix_now())
@@ -1506,11 +1503,15 @@ impl TorrentAdmissionService {
                 let metainfo = match self.read_seed_descriptor(&donor).await {
                     Ok(bytes) => bytes,
                     Err(error) => {
+                        // The donor's descriptor is unreadable: the
+                        // acquisition cannot proceed (terminal failed/io).
                         self.engine
-                            .hold_torrent_acquisition(
+                            .fail_job(
                                 job.id,
-                                nzbd_types::HoldCause::IdentityConflict,
-                                error.to_string(),
+                                nzbd_types::FailureReason::Io,
+                                None,
+                                "torrent_source",
+                                &error.to_string(),
                             )
                             .await
                             .ok();
@@ -1608,17 +1609,35 @@ impl TorrentAdmissionService {
                             Ok(Err(nzbd_state::artifacts::Error::Io(error)))
                                 if error.kind() == std::io::ErrorKind::WouldBlock =>
                             {
-                                nzbd_types::HoldCause::StorageUnavailable
+                                Some(nzbd_types::HoldCause::StorageUnavailable)
                             }
                             Ok(Err(nzbd_state::artifacts::Error::Io(error))) => {
                                 nzbd_engine::io_hold_cause(&error.to_string())
                             }
-                            _ => nzbd_types::HoldCause::IdentityConflict,
+                            _ => None,
                         };
-                        let _ = self
-                            .engine
-                            .hold_torrent_acquisition(id, cause, message)
-                            .await;
+                        match cause {
+                            Some(cause) => {
+                                let _ = self
+                                    .engine
+                                    .hold_torrent_acquisition(id, cause, message)
+                                    .await;
+                            }
+                            // Contract §2.2: a copy that cannot succeed is the
+                            // acquisition's terminal `failed/io`.
+                            None => {
+                                let _ = self
+                                    .engine
+                                    .fail_job(
+                                        id,
+                                        nzbd_types::FailureReason::Io,
+                                        None,
+                                        "torrent_source",
+                                        &message,
+                                    )
+                                    .await;
+                            }
+                        }
                     }
                 }
                 break;

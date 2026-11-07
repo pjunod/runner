@@ -1905,25 +1905,73 @@ fn event_json(ev: &nzbd_engine::Event) -> (&'static str, serde_json::Value) {
             job,
             name,
             category,
+            transfer,
+            outcome,
+            reason,
+            fetch_cause,
+            stage,
+            message,
+            blames_release,
+            salvage,
+            keep_on_failure,
+            fetched,
+            publication,
             pp_status,
             final_dir,
             size_bytes,
             health,
             params,
             history_seq,
+            history_incarnation,
         } => (
             "job_pp_finished",
             json!({
                 "job": job.0,
                 "name": name,
                 "category": category,
+                "transfer": transfer,
+                "outcome": outcome.as_str(),
+                "reason": reason.map(|r| r.as_str()),
+                "fetch_cause": fetch_cause.map(|c| c.as_str()),
+                "stage": stage,
+                "message": message,
+                "blames_release": blames_release,
+                "salvage": salvage.as_str(),
+                "keep_on_failure": keep_on_failure,
+                "fetched": fetched,
+                "publication": publication,
                 "pp_status": pp_status,
                 "final_dir": final_dir,
                 "size_bytes": size_bytes,
                 "health": health,
                 "params": params,
                 "history_seq": history_seq,
+                "history_incarnation": history_incarnation,
             }),
+        ),
+        E::JobStatusChanged {
+            job,
+            transfer,
+            status,
+            stage,
+            control,
+        } => (
+            "job_status_changed",
+            json!({
+                "job": job.0,
+                "transfer": transfer,
+                "status": status,
+                "stage": stage,
+                "control": control,
+            }),
+        ),
+        E::JobPublicationReady {
+            job,
+            transfer,
+            publication,
+        } => (
+            "job_publication_ready",
+            json!({"job": job.0, "transfer": transfer, "publication": publication}),
         ),
     }
 }
@@ -3319,6 +3367,8 @@ mod tests {
             verification: None,
             repair_progress: None,
             control: None,
+            status_projected: status.as_str().into(),
+            transfer: None,
             lifecycle_eligible: false,
             url_fetch: None,
             failed_cleanup: None,
@@ -3577,9 +3627,9 @@ mod tests {
         engine
             .hold_job(
                 id,
-                nzbd_types::HoldCause::IdentityConflict,
+                nzbd_types::HoldCause::MountUnavailable,
                 "download_write",
-                "conflicting yEnc declared size",
+                "configured root identity changed",
             )
             .await
             .unwrap();
@@ -5227,12 +5277,34 @@ mod tests {
             job: JobId(7),
             name: "Show.S01E01".into(),
             category: Some("tv".into()),
+            transfer: Some("t-42-a3f9c1".into()),
+            outcome: nzbd_types::TerminalOutcome::Completed,
+            reason: None,
+            fetch_cause: None,
+            stage: None,
+            message: None,
+            blames_release: false,
+            salvage: nzbd_types::Salvage::None,
+            keep_on_failure: false,
+            fetched: nzbd_types::Fetched {
+                success_articles: 10,
+                total_articles: 10,
+                bytes: 42,
+            },
+            publication: Some(nzbd_types::Publication {
+                path: "/dest/Show.S01E01".into(),
+                generation: "29c8".into(),
+                manifest_digest: "a0ac".into(),
+                files: 1,
+                cross_volume: false,
+            }),
             pp_status: "SUCCESS".into(),
             final_dir: Some("/dest/Show.S01E01".into()),
             size_bytes: 42,
             health: 1000,
             params: vec![("monarr-transfer".into(), "t-42-a3f9c1".into())],
             history_seq: 913,
+            history_incarnation: "7f3a".into(),
         });
         assert_eq!(name, "job_pp_finished");
         assert!(
@@ -5244,5 +5316,70 @@ mod tests {
             data.contains("monarr-transfer"),
             "the transfer id must survive to the wire: {data}"
         );
+        for field in [
+            "\"transfer\":\"t-42-a3f9c1\"",
+            "\"outcome\":\"completed\"",
+            "\"salvage\":\"none\"",
+            "\"history_incarnation\":\"7f3a\"",
+            "\"manifest_digest\":\"a0ac\"",
+            "\"cross_volume\":false",
+            "\"success_articles\":10",
+        ] {
+            assert!(data.contains(field), "{field} missing: {data}");
+        }
+        let (name, data) = wire(&E::JobPpFinished {
+            job: JobId(8),
+            name: "Show.S01E02".into(),
+            category: None,
+            transfer: Some("t-43".into()),
+            outcome: nzbd_types::TerminalOutcome::Failed,
+            reason: Some(nzbd_types::FailureReason::Fetch),
+            fetch_cause: Some(nzbd_types::FetchCause::IndexerUnavailable),
+            stage: Some("fetch".into()),
+            message: Some("http: status 503".into()),
+            blames_release: false,
+            salvage: nzbd_types::Salvage::None,
+            keep_on_failure: false,
+            fetched: Default::default(),
+            publication: None,
+            pp_status: "FAILURE/FETCH".into(),
+            final_dir: None,
+            size_bytes: 0,
+            health: 0,
+            params: vec![],
+            history_seq: 914,
+            history_incarnation: "7f3a".into(),
+        });
+        assert_eq!(name, "job_pp_finished");
+        for field in [
+            "\"reason\":\"fetch\"",
+            "\"fetch_cause\":\"indexer_unavailable\"",
+            "\"blames_release\":false",
+            "\"publication\":null",
+        ] {
+            assert!(data.contains(field), "{field} missing: {data}");
+        }
+        let (name, data) = wire(&E::JobStatusChanged {
+            job: JobId(9),
+            transfer: None,
+            status: "held".into(),
+            stage: None,
+            control: None,
+        });
+        assert_eq!(name, "job_status_changed");
+        assert!(data.contains("\"status\":\"held\""), "{data}");
+        let (name, data) = wire(&E::JobPublicationReady {
+            job: JobId(9),
+            transfer: Some("t-9".into()),
+            publication: nzbd_types::Publication {
+                path: "/c/x.runner-1".into(),
+                generation: "1".into(),
+                manifest_digest: "ab".into(),
+                files: 2,
+                cross_volume: false,
+            },
+        });
+        assert_eq!(name, "job_publication_ready");
+        assert!(data.contains("\"files\":2"), "{data}");
     }
 }

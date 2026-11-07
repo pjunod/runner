@@ -618,7 +618,8 @@ async fn legacy_repair_timeout_recovers_automatically_and_records_terminal_failu
         assert!(engine
             .hold_job(
                 JobId(2301),
-                nzbd_types::HoldCause::PostFailure,
+                // A control persisted by a pre-v2 build.
+                nzbd_types::HoldCause::Unrecognized("post_failure".into()),
                 "par_repair",
                 "subprocess failed: read live Keep setting: engine is shutting down",
             )
@@ -3611,7 +3612,7 @@ async fn manager_operator_retry_of_held_unpack_uses_existing_restart_action() {
     assert!(engine
         .hold_job(
             JobId(812),
-            nzbd_types::HoldCause::PostFailure,
+            nzbd_types::HoldCause::MissingTool,
             "unpack",
             "extraction failed"
         )
@@ -3703,7 +3704,7 @@ async fn held_move_retry_reuses_a_verified_successful_extraction() {
     assert!(engine
         .hold_job(
             JobId(813),
-            nzbd_types::HoldCause::PostFailure,
+            nzbd_types::HoldCause::StorageUnavailable,
             "move",
             "destination conflict"
         )
