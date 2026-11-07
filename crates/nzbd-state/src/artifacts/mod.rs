@@ -20,7 +20,9 @@ mod relocation;
 pub use delivery::{Delivery, DeliveryFile, DeliveryFileOutcome, DeliveryRunnerStages};
 pub use relocation::{RelocationResult, SelectedPublication};
 mod startup;
+mod terminals;
 pub use startup::StartupReconciliation;
+pub use terminals::{JobTerminal, SalvageOutcome, SalvageState, TerminalStep};
 mod tasks;
 mod torrent;
 pub use torrent::TorrentSourceReader;
@@ -175,6 +177,11 @@ pub struct Artifact {
     /// "not measured yet" until this is set — never "empty".
     #[serde(default)]
     pub inspected_at: Option<i64>,
+    /// Contract §2.2/§2.6: the salvage obligation the job's terminal record
+    /// put on this source (`pending`, then `published` or `settled_none`).
+    /// Mirrored from `job_terminals`, which is the authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salvage: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -655,6 +662,8 @@ impl Inventory {
           CREATE TABLE IF NOT EXISTS deliveries(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,artifact TEXT NOT NULL,generation TEXT NOT NULL,data TEXT NOT NULL,accepted_at INTEGER,consumer_receipt_id TEXT,cleanup_status TEXT NOT NULL DEFAULT 'pending',cleanup_error TEXT,cleanup_attempts INTEGER NOT NULL DEFAULT 0,cleanup_next_retry_at INTEGER,cleanup_blocked_since INTEGER,cleanup_started_at INTEGER,cleanup_last_attempt_at INTEGER,cleanup_completed_at INTEGER,UNIQUE(artifact,generation));
           CREATE TABLE IF NOT EXISTS delivery_cleanup_attempts(delivery_id TEXT NOT NULL,attempt INTEGER NOT NULL,started_at INTEGER NOT NULL,ended_at INTEGER,wait_ms INTEGER NOT NULL DEFAULT 0,outcome TEXT NOT NULL,error TEXT,PRIMARY KEY(delivery_id,attempt));
           CREATE INDEX IF NOT EXISTS deliveries_recent ON deliveries(sequence);
+          CREATE TABLE IF NOT EXISTS job_terminals(job INTEGER PRIMARY KEY,transfer TEXT,outcome TEXT NOT NULL,reason TEXT,fetch_cause TEXT,stage TEXT,message TEXT,blames_release INTEGER NOT NULL DEFAULT 0,salvage TEXT NOT NULL,keep_on_failure INTEGER NOT NULL DEFAULT 0,fetched TEXT NOT NULL,publication TEXT,markers TEXT NOT NULL,entry TEXT NOT NULL,history_seq INTEGER,history_incarnation TEXT,markers_stamped INTEGER NOT NULL DEFAULT 0,emitted INTEGER NOT NULL DEFAULT 0,disposal TEXT,salvage_error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+          CREATE INDEX IF NOT EXISTS job_terminals_salvage ON job_terminals(salvage);
           CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT,artifact TEXT NOT NULL,at INTEGER NOT NULL,kind TEXT NOT NULL,detail TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS events_artifact ON events(artifact,seq);
           INSERT OR IGNORE INTO meta VALUES('schema','1');
@@ -1232,6 +1241,7 @@ impl Inventory {
             files: Vec::new(),
             error: None,
             inspected_at: None,
+            salvage: None,
         };
         save_artifact(&db, &a)?;
         drop(db);
@@ -1813,6 +1823,7 @@ impl Inventory {
             files: Vec::new(),
             error: None,
             inspected_at: None,
+            salvage: None,
         };
         save_artifact(&db, &a)?;
         Ok(a)
@@ -3002,6 +3013,7 @@ impl Inventory {
             files: fs::manifest(&dir, 100_000)?,
             error: None,
             inspected_at: Some(now()),
+            salvage: None,
         };
         self.sidecar(&a)?;
         let _coordinator = self.mutation_guard()?;

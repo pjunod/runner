@@ -531,6 +531,8 @@ impl Inventory {
                             next_retry_at_unix: None,
                             blocked_since_unix: None,
                             released_at_unix: None,
+                            deadline_in_s: None,
+                            deadline_unix: None,
                         });
                         return Ok(Some(WorkerRetryAdoption {
                             source,
@@ -889,6 +891,8 @@ mod tests {
             next_retry_at_unix: Some(999999),
             blocked_since_unix: Some(123),
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         };
         job.status = nzbd_types::JobStatus::Downloading;
         job.params
@@ -1034,6 +1038,8 @@ mod tests {
             next_retry_at_unix: Some(999999),
             blocked_since_unix: Some(123),
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         };
         job.set_control(&control);
         inventory.checkpoint_worker_control(&job, "1").unwrap();

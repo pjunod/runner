@@ -213,6 +213,14 @@ impl HistoryDb {
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);",
         )
         .map_err(|e| StateError::Corrupt(format!("sqlite meta schema: {e}")))?;
+        // Text-valued node-local facts. `incarnation` names this index: a
+        // wiped or freshly rebuilt index reassigns rowids, so a consumer's
+        // `since_seq` cursor is meaningful only against the incarnation it
+        // was read from (pipeline contract v2 §2.5).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .map_err(|e| StateError::Corrupt(format!("sqlite history_meta schema: {e}")))?;
         // Derived from portable JSONL tombstones. Keeping the set in SQLite
         // makes the delete win even if a refresh races an insert of the old
         // entry; a wiped index reconstructs it from the log.
@@ -313,7 +321,71 @@ impl HistoryDb {
     /// `docs/DEFECT_HISTORY_DELETE.md` documents for `delete`. The floor
     /// only ever rises, so it can't flap.
     fn rebuild_from_jsonl(&self, quiet: bool) -> Result<(), StateError> {
-        self.replay_logs(quiet)
+        let before = self.head_seq()?;
+        self.replay_logs(quiet)?;
+        // An index that held nothing and now holds replayed rows has just
+        // assigned every rowid afresh: a cursor from any earlier index is
+        // meaningless against it. A routine refresh of a populated index
+        // only appends above the head and keeps the incarnation.
+        if before == 0 && self.head_seq()? > 0 {
+            self.mint_incarnation()?;
+        }
+        Ok(())
+    }
+
+    /// The identity of this SQLite index (contract §2.5): read, or minted
+    /// and stored on first call. It changes whenever the index is rebuilt
+    /// from the portable log with fresh rowids.
+    pub fn incarnation(&self) -> Result<String, StateError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO history_meta (key, value)
+             VALUES ('incarnation', lower(hex(randomblob(16))))",
+            [],
+        )
+        .map_err(|e| StateError::Corrupt(format!("history incarnation mint: {e}")))?;
+        conn.query_row(
+            "SELECT value FROM history_meta WHERE key = 'incarnation'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| StateError::Corrupt(format!("history incarnation read: {e}")))
+    }
+
+    fn mint_incarnation(&self) -> Result<(), StateError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO history_meta (key, value) VALUES ('incarnation', lower(hex(randomblob(16))))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(|e| StateError::Corrupt(format!("history incarnation mint: {e}")))?;
+        Ok(())
+    }
+
+    /// The highest sequence the index holds (0 when empty).
+    pub fn head_seq(&self) -> Result<i64, StateError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT COALESCE(MAX(id), 0) FROM history", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| StateError::Corrupt(format!("history head: {e}")))
+    }
+
+    /// The lowest sequence still retained (0 when empty). A cursor below
+    /// this has lost rows to pruning and must reconcile (contract §2.5).
+    pub fn retained_min_seq(&self) -> Result<i64, StateError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT COALESCE(MIN(id), 0) FROM history", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| StateError::Corrupt(format!("history retained minimum: {e}")))
+    }
+
+    /// Test support: replay the portable log into this index as boot does.
+    #[doc(hidden)]
+    pub fn rebuild_for_test(&self) -> Result<(), StateError> {
+        self.rebuild_from_jsonl(false)
     }
 
     /// Merge previously unseen portable tombstones into the derived index,
@@ -1458,6 +1530,59 @@ mod tests {
             .max_by_key(|s| s.ms.unwrap_or(0))
             .unwrap();
         assert_eq!(slowest.stage, PostStage::ParRepair);
+    }
+
+    /// Contract §2.5 / plan M1 (j): a rebuilt index is a new incarnation, a
+    /// routine refresh is not, and the cursor bounds follow pruning.
+    #[test]
+    fn rebuild_changes_incarnation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let portable = tmp.path().join("portable");
+        let index = tmp.path().join("history.sqlite");
+        let db = HistoryDb::open(&index, Some(&portable)).unwrap();
+        assert_eq!(db.head_seq().unwrap(), 0);
+        assert_eq!(db.retained_min_seq().unwrap(), 0);
+        let first = db.incarnation().unwrap();
+        assert_eq!(first.len(), 32);
+        assert_eq!(db.incarnation().unwrap(), first, "stable across reads");
+        for (job, at) in [(1, 1_000), (2, 2_000), (3, 3_000)] {
+            db.record_seq_durable(&entry(job, at)).unwrap();
+        }
+        assert_eq!(db.head_seq().unwrap(), 3);
+        assert_eq!(db.retained_min_seq().unwrap(), 1);
+        // A routine refresh of a populated index keeps the identity.
+        db.rebuild_for_test().unwrap();
+        assert_eq!(db.incarnation().unwrap(), first);
+        // Pruning raises the retained minimum; the head stays.
+        db.set_retention(Retention {
+            keep_max: 2,
+            keep_days: 0,
+        })
+        .unwrap();
+        assert_eq!(db.retained_min_seq().unwrap(), 2);
+        assert_eq!(db.head_seq().unwrap(), 3);
+        drop(db);
+        // Reopen against the same index: same incarnation.
+        let reopened = HistoryDb::open(&index, Some(&portable)).unwrap();
+        assert_eq!(reopened.incarnation().unwrap(), first);
+        drop(reopened);
+        // A wiped index rebuilt from the portable log reassigns rowids: a
+        // new incarnation, so a consumer holding (first, 3) must reconcile.
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", index.display()));
+        }
+        let rebuilt = HistoryDb::open(&index, Some(&portable)).unwrap();
+        assert!(
+            rebuilt.head_seq().unwrap() > 0,
+            "rows replayed from the log"
+        );
+        let second = rebuilt.incarnation().unwrap();
+        assert_ne!(second, first);
+        let consumer_cursor = (first.clone(), 3_i64);
+        assert!(
+            consumer_cursor.0 != second,
+            "a cursor from the old incarnation is rejected by identity, not by number"
+        );
     }
 
     #[test]
