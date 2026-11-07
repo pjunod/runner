@@ -184,6 +184,11 @@ pub struct Artifact {
     /// Mirrored from `job_terminals`, which is the authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub salvage: Option<String>,
+    /// Contract §2.2: the `FailureReason` wire string of the terminal that
+    /// parked this source (`unpack`, `hold_expired`, …), mirrored from
+    /// `job_terminals` so the Files tab can say why the bytes are here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1244,6 +1249,7 @@ impl Inventory {
             error: None,
             inspected_at: None,
             salvage: None,
+            failure_reason: None,
         };
         save_artifact(&db, &a)?;
         drop(db);
@@ -1826,6 +1832,7 @@ impl Inventory {
             error: None,
             inspected_at: None,
             salvage: None,
+            failure_reason: None,
         };
         save_artifact(&db, &a)?;
         Ok(a)
@@ -3016,6 +3023,7 @@ impl Inventory {
             error: None,
             inspected_at: Some(now()),
             salvage: None,
+            failure_reason: None,
         };
         self.sidecar(&a)?;
         let _coordinator = self.mutation_guard()?;
