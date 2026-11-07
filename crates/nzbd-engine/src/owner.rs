@@ -912,6 +912,8 @@ struct PostRollback {
     in_flight: bool,
 }
 
+type JobTerminalRow = nzbd_state::artifacts::JobTerminal;
+
 pub(crate) struct Owner {
     state: QueueState,
     admission_adoption: Option<HashSet<String>>,
@@ -953,6 +955,13 @@ pub(crate) struct Owner {
     /// history, markers and emit run as one chain and nothing else may
     /// transition the job meanwhile.
     terminals_in_flight: HashSet<JobId>,
+    /// Contract §2.1 (review #280-4): a terminal whose row never landed (the
+    /// `job_terminals` insert failed, or a transient fence refused it) is
+    /// kept here and retried on the replay tick. Nothing may complete,
+    /// admit to post-processing or re-terminate the job meanwhile, so a
+    /// released storage hold cannot turn a recorded `io` into a `completed`.
+    deferred_terminals:
+        HashMap<JobId, (JobTerminalRow, Option<Arc<nzbd_state::history::HistoryDb>>)>,
     last_terminal_replay: Option<Instant>,
     /// The last projected status/stage published per job, so every
     /// observable transition emits one `job_status_changed` (§2.4).
@@ -1459,6 +1468,7 @@ impl Owner {
             pending_journal_loads: HashMap::new(),
             pending_control_commits: HashSet::new(),
             terminals_in_flight: HashSet::new(),
+            deferred_terminals: HashMap::new(),
             last_terminal_replay: None,
             last_status: HashMap::new(),
             pending_control_revisions: HashMap::new(),
@@ -2577,6 +2587,7 @@ impl Owner {
                     && !self.record_transitions.contains(&job)
                     && !self.projection_transition
                     && !self.pending_control_commits.contains(&job)
+                    && !self.deferred_terminals.contains_key(&job)
                     && !self.verification.contains_key(&job)
                     && !self.retiring_writers.contains_key(&job);
                 if !allowed {
@@ -7547,8 +7558,10 @@ impl Owner {
         if self.state.job(job_id).is_some_and(|j| j.held()) {
             return;
         }
-        if self.terminals_in_flight.contains(&job_id) {
-            return; // the job's terminal is being recorded
+        if self.terminals_in_flight.contains(&job_id)
+            || self.deferred_terminals.contains_key(&job_id)
+        {
+            return; // the job's terminal is being (or waits to be) recorded
         }
         if self.delegated.contains_key(&job_id) {
             return; // completes via the executor's report, not locally
@@ -10166,6 +10179,13 @@ pub(crate) fn unix_now() -> i64 {
 ///
 /// The hold message for a partial whose coverage cannot be proven; startup
 /// verification owns its exit.
+///
+/// One-release bridge (remove in M6): pre-v2 builds persisted this partial
+/// as `identity_conflict` and told it apart only by this exact message, so
+/// `rearmed_hold` and `legacy_coverage_hold` match the constant to keep
+/// those rows on the verification path. Once no `identity_conflict` control
+/// can remain on disk (M6 drops the legacy cause strings), match the cause
+/// alone and delete the message comparison.
 pub(crate) const COVERAGE_UNVERIFIED: &str =
     "file coverage or expected size is unverified; partial retained";
 

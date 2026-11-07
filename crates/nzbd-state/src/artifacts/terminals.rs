@@ -240,6 +240,16 @@ impl Inventory {
     /// (nothing was ever allocated) settles to `none`: there is nothing to
     /// salvage.
     pub fn record_terminal(&self, terminal: &JobTerminal) -> Result<JobTerminal> {
+        #[cfg(feature = "test-support")]
+        if TERMINAL_INSERT_FAILURES
+            .lock()
+            .unwrap()
+            .remove(&terminal.job)
+        {
+            return Err(Error::Io(std::io::Error::other(
+                "injected job_terminals insert failure (os error 5)",
+            )));
+        }
         let _guard = self.mutation_guard()?;
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
@@ -415,6 +425,13 @@ impl Inventory {
         TERMINAL_CRASHES.lock().unwrap().insert(job, after.key());
     }
 
+    /// Test support: the next `record_terminal` for `job` fails before the
+    /// row is written, as a refused write would.
+    #[cfg(feature = "test-support")]
+    pub fn inject_terminal_insert_failure(&self, job: u32) {
+        TERMINAL_INSERT_FAILURES.lock().unwrap().insert(job);
+    }
+
     /// Consulted by the terminal orchestration between steps. Always false
     /// outside the `test-support` feature.
     pub fn take_injected_terminal_crash(&self, job: u32, after: &TerminalStep) -> bool {
@@ -434,6 +451,9 @@ impl Inventory {
 #[cfg(feature = "test-support")]
 static TERMINAL_CRASHES: std::sync::LazyLock<Mutex<std::collections::HashMap<u32, u8>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(feature = "test-support")]
+static TERMINAL_INSERT_FAILURES: std::sync::LazyLock<Mutex<std::collections::HashSet<u32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
 #[cfg(test)]
 mod tests {

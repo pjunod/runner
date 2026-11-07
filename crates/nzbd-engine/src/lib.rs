@@ -1242,6 +1242,14 @@ impl EngineHandle {
                     }
                 }
             }
+            // An NZB larger than the durable cache accepts is the indexer
+            // item itself being unusable: `fetch{gone}`, typed here rather
+            // than read back from the cache's conflict message.
+            if received.as_ref().is_some_and(|bytes| bytes.len() > nzbd_state::artifacts::MAX_URL_SOURCE_BYTES) {
+                fetch_cause = Some(nzbd_types::FetchCause::Gone);
+                failure = Some("fetched NZB exceeds supported durable size".into());
+                received = None;
+            }
             if let Some(mut bytes) = received {
                 loop {
                     let store = handle.url_resolutions.clone(); let source_origin = origin.clone();
@@ -1251,7 +1259,9 @@ impl EngineHandle {
                     match tokio::task::spawn_blocking(move || { let result = store.cache_source(&source_origin, &candidate); (result, candidate) }).await {
                         Ok((Ok(_), _)) => break,
                         Ok((Err(nzbd_state::artifacts::Error::NotFound), _)) => return,
-                        Ok((Err(nzbd_state::artifacts::Error::Conflict(message)), _)) => { fetch_cause = Some(nzbd_types::FetchCause::Gone); failure = Some(message); break; }
+                        // Any other cache refusal is local (a missing source
+                        // param, the writer lock): never the release's fault,
+                        // so it takes the storage-retry lane with its deadline.
                         Ok((Err(error), retained)) => {
                             bytes = retained;
                             if !handle.wait_url_storage_retry(&origin, &identity, &error.to_string(), &mut storage_retry).await { return; }

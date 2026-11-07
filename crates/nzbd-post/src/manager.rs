@@ -2068,7 +2068,14 @@ fn spawn_job(
                     // Contract §2.2: environmental errors hold (with their
                     // retry schedule and deadline in the same commit);
                     // everything else is the job's terminal failure.
-                    let _ = apply_pp_verdict(&engine, &history, job, &e).await;
+                    if !apply_pp_verdict(&engine, &history, job, &e).await {
+                        // Neither a hold nor a terminal landed (the owner
+                        // refused: a terminal or control commit in flight,
+                        // persistence fenced). The row is still in Post, so
+                        // the next rescan runs the attempt again.
+                        tracing::warn!(job = job.0, error = %e,
+                            "post-processing verdict not recorded; the next rescan retries");
+                    }
                     // PP writes as much as the downloader does — unpack,
                     // move, script output. An ENOSPC here is the same ground
                     // truth about the volume and must stop intake too, not
@@ -3145,7 +3152,7 @@ async fn process_job_ctx_from_inner(
                         .map(|a| format!("{} exit {}: {}", a.executable, a.exit_code, a.diagnostic))
                         .collect::<Vec<_>>()
                         .join("; ");
-                    let _ = engine.hold_job(job_id, cause, "extract", &detail).await;
+                    let _ = engine.hold_job(job_id, cause, "unpack", &detail).await;
                     return Err(PostError::Held);
                 }
                 if r.retryable_error {
@@ -3164,21 +3171,15 @@ async fn process_job_ctx_from_inner(
                     // extractor on the same bytes forever is not recovery.
                     if nzbd_engine::is_storage_unavailable(&detail) {
                         let _ = engine
-                            .hold_job(job_id, HoldCause::StorageUnavailable, "extract", &detail)
+                            .hold_job(job_id, HoldCause::StorageUnavailable, "unpack", &detail)
                             .await;
-                    } else {
-                        let _ = fail_job_in(
-                            engine,
-                            history,
-                            job_id,
-                            nzbd_types::FailureReason::Io,
-                            None,
-                            "unpack",
-                            &detail,
-                        )
-                        .await;
+                        return Err(PostError::Held);
                     }
-                    return Err(PostError::Held);
+                    // Contract §2.2: an extractor that failed on the bytes,
+                    // not the disk, is `unpack` — recorded by the attempt's
+                    // verdict (stage `unpack`), which reports whether the
+                    // owner took it.
+                    return Err(PostError::Subprocess(detail));
                 }
                 if !r.success && !par_did_repair && par_ok {
                     // The unpack↔repair loop: a broken archive that quick
@@ -3221,12 +3222,7 @@ async fn process_job_ctx_from_inner(
                         HoldCause::Capacity
                     };
                     let _ = engine
-                        .hold_job(
-                            job_id,
-                            cause,
-                            "extract",
-                            "extractor retry exhausted storage",
-                        )
+                        .hold_job(job_id, cause, "unpack", "extractor retry exhausted storage")
                         .await;
                     return Err(PostError::Held);
                 }
@@ -3246,21 +3242,15 @@ async fn process_job_ctx_from_inner(
                     // extractor on the same bytes forever is not recovery.
                     if nzbd_engine::is_storage_unavailable(&detail) {
                         let _ = engine
-                            .hold_job(job_id, HoldCause::StorageUnavailable, "extract", &detail)
+                            .hold_job(job_id, HoldCause::StorageUnavailable, "unpack", &detail)
                             .await;
-                    } else {
-                        let _ = fail_job_in(
-                            engine,
-                            history,
-                            job_id,
-                            nzbd_types::FailureReason::Io,
-                            None,
-                            "unpack",
-                            &detail,
-                        )
-                        .await;
+                        return Err(PostError::Held);
                     }
-                    return Err(PostError::Held);
+                    // Contract §2.2: an extractor that failed on the bytes,
+                    // not the disk, is `unpack` — recorded by the attempt's
+                    // verdict (stage `unpack`), which reports whether the
+                    // owner took it.
+                    return Err(PostError::Subprocess(detail));
                 }
                 if r.password_error {
                     engine
@@ -4790,7 +4780,9 @@ pub fn pp_verdict(error: &PostError, stage: Option<PostStage>) -> PpVerdict {
     }
 }
 
-/// The stage a job's last span names (or `extract` when none was entered).
+/// The stage a job's last span names. Before the first span there is no
+/// stage to blame; such an error is a `publish` refusal (`pp_verdict` with no
+/// stage), so it carries that reason's contract stage, `publication_verify`.
 fn current_stage(engine: &EngineHandle, job: JobId) -> (Option<PostStage>, String) {
     let stage = engine
         .snapshot()
@@ -4803,7 +4795,7 @@ fn current_stage(engine: &EngineHandle, job: JobId) -> (Option<PostStage>, Strin
         stage,
         stage
             .map(|stage| stage.as_str().to_owned())
-            .unwrap_or_else(|| "extract".into()),
+            .unwrap_or_else(|| PostStage::PublicationVerify.as_str().into()),
     )
 }
 
@@ -5703,22 +5695,47 @@ fn ffprobe_media(path: &Path) -> bool {
     let Ok(mut child) = child else {
         return false; // not installed: the sniff's "inconclusive" stands
     };
+    // Drain stdout to EOF on its own thread while this one enforces the
+    // deadline: a child blocked on a full pipe would otherwise never exit
+    // and every probe would end as a timeout. Only the first 4 KiB is kept
+    // (the answer is one short line).
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    };
+    let reader = std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let room = 4096usize.saturating_sub(kept.len());
+                    kept.extend_from_slice(&buf[..n.min(room)]);
+                }
+            }
+        }
+        kept
+    });
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
+    let succeeded = loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => break,
-            Ok(Some(_)) | Err(_) => return false,
+            Ok(Some(status)) => break status.success(),
+            Err(_) => break false,
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                break false;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
         }
-    }
-    let mut out = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        let _ = stdout.read_to_string(&mut out);
+    };
+    // The child has exited (or was killed), so its stdout is closed and the
+    // reader reaches EOF.
+    let out = String::from_utf8_lossy(&reader.join().unwrap_or_default()).into_owned();
+    if !succeeded {
+        return false;
     }
     let format = out.trim().to_ascii_lowercase();
     !format.is_empty()
@@ -6838,6 +6855,32 @@ mod decision_tests {
         );
         assert_eq!(outcome("unsupported.xyz").outcome, "unsupported_review");
         assert_eq!(outcome("unverified.mp4").outcome, "unverified_review");
+
+        // R3: MPEG program streams are payload by name, and an unknown
+        // extension whose verified bytes the sniff/ffprobe identified as
+        // media publishes too (review: the `.mpg` case stays covered).
+        let entries = [payload_entry("film.mpg"), payload_entry("unsupported.xyz")];
+        let verified = ["film.mpg".to_string(), "unsupported.xyz".to_string()]
+            .into_iter()
+            .collect();
+        let probed = ["unsupported.xyz".to_string()].into_iter().collect();
+        let (selected, _) = select_delivery_payload(
+            &entries,
+            &Default::default(),
+            &verified,
+            &Default::default(),
+            &Default::default(),
+            &probed,
+        );
+        let paths = selected
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            paths,
+            ["film.mpg", "unsupported.xyz"].into_iter().collect(),
+            "a verified .mpg and a sniffed unknown both publish"
+        );
     }
 
     #[test]

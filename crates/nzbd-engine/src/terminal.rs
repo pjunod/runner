@@ -239,8 +239,11 @@ pub fn terminal_from_job(
 /// Why a terminal step did not land.
 #[derive(Debug)]
 pub enum TerminalError {
-    /// The row or the history append failed: the job holds
-    /// `storage_unavailable` on stage `persistence` and is replayed.
+    /// The `job_terminals` row itself did not land: nothing durable exists
+    /// to replay, so the owner keeps the terminal and retries it.
+    NotRecorded(String),
+    /// A step after the row failed: the job holds `storage_unavailable` on
+    /// stage `persistence` and the stored row is replayed.
     Persistence(String),
     /// Test support: an injected crash stopped the replay after a step.
     InjectedCrash,
@@ -249,6 +252,7 @@ pub enum TerminalError {
 impl std::fmt::Display for TerminalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TerminalError::NotRecorded(error) => write!(f, "terminal not recorded: {error}"),
             TerminalError::Persistence(error) => write!(f, "terminal not durable: {error}"),
             TerminalError::InjectedCrash => f.write_str("injected crash"),
         }
@@ -264,7 +268,7 @@ pub fn persist_terminal(
 ) -> Result<JobTerminal, TerminalError> {
     let mut row = inventory
         .record_terminal(terminal)
-        .map_err(|error| TerminalError::Persistence(error.to_string()))?;
+        .map_err(|error| TerminalError::NotRecorded(error.to_string()))?;
     if inventory.take_injected_terminal_crash(row.job, &TerminalStep::Recorded) {
         return Err(TerminalError::InjectedCrash);
     }

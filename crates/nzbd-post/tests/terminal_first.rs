@@ -865,3 +865,78 @@ async fn self_contradicting_evidence_is_identity() {
     tracker.wait().await;
     engine.shutdown().await;
 }
+
+/// Review #280-4 / contract §2.1: a terminal whose `job_terminals` insert
+/// fails is kept by the owner and retried, and the job cannot complete or
+/// enter post-processing meanwhile — even after its storage hold releases.
+#[tokio::test]
+async fn unrecorded_terminal_is_retried_and_blocks_completion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, _) = admitted_job(
+        &engine,
+        "unrecorded",
+        &[
+            ("episode.mkv", Some(b"episode".as_slice())),
+            ("other.mkv", None),
+        ],
+        JobStatus::Failed,
+    )
+    .await;
+    let mut events = engine.subscribe();
+    engine.artifacts().inject_terminal_insert_failure(job_id.0);
+    assert!(
+        !engine
+            .fail_job(job_id, FailureReason::Io, None, "download", "write refused")
+            .await
+            .unwrap(),
+        "the insert failed"
+    );
+    assert!(engine.artifacts().terminal(job_id.0).unwrap().is_none());
+    let control = export(&engine, job_id).await.unwrap().control().unwrap();
+    assert_eq!(control.lifecycle, "held");
+    assert_eq!(control.cause, "storage_unavailable");
+    assert_eq!(control.stage, "persistence");
+    // Storage answers again and the hold is released: the job still may
+    // not be admitted to post-processing (it would re-complete on health).
+    engine
+        .release_hold(
+            job_id,
+            control.revision.clone(),
+            nzbd_engine::RetryBy::Operator,
+        )
+        .await
+        .unwrap()
+        .expect("hold released");
+    assert!(
+        engine.begin_post_admission(job_id).await.unwrap().is_none(),
+        "a deferred terminal fences post-processing"
+    );
+    // A second producer does not replace the waiting terminal.
+    assert!(!engine
+        .fail_job(job_id, FailureReason::Health, None, "health", "late")
+        .await
+        .unwrap());
+    engine.replay_terminals().await.unwrap();
+    let terminal = wait_terminal(&engine, job_id, "retried terminal", |t| t.emitted).await;
+    assert_eq!(terminal.reason, Some(FailureReason::Io));
+    assert_eq!(terminal.message.as_deref(), Some("write refused"));
+    assert_eq!(
+        history
+            .get_sequence(terminal.history_seq.unwrap())
+            .unwrap()
+            .unwrap()
+            .status,
+        "FAILURE/IO"
+    );
+    let mut finished = 0;
+    while let Ok(event) = events.try_recv() {
+        if let Event::JobPpFinished { job, reason, .. } = event {
+            assert_eq!(job, job_id);
+            assert_eq!(reason, Some(FailureReason::Io));
+            finished += 1;
+        }
+    }
+    assert_eq!(finished, 1);
+    engine.shutdown().await;
+}

@@ -37,7 +37,7 @@ mod worker_stops;
 pub mod writer_naming;
 pub use url_resolutions::{
     url_source_identity, url_storage_retry_deadline, UrlFileReservation, UrlResolutionFault,
-    UrlResolutionRecord, UrlResolutionStore, UrlStorageRetry,
+    UrlResolutionRecord, UrlResolutionStore, UrlStorageRetry, MAX_SOURCE as MAX_URL_SOURCE_BYTES,
 };
 pub use worker_stops::{
     same_worker_operation, WorkerStopRequest, WorkerStopTicket, WorkerStoppedReceipt,

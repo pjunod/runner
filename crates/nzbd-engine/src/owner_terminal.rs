@@ -47,21 +47,38 @@ impl Owner {
         message: &str,
         callback: TerminalCallback,
     ) -> bool {
-        // The same fences a hold respects: an automatic control transition
-        // still committing owns the job's next state.
-        let refused = self.persistence_fenced
-            || self.automatic_control_pending(job)
-            || self.terminals_in_flight.contains(&job)
+        // Gone, already terminal, or another terminal for it already in
+        // flight or waiting: the first one stands.
+        let settled = self.terminals_in_flight.contains(&job)
+            || self.deferred_terminals.contains_key(&job)
             || self.state.job(job).is_none_or(|row| {
                 row.params
                     .iter()
                     .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
             });
-        if refused {
+        if settled {
             callback(self, None);
             return false;
         }
         let row = self.state.job(job).expect("checked above");
+        // The same fences a hold respects (review #280-5): an automatic
+        // control transition or any other control commit still in flight
+        // owns the job's next state, and a fenced store cannot take a row.
+        // The terminal is not dropped: it waits and is retried on the tick.
+        let fenced = self.persistence_fenced
+            || self.automatic_control_pending(job)
+            || self.pending_control_commits.contains(&job);
+        if fenced {
+            let terminal = terminal::failed_terminal(row, reason, fetch_cause, stage, message);
+            tracing::warn!(
+                job = job.0,
+                reason = reason.as_str(),
+                "terminal waits for an in-flight control commit"
+            );
+            self.deferred_terminals.insert(job, (terminal, None));
+            callback(self, None);
+            return false;
+        }
         tracing::warn!(
             job = job.0,
             reason = reason.as_str(),
@@ -91,7 +108,14 @@ impl Owner {
         callback: TerminalCallback,
     ) {
         let job = JobId(terminal.job);
-        if self.persistence_fenced || !self.terminals_in_flight.insert(job) {
+        if self.persistence_fenced {
+            self.deferred_terminals
+                .entry(job)
+                .or_insert((terminal, history));
+            callback(self, None);
+            return;
+        }
+        if !self.terminals_in_flight.insert(job) {
             callback(self, None);
             return;
         }
@@ -100,6 +124,8 @@ impl Owner {
         // a later attempt never replaces it; `record_terminal` returns the
         // stored row and the chain resumes from its flags.
         let inventory = self.artifacts.clone();
+        let terminal_retry = terminal.clone();
+        let history_retry = history.clone();
         let history = history.or_else(|| self.history.clone());
         self.io_then(
             move || {
@@ -116,12 +142,52 @@ impl Owner {
                     owner.release_terminal(job);
                     callback(owner, None);
                 }
+                Ok(Err(TerminalError::NotRecorded(error))) => {
+                    // Review #280-4: no row to replay — keep the terminal
+                    // itself and retry it, so the job cannot re-complete.
+                    owner
+                        .deferred_terminals
+                        .entry(job)
+                        .or_insert((terminal_retry, history_retry));
+                    owner.terminal_not_durable(job, &error, callback)
+                }
                 Ok(Err(TerminalError::Persistence(error))) => {
                     owner.terminal_not_durable(job, &error, callback)
                 }
-                Err(error) => owner.terminal_not_durable(job, &error.to_string(), callback),
+                Err(error) => {
+                    owner
+                        .deferred_terminals
+                        .entry(job)
+                        .or_insert((terminal_retry, history_retry));
+                    owner.terminal_not_durable(job, &error.to_string(), callback)
+                }
             },
         );
+    }
+
+    /// Retry the terminals kept by [`Self::record_terminal_with_then`] and
+    /// [`Self::fail_job_terminal_then`] whose fence has lifted.
+    fn retry_deferred_terminals(&mut self) {
+        let ready = self
+            .deferred_terminals
+            .keys()
+            .copied()
+            .filter(|job| {
+                !self.terminals_in_flight.contains(job)
+                    && !self.pending_control_commits.contains(job)
+                    && !self.automatic_control_pending(*job)
+            })
+            .collect::<Vec<_>>();
+        for job in ready {
+            let Some((terminal, history)) = self.deferred_terminals.remove(&job) else {
+                continue;
+            };
+            tracing::info!(
+                job = job.0,
+                "retrying a terminal that had not been recorded"
+            );
+            self.record_terminal_with_then(terminal, history, Box::new(|_, _| {}));
+        }
     }
 
     fn release_terminal(&mut self, job: JobId) {
@@ -276,6 +342,7 @@ impl Owner {
         if self.persistence_fenced || !self.persist {
             return;
         }
+        self.retry_deferred_terminals();
         let inventory = self.artifacts.clone();
         self.io_then(
             move || {
