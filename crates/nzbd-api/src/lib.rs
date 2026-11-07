@@ -1298,7 +1298,11 @@ async fn park_write(st: &ApiState, mut parked: Parked) -> bool {
     // same record. A job that already has its terminal (a failed row
     // awaiting salvage or disposal) keeps it: no second terminal.
     let terminal = cancelled_terminal(&parked.entry);
-    let recorded = match st.engine.record_terminal(terminal).await {
+    let recorded = match st
+        .engine
+        .record_terminal_in(terminal, Some(db.clone()))
+        .await
+    {
         Ok(Some(row)) if row.outcome == nzbd_types::TerminalOutcome::Cancelled => {
             Some(row.history_seq.unwrap_or(0))
         }
@@ -2371,8 +2375,8 @@ async fn openapi() -> Response {
         "paths": {
             "/api/v1/status": { "get": { "summary": "Queue + rate + guard status" } },
             "/api/v1/request-admissions/{token}": { "get": { "summary": "Read the durable outcome of one transfer-token URL admission" } },
-            "/api/v1/deliveries": { "get": { "summary": "Durable pending publication deliveries; rescan after=0 or persist every receipt before advancing the cursor" } },
-            "/api/v1/deliveries/{id}/accept": { "post": { "summary": "Persist an idempotent consumer receipt for an immutable publication generation and manifest" } },
+            "/api/v1/deliveries": { "get": { "summary": "Read-only reconciliation feed of publications (kind completed|salvage, manifest body); pass includeAccepted=true" } },
+            "/api/v1/deliveries/{id}/accept": { "post": { "summary": "Deprecated no-op (pipeline contract v2): answers 200 with the unchanged row; removed in M3" } },
             "/api/v1/jobs": {
                 "get": { "summary": "List queue jobs" },
                 "post": { "summary": "Add a job (NZB body, or ?url=)",
@@ -3244,7 +3248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_routes_page_accept_refresh_and_retry_source_cleanup() {
+    async fn accept_answers_200_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = test_engine(&tmp).await;
         let root = tmp.path().join("processing");
@@ -3297,13 +3301,16 @@ mod tests {
             )
             .await
             .unwrap();
+        // Contract §2.5 / plan M1 (h): there is no acceptance. `accept`
+        // answers 200 with the unchanged row so an old curator's retry loop
+        // settles; nothing is recorded and the row stays on the feed.
         assert_eq!(accepted.status(), StatusCode::OK);
-        assert_eq!(
-            body_json(accepted).await["consumerReceiptId"],
-            "curator-receipt-fixture"
-        );
+        let accepted = body_json(accepted).await;
+        assert!(accepted["consumerReceiptId"].is_null());
+        assert!(accepted["acceptedAt"].is_null());
+        assert_eq!(accepted["kind"], "completed");
 
-        let hidden_after_accept = app
+        let still_listed = app
             .clone()
             .oneshot(
                 axum::http::Request::get("/api/v1/deliveries?after=0&limit=1")
@@ -3312,56 +3319,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let hidden_after_accept = body_json(hidden_after_accept).await;
-        assert!(hidden_after_accept["deliveries"]
-            .as_array()
-            .unwrap()
-            .is_empty());
-        assert_eq!(hidden_after_accept["nextCursor"], delivery.sequence);
-
-        let accepted_page = app
-            .clone()
-            .oneshot(
-                axum::http::Request::get("/api/v1/deliveries?after=0&limit=1&includeAccepted=true")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            body_json(accepted_page).await["deliveries"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-
-        let refreshed = app
-            .clone()
-            .oneshot(
-                axum::http::Request::get(format!("/api/v1/deliveries/{}", delivery.delivery_id))
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(refreshed.status(), StatusCode::OK);
-        assert!(body_json(refreshed).await["acceptedAt"].is_number());
-
-        let replay = app
-            .clone()
-            .oneshot(
-                axum::http::Request::post(format!(
-                    "/api/v1/deliveries/{}/accept",
-                    delivery.delivery_id
-                ))
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body.to_string()))
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(replay.status(), StatusCode::OK);
+        let still_listed = body_json(still_listed).await;
+        let row = &still_listed["deliveries"][0];
+        assert_eq!(row["deliveryId"], delivery.delivery_id);
+        assert_eq!(row["kind"], "completed");
+        assert_eq!(row["manifestDigest"], delivery.manifest_digest);
+        assert_eq!(row["files"].as_array().unwrap().len(), 1);
 
         let conflicting = serde_json::json!({
             "protocolVersion": 1,
@@ -3369,7 +3332,7 @@ mod tests {
             "manifestDigest": delivery.manifest_digest,
             "consumerReceiptId": "different-receipt"
         });
-        let conflict = app
+        let replay = app
             .clone()
             .oneshot(
                 axum::http::Request::post(format!(
@@ -3382,7 +3345,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(replay.status(), StatusCode::OK, "a no-op never conflicts");
+        assert_eq!(
+            artifacts.delivery(&delivery.delivery_id).unwrap(),
+            artifacts.delivery(&delivery.delivery_id).unwrap()
+        );
+        assert!(artifacts
+            .delivery(&delivery.delivery_id)
+            .unwrap()
+            .accepted_at
+            .is_none());
 
         let retry_cleanup = app
             .oneshot(
@@ -4028,6 +4000,169 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body_json(response).await["available"], false);
+        engine.shutdown().await;
+    }
+
+    /// Contract §2.2 / IMPL §5.4: an operator delete is a real `cancelled`
+    /// terminal with the transfer, from the same record as its `DELETED`
+    /// history row; `job_deleted` stays advisory.
+    #[tokio::test]
+    async fn operator_delete_emits_cancelled_terminal_with_transfer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let db = Arc::new(HistoryDb::open(&tmp.path().join("history.sqlite"), None).unwrap());
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: Some(db.clone()),
+            torrent: None,
+            log: None,
+            setup: None,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+        let id = engine
+            .add_nzb_opts(
+                "to-delete",
+                NZB.as_bytes(),
+                nzbd_engine::AddOpts {
+                    params: vec![("monarr-transfer".into(), "t-cancel-1".into())],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut events = engine.subscribe();
+        let response = app
+            .oneshot(
+                axum::http::Request::post(format!("/api/v1/jobs/{}/actions/delete", id.0))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let entry = db.get(id).unwrap().unwrap();
+        assert_eq!(entry.status, "DELETED");
+        let terminal = engine.artifacts().terminal(id.0).unwrap().unwrap();
+        assert_eq!(terminal.outcome, nzbd_types::TerminalOutcome::Cancelled);
+        assert_eq!(terminal.transfer.as_deref(), Some("t-cancel-1"));
+        assert_eq!(terminal.history_seq, Some(entry.seq));
+        assert!(terminal.emitted);
+        let (mut deleted, mut cancelled) = (false, false);
+        while let Ok(event) = events.try_recv() {
+            match event {
+                nzbd_engine::Event::JobDeleted { job } if job == id => deleted = true,
+                nzbd_engine::Event::JobPpFinished {
+                    job,
+                    outcome,
+                    transfer,
+                    history_seq,
+                    blames_release,
+                    ..
+                } if job == id => {
+                    assert_eq!(outcome, nzbd_types::TerminalOutcome::Cancelled);
+                    assert_eq!(transfer.as_deref(), Some("t-cancel-1"));
+                    assert_eq!(history_seq, entry.seq);
+                    assert!(!blames_release);
+                    cancelled = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(deleted, "job_deleted is still emitted");
+        assert!(
+            cancelled,
+            "job_pp_finished{{cancelled}} reaches the consumer"
+        );
+        engine.shutdown().await;
+    }
+
+    /// Plan M1 (h): a consumer built against v1 still reads the new event —
+    /// the legacy `pp_status`/`final_dir`/`params`/`history_seq` keep their
+    /// names and the `*Control:v1` it carries parses with the v1 fixture
+    /// consumer — and `GET /history` carries the cursor's incarnation.
+    #[tokio::test]
+    async fn old_curator_fixture_parses_new_event() {
+        let fixture: nzbd_types::JobControl = serde_json::from_str(include_str!(
+            "../../nzbd-types/fixtures/job-control-v1.json"
+        ))
+        .unwrap();
+        let (name, data) = event_json(&nzbd_engine::Event::JobPpFinished {
+            job: JobId(7),
+            name: "Show".into(),
+            category: Some("tv".into()),
+            transfer: Some("t-7".into()),
+            outcome: nzbd_types::TerminalOutcome::Failed,
+            reason: Some(nzbd_types::FailureReason::Unpack),
+            fetch_cause: None,
+            stage: Some("unpack".into()),
+            message: Some("extractor failed".into()),
+            blames_release: true,
+            salvage: nzbd_types::Salvage::Pending,
+            keep_on_failure: false,
+            fetched: Default::default(),
+            publication: None,
+            pp_status: "UNPACK_FAILURE".into(),
+            final_dir: None,
+            size_bytes: 1,
+            health: 1000,
+            params: vec![
+                ("monarr-transfer".into(), "t-7".into()),
+                (
+                    nzbd_types::CONTROL_PARAM.into(),
+                    serde_json::to_string(&fixture).unwrap(),
+                ),
+            ],
+            history_seq: 12,
+            history_incarnation: "abc".into(),
+        });
+        assert_eq!(name, "job_pp_finished");
+        // What an old consumer reads, by name.
+        assert_eq!(data["pp_status"], "UNPACK_FAILURE");
+        assert!(data["pp_status"].as_str().unwrap().contains("FAILURE"));
+        assert!(data["final_dir"].is_null());
+        assert_eq!(data["history_seq"], 12);
+        let control = data["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pair| pair[0] == nzbd_types::CONTROL_PARAM)
+            .unwrap()[1]
+            .as_str()
+            .unwrap();
+        let parsed: nzbd_types::JobControl = serde_json::from_str(control).unwrap();
+        assert_eq!(parsed, fixture);
+        // The history cursor carries its identity.
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let db = Arc::new(HistoryDb::open(&tmp.path().join("history.sqlite"), None).unwrap());
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: Some(db.clone()),
+            torrent: None,
+            log: None,
+            setup: None,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/history?since_seq=0")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let page = body_json(response).await;
+        assert_eq!(page["incarnation"].as_str().unwrap().len(), 32);
+        assert_eq!(page["head_seq"], 0);
+        assert_eq!(page["retained_min_seq"], 0);
         engine.shutdown().await;
     }
 

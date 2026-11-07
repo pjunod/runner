@@ -1399,11 +1399,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
-        assert!(response_json(unsupported).await["error"]
-            .as_str()
-            .unwrap()
-            .contains("unsupported delivery protocol"));
+        // The no-op `accept` reads no body; a missing row is still 404.
+        assert_eq!(unsupported.status(), StatusCode::NOT_FOUND);
 
         let missing = app
             .clone()
