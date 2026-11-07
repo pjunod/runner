@@ -3,7 +3,7 @@
 ## Pipeline contract v2 — M0 (contract in the repo) — 2026-11-07
 
 **Status:** in progress on `claude/pipeline-v2-m0-runner` · **Owner:** Claude
-(Opus builder session) · **PR:** not opened yet · **Plan:**
+(Opus builder session) · **PR:** [#279](https://github.com/pjunod/runner/pull/279) · **Plan:**
 `PIPELINE_REWRITE_PLAN.md` M0 (project doc).
 
 - Added [docs/PIPELINE_CONTRACT.md](docs/PIPELINE_CONTRACT.md), the r4

@@ -11,8 +11,8 @@ failure is a failure unless the job itself is marked keep-on-failure) ·
 after Astra's two rounds, all 2026-11-07 (log in
 `PIPELINE_REVIEW_LOG.md` (project doc))
 
-Companion to `PIPELINE_AUDIT.md` (project doc) (what is broken and why) and
-`PIPELINE_REWRITE_PLAN.md` (project doc) (how it gets built) — this
+Companion to `PIPELINE_AUDIT.md` (project doc: what is broken and why) and
+`PIPELINE_REWRITE_PLAN.md` (project doc: how it gets built) — this
 is *the seam itself*: what each application promises the other two, in wire
 terms. When the code and this document disagree during the rewrite, this
 document wins; after the rewrite ships, the per-repo `INTEGRATION.md` files
