@@ -686,7 +686,6 @@ async fn manager_task(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Contract §2.2/§2.6: what happens to a failed job's bytes after its
 /// terminal is out — salvage first, then disposal — driven from the job's
 /// `job_terminals` row, never from queue status. Returns true once nothing
