@@ -1199,6 +1199,19 @@ async fn dispose_failed_source(
         "local",
     )
     .await;
+    // The move/delete ran under the admission; if the admission was lost
+    // meanwhile (an owner fence, shutdown) the outcome is not recorded by a
+    // holder that no longer owns the job. The next follow-up finds the
+    // canonical result and records it once.
+    if gate.as_ref().is_some_and(|claim| !claim(job))
+        || inventory.take_injected_disposal_admission_loss(job.0)
+    {
+        tracing::warn!(
+            job = job.0,
+            "failed-source disposal lost its admission; the next follow-up records it"
+        );
+        return false;
+    }
     let Some(disposition) =
         canonical_failed_disposition(&failure_cfg, dest_dir, &dir_name, &source).or_else(|| {
             // Nothing was ever written for this attempt: there is nothing to

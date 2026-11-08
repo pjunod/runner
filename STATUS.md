@@ -30,6 +30,34 @@ visible on `/api/v1/artifacts`. The old in-memory, three-attempt budget —
 which retired the queue row with a `delete failed: …` note after about 60 s —
 is gone. A failed row stays queued until its disposal is recorded.
 
+**Deleted-scenario coverage:**
+- v2 tests: `a_failed_attempt_that_left_no_files_retains_nothing`,
+  `absent_integrity_proof_is_unknown_not_cleanup_authority` and
+  `failed_park_losing_admission_after_move_is_fenced_and_retried`.
+- The fenced-park test uses a test-support admission-loss injection. In
+  code, disposal no longer records an outcome when the admission was lost
+  after the move.
+- `retry_now_releases_a_due_failed_source…` has no v2 test. The "due failed
+  source" was the in-memory retry budget, which is gone. Retry-now (like the
+  `job_pp_finished` event) forces the follow-up past the operation ladder;
+  only the 30 s rescan waits on it.
+- A pending-retry fixture would need a raw `Operation` row in the ledger.
+  The engine's maintenance tick (immediate at boot) executes or reviews such
+  rows, so it would race the test. I did not add one.
+
+**Open:** `terminal_junk_with_explicit_keep_retains_owned_sources_and_reports_custody`
+failed once in a full `cluster_e2e` run (1 of 22). I could not reproduce it
+in 40 further runs:
+- 2 more full-suite runs.
+- 12 runs as 4 parallel copies.
+- 12 runs as 6 parallel copies with 4 CPU burners.
+- 4 standalone runs.
+
+No failure message was captured. The free disk on this shared VM dropped to
+about 0.7–1.8 GB several times that day (other agents' builds), and several
+unrelated tests then failed with ENOSPC. That is the leading suspect, not
+confirmed.
+
 **Tests changed to v2 behaviour (contract clause):**
 - `terminal_unusable_cluster_completion_…` → `…_parks_raw_copies_and_drains_sealed_generations`:
   §2.2, publish always parks.

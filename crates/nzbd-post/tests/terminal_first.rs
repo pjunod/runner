@@ -1114,3 +1114,92 @@ async fn absent_integrity_proof_is_unknown_not_cleanup_authority() {
     );
     engine.shutdown().await;
 }
+
+/// v2 of the deleted `failed_park_losing_admission_after_move_is_fenced_and_retried`:
+/// the park runs under the post-processing admission; when the admission is
+/// lost right after the move, the outcome is not recorded by the holder that
+/// lost it — the next follow-up finds the parked copy and records it once,
+/// without moving it again.
+#[tokio::test]
+async fn failed_park_losing_admission_after_move_is_fenced_and_retried() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, _history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, source) = admitted_job(
+        &engine,
+        "fenced-park",
+        &[(
+            "Movie.2020.mkv",
+            Some(b"\x1a\x45\xdf\xa3 unproven matroska".as_slice()),
+        )],
+        JobStatus::Failed,
+    )
+    .await;
+    let mut row = export(&engine, job_id).await.unwrap();
+    for file in &mut row.files {
+        file.crc32 = None; // unproven: the source is parked, never deleted
+    }
+    engine.import_job(row, false, false).await.unwrap();
+    assert!(engine
+        .fail_job(
+            job_id,
+            FailureReason::Health,
+            None,
+            "health",
+            "below critical"
+        )
+        .await
+        .unwrap());
+    let parked = tmp.path().join("parked");
+    let cfg = PostConfig {
+        failure_action: FailureAction::Delete,
+        failed_dir: Some(parked.clone()),
+        ..PostConfig::default()
+    };
+    let dest = tmp.path().join("dest");
+    engine.artifacts().inject_disposal_admission_loss(job_id.0);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Until the owner settles the re-imported row, follow-up is refused
+    // before it moves anything; the injected loss fires on the first move.
+    while engine
+        .artifacts()
+        .terminal(job_id.0)
+        .unwrap()
+        .unwrap()
+        .disposal
+        .is_none()
+        && !parked.join("fenced-park").exists()
+    {
+        assert!(!nzbd_post::manager::follow_up_failure(&engine, &cfg, &dest, job_id).await);
+        assert!(tokio::time::Instant::now() < deadline, "the park runs");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let moved = parked.join("fenced-park").join("Movie.2020.mkv");
+    assert!(moved.exists(), "the move itself happened");
+    assert!(!source.join("Movie.2020.mkv").exists());
+    assert!(
+        engine
+            .artifacts()
+            .terminal(job_id.0)
+            .unwrap()
+            .unwrap()
+            .disposal
+            .is_none(),
+        "a holder that lost its admission records nothing"
+    );
+    assert!(nzbd_post::manager::follow_up_failure(&engine, &cfg, &dest, job_id).await);
+    let disposal = engine
+        .artifacts()
+        .terminal(job_id.0)
+        .unwrap()
+        .unwrap()
+        .disposal
+        .unwrap();
+    assert!(disposal.starts_with("parked at"), "{disposal}");
+    assert!(
+        moved.exists(),
+        "recorded where it already is — not moved twice"
+    );
+    let parked_entries = std::fs::read_dir(&parked).unwrap().count();
+    assert_eq!(parked_entries, 1, "one parked copy");
+    engine.shutdown().await;
+}

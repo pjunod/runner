@@ -460,6 +460,28 @@ impl Inventory {
         )?)
     }
 
+    /// Test support: the next failed-source disposal for `job` loses its
+    /// post-processing admission right after the move/delete, before the
+    /// outcome is recorded (as an owner fence or shutdown would).
+    #[cfg(feature = "test-support")]
+    pub fn inject_disposal_admission_loss(&self, job: u32) {
+        DISPOSAL_ADMISSION_LOSSES.lock().unwrap().insert(job);
+    }
+
+    /// Consulted by disposal after the move. Always false outside the
+    /// `test-support` feature.
+    pub fn take_injected_disposal_admission_loss(&self, job: u32) -> bool {
+        #[cfg(feature = "test-support")]
+        {
+            return DISPOSAL_ADMISSION_LOSSES.lock().unwrap().remove(&job);
+        }
+        #[allow(unreachable_code)]
+        {
+            let _ = job;
+            false
+        }
+    }
+
     /// Test support: the next `record_terminal` for `job` fails before the
     /// row is written, as a refused write would.
     #[cfg(feature = "test-support")]
@@ -486,6 +508,9 @@ impl Inventory {
 #[cfg(feature = "test-support")]
 static TERMINAL_CRASHES: std::sync::LazyLock<Mutex<std::collections::HashMap<u32, u8>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(feature = "test-support")]
+static DISPOSAL_ADMISSION_LOSSES: std::sync::LazyLock<Mutex<std::collections::HashSet<u32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 #[cfg(feature = "test-support")]
 static TERMINAL_INSERT_FAILURES: std::sync::LazyLock<Mutex<std::collections::HashSet<u32>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
