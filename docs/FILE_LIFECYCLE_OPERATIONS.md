@@ -145,6 +145,16 @@ consumers never cause expiry. A missing heartbeat is diagnostic only.
   most); cross-volume files are streamed once, hashing as they are written. A
   published file that a retained PAR set still needs is linked instead, and
   its source name is retained as `retained_repair_dependency`.
+  An unwind never removes the only copy: a cross-volume copy goes only while
+  the source still holds the journaled original, a linked repair input's
+  publication name only while the source name is the same inode; otherwise
+  the move stops for review and its operation error is shown on the artifact.
+  A stuck move (review or retry ladder) is abandoned from the Files detail —
+  **Abandon move and retain original** — which unwinds it, or, where it
+  cannot be put back safely, closes it without deleting anything and
+  registers the publication directory (no manifest) for an explicit
+  disposition; the job's next publication attempt fails `io` and parks the
+  source.
   The processing directory then holds only unselected siblings, which Runner
   disposes of once the delivery row exists. See
   [INTEGRATION.md §2a](INTEGRATION.md#2a-publication-manifest-and-the-move-journal-pipeline-contract-v2-runner-040).

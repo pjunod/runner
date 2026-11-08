@@ -380,8 +380,36 @@ post-processing retry) runner reconciles each intent that is still open:
   `failed/io` (parked, no blame) on its next publication attempt.
 
 Exactly one of finish or unwind runs, and the decision is logged with the
-per-file evidence. While an intent is open, neither the source nor the target
-can be disposed of, deleted or retired.
+per-file evidence. A restart that had already decided to finish and stopped
+again re-locates every file the journal does not yet record as moved (a
+rename can land before its journal update), so finishing is idempotent too.
+While an intent is open, neither the source nor the target can be disposed
+of, deleted or retired.
+
+**What identity proves.** A file with a journaled digest is checked by its
+bytes. A same-volume file the journal has no digest for yet (the crash came
+before its one read pass) is matched by **inode, device, size, mtime and
+ctime only** — the same check a rename preserves. That detects replacement
+and ordinary writes (both change ctime) but not bit rot under unchanged
+metadata; such a file's digest is computed as it is published, and curator
+re-verifies only cross-volume publications. Legacy records without a ctime
+are matched on inode, size and mtime.
+
+**An unwind never deletes the only copy.** A cross-volume copy is removed
+only while the source still holds the journaled original, and a linked PAR
+repair input loses its publication name only while the source name is the
+same inode. Otherwise the unwind stops for review (the operation's error is
+mirrored onto the artifact, so Files and Attention show it).
+
+**Operator exit.** A move stuck in review or on its retry ladder can be
+abandoned from the Files detail (*Abandon move and retain original*), i.e.
+`POST /api/v1/artifact-operations/<op>/abandon-relocation` with the
+artifact's `revision` and `generation`. Runner unwinds the move — the source
+is complete and stays runner's — and the job's next publication attempt fails
+`failed/io`, parking the source. If the move cannot be put back safely,
+abandoning closes it without deleting anything: the files stay where they are
+and the publication directory (no manifest, so never curator's) is registered
+in the inventory for an explicit disposition.
 
 **The reconciliation feed.** `GET /api/v1/deliveries?after=<cursor>&limit=<1..100>`
 is a read-only feed of immutable publication rows in sequence order: job,

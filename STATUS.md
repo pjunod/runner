@@ -2,10 +2,66 @@
 
 ## Pipeline contract v2 M3 — journaled per-file publication, one hash, no ack — 2026-11-07
 
-**Status:** built on `claude/pipeline-v2-m3-runner` (runner 0.4.0), branched
-from M1a's approved head `f0c21f4` (PR #281), with M1a's `d95cb11` merged in. No PR yet, not merged, not
-deployed. Plan: `IMPL_RUNNER.md` §7 / `PIPELINE_REWRITE_PLAN.md` M3. Deploys
-after curator M2 (contract §6).
+**Status:** draft PR [#283](https://github.com/pjunod/runner/pull/283) on
+`claude/pipeline-v2-m3-runner` (runner 0.4.0), `main` (with M1a #281) merged
+in; review round 1 addressed (below). Not merged, not deployed. Plan:
+`IMPL_RUNNER.md` §7 / `PIPELINE_REWRITE_PLAN.md` M3.
+
+**M3 must not reach nuc3 before curator #95 (M2) is deployed there.** Curator
+v1 retries `accept`'s 410 forever (a visible `Error`, warn logs) and, with the
+`accepted` filter gone, re-pages the whole `/deliveries` feed every sweep.
+
+**Review r1 (#283, Fable) — resolutions:**
+- *1 (blocking) manager at boot:* `crash_after_*_finishes_with_manager_at_boot`
+  for every crash point (10 s delivery deadline, inside the 30 s rescan).
+  Root causes: `job_status_changed` was keyed on the owner's status, which
+  never leaves `Post` during boot verification (only the snapshot shows
+  `queued`) — now emitted from the published projection, after it is stored;
+  the manager now rescans on the owner's next queue change after a deferred
+  export/admission, on a `completed` terminal's emission and when an attempt
+  ends with one; `drop_unneeded_verifications` lifted its fence without an
+  epoch bump; boot verification and payload recovery failed against a
+  restart's reconciliation lease and backed off 10 s+ (they now wait on its
+  release); `resume_committed_publication` wrote the delivery row **before**
+  the terminal (now terminal, then row, then source retirement);
+  `finish_stamped_delivery` reads the owed delivery from the terminal row.
+  The publication suite went from ~230 s to ~30 s.
+- *2 (blocking) data loss:* a cross-volume unwind removes a copy only while
+  the source holds the journaled original; a linked repair input drops its
+  publication name only while the source name is the same inode; otherwise
+  conflict, copy retained. Tests for both.
+- *3:* `Finishing` re-entry re-locates unjournaled renames; new crash point
+  `after_rename_before_journal` in the inventory and post (c) suites.
+- *4:* *Abandon move and retain original* (Files/Attention, the existing
+  `abandon-relocation` route) covers per-file moves: unwind, or close without
+  deleting anything and register the target for review; the job then fails
+  `io` and parks. A stuck move's operation error is mirrored onto the
+  artifact.
+- *5:* the cross-volume capacity reservation is held for the whole move (and
+  a restart's finish reserves what is left to copy).
+- *6:* (e) asserts its one outcome: boot verification holds the job for
+  repair, no terminal.
+- *7:* re-covered — a recovery copy whose streamed bytes disagree with the
+  journaled digest never lands; a lease expiring mid-copy stops at the next
+  chunk and the same attempt finishes.
+- *8:* INTEGRATION §2a documents what identity without a digest proves
+  (inode/device/size/mtime/ctime).
+- *9:* a second selected publication of a generation is `Conflict`.
+- *10:* intents whose artifact/operation is gone close as unwound with
+  evidence; a pre-M3 queued deletion unwinds the move.
+- *11:* cluster `accept` answers 410 before any lookup.
+- *12:* one `RETRY_LADDER_SECONDS` / `retry_delay()` replaces eight copies.
+- *13:* the cross-volume tests find a second device (tmpfs, temp dir, test
+  binary's volume) and fail under `NZBD_REQUIRE_TOOLS` instead of skipping.
+- Contract copy: §2.5's "rename" admits a hard link for PAR repair inputs.
+
+**M6 must delete** (rollback shims kept for one release): the
+`deliveries.accepted_at`/`consumer_receipt_id` columns, `delivery_row_json`'s
+`status`, the cluster `encode_record` status shim and
+`cluster_deliveries.accepted_at`, both `include_accepted` params (local and
+cluster), the v1 delivery row write and `pp_status`/`final_dir`,
+`custodyState`/`sourceCleanupStatus`, and the `review: interrupted move` hold
+rewrite in `commit_intent` (`intents.rs`).
 
 - **The move is journaled before it starts.** A selected publication inserts
   its intent into the new `relocation_intents` table (generation, target,
@@ -66,27 +122,24 @@ after curator M2 (contract §6).
   again (crash after the history write → restart hung). Such verifications
   are now dropped (`drop_unneeded_verifications`).
 - **Tests** (fast lane; `TMPDIR=/dev/shm` because the shared workspace disk
-  had < 1 GiB free, below the capacity guard's headroom):
-  - `crates/nzbd-post/tests/publication.rs` 8/8 — (a)
-    `same_volume_publication_renames_selected_only` (tmpfs, fs-ops counter),
-    (c) `crash_after_{first_rename,last_rename,manifest,history,delivery}_finishes_on_restart`
-    (real engine restart), (e) `crash_with_corrupted_source_unwinds`,
-    `delivery_row_written_after_history`.
-  - `nzbd-state` lib 324 passed, 2 ignored (pre-existing performance
-    probes): `artifacts::intents::tests` 9 — (b)
-    `manifest_digest_matches_curator_fixture` (the fixture digest was produced
-    by curator's own `ports.ManifestDigest`), `manifest_digest_golden_vector_unchanged`,
-    (d) `nfs_fixture_fallback_chain`, `cross_volume_publication_copies_once`
-    (/dev/shm is a second device here), `repair_input_is_linked_and_survives_finish_and_unwind`;
-    `terminals::open_intent_alone_blocks_disposal`;
-    `park_root_creation_failure_lands_on_the_operation_ladder`.
-  - `nzbd-post` lib 120, `pp_pipeline` 34, `terminal_first` 14 (its
-    `retire_sweep_waits_for_salvage_and_open_intents` now holds an open
-    salvage intent), `failure_regressions` 6, `rename_producer` 2.
-  - `nzbd-api` lib 88 (`accept_is_gone`), `nzbd-cluster` lib 57,
-    `nzbd-engine` lib 315/316 — the failure is environmental
-    (`inaccessible_path_is_unknown…` sets mode 000, which root ignores; the
-    file is untouched by this branch).
+  had < 1 GiB free, below the capacity guard's headroom), after review r1:
+  - `crates/nzbd-post/tests/publication.rs` 15/15 — (a)
+    `same_volume_publication_renames_selected_only`, (c)
+    `crash_after_{rename_before_journal,first_rename,last_rename,manifest,history,delivery}`
+    both `_finishes_on_restart` and `_finishes_with_manager_at_boot`, (e)
+    `crash_with_corrupted_source_unwinds`, `delivery_row_written_after_history`.
+    13 consecutive full-suite runs: 12 passed, 1 failed once
+    (`crash_after_rename_before_journal_finishes_with_manager_at_boot`, no
+    delivery in 10 s; not reproduced in the following runs, not root-caused).
+  - `nzbd-state` lib 334 passed, 2 ignored (pre-existing performance
+    probes): `artifacts::intents::tests` 19, incl. (b)
+    `manifest_digest_matches_curator_fixture`, (d) `nfs_fixture_fallback_chain`,
+    the cross-volume set on a real second device (/dev/shm vs the disk).
+  - `nzbd-post` lib 120, `pp_pipeline` 34, `terminal_first` 14,
+    `failure_regressions` 6, `rename_producer` 2.
+  - `nzbd-api` lib 88, `nzbd-cluster` lib 57, `nzbd-engine` lib 315/316 — the
+    failure is environmental (`inaccessible_path_is_unknown…` sets mode 000,
+    which root ignores; untouched by this branch).
   - Clippy `-D warnings` on the five touched crates, all targets.
 - **Not verified:** `cargo test --workspace` and clippy `--workspace` (the
   gate's); `NZBD_REQUIRE_TOOLS=1`; `nzbd-cluster` integration tests
@@ -101,17 +154,19 @@ after curator M2 (contract §6).
 - **Post fix:** `finish_stamped_delivery` treated a transient export refusal
   (verification or journal loading) as "row gone" and retired the job
   without its delivery row; it now waits.
-- **Observed, not root-caused:** before the engine fix, with the post manager
-  spawned immediately after a restart, a Post-status job's boot verification
-  stayed `pending`; the restart tests therefore start the manager once boot
-  verification settles (the daemon starts it at once). Not re-checked after
-  the fix.
 - **(e) end to end:** after the unwind, the engine's own boot verification
   sees the corrupted file's CRC and holds the job for a generation-safe
   repair before post-processing runs again; the `failed/io` terminal IMPL §7.2
   names happens when publication is attempted (asserted at the inventory
-  level). Nothing is published or disposed either way.
+  level). The post-level test asserts the hold (review r1 #6). Nothing is
+  published or disposed.
 - **Decisions for Paul:**
+  - Review r1 #4: an abandoned publication move fails the job `io` on its
+    next attempt and parks the source (the generation keeps its one intent
+    row), rather than allowing a second publication of that generation.
+  - Review r1 #1: boot verification and payload recovery now block their
+    worker thread on a reconciliation lease's release (condvar) instead of
+    failing and backing off; the lease is held only for one pass.
   - `accept` answers `410` (IMPL §7.4; the contract's one-release `200`
     was M1a's release).
   - The `accepted_at`/`consumer_receipt_id` columns stay (written NULL, never
