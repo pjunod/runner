@@ -1002,3 +1002,115 @@ async fn partial_torrent_is_io_with_salvage_pending() {
     );
     engine.shutdown().await;
 }
+
+/// v2 of the deleted `a_failed_attempt_that_left_no_files_retains_nothing`:
+/// a failed attempt that never wrote a byte is assessed `unusable` after
+/// salvage finds nothing, and its empty source is disposed by policy —
+/// nothing is parked or retained.
+#[tokio::test]
+async fn a_failed_attempt_that_left_no_files_retains_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, _history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, source) = admitted_job(
+        &engine,
+        "nothing-written",
+        &[("episode.mkv", None)],
+        JobStatus::Failed,
+    )
+    .await;
+    assert!(engine
+        .fail_job(
+            job_id,
+            FailureReason::Health,
+            None,
+            "health",
+            "no article arrived"
+        )
+        .await
+        .unwrap());
+    let parked = tmp.path().join("parked");
+    assert!(
+        nzbd_post::manager::follow_up_failure(
+            &engine,
+            &PostConfig {
+                failure_action: FailureAction::Delete,
+                failed_dir: Some(parked.clone()),
+                ..PostConfig::default()
+            },
+            &tmp.path().join("dest"),
+            job_id,
+        )
+        .await
+    );
+    let terminal = engine.artifacts().terminal(job_id.0).unwrap().unwrap();
+    assert!(terminal.disposal.is_some(), "{terminal:?}");
+    assert!(
+        !parked.join("nothing-written").exists(),
+        "nothing is parked"
+    );
+    assert!(
+        !source.exists() || std::fs::read_dir(&source).unwrap().next().is_none(),
+        "nothing is retained"
+    );
+    engine.shutdown().await;
+}
+
+/// v2 of the deleted `absent_integrity_proof_is_unknown_not_cleanup_authority`:
+/// payload bytes whose integrity was never proven are not deletion
+/// authority — with `failure_action = delete` the source is parked, not
+/// deleted (the pre-v2 "unknown → retain" rule, now after the terminal).
+#[tokio::test]
+async fn absent_integrity_proof_is_unknown_not_cleanup_authority() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, _history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, source) = admitted_job(
+        &engine,
+        "unproven",
+        &[(
+            "Movie.2020.mkv",
+            Some(b"\x1a\x45\xdf\xa3 unproven matroska".as_slice()),
+        )],
+        JobStatus::Failed,
+    )
+    .await;
+    // Drop the proof: the bytes arrived, but no file CRC vouches for them.
+    let mut row = export(&engine, job_id).await.unwrap();
+    for file in &mut row.files {
+        file.crc32 = None;
+    }
+    engine.import_job(row, false, false).await.unwrap();
+    assert!(engine
+        .fail_job(
+            job_id,
+            FailureReason::Health,
+            None,
+            "health",
+            "below critical"
+        )
+        .await
+        .unwrap());
+    let parked = tmp.path().join("parked");
+    let cfg = PostConfig {
+        failure_action: FailureAction::Delete,
+        failed_dir: Some(parked.clone()),
+        ..PostConfig::default()
+    };
+    // As the manager's rescans do: follow up until the owner has settled the
+    // re-imported row (its startup verification owns it first).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !nzbd_post::manager::follow_up_failure(&engine, &cfg, &tmp.path().join("dest"), job_id)
+        .await
+    {
+        assert!(tokio::time::Instant::now() < deadline, "follow-up settles");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let terminal = engine.artifacts().terminal(job_id.0).unwrap().unwrap();
+    let disposal = terminal.disposal.clone().unwrap();
+    assert!(disposal.starts_with("parked at"), "{disposal}");
+    let kept = parked.join("unproven").join("Movie.2020.mkv");
+    assert!(
+        kept.exists() || source.join("Movie.2020.mkv").exists(),
+        "unproven payload is retained: {disposal}"
+    );
+    engine.shutdown().await;
+}

@@ -711,7 +711,16 @@ async fn failure_followup(
             return false;
         }
     }
-    let Some(row) = engine.export_job(job).await.ok().flatten() else {
+    let row = match engine.export_job(job).await {
+        Ok(row) => row,
+        // A busy owner (a lifecycle transition in flight) is not a removed
+        // job: retry later rather than settle the obligation as gone.
+        Err(error) => {
+            tracing::debug!(job = job.0, %error, "failed-job follow-up waits for the owner");
+            return false;
+        }
+    };
+    let Some(row) = row else {
         // The queue row is gone (an operator delete, which owns its bytes):
         // nothing remains for runner to salvage or dispose.
         let inventory = engine.artifacts();
@@ -748,34 +757,40 @@ async fn failure_followup(
             terminal = reloaded;
         }
     }
-    // Review #280-7: what salvage found is the source's assessment from here
-    // on — published or nothing usable makes the remainder redundant; an
-    // assessment that failed leaves it unknown (retained).
-    let assessment = match (terminal.salvage, terminal.salvage_error.is_some()) {
-        (nzbd_state::artifacts::SalvageState::Published, _) => Some((
-            "unusable",
-            "verified payload was published as salvage; the remainder is redundant",
-        )),
-        (nzbd_state::artifacts::SalvageState::SettledNone, false) => Some((
-            "unusable",
-            "bounded post-failure assessment found no usable payload or repairable input",
-        )),
-        _ => None,
-    };
-    if let Some((disposition, reason)) = assessment {
-        let inventory = engine.artifacts();
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Some(source) = inventory.job_source(job.0)? {
-                inventory.set_failure_assessment(
-                    &source.id,
-                    &source.generation,
-                    disposition,
-                    reason,
-                )?;
-            }
-            Ok::<_, nzbd_state::artifacts::Error>(())
-        })
-        .await;
+    // Review #280-7: the source's assessment after salvage. A published
+    // salvage took the verified payload, so the remainder is redundant;
+    // otherwise assess what is left — unverified-but-intact payload or a
+    // repairable input is `recoverable` (the pre-v2 "absent proof is not
+    // cleanup authority" rule), nothing usable is `unusable`.
+    if terminal.salvage != nzbd_state::artifacts::SalvageState::Pending {
+        if terminal.salvage == nzbd_state::artifacts::SalvageState::Published {
+            let inventory = engine.artifacts();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Some(source) = inventory.job_source(job.0)? {
+                    inventory.set_failure_assessment(
+                        &source.id,
+                        &source.generation,
+                        "unusable",
+                        "verified payload was published as salvage; the remainder is redundant",
+                    )?;
+                }
+                Ok::<_, nzbd_state::artifacts::Error>(())
+            })
+            .await;
+        } else if let Err(error) = record_failure_assessment(
+            &scoped,
+            &row,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+        )
+        .await
+        {
+            tracing::warn!(job = job.0, %error, "failed-source assessment did not complete; the source is retained");
+        }
     }
     let done = if terminal.salvage == nzbd_state::artifacts::SalvageState::Pending {
         false
@@ -1151,13 +1166,20 @@ async fn dispose_failed_source(
             Err(_) => false,
         };
     }
-    // Review #280-7 (the pre-v2 "recoverable/unknown → retain" rule): a
-    // source whose salvage could not be assessed is never deleted on the
-    // default policy — it is parked for recovery instead.
-    let action = if action == FailureAction::Delete
-        && terminal.salvage == nzbd_state::artifacts::SalvageState::SettledNone
-        && terminal.salvage_error.is_some()
-    {
+    // Review #280-7 (the pre-v2 "recoverable/unknown → retain" rule): only a
+    // source positively assessed `unusable` may be deleted; a recoverable
+    // or unassessed one is parked for recovery instead.
+    let assessed_unusable = {
+        let inventory = inventory.clone();
+        tokio::task::spawn_blocking(move || inventory.job_source(job.0))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .and_then(|source| source.failure_assessment)
+            .is_some_and(|assessment| assessment.disposition == "unusable")
+    };
+    let action = if action == FailureAction::Delete && !assessed_unusable {
         FailureAction::Park
     } else {
         action
@@ -4300,8 +4322,9 @@ fn record_deobfuscation(params: &mut Vec<(String, String)>, deobfuscated: &[(Pat
 }
 
 /// Record whether a failed attempt's source still holds usable payload
-/// (`recoverable`: a verified sibling or a repairable input) or nothing
-/// (`unusable`), for the lifecycle, cluster cleanup and disposal.
+/// (`recoverable`: a verified sibling or a repairable input), payload whose
+/// integrity is unproven (`unknown`), or nothing (`unusable`), for the
+/// lifecycle, cluster cleanup and disposal. Only `unusable` may be deleted.
 #[allow(clippy::too_many_arguments)]
 async fn record_failure_assessment(
     engine: &EngineHandle,
@@ -4314,7 +4337,7 @@ async fn record_failure_assessment(
     assessed: Option<&std::collections::HashMap<String, FileAssessment>>,
 ) -> Result<(), PostError> {
     let inventory = engine.artifacts();
-    let Some(source) = inventory.for_job(job.id.0)? else {
+    let Some(source) = inventory.job_source(job.id.0)? else {
         return Ok(());
     };
     let mut diagnostics = match assessed {
@@ -4341,22 +4364,32 @@ async fn record_failure_assessment(
     );
     let recovery = recovery_reason(&outcomes);
     let usable = !selected.is_empty() || recovery.is_some();
-    let mut reason = recovery.unwrap_or_else(|| {
-        if usable {
-            "verified sibling payload remains available for publication".into()
-        } else {
-            "bounded post-failure assessment found no usable payload or repairable input".into()
-        }
-    });
+    // Absent integrity proof is not cleanup authority: payload whose bytes
+    // were never verified is `unknown`, which retains like `recoverable`.
+    let unproven = outcomes
+        .iter()
+        .any(|outcome| outcome.outcome == "unverified_review");
+    let (disposition, default_reason) = if usable {
+        (
+            "recoverable",
+            "verified sibling payload remains available for publication",
+        )
+    } else if unproven {
+        (
+            "unknown",
+            "payload integrity is unproven; it is not deletion authority",
+        )
+    } else {
+        (
+            "unusable",
+            "bounded post-failure assessment found no usable payload or repairable input",
+        )
+    };
+    let mut reason = recovery.unwrap_or_else(|| default_reason.into());
     while reason.len() > 2048 {
         reason.pop();
     }
-    inventory.set_failure_assessment(
-        &source.id,
-        &source.generation,
-        if usable { "recoverable" } else { "unusable" },
-        &reason,
-    )?;
+    inventory.set_failure_assessment(&source.id, &source.generation, disposition, &reason)?;
     Ok(())
 }
 
