@@ -4,7 +4,7 @@
 
 **Status:** draft PR [#283](https://github.com/pjunod/runner/pull/283) on
 `claude/pipeline-v2-m3-runner` (runner 0.4.0), `main` (with M1a #281) merged
-in; review round 1 addressed (below). Not merged, not deployed. Plan:
+in (latest `1f73dea`, PR #284); review round 1 addressed (below). Not merged, not deployed. Plan:
 `IMPL_RUNNER.md` §7 / `PIPELINE_REWRITE_PLAN.md` M3.
 
 **M3 must not reach nuc3 before curator #95 (M2) is deployed there.** Curator
@@ -128,14 +128,23 @@ rewrite in `commit_intent` (`intents.rs`).
     `crash_after_{rename_before_journal,first_rename,last_rename,manifest,history,delivery}`
     both `_finishes_on_restart` and `_finishes_with_manager_at_boot`, (e)
     `crash_with_corrupted_source_unwinds`, `delivery_row_written_after_history`.
-    13 consecutive full-suite runs: 12 passed, 1 failed once
-    (`crash_after_rename_before_journal_finishes_with_manager_at_boot`, no
-    delivery in 10 s; not reproduced in the following runs, not root-caused).
-  - `nzbd-state` lib 334 passed, 2 ignored (pre-existing performance
+    The one intermittent failure seen in review r1 work (no delivery in
+    10 s, ~1 in 10 full-suite runs) was reproduced under CPU load and fixed
+    at the root: the owner emits `job_pp_finished` **before** writing the
+    terminal's `emitted` flag, so a manager scan woken by the event could
+    read `emitted = false`, classify it as merely pending, and wait for the
+    30 s rescan. The owner now announces a queue change when the terminal
+    chain releases (`release_terminal`), and an unemitted terminal is a
+    deferred follow-up that waits for it. Free disk at the failure was
+    1.6 GB on `/` and 7.9 GB on the tmpfs the tests use — not disk
+    exhaustion. After the fix: 20/20 full-suite runs under two `yes` loads.
+    `terminal_first::queue_changes_after_the_emitted_flag_lands` fails
+    without the fix and passes with it.
+  - `nzbd-state` lib 340 passed, 2 ignored (pre-existing performance
     probes): `artifacts::intents::tests` 19, incl. (b)
     `manifest_digest_matches_curator_fixture`, (d) `nfs_fixture_fallback_chain`,
     the cross-volume set on a real second device (/dev/shm vs the disk).
-  - `nzbd-post` lib 120, `pp_pipeline` 34, `terminal_first` 14,
+  - `nzbd-post` lib 120, `pp_pipeline` 34, `terminal_first` 15,
     `failure_regressions` 6, `rename_producer` 2.
   - `nzbd-api` lib 88, `nzbd-cluster` lib 57, `nzbd-engine` lib 315/316 — the
     failure is environmental (`inaccessible_path_is_unknown…` sets mode 000,

@@ -193,6 +193,11 @@ impl Owner {
     fn release_terminal(&mut self, job: JobId) {
         self.terminals_in_flight.remove(&job);
         self.pending_control_commits.remove(&job);
+        // The chain's fence lifted (its `emitted` flag is durable, or it
+        // stopped): a caller deferred on it waits for this queue change
+        // (review #283-1 — the event goes out before the flag is written).
+        self.publish_now();
+        self.bump_epoch();
     }
 
     /// Contract §2.1: a terminal that could not be written holds the job

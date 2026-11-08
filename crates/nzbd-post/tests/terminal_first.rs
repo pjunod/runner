@@ -495,6 +495,69 @@ async fn obfuscated_mkv_and_iso_publish() {
 /// `job_terminals` commit, after the history append, after the markers —
 /// replays to exactly one history row, the markers stamped, one event, the
 /// salvage obligation present and disposal not yet run.
+/// Review #283-1: the terminal event goes out before its durable
+/// `emitted` flag. A consumer that reads the row on the event can see
+/// `emitted == false`; the owner must announce a queue change once the flag
+/// has landed, so a caller that deferred on it (the post manager's stamped
+/// follow-up) is woken instead of waiting for its periodic rescan.
+#[tokio::test]
+async fn queue_changes_after_the_emitted_flag_lands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, _history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, _source) = admitted_job(
+        &engine,
+        "emitted-flag",
+        &[("episode.mkv", Some(b"episode")), ("other.mkv", None)],
+        JobStatus::Failed,
+    )
+    .await;
+    let mut events = engine.subscribe();
+    let mut changes = engine.queue_changes();
+    let failing = engine.clone();
+    let chain = tokio::spawn(async move {
+        failing
+            .fail_job(
+                job_id,
+                FailureReason::Health,
+                None,
+                "health",
+                "below critical",
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(Event::JobPpFinished { job, .. }) = events.recv().await {
+                if job == job_id {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("terminal event");
+    changes.borrow_and_update();
+    // From the event on: wake only on queue changes, and stop at the first
+    // one after which the flag reads durable.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            changes.changed().await.unwrap();
+            if engine
+                .artifacts()
+                .terminal(job_id.0)
+                .unwrap()
+                .unwrap()
+                .emitted
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("a queue change follows the durable emitted flag");
+    assert!(chain.await.unwrap().unwrap());
+}
+
 #[tokio::test]
 async fn terminal_crash_after_each_step_replays_once() {
     for (index, step) in [

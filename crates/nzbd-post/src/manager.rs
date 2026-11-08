@@ -1951,7 +1951,10 @@ async fn scan_queue(
             };
             let settled = match &terminal {
                 None => Settle::Done, // stamped before job_terminals existed
-                Some(t) if !t.emitted => Settle::Pending,
+                // The owner's terminal chain is still in flight (its event
+                // can precede its durable `emitted` flag); it ends with a
+                // queue change.
+                Some(t) if !t.emitted => Settle::Deferred,
                 Some(t) if t.outcome == nzbd_types::TerminalOutcome::Failed => {
                     if claim(j.id) {
                         failure_followup_settle(engine, cfg, dest_dir, gate, j.id, false).await
