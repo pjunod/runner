@@ -160,12 +160,16 @@ rewrite in `commit_intent` (`intents.rs`).
   removes (contract §2.5: accept → 410 for every id, publications named
   `<name>.job-<id>.runner-<gen>`) and were updated. Local: `cluster_e2e`
   22/22 in 237 s; `nzbd` bin 27/27.
-- **Open (cluster mode):** the leader materializes the sealed generation into
-  its own publication directory and computes the `runner-manifest-v1`
-  digest for the cluster delivery row, but writes no `.runner-manifest.json`
-  there. Cluster publications therefore rely on the v1 delivery record during
-  the rollout (contract §6); a v2-only curator would not see them. Not built
-  in M3 (IMPL §7 is single-node); needs a decision before the v1 record goes.
+- **Cluster publications carry the manifest** (orchestrator, contract
+  §2.5): the leader, after landing the sealed payload in its publication
+  directory and before the cluster delivery row, writes `.runner-manifest.json`
+  through the single-node writer (`write_runner_manifest`: `.part`, fsync,
+  exclusive rename, directory fsync); `generation` is the result id,
+  `cross_volume` is true (the payload was copied), and its digest is the
+  row's `manifestDigest`. `cluster_e2e`
+  `delivery_receipts_survive_authority_restart_and_consumer_removed_publication`
+  asserts it. Local: `cluster_e2e` 22/22, 250.6 s (plus a 64 s build);
+  `nzbd-cluster` lib 57; `nzbd-state` lib 340.
 - **Not verified:** `cargo test --workspace` and clippy `--workspace` (the
   gate's); `NZBD_REQUIRE_TOOLS=1`; a real NFS mount (no CI NFS fixture exists — (d) drives the
   fallback through the EINVAL rename seam); deploy.

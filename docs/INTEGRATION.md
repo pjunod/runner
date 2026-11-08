@@ -350,6 +350,12 @@ samples, consumed archives, NFOs); runner disposes of it once the delivery
 row exists. The delivery record reuses the journaled digests — the old
 private staging tree and its four-to-five hash passes are gone.
 
+In a cluster, the leader lands the worker's sealed payload in its own
+publication directory and writes the manifest there last, through the same
+writer; its `generation` is the cluster result id, `cross_volume` is `true`
+(the payload was copied) and its digest is the cluster delivery row's
+`manifestDigest`.
+
 **`.runner-manifest.json`:**
 
 ```json

@@ -839,50 +839,20 @@ impl Inventory {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let target_root = fs::open_dir(&intent.target_dir)?;
-        if let Some(existing) = read_manifest(&target_root)? {
-            let expected = RunnerManifest::new(
+        let (manifest, written) = write_runner_manifest(
+            &intent.target_dir,
+            RunnerManifest::new(
                 intent.generation.clone(),
                 intent.job,
                 intent.transfer.clone(),
-                existing.created_at,
+                now(),
                 intent.cross_volume,
                 files,
-            );
-            if existing != expected {
-                return Err(Error::Conflict(
-                    "publication manifest does not match its journaled intent".into(),
-                ));
-            }
-            return Ok(existing);
-        }
-        let manifest = RunnerManifest::new(
-            intent.generation.clone(),
-            intent.job,
-            intent.transfer.clone(),
-            now(),
-            intent.cross_volume,
-            files,
-        );
-        if fs::open_at(&target_root, Path::new(RUNNER_MANIFEST_PART), false).is_ok() {
-            fs::unlink(&target_root, Path::new(RUNNER_MANIFEST_PART), false)?;
-        }
-        let mut output =
-            fs::create_file_exclusive_at(&target_root, Path::new(RUNNER_MANIFEST_PART))?;
-        output.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            output.set_permissions(std::fs::Permissions::from_mode(0o644))?;
-        }
-        output.sync_all()?;
-        drop(output);
-        fs::rename_exclusive(
-            &intent.target_dir.join(RUNNER_MANIFEST_PART),
-            &intent.target_dir.join(RUNNER_MANIFEST_NAME),
+            ),
         )?;
-        fs::count_op(&self.installation, "manifest_write", 1);
-        fs::sync_directory(&target_root)?;
+        if written {
+            fs::count_op(&self.installation, "manifest_write", 1);
+        }
         Ok(manifest)
     }
 
@@ -1590,6 +1560,46 @@ impl Inventory {
         tx.commit()?;
         Ok(())
     }
+}
+
+/// Write `dir`'s `.runner-manifest.json` last — `.part`, fsync, exclusive
+/// rename, directory fsync — the one writer for single-node and cluster
+/// publications (contract §2.5). An existing manifest is accepted only if it
+/// is the same one (all but `created_at`); returns the manifest on disk and
+/// whether this call wrote it.
+pub fn write_runner_manifest(
+    dir: &Path,
+    manifest: RunnerManifest,
+) -> Result<(RunnerManifest, bool)> {
+    let target_root = fs::open_dir(dir)?;
+    if let Some(existing) = read_manifest(&target_root)? {
+        let mut expected = manifest;
+        expected.created_at = existing.created_at;
+        if existing != expected {
+            return Err(Error::Conflict(
+                "publication manifest does not match its journaled intent".into(),
+            ));
+        }
+        return Ok((existing, false));
+    }
+    if fs::open_at(&target_root, Path::new(RUNNER_MANIFEST_PART), false).is_ok() {
+        fs::unlink(&target_root, Path::new(RUNNER_MANIFEST_PART), false)?;
+    }
+    let mut output = fs::create_file_exclusive_at(&target_root, Path::new(RUNNER_MANIFEST_PART))?;
+    output.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        output.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+    }
+    output.sync_all()?;
+    drop(output);
+    fs::rename_exclusive(
+        &dir.join(RUNNER_MANIFEST_PART),
+        &dir.join(RUNNER_MANIFEST_NAME),
+    )?;
+    fs::sync_directory(&target_root)?;
+    Ok((manifest, true))
 }
 
 /// Read and check a directory's `.runner-manifest.json`, if it has one.

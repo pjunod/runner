@@ -17,7 +17,8 @@ pub use materialization::{
 };
 mod intents;
 pub use intents::{
-    IntentFile, IntentState, ManifestFile, RelocationIntent, RunnerManifest, RUNNER_MANIFEST_NAME,
+    write_runner_manifest, IntentFile, IntentState, ManifestFile, RelocationIntent, RunnerManifest,
+    RUNNER_MANIFEST_NAME,
 };
 mod recovery;
 mod relocation;

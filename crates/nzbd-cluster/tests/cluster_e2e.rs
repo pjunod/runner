@@ -1838,6 +1838,23 @@ async fn delivery_receipts_survive_authority_restart_and_consumer_removed_public
         std::fs::read(path.join(delivery["files"][0]["path"].as_str().unwrap())).unwrap(),
         bytes
     );
+    // Contract §2.5: the leader's publication directory is a publication —
+    // `.runner-manifest.json` written last, its digest the row's.
+    let runner_manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(path.join(".runner-manifest.json")).expect("cluster publication manifest"),
+    )
+    .unwrap();
+    assert_eq!(runner_manifest["digest"], delivery["manifestDigest"]);
+    assert_eq!(
+        runner_manifest["generation"],
+        delivery["publicationGeneration"]
+    );
+    assert_eq!(runner_manifest["transfer"], "cluster-ready-token");
+    assert_eq!(runner_manifest["cross_volume"], true);
+    assert_eq!(
+        runner_manifest["files"].as_array().map(Vec::len),
+        delivery["files"].as_array().map(Vec::len)
+    );
     let id = delivery["deliveryId"].as_str().unwrap();
     let acceptance=serde_json::to_vec(&serde_json::json!({"protocolVersion":1,"publicationGeneration":delivery["publicationGeneration"],"manifestDigest":delivery["manifestDigest"],"consumerReceiptId":"curator-accepted-cluster"})).unwrap();
     let (status, accepted) = http_with_headers(

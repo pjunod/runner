@@ -2924,6 +2924,41 @@ async fn ensure_cluster_delivery(
         .params
         .iter()
         .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
+    let manifest_digest = format!("{:x}", Sha256::digest(canonical));
+    if !cleanup_only {
+        // Contract §2.5: a directory without `.runner-manifest.json` is not a
+        // publication. The leader landed the sealed payload in `final_path`;
+        // the manifest goes in last, through the single-node writer, and
+        // its digest is the row's. The payload was copied, not renamed.
+        let runner_manifest = nzbd_state::artifacts::RunnerManifest::new(
+            result_id.to_string(),
+            job.id.0,
+            job.params
+                .iter()
+                .find(|(key, _)| key == "monarr-transfer")
+                .map(|(_, value)| value.clone()),
+            accepted_at_ms / 1000,
+            true,
+            files
+                .iter()
+                .map(|file| nzbd_state::artifacts::ManifestFile {
+                    path: file.path.clone(),
+                    bytes: file.size_bytes,
+                    sha256: file.sha256.clone(),
+                })
+                .collect(),
+        );
+        if runner_manifest.digest != manifest_digest {
+            return Err("cluster publication manifest digest disagrees with its row".into());
+        }
+        let dir = final_path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            nzbd_state::artifacts::write_runner_manifest(&dir, runner_manifest)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("cluster publication manifest: {error}"))?;
+    }
     let delivery:nzbd_state::artifacts::Delivery=serde_json::from_value(serde_json::json!({
         "protocolVersion":1,"sequence":0,"deliveryId":id,"publicationGeneration":result_id,
         "artifactId":format!("cluster-publication:{result_id}"),"sourceArtifactId":source.as_ref().map(|source|source.artifact.as_str()).unwrap_or(""),
@@ -2933,7 +2968,7 @@ async fn ensure_cluster_delivery(
         "keepSourceOnFailure":keep,"terminalOutcome":outcome,
         "failureStage":job.params.iter().find(|(key,_)|key=="Failure:Stage").map(|(_,value)|value),
         "failureCause":job.params.iter().find(|(key,_)|key=="Failure:Reason"||key=="Failure:Files").map(|(_,value)|value),
-        "publicationPath":final_path.to_string_lossy(),"manifestDigest":format!("{:x}",Sha256::digest(canonical)),
+        "publicationPath":final_path.to_string_lossy(),"manifestDigest":manifest_digest,
         "files":files,"fileOutcomes":manifest.file_outcomes,"readyAt":accepted_at_ms/1000,
         "runnerStages":{"nodeId":"unrecorded","clockDomain":"unrecorded","spans":sealed_job.stages.iter().take(128).collect::<Vec<_>>()},
         "lifecycleTiming":nzbd_engine::frozen_lifecycle_timing(&sealed_job),
