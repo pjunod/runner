@@ -820,6 +820,68 @@ async fn fail_and_follow_up(
     failure_followup(engine, cfg, dest_dir, gate, job, true).await
 }
 
+/// Cluster worker, after the leader accepted a failed post-processing result
+/// (so the job's terminal is durable there, contract §2.1): dispose of this
+/// node's own attempt copy by the same rule as single-node disposal —
+/// Keep retains, park-always reasons retain in place, a source assessed `recoverable`
+/// (or not assessed) is retained, anything else follows `failure_action`.
+/// The cluster cleanup ledger then finds the copy already settled. Before
+/// v2 this ran inside the attempt, ahead of the stamp.
+pub async fn dispose_remote_failure(
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    dest_dir: &Path,
+    job: &Job,
+) -> bool {
+    let param = |key: &str| {
+        job.params
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    };
+    if !param(PP_DONE_PARAM).is_some_and(|status| !status.starts_with("SUCCESS")) {
+        return true;
+    }
+    let reason = param("Failure:Reason").and_then(nzbd_types::FailureReason::parse);
+    let inventory = engine.artifacts();
+    let assessed = inventory
+        .for_job(job.id.0)
+        .ok()
+        .flatten()
+        .and_then(|artifact| artifact.failure_assessment)
+        .map(|assessment| assessment.disposition);
+    let action = if nzbd_engine::terminal::keeps_failed_source(job) {
+        FailureAction::None
+    } else if reason.is_some_and(|reason| reason.park_always()) {
+        // Contract §2.2 park-always: the copy stays under runner custody
+        // where it is; the cluster ledger retains it (`artifacts::cluster`).
+        FailureAction::None
+    } else if assessed.as_deref() != Some("unusable") {
+        // `recoverable` holds payload; no assessment proves nothing.
+        FailureAction::None
+    } else {
+        cfg.failure_action
+    };
+    if action == FailureAction::None {
+        return true;
+    }
+    let mut failure_cfg = cfg.clone();
+    failure_cfg.failure_action = action;
+    let dir_name = nzbd_engine::queue::job_dir_name(job);
+    let source = dest_dir.join(&dir_name);
+    let observed = dispose_failed(
+        inventory,
+        &failure_cfg,
+        job.id,
+        &source,
+        dest_dir,
+        &dir_name,
+        "remote",
+    )
+    .await;
+    observed.files_at.is_none() || action == FailureAction::Park
+}
+
 /// Run a failed job's salvage and disposal now (contract §2.2/§2.6), as
 /// the manager does on its `job_pp_finished`. Returns true once nothing is
 /// left to do.
