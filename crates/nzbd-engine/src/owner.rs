@@ -3275,9 +3275,15 @@ impl Owner {
                 }
                 let generation = fresh_epoch();
                 self.job_epochs.insert(id, generation);
+                // Snapshot publication can race the admission save. Reuse the
+                // export barrier until the durable acceptance callback runs.
+                self.pending_control_revisions.insert(id, generation);
                 let persistent = self.persist;
                 self.persist_then(move |owner, committed| {
                     let current = owner.job_epochs.get(&id) == Some(&generation);
+                    if owner.pending_control_revisions.get(&id) == Some(&generation) {
+                        owner.pending_control_revisions.remove(&id);
+                    }
                     if (!persistent || committed) && current {
                         tracing::info!(job = id.0, %name, %url, "url job added (fetching)");
                         owner.publish_now();
@@ -3295,6 +3301,8 @@ impl Owner {
                                 .unaccepted_admissions
                                 .retain(|_, receipt| receipt.job_id != id.0);
                         }
+                        owner.publish_now();
+                        owner.bump_epoch();
                         let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
                     }
                 });
