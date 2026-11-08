@@ -8,7 +8,7 @@ remains pending and production configuration is unchanged.
 `codex/download-inventory-performance`.
 
 Companion to [the I/O audit](IO_EFFICIENCY_AUDIT.md) and
-[publication performance](PUBLICATION_PERFORMANCE_PLAN.md). This plan addresses
+[publication performance](archive/PUBLICATION_PERFORMANCE_PLAN.md). This plan addresses
 slow active Usenet downloads on nuc3. Review the evidence and scope before
 implementing the milestones. If an optimization requires weakening durability,
 identity, generation, retention or deletion checks, revise this plan first.
@@ -650,3 +650,77 @@ of table-blob reads, equality with the current full-artifact custody fields,
 missing/stale generations, and updates to state/ownership/Keep metadata.
 After review, CI and deployment, repeat the owner-latency trace and sustained
 one-slot download measurements. The 109 MiB/s runtime gate remains open.
+
+## 12. Follow-up — malformed BODY frames stalled every provider connection
+
+After the custody batching rollout, a 20-second probe measured only 12.2 ms
+of custody refresh work. A later hard stall was a distinct transport failure.
+A passive probe of the running downloader observed 30 successful greeting,
+USER, PASS and BODY responses (`200`, `381`, `281`, `222`), ruling out a
+provider authentication failure. Separate extra-connection login tests received
+`502` / “too many” because the normal pool already held its connection quota;
+those extra probes are not evidence that the downloader failed authentication.
+
+A decoder probe then captured 30 actual `Malformed("bad =ypart range")` errors.
+Every failing wire chunk was 128–256 bytes and already ended with the NNTP
+dot/CRLF terminator. Input registers and result representation were verified
+against the exact running ELF disassembly; this is not an assumed Rust enum
+layout or a sampled descriptor-number classification. No article contents or
+credentials were recorded.
+
+The decode-error branch consumed the entire buffered chunk and then called
+`drain_body` with a fresh terminator scanner. It had discarded the terminator
+it was about to wait for, and could also discard the next pipelined response.
+The resulting read timeout incorrectly turned an article-level validation
+failure into a connection failure. All 30 connections repeated this cycle
+instead of advancing past malformed articles. The branch dates to July 17
+(`2f45cd5`), so it is an older defect exposed by the current article data,
+separate from the later durability and receipt-refresh changes.
+
+The correction gives transport framing its own persistent `TerminatorScanner`
+across every BODY chunk. Only bytes through the current article's terminator
+reach the decoder or are consumed from the connection. After a decoder error,
+the same scanner discards the rest of that article, then reports one ordinary
+article failure. The next pipelined response remains buffered. Invalid ranges,
+CRC failures, expected lengths and durable writer acknowledgements stay
+enforced; no invalid article is accepted to improve throughput.
+
+Regression coverage must include the observed malformed part range, a plain
+text stub, a malformed article followed by a valid pipelined response in the
+same write, and terminators fragmented across every boundary with dot-stuffed
+content. Capture the pre-fix timeout, then verify prompt article rejection and
+valid successor bytes without a connection failure. The production 0.4
+backport and current-main PR integration need separate source/hash receipts.
+The one-active-download 109 MiB/s acceptance gate remains open.
+
+
+## 13. Remaining bottleneck — full queue writes on GlusterFS
+
+After deployment of the framing fix, a 20-second decoder probe recorded 7,775
+successful calls and no validation errors. Recovery eventually drained to no
+pending/checking jobs, but two untraced one-slot windows still averaged only
+7.77 and 6.13 MiB/s. The speed regression is not resolved by the earlier fixes.
+
+The queue snapshot contains about 1.93 million segments and occupies 225–227 MB.
+A steady 20-second trace measured 12 snapshot saves taking 16.38 seconds. Actual
+syscalls inside those saves spent 10.57 seconds writing, 1.95 seconds in
+fdatasync, 0.39 seconds renaming and 0.015 seconds syncing directories. These
+are queue-state writes on the GlusterFS mount, not decoded payload writes.
+Per-file birth and completion calls were observed producing full checkpoints;
+first post-admission checkpoints added pressure for distinct jobs. The sampled
+post-admissions were not repeated for the same job. A separate steady admission
+sample saw no rejected sends, so increasing the queue bound is not supported
+as the current fix.
+
+The per-file generation and publication barriers date to November 1 `a630414`.
+They contribute to the present regression; the earlier reported onset is not
+precise enough to attribute every prior slow interval to this commit. Removing
+those barriers would weaken recovery. Instead, the next implementation retains
+the exact complete document and atomic durability sequence while reducing its
+on-disk representation. A same-host read-only benchmark reduced 226,988,198
+bytes to 59,533,252 bytes in 0.276 seconds with exact round-trip recovery.
+
+See [Queue snapshot encoding](QUEUE_SNAPSHOT_ENCODING.md) for the versioned
+format, integrity limits, old-binary refusal, offline rollback, alternatives and
+runtime acceptance gate. Neither the compression ratio nor successful unit
+checks establishes 109 MiB/s; deployment measurement is still required.

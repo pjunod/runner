@@ -835,7 +835,7 @@ async fn migrate_legacy_control(
     let snapshot = if bytes.is_empty() {
         nzbd_state::QueueSnapshotDoc::default()
     } else {
-        serde_json::from_slice(&bytes)
+        nzbd_state::SnapshotStore::decode(&bytes)
             .map_err(|error| format!("decode legacy queue for migration: {error}"))?
     };
 
