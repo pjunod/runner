@@ -424,12 +424,28 @@ async fn manager_task(
     // from a dead leader mid-way).
     let mut rescan = tokio::time::interval(RESCAN_INTERVAL);
     rescan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Review #283-1: the owner defers export/admission while a job is
+    // fenced (boot verification, journal loading); a scan that met such a
+    // deferral runs again on the owner's next queue change.
+    let mut queue_changes = engine.queue_changes();
+    let mut deferred = false;
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = rescan.tick() => {
-                scan_queue(
+                queue_changes.borrow_and_update();
+                deferred = scan_queue(
+                    &tracker, &engine, &cfg, &history, &dest_dir, &gate, &sem,
+                    &cancel, &finished_tx, &mut active,
+                ).await;
+            }
+            changed = queue_changes.changed(), if deferred => {
+                if changed.is_err() {
+                    break;
+                }
+                queue_changes.borrow_and_update();
+                deferred = scan_queue(
                     &tracker, &engine, &cfg, &history, &dest_dir, &gate, &sem,
                     &cancel, &finished_tx, &mut active,
                 ).await;
@@ -497,6 +513,17 @@ async fn manager_task(
                     if let Some(attempt) = active.get(&job) {
                         attempt.cancel.cancel();
                     }
+                }
+                // Review #283-1: a job the manager is not processing became
+                // eligible for post-processing — typically boot verification
+                // returning an interrupted job to `Post`/`PostQueued` after
+                // the manager's first scan saw it `Queued`. Scan now rather
+                // than at the next periodic rescan.
+                Ok(Event::JobStatusChanged { job, status, .. })
+                    if !active.contains_key(&job)
+                        && matches!(status.as_str(), "post_queued" | "post_processing" | "completed") =>
+                {
+                    rescan.reset_immediately();
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -678,6 +705,28 @@ async fn manager_task(
 /// `job_terminals` row, never from queue status. Returns true once nothing
 /// is left to do (the row may then retire).
 #[allow(clippy::too_many_arguments)]
+/// Where a terminal's follow-up stands after one pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settle {
+    /// Nothing is left to do.
+    Done,
+    /// Still owed; its own ladder (or the next event) brings it back.
+    Pending,
+    /// The owner deferred its answer (boot verification, journal loading, a
+    /// transition in flight): retry on the next queue change.
+    Deferred,
+}
+
+impl From<bool> for Settle {
+    fn from(done: bool) -> Self {
+        if done {
+            Settle::Done
+        } else {
+            Settle::Pending
+        }
+    }
+}
+
 async fn failure_followup(
     engine: &EngineHandle,
     cfg: &PostConfig,
@@ -686,17 +735,30 @@ async fn failure_followup(
     job: JobId,
     force: bool,
 ) -> bool {
+    failure_followup_settle(engine, cfg, dest_dir, gate, job, force).await == Settle::Done
+}
+
+async fn failure_followup_settle(
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    dest_dir: &Path,
+    gate: &PpGate,
+    job: JobId,
+    force: bool,
+) -> Settle {
     if gate.as_ref().is_some_and(|claim| !claim(job)) {
-        return false;
+        return Settle::Pending;
     }
     let Some(terminal) = load_terminal(engine, job).await else {
-        return false;
+        return Settle::Pending;
     };
     if terminal.outcome != nzbd_types::TerminalOutcome::Failed || !terminal.emitted {
-        return terminal.outcome != nzbd_types::TerminalOutcome::Failed && terminal.emitted;
+        return Settle::from(
+            terminal.outcome != nzbd_types::TerminalOutcome::Failed && terminal.emitted,
+        );
     }
     if terminal.disposal.is_some() {
-        return true;
+        return Settle::Done;
     }
     // Review #280-7: the retry ladder is the disposal operation's own
     // (durable, visible on the artifact); nothing here keeps a second one.
@@ -708,7 +770,7 @@ async fn failure_followup(
             .and_then(Result::ok)
             .flatten();
         if retry_at.is_some_and(|at| at > now()) {
-            return false;
+            return Settle::Pending;
         }
     }
     let row = match engine.export_job(job).await {
@@ -717,7 +779,11 @@ async fn failure_followup(
         // job: retry later rather than settle the obligation as gone.
         Err(error) => {
             tracing::debug!(job = job.0, %error, "failed-job follow-up waits for the owner");
-            return false;
+            return if error.is_deferred() {
+                Settle::Deferred
+            } else {
+                Settle::Pending
+            };
         }
     };
     let Some(row) = row else {
@@ -734,14 +800,16 @@ async fn failure_followup(
             inventory.record_disposal(job.0, "job removed from the queue")
         })
         .await;
-        return true;
+        return Settle::Done;
     };
     let admission = match engine.begin_post_admission(job).await {
         Ok(Some(admission)) => admission,
-        Ok(None) => return false,
+        // Refused for owner state (verification, a transition in flight):
+        // answerable once the queue changes.
+        Ok(None) => return Settle::Deferred,
         Err(error) => {
             tracing::warn!(job = job.0, %error, "failed-job follow-up awaits owner admission");
-            return false;
+            return Settle::Pending;
         }
     };
     let scoped = engine.for_post_admission(&admission);
@@ -819,7 +887,7 @@ async fn failure_followup(
     if let Err(error) = engine.end_post_admission(admission).await {
         tracing::warn!(job = job.0, %error, "failed-job follow-up custody release remains pending");
     }
-    done
+    Settle::from(done)
 }
 
 /// Test support: fail a job as the owner would (a health terminal) and run
@@ -1802,10 +1870,14 @@ async fn scan_queue(
     cancel: &CancellationToken,
     finished: &tokio::sync::mpsc::UnboundedSender<JobId>,
     active: &mut HashMap<JobId, ActiveAttempt>,
-) {
+) -> bool {
     let claim = |job: JobId| gate.as_ref().map(|f| f(job)).unwrap_or(true);
     let inventory = engine.artifacts();
     let snapshot = engine.snapshot();
+    // Review #283-1: a follow-up the owner deferred (boot verification or
+    // journal loading fences export and admission) is retried on the next
+    // queue change, not at the next periodic rescan.
+    let mut deferred = false;
     // Salvage and disposal are driven from `job_terminals`, not from queue
     // status (contract §2.6): a terminal whose queue row is already gone
     // still settles its obligations.
@@ -1828,7 +1900,9 @@ async fn scan_queue(
             for terminal in owed {
                 let job = JobId(terminal.job);
                 if !queued.contains(&job) && claim(job) {
-                    failure_followup(engine, cfg, dest_dir, gate, job, false).await;
+                    deferred |= failure_followup_settle(engine, cfg, dest_dir, gate, job, false)
+                        .await
+                        == Settle::Deferred;
                 }
             }
         }
@@ -1857,14 +1931,19 @@ async fn scan_queue(
                     .flatten()
             };
             let settled = match &terminal {
-                None => true, // stamped before job_terminals existed
-                Some(t) if !t.emitted => false,
+                None => Settle::Done, // stamped before job_terminals existed
+                Some(t) if !t.emitted => Settle::Pending,
                 Some(t) if t.outcome == nzbd_types::TerminalOutcome::Failed => {
-                    claim(j.id) && failure_followup(engine, cfg, dest_dir, gate, j.id, false).await
+                    if claim(j.id) {
+                        failure_followup_settle(engine, cfg, dest_dir, gate, j.id, false).await
+                    } else {
+                        Settle::Pending
+                    }
                 }
                 Some(_) => finish_stamped_delivery(engine, j.id).await,
             };
-            if !settled || gate.is_some() {
+            deferred |= settled == Settle::Deferred;
+            if settled != Settle::Done || gate.is_some() {
                 continue;
             }
             // Contract §2.5: the row is not retired while a publication move
@@ -1935,6 +2014,7 @@ async fn scan_queue(
             active.insert(j.id, attempt);
         }
     }
+    deferred
 }
 
 async fn schedule_recoverable_post_retry(engine: &EngineHandle, job: JobId) {
@@ -4611,14 +4691,15 @@ fn success_publication(
 /// `Delivery:*` markers name the delivery to create; create it from the
 /// still-owned publication (refusing if its digest changed) and retire the
 /// source. True once nothing is owed.
-async fn finish_stamped_delivery(engine: &EngineHandle, job: JobId) -> bool {
+async fn finish_stamped_delivery(engine: &EngineHandle, job: JobId) -> Settle {
     let row = match engine.export_job(job).await {
         Ok(Some(row)) => row,
         // The row is gone: nothing is owed.
-        Ok(None) => return true,
+        Ok(None) => return Settle::Done,
         // A transient owner state (verification or journal loading): the
         // delivery may still be owed; never retire the row on a non-answer.
-        Err(_) => return false,
+        Err(error) if error.is_deferred() => return Settle::Deferred,
+        Err(_) => return Settle::Pending,
     };
     let param = |key: &str| {
         row.params
@@ -4627,7 +4708,7 @@ async fn finish_stamped_delivery(engine: &EngineHandle, job: JobId) -> bool {
             .map(|(_, value)| value.clone())
     };
     let Some(delivery_id) = param("Delivery:Id") else {
-        return true;
+        return Settle::Done;
     };
     let expected_digest = param("Delivery:ManifestDigest");
     let request_token = nzbd_types::transfer_of(&row.params);
@@ -4662,12 +4743,12 @@ async fn finish_stamped_delivery(engine: &EngineHandle, job: JobId) -> bool {
     })
     .await;
     match result {
-        Ok(Ok(())) => true,
+        Ok(Ok(())) => Settle::Done,
         Ok(Err(error)) => {
             tracing::warn!(job = job.0, %error, "stamped completion's delivery remains pending");
-            false
+            Settle::Pending
         }
-        Err(_) => false,
+        Err(_) => Settle::Pending,
     }
 }
 

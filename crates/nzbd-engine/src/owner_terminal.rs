@@ -465,13 +465,23 @@ impl Owner {
 
     /// Emit `job_status_changed` for every job whose projected status or
     /// stage changed since the last published snapshot (contract §2.4).
-    pub(super) fn emit_status_changes(&mut self) {
+    /// `projected` is the published snapshot's `(job, status)`: the
+    /// owner's status with the snapshot overlay (a job under verification
+    /// or with a control commit in flight reads `queued`).
+    pub(super) fn emit_status_changes(&mut self, projected: &[(JobId, JobStatus)]) {
         let mut seen = HashSet::new();
         let mut changes = Vec::new();
-        for job in &self.state.jobs {
+        for (id, published) in projected {
+            let Some(job) = self.state.job(*id) else {
+                continue;
+            };
             seen.insert(job.id);
-            let status = nzbd_types::projected_status(job);
-            let stage = match job.status {
+            let status = if job.held() {
+                "held"
+            } else {
+                published.as_str()
+            };
+            let stage = match published {
                 JobStatus::Post { stage } => Some(stage.as_str()),
                 _ => None,
             };

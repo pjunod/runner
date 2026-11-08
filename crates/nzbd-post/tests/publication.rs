@@ -322,18 +322,16 @@ async fn delivery_row_written_after_history() {
 }
 
 /// After a restart the engine re-verifies a job whose post-processing was
-/// interrupted before it re-admits it. These tests start the post manager
-/// once that boot verification has settled (see the M3 status entry: with
-/// the manager admitted first, the verification was observed to stay
-/// `pending`).
+/// interrupted before it re-admits it. The `…_on_restart` variants start
+/// the post manager once that boot verification has settled; the
+/// `…_with_manager_at_boot` variants start it immediately (the daemon's
+/// order) and must not depend on the manager's periodic rescan.
 async fn settle_boot_verification(engine: &EngineHandle, job: JobId) {
-    let started = tokio::time::Instant::now();
-    let deadline = started + Duration::from_secs(90);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
         let snapshot = engine.snapshot();
         let summary = snapshot.jobs.iter().find(|summary| summary.id == job);
         if summary.is_none_or(|summary| summary.verification.is_none()) {
-            eprintln!("boot verification settled after {:?}", started.elapsed());
             return;
         }
         assert!(
@@ -368,16 +366,26 @@ async fn settle_or_hold(engine: &EngineHandle, job: JobId) {
     }
 }
 
+/// Review #283-1: well inside the manager's 30 s periodic rescan, so a
+/// restart that only finishes on that rescan fails here.
+const DELIVERY_DEADLINE: Duration = Duration::from_secs(10);
+
 async fn wait_delivery(engine: &EngineHandle, job: JobId) -> nzbd_state::artifacts::Delivery {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + DELIVERY_DEADLINE;
     loop {
         if let Some(delivery) = engine.artifacts().delivery_for_job(job.0).unwrap() {
             return delivery;
         }
         if tokio::time::Instant::now() >= deadline {
             let row = engine.export_job(job).await.ok().flatten();
+            let snapshot = engine.snapshot();
             panic!(
-                "no delivery: status {:?}, params {:?}, terminal {:?}, intents {:?}, artifact {:?}",
+                "no delivery: verification {:?}, status {:?}, params {:?}, terminal {:?}, intents {:?}, artifact {:?}",
+                snapshot
+                    .jobs
+                    .iter()
+                    .find(|summary| summary.id == job)
+                    .map(|summary| summary.verification.clone()),
                 row.as_ref().map(|row| row.status),
                 row.as_ref().map(|row| row
                     .params
@@ -404,7 +412,7 @@ async fn wait_delivery(engine: &EngineHandle, job: JobId) -> nzbd_state::artifac
 /// Plan M3 (c): a crash at `stage`, then a restart. Exactly one usable
 /// publication, no file in two places, the processing directory not
 /// disposed of until the publication committed, one history row.
-async fn crash_then_restart(stage: &'static str) {
+async fn crash_then_restart(stage: &'static str, manager_at_boot: bool) {
     let _serial = SERIAL.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let history = open_history(tmp.path());
@@ -484,7 +492,9 @@ async fn crash_then_restart(stage: &'static str) {
     engine.shutdown().await;
     drop(engine);
     let engine = spawn(tmp.path(), &history).await;
-    settle_boot_verification(&engine, job).await;
+    if !manager_at_boot {
+        settle_boot_verification(&engine, job).await;
+    }
     let cancel = CancellationToken::new();
     let tracker = TaskTracker::new();
     spawn_post_manager(
@@ -538,27 +548,27 @@ async fn crash_then_restart(stage: &'static str) {
 
 #[tokio::test]
 async fn crash_after_first_rename_finishes_on_restart() {
-    crash_then_restart("after_first_rename").await;
+    crash_then_restart("after_first_rename", false).await;
 }
 
 #[tokio::test]
 async fn crash_after_last_rename_finishes_on_restart() {
-    crash_then_restart("after_last_rename").await;
+    crash_then_restart("after_last_rename", false).await;
 }
 
 #[tokio::test]
 async fn crash_after_manifest_finishes_on_restart() {
-    crash_then_restart("after_manifest").await;
+    crash_then_restart("after_manifest", false).await;
 }
 
 #[tokio::test]
 async fn crash_after_history_finishes_on_restart() {
-    crash_then_restart("after_history").await;
+    crash_then_restart("after_history", false).await;
 }
 
 #[tokio::test]
 async fn crash_after_delivery_finishes_on_restart() {
-    crash_then_restart("after_delivery").await;
+    crash_then_restart("after_delivery", false).await;
 }
 
 /// Plan M3 (e): a crash with the source half-moved and a *corrupted*
@@ -677,4 +687,31 @@ async fn crash_with_corrupted_source_unwinds() {
     tracker.close();
     tracker.wait().await;
     engine.shutdown().await;
+}
+
+// The daemon's order (`nzbd/src/main.rs`): the post manager starts right
+// after `Engine::spawn`, racing boot verification (review #283-1).
+#[tokio::test]
+async fn crash_after_first_rename_finishes_with_manager_at_boot() {
+    crash_then_restart("after_first_rename", true).await;
+}
+
+#[tokio::test]
+async fn crash_after_last_rename_finishes_with_manager_at_boot() {
+    crash_then_restart("after_last_rename", true).await;
+}
+
+#[tokio::test]
+async fn crash_after_manifest_finishes_with_manager_at_boot() {
+    crash_then_restart("after_manifest", true).await;
+}
+
+#[tokio::test]
+async fn crash_after_history_finishes_with_manager_at_boot() {
+    crash_then_restart("after_history", true).await;
+}
+
+#[tokio::test]
+async fn crash_after_delivery_finishes_with_manager_at_boot() {
+    crash_then_restart("after_delivery", true).await;
 }

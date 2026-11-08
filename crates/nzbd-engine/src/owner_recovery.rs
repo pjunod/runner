@@ -477,14 +477,21 @@ impl Owner {
             })
             .map(|job| job.id)
             .collect::<Vec<_>>();
+        if stale.is_empty() {
+            return;
+        }
         for job in stale {
             self.verification.remove(&job);
             if let Some(current) = self.state.job_mut(job) {
                 set_owner_param(&mut current.params, PENDING, None);
                 set_owner_param(&mut current.params, REASON, None);
             }
-            self.dirty = true;
         }
+        // The fence lifted: callers the owner deferred (export, admission)
+        // wait for this queue change.
+        self.dirty = true;
+        self.publish_now();
+        self.bump_epoch();
     }
 
     /// Re-read the job's allocation and queue its verification again. Not a
