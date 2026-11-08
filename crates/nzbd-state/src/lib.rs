@@ -1807,6 +1807,16 @@ mod tests {
         let plain_worker = dir.path().join("workers/node-plain");
         std::fs::create_dir_all(&plain_worker).unwrap();
         std::fs::write(plain_worker.join("queue.json"), &raw).unwrap();
+        let v2_worker = dir.path().join("workers/node-v2");
+        std::fs::create_dir_all(&v2_worker).unwrap();
+        let mut v2 = b"NZBDQZ02".to_vec();
+        v2.extend_from_slice(&(raw.len() as u64).to_le_bytes());
+        v2.extend_from_slice(&crc32fast::hash(&raw).to_le_bytes());
+        v2.extend_from_slice(&2u32.to_le_bytes());
+        for part in [&raw[..raw.len() / 2], &raw[raw.len() / 2..]] {
+            v2.extend_from_slice(&snapshot_codec::encode_frame(part).unwrap());
+        }
+        std::fs::write(v2_worker.join("queue.json"), &v2).unwrap();
         let journal = dir.path().join("segments.journal");
         std::fs::write(&journal, b"retain every journal byte").unwrap();
         // A bogus SQLite file also proves conversion never opens/migrates DBs.
@@ -1831,7 +1841,7 @@ mod tests {
         std::fs::write(&paths[1], &encoded).unwrap();
         let converted =
             materialize_plain_snapshots(dir.path(), dir.path(), QUEUE_SCHEMA_VERSION).unwrap();
-        assert_eq!(converted.len(), 2);
+        assert_eq!(converted.len(), 3);
         for path in &paths {
             assert_eq!(std::fs::read(path).unwrap(), raw);
         }
@@ -1856,6 +1866,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(&paths[1]).unwrap(), raw);
         assert_eq!(std::fs::read(plain_worker.join("queue.json")).unwrap(), raw);
+        assert_eq!(std::fs::read(v2_worker.join("queue.json")).unwrap(), raw);
     }
 
     #[test]
