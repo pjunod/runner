@@ -1708,9 +1708,9 @@ impl Owner {
 
     /// One classification path for boot, import and both authority adoptions.
     pub(super) fn queue_payload_recovery(&mut self, job: JobId) {
-        let Some(record) = self.state.job(job).cloned().filter(needs_payload) else {
+        if !self.state.job(job).is_some_and(needs_payload) {
             return;
-        };
+        }
         if self.post_admissions.contains_key(&job)
             || self.pending_control_commits.contains(&job)
             || self
@@ -1730,6 +1730,11 @@ impl Owner {
         if self.allocating_jobs.contains(&job) {
             return;
         }
+        // Recovery invalidates the cached capability even when admission must
+        // wait. Otherwise startup's advisory cache makes the retry selector
+        // mistake a deferred row for an already reconciled allocation.
+        self.allocation_cache.remove(&job);
+        self.allocated_jobs.remove(&job);
         if !self.payload_recovery_capacity_available() {
             // Keep the row as the deferred work obligation. Avoid recursively
             // asking queue_verification to allocate while creating its ticket.
@@ -1744,6 +1749,11 @@ impl Owner {
             }
             return;
         }
+        // Deferred rows retain their ticket without repeatedly copying a full
+        // NZB descriptor on every lane completion.
+        let Some(record) = self.state.job(job).cloned() else {
+            return;
+        };
         let plan = match imported_payload_plan(&record, &self.dest_dir) {
             Ok(plan) => plan,
             Err(error) => {
@@ -1755,8 +1765,6 @@ impl Owner {
         let inventory = self.artifacts.clone();
         let fallback_root = self.dest_dir.clone();
         let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
-        self.allocation_cache.remove(&job);
-        self.allocated_jobs.remove(&job);
         self.allocating_jobs.insert(job);
         self.queue_verification(job);
         if let Some(state) = self.verification.get_mut(&job) {

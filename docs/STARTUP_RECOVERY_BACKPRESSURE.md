@@ -81,6 +81,16 @@ prevents a burst of state-lane metadata completions from overrunning the
 payload and state-lane completions retry them as capacity becomes available.
 No unbounded overflow queue or age-based watchdog is introduced.
 
+Startup preloads an advisory allocation cache, which is not proof that payload
+custody has been reconciled. Requesting recovery invalidates that cache and the
+allocated capability before checking admission capacity. Previously, only
+admitted rows invalidated it: deferred rows retained cached metadata, while the
+retry selector excluded cached rows. A 249-job startup therefore admitted 64
+rows and permanently stranded the other 185 in `loading`. Invalidating at the
+recovery transition preserves the existing retry and bounded admission rules.
+A regression seeds 80 existing cached allocations, reproduces the 16-row stall,
+and requires all rows to drain through joined completion events without ticks.
+
 Normal download allocation also checks capacity before scheduling work. A
 refusal leaves the row queued; its callback does not create an allocation
 hold for `Busy`. The scheduler also recognizes this typed deferral at its
