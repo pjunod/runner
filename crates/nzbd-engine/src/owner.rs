@@ -950,6 +950,8 @@ pub(crate) struct Owner {
     retirement_epochs: HashMap<JobId, u64>,
     deferred_replacements: VecDeque<QueueCommand>,
     pending_writer_birth: HashMap<FileId, u64>,
+    #[cfg(test)]
+    work_selection_attempts: usize,
     allocating_jobs: HashSet<JobId>,
     pending_journal_loads: HashMap<JobId, (u64, usize)>,
     pending_control_commits: HashSet<JobId>,
@@ -1466,6 +1468,8 @@ impl Owner {
             retirement_epochs: HashMap::new(),
             deferred_replacements: VecDeque::new(),
             pending_writer_birth: HashMap::new(),
+            #[cfg(test)]
+            work_selection_attempts: 0,
             allocating_jobs: HashSet::new(),
             pending_journal_loads: HashMap::new(),
             pending_control_commits: HashSet::new(),
@@ -6110,6 +6114,10 @@ impl Owner {
                 soft_hold: self.quota_reached,
                 rotate: self.rotate,
             };
+            #[cfg(test)]
+            {
+                self.work_selection_attempts += 1;
+            }
             let result = next_for_server(&self.state, server, &mut ctx);
             let exhausted = result.exhausted;
             let lease = result.lease;
@@ -6139,7 +6147,11 @@ impl Owner {
             }
             let writer = self.writer_for(r.job, r.file);
             let Some(generation) = self.writers.get(&r.file).map(|writer| writer.generation) else {
-                continue;
+                // Only an owner-handled persistence completion can publish the
+                // writer. Yield this batch instead of re-selecting its unchanged
+                // Pending segment once per queued job. Keep any leases already
+                // granted and preserve the active-download cap.
+                break;
             };
             let Some(seg) = self.state.segment_mut(r) else {
                 break;
@@ -7906,9 +7918,8 @@ impl Owner {
         let record = self
             .state
             .job(job)
-            .cloned()
             .ok_or(nzbd_state::artifacts::Error::NotFound)?;
-        let plan = transitions::imported_payload_plan(&record, &self.dest_dir)
+        let plan = transitions::imported_payload_plan(record, &self.dest_dir)
             .map_err(|error| nzbd_state::artifacts::Error::Conflict(error.to_string()))?;
         if self.allocated_jobs.contains(&job)
             && self.allocation_cache.get(&job).is_some_and(|allocation| {
@@ -7923,6 +7934,9 @@ impl Owner {
                 "payload allocation pending".into(),
             ));
         }
+        // Cache hits need only the plan above, not a clone of every file and
+        // segment. Own the descriptor only when scheduling an actual allocation.
+        let record = record.clone();
         let inventory = self.artifacts.clone();
         let root = self.dest_dir.clone();
         let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
