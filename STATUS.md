@@ -2,9 +2,24 @@
 
 ## Split pause: downloads and post-processing pause independently — 2026-11-08
 
-**Status:** draft PR on `feat/split-pause` (runner 0.7.0, mobile 1.1.7),
-base `main` at 0.6.0. Owner: Claude (Opus 5.5 session). Next: adversarial
-review → fixes → `make fast-check` once → merge. Not deployed.
+**Status:** merged as [#302](https://github.com/pjunod/runner/pull/302) (runner 0.7.0,
+mobile 1.1.7). Owner: Claude (Opus 5.5 session). Not deployed — deploy is
+Paul's. The adversarial review was cut short at Paul's call to hurry and did
+not report; nothing from it is folded in.
+
+**Local gate (NZBD_REQUIRE_TOOLS=1, nothing skipped):** fast-lane contract;
+UI harnesses (1,002 DOM assertions); fmt, check, clippy `-D warnings`;
+cluster lib 59 and cluster_e2e 23 (including the new post-pause lease gate);
+the startup lane; the torrent lane's unit suites; post-pause 3; compat 18;
+engine e2e 36; docs contract 3; mobile typecheck and jest 192. Not run here:
+the rqbit maintained-patch-series check, which downloads upstream rqbit and
+gets a 403 from this workspace's network. This branch does not touch rqbit.
+
+**Post-deploy checks:** pause post-processing from the web UI and confirm the
+badge, that a job that finishes downloading waits under "Waiting to
+post-process", and that a running repair completes its stage, then shows
+"held"; resume it. Confirm `nzbd_post_paused` on `/metrics` and that
+curator's NZBGet `status` shows `PostPaused`.
 
 Paul asked for downloads and post-processing to pause separately, without
 disturbing the UI. The approved mockup is what shipped.
@@ -37,9 +52,8 @@ disturbing the UI. The approved mockup is what shipped.
 **Decision made without Paul (review later):** the post pause takes effect at
 a stage boundary rather than interrupting a running stage, because cutting
 off par2 or an extract means redoing the whole stage. In cluster mode the
-flag lives on the authority's snapshot; a worker running a leased post
-attempt does not see it yet. There is one runner node today, so this is noted
-rather than built.
+authority grants no new post lease while paused; a lease already running on
+a worker finishes its attempt rather than parking mid-way.
 
 ## Pipeline contract v2 M6b — legacy wire fields removed, persisted `held` — 2026-11-08
 
