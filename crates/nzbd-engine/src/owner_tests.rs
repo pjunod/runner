@@ -6016,6 +6016,12 @@ async fn acknowledged_worker_api_import_is_noop_for_late_preterminal_descriptor(
         .import_job(marker.clone(), false, false)
         .await
         .unwrap();
+    // Import acknowledges queue intent before background source verification
+    // releases custody. Publication requires actual readiness, not just import.
+    export_job_ready_for_test(&engine, JobId(85))
+        .await
+        .unwrap()
+        .unwrap();
     let target = temporary.path().join("publication/85");
     let selected = inventory.for_job(85).unwrap().unwrap().files;
     inventory

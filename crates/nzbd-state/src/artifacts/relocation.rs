@@ -1518,7 +1518,7 @@ impl Inventory {
         self.invalidate_source_writer_naming(&source.artifact, &source.generation);
         let ids = {
             let db = self.db.lock().unwrap();
-            let mut statement = db.prepare("SELECT id FROM operations WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.id')=?1 AND json_extract(json_extract(data,'$.request'),'$.source.generation')=?2 AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup_done'),0)=0 ORDER BY rowid")?;
+            let mut statement = db.prepare(operation_queries::COMPLETED_RELOCATIONS)?;
             let rows = statement.query_map(params![source.artifact, source.generation], |row| {
                 row.get::<_, String>(0)
             })?;
@@ -1698,7 +1698,7 @@ impl Inventory {
         generation: &str,
     ) -> Result<()> {
         let raws = {
-            let mut statement = db.prepare("SELECT data FROM operations WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.generation')=?1")?;
+            let mut statement = db.prepare(operation_queries::WAKE_RELOCATION_CLEANUP)?;
             let rows = statement.query_map([generation], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
@@ -3090,7 +3090,7 @@ impl Inventory {
         }
         let cleanup = {
             let db = self.db.lock().unwrap();
-            let mut stmt = db.prepare("SELECT data FROM operations o WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.root')=?1 AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup_done'),0)=0 AND json_extract(json_extract(data,'$.request'),'$.source.automatic_cleanup_eligible')=1 AND (COALESCE(json_extract(json_extract(data,'$.request'),'$.defer_source_retirement'),0)=0 OR EXISTS (SELECT 1 FROM deliveries d WHERE d.artifact=o.artifact AND d.generation=json_extract(json_extract(o.data,'$.request'),'$.source.generation')) OR EXISTS (SELECT 1 FROM workspace_finalizations f WHERE f.source=o.artifact AND f.generation=json_extract(json_extract(o.data,'$.request'),'$.source.generation') AND f.activated=1 AND json_extract(f.proof,'$.kind')='cluster')) AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup.state'),'pending') NOT IN ('blocked','running') AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup.next_retry'),0)<=unixepoch() AND NOT EXISTS(SELECT 1 FROM deliveries d WHERE d.artifact=o.artifact AND d.generation=json_extract(json_extract(o.data,'$.request'),'$.source.generation') AND (d.cleanup_status IN ('blocked','running','succeeded') OR COALESCE(d.cleanup_next_retry_at,0)>unixepoch())) ORDER BY o.rowid LIMIT 25")?;
+            let mut stmt = db.prepare(operation_queries::RELOCATION_CLEANUP_CANDIDATES)?;
             let rows =
                 stmt.query_map([root.to_string_lossy().as_ref()], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
