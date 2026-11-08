@@ -692,3 +692,35 @@ content. Capture the pre-fix timeout, then verify prompt article rejection and
 valid successor bytes without a connection failure. The production 0.4
 backport and current-main PR integration need separate source/hash receipts.
 The one-active-download 109 MiB/s acceptance gate remains open.
+
+
+## 13. Remaining bottleneck — full queue writes on GlusterFS
+
+After deployment of the framing fix, a 20-second decoder probe recorded 7,775
+successful calls and no validation errors. Recovery eventually drained to no
+pending/checking jobs, but two untraced one-slot windows still averaged only
+7.77 and 6.13 MiB/s. The speed regression is not resolved by the earlier fixes.
+
+The queue snapshot contains about 1.93 million segments and occupies 225–227 MB.
+A steady 20-second trace measured 12 snapshot saves taking 16.38 seconds. Actual
+syscalls inside those saves spent 10.57 seconds writing, 1.95 seconds in
+fdatasync, 0.39 seconds renaming and 0.015 seconds syncing directories. These
+are queue-state writes on the GlusterFS mount, not decoded payload writes.
+Per-file birth and completion calls were observed producing full checkpoints;
+first post-admission checkpoints added pressure for distinct jobs. The sampled
+post-admissions were not repeated for the same job. A separate steady admission
+sample saw no rejected sends, so increasing the queue bound is not supported
+as the current fix.
+
+The per-file generation and publication barriers date to November 1 `a630414`.
+They contribute to the present regression; the earlier reported onset is not
+precise enough to attribute every prior slow interval to this commit. Removing
+those barriers would weaken recovery. Instead, the next implementation retains
+the exact complete document and atomic durability sequence while reducing its
+on-disk representation. A same-host read-only benchmark reduced 226,988,198
+bytes to 59,533,252 bytes in 0.276 seconds with exact round-trip recovery.
+
+See [Queue snapshot encoding](QUEUE_SNAPSHOT_ENCODING.md) for the versioned
+format, integrity limits, old-binary refusal, offline rollback, alternatives and
+runtime acceptance gate. Neither the compression ratio nor successful unit
+checks establishes 109 MiB/s; deployment measurement is still required.

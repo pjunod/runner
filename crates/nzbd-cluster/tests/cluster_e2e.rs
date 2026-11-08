@@ -1976,6 +1976,77 @@ async fn delivery_receipts_survive_authority_restart_and_consumer_removed_public
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_control_migration_decodes_compressed_snapshot_and_backs_up_original_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let job = nzbd_types::Job {
+        id: nzbd_types::JobId(700),
+        kind: nzbd_types::JobKind::Nzb,
+        name: "paused legacy".into(),
+        dir_name: "paused-legacy".into(),
+        name_provisional: false,
+        delivery_lifecycle: false,
+        queued_at_unix: 1,
+        original_name: String::new(),
+        category: None,
+        priority: 0,
+        dupe: Default::default(),
+        params: vec![("opaque-user-metadata".into(), "metadata".repeat(160_000))],
+        files: Vec::new(),
+        totals: Default::default(),
+        status: nzbd_types::JobStatus::Paused,
+        torrent: None,
+        stages: Vec::new(),
+    };
+    let snapshot = nzbd_state::QueueSnapshotDoc {
+        jobs: vec![job],
+        next_job_id: 700,
+        ..Default::default()
+    };
+    let state = tmp.path().join(".nzbd-cluster");
+    nzbd_state::SnapshotStore::open(&state)
+        .unwrap()
+        .save(&snapshot)
+        .unwrap();
+    let original = std::fs::read(state.join("queue.json")).unwrap();
+    assert!(original.starts_with(b"NZBDQZ01"));
+    let mut fingerprint = sha2::Sha256::new();
+    fingerprint.update(b"queue\0");
+    fingerprint.update(&original);
+    fingerprint.update(b"history\0");
+    let backup = tmp
+        .path()
+        .join("control-a/migration-backup")
+        .join(format!("{:x}", fingerprint.finalize()))
+        .join("queue.json");
+    let node = start_node(
+        tmp.path(),
+        "a",
+        NodeOpts {
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            min_free_disk_bytes: 0,
+        },
+        9,
+        1,
+    )
+    .await;
+    assert_eq!(std::fs::read(backup).unwrap(), original);
+    wait_for("compressed legacy queue reaches authority", 15, || {
+        node.runtime
+            .engine
+            .snapshot()
+            .jobs
+            .iter()
+            .any(|job| job.id == nzbd_types::JobId(700))
+    })
+    .await;
+    node.kill().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn legacy_retired_receipt_without_control_proof_is_preserved_and_refuses_upgrade() {
     let tmp = tempfile::tempdir().unwrap();
     let token = "unproven-legacy-receipt";

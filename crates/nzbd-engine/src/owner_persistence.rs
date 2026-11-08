@@ -1058,6 +1058,11 @@ mod tests {
         let (mut lane, mut rx) = lane(dir.path());
         let mut state = QueueState::default();
         let job = state.admit_url("test".into(), "http://example.invalid/test", None, 0);
+        state
+            .job_mut(job)
+            .unwrap()
+            .params
+            .push(("opaque".into(), "metadata".repeat(160_000)));
         assert!(lane.send(Request::Append {
             revision: 1,
             record: record(job, 1),
@@ -1073,6 +1078,9 @@ mod tests {
         assert!(completion(&mut rx).await.result.is_ok());
         assert!(completion(&mut rx).await.result.is_err());
         assert_eq!(JobJournals::replay_job(dir.path(), job).unwrap().len(), 1);
+        assert!(std::fs::read(dir.path().join("queue.json.tmp"))
+            .unwrap()
+            .starts_with(b"NZBDQZ01"));
         assert!(SnapshotStore::open(dir.path())
             .unwrap()
             .load()

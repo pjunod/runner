@@ -47,6 +47,7 @@ status page is [`STATUS.md`](../STATUS.md) at the repository root.
 | [PAR_REPAIR_PROGRESS_PLAN.md](PAR_REPAIR_PROGRESS_PLAN.md) | Bounded PAR scanning and useful recovery retries |
 | [RENAME_PERFORMANCE_PLAN.md](RENAME_PERFORMANCE_PLAN.md) | Reusing producer reads in rename and verified commits |
 | [DOWNLOAD_SPEED_ROOT_CAUSE_PLAN.md](DOWNLOAD_SPEED_ROOT_CAUSE_PLAN.md) | Download speed regression and its correction |
+| [QUEUE_SNAPSHOT_ENCODING.md](QUEUE_SNAPSHOT_ENCODING.md) | Lossless queue encoding, measured write amplification and offline rollback |
 | [IO_EFFICIENCY_AUDIT.md](IO_EFFICIENCY_AUDIT.md) | Redundant I/O audit (follow-ups open) |
 | [UI_V2_PLAN.md](UI_V2_PLAN.md) | Web UI v2 and the rendering laws its DOM test enforces |
 | [MOBILE_QUEUE_PARITY_PLAN.md](MOBILE_QUEUE_PARITY_PLAN.md) | Torrent grouping in the mobile queue |
