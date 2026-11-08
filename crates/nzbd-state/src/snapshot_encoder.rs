@@ -92,7 +92,10 @@ impl SnapshotEncoder {
             return snapshot_codec::encode(serde_json::to_vec(&doc)?);
         }
         let (prefix, tail) = root_fragments(&doc)?;
-        if prefix.len().saturating_add(tail.len()) > snapshot_codec::MAX_BYTES {
+        if prefix.len() > MAX_JOB_FRAGMENT
+            || tail.len() > MAX_JOB_FRAGMENT
+            || prefix.len().saturating_add(tail.len()) > snapshot_codec::MAX_BYTES
+        {
             drop(prefix);
             drop(tail);
             self.entries.clear();
@@ -100,6 +103,8 @@ impl SnapshotEncoder {
         }
         let first = Frame::new(&prefix, false)?;
         let last = Frame::new(&tail, false)?;
+        drop(prefix);
+        drop(tail);
         let mut seen = HashSet::new();
         let mut duplicates = HashSet::new();
         for job in &doc.jobs {
