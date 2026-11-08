@@ -2189,9 +2189,20 @@ fn spawn_job(
     tracker.spawn(async move {
         // Cancellation revokes further side effects. Once admitted, retain
         // custody until the processing future and every blocking worker drain.
-        let permit =
+        // A paused post-processing lane holds jobs that have not started yet
+        // before they take a slot or owner admission, so they stay plainly
+        // `PostQueued`; jobs already running park at their next stage
+        // boundary instead (`Stages::enter`).
+        let running = tokio::select! {
+            _ = global_cancel.cancelled() => false,
+            running = wait_post_running(&base_engine, &task_cancel) => running,
+        };
+        let permit = if running {
             acquire_admitted_permit(sem, global_cancel.clone(), task_cancel.clone(), gate, job)
-                .await;
+                .await
+        } else {
+            None
+        };
         if let Some(permit) = permit {
             let _permit = permit;
             // Queue status and placement alone do not authorize reading or
@@ -2297,6 +2308,32 @@ fn spawn_job(
     }
 }
 
+/// Park while the post-processing lane is paused. `false` means `cancel`
+/// fired first. The flag lives in the engine snapshot; the owner publishes
+/// it before bumping the queue epoch, so marking the epoch seen before the
+/// read cannot miss a resume.
+async fn wait_post_running(engine: &EngineHandle, cancel: &CancellationToken) -> bool {
+    let mut changes = engine.queue_changes();
+    loop {
+        changes.borrow_and_update();
+        if !engine.snapshot().post_paused {
+            return true;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return false,
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    // The owner is gone, so nothing can resume this job and
+                    // nothing downstream could commit. Shutdown cancels the
+                    // attempt; wait for that rather than inventing a failure.
+                    cancel.cancelled().await;
+                    return false;
+                }
+            }
+        }
+    }
+}
+
 async fn acquire_admitted_permit(
     sem: Arc<tokio::sync::Semaphore>,
     global_cancel: CancellationToken,
@@ -2316,6 +2353,229 @@ async fn acquire_admitted_permit(
         return None;
     }
     Some(permit)
+}
+
+#[cfg(test)]
+mod post_pause_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// One downloaded, verified legacy job (`JobId(41)`) ready for post.
+    async fn post_ready(temp: &tempfile::TempDir) -> (EngineHandle, PathBuf, Arc<HistoryDb>) {
+        let root = temp.path().join("downloads");
+        let dir = root.join("job");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = b"complete media fixture";
+        std::fs::write(dir.join("episode.mkv"), bytes).unwrap();
+        let history = Arc::new(
+            HistoryDb::open(&temp.path().join("history.sqlite"), Some(temp.path())).unwrap(),
+        );
+        let engine = nzbd_engine::Engine::spawn(nzbd_engine::EngineConfig::single_node(
+            vec![],
+            temp.path().join("state"),
+            root.clone(),
+            nzbd_engine::Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let job = Job {
+            id: JobId(41),
+            kind: nzbd_types::JobKind::Nzb,
+            name: "job".into(),
+            dir_name: "job".into(),
+            name_provisional: false,
+            delivery_lifecycle: false,
+            queued_at_unix: 0,
+            original_name: String::new(),
+            category: None,
+            priority: 0,
+            dupe: Default::default(),
+            params: vec![("*File:size:1".into(), bytes.len().to_string())],
+            files: vec![nzbd_types::FileEntry {
+                id: nzbd_types::FileId(1),
+                subject: "episode.mkv".into(),
+                filename: "episode.mkv".into(),
+                filename_confirmed: true,
+                is_par2: false,
+                paused: false,
+                groups: vec![],
+                date: None,
+                crc32: Some(crc32fast::hash(bytes)),
+                finalized: true,
+                segments: vec![nzbd_types::Segment {
+                    message_id: "fixture".into(),
+                    number: 1,
+                    size: bytes.len() as u32,
+                    state: nzbd_types::SegmentState::Done {
+                        offset: 0,
+                        len: bytes.len() as u32,
+                        crc: crc32fast::hash(bytes),
+                    },
+                }],
+            }],
+            totals: Default::default(),
+            status: JobStatus::Completed,
+            torrent: None,
+            stages: vec![],
+        };
+        engine.import_job(job, false, false).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match engine.export_job(JobId(41)).await {
+                    Ok(Some(_)) => break,
+                    Err(nzbd_engine::EngineError::Lifecycle(_)) => tokio::task::yield_now().await,
+                    other => panic!("imported job did not become post-ready: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("fixture job should verify");
+        (engine, root, history)
+    }
+
+    fn plain_cfg() -> PostConfig {
+        PostConfig {
+            unpack: false,
+            cleanup: false,
+            deobfuscate_final: false,
+            failure_action: FailureAction::None,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_lane_holds_an_unstarted_job_before_it_takes_a_slot() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, root, history) = post_ready(&temp).await;
+        engine.pause_post("test").await.unwrap();
+        assert!(engine.snapshot().post_paused);
+        assert!(
+            !engine.snapshot().download_paused,
+            "the lanes are independent"
+        );
+
+        let tracker = TaskTracker::new();
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let cancel = CancellationToken::new();
+        let (finished, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let _attempt = spawn_job(
+            &tracker,
+            &engine,
+            &plain_cfg(),
+            &history,
+            &root,
+            &sem,
+            &cancel,
+            &finished,
+            JobId(41),
+            None,
+            false,
+            RestartPoint::Beginning,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), receiver.recv())
+                .await
+                .is_err(),
+            "a paused lane must not run the job"
+        );
+        assert_eq!(sem.available_permits(), 1, "a held job takes no slot");
+        let row = engine.export_job(JobId(41)).await.unwrap().unwrap();
+        assert!(row.stages.is_empty(), "no stage may start while paused");
+
+        engine.resume_post("test").await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap(),
+            Some(JobId(41))
+        );
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(history.get(JobId(41)).unwrap().unwrap().status, "SUCCESS");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_running_job_finishes_its_stage_then_parks_at_the_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, _root, _history) = post_ready(&temp).await;
+        let cfg = plain_cfg();
+        let cancel = CancellationToken::new();
+        let mut stages = Stages::new(&engine, JobId(41), "job".into(), &cfg, cancel.clone());
+        stages.enter(PostStage::ParRename).await.unwrap();
+
+        engine.pause_post("test").await.unwrap();
+        let next = stages.enter(PostStage::ParVerify);
+        tokio::pin!(next);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut next)
+                .await
+                .is_err(),
+            "the next stage must wait while paused"
+        );
+        let row = engine.export_job(JobId(41)).await.unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            JobStatus::Post {
+                stage: PostStage::ParRename
+            }
+        );
+        assert_eq!(row.stages.len(), 1);
+        assert!(
+            row.stages[0].ms.is_some(),
+            "the finished stage's span is closed while parked"
+        );
+
+        engine.resume_post("test").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), &mut next)
+            .await
+            .expect("resume releases the boundary")
+            .unwrap();
+        let row = engine.export_job(JobId(41)).await.unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            JobStatus::Post {
+                stage: PostStage::ParVerify
+            }
+        );
+        assert_eq!(row.stages.len(), 2);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_parked_job_starts_no_further_stage() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, _root, _history) = post_ready(&temp).await;
+        let cfg = plain_cfg();
+        let cancel = CancellationToken::new();
+        let mut stages = Stages::new(&engine, JobId(41), "job".into(), &cfg, cancel.clone());
+        stages.enter(PostStage::ParRename).await.unwrap();
+        engine.pause_post("test").await.unwrap();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            canceller.cancel();
+        });
+        let error =
+            tokio::time::timeout(Duration::from_secs(5), stages.enter(PostStage::ParVerify))
+                .await
+                .expect("cancellation releases a parked stage")
+                .unwrap_err();
+        assert!(
+            matches!(&error, PostError::Io(e) if e.kind() == std::io::ErrorKind::Interrupted),
+            "{error:?}"
+        );
+        let row = engine.export_job(JobId(41)).await.unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            JobStatus::Post {
+                stage: PostStage::ParRename
+            }
+        );
+        drop(stages);
+        engine.shutdown().await;
+    }
 }
 
 #[cfg(test)]
@@ -2612,22 +2872,59 @@ struct Stages<'a> {
     engine: &'a EngineHandle,
     job: JobId,
     name: String,
+    cancel: CancellationToken,
     stats: Option<Arc<PpStageStats>>,
     current: Option<(PostStage, std::time::Instant)>,
 }
 
 impl<'a> Stages<'a> {
-    fn new(engine: &'a EngineHandle, job: JobId, name: String, cfg: &PostConfig) -> Stages<'a> {
+    fn new(
+        engine: &'a EngineHandle,
+        job: JobId,
+        name: String,
+        cfg: &PostConfig,
+        cancel: CancellationToken,
+    ) -> Stages<'a> {
         Stages {
             engine,
             job,
             name,
+            cancel,
             stats: cfg.stats.clone(),
             current: None,
         }
     }
 
-    async fn enter(&mut self, stage: PostStage) {
+    /// Every stage begins here, which makes it the one place the
+    /// post-processing pause is honored: the stage that is running finishes,
+    /// then the job parks before the next one. The finished stage's span is
+    /// closed first so the timeline shows when work stopped rather than
+    /// billing the pause to it. Cancellation while parked surfaces as
+    /// the same interrupted error every other checkpoint returns, so no stage
+    /// starts after the attempt was revoked.
+    async fn enter(&mut self, stage: PostStage) -> Result<(), PostError> {
+        if self.engine.snapshot().post_paused {
+            // A closed last span on a job still in `Post` is how the queue
+            // tells "holding at a boundary" from "running".
+            if self.current.is_some() {
+                let ms = self.close();
+                self.engine.close_post_stage(self.job, now(), ms).await;
+            }
+            tracing::info!(
+                job = self.job.0,
+                next = ?stage,
+                "post-processing paused; holding at stage boundary"
+            );
+            if !wait_post_running(self.engine, &self.cancel).await {
+                // Same shape as every other revoked-attempt checkpoint; the
+                // caller has already decided the outcome is "cancelled".
+                return Err(PostError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "processing attempt cancelled while post-processing was paused",
+                )));
+            }
+            tracing::info!(job = self.job.0, next = ?stage, "post-processing resumed");
+        }
         let prev_ms = self.close();
         // Status, timeline and event in that order. The first two are one
         // command precisely so a consumer that reacts to the event can
@@ -2642,6 +2939,7 @@ impl<'a> Stages<'a> {
             stage,
         });
         self.current = Some((stage, std::time::Instant::now()));
+        Ok(())
     }
 
     /// Bank the running stage's duration into the process histogram and
@@ -3263,7 +3561,7 @@ async fn process_job_ctx_from_inner(
     // by definition — this lease is now the only live executor.
     let staging = dir.join(format!(".pp.{}", ctx.tag));
     remove_stale_staging(&dir, &staging);
-    let mut stages = Stages::new(engine, job_id, job.name.clone(), cfg);
+    let mut stages = Stages::new(engine, job_id, job.name.clone(), cfg, ctx.cancel.clone());
 
     // ---- RENAME stage (par-rename, then rar-rename) ------------------------
     // Obfuscated posts get their real names back before anything verifies
@@ -3271,7 +3569,7 @@ async fn process_job_ctx_from_inner(
     // evidence just needs its paths remapped.
     let mut renames = Vec::new();
     if from == RestartPoint::Beginning {
-        stages.enter(PostStage::ParRename).await;
+        stages.enter(PostStage::ParRename).await?;
         let rename_dir = dir.clone();
         let inventory = engine.artifacts();
         let candidates = naming_candidates(&job, &rename_dir);
@@ -3335,7 +3633,7 @@ async fn process_job_ctx_from_inner(
                     .map(|path| path.to_string_lossy().into_owned())
             }));
             if from.includes(RestartPoint::Verify) {
-                stages.enter(PostStage::ParVerify).await;
+                stages.enter(PostStage::ParVerify).await?;
                 let quick = par2::quick_verify(&set, &evidence_of(&job, &dir, &rename_map));
                 if quick == VerifyResult::Intact && partials.is_empty() {
                     tracing::info!(job = job_id.0, "par quick-verify: intact (no data re-read)");
@@ -3372,7 +3670,7 @@ async fn process_job_ctx_from_inner(
     // Damaged archive headers are not naming evidence. Repair first, then
     // restore archive names using the verified files.
     if from.includes(RestartPoint::Unpack) && unpack_enabled && par_ok {
-        stages.enter(PostStage::RarRename).await;
+        stages.enter(PostStage::RarRename).await?;
         let archive_dir = dir.clone();
         let inventory = engine.artifacts();
         crate::attempt::current()
@@ -3391,7 +3689,7 @@ async fn process_job_ctx_from_inner(
     if unpack_enabled && par_ok && from.includes(RestartPoint::Unpack) {
         let archives = detect_archives(&dir);
         if !archives.is_empty() {
-            stages.enter(PostStage::Unpack).await;
+            stages.enter(PostStage::Unpack).await?;
             let ex = Extractors {
                 unrar_cmd: cfg.unrar_cmd.clone(),
                 sevenzip_cmd: cfg.sevenzip_cmd.clone(),
@@ -3517,7 +3815,7 @@ async fn process_job_ctx_from_inner(
                                 job = job_id.0,
                                 "unpack failed; forcing par repair + retry"
                             );
-                            stages.enter(PostStage::ParRepair).await;
+                            stages.enter(PostStage::ParRepair).await?;
                             engine
                                 .artifacts()
                                 .abandon_workspace(&workspace)
@@ -3526,7 +3824,7 @@ async fn process_job_ctx_from_inner(
                                 .await?
                             {
                                 par_did_repair = true;
-                                stages.enter(PostStage::Unpack).await;
+                                stages.enter(PostStage::Unpack).await?;
                                 workspace = engine
                                     .artifacts()
                                     .workspace(job_id.0, "extract", &token)
@@ -3661,7 +3959,7 @@ async fn process_job_ctx_from_inner(
 
     // ---- CLEANUP stage -----------------------------------------------------
     if from.includes(RestartPoint::Cleanup) && cfg.cleanup && par_ok && unpack_ok && unpacked_any {
-        stages.enter(PostStage::Cleanup).await;
+        stages.enter(PostStage::Cleanup).await?;
         tracing::info!(
             job = job_id.0,
             "archive inputs retained pending manifest retirement"
@@ -3678,7 +3976,7 @@ async fn process_job_ctx_from_inner(
     // parameters, which persist into history.
     let mut deobfuscated: Vec<(PathBuf, PathBuf)> = Vec::new();
     if from.includes(RestartPoint::Cleanup) && cfg.deobfuscate_final && par_ok && unpack_ok {
-        stages.enter(PostStage::PostUnpackRename).await;
+        stages.enter(PostStage::PostUnpackRename).await?;
         deobfuscated = crate::deobfuscate::restore_media_extensions_owned(
             &dir,
             &par2_names,
@@ -3741,7 +4039,7 @@ async fn process_job_ctx_from_inner(
             let target = target_root.join(target_name);
             if target != dir && dir.exists() {
                 let _ = std::fs::remove_dir_all(&staging); // never move the lease's scratch
-                stages.enter(PostStage::Move).await;
+                stages.enter(PostStage::Move).await?;
                 if !(ctx.commit_ok)() {
                     return Err(PostError::Subprocess("pp lease lost before move".into()));
                 }
@@ -3795,7 +4093,7 @@ async fn process_job_ctx_from_inner(
                 .unwrap_or(&[]),
         );
         if !scripts.is_empty() {
-            stages.enter(PostStage::Script).await;
+            stages.enter(PostStage::Script).await?;
             let host = ScriptHost {
                 timeout: cfg.script_timeout,
             };
@@ -3922,7 +4220,7 @@ async fn process_job_ctx_from_inner(
     // Repair, extraction and scripts have all returned. Join their actual
     // workers before terminal disposition can move or delete the payload.
     if job.lifecycle_eligible() {
-        stages.enter(PostStage::PublicationVerify).await;
+        stages.enter(PostStage::PublicationVerify).await?;
     }
     if let Some(control) = crate::attempt::current() {
         control.finish_filesystem_work().await?;
@@ -4203,7 +4501,7 @@ async fn process_job_ctx_from_inner(
                     "{publication_name}.job-{}.runner-{}",
                     job_id.0, source.generation
                 ));
-                stages.enter(PostStage::Move).await;
+                stages.enter(PostStage::Move).await?;
                 if !(ctx.commit_ok)() {
                     return Err(PostError::Subprocess(
                         "pp lease lost before selected publication".into(),
@@ -6385,7 +6683,7 @@ async fn repair_isolated_loop(
     let mut last_reason = "no additional recovery files remain".to_string();
     for round in 0..8 {
         control.checkpoint()?;
-        stages.enter(PostStage::ParRepair).await;
+        stages.enter(PostStage::ParRepair).await?;
         control
             .round(round, session.set.recovery_blocks, Some(needed))
             .await;
