@@ -38,7 +38,7 @@ pub(crate) async fn spawn_retrying_etxtbsy(
     const WAITS_MS: [u64; 4] = [1, 5, 20, 50];
     for wait in WAITS_MS {
         match cmd.spawn() {
-            Err(e) if e.raw_os_error() == Some(26) => {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
                 tokio::time::sleep(Duration::from_millis(wait)).await;
             }
             other => return other,
