@@ -717,13 +717,14 @@ pub(crate) async fn serve_cluster_delivery(
         }
         let relative=path.strip_prefix("/api/v1/deliveries/").ok_or((StatusCode::NOT_FOUND,"delivery not found".into()))?;
         let mut pieces=relative.split('/');let id=decode_delivery_segment(pieces.next().unwrap_or("")).map_err(|error|(StatusCode::BAD_REQUEST,error))?;let action=pieces.collect::<Vec<_>>().join("/");
-        let mut record=control.cluster_delivery(&id).await.map_err(|e|(StatusCode::SERVICE_UNAVAILABLE,e))?.ok_or((StatusCode::NOT_FOUND,"delivery not found".into()))?;
-        if method==Method::GET && action.is_empty() {return Ok(discovery_value(&record));}
         if method==Method::POST && action=="accept" {
             // Contract §2.5, IMPL §7.4: there is no acceptance; M1a's
-            // one-release 200 no-op is over.
+            // one-release 200 no-op is over. Review #283-11: 410 for every
+            // id, before any lookup, exactly like the local route.
             return Err((StatusCode::GONE,"delivery acceptance was removed (pipeline contract v2 §2.5)".into()));
         }
+        let mut record=control.cluster_delivery(&id).await.map_err(|e|(StatusCode::SERVICE_UNAVAILABLE,e))?.ok_or((StatusCode::NOT_FOUND,"delivery not found".into()))?;
+        if method==Method::GET && action.is_empty() {return Ok(discovery_value(&record));}
         if method==Method::POST && action=="source-cleanup/retry" {
             let mut queued=false;
             for copy in &mut record.copies {if copy.status!="removed" && copy.status!="review_required" {copy.next_retry_at=None;queued=true;}}
@@ -1933,6 +1934,18 @@ mod tests {
             .await
             .unwrap();
         // Contract §2.5 / IMPL §7.4: there is no acceptance; the route is gone.
+        assert_eq!(response.status(), axum::http::StatusCode::GONE);
+        // Review #283-11: gone for an unknown id too, as on the local route.
+        let response = client
+            .forward(
+                &format!("http://{address}"),
+                hyper::Request::post("/api/v1/deliveries/no-such-delivery/accept")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::GONE);
         drop(queue_serial);
         for id in ["bad%ZZ", "bad%2Fsegment", "bad%FF"] {
