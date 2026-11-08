@@ -1,5 +1,42 @@
 # nzbd — Project Status
 
+## Pipeline contract v2 M1a — review rounds (#280, #281) — 2026-11-08
+
+**Status:** all #280 findings fixed on `claude/pipeline-v2-m1a-runner`
+(PR #281, draft). Highlights since the first entry below:
+
+- Completed terminal before the delivery row and source retirement, with
+  crash repair from the stamped `Delivery:*` markers.
+- `PostError::Identity`; native torrent failures, partial torrents and
+  worker post-processing results are typed terminals through the shared
+  chain. In a cluster exactly one node records each terminal: the leader
+  when it holds the history store, else the worker that writes the history
+  row.
+- Unrecorded terminals are kept and retried on the owner; a stored row is
+  never forgotten.
+- Failed-source assessment restored: `recoverable` / `unknown` (unproven
+  payload) / `unusable`. Only `unusable` is deleted on the default policy.
+- Cluster cleanup ledger: publish/io/identity/hold_expired raw copies are
+  retained (park-always); a worker disposes its own attempt copy after the
+  leader accepts the result.
+- Flakes fixed at the root:
+  - Transforms ran outside attempt custody, racing the artifact tick.
+  - Operator Keep and recovery staging were refused while a maintenance
+    lease was held; they now wait for the lease to be released.
+
+**Behaviour change for Paul:** failed-source disposal now retries on the
+disposal operation's own durable `next_retry` ladder until it succeeds,
+visible on `/api/v1/artifacts`. The old in-memory, three-attempt budget —
+which retired the queue row with a `delete failed: …` note after about 60 s —
+is gone. A failed row stays queued until its disposal is recorded.
+
+**Tests changed to v2 behaviour (contract clause):**
+- `terminal_unusable_cluster_completion_…` → `…_parks_raw_copies_and_drains_sealed_generations`:
+  §2.2, publish always parks.
+- `completed_text_document_is_retained_with_visible_review_action` →
+  `…_is_one_publish_failure_with_bytes_retained`: §2.2/§2.3, a
+  post-processing failure is terminal and there is no review hold.
+
 ## Pipeline contract v2 M1a — terminal first, typed at the source — 2026-11-07
 
 **Status:** built on `claude/pipeline-v2-m1a-runner` (runner 0.3.0), not merged,
