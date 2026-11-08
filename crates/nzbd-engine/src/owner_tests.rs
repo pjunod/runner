@@ -3874,6 +3874,31 @@ fn restarted_recovery_job(id: u32, state: SegmentState) -> Job {
     job
 }
 
+/// Review #296-4: a full state volume under the terminal store latches
+/// out-of-space instead of reading as corruption.
+#[tokio::test]
+async fn a_full_terminal_store_latches_out_of_space() {
+    let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    let full = nzbd_state::artifacts::Error::Sql(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+        Some("database or disk is full".into()),
+    ));
+    let fault = terminal_owner::StoreFault::of(&full);
+    assert_eq!(fault.cause, Some(nzbd_types::HoldCause::Capacity));
+    owner.terminal_store_fault("terminal emitted flag", &fault);
+    assert!(owner.enospc_latched);
+    assert_eq!(owner.enospc_observed, 1);
+    // Anything else is logged and replayed, not a latch.
+    let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    owner.terminal_store_fault(
+        "terminal replay",
+        &terminal_owner::StoreFault::of(&nzbd_state::artifacts::Error::NotFound),
+    );
+    assert!(!owner.enospc_latched);
+}
+
 #[tokio::test]
 async fn writer_resource_errors_hold_pending_segments_and_latch_out_of_space() {
     let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
