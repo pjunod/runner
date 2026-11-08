@@ -3,7 +3,22 @@
 ## Pipeline contract v2 M6a — one clock per job, errno not text, docs from the contract — 2026-11-08
 
 **Status:** draft PR [#296](https://github.com/pjunod/runner/pull/296) on `claude/pipeline-v2-m6a-runner` (runner 0.5.0),
-base `main` (M3 #283 merged in). Not reviewed, not merged, not deployed.
+base `main` (M3 #283 merged in). Adversarial review r1 (Fable): REQUEST
+CHANGES, all seven findings fixed (fb59323, 50ae889, 43d9408, c50432d) —
+re-review requested. Not merged, not deployed.
+
+- **Review r1 fixes.** An io error rebuilt from its kind kept no errno, so a
+  dropped mount on the deobfuscate stage parked as `failed/io`:
+  `nzbd_state::io_context` now wraps the original as `source()` (deobfuscate,
+  recovery `at`/`at_dir`), and `io_error_hold_cause` reads the wrapped error
+  before falling back to a kind table that mirrors the errno table. Policy
+  (Paul's call via the orchestrator): `EROFS` and `ENETDOWN`/`ENETUNREACH`
+  hold `storage_unavailable`; `EMFILE`/`ENFILE`/`ENOMEM` stay `failed/io`.
+  A full state volume under the terminal store latches out-of-space instead
+  of reading as corruption. CI: `make fast-check-docs` (the two doc contract
+  tests) runs in the Rust lane and, for a docs-only diff, in its own lane.
+  Not fixed here, filed as issues by the orchestrator: worker-leased hold
+  deadline enforcement; salvage retry-every-scan on a full volume.
 Safe to merge right after M3: no wire field is removed and nothing persisted
 changes shape. Plan: `IMPL_RUNNER.md` §8 / `PIPELINE_REWRITE_PLAN.md` M6.
 M6b (wire removals, persisted `Held`) is stacked on this branch and merges
