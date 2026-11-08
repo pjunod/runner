@@ -1063,7 +1063,7 @@ mod tests {
         );
         assert_eq!(
             adopted.completed_job.as_ref().unwrap().status,
-            nzbd_types::JobStatus::Paused
+            nzbd_types::JobStatus::Held
         );
         let late = adopted.completed_job.as_ref().unwrap().clone();
         let source = SourceGeneration {

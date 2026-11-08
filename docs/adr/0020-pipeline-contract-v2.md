@@ -64,7 +64,15 @@ person removed while they sat in a review hold.
   `failure_action` says (decision for Paul, adopted by both reviewers).
 - The legacy wire fields rode one release for mixed-version safety. M6b
   (0.6.0) removes `pp_status`, `final_dir`, `includeAccepted` and the v1
-  delivery-row shims, and deploys only after every node runs curator M2 and
-  runner 0.5.0. Still to go: `custodyState`/`sourceCleanupStatus` with the
-  receipt custody tracking behind them, and the persisted `held` status
-  (0.5.0 already reads one).
+  delivery-row shims, and persists a held job's status as `held` (0.5.0
+  reads it as `paused`; 0.6.0 loads 0.5.0's `paused` + held control as
+  `held`). It deploys only after every curator runs M2+, every runner node
+  runs at least M3 (0.4.0), and every runner node runs 0.5.0 (M6a) — the
+  last because a node older than 0.5.0 cannot decode a persisted `held`.
+- `custodyState`/`sourceCleanupStatus` stay on the receipt (deprecated on the
+  wire): `custody_state == "curator"` is a monotonic pin that keeps a
+  completed transfer's receipt answering after its queue row retires and
+  stops cluster projection overwriting the handoff. Removing them needs a
+  replacement for that pin first.
+- Contract §2.5 is the authority on the `/api/v1/deliveries` feed: M6b
+  removes only the v1 acceptance shims, never the feed rows curator reads.

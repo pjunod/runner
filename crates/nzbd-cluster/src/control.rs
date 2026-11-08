@@ -1955,6 +1955,46 @@ pub(crate) fn decode_intent(json: &str) -> serde_json::Result<nzbd_types::Job> {
 #[cfg(test)]
 mod coordinator_protocol_tests {
     use super::*;
+
+    /// A row a 0.5.0 node replicated stores a hold as `paused` + a held
+    /// control; it decodes as `held`. A person's pause stays `paused`.
+    #[test]
+    fn a_050_replicated_hold_decodes_as_held() {
+        let mut job = nzbd_types::Job {
+            id: nzbd_types::JobId(7),
+            kind: nzbd_types::JobKind::Nzb,
+            name: "job".into(),
+            dir_name: "job".into(),
+            name_provisional: false,
+            delivery_lifecycle: false,
+            queued_at_unix: 0,
+            original_name: String::new(),
+            category: None,
+            priority: 0,
+            dupe: nzbd_types::DupeInfo::default(),
+            params: Vec::new(),
+            files: Vec::new(),
+            totals: nzbd_types::JobTotals::default(),
+            status: nzbd_types::JobStatus::Paused,
+            torrent: None,
+            stages: Vec::new(),
+        };
+        let paused = serde_json::to_string(&job).unwrap();
+        assert_eq!(
+            decode_intent(&paused).unwrap().status,
+            nzbd_types::JobStatus::Paused
+        );
+        job.params.push((
+            nzbd_types::CONTROL_PARAM.into(),
+            r#"{"version":1,"revision":"3","lifecycle":"held","cause":"capacity","stage":"download_write","retry_policy":"scheduled_retry","message":"","instance":"i"}"#.into(),
+        ));
+        let held = serde_json::to_string(&job).unwrap();
+        assert!(held.contains("\"paused\""));
+        assert_eq!(
+            decode_intent(&held).unwrap().status,
+            nzbd_types::JobStatus::Held
+        );
+    }
     async fn test_store(temp: &tempfile::TempDir, cluster_id: &str) -> ControlStore {
         let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
