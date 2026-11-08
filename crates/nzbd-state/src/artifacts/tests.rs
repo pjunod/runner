@@ -72,19 +72,12 @@ fn receipt_custody_matches_full_header_without_loading_large_manifest() {
     eprintln!("custody large manifest: files={} full_bytes={} projected_bytes={} iterations=100 full_us={} custody_us={}",full.files.len(),serde_json::to_string(&full).unwrap().len(),raw.len(),full_elapsed.as_micros(),started.elapsed().as_micros());
 }
 
-#[test]
-fn receipt_custody_reads_only_its_covering_index() {
-    let (_tmp, inventory, root) = fixture();
-    let artifact = inventory
-        .allocate(1, &root, &root.join("index-plan"))
-        .unwrap();
+fn assert_custody_covering_plan(inventory: &Inventory, query: &str, argument: &str) {
     let db = inventory.db.lock().unwrap();
     let plan: String = db
-        .query_row(
-            &format!("EXPLAIN QUERY PLAN {RECEIPT_CUSTODY_QUERY}"),
-            [&artifact.id],
-            |row| row.get(3),
-        )
+        .query_row(&format!("EXPLAIN QUERY PLAN {query}"), [argument], |row| {
+            row.get(3)
+        })
         .unwrap();
     assert!(plan.contains("artifacts_receipt_custody"), "{plan}");
     let table_root: i64 = db
@@ -96,9 +89,9 @@ fn receipt_custody_reads_only_its_covering_index() {
         .unwrap();
     let index_root: i64 = db.query_row("SELECT rootpage FROM sqlite_master WHERE type='index' AND name='artifacts_receipt_custody'", [], |row| row.get(0)).unwrap();
     let operations = db
-        .prepare(&format!("EXPLAIN {RECEIPT_CUSTODY_QUERY}"))
+        .prepare(&format!("EXPLAIN {query}"))
         .unwrap()
-        .query_map([&artifact.id], |row| {
+        .query_map([argument], |row| {
             Ok((
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
@@ -122,6 +115,122 @@ fn receipt_custody_reads_only_its_covering_index() {
                 && table_cursors.contains(cursor)
         ),
         "must not fetch the table's manifest blob: {operations:?}"
+    );
+}
+
+#[test]
+fn receipt_custody_reads_only_its_covering_index() {
+    let (_tmp, inventory, root) = fixture();
+    let artifact = inventory
+        .allocate(1, &root, &root.join("index-plan"))
+        .unwrap();
+    assert_custody_covering_plan(&inventory, RECEIPT_CUSTODY_QUERY, &artifact.id);
+}
+
+#[test]
+fn receipt_custodies_share_one_read_statement_and_covering_index() {
+    let (_tmp, inventory, root) = fixture();
+    let first = inventory.allocate(1, &root, &root.join("first")).unwrap();
+    let second = inventory.allocate(2, &root, &root.join("second")).unwrap();
+    let keys = vec![first.id, second.id, "missing".into()];
+    assert_custody_covering_plan(
+        &inventory,
+        RECEIPT_CUSTODIES_QUERY,
+        &serde_json::to_string(&keys).unwrap(),
+    );
+    let db = inventory.db.lock().unwrap();
+    let transaction_count = db
+        .prepare(&format!("EXPLAIN {RECEIPT_CUSTODIES_QUERY}"))
+        .unwrap()
+        .query_map([serde_json::to_string(&keys).unwrap()], |row| {
+            row.get::<_, String>(1)
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .into_iter()
+        .filter(|opcode| opcode == "Transaction")
+        .count();
+    assert_eq!(
+        transaction_count, 1,
+        "the batch must use one read transaction, not one statement per key"
+    );
+}
+
+#[test]
+fn receipt_custodies_isolate_bad_rows_missing_duplicates_and_fresh_mutations() {
+    let (_tmp, db, root) = fixture();
+    let mut first = db.allocate(1, &root, &root.join("batch-first")).unwrap();
+    let mut second = db.allocate(2, &root, &root.join("batch-second")).unwrap();
+    let broken_json = db.allocate(3, &root, &root.join("batch-json")).unwrap();
+    let broken_header = db.allocate(4, &root, &root.join("batch-header")).unwrap();
+    let broken_type = db.allocate(5, &root, &root.join("batch-blob")).unwrap();
+    {
+        let connection = db.db.lock().unwrap();
+        connection
+            .execute(
+                "UPDATE artifacts SET data='{broken' WHERE id=?1",
+                [&broken_json.id],
+            )
+            .unwrap();
+        let mut malformed = serde_json::to_value(&broken_header).unwrap();
+        malformed["owned"] = serde_json::json!("invalid");
+        connection
+            .execute(
+                "UPDATE artifacts SET data=?1 WHERE id=?2",
+                params![malformed.to_string(), broken_header.id],
+            )
+            .unwrap();
+        // SQLite JSON functions accept some BLOB inputs; the projection must
+        // not promote a value the original typed text read would reject.
+        connection
+            .execute(
+                "UPDATE artifacts SET data=?1 WHERE id=?2",
+                params![serde_json::to_vec(&broken_type).unwrap(), broken_type.id],
+            )
+            .unwrap();
+    }
+    let mut keys = vec![
+        first.id.clone(),
+        second.id.clone(),
+        broken_json.id.clone(),
+        broken_header.id.clone(),
+        broken_type.id.clone(),
+    ];
+    keys.extend((0..2_000).map(|i| format!("missing-{i}")));
+    keys.push(first.id.clone());
+    let rows = db.receipt_custodies(&keys).unwrap();
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[&first.id].as_ref().unwrap(), &expected_custody(&first));
+    assert_eq!(
+        rows[&second.id].as_ref().unwrap(),
+        &expected_custody(&second)
+    );
+    assert!(matches!(rows[&broken_json.id], Err(Error::Json(_))));
+    assert!(matches!(rows[&broken_header.id], Err(Error::Json(_))));
+    assert!(matches!(rows[&broken_type.id], Err(Error::Sql(_))));
+    assert!(matches!(db.get(&broken_type.id), Err(Error::Sql(_))));
+    assert!(matches!(
+        db.receipt_custody(&broken_type.id),
+        Err(Error::Sql(_))
+    ));
+    assert!(!rows.contains_key("missing-0"));
+    assert!(db.receipt_custodies(&[]).unwrap().is_empty());
+    assert!(db.set_keep_on_failure(1, true).unwrap());
+    first = db.get(&first.id).unwrap();
+    second.generation = "new-generation".into();
+    second.state = "deleted".into();
+    second.owned = false;
+    second.keep = true;
+    save_artifact(&db.db.lock().unwrap(), &second).unwrap();
+    let updated = db.receipt_custodies(&keys).unwrap();
+    assert_eq!(
+        updated[&first.id].as_ref().unwrap(),
+        &expected_custody(&first)
+    );
+    assert_eq!(
+        updated[&second.id].as_ref().unwrap(),
+        &expected_custody(&second)
     );
 }
 
@@ -225,6 +334,12 @@ fn receipt_custody_index_migrates_on_reopen_without_promoting_invalid_json() {
         reopened.receipt_custody(&bad.id),
         Err(Error::Json(_))
     ));
+    let rows = reopened
+        .receipt_custodies(&[good.id.clone(), bad.id.clone(), "missing".into()])
+        .unwrap();
+    assert_eq!(rows[&good.id].as_ref().unwrap(), &expected_custody(&good));
+    assert!(matches!(rows[&bad.id], Err(Error::Json(_))));
+    assert!(!rows.contains_key("missing"));
     assert_eq!(reopened.db.lock().unwrap().query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='artifacts_receipt_custody'",[],|row| row.get::<_,i64>(0)).unwrap(),1);
 }
 

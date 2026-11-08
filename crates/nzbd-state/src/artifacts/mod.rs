@@ -253,10 +253,24 @@ pub struct ArtifactCustody {
     pub keep_on_failure: bool,
 }
 
+impl ArtifactCustody {
+    fn from_header(raw: &str) -> Result<Self> {
+        let header: Artifact = serde_json::from_str(raw)?;
+        Ok(Self {
+            generation: header.generation,
+            state: header.state,
+            owned: header.owned,
+            keep: header.keep,
+            keep_on_failure: header.keep_on_failure,
+        })
+    }
+}
+
 // The expression must match in the index and SELECT. Invalid JSON remains
 // invalid instead of making one corrupt row prevent index creation on reopen.
-const RECEIPT_CUSTODY_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS artifacts_receipt_custody ON artifacts(id,CASE WHEN json_valid(data) THEN json_remove(data,'$.files') ELSE data END)";
-const RECEIPT_CUSTODY_QUERY: &str = "SELECT CASE WHEN json_valid(data) THEN json_remove(data,'$.files') ELSE data END FROM artifacts INDEXED BY artifacts_receipt_custody WHERE id=?1";
+const RECEIPT_CUSTODY_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS artifacts_receipt_custody ON artifacts(id,CASE WHEN typeof(data)='text' AND json_valid(data) THEN json_remove(data,'$.files') ELSE data END)";
+const RECEIPT_CUSTODY_QUERY: &str = "SELECT CASE WHEN typeof(data)='text' AND json_valid(data) THEN json_remove(data,'$.files') ELSE data END FROM artifacts INDEXED BY artifacts_receipt_custody WHERE id=?1";
+const RECEIPT_CUSTODIES_QUERY: &str = "SELECT id,CASE WHEN typeof(data)='text' AND json_valid(data) THEN json_remove(data,'$.files') ELSE data END FROM artifacts INDEXED BY artifacts_receipt_custody WHERE id IN (SELECT value FROM json_each(?1))";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Operation {
@@ -932,14 +946,39 @@ impl Inventory {
             let mut statement = db.prepare_cached(RECEIPT_CUSTODY_QUERY)?;
             statement.query_row([key], |row| row.get(0)).optional()?
         };
-        let header: Artifact = serde_json::from_str(&raw.ok_or(Error::NotFound)?)?;
-        Ok(ArtifactCustody {
-            generation: header.generation,
-            state: header.state,
-            owned: header.owned,
-            keep: header.keep,
-            keep_on_failure: header.keep_on_failure,
-        })
+        ArtifactCustody::from_header(&raw.ok_or(Error::NotFound)?)
+    }
+    /// Read all requested custody headers in one consistent SQLite statement
+    /// and one database-lock round trip. Missing keys are absent; malformed
+    /// rows retain their own errors without hiding unrelated valid rows.
+    pub fn receipt_custodies(
+        &self,
+        keys: &[String],
+    ) -> Result<std::collections::HashMap<String, Result<ArtifactCustody>>> {
+        if keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let keys = serde_json::to_string(keys)?;
+        let rows = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare_cached(RECEIPT_CUSTODIES_QUERY)?;
+            let rows = statement.query_map([keys], |row| {
+                // A non-text corrupt header is a per-row error too. Failure
+                // to step the statement itself still fails the whole read.
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(key, raw)| {
+                (
+                    key,
+                    raw.map_err(Error::Sql)
+                        .and_then(|raw| ArtifactCustody::from_header(&raw)),
+                )
+            })
+            .collect())
     }
     pub fn for_job(&self, job: u32) -> Result<Option<Artifact>> {
         let db = self.db.lock().unwrap();
