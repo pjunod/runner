@@ -3016,6 +3016,19 @@ async fn record_pp_history(
     // history row, the queue stamp and `job_pp_finished`. Idempotent: a
     // replay returns the stored row.
     let entry = pp_history_entry(job, accepted_at_ms, final_path);
+    record_remote_terminal(&s.engine, history.clone(), job, entry).await
+}
+
+/// Record a remotely post-processed job's terminal on `engine` with the
+/// node's history store (contract §2.1): the leader when it holds the
+/// shared history, otherwise the executing worker that writes the history
+/// row — exactly one node, so exactly one terminal per job.
+pub(crate) async fn record_remote_terminal(
+    engine: &nzbd_engine::EngineHandle,
+    history: Arc<nzbd_state::history::HistoryDb>,
+    job: &nzbd_types::Job,
+    entry: nzbd_state::HistoryEntry,
+) -> Result<(), String> {
     let mut stamped = job.clone();
     if !stamped
         .params
@@ -3050,21 +3063,17 @@ async fn record_pp_history(
         };
     }
     let job_id = job.id;
-    match s
-        .engine
-        .record_terminal_in(terminal, Some(history.clone()))
-        .await
-    {
+    match engine.record_terminal_in(terminal, Some(history)).await {
         Ok(Some(row)) => {
             // First recording only (a replay finds the disposal noted).
             if failed && row.disposal.is_none() {
-                let inventory = s.engine.artifacts();
+                let inventory = engine.artifacts();
                 let _ = tokio::task::spawn_blocking(move || {
                     inventory.record_disposal(job_id.0, "cluster source cleanup ledger")
                 })
                 .await;
                 if let Some(publication) = salvage_publication {
-                    s.engine.emit_publication_ready(job_id, publication);
+                    engine.emit_publication_ready(job_id, publication);
                 }
             }
             Ok(())

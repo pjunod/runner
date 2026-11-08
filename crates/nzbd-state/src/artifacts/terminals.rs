@@ -464,6 +464,50 @@ impl Inventory {
         )?)
     }
 
+    /// Test support: the next failed-source disposal for `job` loses its
+    /// post-processing admission right after the move/delete, before the
+    /// outcome is recorded (as an owner fence or shutdown would).
+    #[cfg(feature = "test-support")]
+    pub fn inject_disposal_admission_loss(&self, job: u32) {
+        DISPOSAL_ADMISSION_LOSSES.lock().unwrap().insert(job);
+    }
+
+    /// Consulted by disposal after the move. Always false outside the
+    /// `test-support` feature.
+    pub fn take_injected_disposal_admission_loss(&self, job: u32) -> bool {
+        #[cfg(feature = "test-support")]
+        {
+            return DISPOSAL_ADMISSION_LOSSES.lock().unwrap().remove(&job);
+        }
+        #[allow(unreachable_code)]
+        {
+            let _ = job;
+            false
+        }
+    }
+
+    /// Whether a failed-source disposal operation (`delete`, or a park
+    /// `relocate`) for any of the job's artifacts is still unresolved. Its
+    /// payload is then held by that operation — possibly already moved but
+    /// not committed — not absent.
+    pub fn disposal_in_flight(&self, job: u32) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        Ok(db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations o JOIN artifacts a ON a.id=o.artifact WHERE a.job=?1 AND o.state NOT IN ('succeeded','cancelled') AND json_extract(o.data,'$.kind') IN ('delete','relocate'))",
+            [job],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Operator Retry now for a failed source's disposal: the job's pending
+    /// park relocation becomes due on its own ladder and is replayed now
+    /// (the same single-operation resume a post-processing retry uses). A
+    /// move that ran but did not commit is committed where its bytes are;
+    /// anything the relocation cannot resume is left on its ladder.
+    pub fn retry_disposal_now(&self, job: u32) -> Result<()> {
+        self.resume_post_relocation_checked(job, &|| Ok(()), true)
+    }
+
     /// Test support: the next `record_terminal` for `job` fails before the
     /// row is written, as a refused write would.
     #[cfg(feature = "test-support")]
@@ -490,6 +534,9 @@ impl Inventory {
 #[cfg(feature = "test-support")]
 static TERMINAL_CRASHES: std::sync::LazyLock<Mutex<std::collections::HashMap<u32, u8>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(feature = "test-support")]
+static DISPOSAL_ADMISSION_LOSSES: std::sync::LazyLock<Mutex<std::collections::HashSet<u32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 #[cfg(feature = "test-support")]
 static TERMINAL_INSERT_FAILURES: std::sync::LazyLock<Mutex<std::collections::HashSet<u32>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));

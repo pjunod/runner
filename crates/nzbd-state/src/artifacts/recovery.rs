@@ -223,6 +223,29 @@ impl Inventory {
         paths: &[String],
         root: &Path,
     ) -> Result<Recovery> {
+        // An operator's recovery copy serializes behind a maintenance pass's
+        // momentary reconciliation lease on the source instead of failing
+        // against it; the wait happens outside the mutation guard, which
+        // the lease's release needs.
+        loop {
+            if let Ok(source) = self.get(key) {
+                self.wait_reconciliation_released(&source);
+            }
+            match self.stage_recovery_once(key, revision, request_id, paths, root) {
+                Err(Error::Conflict(reason)) if reason == RECOVERY_SOURCE_IN_USE => continue,
+                result => return result,
+            }
+        }
+    }
+
+    fn stage_recovery_once(
+        &self,
+        key: &str,
+        revision: u64,
+        request_id: &str,
+        paths: &[String],
+        root: &Path,
+    ) -> Result<Recovery> {
         let source_lease;
         let mut guard = Some(self.mutation_guard()?);
         if paths.is_empty() || paths.len() > 1000 || request_id.is_empty() || request_id.len() > 128
@@ -270,9 +293,23 @@ impl Inventory {
                 "recovery root overlaps source or state".into(),
             ));
         }
-        source_lease = self
-            .reserve_reconciliation_locked(std::slice::from_ref(&a), None, guard.as_ref().unwrap())?
-            .ok_or_else(|| Error::Conflict("recovery source remains in use".into()))?;
+        source_lease = match self.reserve_reconciliation_locked(
+            std::slice::from_ref(&a),
+            None,
+            guard.as_ref().unwrap(),
+        )? {
+            Some(lease) => lease,
+            // Only a maintenance lease is waited out (`stage_recovery`); a
+            // processing attempt or a changed generation is a refusal.
+            None if self.reconciliation_in_use(&a) => {
+                return Err(Error::Conflict(RECOVERY_SOURCE_IN_USE.into()))
+            }
+            None => {
+                return Err(Error::Conflict(
+                    "recovery source is in use by processing or changed; inspect again".into(),
+                ))
+            }
+        };
         drop(guard.take());
         let source = self.verify(&a)?;
         let observed = fs::manifest(&source, 100_000)?;
@@ -1057,3 +1094,5 @@ impl Inventory {
         Ok(())
     }
 }
+
+const RECOVERY_SOURCE_IN_USE: &str = "recovery source remains in use";

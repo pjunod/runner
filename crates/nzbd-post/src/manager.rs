@@ -711,7 +711,16 @@ async fn failure_followup(
             return false;
         }
     }
-    let Some(row) = engine.export_job(job).await.ok().flatten() else {
+    let row = match engine.export_job(job).await {
+        Ok(row) => row,
+        // A busy owner (a lifecycle transition in flight) is not a removed
+        // job: retry later rather than settle the obligation as gone.
+        Err(error) => {
+            tracing::debug!(job = job.0, %error, "failed-job follow-up waits for the owner");
+            return false;
+        }
+    };
+    let Some(row) = row else {
         // The queue row is gone (an operator delete, which owns its bytes):
         // nothing remains for runner to salvage or dispose.
         let inventory = engine.artifacts();
@@ -748,34 +757,59 @@ async fn failure_followup(
             terminal = reloaded;
         }
     }
-    // Review #280-7: what salvage found is the source's assessment from here
-    // on — published or nothing usable makes the remainder redundant; an
-    // assessment that failed leaves it unknown (retained).
-    let assessment = match (terminal.salvage, terminal.salvage_error.is_some()) {
-        (nzbd_state::artifacts::SalvageState::Published, _) => Some((
-            "unusable",
-            "verified payload was published as salvage; the remainder is redundant",
-        )),
-        (nzbd_state::artifacts::SalvageState::SettledNone, false) => Some((
-            "unusable",
-            "bounded post-failure assessment found no usable payload or repairable input",
-        )),
-        _ => None,
-    };
-    if let Some((disposition, reason)) = assessment {
+    // Review #280-7: the source's assessment after salvage. A published
+    // salvage took the verified payload, so the remainder is redundant;
+    // otherwise assess what is left — unverified-but-intact payload or a
+    // repairable input is `recoverable` (the pre-v2 "absent proof is not
+    // cleanup authority" rule), nothing usable is `unusable`.
+    if terminal.salvage != nzbd_state::artifacts::SalvageState::Pending {
+        if terminal.salvage == nzbd_state::artifacts::SalvageState::Published {
+            let inventory = engine.artifacts();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Some(source) = inventory.job_source(job.0)? {
+                    inventory.set_failure_assessment(
+                        &source.id,
+                        &source.generation,
+                        "unusable",
+                        "verified payload was published as salvage; the remainder is redundant",
+                    )?;
+                }
+                Ok::<_, nzbd_state::artifacts::Error>(())
+            })
+            .await;
+        } else if let Err(error) = record_failure_assessment(
+            &scoped,
+            &row,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+        )
+        .await
+        {
+            tracing::warn!(job = job.0, %error, "failed-source assessment did not complete; the source is retained");
+        }
+    }
+    // Forced (Retry now, `job_pp_finished`): the disposal operation's own
+    // ladder is brought forward, so a park that moved its bytes but did not
+    // commit is completed now rather than at its `next_retry`.
+    if force && terminal.salvage != nzbd_state::artifacts::SalvageState::Pending {
         let inventory = engine.artifacts();
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Some(source) = inventory.job_source(job.0)? {
-                inventory.set_failure_assessment(
-                    &source.id,
-                    &source.generation,
-                    disposition,
-                    reason,
-                )?;
+        let in_flight = inventory.clone();
+        if tokio::task::spawn_blocking(move || in_flight.disposal_in_flight(job.0))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false)
+        {
+            if let Ok(Err(error)) =
+                tokio::task::spawn_blocking(move || inventory.retry_disposal_now(job.0)).await
+            {
+                tracing::warn!(job = job.0, %error, "failed-source disposal stays on its ladder");
             }
-            Ok::<_, nzbd_state::artifacts::Error>(())
-        })
-        .await;
+        }
     }
     let done = if terminal.salvage == nzbd_state::artifacts::SalvageState::Pending {
         false
@@ -818,6 +852,68 @@ async fn fail_and_follow_up(
         }
     }
     failure_followup(engine, cfg, dest_dir, gate, job, true).await
+}
+
+/// Cluster worker, after the leader accepted a failed post-processing result
+/// (so the job's terminal is durable there, contract §2.1): dispose of this
+/// node's own attempt copy by the same rule as single-node disposal —
+/// Keep retains, park-always reasons retain in place, a source assessed `recoverable`
+/// (or not assessed) is retained, anything else follows `failure_action`.
+/// The cluster cleanup ledger then finds the copy already settled. Before
+/// v2 this ran inside the attempt, ahead of the stamp.
+pub async fn dispose_remote_failure(
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    dest_dir: &Path,
+    job: &Job,
+) -> bool {
+    let param = |key: &str| {
+        job.params
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    };
+    if !param(PP_DONE_PARAM).is_some_and(|status| !status.starts_with("SUCCESS")) {
+        return true;
+    }
+    let reason = param("Failure:Reason").and_then(nzbd_types::FailureReason::parse);
+    let inventory = engine.artifacts();
+    let assessed = inventory
+        .for_job(job.id.0)
+        .ok()
+        .flatten()
+        .and_then(|artifact| artifact.failure_assessment)
+        .map(|assessment| assessment.disposition);
+    let action = if nzbd_engine::terminal::keeps_failed_source(job) {
+        FailureAction::None
+    } else if reason.is_some_and(|reason| reason.park_always()) {
+        // Contract §2.2 park-always: the copy stays under runner custody
+        // where it is; the cluster ledger retains it (`artifacts::cluster`).
+        FailureAction::None
+    } else if assessed.as_deref() != Some("unusable") {
+        // `recoverable` holds payload; no assessment proves nothing.
+        FailureAction::None
+    } else {
+        cfg.failure_action
+    };
+    if action == FailureAction::None {
+        return true;
+    }
+    let mut failure_cfg = cfg.clone();
+    failure_cfg.failure_action = action;
+    let dir_name = nzbd_engine::queue::job_dir_name(job);
+    let source = dest_dir.join(&dir_name);
+    let observed = dispose_failed(
+        inventory,
+        &failure_cfg,
+        job.id,
+        &source,
+        dest_dir,
+        &dir_name,
+        "remote",
+    )
+    .await;
+    observed.files_at.is_none() || action == FailureAction::Park
 }
 
 /// Run a failed job's salvage and disposal now (contract §2.2/§2.6), as
@@ -1056,7 +1152,10 @@ async fn dispose_failed_source(
         .ok()
         .flatten()
         .is_some_and(|artifact| !artifact.terminal() && artifact.path.exists())
-        || source.exists();
+        || source.exists()
+        // A disposal operation that moved the bytes but did not commit
+        // still holds them; replaying it below records where they are.
+        || inventory.disposal_in_flight(job.0).unwrap_or(true);
     if !has_source {
         // A fetch failure, or an attempt that never wrote a byte.
         return record("no payload".into()).await;
@@ -1089,13 +1188,20 @@ async fn dispose_failed_source(
             Err(_) => false,
         };
     }
-    // Review #280-7 (the pre-v2 "recoverable/unknown → retain" rule): a
-    // source whose salvage could not be assessed is never deleted on the
-    // default policy — it is parked for recovery instead.
-    let action = if action == FailureAction::Delete
-        && terminal.salvage == nzbd_state::artifacts::SalvageState::SettledNone
-        && terminal.salvage_error.is_some()
-    {
+    // Review #280-7 (the pre-v2 "recoverable/unknown → retain" rule): only a
+    // source positively assessed `unusable` may be deleted; a recoverable
+    // or unassessed one is parked for recovery instead.
+    let assessed_unusable = {
+        let inventory = inventory.clone();
+        tokio::task::spawn_blocking(move || inventory.job_source(job.0))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .and_then(|source| source.failure_assessment)
+            .is_some_and(|assessment| assessment.disposition == "unusable")
+    };
+    let action = if action == FailureAction::Delete && !assessed_unusable {
         FailureAction::Park
     } else {
         action
@@ -1115,6 +1221,19 @@ async fn dispose_failed_source(
         "local",
     )
     .await;
+    // The move/delete ran under the admission; if the admission was lost
+    // meanwhile (an owner fence, shutdown) the outcome is not recorded by a
+    // holder that no longer owns the job. The next follow-up finds the
+    // canonical result and records it once.
+    if gate.as_ref().is_some_and(|claim| !claim(job))
+        || inventory.take_injected_disposal_admission_loss(job.0)
+    {
+        tracing::warn!(
+            job = job.0,
+            "failed-source disposal lost its admission; the next follow-up records it"
+        );
+        return false;
+    }
     let Some(disposition) =
         canonical_failed_disposition(&failure_cfg, dest_dir, &dir_name, &source).or_else(|| {
             // Nothing was ever written for this attempt: there is nothing to
@@ -4324,8 +4443,9 @@ fn record_deobfuscation(params: &mut Vec<(String, String)>, deobfuscated: &[(Pat
 }
 
 /// Record whether a failed attempt's source still holds usable payload
-/// (`recoverable`: a verified sibling or a repairable input) or nothing
-/// (`unusable`), for the lifecycle, cluster cleanup and disposal.
+/// (`recoverable`: a verified sibling or a repairable input), payload whose
+/// integrity is unproven (`unknown`), or nothing (`unusable`), for the
+/// lifecycle, cluster cleanup and disposal. Only `unusable` may be deleted.
 #[allow(clippy::too_many_arguments)]
 async fn record_failure_assessment(
     engine: &EngineHandle,
@@ -4338,7 +4458,7 @@ async fn record_failure_assessment(
     assessed: Option<&std::collections::HashMap<String, FileAssessment>>,
 ) -> Result<(), PostError> {
     let inventory = engine.artifacts();
-    let Some(source) = inventory.for_job(job.id.0)? else {
+    let Some(source) = inventory.job_source(job.id.0)? else {
         return Ok(());
     };
     let mut diagnostics = match assessed {
@@ -4365,22 +4485,32 @@ async fn record_failure_assessment(
     );
     let recovery = recovery_reason(&outcomes);
     let usable = !selected.is_empty() || recovery.is_some();
-    let mut reason = recovery.unwrap_or_else(|| {
-        if usable {
-            "verified sibling payload remains available for publication".into()
-        } else {
-            "bounded post-failure assessment found no usable payload or repairable input".into()
-        }
-    });
+    // Absent integrity proof is not cleanup authority: payload whose bytes
+    // were never verified is `unknown`, which retains like `recoverable`.
+    let unproven = outcomes
+        .iter()
+        .any(|outcome| outcome.outcome == "unverified_review");
+    let (disposition, default_reason) = if usable {
+        (
+            "recoverable",
+            "verified sibling payload remains available for publication",
+        )
+    } else if unproven {
+        (
+            "unknown",
+            "payload integrity is unproven; it is not deletion authority",
+        )
+    } else {
+        (
+            "unusable",
+            "bounded post-failure assessment found no usable payload or repairable input",
+        )
+    };
+    let mut reason = recovery.unwrap_or_else(|| default_reason.into());
     while reason.len() > 2048 {
         reason.pop();
     }
-    inventory.set_failure_assessment(
-        &source.id,
-        &source.generation,
-        if usable { "recoverable" } else { "unusable" },
-        &reason,
-    )?;
+    inventory.set_failure_assessment(&source.id, &source.generation, disposition, &reason)?;
     Ok(())
 }
 
