@@ -183,6 +183,11 @@ impl Owner {
         if let Some(callback) = self.io_callbacks.remove(&revision) {
             callback(self, result);
         }
+        // State-lane completions free admission capacity too. Give retained
+        // journal facts priority, then resume bounded recovery prerequisites.
+        self.retry_journal_checkpoint();
+        self.retry_payload_recoveries();
+        self.start_verifications();
     }
 
     pub(super) fn persist_then(
