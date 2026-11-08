@@ -1847,8 +1847,11 @@ async fn delivery_receipts_survive_authority_restart_and_consumer_removed_public
         &acceptance,
         &[("Content-Type", "application/json")],
     );
-    assert_eq!(status, 200, "acceptance through worker proxy: {accepted}");
-    assert!(accepted.contains("sourceCopies"));
+    // Contract §2.5 (v2, runner M3): there is no acceptance. The route is
+    // gone, and answers so through the worker's proxy as well; source cleanup
+    // does not wait for a consumer receipt.
+    assert_eq!(status, 410, "acceptance through worker proxy: {accepted}");
+    assert!(accepted.contains("acceptance was removed"), "{accepted}");
     // Consumer is entitled to remove its transferred publication immediately.
     std::fs::remove_dir_all(&path).unwrap();
     let last_cleanup_progress = std::cell::RefCell::new(String::new());
@@ -2213,8 +2216,11 @@ async fn delivery_receipts_and_copy_acks_survive_actual_majority_authority_chang
         &acceptance,
         &[("Content-Type", "application/json")],
     );
-    assert_eq!(status, 200, "acceptance through worker proxy: {accepted}");
-    assert!(accepted.contains("sourceCopies"));
+    // Contract §2.5 (v2, runner M3): there is no acceptance. The route is
+    // gone, and answers so through the worker's proxy as well; source cleanup
+    // does not wait for a consumer receipt.
+    assert_eq!(status, 410, "acceptance through worker proxy: {accepted}");
+    assert!(accepted.contains("acceptance was removed"), "{accepted}");
     // Consumer is entitled to remove its transferred publication immediately.
     std::fs::remove_dir_all(&path).unwrap();
     let last_cleanup_progress = std::cell::RefCell::new(String::new());
@@ -2947,7 +2953,9 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
         &format!("/api/v1/deliveries/{id}/accept"),
         b"{}",
     );
-    assert_eq!(code, 409);
+    // Contract §2.5: there is no acceptance; the route is gone for every id
+    // (it answered 409 for a private cleanup row under v1).
+    assert_eq!(code, 410);
     worker.kill().await;
     downloader.kill().await;
     authority.kill().await;

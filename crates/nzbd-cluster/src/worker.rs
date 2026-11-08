@@ -2479,6 +2479,12 @@ fn copy_generation_tree(
         if name.to_string_lossy().starts_with(".pp.") {
             continue;
         }
+        // Contract §2.5: `.runner-manifest.json` is the local publication's
+        // commit marker, not payload; the sealed generation carries the
+        // payload the leader verifies against the journaled file list.
+        if relative.as_os_str().is_empty() && name == nzbd_state::artifacts::RUNNER_MANIFEST_NAME {
+            continue;
+        }
         let from = entry.path();
         let rel = relative.join(&name);
         let to = target.join(&name);
