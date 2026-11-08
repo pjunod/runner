@@ -539,3 +539,53 @@ builds. No NZB-fetch task logic is changed in this follow-up.
 The remaining acceptance gate is an active-download comparison on nuc3 after
 the reviewed scheduler correction is installed. Do not infer restoration to
 109 MiB/s from the deterministic selection-count improvement alone.
+
+## 10. Follow-up — per-article durability round trips on GlusterFS
+
+**Measured November 8, after the verified #287 deployment:** one active job
+remained Downloading for an untraced 30.138-second window. Its durable byte
+counter advanced 1.295 GB, or 40.98 MiB/s. The active limit stayed at one.
+The previous indexing and scheduling fixes did not restore the 109 MiB/s target.
+
+A separate 20-second kernel trace classified actual open files through the
+process fdtable and dentry, rather than reusing a sampled descriptor-number
+list. It counted 1,123 payload `fdatasync` calls taking 18.059 seconds in total
+(mean 16.08 ms), and 1,123 journal calls taking 12.526 seconds (mean 11.15 ms).
+Payload files were on the `/processing` GlusterFS FUSE mount. At roughly 700 KiB
+per article, one payload sync per article predicts approximately the observed
+40–45 MiB/s ceiling. The journal's separate per-record sync would constrain
+throughput even if payload flushing alone were improved. These measurements
+identify application durability round trips; they do not establish the raw
+sequential bandwidth of the storage or the provider.
+
+The payload writer now shares one durable sync across an already-queued
+contiguous prefix of at most eight segment commands. Each segment's buffered
+write finishes before processing the next; pending facts retain metadata only.
+An empty queue, the bound, cancellation, rejected input, or any control command
+flushes the prefix before further processing. Written facts are emitted only
+after successful sync and verification of the final file identity. Every fact
+in the group carries that same post-sync identity. Publication, finalization,
+and sealing cannot overtake pending writes. Sync failure or a conflicting file
+mutation acknowledges none of the affected facts and retains the partial file.
+
+The persistence lane similarly groups at most 32 already-queued contiguous
+journal appends. It retains the first non-append request as the next FIFO
+barrier. Per-revision completions follow the shared sync, with the original
+filesystem error context preserved on failure. An append or sync failure fences
+later append groups until a successful complete snapshot establishes durable
+owner state and rotates local append descriptors to a fresh journal incarnation.
+Recovery checkpoints retain the old journal files, including torn tails, and
+foreign writers remain untouched; healthy checkpoint compaction is unchanged. No timer, input-capacity increase, early acknowledgement, or
+relaxation of payload or journal durability is introduced.
+
+Regression coverage adds six writer tests for shared sync and final identity,
+cancellation ordering, failed sync, control barriers, duplicates/rejected
+overlaps, and external mutation during sync. Six persistence tests cover prefix
+bounds/barriers, shared-sync completion, append and sync failures, and the
+cross-batch failure fence. A real torn-tail replay regression covers worker,
+delegated, and ordinary authoritative recovery checkpoints; a state test checks
+incarnation rotation, stable lease identity, and retained foreign journal access. Combined validation and deployment evidence belong
+with the PR. Runtime acceptance still requires untraced sustained measurements
+on nuc3 with one active download, unchanged provider settings, and verified
+binary provenance. The target remains 109 MiB/s; a passing test suite alone
+does not establish that throughput.

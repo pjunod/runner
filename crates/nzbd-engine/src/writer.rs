@@ -53,6 +53,8 @@ pub(crate) struct WriterScope {
     pub naming_inventory: Option<std::sync::Arc<nzbd_state::artifacts::Inventory>>,
     #[cfg(test)]
     pub naming_test_hook: Option<std::sync::Arc<dyn Fn(&'static str) + Send + Sync>>,
+    #[cfg(test)]
+    pub sync_test_hook: Option<std::sync::Arc<dyn Fn(&'static str) + Send + Sync>>,
 }
 
 #[derive(Debug)]
@@ -285,6 +287,96 @@ async fn ensure_open(
     Ok(())
 }
 
+// Pending facts carry no payload buffers. The existing eight-command input
+// queue bounds batching; no timer or additional payload queue is introduced.
+struct PendingWrite {
+    seg_number: u32,
+    offset: u64,
+    len: u32,
+    crc: u32,
+    file_size: u64,
+    server: ServerId,
+}
+
+#[derive(Default)]
+struct PendingWrites {
+    facts: Vec<PendingWrite>,
+    dirty: bool,
+    #[cfg(test)]
+    sync_fault: Option<i32>,
+}
+
+impl PendingWrites {
+    async fn flush(
+        &mut self,
+        out: &Option<File>,
+        expected: &mut Option<Identity>,
+        report: &Reporter,
+        part_path: &Path,
+        #[cfg(test)] hook: Option<&std::sync::Arc<dyn Fn(&'static str) + Send + Sync>>,
+    ) -> bool {
+        if self.facts.is_empty() {
+            return true;
+        }
+        let file = out.as_ref().expect("pending writes have an open file");
+        if self.dirty {
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook("before_sync");
+            }
+            let result = file.sync_data().await;
+            #[cfg(test)]
+            let result = if let Some(code) = self.sync_fault.take() {
+                Err(std::io::Error::from_raw_os_error(code))
+            } else {
+                result
+            };
+            if let Err(error) = result {
+                report
+                    .error(format!("write {}: {error}", part_path.display()))
+                    .await;
+                return false;
+            }
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook("after_sync");
+            }
+        }
+        let identity = match file_identity(file).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                report.error(error).await;
+                return false;
+            }
+        };
+        if expected.as_ref().is_some_and(|prior| *prior != identity) {
+            report.error(identity_error()).await;
+            return false;
+        }
+        *expected = Some(identity.clone());
+        // Every fact names the same post-sync identity. No member of a new
+        // batch is acknowledged before the shared durability boundary succeeds.
+        for fact in self.facts.drain(..) {
+            if !report
+                .send(WriterFact::Written {
+                    seg_number: fact.seg_number,
+                    offset: fact.offset,
+                    len: fact.len,
+                    crc: fact.crc,
+                    file_size: fact.file_size,
+                    server: fact.server,
+                    identity: identity.clone(),
+                })
+                .await
+            {
+                return false;
+            }
+        }
+        self.dirty = false;
+        true
+    }
+}
+
 // The task owns one writer actor; keep its bounded plumbing explicit here.
 #[allow(clippy::too_many_arguments)]
 async fn writer_task(
@@ -370,10 +462,52 @@ async fn writer_task(
     let mut reservation = None;
     #[cfg(test)]
     let mut fault = None;
+    let mut pending = PendingWrites::default();
+    let mut deferred = None;
     loop {
-        // Never cancel an in-flight seek/write/sync. Stop before the next command.
-        let cmd = tokio::select! { biased; _ = stop.cancelled() => break,
-        command = rx.recv() => match command { Some(command)=>command,None=>break } };
+        // Drain only an already-queued contiguous segment prefix. A control
+        // command, an empty queue, the batch bound, or cancellation flushes the
+        // accepted prefix before another command can run.
+        let cmd = if !pending.facts.is_empty() {
+            let next = if !stop.is_cancelled() && pending.facts.len() < WRITER_QUEUE {
+                rx.try_recv().ok()
+            } else {
+                None
+            };
+            match next {
+                Some(command @ WriteCmd::Segment { .. }) => command,
+                other => {
+                    deferred = other;
+                    if !pending
+                        .flush(
+                            &out,
+                            &mut expected,
+                            &report,
+                            &part_path,
+                            #[cfg(test)]
+                            scope.sync_test_hook.as_ref(),
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                    if stop.is_cancelled() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        } else if let Some(command) = deferred.take() {
+            if stop.is_cancelled() {
+                break;
+            }
+            command
+        } else {
+            // Never cancel an in-flight seek/write/sync. Only the next receive
+            // is cancellable, after any completed writes have been drained.
+            tokio::select! { biased; _ = stop.cancelled() => break,
+            command = rx.recv() => match command { Some(command)=>command,None=>break } }
+        };
         match cmd {
             #[cfg(test)]
             WriteCmd::InjectFailure(stage, code) => {
@@ -409,6 +543,19 @@ async fn writer_task(
                     (prior.seg_number == seg_number || prior.overlaps(&range)) && *prior != range
                 });
                 if invalid || conflict {
+                    if !pending
+                        .flush(
+                            &out,
+                            &mut expected,
+                            &report,
+                            &part_path,
+                            #[cfg(test)]
+                            scope.sync_test_hook.as_ref(),
+                        )
+                        .await
+                    {
+                        return;
+                    }
                     if !report
                         .send(WriterFact::Rejected {
                             seg_number,
@@ -474,23 +621,23 @@ async fn writer_task(
                         }
                         f.seek(SeekFrom::Start(offset)).await?;
                         f.write_all(&data).await?;
-                        // Segment sync is the durability boundary for every acknowledgement.
-                        f.sync_data().await?;
+                        // Drain Tokio's buffered write before checking identity or
+                        // seeking for another member. Durability is shared below.
+                        f.flush().await?;
                         Ok::<_, std::io::Error>(())
                     }
                     .await;
                     #[cfg(test)]
-                    let result = if let Some(("sync", code)) = injected {
-                        Err(std::io::Error::from_raw_os_error(code))
-                    } else {
-                        result
-                    };
+                    if let Some(("sync", code)) = injected {
+                        pending.sync_fault = Some(code);
+                    }
                     if let Err(error) = result {
                         report
                             .error(format!("write {}: {error}", part_path.display()))
                             .await;
                         return;
                     }
+                    pending.dirty = true;
                 }
                 let identity = match file_identity(out.as_ref().unwrap()).await {
                     Ok(identity) => identity,
@@ -499,21 +646,15 @@ async fn writer_task(
                         return;
                     }
                 };
-                expected = Some(identity.clone());
-                if !report
-                    .send(WriterFact::Written {
-                        seg_number,
-                        offset,
-                        len: range.len,
-                        crc,
-                        file_size,
-                        server,
-                        identity,
-                    })
-                    .await
-                {
-                    return;
-                }
+                expected = Some(identity);
+                pending.facts.push(PendingWrite {
+                    seg_number,
+                    offset,
+                    len: range.len,
+                    crc,
+                    file_size,
+                    server,
+                });
             }
             WriteCmd::SealPartial {
                 file_size,
@@ -1643,5 +1784,293 @@ mod tests {
             })
         ));
         assert_eq!(std::fs::read(path).unwrap(), b"abcd");
+    }
+
+    fn batch_segment(number: u32, offset: u64, bytes: &[u8], size: u64) -> WriteCmd {
+        WriteCmd::Segment {
+            seg_number: number,
+            offset,
+            data: bytes.to_vec(),
+            crc: crc32fast::hash(bytes),
+            file_size: size,
+            server: ServerId(1),
+        }
+    }
+
+    fn queued_writer(
+        dir: &Path,
+        commands: Vec<WriteCmd>,
+        scope: WriterScope,
+    ) -> (
+        mpsc::Receiver<EngineMsg>,
+        tokio_util::sync::CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = channel(WRITER_QUEUE);
+        for command in commands {
+            tx.try_send(command).unwrap();
+        }
+        drop(tx);
+        let (events, received) = channel(32);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(writer_task(
+            JobId(1),
+            FileId(2),
+            dir.into(),
+            "out".into(),
+            rx,
+            events,
+            stop.clone(),
+            scope,
+            true,
+        ));
+        (received, stop, task)
+    }
+
+    async fn batch_facts(events: &mut mpsc::Receiver<EngineMsg>) -> Vec<WriterFact> {
+        let mut facts = Vec::new();
+        while let Some(message) = naming_writer_event(events).await {
+            match message {
+                EngineMsg::ScopedWriter { fact, .. } => facts.push(fact),
+                _ => panic!("scoped writer must retain its generation envelope"),
+            }
+        }
+        facts
+    }
+
+    #[tokio::test]
+    async fn queued_segments_share_one_sync_and_post_sync_identity() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let observed = syncs.clone();
+        let commands = (1..=WRITER_QUEUE)
+            .map(|n| batch_segment(n as u32, (n - 1) as u64, &[n as u8], WRITER_QUEUE as u64))
+            .collect();
+        let scope = WriterScope {
+            sync_test_hook: Some(Arc::new(move |stage| {
+                if stage == "before_sync" {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            })),
+            ..Default::default()
+        };
+        let (mut events, _, task) = queued_writer(temp.path(), commands, scope);
+        let facts = batch_facts(&mut events).await;
+        task.await.unwrap();
+        assert_eq!(facts.len(), WRITER_QUEUE);
+        assert_eq!(
+            syncs.load(Ordering::SeqCst),
+            1,
+            "an already queued prefix shares one durable flush"
+        );
+        let mut first = None;
+        for (index, fact) in facts.iter().enumerate() {
+            let WriterFact::Written {
+                seg_number,
+                identity,
+                ..
+            } = fact
+            else {
+                panic!("every valid segment is acknowledged");
+            };
+            assert_eq!(*seg_number, index as u32 + 1);
+            if let Some(expected) = &first {
+                assert_eq!(identity, expected);
+            } else {
+                first = Some(identity.clone());
+            }
+        }
+        assert_eq!(
+            std::fs::read(temp.path().join(".runner-file-2.part")).unwrap(),
+            (1..=WRITER_QUEUE as u8).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_drains_written_batch_only_after_shared_sync() {
+        use std::sync::{Arc, Mutex};
+        let temp = tempfile::tempdir().unwrap();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let entered = Mutex::new(Some(entered));
+        let (release, gate) = std::sync::mpsc::channel();
+        let gate = Mutex::new(gate);
+        let scope = WriterScope {
+            sync_test_hook: Some(Arc::new(move |stage| {
+                if stage == "before_sync" {
+                    if let Some(signal) = entered.lock().unwrap().take() {
+                        let _ = signal.send(());
+                    }
+                    let _ = gate.lock().unwrap().recv();
+                }
+            })),
+            ..Default::default()
+        };
+        let mut commands = (1..=4)
+            .map(|n| batch_segment(n, u64::from(n - 1), &[n as u8], 4))
+            .collect::<Vec<_>>();
+        commands.push(WriteCmd::Finalize {
+            file_size: 4,
+            combined_crc: Some(crc32fast::hash(&[1, 2, 3, 4])),
+        });
+        let (mut events, stop, task) = queued_writer(temp.path(), commands, scope);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        let early = events.try_recv().is_ok();
+        stop.cancel();
+        release.send(()).unwrap();
+        let facts = batch_facts(&mut events).await;
+        task.await.unwrap();
+        assert!(
+            !early,
+            "no batch acknowledgement may precede the shared durable flush"
+        );
+        assert_eq!(facts.len(), 4);
+        assert!(facts
+            .iter()
+            .all(|fact| matches!(fact, WriterFact::Written { .. })));
+        assert!(
+            !temp.path().join("out").exists(),
+            "cancelled queued Finalize must not publish"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join(".runner-file-2.part")).unwrap(),
+            [1, 2, 3, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_shared_sync_acknowledges_none_and_retains_all_written_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut commands = vec![WriteCmd::InjectFailure("sync", 28)];
+        commands.extend((1..=4).map(|n| batch_segment(n, u64::from(n - 1), &[n as u8], 4)));
+        let (mut events, _, task) = queued_writer(temp.path(), commands, WriterScope::default());
+        let facts = batch_facts(&mut events).await;
+        task.await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert!(matches!(&facts[0],WriterFact::Error{error} if error.contains("os error 28")));
+        assert_eq!(
+            std::fs::read(temp.path().join(".runner-file-2.part")).unwrap(),
+            [1, 2, 3, 4]
+        );
+        assert!(!temp.path().join("out").exists());
+    }
+
+    #[tokio::test]
+    async fn publication_name_and_finalize_do_not_overtake_a_pending_batch() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let observed = syncs.clone();
+        let scope = WriterScope {
+            sync_test_hook: Some(Arc::new(move |stage| {
+                if stage == "before_sync" {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            })),
+            ..Default::default()
+        };
+        let commands = vec![
+            batch_segment(1, 0, b"a", 2),
+            WriteCmd::PublicationName("published.bin".into()),
+            batch_segment(2, 1, b"b", 2),
+            WriteCmd::Finalize {
+                file_size: 2,
+                combined_crc: Some(crc32fast::hash(b"ab")),
+            },
+        ];
+        let (mut events, _, task) = queued_writer(temp.path(), commands, scope);
+        let facts = batch_facts(&mut events).await;
+        task.await.unwrap();
+        assert_eq!(
+            syncs.load(Ordering::SeqCst),
+            2,
+            "a publication command separates durable prefixes"
+        );
+        assert!(matches!(
+            &facts[..],
+            [
+                WriterFact::Written { seg_number: 1, .. },
+                WriterFact::Written { seg_number: 2, .. },
+                WriterFact::Finalized { ok: true, .. }
+            ]
+        ));
+        assert_eq!(
+            std::fs::read(temp.path().join("published.bin")).unwrap(),
+            b"ab"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_and_rejected_overlap_preserve_batch_acknowledgement_order() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let observed = syncs.clone();
+        let scope = WriterScope {
+            sync_test_hook: Some(Arc::new(move |stage| {
+                if stage == "before_sync" {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            })),
+            ..Default::default()
+        };
+        let commands = vec![
+            batch_segment(1, 0, b"ab", 4),
+            batch_segment(1, 0, b"ab", 4),
+            batch_segment(9, 1, b"xx", 4),
+            batch_segment(2, 2, b"cd", 4),
+        ];
+        let (mut events, _, task) = queued_writer(temp.path(), commands, scope);
+        let facts = batch_facts(&mut events).await;
+        task.await.unwrap();
+        assert_eq!(syncs.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            &facts[..],
+            [
+                WriterFact::Written { seg_number: 1, .. },
+                WriterFact::Written { seg_number: 1, .. },
+                WriterFact::Rejected { seg_number: 9, .. },
+                WriterFact::Written { seg_number: 2, .. }
+            ]
+        ));
+        assert_eq!(
+            std::fs::read(temp.path().join(".runner-file-2.part")).unwrap(),
+            b"abcd"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_mutation_during_shared_sync_is_not_acknowledged() {
+        use std::sync::Arc;
+        let temp = tempfile::tempdir().unwrap();
+        let part = temp.path().join(".runner-file-2.part");
+        let changed = part.clone();
+        let scope = WriterScope {
+            sync_test_hook: Some(Arc::new(move |stage| {
+                if stage == "before_sync" {
+                    std::fs::write(&changed, b"foreign mutation").unwrap();
+                }
+            })),
+            ..Default::default()
+        };
+        let commands = vec![batch_segment(1, 0, b"ab", 4), batch_segment(2, 2, b"cd", 4)];
+        let (mut events, _, task) = queued_writer(temp.path(), commands, scope);
+        let facts = batch_facts(&mut events).await;
+        task.await.unwrap();
+        assert!(matches!(&facts[..], [WriterFact::Error {error}] if error.contains("identity")));
+        assert_eq!(std::fs::read(part).unwrap(), b"foreign mutation");
+        assert!(!temp.path().join("out").exists());
     }
 }
