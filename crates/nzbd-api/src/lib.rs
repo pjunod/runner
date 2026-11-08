@@ -5519,6 +5519,15 @@ mod tests {
             data.contains("monarr/1.0"),
             "pause events carry their source: {data}"
         );
+        let (name, data) = wire(&E::PostPauseChanged {
+            paused: false,
+            source: "curator/0.6".into(),
+        });
+        assert_eq!(name, "post_pause_changed");
+        assert!(
+            data.contains("false") && data.contains("curator/0.6"),
+            "{data}"
+        );
         let (name, data) = wire(&E::SpeedLimitChanged {
             bytes_per_sec: Some(1024),
         });
@@ -5717,6 +5726,10 @@ mod integration_doc_tests {
                 seconds: 1,
             },
             E::QueuePauseChanged {
+                paused: true,
+                source: "test".into(),
+            },
+            E::PostPauseChanged {
                 paused: true,
                 source: "test".into(),
             },
