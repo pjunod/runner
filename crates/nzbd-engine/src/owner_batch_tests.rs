@@ -569,3 +569,33 @@ async fn saturated_journal_admission_checkpoints_latest_progress_without_false_h
     );
     owner.drain_shutdown_results(&mut messages).await;
 }
+
+#[tokio::test]
+async fn failed_journal_checkpoint_retains_fence_and_backs_off_until_storage_recovers() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut owner, _adapter, mut messages) = owner_fixture(&temp);
+    pump_idle(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(1, FileId(1)));
+    let blocked = owner.state_dir.join("queue.json.tmp");
+    std::fs::create_dir(&blocked).unwrap();
+    owner.journal_checkpoint = Some(fresh_epoch());
+    owner.retry_journal_checkpoint();
+    pump_idle(&mut owner, &mut messages).await;
+    assert!(owner.journal_checkpoint.is_some());
+    assert!(!owner.journal_checkpoint_inflight);
+    assert!(owner.journal_checkpoint_retry_at > Instant::now());
+    owner.retry_journal_checkpoint();
+    assert!(
+        owner.persistence_callbacks.is_empty(),
+        "storage failure must not spin on new saves"
+    );
+    std::fs::remove_dir(blocked).unwrap();
+    owner.journal_checkpoint_retry_at = Instant::now();
+    owner.retry_journal_checkpoint();
+    pump_idle(&mut owner, &mut messages).await;
+    assert!(
+        owner.journal_checkpoint.is_none(),
+        "only the actual durable checkpoint releases the fence"
+    );
+    owner.drain_shutdown_results(&mut messages).await;
+}

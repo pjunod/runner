@@ -1059,6 +1059,7 @@ pub(crate) struct Owner {
     // Stop leasing until that snapshot durably covers the latest accepted fact.
     journal_checkpoint: Option<u64>,
     journal_checkpoint_inflight: bool,
+    journal_checkpoint_retry_at: Instant,
     journal_suffix: String,
     payload_waiting: VecDeque<PayloadWork>,
     payload_active: HashSet<PathBuf>,
@@ -1532,6 +1533,7 @@ impl Owner {
             persistence_callbacks: HashMap::new(),
             journal_checkpoint: None,
             journal_checkpoint_inflight: false,
+            journal_checkpoint_retry_at: Instant::now(),
             io_callbacks: HashMap::new(),
             payload_waiting: VecDeque::new(),
             payload_active: HashSet::new(),

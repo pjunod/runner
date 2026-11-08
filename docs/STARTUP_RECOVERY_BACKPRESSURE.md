@@ -1,7 +1,7 @@
 # Startup recovery — pacing, admission pressure, and durable progress
 
 **Status:** implemented; validation and delivery recorded in the PR.
-**Written:** 2026-11-08 (America/New_York). **Incident build:** `1f73dea`.
+**Written:** 2026-11-08 (America/New_York). **Incident checkout:** `1f73dea`.
 
 Read this alongside [startup verification](STARTUP_VERIFICATION_PLAN.md),
 [URL acquisition recovery](URL_FETCH_RECOVERY.md), and the measured
@@ -128,7 +128,8 @@ latest checkpoint generation. A later writer fact requires another snapshot;
 an older acknowledgement cannot release newer progress.
 
 Actual append write/sync errors retain their existing failure handling. A
-failed checkpoint keeps the fence and evidence. Ordinary background snapshots
+failed checkpoint keeps the fence and evidence, then waits the existing
+30-second storage-recovery cadence before retrying; it cannot spin on failed saves. Ordinary background snapshots
 do not compete with a pending journal checkpoint. State-lane completions and
 the owner tick drive retries. Shutdown's existing final snapshot covers all
 accepted owner state before disarming the unclean marker.
@@ -150,6 +151,8 @@ and persistence rather than only checking display strings:
 - More than 256 accepted writer facts survive a blocked persistence lane.
 - A completion arriving after checkpoint capture prevents premature release;
   the final durable snapshot contains all 301 accepted completion facts.
+- A genuine failed checkpoint retains the fence, backs off, and releases only
+  after storage recovers and a new checkpoint actually commits.
 
 The existing metadata-responsiveness and pending-delete fixtures were updated
 to reflect metadata-only completion and an actual retained byte claim.

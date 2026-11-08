@@ -293,13 +293,22 @@ impl Owner {
             || self.persistence_fenced
             || self.cancel.is_cancelled()
             || self.persistence.tx.capacity() == 0
+            || Instant::now() < self.journal_checkpoint_retry_at
         {
             return;
         }
         self.journal_checkpoint_inflight = true;
         self.persist_then(move |owner, committed| {
             owner.journal_checkpoint_inflight = false;
-            if committed && owner.journal_checkpoint == Some(epoch) {
+            if !committed {
+                // A genuine storage refusal must not create an immediate
+                // failed-save loop. Keep the fence and use the existing
+                // recovery cadence before another checkpoint attempt.
+                owner.journal_checkpoint_retry_at = Instant::now() + Duration::from_secs(30);
+                return;
+            }
+            owner.journal_checkpoint_retry_at = Instant::now();
+            if owner.journal_checkpoint == Some(epoch) {
                 owner.journal_checkpoint = None;
                 let jobs = owner
                     .state
