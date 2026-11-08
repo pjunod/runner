@@ -1950,9 +1950,9 @@ pub(crate) fn unix_ms_public() -> i64 {
 /// A `held` row without a holding control is logged once per job and
 /// control revision: replicated rows are decoded on every read.
 pub(crate) fn decode_intent(json: &str) -> serde_json::Result<nzbd_types::Job> {
-    static LOGGED: std::sync::LazyLock<
-        std::sync::Mutex<std::collections::HashSet<(u32, Option<String>)>>,
-    > = std::sync::LazyLock::new(Default::default);
+    /// (job id, control revision) already logged as a lost hold.
+    type Logged = std::sync::Mutex<std::collections::HashSet<(u32, Option<String>)>>;
+    static LOGGED: std::sync::LazyLock<Logged> = std::sync::LazyLock::new(Default::default);
     let mut job: nzbd_types::Job = serde_json::from_str(json)?;
     if job.normalize_hold_status() == nzbd_types::HoldStatusChange::LostHold {
         let control = job.control();

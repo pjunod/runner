@@ -9,9 +9,32 @@ gate now that `held` is persisted: a node older than 0.5.0 cannot decode a
 `held` status a 0.6.0 node writes to the shared queue. **Status:** draft PR
 [#297](https://github.com/pjunod/runner/pull/297) on
 `claude/pipeline-v2-m6b-runner` (runner 0.6.0), stacked on M6a
-(base `claude/pipeline-v2-m6a-runner`, review r1 fixes and main #290 merged
-up). Held built since the first review; awaiting re-review. Not merged, not
-deployed.
+(now targets `main`; M6a merged as #296 `fb6f1b9`, merged up). Fable
+re-review r2 at `c36d368`: two should-fixes and three minors, all resolved
+(`af35a35`); re-review requested. Not merged, not deployed.
+
+- **Review r2 fixes.**
+  - **Rollback wedge closed.** Automatic-control markers are stamped in
+    the 0.5.0 form (`Held` → `paused`, the held control beside it). Their
+    identity hashes the statuses, so a node rolled back to 0.5.0 still
+    validates, applies or drops a marker 0.6.0 wrote; this build restores
+    `Held` from the control on read. Test:
+    `a_held_marker_is_stamped_in_the_050_form_and_reads_back_held`.
+  - **A lost hold is no longer silent.** `normalize_hold_status` returns a
+    `HoldStatusChange`. A `held` row whose control no longer holds becomes
+    `paused` and logs a warning with the job and the control found. That
+    covers the queue-snapshot load, imports, replicated authority, adopted
+    worker checkpoints, and cluster `decode_intent` (once per job and
+    control revision).
+  - **Minors.** The receipt `outcome` list in `INTEGRATION.md` now includes
+    `held`. The debug-assert diagnostic filter now matches its predicate.
+    The `normalize_hold_status` doc notes the `manual_pause` + unknown
+    control-version checkpoint case.
+  - **New tests.** `a_persisted_hold_reloads_held_and_recovers_and_a_050_snapshot_loads_held`
+    (e2e) covers three things: save→reopen keeps `held` and hold recovery
+    releases it; a 0.5.0 `paused` + held snapshot loads `held`; a `held`
+    row without a control loads `paused`. The owner test now counts exactly
+    one `held` status change per hold, and none for a pause inside it.
 
 - **Persisted `JobStatus::Held`.** A hold is now its own status: `held`
   exactly while `control.lifecycle == "held"`, `paused` only for a person's
@@ -95,6 +118,18 @@ deployed.
 - The `review: interrupted move` hold clear in `commit_intent` stays:
   `relocation.rs` still writes that hold for non-intent moves, so the clear
   is live code, not a rollback shim.
+
+**Fast lane, r2 (after merging `origin/main` `fb6f1b9`):**
+- clippy workspace `-D warnings`: clean.
+- Library tests:
+  - types 14/14;
+  - engine 354/355 (fails only the root-only `volumes` test);
+  - state 340/340;
+  - cluster 58/58.
+- Integration tests:
+  - `cluster_e2e`: 22/22;
+  - engine `e2e` holds (including the new reopen test): 6/6.
+- `make fast-check-docs`: 3/3.
 
 **Fast lane run (head after merging M6a `e14022c`):**
 - `cargo clippy --workspace --all-targets --locked -D warnings`: clean.
