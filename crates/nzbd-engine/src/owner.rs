@@ -1930,8 +1930,10 @@ impl Owner {
             }
             EngineMsg::ScopedEvent { admission, event } => {
                 let cleanup_event = !self.failed_cleanup_admissions.contains_key(&admission.job)
-                    || (matches!(&event, Event::JobPpFinished { job, pp_status, .. }
-                            if *job == admission.job && pp_status.starts_with("FAILURE/"))
+                    || (matches!(&event, Event::JobPpFinished { job, outcome, reason, .. }
+                            if *job == admission.job
+                                && *outcome == nzbd_types::TerminalOutcome::Failed
+                                && reason.is_some_and(|reason| reason.history_status().starts_with("FAILURE/")))
                         && self.state.job(admission.job).is_some_and(|job| {
                             job.params
                                 .iter()

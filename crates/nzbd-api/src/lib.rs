@@ -1978,8 +1978,6 @@ fn event_json(ev: &nzbd_engine::Event) -> (&'static str, serde_json::Value) {
             keep_on_failure,
             fetched,
             publication,
-            pp_status,
-            final_dir,
             size_bytes,
             health,
             params,
@@ -2002,8 +2000,6 @@ fn event_json(ev: &nzbd_engine::Event) -> (&'static str, serde_json::Value) {
                 "keep_on_failure": keep_on_failure,
                 "fetched": fetched,
                 "publication": publication,
-                "pp_status": pp_status,
-                "final_dir": final_dir,
                 "size_bytes": size_bytes,
                 "health": health,
                 "params": params,
@@ -4079,10 +4075,10 @@ mod tests {
         engine.shutdown().await;
     }
 
-    /// Plan M1 (h): a consumer built against v1 still reads the new event —
-    /// the legacy `pp_status`/`final_dir`/`params`/`history_seq` keep their
-    /// names and the `*Control:v1` it carries parses with the v1 fixture
-    /// consumer — and `GET /history` carries the cursor's incarnation.
+    /// Plan M1 (h), narrowed in M6b: `params`/`history_seq` keep their
+    /// names and the `*Control:v1` the event carries parses with the v1
+    /// fixture consumer; the legacy `pp_status`/`final_dir` are gone (every
+    /// curator reads `outcome`/`reason`/`publication` since M2).
     #[tokio::test]
     async fn old_curator_fixture_parses_new_event() {
         let fixture: nzbd_types::JobControl = serde_json::from_str(include_str!(
@@ -4104,8 +4100,6 @@ mod tests {
             keep_on_failure: false,
             fetched: Default::default(),
             publication: None,
-            pp_status: "UNPACK_FAILURE".into(),
-            final_dir: None,
             size_bytes: 1,
             health: 1000,
             params: vec![
@@ -4119,10 +4113,9 @@ mod tests {
             history_incarnation: "abc".into(),
         });
         assert_eq!(name, "job_pp_finished");
-        // What an old consumer reads, by name.
-        assert_eq!(data["pp_status"], "UNPACK_FAILURE");
-        assert!(data["pp_status"].as_str().unwrap().contains("FAILURE"));
-        assert!(data["final_dir"].is_null());
+        assert_eq!(data["outcome"], "failed");
+        assert_eq!(data["reason"], "unpack");
+        assert!(data.get("pp_status").is_none() && data.get("final_dir").is_none());
         assert_eq!(data["history_seq"], 12);
         let control = data["params"]
             .as_array()
@@ -5501,8 +5494,6 @@ mod tests {
                 files: 1,
                 cross_volume: false,
             }),
-            pp_status: "SUCCESS".into(),
-            final_dir: Some("/dest/Show.S01E01".into()),
             size_bytes: 42,
             health: 1000,
             params: vec![("monarr-transfer".into(), "t-42-a3f9c1".into())],
@@ -5510,8 +5501,9 @@ mod tests {
             history_incarnation: "7f3a".into(),
         });
         assert_eq!(name, "job_pp_finished");
+        assert!(data.contains("\"path\":\"/dest/Show.S01E01\""), "{data}");
         assert!(
-            data.contains("\"final_dir\":\"/dest/Show.S01E01\""),
+            !data.contains("final_dir") && !data.contains("pp_status"),
             "{data}"
         );
         assert!(data.contains("\"history_seq\":913"), "{data}");
@@ -5545,8 +5537,6 @@ mod tests {
             keep_on_failure: false,
             fetched: Default::default(),
             publication: None,
-            pp_status: "FAILURE/FETCH".into(),
-            final_dir: None,
             size_bytes: 0,
             health: 0,
             params: vec![],
@@ -5688,8 +5678,6 @@ mod integration_doc_tests {
                     bytes: 0,
                 },
                 publication: Some(publication.clone()),
-                pp_status: "SUCCESS".into(),
-                final_dir: None,
                 size_bytes: 0,
                 health: 1000,
                 params: Vec::new(),

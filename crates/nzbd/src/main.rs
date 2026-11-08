@@ -2030,7 +2030,7 @@ mod tests {
                 assert!(!published_dir.join("payload.mkv").exists());
             } else {
                 assert_eq!(result.unwrap(), nzbd_post::manager::PpFinal::Success);
-                let (pp_status, final_dir) = tokio::time::timeout(Duration::from_secs(5), async {
+                let (outcome, publication) = tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
                         match pp_events
                             .recv()
@@ -2039,18 +2039,21 @@ mod tests {
                         {
                             Event::JobPpFinished {
                                 job: finished,
-                                pp_status,
-                                final_dir,
+                                outcome,
+                                publication,
                                 ..
-                            } if finished == job => break (pp_status, final_dir),
+                            } if finished == job => break (outcome, publication),
                             _ => continue,
                         }
                     }
                 })
                 .await
                 .expect("durable post-processing completion event");
-                assert_eq!(pp_status, "SUCCESS");
-                assert_eq!(final_dir.as_deref(), Some(published_dir.to_str().unwrap()));
+                assert_eq!(outcome, nzbd_types::TerminalOutcome::Completed);
+                assert_eq!(
+                    publication.map(|p| p.path).as_deref(),
+                    Some(published_dir.to_str().unwrap())
+                );
                 assert!(engine.export_job(job).await.unwrap().unwrap().ready());
                 assert_eq!(
                     std::fs::read(published_dir.join("payload.mkv")).unwrap(),

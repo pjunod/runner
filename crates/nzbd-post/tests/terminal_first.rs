@@ -195,7 +195,6 @@ async fn unpack_failure_is_terminal_before_salvage() {
                 salvage,
                 transfer,
                 history_seq,
-                pp_status,
                 ..
             } if job == job_id => {
                 assert!(
@@ -207,7 +206,6 @@ async fn unpack_failure_is_terminal_before_salvage() {
                 assert!(blames_release);
                 assert_eq!(salvage, nzbd_types::Salvage::Pending);
                 assert_eq!(transfer.as_deref(), Some("t-corrupt-pack"));
-                assert_eq!(pp_status, "UNPACK_FAILURE");
                 let row = history.get_sequence(history_seq).unwrap().unwrap();
                 assert_eq!(row.status, "UNPACK_FAILURE", "history is durable first");
                 assert!(
@@ -976,7 +974,6 @@ async fn self_contradicting_evidence_is_identity() {
             reason,
             blames_release,
             salvage,
-            pp_status,
             ..
         } = event
         {
@@ -985,7 +982,6 @@ async fn self_contradicting_evidence_is_identity() {
             assert_eq!(reason, Some(FailureReason::Identity));
             assert!(blames_release);
             assert_eq!(salvage, nzbd_types::Salvage::None);
-            assert_eq!(pp_status, "FAILURE/IDENTITY");
             break;
         }
     }
