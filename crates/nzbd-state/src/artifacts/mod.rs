@@ -25,6 +25,9 @@ mod startup;
 mod terminals;
 pub use startup::StartupReconciliation;
 pub use terminals::{JobTerminal, SalvageOutcome, SalvageState, TerminalStep};
+#[cfg(test)]
+mod operation_index_tests;
+mod operation_queries;
 mod tasks;
 mod torrent;
 pub use torrent::TorrentSourceReader;
@@ -668,6 +671,9 @@ impl Inventory {
           CREATE TABLE IF NOT EXISTS worker_completion_receipts(id TEXT PRIMARY KEY,job INTEGER NOT NULL,data TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS operations_state ON operations(state);
           CREATE INDEX IF NOT EXISTS operations_artifact ON operations(artifact);
+          CREATE INDEX IF NOT EXISTS operations_transform_scratch ON operations(json_extract(json_extract(data,'$.request'),'$.scratch.id'),json_extract(json_extract(data,'$.request'),'$.scratch.generation')) WHERE json_extract(data,'$.kind') IN ('extract','par_repair');
+          CREATE INDEX IF NOT EXISTS operations_scan_recent ON operations(json_extract(data,'$.kind'),json_extract(data,'$.created_at') DESC) WHERE json_extract(data,'$.kind')='scan';
+          CREATE INDEX IF NOT EXISTS operations_kind ON operations(json_extract(data,'$.kind'));
           CREATE TABLE IF NOT EXISTS recoveries(id TEXT PRIMARY KEY,artifact TEXT NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS workspace_finalizations(source TEXT NOT NULL,generation TEXT NOT NULL,outcome TEXT NOT NULL,proof TEXT NOT NULL,job INTEGER,activated INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(source,generation));
           CREATE TABLE IF NOT EXISTS deliveries(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,artifact TEXT NOT NULL,generation TEXT NOT NULL,data TEXT NOT NULL,accepted_at INTEGER,consumer_receipt_id TEXT,cleanup_status TEXT NOT NULL DEFAULT 'pending',cleanup_error TEXT,cleanup_attempts INTEGER NOT NULL DEFAULT 0,cleanup_next_retry_at INTEGER,cleanup_blocked_since INTEGER,cleanup_started_at INTEGER,cleanup_last_attempt_at INTEGER,cleanup_completed_at INTEGER,UNIQUE(artifact,generation));

@@ -7,7 +7,12 @@ impl Inventory {
         Ok(())
     }
     pub fn discovery_status(&self) -> Result<Option<Operation>> {
-        let raw: Option<String> = self.db.lock().unwrap().query_row("SELECT data FROM operations WHERE json_extract(data,'$.kind')='scan' ORDER BY json_extract(data,'$.created_at') DESC LIMIT 1", [], |r| r.get(0)).optional()?;
+        let raw: Option<String> = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(operation_queries::DISCOVERY_STATUS, [], |r| r.get(0))
+            .optional()?;
         raw.map(|r| serde_json::from_str(&r).map_err(Error::from))
             .transpose()
     }
