@@ -47,6 +47,11 @@ only after deploy confirmation.
   a new `Event` variant does not compile until listed);
   `crates/nzbd/tests/docs_index.rs` (index lists every doc; every relative
   link in `docs/` and `README.md` resolves).
+- **Rolling-upgrade read for M6b:** `JobStatus::Paused` deserializes
+  `"held"` (`#[serde(alias = "held")]`), so a node on this release reads the
+  persisted `held` status an M6b node writes as today's representation
+  (`Paused` + `control.lifecycle == "held"`). M6b therefore needs every node
+  on **0.5.0 (M6a)**, not merely M1a: an M1a/M3 node cannot decode `held`.
 - **Found doing it:** the web job detail read `post_timing`, `url_fetch` and
   `failed_cleanup` under camelCase keys the API never sends, so none of the
   three lines ever rendered; fixed, asserted in the UI DOM harness. An
