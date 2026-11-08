@@ -203,6 +203,11 @@ fast-check-rust: ## Reviewed merge candidate: compile/lint Rust and run bounded 
 	$(CARGO) test --locked -p nzbd-cluster --lib
 	$(CARGO) test --locked -p nzbd-cluster --test cluster_e2e -- --test-threads=1
 
+.PHONY: fast-check-docs
+fast-check-docs: ## Docs contract: the doc index/links and INTEGRATION.md event tables against the code
+	$(CARGO) test --locked -p nzbd --test docs_index
+	$(CARGO) test --locked -p nzbd-api --lib integration_doc_names_every_sse_event
+
 .PHONY: fast-check-torrent
 fast-check-torrent: ## Reviewed torrent changes: bounded transfer, recovery, and release-dispatch checks
 	@status=0; \
