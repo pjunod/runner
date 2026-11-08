@@ -650,3 +650,45 @@ of table-blob reads, equality with the current full-artifact custody fields,
 missing/stale generations, and updates to state/ownership/Keep metadata.
 After review, CI and deployment, repeat the owner-latency trace and sustained
 one-slot download measurements. The 109 MiB/s runtime gate remains open.
+
+## 12. Follow-up — malformed BODY frames stalled every provider connection
+
+After the custody batching rollout, a 20-second probe measured only 12.2 ms
+of custody refresh work. A later hard stall was a distinct transport failure.
+A passive probe of the running downloader observed 30 successful greeting,
+USER, PASS and BODY responses (`200`, `381`, `281`, `222`), ruling out a
+provider authentication failure. Separate extra-connection login tests received
+`502` / “too many” because the normal pool already held its connection quota;
+those extra probes are not evidence that the downloader failed authentication.
+
+A decoder probe then captured 30 actual `Malformed("bad =ypart range")` errors.
+Every failing wire chunk was 128–256 bytes and already ended with the NNTP
+dot/CRLF terminator. Input registers and result representation were verified
+against the exact running ELF disassembly; this is not an assumed Rust enum
+layout or a sampled descriptor-number classification. No article contents or
+credentials were recorded.
+
+The decode-error branch consumed the entire buffered chunk and then called
+`drain_body` with a fresh terminator scanner. It had discarded the terminator
+it was about to wait for, and could also discard the next pipelined response.
+The resulting read timeout incorrectly turned an article-level validation
+failure into a connection failure. All 30 connections repeated this cycle
+instead of advancing past malformed articles. The branch dates to July 17
+(`2f45cd5`), so it is an older defect exposed by the current article data,
+separate from the later durability and receipt-refresh changes.
+
+The correction gives transport framing its own persistent `TerminatorScanner`
+across every BODY chunk. Only bytes through the current article's terminator
+reach the decoder or are consumed from the connection. After a decoder error,
+the same scanner discards the rest of that article, then reports one ordinary
+article failure. The next pipelined response remains buffered. Invalid ranges,
+CRC failures, expected lengths and durable writer acknowledgements stay
+enforced; no invalid article is accepted to improve throughput.
+
+Regression coverage must include the observed malformed part range, a plain
+text stub, a malformed article followed by a valid pipelined response in the
+same write, and terminators fragmented across every boundary with dot-stuffed
+content. Capture the pre-fix timeout, then verify prompt article rejection and
+valid successor bytes without a connection failure. The production 0.4
+backport and current-main PR integration need separate source/hash receipts.
+The one-active-download 109 MiB/s acceptance gate remains open.
