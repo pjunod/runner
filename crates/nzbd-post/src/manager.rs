@@ -425,17 +425,13 @@ async fn manager_task(
     let mut rescan = tokio::time::interval(RESCAN_INTERVAL);
     rescan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // Each failed job's follow-up attempts and when it last tried, for the
-    // disposal backoff (`failed_cleanup_retry_delay`).
-    let mut last_disposition: HashMap<JobId, (u32, tokio::time::Instant)> = HashMap::new();
-
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = rescan.tick() => {
                 scan_queue(
                     &tracker, &engine, &cfg, &history, &dest_dir, &gate, &sem,
-                    &cancel, &finished_tx, &mut active, &mut last_disposition,
+                    &cancel, &finished_tx, &mut active,
                 ).await;
             }
             ev = rx.recv() => match ev {
@@ -483,7 +479,7 @@ async fn manager_task(
                     if claim(&gate, job) =>
                 {
                     if failure_followup(
-                        &engine, &cfg, &dest_dir, &gate, job, &mut last_disposition, true,
+                        &engine, &cfg, &dest_dir, &gate, job, true,
                     )
                     .await
                         && gate.is_none()
@@ -493,7 +489,6 @@ async fn manager_task(
                         // row's history is final, retire it now.
                         if reconcile_stamped_completion(&engine, &history, job).await.is_ok() {
                             let _ = engine.remove_job_silent(job).await;
-                            last_disposition.remove(&job);
                         }
                     }
                 }
@@ -522,7 +517,7 @@ async fn manager_task(
                     let settled = terminal.disposal.is_some()
                         || (claim(&gate, job)
                             && failure_followup(
-                                &engine, &cfg, &dest_dir, &gate, job, &mut last_disposition, true,
+                                &engine, &cfg, &dest_dir, &gate, job, true,
                             )
                             .await);
                     if settled
@@ -530,7 +525,6 @@ async fn manager_task(
                         && reconcile_stamped_completion(&engine, &history, job).await.is_ok()
                     {
                         let _ = engine.remove_job_silent(job).await;
-                        last_disposition.remove(&job);
                     }
                 }
                 if let Some(from) = pending_restarts.remove(&job) {
@@ -563,8 +557,7 @@ async fn manager_task(
                         // owed salvage/disposal immediately.
                         Ok(Some(row)) if row.status == JobStatus::Failed => {
                             if failure_followup(
-                                &engine, &cfg, &dest_dir, &gate, job,
-                                &mut last_disposition, true,
+                                &engine, &cfg, &dest_dir, &gate, job, true,
                             ).await {
                                 Ok(())
                             } else {
@@ -691,7 +684,6 @@ async fn failure_followup(
     dest_dir: &Path,
     gate: &PpGate,
     job: JobId,
-    backoff: &mut HashMap<JobId, (u32, tokio::time::Instant)>,
     force: bool,
 ) -> bool {
     if gate.as_ref().is_some_and(|claim| !claim(job)) {
@@ -706,12 +698,18 @@ async fn failure_followup(
     if terminal.disposal.is_some() {
         return true;
     }
-    if !force
-        && backoff.get(&job).is_some_and(|(attempts, at)| {
-            at.elapsed() < Duration::from_secs(failed_cleanup_retry_delay(*attempts) as u64)
-        })
-    {
-        return false;
+    // Review #280-7: the retry ladder is the disposal operation's own
+    // (durable, visible on the artifact); nothing here keeps a second one.
+    if !force {
+        let inventory = engine.artifacts();
+        let retry_at = tokio::task::spawn_blocking(move || inventory.disposal_retry_at(job.0))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten();
+        if retry_at.is_some_and(|at| at > now()) {
+            return false;
+        }
     }
     let Some(row) = engine.export_job(job).await.ok().flatten() else {
         // The queue row is gone (an operator delete, which owns its bytes):
@@ -750,6 +748,35 @@ async fn failure_followup(
             terminal = reloaded;
         }
     }
+    // Review #280-7: what salvage found is the source's assessment from here
+    // on — published or nothing usable makes the remainder redundant; an
+    // assessment that failed leaves it unknown (retained).
+    let assessment = match (terminal.salvage, terminal.salvage_error.is_some()) {
+        (nzbd_state::artifacts::SalvageState::Published, _) => Some((
+            "unusable",
+            "verified payload was published as salvage; the remainder is redundant",
+        )),
+        (nzbd_state::artifacts::SalvageState::SettledNone, false) => Some((
+            "unusable",
+            "bounded post-failure assessment found no usable payload or repairable input",
+        )),
+        _ => None,
+    };
+    if let Some((disposition, reason)) = assessment {
+        let inventory = engine.artifacts();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(source) = inventory.job_source(job.0)? {
+                inventory.set_failure_assessment(
+                    &source.id,
+                    &source.generation,
+                    disposition,
+                    reason,
+                )?;
+            }
+            Ok::<_, nzbd_state::artifacts::Error>(())
+        })
+        .await;
+    }
     let done = if terminal.salvage == nzbd_state::artifacts::SalvageState::Pending {
         false
     } else {
@@ -757,15 +784,6 @@ async fn failure_followup(
     };
     if let Err(error) = engine.end_post_admission(admission).await {
         tracing::warn!(job = job.0, %error, "failed-job follow-up custody release remains pending");
-    }
-    if done {
-        backoff.remove(&job);
-    } else {
-        let attempts = backoff.get(&job).map_or(0, |(attempts, _)| *attempts);
-        backoff.insert(
-            job,
-            (attempts.saturating_add(1), tokio::time::Instant::now()),
-        );
     }
     done
 }
@@ -783,7 +801,6 @@ async fn fail_and_follow_up(
     job: JobId,
     _name: String,
     _health: u16,
-    backoff: &mut HashMap<JobId, (u32, tokio::time::Instant)>,
     _force: bool,
 ) -> bool {
     if let Ok(Some(row)) = engine.export_job(job).await {
@@ -800,7 +817,7 @@ async fn fail_and_follow_up(
                 .await;
         }
     }
-    failure_followup(engine, cfg, dest_dir, gate, job, backoff, true).await
+    failure_followup(engine, cfg, dest_dir, gate, job, true).await
 }
 
 /// Run a failed job's salvage and disposal now (contract §2.2/§2.6), as
@@ -812,7 +829,7 @@ pub async fn follow_up_failure(
     dest_dir: &Path,
     job: JobId,
 ) -> bool {
-    failure_followup(engine, cfg, dest_dir, &None, job, &mut HashMap::new(), true).await
+    failure_followup(engine, cfg, dest_dir, &None, job, true).await
 }
 
 async fn load_terminal(
@@ -1072,6 +1089,17 @@ async fn dispose_failed_source(
             Err(_) => false,
         };
     }
+    // Review #280-7 (the pre-v2 "recoverable/unknown → retain" rule): a
+    // source whose salvage could not be assessed is never deleted on the
+    // default policy — it is parked for recovery instead.
+    let action = if action == FailureAction::Delete
+        && terminal.salvage == nzbd_state::artifacts::SalvageState::SettledNone
+        && terminal.salvage_error.is_some()
+    {
+        FailureAction::Park
+    } else {
+        action
+    };
     let mut failure_cfg = cfg.clone();
     failure_cfg.failure_action = action;
     if gate.as_ref().is_some_and(|claim| !claim(job)) {
@@ -1104,7 +1132,7 @@ async fn dispose_failed_source(
             ));
         }
         tracing::warn!(job = job.0, outcome = %observed.note,
-            "failed-source disposition is incomplete; retrying on its backoff");
+            "failed-source disposition is incomplete; its operation retries on its own ladder");
         return false;
     };
     if let Some(path) = disposition.files_at.as_deref() {
@@ -1592,7 +1620,6 @@ async fn scan_queue(
     cancel: &CancellationToken,
     finished: &tokio::sync::mpsc::UnboundedSender<JobId>,
     active: &mut HashMap<JobId, ActiveAttempt>,
-    last_disposition: &mut HashMap<JobId, (u32, tokio::time::Instant)>,
 ) {
     let claim = |job: JobId| gate.as_ref().map(|f| f(job)).unwrap_or(true);
     let inventory = engine.artifacts();
@@ -1600,7 +1627,9 @@ async fn scan_queue(
     // Salvage and disposal are driven from `job_terminals`, not from queue
     // status (contract §2.6): a terminal whose queue row is already gone
     // still settles its obligations.
-    if gate.is_none() {
+    // Review #280-6: in cluster mode too — each owed terminal is followed up
+    // only by the node whose gate claims the job, so exactly one disposes.
+    {
         let queued = snapshot
             .jobs
             .iter()
@@ -1616,9 +1645,8 @@ async fn scan_queue(
         if let Ok(Ok(owed)) = owed {
             for terminal in owed {
                 let job = JobId(terminal.job);
-                if !queued.contains(&job) {
-                    failure_followup(engine, cfg, dest_dir, gate, job, last_disposition, false)
-                        .await;
+                if !queued.contains(&job) && claim(job) {
+                    failure_followup(engine, cfg, dest_dir, gate, job, false).await;
                 }
             }
         }
@@ -1650,17 +1678,7 @@ async fn scan_queue(
                 None => true, // stamped before job_terminals existed
                 Some(t) if !t.emitted => false,
                 Some(t) if t.outcome == nzbd_types::TerminalOutcome::Failed => {
-                    claim(j.id)
-                        && failure_followup(
-                            engine,
-                            cfg,
-                            dest_dir,
-                            gate,
-                            j.id,
-                            last_disposition,
-                            false,
-                        )
-                        .await
+                    claim(j.id) && failure_followup(engine, cfg, dest_dir, gate, j.id, false).await
                 }
                 Some(_) => finish_stamped_delivery(engine, j.id).await,
             };
@@ -1672,7 +1690,6 @@ async fn scan_queue(
                 continue;
             }
             let _ = engine.remove_job_silent(j.id).await;
-            last_disposition.remove(&j.id);
             if let Some(attempt) = active.remove(&j.id) {
                 attempt.cancel.cancel();
             }
@@ -2370,13 +2387,6 @@ fn set_param(params: &mut Vec<(String, String)>, key: &str, value: String) {
     } else {
         params.push((key.to_owned(), value));
     }
-}
-
-fn failed_cleanup_retry_delay(attempt: u32) -> i64 {
-    let index = attempt
-        .saturating_sub(1)
-        .min((nzbd_types::HOLD_RETRY_DELAYS_SECONDS.len() - 1) as u32);
-    nzbd_types::HOLD_RETRY_DELAYS_SECONDS[index as usize]
 }
 
 /// Evidence for quick verification straight from the engine's export,
@@ -3707,6 +3717,27 @@ async fn process_job_ctx_from_inner(
         record_deobfuscation(&mut fin.params, &deobfuscated);
         fin.params.extend(script_receipts);
         let (reason, stage, message) = pp_failure(outcome, unusable_source_reason.as_deref());
+        // Review #280-7: the failed source's assessment (`recoverable` /
+        // `unusable`) is what the file lifecycle (Keep-off disposal), the
+        // cluster's raw-copy cleanup and disposal below read to decide
+        // whether these bytes are redundant. It is recorded here, with the
+        // terminal, as before v2 — only the disposal that follows moved.
+        if job.lifecycle_eligible() {
+            if let Err(error) = record_failure_assessment(
+                engine,
+                &job,
+                &consumed_archive_paths,
+                &verified_payload_paths,
+                &terminal_unusable_archive_paths,
+                &password_required_archive_paths,
+                &probed_payload_paths,
+                assessed_inputs.as_ref(),
+            )
+            .await
+            {
+                tracing::warn!(job = job_id.0, %error, "failed-source assessment not recorded; disposal treats the source as unknown");
+            }
+        }
         if !ctx.publish_history {
             // A cluster worker reports the outcome to the leader, which owns
             // the terminal record and history.
@@ -4204,6 +4235,67 @@ fn record_deobfuscation(params: &mut Vec<(String, String)>, deobfuscated: &[(Pat
         list.push_str("; …");
     }
     params.push(("Deobfuscate:Files".into(), list));
+}
+
+/// Record whether a failed attempt's source still holds usable payload
+/// (`recoverable`: a verified sibling or a repairable input) or nothing
+/// (`unusable`), for the lifecycle, cluster cleanup and disposal.
+#[allow(clippy::too_many_arguments)]
+async fn record_failure_assessment(
+    engine: &EngineHandle,
+    job: &Job,
+    consumed: &std::collections::HashSet<String>,
+    verified: &std::collections::HashSet<String>,
+    terminal_unusable: &std::collections::HashSet<String>,
+    password_required: &std::collections::HashSet<String>,
+    probed: &std::collections::HashSet<String>,
+    assessed: Option<&std::collections::HashMap<String, FileAssessment>>,
+) -> Result<(), PostError> {
+    let inventory = engine.artifacts();
+    let Some(source) = inventory.for_job(job.id.0)? else {
+        return Ok(());
+    };
+    let mut diagnostics = match assessed {
+        Some(diagnostics) => diagnostics.clone(),
+        None => {
+            publication_diagnostics(job, &source, consumed, verified, terminal_unusable, probed)?
+        }
+    };
+    for path in password_required {
+        diagnostics.insert(
+            path.clone(),
+            FileAssessment::Repairable(
+                "archive requires a password; set *Unpack:Password and retry extraction".into(),
+            ),
+        );
+    }
+    let (selected, outcomes) = select_delivery_payload(
+        &source.files,
+        consumed,
+        verified,
+        terminal_unusable,
+        &diagnostics,
+        probed,
+    );
+    let recovery = recovery_reason(&outcomes);
+    let usable = !selected.is_empty() || recovery.is_some();
+    let mut reason = recovery.unwrap_or_else(|| {
+        if usable {
+            "verified sibling payload remains available for publication".into()
+        } else {
+            "bounded post-failure assessment found no usable payload or repairable input".into()
+        }
+    });
+    while reason.len() > 2048 {
+        reason.pop();
+    }
+    inventory.set_failure_assessment(
+        &source.id,
+        &source.generation,
+        if usable { "recoverable" } else { "unusable" },
+        &reason,
+    )?;
+    Ok(())
 }
 
 /// Contract §2.2: the typed reason, stage and message for a PP outcome.
@@ -7122,7 +7214,6 @@ mod decision_tests {
             JobId(41),
             "Some.Release".into(),
             0,
-            &mut HashMap::new(),
             false,
         )
         .await;
@@ -7469,7 +7560,6 @@ mod decision_tests {
             request.id,
             request.name.clone(),
             100,
-            &mut HashMap::new(),
             false,
         )
         .await;
@@ -8656,7 +8746,6 @@ mod decision_tests {
                 .into_owned(),
             ..PostConfig::default()
         };
-        let mut last_disposition = HashMap::new();
         fail_and_follow_up(
             &engine,
             &cfg,
@@ -8666,7 +8755,6 @@ mod decision_tests {
             JobId(41),
             "failed-archive-pack".into(),
             0,
-            &mut last_disposition,
             false,
         )
         .await;
@@ -8690,7 +8778,6 @@ mod decision_tests {
             JobId(41),
             "failed-archive-pack".into(),
             0,
-            &mut last_disposition,
             false,
         )
         .await;
@@ -9608,7 +9695,6 @@ mod decision_tests {
             request.id,
             request.name.clone(),
             0,
-            &mut HashMap::new(),
             false,
         )
         .await;
@@ -10007,18 +10093,7 @@ mod decision_tests {
             |(key, value)| key == "Failure:Message" && value.contains("no publishable payload")
         ));
         // `failure_action` is delete; publish parks anyway.
-        assert!(
-            failure_followup(
-                &engine,
-                &cfg,
-                &downloads,
-                &None,
-                JobId(41),
-                &mut HashMap::new(),
-                true,
-            )
-            .await
-        );
+        assert!(failure_followup(&engine, &cfg, &downloads, &None, JobId(41), true,).await);
         let disposal = inventory.terminal(41).unwrap().unwrap().disposal.unwrap();
         assert!(!source.exists(), "{disposal}");
         assert!(disposal.starts_with("parked at "), "{disposal}");

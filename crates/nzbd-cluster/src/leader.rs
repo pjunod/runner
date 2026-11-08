@@ -3010,13 +3010,72 @@ async fn record_pp_history(
     let Some(history) = &s.history else {
         return Ok(());
     };
+    // Contract §2.1 (review #280-6): a worker's post-processing result is the
+    // job's terminal, recorded by the leader — which owns the shared history
+    // and the event stream — through the same chain as every other
+    // terminal: the `job_terminals` row with its salvage obligation, the
+    // history row, the queue stamp and `job_pp_finished`. Idempotent: a
+    // replay returns the stored row.
     let entry = pp_history_entry(job, accepted_at_ms, final_path);
-    let history = history.clone();
-    tokio::task::spawn_blocking(move || history.record_seq(&entry))
+    let mut stamped = job.clone();
+    if !stamped
+        .params
+        .iter()
+        .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+    {
+        stamped
+            .params
+            .push((nzbd_types::PP_DONE_PARAM.into(), entry.status.clone()));
+    }
+    let publication = cluster_publication(&stamped, entry.final_dir.as_deref());
+    let terminal = nzbd_engine::terminal::terminal_from_stamped(&stamped, entry, publication)
+        .ok_or_else(|| "post-processing result carries no terminal stamp".to_string())?;
+    match s
+        .engine
+        .record_terminal_in(terminal, Some(history.clone()))
         .await
-        .map_err(|error| format!("history recovery task failed: {error}"))?
-        .map_err(|error| error.to_string())?;
-    Ok(())
+    {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err("the terminal record is not durable yet".into()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// The `publication` of a remotely completed job: its Delivery's when one
+/// was attached, else the materialized final directory.
+fn cluster_publication(
+    job: &nzbd_types::Job,
+    final_dir: Option<&str>,
+) -> Option<nzbd_types::Publication> {
+    let param = |key: &str| {
+        job.params
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+    };
+    let path = param("Delivery:Path").or_else(|| final_dir.map(str::to_string))?;
+    let cross_volume = {
+        use std::os::unix::fs::MetadataExt;
+        // The immutable worker generation the publication was materialized from.
+        let original = param("*Cluster:result-ref");
+        matches!(
+            (std::fs::metadata(&path), original.map(std::fs::metadata)),
+            (Ok(a), Some(Ok(b))) if a.dev() != b.dev()
+        )
+    };
+    Some(nzbd_types::Publication {
+        path,
+        generation: param("Delivery:Generation").unwrap_or_default(),
+        manifest_digest: param("Delivery:ManifestDigest").unwrap_or_default(),
+        files: job
+            .files
+            .iter()
+            .filter(|file| file.finalized)
+            .count()
+            .try_into()
+            .unwrap_or(u32::MAX),
+        cross_volume,
+    })
 }
 
 async fn sweep_expired(s: &Arc<LeaderShared>) {
@@ -3151,6 +3210,25 @@ async fn schedule(s: &Arc<LeaderShared>) {
             && matches!(j.status, JobStatus::Completed | JobStatus::Failed)
             && durable_status.get(&j.id) == Some(&j.status)
         {
+            // Contract §2.6 (review #280-6): a row whose terminal is not yet
+            // out, or whose failed terminal still owes salvage or disposal,
+            // stays queued — salvage and disposal read it.
+            let inventory = s.engine.artifacts();
+            let id = j.id.0;
+            let settled = tokio::task::spawn_blocking(move || match inventory.terminal(id) {
+                Ok(None) => true, // stamped before job_terminals existed
+                Ok(Some(terminal)) => {
+                    terminal.emitted
+                        && (terminal.outcome != nzbd_types::TerminalOutcome::Failed
+                            || terminal.disposal.is_some())
+                }
+                Err(_) => false,
+            })
+            .await
+            .unwrap_or(false);
+            if !settled {
+                continue;
+            }
             let Some(checked) = checked_schedule_job(s, j).await else {
                 continue;
             };

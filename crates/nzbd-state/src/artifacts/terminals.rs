@@ -432,6 +432,34 @@ impl Inventory {
         TERMINAL_CRASHES.lock().unwrap().insert(job, after.key());
     }
 
+    /// The job's source artifact by role (see `set_artifact_salvage`): a
+    /// salvage delivery's `sourceArtifactId`, else the job's row that is not
+    /// a publication.
+    pub fn job_source(&self, job: u32) -> Result<Option<super::Artifact>> {
+        let raw: Option<String> = self.db.lock().unwrap().query_row(
+            "SELECT data FROM artifacts WHERE id=COALESCE(
+                (SELECT json_extract(d.data,'$.sourceArtifactId') FROM deliveries d JOIN artifacts p ON p.id=d.artifact WHERE p.job=?1 ORDER BY d.sequence DESC LIMIT 1),
+                (SELECT a.id FROM artifacts a WHERE a.job=?1 AND json_extract(a.data,'$.state')<>'transferred' AND a.id NOT IN (SELECT artifact FROM deliveries) ORDER BY a.updated_at DESC LIMIT 1))",
+            [job],
+            |row| row.get(0),
+        ).optional()?;
+        Ok(raw.map(|raw| serde_json::from_str(&raw)).transpose()?)
+    }
+
+    /// Review #280-7: when the job's failed-source disposal may next run.
+    /// Disposal is an inventory `delete` (or a park `relocate`) operation
+    /// whose own attempts / `next_retry` ladder is durable and listed with
+    /// the artifact (`/api/v1/artifacts`); this is the latest such retry
+    /// still pending for any of the job's artifacts, if one is.
+    pub fn disposal_retry_at(&self, job: u32) -> Result<Option<i64>> {
+        let db = self.db.lock().unwrap();
+        Ok(db.query_row(
+            "SELECT MAX(json_extract(o.data,'$.next_retry')) FROM operations o JOIN artifacts a ON a.id=o.artifact WHERE a.job=?1 AND o.state NOT IN ('succeeded','cancelled') AND json_extract(o.data,'$.kind') IN ('delete','relocate') AND json_extract(o.data,'$.next_retry')>0",
+            [job],
+            |row| row.get::<_, Option<i64>>(0),
+        )?)
+    }
+
     /// Test support: the next `record_terminal` for `job` fails before the
     /// row is written, as a refused write would.
     #[cfg(feature = "test-support")]

@@ -236,6 +236,68 @@ pub fn terminal_from_job(
     }
 }
 
+/// The terminal a row already stamped elsewhere describes — a cluster
+/// worker's post-processing result arriving at the leader (contract §2.1:
+/// the leader, which owns the shared history and the event stream, records
+/// it through the same chain). Outcome, reason and stage come from the
+/// row's own `*PP:done` / `Failure:*` markers; `None` for a row that is not
+/// stamped or a cancelled one.
+pub fn terminal_from_stamped(
+    job: &Job,
+    entry: nzbd_state::HistoryEntry,
+    publication: Option<Publication>,
+) -> Option<JobTerminal> {
+    let param = |key: &str| {
+        job.params
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+    };
+    let status = param(PP_DONE_PARAM)?;
+    let success = status.starts_with("SUCCESS");
+    let reason = (!success).then(|| {
+        param("Failure:Reason")
+            .as_deref()
+            .and_then(FailureReason::parse)
+            .or_else(|| reason_for_status(&status))
+            .unwrap_or(FailureReason::Publish)
+    });
+    let fetch_cause = param("Failure:FetchCause")
+        .as_deref()
+        .and_then(FetchCause::parse)
+        .filter(|_| reason == Some(FailureReason::Fetch));
+    let mut terminal = terminal_from_job(
+        job,
+        if success {
+            TerminalOutcome::Completed
+        } else {
+            TerminalOutcome::Failed
+        },
+        &status,
+        entry.final_dir.clone(),
+        Vec::new(),
+        TerminalFacts {
+            reason,
+            fetch_cause,
+            stage: (!success).then(|| param("Failure:Stage")).flatten(),
+            message: (!success)
+                .then(|| param("Failure:Message"))
+                .flatten()
+                .map(|message| bounded(&message)),
+            blames_release: reason.is_some_and(|reason| reason.blames_release(fetch_cause)),
+            salvage: match reason {
+                Some(reason) if salvage_owed(job, reason) => SalvageState::Pending,
+                _ => SalvageState::None,
+            },
+            keep_on_failure: keeps_failed_source(job),
+            publication: if success { publication } else { None },
+        },
+        entry.completed_at_unix,
+    );
+    terminal.entry = entry;
+    Some(terminal)
+}
+
 /// Why a terminal step did not land.
 #[derive(Debug)]
 pub enum TerminalError {

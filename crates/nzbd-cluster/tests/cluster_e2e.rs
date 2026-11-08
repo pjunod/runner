@@ -1772,7 +1772,9 @@ async fn delivery_receipts_survive_authority_restart_and_consumer_removed_public
                 &format!("/api/v1/deliveries/{id}"),
                 b"",
             );
-            code == 200 && body.contains("curator-accepted-cluster")
+            // Contract v2: accept is a no-op, so the replayed row carries no
+            // consumer receipt; recovery is the row answering unchanged.
+            code == 200 && body.contains("deliveryId")
         },
     )
     .await;
@@ -2198,7 +2200,9 @@ async fn delivery_receipts_and_copy_acks_survive_actual_majority_authority_chang
                 &format!("/api/v1/deliveries/{id}"),
                 b"",
             );
-            code == 200 && body.contains("curator-accepted-cluster")
+            // Contract v2: accept is a no-op, so the replayed row carries no
+            // consumer receipt; recovery is the row answering unchanged.
+            code == 200 && body.contains("deliveryId")
         },
     )
     .await;
@@ -2221,7 +2225,10 @@ async fn delivery_receipts_and_copy_acks_survive_actual_majority_authority_chang
         !path.exists(),
         "replay must not republish a consumer-removed path"
     );
-    assert_eq!(replay["consumerReceiptId"], "curator-accepted-cluster");
+    assert!(
+        replay["consumerReceiptId"].is_null(),
+        "accept records nothing"
+    );
     assert_eq!(replay["sourceCleanup"]["status"], "succeeded");
     assert!(replay["sourceCopies"]
         .as_array()
