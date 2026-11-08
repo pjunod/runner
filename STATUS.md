@@ -2,7 +2,7 @@
 
 ## Pipeline contract v2 M6a — one clock per job, errno not text, docs from the contract — 2026-11-08
 
-**Status:** draft PR (#PR) on `claude/pipeline-v2-m6a-runner` (runner 0.5.0),
+**Status:** draft PR [#296](https://github.com/pjunod/runner/pull/296) on `claude/pipeline-v2-m6a-runner` (runner 0.5.0),
 base `main` (M3 #283 merged in). Not reviewed, not merged, not deployed.
 Safe to merge right after M3: no wire field is removed and nothing persisted
 changes shape. Plan: `IMPL_RUNNER.md` §8 / `PIPELINE_REWRITE_PLAN.md` M6.
