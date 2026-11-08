@@ -1128,7 +1128,7 @@ impl Inventory {
                 return Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        "publication unwound after restart; source incomplete: {}",
+                        "publication unwound: {}",
                         unwound.evidence.unwrap_or_default()
                     ),
                 )));
@@ -3462,6 +3462,22 @@ impl Inventory {
             .reserve_reconciliation_locked(std::slice::from_ref(&source), None, &guard)?
             .ok_or_else(|| Error::Conflict("relocation custody is already active".into()))?;
         drop(guard);
+        if let Some(intent) = movement.intent.as_deref() {
+            // Contract §2.5 per-file move (review #283-4): abandoning it
+            // unwinds the journaled move under the same single flight as
+            // restart reconciliation.
+            if !self.relocation_active.lock().unwrap().insert(op.id.clone()) {
+                return Err(Error::Conflict(
+                    "relocation custody is already active".into(),
+                ));
+            }
+            let _flight = RelocationLease {
+                inventory: self,
+                id: op.id.clone(),
+            };
+            self.abandon_intent(intent)?;
+            return self.get(&op.artifact);
+        }
         let baseline = source.clone();
         let root = self.verify(&source)?;
         let actual_files = fs::manifest(&root, 100_000)?;

@@ -1162,11 +1162,69 @@ impl Inventory {
                         op.state = "review".into();
                     }
                     op.error = Some(format!("publication intent: {error}"));
-                    save_operation(&self.db.lock().unwrap(), &op)?;
+                    // Review #283-4: the reason is on the artifact too, where
+                    // Files and Attention show it beside the abandon action.
+                    let mut current = self.get(&source.id)?;
+                    current.error = op.error.clone();
+                    current.updated_at = now();
+                    let mut db = self.db.lock().unwrap();
+                    let tx = db.transaction()?;
+                    save_operation(&tx, &op)?;
+                    save_artifact(&tx, &current)?;
+                    tx.commit()?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Review #283-4: the operator's exit for a publication move stuck in
+    /// review or on its retry ladder. The move is unwound (source retained,
+    /// complete); where it cannot be put back safely (the unwind refuses),
+    /// it is closed without deleting anything — the files stay where they
+    /// are and the target directory is registered for review. The job's
+    /// next publication attempt fails `io` and parks the source.
+    pub(super) fn abandon_intent(&self, generation: &str) -> Result<()> {
+        let mut intent = self
+            .relocation_intent(generation)?
+            .filter(|intent| intent.state.is_open())
+            .ok_or_else(|| Error::Conflict("the publication move is not open".into()))?;
+        if let Ok(target_root) = fs::open_dir(&intent.target_dir) {
+            if read_manifest(&target_root)?.is_some() {
+                return Err(Error::Conflict(
+                    "the publication committed (its manifest is written); reconcile the move instead"
+                        .into(),
+                ));
+            }
+        }
+        let abandoned = "operator abandoned the publication; source retained";
+        intent.evidence = Some(match intent.evidence.take() {
+            Some(earlier) => format!("{abandoned} (earlier: {earlier})"),
+            None => abandoned.into(),
+        });
+        intent.state = IntentState::Unwinding;
+        {
+            let _guard = self.mutation_guard()?;
+            update_intent(&self.db.lock().unwrap(), &intent)?;
+        }
+        match self.unwind_intent(intent.clone()) {
+            Ok(()) => Ok(()),
+            Err(Error::Conflict(why)) => {
+                let source_root = fs::open_dir(&intent.source_dir)?;
+                if intent.target_dir.symlink_metadata().is_ok() {
+                    if let Some(parent) = intent.target_dir.parent() {
+                        self.discover_unlocked(parent, &intent.target_dir)?;
+                    }
+                }
+                intent.evidence = Some(format!(
+                    "{}; not put back ({why}); {} retained for review",
+                    intent.evidence.as_deref().unwrap_or(abandoned),
+                    intent.target_dir.display()
+                ));
+                self.close_unwound_intent(intent, &source_root)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Close an intent nothing in the inventory owns any more: no file is
@@ -1361,7 +1419,26 @@ impl Inventory {
             update_intent(&self.db.lock().unwrap(), &intent)?;
         }
         let source_root = fs::open_dir(&intent.source_dir)?;
-        if let Ok(target_root) = fs::open_dir(&intent.target_dir) {
+        let target = match fs::open_dir(&intent.target_dir) {
+            Ok(target_root) => Some(target_root),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A renamed file left the source; with the publication
+                // directory gone it is not where the journal says.
+                if let Some(file) = intent
+                    .files
+                    .iter()
+                    .find(|file| file.moved && !intent.cross_volume && !file.keep_source)
+                {
+                    return Err(Error::Conflict(format!(
+                        "cannot unwind {}: the publication directory is gone; retained for review",
+                        file.dst
+                    )));
+                }
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(target_root) = target {
             for file in &intent.files {
                 let parent = match relative_dir(&target_root, parent_of(&file.dst)) {
                     Ok(parent) => parent,
@@ -1474,6 +1551,12 @@ impl Inventory {
             )?;
             fs::sync_directory(&parent)?;
         }
+        self.close_unwound_intent(intent, &source_root)
+    }
+
+    /// Record an unwound intent: the source is runner's again, the
+    /// operation cancelled, the evidence on the artifact and its events.
+    fn close_unwound_intent(&self, mut intent: RelocationIntent, source_root: &File) -> Result<()> {
         let evidence = intent
             .evidence
             .clone()
@@ -1492,7 +1575,7 @@ impl Inventory {
                 current.state = "active".into();
             }
             current.error = Some(format!("publication unwound: {evidence}"));
-            current.files = fs::manifest(&source_root, 100_000)?;
+            current.files = fs::manifest(source_root, 100_000)?;
             current.revision += 1;
             current.updated_at = now();
             save_artifact(&tx, &current)?;
@@ -2029,6 +2112,118 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Review #283-4: the operator's exit for a stuck publication move.
+    /// Abandoning unwinds it (source complete and retained, the move
+    /// cancelled, the artifact says why); the job's next publication
+    /// attempt is an I/O failure naming the abandonment.
+    #[test]
+    fn operator_abandon_unwinds_a_stuck_publication() {
+        let base = tempfile::tempdir().unwrap();
+        let (db, root) = fixture_in(base.path());
+        let (source, selected, outcomes) = job(&db, &root, 77, SELECTED, SIBLINGS);
+        let completed = base.path().join("completed");
+        std::fs::create_dir(&completed).unwrap();
+        let target = completed.join("release.job-77.runner-g");
+        super::super::relocation::FAULTS
+            .with(|faults| faults.borrow_mut().insert("after_first_rename", libc::EIO));
+        assert!(db
+            .publish_selected_with_transfer(
+                77,
+                &target,
+                selected.clone(),
+                outcomes.clone(),
+                None,
+                true,
+                &|| Ok(())
+            )
+            .is_err());
+        let artifact = db.for_job(77).unwrap().unwrap();
+        let intent = db.relocation_intent(&artifact.generation).unwrap().unwrap();
+        let mut op = db.operation(&intent.operation).unwrap();
+        op.state = "review".into();
+        save_operation(&db.db.lock().unwrap(), &op).unwrap();
+        let abandoned = db
+            .abandon_relocation(&op.id, artifact.revision, &artifact.generation)
+            .unwrap();
+        assert!(abandoned
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("operator abandoned the publication"));
+        assert_eq!(abandoned.state, "active");
+        let intent = db.relocation_intent(&artifact.generation).unwrap().unwrap();
+        assert_eq!(intent.state, IntentState::Unwound);
+        assert_eq!(db.operation(&op.id).unwrap().state, "cancelled");
+        assert!(!target.exists());
+        for (path, bytes) in SELECTED.iter().chain(SIBLINGS) {
+            assert_eq!(std::fs::read(source.join(path)).unwrap(), *bytes, "{path}");
+        }
+        let error = db
+            .publish_selected_with_transfer(77, &target, selected, outcomes, None, true, &|| Ok(()))
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::Io(io) if io.to_string().contains("operator abandoned")),
+            "{error}"
+        );
+    }
+
+    /// Review #283-4: where the move cannot be put back safely, abandoning
+    /// closes it without deleting anything: the publication directory is
+    /// registered for review, the artifact carries the refusal (mirrored
+    /// from its operation while it was stuck).
+    #[test]
+    fn operator_abandon_closes_a_move_that_cannot_be_put_back() {
+        let base = tempfile::tempdir().unwrap();
+        let (db, root) = fixture_in(base.path());
+        let files: &[(&str, &[u8])] = &[("a.mkv", b"repair input"), ("b.mkv", b"plain")];
+        let (source, selected, mut outcomes) = job(&db, &root, 78, files, &[]);
+        outcomes
+            .iter_mut()
+            .find(|outcome| outcome.source_path == "a.mkv")
+            .unwrap()
+            .repair_dependency = true;
+        let completed = base.path().join("completed");
+        std::fs::create_dir(&completed).unwrap();
+        let target = completed.join("release.job-78.runner-g");
+        super::super::relocation::FAULTS
+            .with(|faults| faults.borrow_mut().insert("after_first_rename", libc::EIO));
+        assert!(db
+            .publish_selected_with_transfer(78, &target, selected, outcomes, None, true, &|| Ok(()))
+            .is_err());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(source.join("b.mkv"), b"changed").unwrap();
+        std::fs::remove_file(source.join("a.mkv")).unwrap();
+        std::fs::write(source.join("a.mkv"), b"imposter").unwrap();
+        db.reconcile_relocations().unwrap();
+        let artifact = db.for_job(78).unwrap().unwrap();
+        let intent = db.relocation_intent(&artifact.generation).unwrap().unwrap();
+        assert_eq!(intent.state, IntentState::Unwinding);
+        let op = db.operation(&intent.operation).unwrap();
+        assert_eq!(op.state, "review");
+        assert_eq!(artifact.error, op.error, "the refusal is on the artifact");
+        db.abandon_relocation(&op.id, artifact.revision, &artifact.generation)
+            .unwrap();
+        let intent = db.relocation_intent(&artifact.generation).unwrap().unwrap();
+        assert_eq!(intent.state, IntentState::Unwound);
+        let evidence = intent.evidence.unwrap();
+        assert!(evidence.contains("operator abandoned"), "{evidence}");
+        assert!(evidence.contains("retained for review"), "{evidence}");
+        assert_eq!(
+            std::fs::read(target.join("a.mkv")).unwrap(),
+            b"repair input",
+            "nothing is deleted"
+        );
+        assert!(
+            db.list(0, 1000)
+                .unwrap()
+                .iter()
+                .any(|item| item.path == target),
+            "the publication directory is registered for review"
+        );
+        assert_eq!(db.operation(&op.id).unwrap().state, "cancelled");
+        assert!(!db.open_intent_for_job(78).unwrap());
     }
 
     /// Plan M3 (d): no NFS fixture exists in CI, so the PR #247 fallback
