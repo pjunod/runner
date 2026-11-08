@@ -205,7 +205,7 @@ fn pristine_download(job: &Job) -> bool {
         })
 }
 
-pub(super) fn needs_payload(job: &Job) -> bool {
+fn needs_payload(job: &Job) -> bool {
     job.torrent.is_none()
         && !failed_cleanup_only(job)
         && !job.files.is_empty()
