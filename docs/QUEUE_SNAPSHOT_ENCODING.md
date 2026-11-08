@@ -148,7 +148,7 @@ nested Vec capacities, String capacities, boxed message IDs and frame capacities
 with double-capacity plus per-allocation headroom and a map reserve. Oversized
 entries are not retained. This is not an RSS cap: the owned incoming document,
 encoded output and temporary changed fragment also occupy memory. Staging is
-bounded to 256 MiB of compressed fragments and 128 MiB per changed job fragment;
+bounded to 256 MiB of compressed fragments and 128 MiB per changed job or root fragment;
 oversized documents fall back to the original complete encoding after releasing
 staged/cache buffers. Queues beyond the 1 GiB compressed-document limit remain
 supported as plain JSON. The read-only native benchmark reports actual process
