@@ -153,6 +153,8 @@ export interface StatusDto {
   remaining_bytes: number;
   session_downloaded_bytes: number;
   download_paused: boolean;
+  /** Absent on older daemons; treat as false. */
+  post_paused?: boolean;
   disk_low: boolean;
   disk_guard_free_bytes?: number | null;
   disk_guard_label?: string | null;

@@ -120,7 +120,7 @@ export class NzbdClient {
     return this.json<LogsPage>(`/api/v1/logs?${query.toString()}`);
   }
 
-  async queueAction(action: 'pause' | 'resume'): Promise<void> {
+  async queueAction(action: 'pause' | 'resume' | 'pause-post' | 'resume-post'): Promise<void> {
     await this.json(`/api/v1/queue/actions/${action}`, { method: 'POST' });
   }
 

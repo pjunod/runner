@@ -5,7 +5,7 @@ import { Theme, useTheme } from '../theme';
 interface Props {
   label: string;
   onPress: () => void;
-  variant?: 'primary' | 'secondary' | 'danger' | 'ghost';
+  variant?: 'primary' | 'secondary' | 'danger' | 'ghost' | 'latched';
   compact?: boolean;
   disabled?: boolean;
   loading?: boolean;
@@ -68,11 +68,13 @@ const makeStyles = (theme: Theme) =>
     secondary: { backgroundColor: theme.panel, borderColor: theme.border },
     danger: { backgroundColor: theme.dangerSoft, borderColor: theme.danger },
     ghost: { backgroundColor: 'transparent', borderColor: 'transparent' },
+    latched: { backgroundColor: theme.panel, borderColor: theme.warning },
     label: { color: theme.text, fontSize: 14, fontWeight: '700' },
     primaryLabel: { color: theme.onAccent },
     secondaryLabel: { color: theme.text },
     dangerLabel: { color: theme.danger },
     ghostLabel: { color: theme.accent },
+    latchedLabel: { color: theme.warning },
     pressed: { opacity: 0.72 },
     disabled: { opacity: 0.45 },
   });
