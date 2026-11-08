@@ -424,12 +424,28 @@ async fn manager_task(
     // from a dead leader mid-way).
     let mut rescan = tokio::time::interval(RESCAN_INTERVAL);
     rescan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Review #283-1: the owner defers export/admission while a job is
+    // fenced (boot verification, journal loading); a scan that met such a
+    // deferral runs again on the owner's next queue change.
+    let mut queue_changes = engine.queue_changes();
+    let mut deferred = false;
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = rescan.tick() => {
-                scan_queue(
+                queue_changes.borrow_and_update();
+                deferred = scan_queue(
+                    &tracker, &engine, &cfg, &history, &dest_dir, &gate, &sem,
+                    &cancel, &finished_tx, &mut active,
+                ).await;
+            }
+            changed = queue_changes.changed(), if deferred => {
+                if changed.is_err() {
+                    break;
+                }
+                queue_changes.borrow_and_update();
+                deferred = scan_queue(
                     &tracker, &engine, &cfg, &history, &dest_dir, &gate, &sem,
                     &cancel, &finished_tx, &mut active,
                 ).await;
@@ -492,11 +508,29 @@ async fn manager_task(
                         }
                     }
                 }
+                // Review #283-1: a `completed` terminal emitted by the
+                // owner's replay (a restart after the history write) owes
+                // its delivery and retirement; the stamped follow-up runs
+                // on this scan, not at the next periodic one.
+                Ok(Event::JobPpFinished { outcome: nzbd_types::TerminalOutcome::Completed, .. }) => {
+                    rescan.reset_immediately();
+                }
                 Ok(Event::JobDeleted { job }) => {
                     pending_restarts.remove(&job);
                     if let Some(attempt) = active.get(&job) {
                         attempt.cancel.cancel();
                     }
+                }
+                // Review #283-1: a job the manager is not processing became
+                // eligible for post-processing — typically boot verification
+                // returning an interrupted job to `Post`/`PostQueued` after
+                // the manager's first scan saw it `Queued`. Scan now rather
+                // than at the next periodic rescan.
+                Ok(Event::JobStatusChanged { job, status, .. })
+                    if !active.contains_key(&job)
+                        && matches!(status.as_str(), "post_queued" | "post_processing" | "completed") =>
+                {
+                    rescan.reset_immediately();
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -511,7 +545,19 @@ async fn manager_task(
                 // attempt still held admission; its salvage and disposal run
                 // now that the attempt has released it, and the row retires
                 // once nothing is left to do.
-                if let Some(terminal) = load_terminal(&engine, job).await.filter(|terminal| {
+                let terminal = load_terminal(&engine, job).await;
+                // Review #283-1: an attempt that ended while the owner
+                // replayed the job's `completed` terminal (a restart after
+                // the history write) leaves its delivery and retirement to
+                // the stamped follow-up; run that now, not at the next
+                // periodic rescan. Status events met while the attempt held
+                // the job were skipped above.
+                if terminal.as_ref().is_some_and(|terminal| {
+                    terminal.outcome == nzbd_types::TerminalOutcome::Completed && terminal.emitted
+                }) {
+                    rescan.reset_immediately();
+                }
+                if let Some(terminal) = terminal.filter(|terminal| {
                     terminal.outcome == nzbd_types::TerminalOutcome::Failed && terminal.emitted
                 }) {
                     let settled = terminal.disposal.is_some()
@@ -678,6 +724,28 @@ async fn manager_task(
 /// `job_terminals` row, never from queue status. Returns true once nothing
 /// is left to do (the row may then retire).
 #[allow(clippy::too_many_arguments)]
+/// Where a terminal's follow-up stands after one pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settle {
+    /// Nothing is left to do.
+    Done,
+    /// Still owed; its own ladder (or the next event) brings it back.
+    Pending,
+    /// The owner deferred its answer (boot verification, journal loading, a
+    /// transition in flight): retry on the next queue change.
+    Deferred,
+}
+
+impl From<bool> for Settle {
+    fn from(done: bool) -> Self {
+        if done {
+            Settle::Done
+        } else {
+            Settle::Pending
+        }
+    }
+}
+
 async fn failure_followup(
     engine: &EngineHandle,
     cfg: &PostConfig,
@@ -686,17 +754,30 @@ async fn failure_followup(
     job: JobId,
     force: bool,
 ) -> bool {
+    failure_followup_settle(engine, cfg, dest_dir, gate, job, force).await == Settle::Done
+}
+
+async fn failure_followup_settle(
+    engine: &EngineHandle,
+    cfg: &PostConfig,
+    dest_dir: &Path,
+    gate: &PpGate,
+    job: JobId,
+    force: bool,
+) -> Settle {
     if gate.as_ref().is_some_and(|claim| !claim(job)) {
-        return false;
+        return Settle::Pending;
     }
     let Some(terminal) = load_terminal(engine, job).await else {
-        return false;
+        return Settle::Pending;
     };
     if terminal.outcome != nzbd_types::TerminalOutcome::Failed || !terminal.emitted {
-        return terminal.outcome != nzbd_types::TerminalOutcome::Failed && terminal.emitted;
+        return Settle::from(
+            terminal.outcome != nzbd_types::TerminalOutcome::Failed && terminal.emitted,
+        );
     }
     if terminal.disposal.is_some() {
-        return true;
+        return Settle::Done;
     }
     // Review #280-7: the retry ladder is the disposal operation's own
     // (durable, visible on the artifact); nothing here keeps a second one.
@@ -708,7 +789,7 @@ async fn failure_followup(
             .and_then(Result::ok)
             .flatten();
         if retry_at.is_some_and(|at| at > now()) {
-            return false;
+            return Settle::Pending;
         }
     }
     let row = match engine.export_job(job).await {
@@ -717,7 +798,11 @@ async fn failure_followup(
         // job: retry later rather than settle the obligation as gone.
         Err(error) => {
             tracing::debug!(job = job.0, %error, "failed-job follow-up waits for the owner");
-            return false;
+            return if error.is_deferred() {
+                Settle::Deferred
+            } else {
+                Settle::Pending
+            };
         }
     };
     let Some(row) = row else {
@@ -734,14 +819,16 @@ async fn failure_followup(
             inventory.record_disposal(job.0, "job removed from the queue")
         })
         .await;
-        return true;
+        return Settle::Done;
     };
     let admission = match engine.begin_post_admission(job).await {
         Ok(Some(admission)) => admission,
-        Ok(None) => return false,
+        // Refused for owner state (verification, a transition in flight):
+        // answerable once the queue changes.
+        Ok(None) => return Settle::Deferred,
         Err(error) => {
             tracing::warn!(job = job.0, %error, "failed-job follow-up awaits owner admission");
-            return false;
+            return Settle::Pending;
         }
     };
     let scoped = engine.for_post_admission(&admission);
@@ -819,7 +906,7 @@ async fn failure_followup(
     if let Err(error) = engine.end_post_admission(admission).await {
         tracing::warn!(job = job.0, %error, "failed-job follow-up custody release remains pending");
     }
-    done
+    Settle::from(done)
 }
 
 /// Test support: fail a job as the owner would (a health terminal) and run
@@ -1539,6 +1626,27 @@ fn salvage_failed_delivery(
     failure_cause: &str,
     archive_assessment: &EarlyArchiveAssessment,
 ) -> Result<Option<FailedSalvage>, String> {
+    // Contract §2.5: a salvage move a crash left open is finished or unwound
+    // first; one that committed is completed from its journal, never
+    // selected again from what is now the publication.
+    inventory
+        .reconcile_job_intents(job.id.0)
+        .map_err(|error| error.to_string())?;
+    if let Some(moved) = inventory
+        .committed_intent_publication(job.id.0)
+        .map_err(|error| error.to_string())?
+    {
+        return finish_salvage_receipt(
+            inventory,
+            job,
+            completed_root,
+            moved,
+            terminal_outcome,
+            failure_stage,
+            failure_cause,
+        )
+        .map(Some);
+    }
     let source = inventory
         .refresh_for_delivery(job.id.0)
         .map_err(|error| error.to_string())?;
@@ -1583,20 +1691,62 @@ fn salvage_failed_delivery(
     }
     std::fs::create_dir_all(completed_root).map_err(|error| error.to_string())?;
     let name = nzbd_engine::queue::sanitize_name(&job.name);
-    let target = completed_root.join(format!("{name}.runner-{}", source.generation));
+    let target = completed_root.join(format!(
+        "{name}.job-{}.runner-{}",
+        job.id.0, source.generation
+    ));
     let delivery_lifecycle = job.delivery_lifecycle;
-    let moved = if delivery_lifecycle {
-        inventory.publish_selected_for_delivery_checked(
+    let transfer = job
+        .params
+        .iter()
+        .find(|(key, _)| key == "monarr-transfer")
+        .map(|(_, value)| value.as_str());
+    let moved = inventory
+        .publish_selected_with_transfer(
             job.id.0,
             &target,
             selected,
             outcomes,
+            transfer,
+            delivery_lifecycle,
             &|| Ok(()),
         )
-    } else {
-        inventory.publish_selected_checked(job.id.0, &target, selected, outcomes, &|| Ok(()))
+        .map_err(|error| error.to_string())?;
+    finish_salvage_receipt(
+        inventory,
+        job,
+        completed_root,
+        moved,
+        terminal_outcome,
+        failure_stage,
+        failure_cause,
+    )
+    .map(Some)
+}
+
+/// The receipt half of a salvage publication: mark it completed and write
+/// its delivery row (idempotent for the same generation).
+fn finish_salvage_receipt(
+    inventory: &nzbd_state::artifacts::Inventory,
+    job: &Job,
+    completed_root: &Path,
+    moved: nzbd_state::artifacts::RelocationResult,
+    terminal_outcome: &str,
+    failure_stage: &str,
+    failure_cause: &str,
+) -> Result<FailedSalvage, String> {
+    let delivery_lifecycle = job.delivery_lifecycle;
+    if let Some(delivery) = inventory
+        .delivery_for_job(job.id.0)
+        .map_err(|error| error.to_string())?
+        .filter(|delivery| delivery.publication_generation == moved.generation)
+    {
+        return Ok(FailedSalvage {
+            delivery: Some(delivery),
+            published_path: moved.published_path,
+            generation: moved.generation,
+        });
     }
-    .map_err(|error| error.to_string())?;
     inventory
         .finish(
             job.id.0,
@@ -1629,11 +1779,11 @@ fn salvage_failed_delivery(
     } else {
         None
     };
-    Ok(Some(FailedSalvage {
+    Ok(FailedSalvage {
         delivery,
         published_path: moved.published_path,
         generation: moved.generation,
-    }))
+    })
 }
 
 struct FailedSalvage {
@@ -1739,10 +1889,14 @@ async fn scan_queue(
     cancel: &CancellationToken,
     finished: &tokio::sync::mpsc::UnboundedSender<JobId>,
     active: &mut HashMap<JobId, ActiveAttempt>,
-) {
+) -> bool {
     let claim = |job: JobId| gate.as_ref().map(|f| f(job)).unwrap_or(true);
     let inventory = engine.artifacts();
     let snapshot = engine.snapshot();
+    // Review #283-1: a follow-up the owner deferred (boot verification or
+    // journal loading fences export and admission) is retried on the next
+    // queue change, not at the next periodic rescan.
+    let mut deferred = false;
     // Salvage and disposal are driven from `job_terminals`, not from queue
     // status (contract §2.6): a terminal whose queue row is already gone
     // still settles its obligations.
@@ -1765,7 +1919,9 @@ async fn scan_queue(
             for terminal in owed {
                 let job = JobId(terminal.job);
                 if !queued.contains(&job) && claim(job) {
-                    failure_followup(engine, cfg, dest_dir, gate, job, false).await;
+                    deferred |= failure_followup_settle(engine, cfg, dest_dir, gate, job, false)
+                        .await
+                        == Settle::Deferred;
                 }
             }
         }
@@ -1794,14 +1950,37 @@ async fn scan_queue(
                     .flatten()
             };
             let settled = match &terminal {
-                None => true, // stamped before job_terminals existed
-                Some(t) if !t.emitted => false,
+                None => Settle::Done, // stamped before job_terminals existed
+                // The owner's terminal chain is still in flight (its event
+                // can precede its durable `emitted` flag); it ends with a
+                // queue change.
+                Some(t) if !t.emitted => Settle::Deferred,
                 Some(t) if t.outcome == nzbd_types::TerminalOutcome::Failed => {
-                    claim(j.id) && failure_followup(engine, cfg, dest_dir, gate, j.id, false).await
+                    if claim(j.id) {
+                        failure_followup_settle(engine, cfg, dest_dir, gate, j.id, false).await
+                    } else {
+                        Settle::Pending
+                    }
                 }
-                Some(_) => finish_stamped_delivery(engine, j.id).await,
+                Some(terminal) => finish_stamped_delivery(engine, j.id, terminal).await,
             };
-            if !settled || gate.is_some() {
+            deferred |= settled == Settle::Deferred;
+            if settled != Settle::Done || gate.is_some() {
+                continue;
+            }
+            // Contract §2.5: the row is not retired while a publication move
+            // of the job is open — the salvage above is what finishes it.
+            let open_intent = {
+                let inventory = inventory.clone();
+                let id = j.id.0;
+                tokio::task::spawn_blocking(move || inventory.open_intent_for_job(id))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    // A read error counts as open: the row waits.
+                    .unwrap_or(true)
+            };
+            if open_intent {
                 continue;
             }
             if let Err(error) = reconcile_stamped_completion(engine, history, j.id).await {
@@ -1857,6 +2036,7 @@ async fn scan_queue(
             active.insert(j.id, attempt);
         }
     }
+    deferred
 }
 
 async fn schedule_recoverable_post_retry(engine: &EngineHandle, job: JobId) {
@@ -2777,14 +2957,75 @@ async fn resume_committed_publication(
         return Ok(None);
     };
     let inventory = engine.artifacts();
-    let resumed =
-        tokio::task::spawn_blocking(move || finish_committed_publication_receipt(&inventory, &job))
+    let snapshot = job.clone();
+    let prepared =
+        tokio::task::spawn_blocking(move || prepare_committed_publication(&inventory, &snapshot))
             .await
             .map_err(|error| PostError::Subprocess(error.to_string()))??;
-    if resumed.is_none() {
+    let Some(committed) = prepared else {
         return Ok(None);
-    }
-    resume_durable_delivery(engine, history, job_id).await
+    };
+    // Contract §2.1 / review #283-1 follow-up: the terminal (history) is
+    // recorded before the delivery row, as on the first attempt; a crash
+    // between them is finished by `finish_stamped_delivery` from the
+    // terminal's `Delivery:*` markers.
+    let facts = ResumedDelivery {
+        terminal_outcome: committed.outcome.clone(),
+        failure_stage: committed.failure_stage.clone(),
+        failure_cause: committed.failure_cause.clone(),
+        keep_source_on_failure: committed.keep_source_on_failure,
+        source_artifact_id: committed.prepared.source_artifact_id().into(),
+        source_generation: committed.prepared.source_generation().into(),
+        publication_path: committed.prepared.publication_path.clone(),
+        artifact_id: committed.artifact_id.clone(),
+        publication_generation: committed.prepared.generation().into(),
+        delivery_id: format!(
+            "{}:{}",
+            committed.artifact_id,
+            committed.prepared.generation()
+        ),
+        manifest_digest: committed.prepared.manifest_digest.clone(),
+        files: committed.prepared.files.len(),
+        cross_volume: committed.prepared.cross_volume,
+        ready_at: now(),
+    };
+    let outcome = record_resumed_terminal(engine, history, job_id, job, facts).await?;
+    // Outside an attempt's scope (this runs before one is opened): a plain
+    // blocking task, like `finish_stamped_delivery`.
+    let inventory = engine.artifacts();
+    tokio::task::spawn_blocking(move || -> Result<(), PostError> {
+        let delivery = inventory.commit_prepared_delivery(
+            committed.prepared,
+            committed.request_token.as_deref(),
+            &committed.outcome,
+            committed.failure_stage.as_deref(),
+            committed.failure_cause.as_deref(),
+            committed.keep_source_on_failure,
+            committed.runner_stages,
+            committed.lifecycle_timing,
+        )?;
+        if let Err(error) = inventory.retire_delivery_source(&delivery.delivery_id) {
+            tracing::warn!(job = job_id.0, %error, "delivery ready; source cleanup remains pending");
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| PostError::Subprocess(error.to_string()))??;
+    Ok(Some(outcome))
+}
+
+/// A selected publication that committed before its terminal, prepared for
+/// the terminal-then-delivery order.
+struct CommittedPublication {
+    prepared: nzbd_state::artifacts::PreparedDelivery,
+    artifact_id: String,
+    outcome: String,
+    failure_stage: Option<String>,
+    failure_cause: Option<String>,
+    keep_source_on_failure: bool,
+    request_token: Option<String>,
+    runner_stages: Option<nzbd_state::artifacts::DeliveryRunnerStages>,
+    lifecycle_timing: Option<nzbd_types::LifecycleTiming>,
 }
 
 fn delivery_stage_snapshot(
@@ -2800,10 +3041,34 @@ fn delivery_stage_snapshot(
     })
 }
 
+/// A salvage's committed publication (its failed terminal already
+/// recorded): the delivery row, now.
 fn finish_committed_publication_receipt(
     inventory: &Arc<nzbd_state::artifacts::Inventory>,
     job: &Job,
 ) -> Result<Option<nzbd_state::artifacts::Delivery>, PostError> {
+    let Some(committed) = prepare_committed_publication(inventory, job)? else {
+        return Ok(None);
+    };
+    inventory
+        .commit_prepared_delivery(
+            committed.prepared,
+            committed.request_token.as_deref(),
+            &committed.outcome,
+            committed.failure_stage.as_deref(),
+            committed.failure_cause.as_deref(),
+            committed.keep_source_on_failure,
+            committed.runner_stages,
+            committed.lifecycle_timing,
+        )
+        .map(Some)
+        .map_err(PostError::from)
+}
+
+fn prepare_committed_publication(
+    inventory: &Arc<nzbd_state::artifacts::Inventory>,
+    job: &Job,
+) -> Result<Option<CommittedPublication>, PostError> {
     if !job.delivery_lifecycle {
         return Ok(None);
     }
@@ -2811,7 +3076,7 @@ fn finish_committed_publication_receipt(
         .params
         .iter()
         .find(|(key, _)| key == PP_SELECTED_OUTCOME_PARAM)
-        .map(|(_, value)| value.as_str())
+        .map(|(_, value)| value.clone())
     else {
         return Ok(None);
     };
@@ -2825,19 +3090,19 @@ fn finish_committed_publication_receipt(
         .params
         .iter()
         .find(|(key, _)| key == "monarr-transfer")
-        .map(|(_, value)| value.as_str());
-    let failure_stage = (outcome == PpFinal::HealthFailure.as_str()).then_some("health");
+        .map(|(_, value)| value.clone());
+    let failure_stage = (outcome == PpFinal::HealthFailure.as_str()).then(|| "health".to_string());
     let failure_cause = job
         .params
         .iter()
         .find(|(key, _)| key == PP_SELECTED_FAILURE_CAUSE_PARAM)
-        .map(|(_, value)| value.as_str());
+        .map(|(_, value)| value.clone());
     if failure_stage.is_some() && failure_cause.is_none() {
         return Err(PostError::Subprocess(
             "committed failed-health publication lacks its durable failure cause".into(),
         ));
     }
-    inventory
+    let artifact = inventory
         .finish(
             job.id.0,
             &published,
@@ -2845,20 +3110,21 @@ fn finish_committed_publication_receipt(
             "completed",
         )
         .map_err(PostError::from)?;
-    let delivery = inventory
-        .create_delivery_with_lifecycle_snapshot(
-            job.id.0,
-            true,
-            request_token,
-            outcome,
-            failure_stage,
-            failure_cause,
-            outcome != PpFinal::Success.as_str() && job_keeps_failed_source(job),
-            delivery_stage_snapshot(inventory, job),
-            nzbd_engine::frozen_lifecycle_timing(job),
-        )
+    let prepared = inventory
+        .prepare_delivery(job.id.0, true)
         .map_err(PostError::from)?;
-    Ok(Some(delivery))
+    Ok(Some(CommittedPublication {
+        prepared,
+        artifact_id: artifact.id,
+        keep_source_on_failure: outcome != PpFinal::Success.as_str()
+            && job_keeps_failed_source(job),
+        outcome,
+        failure_stage,
+        failure_cause,
+        request_token,
+        runner_stages: delivery_stage_snapshot(inventory, job),
+        lifecycle_timing: nzbd_engine::frozen_lifecycle_timing(job),
+    }))
 }
 
 /// A consumer can accept a ready delivery before Runner has appended terminal
@@ -2869,7 +3135,7 @@ async fn resume_durable_delivery(
     history: &Arc<HistoryDb>,
     job_id: JobId,
 ) -> Result<Option<PpFinal>, PostError> {
-    let Some(mut job) = engine
+    let Some(job) = engine
         .export_job(job_id)
         .await
         .map_err(|e| PostError::Subprocess(e.to_string()))?
@@ -2887,7 +3153,55 @@ async fn resume_durable_delivery(
     let Some(delivery) = delivery else {
         return Ok(None);
     };
+    let facts = ResumedDelivery {
+        cross_volume: engine.artifacts().delivery_cross_volume(&delivery),
+        terminal_outcome: delivery.terminal_outcome,
+        failure_stage: delivery.failure_stage,
+        failure_cause: delivery.failure_cause,
+        keep_source_on_failure: delivery.keep_source_on_failure,
+        source_artifact_id: delivery.source_artifact_id,
+        source_generation: delivery.source_generation,
+        publication_path: delivery.publication_path,
+        artifact_id: delivery.artifact_id,
+        publication_generation: delivery.publication_generation,
+        delivery_id: delivery.delivery_id,
+        manifest_digest: delivery.manifest_digest,
+        files: delivery.files.len(),
+        ready_at: delivery.ready_at,
+    };
+    record_resumed_terminal(engine, history, job_id, job, facts)
+        .await
+        .map(Some)
+}
 
+/// What a resumed terminal needs from its publication — read from the
+/// durable delivery row, or from a prepared (not yet committed) one.
+struct ResumedDelivery {
+    terminal_outcome: String,
+    failure_stage: Option<String>,
+    failure_cause: Option<String>,
+    keep_source_on_failure: bool,
+    source_artifact_id: String,
+    source_generation: String,
+    publication_path: String,
+    artifact_id: String,
+    publication_generation: String,
+    delivery_id: String,
+    manifest_digest: String,
+    files: usize,
+    cross_volume: bool,
+    ready_at: i64,
+}
+
+/// Record the terminal of a job whose publication already exists, through
+/// the one terminal chain (row, history, markers, event).
+async fn record_resumed_terminal(
+    engine: &EngineHandle,
+    history: &Arc<HistoryDb>,
+    job_id: JobId,
+    mut job: Job,
+    delivery: ResumedDelivery,
+) -> Result<PpFinal, PostError> {
     job.params.retain(|(key, _)| {
         !matches!(
             key.as_str(),
@@ -2979,8 +3293,8 @@ async fn resume_durable_delivery(
         path: delivery.publication_path.clone(),
         generation: delivery.publication_generation.clone(),
         manifest_digest: delivery.manifest_digest.clone(),
-        files: u32::try_from(delivery.files.len()).unwrap_or(u32::MAX),
-        cross_volume: engine.artifacts().delivery_cross_volume(&delivery),
+        files: u32::try_from(delivery.files).unwrap_or(u32::MAX),
+        cross_volume: delivery.cross_volume,
     };
     let terminal = nzbd_engine::terminal::terminal_from_job(
         &job,
@@ -3010,7 +3324,7 @@ async fn resume_durable_delivery(
         delivery.ready_at,
     );
     record_pp_terminal(engine, history, terminal).await?;
-    Ok(Some(final_outcome))
+    Ok(final_outcome)
 }
 
 async fn process_job_ctx_from_inner(
@@ -3904,6 +4218,18 @@ async fn process_job_ctx_from_inner(
         // after scripts have finished mutating the Runner-owned source.
         if job.lifecycle_eligible() {
             let inventory = engine.artifacts();
+            // Contract §2.5: a publication move left open by a crash or an
+            // I/O error is finished or unwound before deciding whether it
+            // committed — never selected from again.
+            let reconcile_inventory = inventory.clone();
+            crate::attempt::current()
+                .expect("processing control")
+                .blocking(move |_| {
+                    reconcile_inventory
+                        .reconcile_job_intents(job_id.0)
+                        .map_err(PostError::from)
+                })
+                .await?;
             let current = inventory
                 .for_job(job_id.0)
                 .map_err(|e| PostError::Subprocess(e.to_string()))?
@@ -3976,8 +4302,12 @@ async fn process_job_ctx_from_inner(
                 } else {
                     "private-payload"
                 };
-                let target =
-                    target_root.join(format!("{publication_name}.runner-{}", source.generation));
+                // Contract §1: `<name>.job-<id>.runner-<gen>` — two attempts
+                // at the same release can never collide.
+                let target = target_root.join(format!(
+                    "{publication_name}.job-{}.runner-{}",
+                    job_id.0, source.generation
+                ));
                 stages.enter(PostStage::Move).await;
                 if !(ctx.commit_ok)() {
                     return Err(PostError::Subprocess(
@@ -4017,27 +4347,25 @@ async fn process_job_ctx_from_inner(
                 let inventory_for_publish = inventory.clone();
                 let target_for_publish = target.clone();
                 let delivery_eligible = job.delivery_lifecycle;
+                let transfer = job
+                    .params
+                    .iter()
+                    .find(|(key, _)| key == "monarr-transfer")
+                    .map(|(_, value)| value.clone());
                 let published = crate::attempt::current()
                     .expect("processing control")
                     .blocking(move |control| {
-                        let publish = if delivery_eligible {
-                            inventory_for_publish.publish_selected_for_delivery_checked(
+                        inventory_for_publish
+                            .publish_selected_with_transfer(
                                 job_id.0,
                                 &target_for_publish,
                                 selected_files,
                                 file_outcomes,
+                                transfer.as_deref(),
+                                delivery_eligible,
                                 &|| control.checkpoint(),
                             )
-                        } else {
-                            inventory_for_publish.publish_selected_checked(
-                                job_id.0,
-                                &target_for_publish,
-                                selected_files,
-                                file_outcomes,
-                                &|| control.checkpoint(),
-                            )
-                        };
-                        publish.map_err(PostError::from)
+                            .map_err(PostError::from)
                     })
                     .await;
                 stages.finish().await;
@@ -4519,18 +4847,33 @@ fn success_publication(
 /// `Delivery:*` markers name the delivery to create; create it from the
 /// still-owned publication (refusing if its digest changed) and retire the
 /// source. True once nothing is owed.
-async fn finish_stamped_delivery(engine: &EngineHandle, job: JobId) -> bool {
-    let Ok(Some(row)) = engine.export_job(job).await else {
-        return true;
+async fn finish_stamped_delivery(
+    engine: &EngineHandle,
+    job: JobId,
+    terminal: &nzbd_state::artifacts::JobTerminal,
+) -> Settle {
+    let row = match engine.export_job(job).await {
+        Ok(Some(row)) => row,
+        // The row is gone: nothing is owed.
+        Ok(None) => return Settle::Done,
+        // A transient owner state (verification or journal loading): the
+        // delivery may still be owed; never retire the row on a non-answer.
+        Err(error) if error.is_deferred() => return Settle::Deferred,
+        Err(_) => return Settle::Pending,
     };
+    // Contract §2.1: the terminal row is authoritative. Its markers name
+    // the delivery the publication owes even before replay has stamped them
+    // onto the queue row (review #283-1: a restart after the history write).
     let param = |key: &str| {
-        row.params
+        terminal
+            .markers
             .iter()
+            .chain(row.params.iter())
             .find(|(name, _)| name == key)
             .map(|(_, value)| value.clone())
     };
     let Some(delivery_id) = param("Delivery:Id") else {
-        return true;
+        return Settle::Done;
     };
     let expected_digest = param("Delivery:ManifestDigest");
     let request_token = nzbd_types::transfer_of(&row.params);
@@ -4565,12 +4908,12 @@ async fn finish_stamped_delivery(engine: &EngineHandle, job: JobId) -> bool {
     })
     .await;
     match result {
-        Ok(Ok(())) => true,
+        Ok(Ok(())) => Settle::Done,
         Ok(Err(error)) => {
             tracing::warn!(job = job.0, %error, "stamped completion's delivery remains pending");
-            false
+            Settle::Pending
         }
-        Err(_) => false,
+        Err(_) => Settle::Pending,
     }
 }
 
@@ -7902,7 +8245,10 @@ mod decision_tests {
             .retire_delivery_source(&delivery.delivery_id)
             .unwrap();
         assert_ne!(cleanup.source_cleanup.status, "succeeded");
+        // A published repair input keeps its source name (contract §2.5 as
+        // built: linked, not renamed), so the set stays repairable.
         assert!(source.join("episode-01.mkv").exists());
+        assert!(salvage.published_path.join("episode-01.mkv").exists());
         assert!(source.join(".runner-file-2.part").exists());
         assert_eq!(
             std::fs::read(source.join(".runner-file-3.part")).unwrap(),
@@ -8133,14 +8479,6 @@ mod decision_tests {
         let delivery = inventory
             .create_delivery(41, true, Some("transfer-41"))
             .unwrap();
-        inventory
-            .accept_delivery(
-                &delivery.delivery_id,
-                &delivery.publication_generation,
-                &delivery.manifest_digest,
-                "curator-receipt-41",
-            )
-            .unwrap();
         std::fs::remove_dir_all(&published).unwrap();
 
         assert_eq!(
@@ -8311,7 +8649,7 @@ mod decision_tests {
                 .unwrap()
                 .generation;
             self.completed
-                .join(format!("Some.Release.runner-{generation}"))
+                .join(format!("Some.Release.job-41.runner-{generation}"))
         }
 
         /// The publication holds exactly the release-named media.
@@ -8757,8 +9095,13 @@ mod decision_tests {
             PpFinal::Success
         );
         assert!(published.join("episode.mkv").exists());
-        assert!(source.join("episode.zip").exists());
         assert!(inventory.delivery_for_job(41).unwrap().is_some());
+        // The terminal is recorded first, then the delivery row, then the
+        // source retires with it — the first attempt's order (review #283).
+        assert!(
+            !source.join("episode.zip").exists(),
+            "the consumed archive retires with the delivery"
+        );
         assert_eq!(history.get(JobId(41)).unwrap().unwrap().status, "SUCCESS");
     }
 
@@ -8984,14 +9327,7 @@ mod decision_tests {
                 true,
             )
             .unwrap();
-        inventory
-            .accept_delivery(
-                &delivery.delivery_id,
-                &delivery.publication_generation,
-                &delivery.manifest_digest,
-                "curator-receipt-42",
-            )
-            .unwrap();
+        assert_eq!(delivery.kind(), "salvage");
         std::fs::remove_dir_all(&published).unwrap();
 
         assert_eq!(

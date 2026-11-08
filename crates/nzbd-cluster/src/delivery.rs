@@ -159,58 +159,56 @@ impl ControlStore {
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty() && id.len() <= 4096)
                 .ok_or("untrusted migration identity")?;
-            let (data, public, accepted_at, error) =
-                match serde_json::from_value::<Delivery>(value.clone()) {
-                    Ok(delivery) => {
-                        let record = ClusterDelivery {
-                            revision: 0,
-                            cleanup_only: false,
-                            source_disposition: None,
-                            receipt_id: String::new(),
-                            result_id: String::new(),
-                            copies: vec![CopyObligation {
-                                id: format!("local-delivery:{}", delivery.delivery_id),
-                                owner_node: owner_node.into(),
-                                artifact: None,
-                                local_delivery_id: Some(delivery.delivery_id.clone()),
-                                result_ref: None,
-                                result_id: None,
-                                directory_identity: None,
-                                deletion_files: None,
-                                claim_id: None,
-                                attempts: 0,
-                                next_retry_at: None,
-                                status: if delivery.source_cleanup.status == "succeeded" {
-                                    "removed"
-                                } else {
-                                    "pending"
-                                }
-                                .into(),
-                                error: delivery.source_cleanup.error.clone(),
-                            }],
-                            delivery,
-                        };
-                        let (data, public) = encode_record(&record)?;
-                        (data, Some(public), record.delivery.accepted_at, None)
-                    }
-                    Err(_) => (
-                        "{}".into(),
-                        None,
-                        None,
-                        Some(
-                            value
-                                .get("discoveryError")
-                                .and_then(Value::as_str)
-                                .unwrap_or(
-                                    "publication manifest is invalid; source retained for review",
-                                )
-                                .chars()
-                                .take(4096)
-                                .collect::<String>(),
-                        ),
+            let (data, public, error) = match serde_json::from_value::<Delivery>(value.clone()) {
+                Ok(delivery) => {
+                    let record = ClusterDelivery {
+                        revision: 0,
+                        cleanup_only: false,
+                        source_disposition: None,
+                        receipt_id: String::new(),
+                        result_id: String::new(),
+                        copies: vec![CopyObligation {
+                            id: format!("local-delivery:{}", delivery.delivery_id),
+                            owner_node: owner_node.into(),
+                            artifact: None,
+                            local_delivery_id: Some(delivery.delivery_id.clone()),
+                            result_ref: None,
+                            result_id: None,
+                            directory_identity: None,
+                            deletion_files: None,
+                            claim_id: None,
+                            attempts: 0,
+                            next_retry_at: None,
+                            status: if delivery.source_cleanup.status == "succeeded" {
+                                "removed"
+                            } else {
+                                "pending"
+                            }
+                            .into(),
+                            error: delivery.source_cleanup.error.clone(),
+                        }],
+                        delivery,
+                    };
+                    let (data, public) = encode_record(&record)?;
+                    (data, Some(public), None)
+                }
+                Err(_) => (
+                    "{}".into(),
+                    None,
+                    Some(
+                        value
+                            .get("discoveryError")
+                            .and_then(Value::as_str)
+                            .unwrap_or(
+                                "publication manifest is invalid; source retained for review",
+                            )
+                            .chars()
+                            .take(4096)
+                            .collect::<String>(),
                     ),
-                };
-            writes.push(("INSERT INTO cluster_deliveries(sequence,id,data,discovery_error,public_data,accepted_at,request_token) SELECT ?1,?2,?3,?4,?6,?7,?8 WHERE (SELECT value FROM cluster_delivery_meta WHERE key='migration_cursor')=?5 ON CONFLICT(id) DO NOTHING".into(),params!(sequence,id,data,error,after.to_string(),public,accepted_at,value.get("requestToken").and_then(Value::as_str))));
+                ),
+            };
+            writes.push(("INSERT INTO cluster_deliveries(sequence,id,data,discovery_error,public_data,accepted_at,request_token) SELECT ?1,?2,?3,?4,?6,?7,?8 WHERE (SELECT value FROM cluster_delivery_meta WHERE key='migration_cursor')=?5 ON CONFLICT(id) DO NOTHING".into(),params!(sequence,id,data,error,after.to_string(),public,None::<i64>,value.get("requestToken").and_then(Value::as_str))));
         }
         writes.push((
             "UPDATE cluster_delivery_meta SET value=?2 WHERE key='migration_cursor' AND value=?1"
@@ -280,14 +278,15 @@ impl ControlStore {
         selected: Option<(u32, u64)>,
     ) -> Result<ClusterDelivery, String> {
         // The row is written only after publication and fsync. Repeated READY
-        // creation cannot replace consumer acceptance or cleanup progress.
+        // creation cannot replace cleanup progress. There is no acceptance
+        // (contract §2.5); the legacy `accepted_at` column is written NULL.
         let (data, public) = encode_record(record)?;
         let sql = "INSERT INTO cluster_deliveries(id,data,public_data,accepted_at,cleanup_only,request_token) SELECT ?1,?2,?3,?4,?8,?9 WHERE ?5 IS NULL OR EXISTS(SELECT 1 FROM control_jobs WHERE job_id=?5 AND revision=?6 AND result_id=?7 AND deleted=0) ON CONFLICT(id) DO NOTHING";
         let params = params!(
             &record.delivery.delivery_id,
             data,
             public,
-            record.delivery.accepted_at,
+            None::<i64>,
             selected.map(|(job, _)| i64::from(job)),
             selected.map(|(_, revision)| revision as i64),
             &record.result_id,
@@ -313,7 +312,7 @@ impl ControlStore {
         after: i64,
         limit: u32,
     ) -> Result<(Vec<ClusterDelivery>, i64), String> {
-        let pointers=self.client.query_consistent_map::<DiscoveryRow,_>("SELECT sequence,id,length(CAST(data AS BLOB)) AS bytes,discovery_error,0 AS accepted FROM cluster_deliveries WHERE sequence>?1 ORDER BY sequence LIMIT ?2",params!(after,i64::from(limit.min(100)))).await.map_err(|error|error.to_string())?;
+        let pointers=self.client.query_consistent_map::<DiscoveryRow,_>("SELECT sequence,id,length(CAST(data AS BLOB)) AS bytes,discovery_error FROM cluster_deliveries WHERE sequence>?1 ORDER BY sequence LIMIT ?2",params!(after,i64::from(limit.min(100)))).await.map_err(|error|error.to_string())?;
         let mut rows = Vec::new();
         let mut bytes = 0;
         let mut cursor = after;
@@ -335,41 +334,6 @@ impl ControlStore {
         }
         Ok((rows, cursor))
     }
-    /// Test support only (removed with acceptance in M3): the production
-    /// `accept` route no longer records anything (contract §2.5).
-    #[cfg(test)]
-    pub(crate) async fn accept_cluster_delivery(
-        &self,
-        id: &str,
-        generation: &str,
-        digest: &str,
-        receipt: &str,
-    ) -> Result<Delivery, String> {
-        if receipt.is_empty() || receipt.len() > 4096 {
-            return Err("valid consumer receipt required".into());
-        }
-        let mut record = self
-            .cluster_delivery(id)
-            .await?
-            .ok_or("delivery not found")?;
-        if record.delivery.publication_generation != generation
-            || record.delivery.manifest_digest != digest
-            || record
-                .delivery
-                .consumer_receipt_id
-                .as_deref()
-                .is_some_and(|old| old != receipt)
-        {
-            return Err("delivery acceptance identity conflict".into());
-        }
-        if record.delivery.accepted_at.is_none() {
-            record.delivery.accepted_at = Some(crate::control::unix_ms_public() / 1000);
-            record.delivery.consumer_receipt_id = Some(receipt.into());
-            record.delivery.status = "accepted".into();
-            self.update_cluster_delivery(&record).await?;
-        }
-        Ok(record.delivery)
-    }
     /// Callers serialize mutable receipt updates with the leader's short
     /// delivery mutex, independently of queue mutation and heartbeat lanes.
     pub(crate) async fn update_cluster_delivery(
@@ -377,14 +341,8 @@ impl ControlStore {
         record: &ClusterDelivery,
     ) -> Result<(), String> {
         let (data, public) = encode_record(record)?;
-        let sql = "UPDATE cluster_deliveries SET data=?2,public_data=?4,accepted_at=?5,revision=revision+1 WHERE id=?1 AND revision=?3";
-        let params = params!(
-            &record.delivery.delivery_id,
-            data,
-            record.revision,
-            public,
-            record.delivery.accepted_at
-        );
+        let sql = "UPDATE cluster_deliveries SET data=?2,public_data=?4,revision=revision+1 WHERE id=?1 AND revision=?3";
+        let params = params!(&record.delivery.delivery_id, data, record.revision, public);
         bounded_statement(sql, &params)?;
         let changed = self
             .client
@@ -416,7 +374,19 @@ pub(crate) fn bounded_transaction(writes: &[(String, hiqlite::Params)]) -> Resul
     Ok(())
 }
 pub(crate) fn encode_record(record: &ClusterDelivery) -> Result<(String, String), String> {
-    let data = serde_json::to_string(record).map_err(|error| error.to_string())?;
+    // For one release the private row also carries the `status: "ready"`
+    // the M1a build requires to decode a delivery, so a mixed-version
+    // cluster (or a rollback) can still read what this build wrote. M6.
+    let mut private = serde_json::to_value(record).map_err(|error| error.to_string())?;
+    if let Some(delivery) = private.get_mut("delivery").and_then(Value::as_object_mut) {
+        let status = if record.cleanup_only {
+            "internal_cleanup"
+        } else {
+            "ready"
+        };
+        delivery.insert("status".into(), status.into());
+    }
+    let data = serde_json::to_string(&private).map_err(|error| error.to_string())?;
     let public =
         serde_json::to_string(&discovery_value(record)).map_err(|error| error.to_string())?;
     if data.len() > crate::proto::MAX_RPC_BYTES || public.len() > crate::proto::MAX_RPC_BYTES {
@@ -433,13 +403,7 @@ fn decode(row: DeliveryRow) -> Result<ClusterDelivery, String> {
 }
 pub(crate) fn immutable_delivery(record: &ClusterDelivery) -> Value {
     let mut value = serde_json::to_value(&record.delivery).expect("Delivery serializes");
-    for key in [
-        "sequence",
-        "status",
-        "acceptedAt",
-        "consumerReceiptId",
-        "sourceCleanup",
-    ] {
+    for key in ["sequence", "sourceCleanup"] {
         value.as_object_mut().unwrap().remove(key);
     }
     if let Some(outcomes) = value.get_mut("fileOutcomes").and_then(Value::as_array_mut) {
@@ -493,7 +457,6 @@ struct DiscoveryRow {
     id: String,
     bytes: i64,
     discovery_error: Option<String>,
-    accepted: bool,
 }
 impl From<&mut Row<'_>> for DiscoveryRow {
     fn from(row: &mut Row<'_>) -> Self {
@@ -502,7 +465,6 @@ impl From<&mut Row<'_>> for DiscoveryRow {
             id: row.get("id"),
             bytes: row.get("bytes"),
             discovery_error: row.get("discovery_error"),
-            accepted: row.get::<i64>("accepted") != 0,
         }
     }
 }
@@ -520,21 +482,18 @@ impl ControlStore {
             .await
             .map(|record| record.map(|record| discovery_value(&record)))
     }
+    /// The read-only reconciliation feed (contract §2.5): every publication
+    /// row, in sequence order. There is no acceptance to filter on.
     pub(crate) async fn cluster_discovery_page(
         &self,
         after: i64,
         limit: u32,
-        include_accepted: bool,
     ) -> Result<(Vec<Value>, i64), String> {
-        let rows=self.client.query_consistent_map::<DiscoveryRow,_>("SELECT sequence,id,length(CAST(COALESCE(public_data,data) AS BLOB)) AS bytes,discovery_error,accepted_at IS NOT NULL AS accepted FROM cluster_deliveries WHERE cleanup_only=0 AND sequence>?1 ORDER BY sequence LIMIT ?2",params!(after,i64::from(limit))).await.map_err(|e|e.to_string())?;
+        let rows=self.client.query_consistent_map::<DiscoveryRow,_>("SELECT sequence,id,length(CAST(COALESCE(public_data,data) AS BLOB)) AS bytes,discovery_error FROM cluster_deliveries WHERE cleanup_only=0 AND sequence>?1 ORDER BY sequence LIMIT ?2",params!(after,i64::from(limit))).await.map_err(|e|e.to_string())?;
         let mut values = Vec::new();
         let mut cursor = after;
         let mut bytes = 0;
         for row in rows {
-            if row.accepted && !include_accepted {
-                cursor = row.sequence;
-                continue;
-            }
             let value = if let Some(error) = row.discovery_error {
                 discovery_stub(row.sequence, &row.id, &error)
             } else if row.bytes > 8 * 1024 * 1024 {
@@ -574,7 +533,9 @@ struct Page {
     #[serde(default)]
     after: i64,
     limit: Option<u32>,
+    /// Accepted and ignored for one release (contract §2.5).
     #[serde(default)]
+    #[allow(dead_code)]
     include_accepted: bool,
 }
 
@@ -749,23 +710,21 @@ pub(crate) async fn serve_cluster_delivery(
             let axum::extract::Query(page)=axum::extract::Query::<Page>::try_from_uri(&uri).map_err(|e|(StatusCode::BAD_REQUEST,e.to_string()))?;
             let limit=page.limit.unwrap_or(50);
             if page.after<0 || !(1..=100).contains(&limit) {return Err((StatusCode::BAD_REQUEST,"invalid delivery cursor or limit".into()));}
-            let (values,cursor)=control.cluster_discovery_page(page.after,limit,page.include_accepted).await.map_err(|e|(StatusCode::SERVICE_UNAVAILABLE,e))?;
+            let (values,cursor)=control.cluster_discovery_page(page.after,limit).await.map_err(|e|(StatusCode::SERVICE_UNAVAILABLE,e))?;
             let adopted=control.delivery_meta("local_imported").await.map_err(|error|(StatusCode::SERVICE_UNAVAILABLE,error))?.is_some();
             return Ok(json!({"protocolVersion":1,"deliveries":values,"nextCursor":cursor,"catalogAdoptionComplete":adopted,
                 "cursorRule":"Rescan with after=0 each sweep, or durably persist every returned delivery before advancing the cursor."}));
         }
         let relative=path.strip_prefix("/api/v1/deliveries/").ok_or((StatusCode::NOT_FOUND,"delivery not found".into()))?;
         let mut pieces=relative.split('/');let id=decode_delivery_segment(pieces.next().unwrap_or("")).map_err(|error|(StatusCode::BAD_REQUEST,error))?;let action=pieces.collect::<Vec<_>>().join("/");
+        if method==Method::POST && action=="accept" {
+            // Contract §2.5, IMPL §7.4: there is no acceptance; M1a's
+            // one-release 200 no-op is over. Review #283-11: 410 for every
+            // id, before any lookup, exactly like the local route.
+            return Err((StatusCode::GONE,"delivery acceptance was removed (pipeline contract v2 §2.5)".into()));
+        }
         let mut record=control.cluster_delivery(&id).await.map_err(|e|(StatusCode::SERVICE_UNAVAILABLE,e))?.ok_or((StatusCode::NOT_FOUND,"delivery not found".into()))?;
         if method==Method::GET && action.is_empty() {return Ok(discovery_value(&record));}
-        if method==Method::POST && action=="accept" {
-            if record.cleanup_only {return Err((StatusCode::CONFLICT,"terminal cleanup has no consumer payload to accept".into()));}
-            // Contract §2.5: there is no acceptance. For one release the
-            // route answers 200 with the unchanged row so an old curator's
-            // acknowledgement settles; nothing is recorded and retirement
-            // never waits on it.
-            return Ok(discovery_value(&record));
-        }
         if method==Method::POST && action=="source-cleanup/retry" {
             let mut queued=false;
             for copy in &mut record.copies {if copy.status!="removed" && copy.status!="review_required" {copy.next_retry_at=None;queued=true;}}
@@ -809,7 +768,7 @@ pub(crate) async fn local_delivery_page(
             .into_response();
     }
     match tokio::task::spawn_blocking(move || {
-        let (values, next_cursor) = inventory.deliveries_discovery_page(request.after, 32, true)?;
+        let (values, next_cursor) = inventory.deliveries_discovery_page(request.after, 32)?;
         Ok::<_, nzbd_state::artifacts::Error>(MigrationPage {
             done: values.is_empty() && next_cursor == request.after,
             values,
@@ -851,7 +810,7 @@ pub(crate) async fn migrate_local_deliveries(
             );
         }
         tokio::task::spawn_blocking(move || {
-            let (values, next_cursor) = inventory.deliveries_discovery_page(after, 32, true)?;
+            let (values, next_cursor) = inventory.deliveries_discovery_page(after, 32)?;
             Ok::<_, nzbd_state::artifacts::Error>(MigrationPage {
                 done: values.is_empty() && next_cursor == after,
                 values,
@@ -1367,11 +1326,11 @@ mod tests {
     }
     fn record(instance: &str, id: &str) -> ClusterDelivery {
         let delivery:Delivery=serde_json::from_value(json!({
-            "protocolVersion":1,"sequence":0,"status":"ready","deliveryId":id,"publicationGeneration":"generation",
+            "protocolVersion":1,"sequence":0,"deliveryId":id,"publicationGeneration":"generation",
             "artifactId":"publication","sourceArtifactId":"source","sourceGeneration":"source-generation","jobId":7,
             "runnerInstanceId":instance,"requestToken":"request","keepSourceOnFailure":false,"terminalOutcome":"SUCCESS",
             "publicationPath":"/completed/payload","manifestDigest":"digest","files":[{"path":"episode.mkv","sizeBytes":7,"sha256":"00".repeat(32)}],
-            "fileOutcomes":[],"readyAt":1,"acceptedAt":null,"consumerReceiptId":null,
+            "fileOutcomes":[],"readyAt":1,
             "sourceCleanup":{"status":"pending","error":null,"attempts":0,"nextRetryAt":null,"blockedSince":null,"warning":null}
         })).unwrap();
         ClusterDelivery {
@@ -1479,14 +1438,6 @@ mod tests {
         old.commit_delivery(&record("old-installation", "old-delivery"))
             .await
             .unwrap();
-        old.accept_cluster_delivery(
-            "old-delivery",
-            "generation",
-            "digest",
-            "old-consumer-receipt",
-        )
-        .await
-        .unwrap();
         old.shutdown().await.unwrap();
         drop(old);
         let store = ControlStore::start(&cfg).await.unwrap();
@@ -1514,9 +1465,8 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .delivery
-                .consumer_receipt_id
-                .as_deref(),
-            Some("old-consumer-receipt")
+                .publication_generation,
+            "generation"
         );
         let mut large = record("old-installation", "large-after-upgrade");
         large.copies.push(CopyObligation {
@@ -1582,9 +1532,8 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .delivery
-                .consumer_receipt_id
-                .as_deref(),
-            Some("old-consumer-receipt")
+                .publication_generation,
+            "generation"
         );
         store.shutdown().await.unwrap();
     }
@@ -1818,20 +1767,16 @@ mod tests {
             .params
             .contains(&("*Runner:KeepOnFailure".into(), "1".into())));
         assert_eq!(selected.status, nzbd_types::JobStatus::Failed);
-        let mut legacy = record(&instance, "accepted-local").delivery;
-        legacy.sequence = 41;
-        legacy.accepted_at = Some(5);
-        legacy.consumer_receipt_id = Some("existing-local-receipt".into());
-        legacy.status = "accepted".into();
+        // A row an M1a (or older) node wrote with acceptance fields still
+        // imports and is listed: the feed returns every row (contract §2.5).
+        let mut legacy =
+            serde_json::to_value(&record(&instance, "accepted-local").delivery).unwrap();
+        legacy["sequence"] = json!(41);
+        legacy["status"] = json!("accepted");
+        legacy["acceptedAt"] = json!(5);
+        legacy["consumerReceiptId"] = json!("existing-local-receipt");
         store
-            .import_delivery_page(
-                &instance,
-                "leader",
-                0,
-                &[serde_json::to_value(&legacy).unwrap()],
-                41,
-                true,
-            )
+            .import_delivery_page(&instance, "leader", 0, &[legacy], 41, true)
             .await
             .unwrap();
         assert_eq!(
@@ -1842,31 +1787,27 @@ mod tests {
                 .as_deref(),
             Some("41")
         );
-        let (pending, _) = store.cluster_discovery_page(0, 100, false).await.unwrap();
-        assert!(!pending
-            .iter()
-            .any(|row| row["deliveryId"] == "accepted-local"));
-        let (all, _) = store.cluster_discovery_page(0, 100, true).await.unwrap();
+        let (all, _) = store.cluster_discovery_page(0, 100).await.unwrap();
         let imported = all
             .iter()
             .find(|row| row["deliveryId"] == "accepted-local")
             .unwrap();
         assert_eq!(imported["sequence"], 41);
-        assert_eq!(imported["consumerReceiptId"], "existing-local-receipt");
+        assert!(imported.get("consumerReceiptId").is_none());
+        assert!(imported.get("status").is_none());
         assert!(imported["sourceCopies"].is_array());
         let committed = store
             .commit_delivery(&record(&instance, "first"))
             .await
             .unwrap();
         let mut stale = store.cluster_delivery("first").await.unwrap().unwrap();
-        store
-            .accept_cluster_delivery("first", "generation", "digest", "consumer-receipt")
-            .await
-            .unwrap();
+        let mut newer = store.cluster_delivery("first").await.unwrap().unwrap();
+        newer.delivery.source_cleanup.attempts = 1;
+        store.update_cluster_delivery(&newer).await.unwrap();
         stale.delivery.source_cleanup.status = "succeeded".into();
         assert!(
             store.update_cluster_delivery(&stale).await.is_err(),
-            "old leader cleanup cannot overwrite newer acceptance"
+            "old leader cleanup cannot overwrite a newer update"
         );
         assert_eq!(
             store
@@ -1875,9 +1816,9 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .delivery
-                .consumer_receipt_id
-                .as_deref(),
-            Some("consumer-receipt")
+                .source_cleanup
+                .attempts,
+            1
         );
         let mut changed = record(&instance, "first");
         changed.delivery.source_generation = "changed".into();
@@ -1951,13 +1892,11 @@ mod tests {
         encoded.delivery.source_cleanup.status = "succeeded".into();
         store.commit_delivery(&encoded).await.unwrap();
         let client = crate::http::ClusterClient::new("secret".into());
-        let acceptance=json!({"protocolVersion":1,"publicationGeneration":"generation","manifestDigest":"digest","consumerReceiptId":"encoded-consumer"}).to_string();
         // Queue reconciliation may be blocked by unrelated payload custody.
         // The receipt lane must remain independent while preserving its CAS.
         let queue_serial = runtime.leader_shared.mutation_serial.lock().await;
         for (method, action, body) in [
             ("GET", "", String::new()),
-            ("POST", "/accept", acceptance),
             ("POST", "/source-cleanup/retry", String::new()),
         ] {
             let request = hyper::Request::builder()
@@ -1994,20 +1933,20 @@ mod tests {
             )
             .await
             .unwrap();
-        // Contract v2: accept is a 200 no-op whatever the body says, and
-        // records no receipt.
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        assert_eq!(
-            store
-                .cluster_delivery("encoded:sha256:receipt")
-                .await
-                .unwrap()
-                .unwrap()
-                .delivery
-                .consumer_receipt_id
-                .as_deref(),
-            None
-        );
+        // Contract §2.5 / IMPL §7.4: there is no acceptance; the route is gone.
+        assert_eq!(response.status(), axum::http::StatusCode::GONE);
+        // Review #283-11: gone for an unknown id too, as on the local route.
+        let response = client
+            .forward(
+                &format!("http://{address}"),
+                hyper::Request::post("/api/v1/deliveries/no-such-delivery/accept")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::GONE);
         drop(queue_serial);
         for id in ["bad%ZZ", "bad%2Fsegment", "bad%FF"] {
             let response = client
@@ -2211,7 +2150,10 @@ mod tests {
             .is_none());
         assert_eq!(page["nextCursor"], final_record.delivery.sequence);
         assert_eq!(by_id["first"]["sequence"], committed.delivery.sequence);
-        assert_eq!(by_id["first"]["consumerReceiptId"], "consumer-receipt");
+        assert!(
+            by_id["first"].get("consumerReceiptId").is_none(),
+            "no acceptance on the feed"
+        );
         // Force an actual false actor commit after its snapshot fence fails.
         // A directory at the projection path also defeats concurrent election
         // projection rewrites until we repair it; no sleep-based race proof.

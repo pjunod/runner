@@ -1,5 +1,221 @@
 # nzbd — Project Status
 
+## Pipeline contract v2 M3 — journaled per-file publication, one hash, no ack — 2026-11-07
+
+**Status:** draft PR [#283](https://github.com/pjunod/runner/pull/283) on
+`claude/pipeline-v2-m3-runner` (runner 0.4.0), `main` (with M1a #281) merged
+in (latest `1f73dea`, PR #284); review round 1 addressed (below). Not merged, not deployed. Plan:
+`IMPL_RUNNER.md` §7 / `PIPELINE_REWRITE_PLAN.md` M3.
+
+**M3 must not reach nuc3 before curator #95 (M2) is deployed there.** Curator
+v1 retries `accept`'s 410 forever (a visible `Error`, warn logs) and, with the
+`accepted` filter gone, re-pages the whole `/deliveries` feed every sweep.
+
+**Review r1 (#283, Fable) — resolutions:**
+- *1 (blocking) manager at boot:* `crash_after_*_finishes_with_manager_at_boot`
+  for every crash point (10 s delivery deadline, inside the 30 s rescan).
+  Root causes: `job_status_changed` was keyed on the owner's status, which
+  never leaves `Post` during boot verification (only the snapshot shows
+  `queued`) — now emitted from the published projection, after it is stored;
+  the manager now rescans on the owner's next queue change after a deferred
+  export/admission, on a `completed` terminal's emission and when an attempt
+  ends with one; `drop_unneeded_verifications` lifted its fence without an
+  epoch bump; boot verification and payload recovery failed against a
+  restart's reconciliation lease and backed off 10 s+ (they now wait on its
+  release); `resume_committed_publication` wrote the delivery row **before**
+  the terminal (now terminal, then row, then source retirement);
+  `finish_stamped_delivery` reads the owed delivery from the terminal row.
+  The publication suite went from ~230 s to ~30 s.
+- *2 (blocking) data loss:* a cross-volume unwind removes a copy only while
+  the source holds the journaled original; a linked repair input drops its
+  publication name only while the source name is the same inode; otherwise
+  conflict, copy retained. Tests for both.
+- *3:* `Finishing` re-entry re-locates unjournaled renames; new crash point
+  `after_rename_before_journal` in the inventory and post (c) suites.
+- *4:* *Abandon move and retain original* (Files/Attention, the existing
+  `abandon-relocation` route) covers per-file moves: unwind, or close without
+  deleting anything and register the target for review; the job then fails
+  `io` and parks. A stuck move's operation error is mirrored onto the
+  artifact.
+- *5:* the cross-volume capacity reservation is held for the whole move (and
+  a restart's finish reserves what is left to copy).
+- *6:* (e) asserts its one outcome: boot verification holds the job for
+  repair, no terminal.
+- *7:* re-covered — a recovery copy whose streamed bytes disagree with the
+  journaled digest never lands; a lease expiring mid-copy stops at the next
+  chunk and the same attempt finishes.
+- *8:* INTEGRATION §2a documents what identity without a digest proves
+  (inode/device/size/mtime/ctime).
+- *9:* a second selected publication of a generation is `Conflict`.
+- *10:* intents whose artifact/operation is gone close as unwound with
+  evidence; a pre-M3 queued deletion unwinds the move.
+- *11:* cluster `accept` answers 410 before any lookup.
+- *12:* one `RETRY_LADDER_SECONDS` / `retry_delay()` replaces eight copies.
+- *13:* the cross-volume tests find a second device (tmpfs, temp dir, test
+  binary's volume) and fail under `NZBD_REQUIRE_TOOLS` instead of skipping.
+- Contract copy: §2.5's "rename" admits a hard link for PAR repair inputs.
+
+**M6 must delete** (rollback shims kept for one release): the
+`deliveries.accepted_at`/`consumer_receipt_id` columns, `delivery_row_json`'s
+`status`, the cluster `encode_record` status shim and
+`cluster_deliveries.accepted_at`, both `include_accepted` params (local and
+cluster), the v1 delivery row write and `pp_status`/`final_dir`,
+`custodyState`/`sourceCleanupStatus`, and the `review: interrupted move` hold
+rewrite in `commit_intent` (`intents.rs`).
+
+- **The move is journaled before it starts.** A selected publication inserts
+  its intent into the new `relocation_intents` table (generation, target,
+  every selected file's identity, journaled digest and destination) in the
+  same transaction as the relocation `Operation`, before the first rename.
+  `crates/nzbd-state/src/artifacts/intents.rs`.
+- **Selected files only, per file.** Same volume: `rename_exclusive`
+  (renameat2 `RENAME_NOREPLACE`, PR #247 link + unlink fallback kept); a file
+  without a journaled digest gets one read pass. Cross volume: one streaming
+  copy per file into `<dst>.part` that hashes as it writes. The processing
+  directory keeps only unselected siblings and is disposed of after the
+  delivery row. The "always stage privately" branch for selections is gone.
+  Exception (decision for Paul): a selected file that is still a PAR repair
+  input of the source (`repair_dependency`) is linked, not renamed, so the
+  set stays repairable after curator deletes the publication — the existing
+  test `failed_health_par_tool_failure_still_publishes_good_sibling_and_retains_repair_set`
+  requires it.
+- **Manifest written last.** `.runner-manifest.json` = `{generation, job,
+  transfer, created_at, cross_volume, files[{path,bytes,sha256}], digest}`,
+  `.part` + fsync + exclusive rename, the deployed `runner-manifest-v1`
+  digest. Publications are named `<name>.job-<id>.runner-<gen>`.
+- **Restart reconciliation** (startup root workers, the 30 s tick, and every
+  explicit retry / PP restart via `reconcile_job_intents`): manifest present →
+  commit; every file found unchanged in the target or the source → finish;
+  anything missing or changed → unwind (moved files back by identity, target
+  removed, the generation's next publication fails `io`). One of the two,
+  logged with per-file evidence. While an intent is open: `disposal_allowed`
+  is `None`, deletion requests are refused, the retire sweep waits, and the
+  source shows under Files → Attention.
+- **One hash pass.** The delivery record reuses the journaled digests; with
+  the scratch tree gone, so are the extra reads.
+- **Delivery after history** (already M1a's #280-2 ordering, kept). The v1
+  delivery record is still written for one release and now carries the
+  manifest body (`manifest`). Salvage resumes a committed move from its
+  journal instead of selecting again from the publication.
+- **No acceptance.** `POST /deliveries/{id}/accept` answers `410 Gone` (local
+  and cluster). Deleted: `accept_delivery`, `Delivery.accepted_at`,
+  `consumer_receipt_id`, `Delivery.status` and its derivation, the
+  `include_accepted` filters (local and cluster discovery — the query param
+  is accepted and ignored for one release), the test-only
+  `accept_cluster_delivery`. `/deliveries` is documented as the
+  reconciliation feed; `custodyState`/`sourceCleanupStatus` are `deprecated`
+  in `/api/v1/openapi.json`.
+- **Park root failures are journaled** (orchestrator addition, contract
+  §2.6): a move whose destination root cannot be created — a failed-source
+  park onto an unavailable volume — now records a `relocate` operation in
+  `retry` with the error and the 30 s/1 m/2 m/5 m ladder, notes it on the
+  artifact (Files → Attention) and so drives `disposal_retry_at`; the same
+  request supersedes it (keeping the attempt count) once the root exists.
+  Test `park_root_creation_failure_lands_on_the_operation_ladder`.
+- **Found while testing the journal:** a job's own attempt reconciles its
+  open intent under its processing lease (a reconciliation lease is refused
+  by the attempt's own use), and the retire sweep gates only the retirement
+  on an open intent, not the salvage that finishes it.
+- **Engine fix found by the restart tests:** a boot verification that was
+  waiting for its payload root when the terminal replay stamped the job was
+  never run or cleared, so the job could be neither exported nor admitted
+  again (crash after the history write → restart hung). Such verifications
+  are now dropped (`drop_unneeded_verifications`).
+- **Tests** (fast lane; `TMPDIR=/dev/shm` because the shared workspace disk
+  had < 1 GiB free, below the capacity guard's headroom), after review r1:
+  - `crates/nzbd-post/tests/publication.rs` 15/15 — (a)
+    `same_volume_publication_renames_selected_only`, (c)
+    `crash_after_{rename_before_journal,first_rename,last_rename,manifest,history,delivery}`
+    both `_finishes_on_restart` and `_finishes_with_manager_at_boot`, (e)
+    `crash_with_corrupted_source_unwinds`, `delivery_row_written_after_history`.
+    The one intermittent failure seen in review r1 work (no delivery in
+    10 s, ~1 in 10 full-suite runs) was reproduced under CPU load and fixed
+    at the root: the owner emits `job_pp_finished` **before** writing the
+    terminal's `emitted` flag, so a manager scan woken by the event could
+    read `emitted = false`, classify it as merely pending, and wait for the
+    30 s rescan. The owner now announces a queue change when the terminal
+    chain releases (`release_terminal`), and an unemitted terminal is a
+    deferred follow-up that waits for it. Free disk at the failure was
+    1.6 GB on `/` and 7.9 GB on the tmpfs the tests use — not disk
+    exhaustion. After the fix: 20/20 full-suite runs under two `yes` loads.
+    `terminal_first::queue_changes_after_the_emitted_flag_lands` fails
+    without the fix and passes with it.
+  - `nzbd-state` lib 340 passed, 2 ignored (pre-existing performance
+    probes): `artifacts::intents::tests` 19, incl. (b)
+    `manifest_digest_matches_curator_fixture`, (d) `nfs_fixture_fallback_chain`,
+    the cross-volume set on a real second device (/dev/shm vs the disk).
+  - `nzbd-post` lib 120, `pp_pipeline` 34, `terminal_first` 15,
+    `failure_regressions` 6, `rename_producer` 2.
+  - `nzbd-api` lib 88, `nzbd-cluster` lib 57, `nzbd-engine` lib 315/316 — the
+    failure is environmental (`inaccessible_path_is_unknown…` sets mode 000,
+    which root ignores; untouched by this branch).
+  - Clippy `-D warnings` on the five touched crates, all targets.
+- **CI gate 1 on #283** (`f492aa9`): the sealed cluster PP generation
+  copied the worker publication's `.runner-manifest.json` as payload, so its
+  file list never matched the journaled one ("selected PP publication changed
+  after its durable journal committed", retried every 150 ms) and no cluster
+  delivery appeared — the three `cluster_e2e` READY/remote-PP timeouts. The
+  manifest is now excluded from the sealed payload (`c74608a`). Two
+  `cluster_e2e` tests and one `nzbd` bin test asserted v1 behaviour M3
+  removes (contract §2.5: accept → 410 for every id, publications named
+  `<name>.job-<id>.runner-<gen>`) and were updated. Local: `cluster_e2e`
+  22/22 in 237 s; `nzbd` bin 27/27.
+- **Cluster publications carry the manifest** (orchestrator, contract
+  §2.5): the leader, after landing the sealed payload in its publication
+  directory and before the cluster delivery row, writes `.runner-manifest.json`
+  through the single-node writer (`write_runner_manifest`: `.part`, fsync,
+  exclusive rename, directory fsync); `generation` is the result id,
+  `cross_volume` is true (the payload was copied), and its digest is the
+  row's `manifestDigest`. `cluster_e2e`
+  `delivery_receipts_survive_authority_restart_and_consumer_removed_publication`
+  asserts it. Local: `cluster_e2e` 22/22, 250.6 s (plus a 64 s build);
+  `nzbd-cluster` lib 57; `nzbd-state` lib 340.
+- **Not verified:** `cargo test --workspace` and clippy `--workspace` (the
+  gate's); `NZBD_REQUIRE_TOOLS=1`; a real NFS mount (no CI NFS fixture exists — (d) drives the
+  fallback through the EINVAL rename seam); deploy.
+- **Engine fix 2:** a boot verification that read an allocation the
+  startup intent reconciliation had just replaced (the job's artifact moved
+  to its publication) was blocked as `review` forever ("allocation authority
+  changed before verification"). The owner now reloads the allocation and
+  verifies again. Before this fix one run settled only after a 10 s + 20 s
+  backoff; with it every restart test settles in about a second.
+- **Post fix:** `finish_stamped_delivery` treated a transient export refusal
+  (verification or journal loading) as "row gone" and retired the job
+  without its delivery row; it now waits.
+- **(e) end to end:** after the unwind, the engine's own boot verification
+  sees the corrupted file's CRC and holds the job for a generation-safe
+  repair before post-processing runs again; the `failed/io` terminal IMPL §7.2
+  names happens when publication is attempted (asserted at the inventory
+  level). The post-level test asserts the hold (review r1 #6). Nothing is
+  published or disposed.
+- **Decisions for Paul:**
+  - Review r1 #4: an abandoned publication move fails the job `io` on its
+    next attempt and parks the source (the generation keeps its one intent
+    row), rather than allowing a second publication of that generation.
+  - Review r1 #1: boot verification and payload recovery now block their
+    worker thread on a reconciliation lease's release (condvar) instead of
+    failing and backing off; the lease is held only for one pass.
+  - `accept` answers `410` (IMPL §7.4; the contract's one-release `200`
+    was M1a's release).
+  - The `accepted_at`/`consumer_receipt_id` columns stay (written NULL, never
+    read) and persisted rows keep `status:"ready"` for one release, so an M1a
+    rollback or mixed-version cluster can still decode them; M6 drops both.
+  - The publication generation is the source artifact's generation (IMPL
+    said a fresh id), so delivery ids, `Delivery:Generation` and source
+    retirement keep their keys.
+  - `relocation_intents` has four columns beyond IMPL §3.3 (transfer,
+    operation, source_dir, evidence) — reconciliation needs them.
+  - Published PAR repair inputs are linked, not renamed (above).
+  - The fs-ops counter is keyed by inventory, not thread-local (publication
+    runs on a blocking worker); `rename` counts payload files, the
+    manifest's own commit rename is `manifest_write`.
+  - Cross-volume copies keep the source's mode (the scratch copy was 0600);
+    the manifest is 0644.
+
+**Post-deploy checks:** history `stages` show `move` p90 < 60 s over the first
+day; `GET /api/v1/artifacts?filter=attention` lists no `transitioning`
+sources after the first restart (no open intents).
+
 ## Pipeline contract v2 M1b — surfaces — 2026-11-07
 
 **Status:** built on `claude/pipeline-v2-m1b-runner` (stacked on M1a, mobile

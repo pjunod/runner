@@ -521,10 +521,14 @@ pub struct UrlAdmissionReceipt {
     pub failure_stage: Option<String>,
     #[serde(default)]
     pub failure_cause: Option<String>,
+    /// Deprecated (pipeline contract v2 §2.5, OpenAPI `deprecated`): runner
+    /// never holds bytes on curator's behalf. Removed in M6.
     #[serde(default)]
     pub custody_state: String,
     #[serde(default)]
     pub keep_source_on_failure: bool,
+    /// Deprecated (pipeline contract v2 §2.5, OpenAPI `deprecated`): source
+    /// cleanup no longer gates curator. Removed in M6.
     #[serde(default)]
     pub source_cleanup_status: Option<String>,
     #[serde(default)]

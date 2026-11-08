@@ -145,13 +145,26 @@ struct VerificationFailure {
     reason: String,
     checked_bytes: u64,
     review_required: bool,
+    /// The owner verified against an allocation snapshot that a committed
+    /// inventory transition (e.g. a publication move reconciled at startup)
+    /// has since replaced: reload the allocation and verify again.
+    stale_allocation: bool,
 }
 impl VerificationFailure {
+    fn stale(reason: impl ToString, checked_bytes: u64) -> Self {
+        Self {
+            reason: reason.to_string(),
+            checked_bytes,
+            review_required: false,
+            stale_allocation: true,
+        }
+    }
     fn unavailable(reason: impl ToString, checked_bytes: u64) -> Self {
         Self {
             reason: reason.to_string(),
             checked_bytes,
             review_required: false,
+            stale_allocation: false,
         }
     }
     fn conflict(reason: impl ToString, checked_bytes: u64) -> Self {
@@ -159,6 +172,7 @@ impl VerificationFailure {
             reason: reason.to_string(),
             checked_bytes,
             review_required: true,
+            stale_allocation: false,
         }
     }
 }
@@ -445,7 +459,71 @@ impl Owner {
         }
     }
 
+    /// A boot verification waits for its payload root; if the job's
+    /// `completed` terminal is stamped meanwhile (the terminal replay of a
+    /// crash after the history write), its payload is the publication's and
+    /// nothing is left to prove — yet nothing would ever run or clear that
+    /// verification, and a job under verification can be neither exported
+    /// nor admitted. Drop exactly those waiting verifications.
+    ///
+    /// Only a successful, stamped completion qualifies: a failed job's
+    /// retained or partially deleted source (failed cleanup included) keeps
+    /// its verification, which fences export and admission until its `Done`
+    /// bits are proven or dropped.
+    pub(super) fn drop_unneeded_verifications(&mut self) {
+        let stale = self
+            .state
+            .jobs
+            .iter()
+            .filter(|job| {
+                job.status == JobStatus::Completed
+                    && job.torrent.is_none()
+                    && !super::transitions::failed_cleanup_only(job)
+                    && job
+                        .params
+                        .iter()
+                        .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+            })
+            .filter(|job| {
+                self.verification
+                    .get(&job.id)
+                    .is_some_and(|state| !state.running)
+            })
+            .map(|job| job.id)
+            .collect::<Vec<_>>();
+        if stale.is_empty() {
+            return;
+        }
+        for job in stale {
+            self.verification.remove(&job);
+            if let Some(current) = self.state.job_mut(job) {
+                set_owner_param(&mut current.params, PENDING, None);
+                set_owner_param(&mut current.params, REASON, None);
+            }
+        }
+        // The fence lifted: callers the owner deferred (export, admission)
+        // wait for this queue change.
+        self.dirty = true;
+        self.publish_now();
+        self.bump_epoch();
+    }
+
+    /// Re-read the job's allocation and queue its verification again. Not a
+    /// retry ladder: it runs once per observed inventory transition.
+    fn reload_stale_allocation(&mut self, job: JobId) {
+        if let Some(state) = self.verification.get_mut(&job) {
+            state.running = false;
+            state.phase = "loading".into();
+            state.partial = None;
+        }
+        self.queue_payload_recovery(job);
+        self.dirty = true;
+        self.publish_now();
+        self.bump_epoch();
+    }
+
     pub(super) fn start_verifications(&mut self) {
+        self.drop_unneeded_verifications();
         if self.cancel.is_cancelled() || self.verification_roots.len() >= MAX_VERIFICATION_WORKERS {
             return;
         }
@@ -677,6 +755,10 @@ impl Owner {
         }
         let verified = match result.outcome {
             Ok(verified) => verified,
+            Err(failure) if failure.stale_allocation => {
+                self.reload_stale_allocation(job);
+                return;
+            }
             Err(failure) => {
                 self.block_verification(job, failure);
                 self.dirty = true;
@@ -691,16 +773,9 @@ impl Owner {
                 && cached.path == verified.allocation.path
                 && cached.root == verified.allocation.root
         }) {
-            self.block_verification(
-                job,
-                VerificationFailure::conflict(
-                    "allocation generation changed while verifying",
-                    verified.checked_bytes,
-                ),
-            );
-            self.dirty = true;
-            self.publish_now();
-            self.bump_epoch();
+            // The worker read the current allocation; the owner's cached
+            // snapshot is the stale one.
+            self.reload_stale_allocation(job);
             return;
         }
         if !verified.complete {
@@ -1068,7 +1143,7 @@ fn verify_job_batch(
         || current.path != allocation.path
         || current.root != allocation.root
     {
-        return Err(VerificationFailure::conflict(
+        return Err(VerificationFailure::stale(
             "allocation authority changed before verification",
             checked,
         ));
@@ -1088,8 +1163,11 @@ fn verify_job_batch(
             .validate_post_retry(job.id.0)
             .map_err(|error| VerificationFailure::conflict(error, checked))?;
     }
+    // Review #283-1: a restart's reconciliation pass on this source (an open
+    // publication move being finished) holds it momentarily; verification
+    // serializes behind it instead of failing against it and backing off.
     let custody = inventory
-        .acquire_terminal_use(job.id.0, &check)
+        .acquire_terminal_use_after_reconciliation(job.id.0, &check)
         .map_err(|error| VerificationFailure::unavailable(error, checked))?
         .ok_or_else(|| {
             VerificationFailure::conflict("allocation custody is unavailable", checked)

@@ -1998,8 +1998,11 @@ mod tests {
             } else {
                 cfg.dest_dir()
             };
-            let published_dir =
-                destination.join(format!("storage-contract.runner-{}", allocation.generation));
+            // Contract §2.5: `<name>.job-<id>.runner-<gen>`.
+            let published_dir = destination.join(format!(
+                "storage-contract.job-{}.runner-{}",
+                job.0, allocation.generation
+            ));
             assert!(!published_dir.exists());
             if conflict {
                 std::fs::create_dir_all(&published_dir).unwrap();

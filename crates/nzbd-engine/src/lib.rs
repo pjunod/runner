@@ -267,6 +267,19 @@ pub enum EngineError {
     Timeout(&'static str),
 }
 
+/// The owner cannot answer for the job yet (boot verification, journal
+/// loading or writer retirement). It answers once the queue changes.
+const EXPORT_DEFERRED: &str =
+    "job verification or writer retirement is still in progress; retry later";
+
+impl EngineError {
+    /// True for an export the owner deferred until its next queue change
+    /// (see [`EngineHandle::queue_changes`]).
+    pub fn is_deferred(&self) -> bool {
+        matches!(self, EngineError::Lifecycle(message) if message == EXPORT_DEFERRED)
+    }
+}
+
 /// Behavioral knobs, defaulting to NZBGet's values (ARCHITECTURE.md §3.3).
 #[derive(Debug, Clone)]
 pub struct Tuning {
@@ -1194,7 +1207,7 @@ impl EngineHandle {
             let origin = loop {
                 match handle.export_job(id).await {
                     Ok(Some(origin)) => break origin,
-                    Err(EngineError::Lifecycle(message)) if message == "job verification or writer retirement is still in progress; retry later" => {
+                    Err(error) if error.is_deferred() => {
                         tokio::select! {
                             _ = handle.cancel.cancelled() => return,
                             result = changes.changed() => if result.is_err() { return; },
@@ -2492,9 +2505,7 @@ impl EngineHandle {
             if !exists {
                 return Ok(None);
             }
-            return Err(EngineError::Lifecycle(
-                "job verification or writer retirement is still in progress; retry later".into(),
-            ));
+            return Err(EngineError::Lifecycle(EXPORT_DEFERRED.into()));
         }
         Ok(result)
     }
@@ -2837,6 +2848,12 @@ impl EngineHandle {
         })
         .await?;
         owner_reply(rx).await
+    }
+
+    /// Changes whenever the owner's queue state changes: the wake for a
+    /// caller whose request the owner deferred ([`EngineError::is_deferred`]).
+    pub fn queue_changes(&self) -> watch::Receiver<u64> {
+        self.queue_changes.clone()
     }
 
     /// Lock-free snapshot of the queue (never blocks the engine).

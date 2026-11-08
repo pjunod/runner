@@ -2,7 +2,6 @@
   "delivery": {
     "protocolVersion": 1,
     "sequence": 23,
-    "status": "ready",
     "deliveryId": "artifact-α:generation-23",
     "publicationGeneration": "generation-23",
     "artifactId": "artifact-α",
@@ -45,8 +44,6 @@
       }
     ],
     "readyAt": 1792670400,
-    "acceptedAt": null,
-    "consumerReceiptId": null,
     "sourceCleanup": {
       "status": "blocked",
       "error": "unsupported file remains in Runner source",

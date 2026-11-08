@@ -495,6 +495,69 @@ async fn obfuscated_mkv_and_iso_publish() {
 /// `job_terminals` commit, after the history append, after the markers —
 /// replays to exactly one history row, the markers stamped, one event, the
 /// salvage obligation present and disposal not yet run.
+/// Review #283-1: the terminal event goes out before its durable
+/// `emitted` flag. A consumer that reads the row on the event can see
+/// `emitted == false`; the owner must announce a queue change once the flag
+/// has landed, so a caller that deferred on it (the post manager's stamped
+/// follow-up) is woken instead of waiting for its periodic rescan.
+#[tokio::test]
+async fn queue_changes_after_the_emitted_flag_lands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, _history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, _source) = admitted_job(
+        &engine,
+        "emitted-flag",
+        &[("episode.mkv", Some(b"episode")), ("other.mkv", None)],
+        JobStatus::Failed,
+    )
+    .await;
+    let mut events = engine.subscribe();
+    let mut changes = engine.queue_changes();
+    let failing = engine.clone();
+    let chain = tokio::spawn(async move {
+        failing
+            .fail_job(
+                job_id,
+                FailureReason::Health,
+                None,
+                "health",
+                "below critical",
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(Event::JobPpFinished { job, .. }) = events.recv().await {
+                if job == job_id {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("terminal event");
+    changes.borrow_and_update();
+    // From the event on: wake only on queue changes, and stop at the first
+    // one after which the flag reads durable.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            changes.changed().await.unwrap();
+            if engine
+                .artifacts()
+                .terminal(job_id.0)
+                .unwrap()
+                .unwrap()
+                .emitted
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("a queue change follows the durable emitted flag");
+    assert!(chain.await.unwrap().unwrap());
+}
+
 #[tokio::test]
 async fn terminal_crash_after_each_step_replays_once() {
     for (index, step) in [
@@ -603,8 +666,9 @@ async fn terminal_crash_after_each_step_replays_once() {
 /// owes salvage stays in the queue — salvage and disposal read it — until
 /// `job_publication_ready` has gone out and its source is disposed; only
 /// then does the manager's sweep retire it.
-/// (Open relocation intents are not exercised here: no fixture creates one
-/// on a failed row without a full cluster or publication crash.)
+/// A salvage publication that crashed mid-move leaves an open relocation
+/// intent (contract §2.5): neither disposal nor the sweep may claim either
+/// side until reconciliation finishes it, which the next salvage attempt does.
 #[tokio::test]
 async fn retire_sweep_waits_for_salvage_and_open_intents() {
     let tmp = tempfile::tempdir().unwrap();
@@ -644,6 +708,64 @@ async fn retire_sweep_waits_for_salvage_and_open_intents() {
         .params
         .iter()
         .any(|(key, value)| key == nzbd_types::PP_DONE_PARAM && value == "PAR_FAILURE"));
+    // The salvage move of the verified episode stops after its first rename,
+    // as a crash there would leave it.
+    let source = engine.artifacts().for_job(job_id.0).unwrap().unwrap();
+    let selected = source
+        .files
+        .iter()
+        .filter(|entry| entry.path == "Show.S01E01.mkv")
+        .cloned()
+        .collect::<Vec<_>>();
+    let outcomes = source
+        .files
+        .iter()
+        .filter(|entry| !entry.identity.directory)
+        .map(|entry| nzbd_state::artifacts::DeliveryFileOutcome {
+            source_path: entry.path.clone(),
+            publication_path: (entry.path == "Show.S01E01.mkv").then(|| entry.path.clone()),
+            classification: "video".into(),
+            outcome: if entry.path == "Show.S01E01.mkv" {
+                "published"
+            } else {
+                "excluded_source_cleanup"
+            }
+            .into(),
+            reason: None,
+            repair_dependency: false,
+            source_cleanup_status: "pending".into(),
+        })
+        .collect();
+    std::fs::create_dir_all(tmp.path().join("completed")).unwrap();
+    let crash = engine
+        .artifacts()
+        .inject_relocation_test_fault(job_id.0, "after_first_rename", libc::EIO)
+        .unwrap();
+    assert!(engine
+        .artifacts()
+        .publish_selected_with_transfer(
+            job_id.0,
+            &tmp.path().join("completed").join(format!(
+                "par-pack.job-{}.runner-{}",
+                job_id.0, source.generation
+            )),
+            selected,
+            outcomes,
+            Some("t-par-pack"),
+            true,
+            &|| Ok(()),
+        )
+        .is_err());
+    drop(crash);
+    assert!(engine.artifacts().open_intent_for_job(job_id.0).unwrap());
+    assert!(
+        engine
+            .artifacts()
+            .disposal_allowed(job_id.0)
+            .unwrap()
+            .is_none(),
+        "an open relocation intent blocks disposal"
+    );
     let mut events = engine.subscribe();
     let cancel = CancellationToken::new();
     let tracker = TaskTracker::new();
@@ -663,11 +785,18 @@ async fn retire_sweep_waits_for_salvage_and_open_intents() {
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
-        let event = tokio::time::timeout_at(deadline, events.recv())
-            .await
-            .expect("job_publication_ready")
-            .unwrap();
-        if let Event::JobPublicationReady { job, .. } = event {
+        let Ok(event) = tokio::time::timeout_at(deadline, events.recv()).await else {
+            panic!(
+                "job_publication_ready: terminal {:?}, intents {:?}",
+                engine.artifacts().terminal(job_id.0).unwrap().map(|t| (
+                    t.salvage,
+                    t.salvage_error,
+                    t.disposal
+                )),
+                engine.artifacts().open_relocation_intents().unwrap()
+            );
+        };
+        if let Event::JobPublicationReady { job, .. } = event.unwrap() {
             assert_eq!(job, job_id);
             break;
         }

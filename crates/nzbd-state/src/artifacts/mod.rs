@@ -15,6 +15,11 @@ mod materialization;
 pub use materialization::{
     external_generation_identity, ExternalGeneration, ExternalGenerationFile,
 };
+mod intents;
+pub use intents::{
+    write_runner_manifest, IntentFile, IntentState, ManifestFile, RelocationIntent, RunnerManifest,
+    RUNNER_MANIFEST_NAME,
+};
 mod recovery;
 mod relocation;
 pub use delivery::{
@@ -314,7 +319,8 @@ pub enum ListFilter {
     /// Everything still on disk (the default view).
     #[default]
     Live,
-    /// Live records that need a person: not owned, on hold, or in error.
+    /// Live records that need a person: not owned, on hold, in error, or
+    /// the source of a publication move still open after a restart.
     Attention,
     /// Live records Runner owns outright.
     Owned,
@@ -327,7 +333,7 @@ impl ListFilter {
             Self::All => "1=1",
             Self::Live => "state NOT IN ('deleted','source_gone')",
             Self::Attention => {
-                "state NOT IN ('deleted','source_gone') AND (json_extract(data,'$.owned')=0 OR json_extract(data,'$.hold') IS NOT NULL OR json_extract(data,'$.error') IS NOT NULL)"
+                "state NOT IN ('deleted','source_gone') AND (json_extract(data,'$.owned')=0 OR json_extract(data,'$.hold') IS NOT NULL OR json_extract(data,'$.error') IS NOT NULL OR id IN (SELECT artifact FROM relocation_intents WHERE state IN ('open','finishing','unwinding')))"
             }
             Self::Owned => {
                 "state NOT IN ('deleted','source_gone') AND json_extract(data,'$.owned')=1"
@@ -425,6 +431,16 @@ impl Drop for AllocationReservation<'_> {
             .unwrap()
             .remove(&self.job);
     }
+}
+
+/// The Operation retry ladder, seconds after the Nth failed attempt
+/// (review #283-12: one ladder, not a copy per caller).
+pub(crate) const RETRY_LADDER_SECONDS: [i64; 4] = [30, 60, 120, 300];
+
+/// Backoff after `attempts` failed attempts (1-based; the last rung
+/// repeats).
+pub(crate) fn retry_delay(attempts: u32) -> i64 {
+    RETRY_LADDER_SECONDS[(attempts.saturating_sub(1) as usize).min(RETRY_LADDER_SECONDS.len() - 1)]
 }
 
 pub fn now() -> i64 {
@@ -685,6 +701,8 @@ impl Inventory {
           CREATE INDEX IF NOT EXISTS deliveries_recent ON deliveries(sequence);
           CREATE TABLE IF NOT EXISTS job_terminals(job INTEGER PRIMARY KEY,transfer TEXT,outcome TEXT NOT NULL,reason TEXT,fetch_cause TEXT,stage TEXT,message TEXT,blames_release INTEGER NOT NULL DEFAULT 0,salvage TEXT NOT NULL,keep_on_failure INTEGER NOT NULL DEFAULT 0,fetched TEXT NOT NULL,publication TEXT,markers TEXT NOT NULL,entry TEXT NOT NULL,history_seq INTEGER,history_incarnation TEXT,markers_stamped INTEGER NOT NULL DEFAULT 0,emitted INTEGER NOT NULL DEFAULT 0,disposal TEXT,salvage_error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
           CREATE INDEX IF NOT EXISTS job_terminals_salvage ON job_terminals(salvage);
+          CREATE TABLE IF NOT EXISTS relocation_intents(generation TEXT PRIMARY KEY,job INTEGER NOT NULL,transfer TEXT,artifact TEXT NOT NULL,operation TEXT NOT NULL,source_dir TEXT NOT NULL,target_dir TEXT NOT NULL,cross_volume INTEGER NOT NULL,files TEXT NOT NULL,state TEXT NOT NULL,evidence TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+          CREATE INDEX IF NOT EXISTS relocation_intents_open ON relocation_intents(state);
           CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT,artifact TEXT NOT NULL,at INTEGER NOT NULL,kind TEXT NOT NULL,detail TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS events_artifact ON events(artifact,seq);
           INSERT OR IGNORE INTO meta VALUES('schema','1');
@@ -2456,6 +2474,13 @@ impl Inventory {
             ));
         }
         let a = self.get(key)?;
+        if self.open_intent_for_artifact(&a.id)? {
+            // Contract §2.5: neither side of an open per-file move may be
+            // claimed until restart reconciliation finishes or unwinds it.
+            return Err(Error::Conflict(
+                "an open publication move owns this source; reconciliation must finish or unwind it first".into(),
+            ));
+        }
         let explicit_cancellation = cancellation_receipt
             .map(|receipt| self.cluster_cancellation_delete_accepted(&a.id, &a.generation, receipt))
             .transpose()?
@@ -2744,7 +2769,7 @@ impl Inventory {
                     a.hold = Some("review".into());
                 }
                 let delay = if a.automatic_cleanup_eligible {
-                    [30, 60, 120, 300][(op.attempts.saturating_sub(1) as usize).min(3)]
+                    retry_delay(op.attempts)
                 } else {
                     [60, 300, 1800, 21600][(op.attempts.saturating_sub(1) as usize).min(3)]
                 };

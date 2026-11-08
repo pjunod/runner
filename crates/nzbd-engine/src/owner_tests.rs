@@ -5572,7 +5572,7 @@ async fn unified_post_release_recovers_exact_retry_and_moved_source_but_preserve
                     if phase == "source_already_moved" {
                         "before_commit"
                     } else {
-                        "copy_chunk"
+                        "move_file"
                     },
                     libc::ENOSPC,
                 )
@@ -5612,7 +5612,7 @@ async fn unified_post_release_recovers_exact_retry_and_moved_source_but_preserve
             .revision;
         if phase == "repeated_enospc" {
             let _fault = inventory
-                .inject_relocation_test_fault(92, "copy_chunk", libc::ENOSPC)
+                .inject_relocation_test_fault(92, "move_file", libc::ENOSPC)
                 .unwrap();
             assert!(engine
                 .release_hold(JobId(92), revision.clone(), RetryBy::Operator)
@@ -6192,7 +6192,8 @@ async fn proven_worker_completion_preserves_selected_publication_and_separate_so
     assert_eq!(retained.path, original);
     assert!(retained.owned);
     assert!(retained.job.is_none());
-    assert!(original.join("episode.mkv").exists());
+    // Contract §2.5 (M3): the selected file was moved, not copied.
+    assert!(!original.join("episode.mkv").exists());
     assert!(target.join("episode.mkv").exists());
 }
 
@@ -6221,22 +6222,13 @@ async fn authority_fence_stops_relocation_midcopy_before_publication_and_recover
         if !observed.load(Ordering::SeqCst) {
             return false;
         }
+        // Contract §2.5 (M3): the grant expires once the first selected
+        // file of the resumed per-file move has landed in the target.
         if let Some(path) = watching.lock().unwrap().as_ref() {
-            for entry in std::fs::read_dir(path).unwrap().flatten() {
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".runner-copy-")
-                {
-                    let length = entry.metadata().unwrap().len();
-                    if length == 0 {
-                        copy_started.store(true, Ordering::SeqCst);
-                    }
-                    if copy_started.load(Ordering::SeqCst) && length >= 65536 {
-                        observed.store(false, Ordering::SeqCst);
-                        return false;
-                    }
-                }
+            if path.join("a.mkv").exists() {
+                copy_started.store(true, Ordering::SeqCst);
+                observed.store(false, Ordering::SeqCst);
+                return false;
             }
         }
         true
@@ -6252,6 +6244,7 @@ async fn authority_fence_stops_relocation_midcopy_before_publication_and_recover
         .allocate_for_delivery(95, &destination, &source, true, true)
         .unwrap();
     let payload = vec![17u8; 256 * 1024];
+    std::fs::write(source.join("a.mkv"), &payload).unwrap();
     std::fs::write(source.join("episode.mkv"), &payload).unwrap();
     let artifact = inventory
         .finish(95, &source, &destination, "active")
@@ -6266,22 +6259,25 @@ async fn authority_fence_stops_relocation_midcopy_before_publication_and_recover
     let target = completed.join("episode");
     {
         let _fault = inventory
-            .inject_relocation_test_fault(95, "copy_chunk", libc::ENOSPC)
+            .inject_relocation_test_fault(95, "move_file", libc::ENOSPC)
             .unwrap();
         assert!(inventory
             .publish_selected_for_delivery_checked(
                 95,
                 &target,
                 artifact.files,
-                vec![nzbd_state::artifacts::DeliveryFileOutcome {
-                    source_path: "episode.mkv".into(),
-                    publication_path: Some("episode.mkv".into()),
-                    classification: "media".into(),
-                    outcome: "published".into(),
-                    reason: None,
-                    repair_dependency: false,
-                    source_cleanup_status: "pending".into()
-                }],
+                ["a.mkv", "episode.mkv"]
+                    .into_iter()
+                    .map(|name| nzbd_state::artifacts::DeliveryFileOutcome {
+                        source_path: name.into(),
+                        publication_path: Some(name.into()),
+                        classification: "media".into(),
+                        outcome: "published".into(),
+                        reason: None,
+                        repair_dependency: false,
+                        source_cleanup_status: "pending".into()
+                    })
+                    .collect(),
                 &|| Ok(())
             )
             .is_err());
@@ -6300,8 +6296,7 @@ async fn authority_fence_stops_relocation_midcopy_before_publication_and_recover
         .unwrap()
         .pop()
         .unwrap();
-    let movement: serde_json::Value = serde_json::from_str(&operation.request).unwrap();
-    *scope.lock().unwrap() = Some(PathBuf::from(movement["scratch"]["path"].as_str().unwrap()));
+    *scope.lock().unwrap() = Some(target.clone());
     let revision = export_job_ready_for_test(&engine, JobId(95))
         .await
         .unwrap()
@@ -6315,7 +6310,12 @@ async fn authority_fence_stops_relocation_midcopy_before_publication_and_recover
         .unwrap()
         .is_err());
     assert!(!valid.load(Ordering::SeqCst));
-    assert!(!target.exists());
+    assert!(armed.load(Ordering::SeqCst));
+    assert!(
+        !target.join(".runner-manifest.json").exists(),
+        "an expired grant cannot commit the publication"
+    );
+    assert!(!target.join("episode.mkv").exists(), "no move after expiry");
     assert_eq!(std::fs::read(source.join("episode.mkv")).unwrap(), payload);
     assert_eq!(inventory.operation(&operation.id).unwrap().state, "retry");
     *scope.lock().unwrap() = None;
@@ -6336,7 +6336,7 @@ async fn authority_fence_stops_relocation_midcopy_before_publication_and_recover
     let delivery = inventory
         .create_delivery(95, true, Some("authority-fence-recovered"))
         .unwrap();
-    assert_eq!(delivery.files.len(), 1);
+    assert_eq!(delivery.files.len(), 2);
     assert_eq!(
         inventory.operation(&operation.id).unwrap().state,
         "succeeded"
