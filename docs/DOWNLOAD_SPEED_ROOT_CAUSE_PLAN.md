@@ -589,3 +589,106 @@ with the PR. Runtime acceptance still requires untraced sustained measurements
 on nuc3 with one active download, unchanged provider settings, and verified
 binary provenance. The target remains 109 MiB/s; a passing test suite alone
 does not establish that throughput.
+
+## 11. Follow-up — receipt custody refresh blocked the owner
+
+PR #290 merged as `0b7fa3b` and deployed the verified `ef5692d` source tree.
+A separate actual-file 20-second trace showed the intended flush reduction:
+payload writer syncs fell from 1,123 calls / 18.059 seconds to 100 calls /
+1.399 seconds; journal syncs fell from 1,123 / 12.526 seconds to 15 / 0.192
+seconds. Recovery-loaded untraced windows still measured only 11–13 MiB/s.
+These windows do not establish steady-state restoration to 109 MiB/s.
+
+Targeted owner probes isolated the remaining pauses. Most `grant_work` calls
+took less than 128 microseconds, but occasional writer births and completion
+handlers took 1–4 seconds. Queue document cloning consumed only 0.438 seconds
+in one 20-second sample, and owner ticks only 0.064 seconds. In the next
+20-second sample, `refresh_url_admission_custody` consumed 17.634 seconds;
+synchronizing receipt fields in memory took 0.002 seconds and lifecycle
+timing took 0.021 seconds. All 30 provider sockets were present, with empty
+receive buffers and several-second command gaps. The owner was repeatedly
+blocked in receipt refresh rather than servicing those connections.
+
+`persist_then` refreshes every URL receipt before enqueuing a structural
+snapshot. A pinned receipt calls `Inventory::get`, which reads and decodes
+the complete artifact JSON, including its file manifest, while holding the
+inventory connection mutex. Custody refresh uses only generation, state,
+ownership and Keep flags. The checkpoint path runs for writer birth, file
+publication intent and recovery progress, so queue and receipt history amplify
+the cost. The refresh behavior predates the batching change.
+
+A further syscall probe identified the dominant round trip: in a 20-second
+window, 1,318 custody refreshes consumed 1.284 seconds, of which 1,124 `fcntl`
+calls consumed 1.235 seconds. Page reads took only 0.001 seconds and futex waits
+0.010 seconds. Individual SQLite read transactions repeatedly acquire/release
+file locks through the GlusterFS volume. A projection alone cannot remove
+those per-query lock round trips.
+
+A separate read-only nuc3 comparison fetched the same 200 artifact records
+(360,536 bytes per sweep) without the proposed index: 200 individual SELECTs
+took 681–806 ms; one bound `json_each` SELECT took 3.8–4.9 ms. This isolates
+transaction/lock round trips from manifest projection and changes no runtime
+state. It is not a download-throughput result.
+
+The follow-up reads all checkpoint receipt headers with one bound JSON-array
+query and one SQLite read statement/transaction, then applies the same custody
+rules to each receipt. Missing rows and per-row decoding failures leave only
+that receipt unchanged. Unpinned failed sources are pinned first using the
+existing generation/installation checks. The batch reads current values at
+one consistent point; it is not cached across checkpoints.
+
+Both batch and individual lookups use an indexed `json_remove(data,'$.files')`
+projection (guarded by `json_valid`, retaining malformed rows as raw data). The index carries the compact header beside the artifact
+ID, avoiding reads and decoding of the full manifest on this hot path. It
+returns an explicit custody-only value, retains the existing artifact metadata
+validation and generation comparison, and reads current values on every call.
+There is no cache timeout, delayed custody update, or change to the state/Keep
+rules. The rare unpinned failed-source lookup retains its existing behavior.
+
+Validation must cover existing-inventory reopen, index selection and avoidance
+of table-blob reads, equality with the current full-artifact custody fields,
+missing/stale generations, and updates to state/ownership/Keep metadata.
+After review, CI and deployment, repeat the owner-latency trace and sustained
+one-slot download measurements. The 109 MiB/s runtime gate remains open.
+
+## 12. Follow-up — malformed BODY frames stalled every provider connection
+
+After the custody batching rollout, a 20-second probe measured only 12.2 ms
+of custody refresh work. A later hard stall was a distinct transport failure.
+A passive probe of the running downloader observed 30 successful greeting,
+USER, PASS and BODY responses (`200`, `381`, `281`, `222`), ruling out a
+provider authentication failure. Separate extra-connection login tests received
+`502` / “too many” because the normal pool already held its connection quota;
+those extra probes are not evidence that the downloader failed authentication.
+
+A decoder probe then captured 30 actual `Malformed("bad =ypart range")` errors.
+Every failing wire chunk was 128–256 bytes and already ended with the NNTP
+dot/CRLF terminator. Input registers and result representation were verified
+against the exact running ELF disassembly; this is not an assumed Rust enum
+layout or a sampled descriptor-number classification. No article contents or
+credentials were recorded.
+
+The decode-error branch consumed the entire buffered chunk and then called
+`drain_body` with a fresh terminator scanner. It had discarded the terminator
+it was about to wait for, and could also discard the next pipelined response.
+The resulting read timeout incorrectly turned an article-level validation
+failure into a connection failure. All 30 connections repeated this cycle
+instead of advancing past malformed articles. The branch dates to July 17
+(`2f45cd5`), so it is an older defect exposed by the current article data,
+separate from the later durability and receipt-refresh changes.
+
+The correction gives transport framing its own persistent `TerminatorScanner`
+across every BODY chunk. Only bytes through the current article's terminator
+reach the decoder or are consumed from the connection. After a decoder error,
+the same scanner discards the rest of that article, then reports one ordinary
+article failure. The next pipelined response remains buffered. Invalid ranges,
+CRC failures, expected lengths and durable writer acknowledgements stay
+enforced; no invalid article is accepted to improve throughput.
+
+Regression coverage must include the observed malformed part range, a plain
+text stub, a malformed article followed by a valid pipelined response in the
+same write, and terminators fragmented across every boundary with dot-stuffed
+content. Capture the pre-fix timeout, then verify prompt article rejection and
+valid successor bytes without a connection failure. The production 0.4
+backport and current-main PR integration need separate source/hash receipts.
+The one-active-download 109 MiB/s acceptance gate remains open.

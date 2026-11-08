@@ -341,9 +341,7 @@ impl Owner {
             crate::automatic_control::invalidate_changed(job);
         }
         self.state.sync_url_admission_receipts();
-        for receipt in &mut self.state.url_admission_receipts {
-            refresh_url_admission_custody(receipt, &self.artifacts);
-        }
+        refresh_url_admission_custodies(&mut self.state.url_admission_receipts, &self.artifacts);
 
         let revision = fresh_epoch();
         let request = Request::Snapshot {

@@ -4144,7 +4144,7 @@ impl Owner {
                                 let updated = artifacts.set_keep_on_failure(job.0, keep)
                                     .map_err(|e| nzbd_state::StateError::Corrupt(format!("artifact inventory: {e}")))?;
                                 if updated {
-                                    for receipt in &mut refreshed_receipts { refresh_url_admission_custody(receipt, &artifacts); }
+                                    refresh_url_admission_custodies(&mut refreshed_receipts, &artifacts);
                                 }
                                 Ok((updated, updated, refreshed_receipts))
                             },
@@ -10065,16 +10065,60 @@ fn refresh_pinned_url_admission_custody(
     receipt: &mut UrlAdmissionReceipt,
     inventory: &nzbd_state::artifacts::Inventory,
 ) -> bool {
-    // Consumer custody is terminal for this receipt. Retention of a separate
-    // processing source cannot reclaim the accepted publication.
-    let Some((artifact_id, source_generation)) = receipt
-        .source_artifact_id
-        .as_deref()
-        .zip(receipt.source_generation.as_deref())
-    else {
+    let Some(artifact_id) = receipt.source_artifact_id.as_deref() else {
         return false;
     };
-    let Ok(artifact) = inventory.get(artifact_id) else {
+    if receipt.source_generation.is_none() {
+        return false;
+    }
+    let Ok(artifact) = inventory.receipt_custody(artifact_id) else {
+        return false;
+    };
+    apply_receipt_custody(receipt, &artifact)
+}
+
+/// Refresh a checkpoint's pinned receipts in one current inventory read.
+/// A single statement keeps one SQLite read transaction across all headers,
+/// avoiding a Gluster file-lock round trip for every individual receipt.
+fn refresh_url_admission_custodies(
+    receipts: &mut [UrlAdmissionReceipt],
+    inventory: &nzbd_state::artifacts::Inventory,
+) -> bool {
+    let mut changed = false;
+    for receipt in receipts.iter_mut() {
+        changed |= pin_unpinned_failed_source(receipt, inventory);
+    }
+    let keys = receipts
+        .iter()
+        .filter(|receipt| receipt.source_generation.is_some())
+        .filter_map(|receipt| receipt.source_artifact_id.clone())
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return changed;
+    }
+    let Ok(custodies) = inventory.receipt_custodies(&keys) else {
+        return changed;
+    };
+    for receipt in receipts {
+        let Some(Ok(custody)) = receipt
+            .source_artifact_id
+            .as_ref()
+            .and_then(|id| custodies.get(id))
+        else {
+            continue;
+        };
+        changed |= apply_receipt_custody(receipt, custody);
+    }
+    changed
+}
+
+fn apply_receipt_custody(
+    receipt: &mut UrlAdmissionReceipt,
+    artifact: &nzbd_state::artifacts::ArtifactCustody,
+) -> bool {
+    // Consumer custody is terminal for this receipt. Retention of a separate
+    // processing source cannot reclaim the accepted publication.
+    let Some(source_generation) = receipt.source_generation.as_deref() else {
         return false;
     };
     if artifact.generation != source_generation {

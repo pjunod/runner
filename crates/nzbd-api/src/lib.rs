@@ -3350,10 +3350,13 @@ mod tests {
             row.get("acceptedAt").is_none(),
             "no acceptance state: {row}"
         );
-        assert_eq!(
-            artifacts.delivery(&delivery.delivery_id).unwrap(),
-            artifacts.delivery(&delivery.delivery_id).unwrap()
-        );
+        // Cleanup can advance concurrently with these requests. Compare the
+        // immutable delivery to the original fixture, rather than racing two
+        // reads of the mutable cleanup progress (or comparing a row to itself).
+        let stored = artifacts.delivery(&delivery.delivery_id).unwrap();
+        let mut expected = delivery.clone();
+        expected.source_cleanup = stored.source_cleanup.clone();
+        assert_eq!(stored, expected);
 
         let retry_cleanup = app
             .oneshot(
