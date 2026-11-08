@@ -100,6 +100,8 @@ async fn replicated_election_task(
             break;
         }
         if let Some(current) = token.take() {
+            #[cfg(test)]
+            tests::pause_before_renewal(&cfg.node).await;
             match control.renew(&current, cfg.takeover_after).await {
                 Ok(Some(renewed)) => {
                     seq = seq.saturating_add(1);
@@ -541,57 +543,85 @@ mod tests {
         drop(tx);
     }
 
+    /// Test-only pause between the loop's cancellation check and the
+    /// renewal write, keyed by election node name. This is the window the
+    /// shutdown race needs: the check passed, then shutdown cancels and
+    /// stops the control store before the renewal is submitted.
+    pub(super) struct RenewalGate {
+        reached: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    static RENEWAL_GATES: std::sync::Mutex<Vec<(String, std::sync::Arc<RenewalGate>)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    pub(super) async fn pause_before_renewal(node: &str) {
+        let gate = RENEWAL_GATES
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(name, _)| name == node)
+            .map(|(_, gate)| gate.clone());
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
     /// Shutdown cancels the election, then stops the replicated control
     /// store before the engine writes its final checkpoint. A renewal that
-    /// was already in flight then fails with "raft stopped". That error is
+    /// passed the cancellation check before shutdown began is submitted
+    /// after the store stopped and fails with "raft stopped". That error is
     /// this node's own shutdown, not lost office: the lease is still valid
     /// until its deadline, so the view must stay "me" and the final
-    /// checkpoint must not be fenced. A one-millisecond interval keeps a
-    /// renewal in flight almost continuously, so the race is hit on nearly
-    /// every round.
+    /// checkpoint must not be fenced.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn renewal_error_after_shutdown_cancel_does_not_demote() {
-        for round in 0..3 {
-            let temp = tempfile::tempdir().unwrap();
-            let control = crate::control::coordinator_protocol_tests::test_store(
-                &temp,
-                &format!("shutdown-renewal-{round}"),
-            )
-            .await;
-            let layout = SharedLayout::new(&temp.path().join("shared"), "new").unwrap();
-            let mut election = cfg("new", 0);
-            election.lease_interval = Duration::from_millis(1);
-            let tracker = TaskTracker::new();
-            let cancel = CancellationToken::new();
-            let mut view = spawn_replicated_election(
-                layout,
-                election,
-                control.clone(),
-                "boot".into(),
-                cancel.clone(),
-                &tracker,
-            );
-            tokio::time::timeout(Duration::from_secs(10), view.wait_for(|v| v.is_me))
-                .await
-                .expect("single voter takes office")
-                .unwrap();
-            // Let several renewals commit so one is in flight below.
-            let renewed = view.borrow().record.as_ref().map_or(0, |r| r.seq);
-            tokio::time::timeout(
-                Duration::from_secs(10),
-                view.wait_for(|v| v.record.as_ref().is_some_and(|r| r.seq >= renewed + 3)),
-            )
+        const NODE: &str = "renewal-interrupted-by-shutdown";
+        let temp = tempfile::tempdir().unwrap();
+        let control =
+            crate::control::coordinator_protocol_tests::test_store(&temp, "shutdown-renewal").await;
+        let layout = SharedLayout::new(&temp.path().join("shared"), NODE).unwrap();
+        let tracker = TaskTracker::new();
+        let cancel = CancellationToken::new();
+        let gate = std::sync::Arc::new(RenewalGate {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        RENEWAL_GATES
+            .lock()
+            .unwrap()
+            .push((NODE.into(), gate.clone()));
+        let mut view = spawn_replicated_election(
+            layout,
+            cfg(NODE, 0),
+            control.clone(),
+            "boot".into(),
+            cancel.clone(),
+            &tracker,
+        );
+        tokio::time::timeout(Duration::from_secs(10), view.wait_for(|v| v.is_me))
             .await
-            .expect("renewals commit")
+            .expect("single voter takes office")
             .unwrap();
-            cancel.cancel();
-            control.shutdown().await.unwrap();
-            tracker.close();
-            tracker.wait().await;
-            assert!(
-                view.borrow().is_me,
-                "round {round}: shutdown's own control stop demoted the leader"
-            );
-        }
+        tokio::time::timeout(Duration::from_secs(10), gate.reached.notified())
+            .await
+            .expect("first renewal reaches the gate");
+        // Exactly ClusterRuntime::shutdown's order: cancel, then stop control.
+        cancel.cancel();
+        control.shutdown().await.unwrap();
+        gate.release.notify_one();
+        tracker.close();
+        tokio::time::timeout(Duration::from_secs(10), tracker.wait())
+            .await
+            .expect("election task exits after shutdown");
+        RENEWAL_GATES
+            .lock()
+            .unwrap()
+            .retain(|(name, _)| name != NODE);
+        assert!(
+            view.borrow().is_me,
+            "shutdown's own control stop demoted the leader"
+        );
     }
 }
