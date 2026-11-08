@@ -131,6 +131,7 @@ people need:
 | [docs/FILE_LIFECYCLE_OPERATIONS.md](docs/FILE_LIFECYCLE_OPERATIONS.md) | What happens to payload bytes: retention, parking, recovery |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design: the whole system, phase by phase, and the ADR summary |
 | [docs/CLUSTERING.md](docs/CLUSTERING.md) | Cluster design (ADR-13…16), failure matrix, operations |
+| [docs/BITTORRENT_RELEASE_REVIEW.md](docs/BITTORRENT_RELEASE_REVIEW.md) | BitTorrent pre-release operations review: current no-go and the sign-off conditions |
 | [STATUS.md](STATUS.md) | What's done, what's next, with commit evidence |
 
 Deployable examples live under [`examples/`](examples/):
