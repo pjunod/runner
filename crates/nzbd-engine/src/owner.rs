@@ -950,6 +950,8 @@ pub(crate) struct Owner {
     retirement_epochs: HashMap<JobId, u64>,
     deferred_replacements: VecDeque<QueueCommand>,
     pending_writer_birth: HashMap<FileId, u64>,
+    #[cfg(test)]
+    work_selection_attempts: usize,
     allocating_jobs: HashSet<JobId>,
     pending_journal_loads: HashMap<JobId, (u64, usize)>,
     pending_control_commits: HashSet<JobId>,
@@ -1053,6 +1055,11 @@ pub(crate) struct Owner {
     state_dir: PathBuf,
     persistence: Persistence,
     persistence_callbacks: HashMap<u64, Continuation>,
+    // Saturated journal admission is covered by one coalesced owner snapshot.
+    // Stop leasing until that snapshot durably covers the latest accepted fact.
+    journal_checkpoint: Option<u64>,
+    journal_checkpoint_inflight: bool,
+    journal_checkpoint_retry_at: Instant,
     journal_suffix: String,
     payload_waiting: VecDeque<PayloadWork>,
     payload_active: HashSet<PathBuf>,
@@ -1466,6 +1473,8 @@ impl Owner {
             retirement_epochs: HashMap::new(),
             deferred_replacements: VecDeque::new(),
             pending_writer_birth: HashMap::new(),
+            #[cfg(test)]
+            work_selection_attempts: 0,
             allocating_jobs: HashSet::new(),
             pending_journal_loads: HashMap::new(),
             pending_control_commits: HashSet::new(),
@@ -1522,6 +1531,9 @@ impl Owner {
                 engine_tx.clone(),
             ),
             persistence_callbacks: HashMap::new(),
+            journal_checkpoint: None,
+            journal_checkpoint_inflight: false,
+            journal_checkpoint_retry_at: Instant::now(),
             io_callbacks: HashMap::new(),
             payload_waiting: VecDeque::new(),
             payload_active: HashSet::new(),
@@ -3265,9 +3277,15 @@ impl Owner {
                 }
                 let generation = fresh_epoch();
                 self.job_epochs.insert(id, generation);
+                // Snapshot publication can race the admission save. Reuse the
+                // export barrier until the durable acceptance callback runs.
+                self.pending_control_revisions.insert(id, generation);
                 let persistent = self.persist;
                 self.persist_then(move |owner, committed| {
                     let current = owner.job_epochs.get(&id) == Some(&generation);
+                    if owner.pending_control_revisions.get(&id) == Some(&generation) {
+                        owner.pending_control_revisions.remove(&id);
+                    }
                     if (!persistent || committed) && current {
                         tracing::info!(job = id.0, %name, %url, "url job added (fetching)");
                         owner.publish_now();
@@ -3285,6 +3303,8 @@ impl Owner {
                                 .unaccepted_admissions
                                 .retain(|_, receipt| receipt.job_id != id.0);
                         }
+                        owner.publish_now();
+                        owner.bump_epoch();
                         let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
                     }
                 });
@@ -6029,7 +6049,11 @@ impl Owner {
     // -- scheduling ----------------------------------------------------------
 
     fn grant_work(&mut self, server_id: ServerId, max: usize) -> Vec<Lease> {
-        if self.cancel.is_cancelled() || self.disk_low || self.is_blocked(server_id) {
+        if self.cancel.is_cancelled()
+            || self.disk_low
+            || self.is_blocked(server_id)
+            || self.journal_checkpoint.is_some()
+        {
             return Vec::new();
         }
         let servers = self.servers.clone();
@@ -6102,6 +6126,10 @@ impl Owner {
                 soft_hold: self.quota_reached,
                 rotate: self.rotate,
             };
+            #[cfg(test)]
+            {
+                self.work_selection_attempts += 1;
+            }
             let result = next_for_server(&self.state, server, &mut ctx);
             let exhausted = result.exhausted;
             let lease = result.lease;
@@ -6111,6 +6139,12 @@ impl Owner {
             let Some(r) = lease else { break };
 
             if let Err(e) = self.ensure_allocation(r.job, false) {
+                if matches!(e, nzbd_state::artifacts::Error::Busy(_)) {
+                    // No allocation was admitted and no callback owns this
+                    // row. Retain it in the queue and yield this bounded batch
+                    // until the payload-capacity wakeup; preserve prior leases.
+                    break;
+                }
                 if self.retiring_writers.contains_key(&r.job)
                     || self.allocating_jobs.contains(&r.job)
                 {
@@ -6131,7 +6165,11 @@ impl Owner {
             }
             let writer = self.writer_for(r.job, r.file);
             let Some(generation) = self.writers.get(&r.file).map(|writer| writer.generation) else {
-                continue;
+                // Only an owner-handled persistence completion can publish the
+                // writer. Yield this batch instead of re-selecting its unchanged
+                // Pending segment once per queued job. Keep any leases already
+                // granted and preserve the active-download cap.
+                break;
             };
             let Some(seg) = self.state.segment_mut(r) else {
                 break;
@@ -7551,6 +7589,7 @@ impl Owner {
 
     fn check_job_complete(&mut self, job_id: JobId) {
         if self.pending_control_commits.contains(&job_id)
+            || self.journal_checkpoint.is_some()
             || self.cancel.is_cancelled()
             || self.verification.contains_key(&job_id)
             || self.retiring_writers.contains_key(&job_id)
@@ -7898,9 +7937,8 @@ impl Owner {
         let record = self
             .state
             .job(job)
-            .cloned()
             .ok_or(nzbd_state::artifacts::Error::NotFound)?;
-        let plan = transitions::imported_payload_plan(&record, &self.dest_dir)
+        let plan = transitions::imported_payload_plan(record, &self.dest_dir)
             .map_err(|error| nzbd_state::artifacts::Error::Conflict(error.to_string()))?;
         if self.allocated_jobs.contains(&job)
             && self.allocation_cache.get(&job).is_some_and(|allocation| {
@@ -7915,6 +7953,14 @@ impl Owner {
                 "payload allocation pending".into(),
             ));
         }
+        if !self.payload_capacity_available() {
+            return Err(nzbd_state::artifacts::Error::Busy(
+                "payload allocation awaits lane capacity",
+            ));
+        }
+        // Cache hits need only the plan above, not a clone of every file and
+        // segment. Own the descriptor only when scheduling an actual allocation.
+        let record = record.clone();
         let inventory = self.artifacts.clone();
         let root = self.dest_dir.clone();
         let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
@@ -7971,6 +8017,10 @@ impl Owner {
                         owner.allocation_cache.insert(job, allocation);
                         owner.allocated_jobs.insert(job);
                         owner.bump_epoch();
+                    }
+                    Err(nzbd_state::StateError::Busy(_)) => {
+                        // The action never started. The scheduler retains the
+                        // row and will retry on the payload capacity wakeup.
                     }
                     Err(error) => {
                         owner.hold_job(
@@ -8801,6 +8851,7 @@ impl Owner {
         let publish_ms = t.elapsed().as_millis() as u64;
 
         let sync_started = Instant::now();
+        self.retry_journal_checkpoint();
         self.sync_journal();
         let sync_ms = sync_started.elapsed().as_millis() as u64;
 
@@ -9900,7 +9951,7 @@ impl Owner {
     }
 
     fn save_snapshot(&mut self) {
-        if self.background_save_pending {
+        if self.background_save_pending || self.journal_checkpoint.is_some() {
             return;
         }
         self.background_save_pending = true;

@@ -35,6 +35,7 @@ pub use lifecycle::frozen_lifecycle_timing;
 mod owner;
 mod pool;
 mod recovery;
+mod url_dispatch;
 mod writer;
 
 pub use events::Event;
@@ -554,10 +555,9 @@ impl Engine {
                 }
             });
         }
-        // Jobs recovered mid-fetch: their fetch tasks died with the old
-        // process — re-spawn one per unique URL below (once the handle
-        // exists) and fail same-URL pile-ups as duplicates.
-        let (refetch, refetch_dupes) =
+        // Preserve the one-shot legacy duplicate decision. Normal execution
+        // is reconciled from the snapshot by the URL dispatcher below.
+        let (_, refetch_dupes) =
             crate::owner::plan_url_refetches_scoped(owner.pending_url_fetches());
 
         // Multi-root free-space prober — OFF the owner loop and startup
@@ -649,6 +649,7 @@ impl Engine {
             backend_adapter: Arc::new(std::sync::Mutex::new(Some(backend_adapter))),
             budget_tracker,
             url_fetches: Arc::new(Mutex::new(HashSet::new())),
+            url_fetch_wakeup: Arc::new(tokio::sync::Notify::new()),
             hold_probes: Arc::new(Mutex::new(HashSet::new())),
             recovery_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             post_scope: None,
@@ -663,23 +664,9 @@ impl Engine {
             .tracker
             .spawn(hold_recovery::run(handle.clone(), handle.cancel.clone()));
 
-        for (job, url) in refetch {
-            tracing::info!(job = job.0, %url, "re-spawning NZB fetch for job recovered mid-fetch");
-            // Startup verification may still own this recovered row. The
-            // fetch task reads its durable retry state once that row is ready.
-            handle.spawn_url_fetch(job, url, crate::fetch::FetchRetryState::default());
-        }
-        for (job, original) in refetch_dupes {
-            let h = handle.clone();
-            handle.tracker.spawn(async move {
-                let _ = h
-                    .fail_url_fetch(
-                        job,
-                        format!("duplicate of job #{} (same URL was re-added)", original.0),
-                    )
-                    .await;
-            });
-        }
+        handle
+            .tracker
+            .spawn(url_dispatch::run(handle.clone(), refetch_dupes));
 
         Ok(handle)
     }
@@ -779,6 +766,7 @@ pub struct EngineHandle {
     backend_adapter: Arc<std::sync::Mutex<Option<backend::BackendAdapterPort>>>,
     budget_tracker: Arc<pool::BudgetTracker>,
     url_fetches: Arc<Mutex<HashSet<JobId>>>,
+    url_fetch_wakeup: Arc<tokio::sync::Notify>,
     hold_probes: Arc<Mutex<HashSet<JobId>>>,
     recovery_cursor: Arc<std::sync::atomic::AtomicUsize>,
     post_scope: Option<PostAdmission>,
@@ -790,13 +778,38 @@ pub struct EngineHandle {
 struct UrlFetchGuard {
     jobs: Arc<Mutex<HashSet<JobId>>>,
     job: JobId,
+    wakeup: Arc<tokio::sync::Notify>,
+    phase: &'static str,
+    identity: Option<String>,
+    shared: SharedSnapshot,
+    cancel: CancellationToken,
 }
 
 impl Drop for UrlFetchGuard {
     fn drop(&mut self) {
-        if let Ok(mut jobs) = self.jobs.lock() {
-            jobs.remove(&self.job);
+        match self.jobs.lock() {
+            Ok(mut jobs) => {
+                jobs.remove(&self.job);
+            }
+            Err(poisoned) => {
+                tracing::error!(job = self.job.0, "URL executor set poisoned during release");
+                poisoned.into_inner().remove(&self.job);
+            }
         }
+        let pending = self
+            .shared
+            .load()
+            .jobs
+            .iter()
+            .any(|job| job.id == self.job && job.status == nzbd_types::JobStatus::Fetching);
+        if pending && !self.cancel.is_cancelled() {
+            tracing::warn!(job=self.job.0, identity=?self.identity, phase=self.phase,
+                panicking=std::thread::panicking(), "URL fetch worker exited with admission still pending");
+        } else {
+            tracing::debug!(job=self.job.0, identity=?self.identity, phase=self.phase,
+                "URL fetch worker exited");
+        }
+        self.wakeup.notify_one();
     }
 }
 
@@ -1138,14 +1151,9 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        let (id, created) = rx.await.map_err(|_| EngineError::Closed)??;
-        if created {
-            self.spawn_url_fetch(
-                id,
-                url.to_string(),
-                crate::fetch::FetchRetryState::default(),
-            );
-        }
+        let (id, _created) = rx.await.map_err(|_| EngineError::Closed)??;
+        // Dispatch follows the owner's committed snapshot/epoch, independently
+        // of whether this caller survives to receive the admission reply.
         Ok(id)
     }
 
@@ -1167,17 +1175,34 @@ impl EngineHandle {
     /// Background NZB download for a URL job. Shutdown-aware: an in-flight
     /// fetch aborts on cancel instead of holding graceful shutdown open for
     /// up to the 60 s hop timeout.
-    fn spawn_url_fetch(&self, id: JobId, url: String, _retry_state: crate::fetch::FetchRetryState) {
-        if !self
-            .url_fetches
-            .lock()
-            .is_ok_and(|mut jobs| jobs.insert(id))
-        {
-            return;
+    fn spawn_url_fetch(&self, id: JobId) -> bool {
+        self.spawn_url_acquisition(id, None)
+    }
+
+    fn spawn_url_acquisition(&self, id: JobId, duplicate_of: Option<JobId>) -> bool {
+        let mut jobs = self.url_fetches.lock().unwrap_or_else(|poisoned| {
+            tracing::error!(job = id.0, "URL executor set poisoned during acquisition");
+            poisoned.into_inner()
+        });
+        if !jobs.insert(id) {
+            return false;
         }
+        drop(jobs);
         let handle = self.clone();
         self.tracker.spawn(async move {
-            let _fetch_guard = UrlFetchGuard { jobs: handle.url_fetches.clone(), job: id };
+            let mut fetch_guard = UrlFetchGuard {
+                jobs: handle.url_fetches.clone(), job: id,
+                wakeup: handle.url_fetch_wakeup.clone(), phase: "initial owner lookup",
+                identity: None, shared: handle.shared.clone(), cancel: handle.cancel.clone(),
+            };
+            if let Some(original) = duplicate_of {
+                fetch_guard.phase = "startup duplicate disposition";
+                if let Err(error) = handle.fail_url_fetch(id,
+                    format!("duplicate of job #{} (same URL was re-added)", original.0)).await {
+                    tracing::warn!(job=id.0, %error, "startup URL duplicate disposition interrupted");
+                }
+                return;
+            }
             let mut changes = handle.queue_changes.clone();
             let origin = loop {
                 match handle.export_job(id).await {
@@ -1188,11 +1213,22 @@ impl EngineHandle {
                             result = changes.changed() => if result.is_err() { return; },
                         }
                     }
-                    _ => return,
+                    Ok(None) => { tracing::debug!(job=id.0, "URL admission disappeared before fetch"); return; }
+                    Err(error) => { tracing::warn!(job=id.0, %error, "URL source lookup interrupted; pending admission will retry"); return; }
                 }
+            };
+            if origin.status != nzbd_types::JobStatus::Fetching || origin.held() {
+                fetch_guard.phase = "admission resolved or held";
+                return;
+            }
+            let Some(url) = origin.params.iter().find(|(key, _)| key == "*URL")
+                .map(|(_, url)| url.clone()) else {
+                tracing::error!(job=id.0, "fetching URL admission has no source URL"); return;
             };
             let retry_state = fetch_retry_state(&origin);
             let identity = match nzbd_state::artifacts::url_source_identity(&origin) { Ok(identity) => identity, Err(_) => return };
+            fetch_guard.identity = Some(identity.clone());
+            fetch_guard.phase = "cached source read";
             let mut storage_retry = nzbd_state::artifacts::UrlStorageRetry::default();
             let retry_store = handle.url_resolutions.clone(); let retry_id = identity.clone();
             if let Ok(Ok(Some(retry))) = tokio::task::spawn_blocking(move || retry_store.retry(&retry_id)).await {
@@ -1216,6 +1252,7 @@ impl EngineHandle {
                 }
             };
             if received.is_none() && failure.is_none() {
+                fetch_guard.phase = "HTTP acquisition";
                 let mut events = handle.subscribe();
                 let fetched = tokio::select! {
                     _ = handle.cancel.cancelled() => return,
@@ -1234,11 +1271,16 @@ impl EngineHandle {
                             let handle = progress_handle.clone(); let origin = progress_origin.clone(); let identity = progress_identity.clone();
                             async move {
                                 let mut retry = nzbd_state::artifacts::UrlStorageRetry::default();
+                                let mut coordination_attempt = 0;
                                 loop {
                                     if handle.cancel.is_cancelled() { return false; }
                                     match handle.record_url_fetch_progress(id, progress.clone()).await {
                                         Ok(active) => return active,
                                         Err(EngineError::OwnershipLost | EngineError::Closed) => return false,
+                                        Err(error @ EngineError::Timeout(_)) => {
+                                            if !handle.wait_url_coordination_retry(id, &error, coordination_attempt).await { return false; }
+                                            coordination_attempt = coordination_attempt.saturating_add(1);
+                                        }
                                         Err(error) => if !handle.wait_url_storage_retry_after(&origin, &identity, &error.to_string(), &mut retry, progress.next_retry_at).await { return false; },
                                     }
                                 }
@@ -1264,6 +1306,7 @@ impl EngineHandle {
                 received = None;
             }
             if let Some(mut bytes) = received {
+                fetch_guard.phase = "source cache publication";
                 loop {
                     let store = handle.url_resolutions.clone(); let source_origin = origin.clone();
                     // Move the one received buffer through storage retries;
@@ -1283,11 +1326,18 @@ impl EngineHandle {
                     }
                 }
             }
+            let mut coordination_attempt = 0;
             loop {
                 if handle.cancel.is_cancelled() { return; }
+                fetch_guard.phase = "resolution preparation";
                 let prepared = match handle.prepare_url_resolution(&origin, failure.clone(), fetch_cause).await {
                     Ok(prepared) => prepared,
                     Err(EngineError::OwnershipLost | EngineError::Closed) => return,
+                    Err(error @ EngineError::Timeout(_)) => {
+                        if !handle.wait_url_coordination_retry(id, &error, coordination_attempt).await { return; }
+                        coordination_attempt = coordination_attempt.saturating_add(1);
+                        continue;
+                    }
                     Err(EngineError::Lifecycle(message)) => {
                         // Size/identity/parse constraints are permanent for this
                         // input. Persist an actionable failed disposition once.
@@ -1306,10 +1356,18 @@ impl EngineHandle {
                     }
                 };
                 let (tx, rx) = oneshot::channel();
-                if handle.send(QueueCommand::CompleteUrlFetch { job: id, source_identity: identity.clone(), prepared: Box::new(prepared), reply: tx }).await.is_err() { return; }
+                fetch_guard.phase = "resolution enqueue";
+                if let Err(error) = handle.send(QueueCommand::CompleteUrlFetch { job: id, source_identity: identity.clone(), prepared: Box::new(prepared), reply: tx }).await {
+                    tracing::warn!(job=id.0, identity=%identity, %error, "URL resolution enqueue interrupted; cached source retained for retry");
+                    return;
+                }
+                fetch_guard.phase = "resolution acknowledgement";
+                // This is an issued mutation, not a disposable read. Receive
+                // its actual result so retry never overlaps a pending commit.
                 match rx.await {
                     Ok(Ok(true)) => {
                         if !handle.url_outbox_external {
+                            fetch_guard.phase = "outbox compaction";
                             loop {
                                 let store = handle.url_resolutions.clone(); let acknowledgement = identity.clone();
                                 match tokio::task::spawn_blocking(move || store.acknowledge(&acknowledgement)).await {
@@ -1325,6 +1383,22 @@ impl EngineHandle {
                 }
             }
         });
+        true
+    }
+
+    async fn wait_url_coordination_retry(
+        &self,
+        job: JobId,
+        error: &EngineError,
+        attempt: u32,
+    ) -> bool {
+        let delay = url_dispatch::retry_delay(attempt);
+        tracing::warn!(job=job.0, %error, delay_secs=delay.as_secs(),
+            "URL coordination interrupted; retrying without a storage failure");
+        tokio::select! {
+            _ = self.cancel.cancelled() => false,
+            _ = tokio::time::sleep(delay) => true,
+        }
     }
 
     async fn wait_url_storage_retry(
@@ -1539,16 +1613,9 @@ impl EngineHandle {
     /// job remains `Fetching`, and the control adapter revision-checks the
     /// single winning resolution.
     pub async fn resume_url_fetches(&self) -> Result<(), EngineError> {
-        for summary in &self.snapshot().jobs {
-            if summary.status != nzbd_types::JobStatus::Fetching {
-                continue;
-            }
-            if let Some(job) = self.export_job(summary.id).await? {
-                if let Some((_, url)) = job.params.iter().find(|(key, _)| key == "*URL") {
-                    self.spawn_url_fetch(job.id, url.clone(), fetch_retry_state(&job));
-                }
-            }
-        }
+        // A single slow row must not prevent the remaining rows from resuming.
+        // The dispatcher reads the local snapshot without owner round trips.
+        self.url_fetch_wakeup.notify_one();
         Ok(())
     }
 

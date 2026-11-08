@@ -206,10 +206,10 @@ async fn blocked_io_lane_preserves_actor_reads_and_noop_controls_without_faking_
             .status,
         JobStatus::Paused
     );
-    let verification_after = owner.verification[&JobId(1)].progress();
-    assert_eq!(verification_after.reason, None);
-    assert_eq!(verification_after.checked_bytes, 0);
-    assert_eq!(verification_after.total_bytes, 0);
+    assert!(
+        !owner.verification.contains_key(&JobId(1)),
+        "after metadata recovery, this zero-claim row needs no checksum ticket"
+    );
 }
 
 #[tokio::test]
@@ -287,6 +287,7 @@ async fn engine_shutdown_drains_real_writer_acknowledgement_behind_full_result_c
         backend_adapter: Arc::new(std::sync::Mutex::new(Some(adapter))),
         budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
         url_fetches: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        url_fetch_wakeup: Default::default(),
         post_scope: None,
         queue_changes: owner.epoch_tx.subscribe(),
         owner_heartbeat: owner.owner_heartbeat.clone(),
@@ -4793,6 +4794,9 @@ async fn storage_retry_record_failure_keeps_provider_floor_in_live_fallback() {
     job.files.clear();
     job.params
         .push(("*URL".into(), "http://example.test/source.nzb".into()));
+    // This fixture is itself the acquisition worker: reserve its slot before
+    // import so the new dispatcher cannot run a competing progress producer.
+    engine.url_fetches.lock().unwrap().insert(job.id);
     engine.import_job(job.clone(), false, false).await.unwrap();
     let identity = nzbd_state::artifacts::url_source_identity(&job).unwrap();
     std::fs::create_dir(state.join("url-resolutions/retries").join(&identity)).unwrap();
@@ -4815,6 +4819,7 @@ async fn storage_retry_record_failure_keeps_provider_floor_in_live_fallback() {
             loop { let job = engine.export_job(JobId(87)).await.unwrap().unwrap(); if job.params.iter().any(|(key,value)| key == crate::fetch::NEXT_RETRY_PARAM && value.parse::<i64>().ok().is_some_and(|deadline| deadline >= floor)) { break; } tokio::task::yield_now().await; }
         }).await.expect("failed retry-record persistence must still honor the provider floor in the live scheduled progress");
     engine.cancel.cancel();
+    engine.url_fetches.lock().unwrap().remove(&JobId(87));
     let fallback = retrying.await.unwrap();
     assert_eq!(fallback.attempts, 1);
     assert!(fallback.next_retry_at >= floor);
@@ -5317,10 +5322,18 @@ async fn public_delete_cancels_pending_verification_and_retains_payload() {
     row.status = JobStatus::Paused;
     let source = owner.dest_dir.join(&row.dir_name);
     let payload = source.join("payload.bin");
-    owner
+    let allocation = owner
         .artifacts
         .allocate_for_delivery(41, &owner.dest_dir, &source, true, false)
         .unwrap();
+    owner.allocation_cache.insert(JobId(41), allocation);
+    owner.allocated_jobs.insert(JobId(41));
+    row.files[0].segments[0].state = SegmentState::Done {
+        offset: 0,
+        len: 17,
+        crc: crc32fast::hash(b"retained download"),
+    };
+    recompute_job_totals(&mut row);
     std::fs::write(&payload, b"retained download").unwrap();
     owner.state.jobs.push(row);
     owner.queue_verification(JobId(41));
@@ -5347,6 +5360,7 @@ async fn public_delete_cancels_pending_verification_and_retains_payload() {
         backend_adapter: Arc::new(std::sync::Mutex::new(Some(adapter))),
         budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
         url_fetches: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        url_fetch_wakeup: Default::default(),
         post_scope: None,
         queue_changes: owner.epoch_tx.subscribe(),
         owner_heartbeat: owner.owner_heartbeat.clone(),
@@ -5448,6 +5462,7 @@ async fn automatic_hold_recovery_bounds_each_pass_and_rotates_all_due_jobs() {
         backend_adapter: Arc::new(std::sync::Mutex::new(Some(adapter))),
         budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
         url_fetches: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        url_fetch_wakeup: Default::default(),
         post_scope: None,
         queue_changes: owner.epoch_tx.subscribe(),
         owner_heartbeat: owner.owner_heartbeat.clone(),
@@ -7807,4 +7822,651 @@ async fn newer_hold_replaces_the_first_cause() {
         second.deadline_unix, first.deadline_unix,
         "the deadline runs from the episode's start"
     );
+}
+
+// URL dispatch uses the real owner/persistence lanes. Faults below hold or
+// saturate the actual bounded control channel, rather than faking HTTP errors.
+fn url_dispatch_test_handle(
+    owner: &Owner,
+    adapter: crate::backend::BackendAdapterPort,
+) -> crate::EngineHandle {
+    crate::EngineHandle {
+        artifacts: owner.artifacts.clone(),
+        url_resolutions: owner.url_resolutions.clone(),
+        url_dest_dir: owner.dest_dir.clone(),
+        import_state_dir: owner.state_dir.clone(),
+        url_history: owner.history.clone(),
+        url_outbox_external: owner.persist_guard.is_some(),
+        owner_persist_guard: owner.persist_guard.clone(),
+        native_seed_recovery_cursor: Default::default(),
+        cmd_tx: owner.engine_tx.clone(),
+        shared: owner.shared.clone(),
+        events: owner.events.clone(),
+        cancel: owner.cancel.clone(),
+        tracker: owner.tracker.clone(),
+        backend_adapter: Arc::new(std::sync::Mutex::new(Some(adapter))),
+        budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
+        url_fetches: Default::default(),
+        url_fetch_wakeup: Default::default(),
+        hold_probes: Default::default(),
+        recovery_cursor: Default::default(),
+        post_scope: None,
+        queue_changes: owner.epoch_tx.subscribe(),
+        owner_heartbeat: owner.owner_heartbeat.clone(),
+        shutdown_complete: owner.shutdown_complete.clone(),
+    }
+}
+
+const DISPATCH_NZB: &str = r#"<?xml version="1.0"?><nzb><file poster="test" date="0" subject="&quot;one.bin&quot; yEnc (1/1)"><groups><group>alt.test</group></groups><segments><segment bytes="5" number="1">one@test</segment></segments></file></nzb>"#;
+
+fn dispatch_test_backoff(_: u32) -> Duration {
+    Duration::from_millis(20)
+}
+
+async fn drive_url_dispatch_until(
+    owner: &mut Owner,
+    messages: &mut mpsc::Receiver<EngineMsg>,
+    ids: &[JobId],
+) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while ids.iter().any(|id| {
+            owner
+                .state
+                .job(*id)
+                .is_some_and(|job| job.status == JobStatus::Fetching)
+        }) {
+            owner.on_msg(messages.recv().await.unwrap());
+        }
+        pump(owner, messages).await;
+    })
+    .await
+    .expect("fetching admissions must progress after coordination recovers");
+}
+
+#[tokio::test]
+async fn url_dispatch_owner_timeout_does_not_orphan_or_starve_takeover_rows() {
+    let (_tmp, mut owner, adapter, mut messages) = control_test_owner();
+    let first = owner
+        .state
+        .admit_url("first".into(), "http://127.0.0.1:9/first.nzb", None, 0);
+    let second = owner
+        .state
+        .admit_url("second".into(), "http://127.0.0.1:9/second.nzb", None, 0);
+    for id in [first, second] {
+        owner
+            .url_resolutions
+            .cache_source(owner.state.job(id).unwrap(), DISPATCH_NZB.as_bytes())
+            .unwrap();
+    }
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    let handle = url_dispatch_test_handle(&owner, adapter);
+    let dispatcher = tokio::spawn(crate::url_dispatch::run_with_retry(
+        handle.clone(),
+        vec![],
+        dispatch_test_backoff,
+    ));
+    // Takeover no longer exports rows sequentially or fails the entire list.
+    handle.resume_url_fetches().await.unwrap();
+    let mut delayed = None;
+    let mut first_lookups = 0;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while [first, second]
+            .iter()
+            .any(|id| owner.state.job(*id).unwrap().status == JobStatus::Fetching)
+        {
+            let message = messages.recv().await.unwrap();
+            match message {
+                EngineMsg::Command(QueueCommand::ExportJob { job, reply }) if job == first => {
+                    first_lookups += 1;
+                    if delayed.is_none() {
+                        delayed = Some(reply);
+                    } else {
+                        assert_ne!(
+                            owner.state.job(second).unwrap().status,
+                            JobStatus::Fetching,
+                            "one stalled lookup must not block the rest of the takeover list"
+                        );
+                        owner.on_command(QueueCommand::ExportJob { job, reply });
+                    }
+                }
+                message => owner.on_msg(message),
+            }
+        }
+        pump(&mut owner, &mut messages).await;
+    })
+    .await
+    .unwrap();
+    assert_eq!(first_lookups, 2);
+    assert!(delayed
+        .unwrap()
+        .send(Some(Box::new(owner.state.job(first).unwrap().clone())))
+        .is_err());
+    assert_eq!(owner.state.job(first).unwrap().status, JobStatus::Queued);
+    assert_eq!(owner.state.job(second).unwrap().status, JobStatus::Queued);
+    handle.cancel.cancel();
+    dispatcher.await.unwrap();
+}
+
+#[tokio::test]
+async fn url_dispatch_complete_enqueue_timeout_reuses_cached_source() {
+    let (_tmp, mut owner, adapter, mut messages) = control_test_owner();
+    let id = owner.state.admit_url(
+        "cached".into(),
+        "http://127.0.0.1:9/never-refetch.nzb",
+        None,
+        0,
+    );
+    let origin = owner.state.job(id).unwrap().clone();
+    let identity = nzbd_state::artifacts::url_source_identity(&origin).unwrap();
+    owner
+        .url_resolutions
+        .cache_source(&origin, DISPATCH_NZB.as_bytes())
+        .unwrap();
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    let handle = url_dispatch_test_handle(&owner, adapter);
+    let dispatcher = tokio::spawn(crate::url_dispatch::run_with_retry(
+        handle.clone(),
+        vec![],
+        dispatch_test_backoff,
+    ));
+    // Fill the one-slot owner channel immediately after file-ID reservation;
+    // source preparation can finish, but CompleteUrlFetch cannot enqueue.
+    loop {
+        let message = messages.recv().await.unwrap();
+        let reserved = matches!(
+            message,
+            EngineMsg::Command(QueueCommand::ReserveUrlFiles { .. })
+        );
+        owner.on_msg(message);
+        if reserved {
+            owner
+                .engine_tx
+                .try_send(EngineMsg::ConnectFailed {
+                    server: ServerId(99),
+                })
+                .unwrap();
+            break;
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while owner.url_resolutions.record(&identity).unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert_eq!(owner.state.job(id).unwrap().status, JobStatus::Fetching);
+    assert_eq!(
+        owner.url_resolutions.source(&origin).unwrap().unwrap(),
+        DISPATCH_NZB.as_bytes()
+    );
+    drive_url_dispatch_until(&mut owner, &mut messages, &[id]).await;
+    assert_eq!(
+        owner.state.job(id).unwrap().status,
+        JobStatus::Queued,
+        "the dead provider URL must not be requested when the source is cached"
+    );
+    handle.cancel.cancel();
+    dispatcher.await.unwrap();
+}
+
+#[tokio::test]
+async fn url_dispatch_admission_export_waits_for_durability_and_failed_save_removes_row() {
+    for fail in [false, true] {
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
+        if fail {
+            std::fs::create_dir(owner.state_dir.join("queue.json.tmp")).unwrap();
+        }
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::AddUrl {
+            name: "pending-save".into(),
+            url: "http://127.0.0.1:9/pending.nzb".into(),
+            category: None,
+            priority: 0,
+            dupe: None,
+            paused: false,
+            params: vec![],
+            reply,
+        });
+        let id = owner.state.jobs.last().unwrap().id;
+        // Force publication while the acceptance continuation is still pending.
+        owner.publish_snapshot(0);
+        let (reply, export) = oneshot::channel();
+        owner.on_command(QueueCommand::ExportJob { job: id, reply });
+        assert!(
+            export.await.unwrap().is_none(),
+            "no pre-commit source descriptor may escape"
+        );
+        pump(&mut owner, &mut messages).await;
+        assert!(!owner.pending_control_revisions.contains_key(&id));
+        if fail {
+            assert!(result.await.unwrap().is_err());
+            assert!(owner.state.job(id).is_none());
+            assert!(owner.shared.load().jobs.iter().all(|job| job.id != id));
+        } else {
+            assert!(result.await.unwrap().is_ok());
+            let (reply, export) = oneshot::channel();
+            owner.on_command(QueueCommand::ExportJob { job: id, reply });
+            assert!(export.await.unwrap().is_some());
+        }
+    }
+}
+
+#[tokio::test]
+async fn url_dispatch_survives_abandoned_admission_reply_and_preserves_add_paused() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let temporary = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        DISPATCH_NZB.len(),
+                        DISPATCH_NZB
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let handle = crate::Engine::spawn(crate::EngineConfig::single_node(
+        vec![],
+        temporary.path().join("state"),
+        temporary.path().join("dest"),
+        Tuning::default(),
+        None,
+    ))
+    .await
+    .unwrap();
+    for (index, paused) in [false, true].into_iter().enumerate() {
+        let (reply, abandoned) = oneshot::channel();
+        drop(abandoned);
+        handle
+            .send(QueueCommand::AddUrl {
+                name: format!("abandoned-{index}"),
+                url: format!("{base}/{index}.nzb"),
+                category: None,
+                priority: 0,
+                dupe: None,
+                paused,
+                params: vec![],
+                reply,
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = handle.snapshot();
+            if snapshot.jobs.len() == 2
+                && snapshot
+                    .jobs
+                    .iter()
+                    .all(|job| job.status != JobStatus::Fetching)
+            {
+                assert_eq!(snapshot.jobs[0].status, JobStatus::Queued);
+                assert_eq!(snapshot.jobs[1].status, JobStatus::Paused);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    server.await.unwrap();
+    assert!(handle.shutdown().await);
+}
+
+#[tokio::test]
+async fn url_dispatch_repeated_worker_exits_back_off_despite_coalesced_wakeups() {
+    let (_tmp, mut owner, adapter, mut messages) = control_test_owner();
+    let id = owner
+        .state
+        .admit_url("retry".into(), "http://127.0.0.1:9/retry.nzb", None, 0);
+    owner
+        .url_resolutions
+        .cache_source(owner.state.job(id).unwrap(), DISPATCH_NZB.as_bytes())
+        .unwrap();
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    let handle = url_dispatch_test_handle(&owner, adapter);
+    let dispatcher = tokio::spawn(crate::url_dispatch::run_with_retry(
+        handle.clone(),
+        vec![],
+        dispatch_test_backoff,
+    ));
+    let mut starts = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while owner.state.job(id).unwrap().status == JobStatus::Fetching {
+            let message = messages.recv().await.unwrap();
+            match message {
+                EngineMsg::Command(QueueCommand::ExportJob { job, reply }) => {
+                    starts.push(tokio::time::Instant::now());
+                    assert_eq!(job, id);
+                    if starts.len() <= 3 {
+                        // A closed reply ends the worker but not the obligation.
+                        drop(reply);
+                        for _ in 0..100 {
+                            handle.resume_url_fetches().await.unwrap();
+                            owner.bump_epoch();
+                        }
+                    } else {
+                        owner.on_command(QueueCommand::ExportJob { job, reply });
+                    }
+                }
+                message => owner.on_msg(message),
+            }
+        }
+        pump(&mut owner, &mut messages).await;
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        starts.len(),
+        4,
+        "coalesced hints must not start duplicate executors"
+    );
+    for pair in starts.windows(2) {
+        assert!(pair[1].duration_since(pair[0]) >= dispatch_test_backoff(0));
+    }
+    handle.cancel.cancel();
+    dispatcher.await.unwrap();
+}
+
+#[tokio::test]
+async fn url_dispatch_deletion_between_snapshot_and_lookup_does_not_respawn() {
+    let (_tmp, mut owner, adapter, mut messages) = control_test_owner();
+    let id = owner
+        .state
+        .admit_url("delete".into(), "http://127.0.0.1:9/deleted.nzb", None, 0);
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    let handle = url_dispatch_test_handle(&owner, adapter);
+    let dispatcher = tokio::spawn(crate::url_dispatch::run_with_retry(
+        handle.clone(),
+        vec![],
+        dispatch_test_backoff,
+    ));
+    let message = messages.recv().await.unwrap();
+    assert!(matches!(
+        message,
+        EngineMsg::Command(QueueCommand::ExportJob { .. })
+    ));
+    owner.state.jobs.retain(|job| job.id != id);
+    owner.on_msg(message);
+    owner.publish_snapshot(0);
+    owner.bump_epoch();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handle.url_fetches.lock().unwrap().contains(&id) {
+            tokio::select! {
+                message = messages.recv() => owner.on_msg(message.unwrap()),
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {},
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), messages.recv())
+            .await
+            .is_err(),
+        "an absent row must not produce another owner lookup"
+    );
+    assert!(owner.url_resolutions.pending(10).unwrap().is_empty());
+    handle.cancel.cancel();
+    dispatcher.await.unwrap();
+}
+
+#[tokio::test]
+async fn url_dispatch_authority_gate_defers_fetch_until_takeover_wakeup() {
+    let (_tmp, mut owner, adapter, mut messages) = control_test_owner();
+    let id = owner.state.admit_url(
+        "authority".into(),
+        "http://127.0.0.1:9/authority.nzb",
+        None,
+        0,
+    );
+    owner
+        .url_resolutions
+        .cache_source(owner.state.job(id).unwrap(), DISPATCH_NZB.as_bytes())
+        .unwrap();
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    let mut handle = url_dispatch_test_handle(&owner, adapter);
+    let authority = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let check = authority.clone();
+    handle.url_outbox_external = true;
+    handle.owner_persist_guard = Some(Arc::new(move || {
+        check.load(std::sync::atomic::Ordering::SeqCst)
+    }));
+    let dispatcher = tokio::spawn(crate::url_dispatch::run_with_retry(
+        handle.clone(),
+        vec![],
+        dispatch_test_backoff,
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), messages.recv())
+            .await
+            .is_err()
+    );
+    assert!(handle.url_fetches.lock().unwrap().is_empty());
+    authority.store(true, std::sync::atomic::Ordering::SeqCst);
+    handle.resume_url_fetches().await.unwrap();
+    drive_url_dispatch_until(&mut owner, &mut messages, &[id]).await;
+    handle.cancel.cancel();
+    dispatcher.await.unwrap();
+}
+
+#[tokio::test]
+async fn url_dispatch_progress_timeout_is_not_a_storage_failure() {
+    let (_tmp, mut owner, adapter, mut messages) = control_test_owner();
+    let id = owner.state.admit_url(
+        "progress".into(),
+        "http://127.0.0.1:9/progress.nzb",
+        None,
+        0,
+    );
+    let identity =
+        nzbd_state::artifacts::url_source_identity(owner.state.job(id).unwrap()).unwrap();
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    let handle = url_dispatch_test_handle(&owner, adapter);
+    let dispatcher = tokio::spawn(crate::url_dispatch::run_with_retry(
+        handle.clone(),
+        vec![],
+        dispatch_test_backoff,
+    ));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match messages.recv().await.unwrap() {
+                EngineMsg::Command(QueueCommand::UpdateUrlFetchProgress { reply, .. }) => {
+                    reply
+                        .send(Err(crate::EngineError::Timeout(
+                            "injected coordination delay",
+                        )))
+                        .unwrap();
+                    break;
+                }
+                message => owner.on_msg(message),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // Yield to the callback. It must retain the operation in a volatile
+    // coordination wait, without scheduling a durable storage failure.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(handle.url_fetches.lock().unwrap().contains(&id));
+    assert!(owner.url_resolutions.retry(&identity).unwrap().is_none());
+    assert!(owner
+        .state
+        .job(id)
+        .unwrap()
+        .params
+        .iter()
+        .all(|(key, _)| key != crate::fetch::LAST_ERROR_PARAM));
+    handle.cancel.cancel();
+    dispatcher.await.unwrap();
+}
+
+#[tokio::test]
+async fn url_dispatch_lifecycle_hold_blocks_acquisition_until_release() {
+    let (_tmp, mut owner, adapter, mut messages) = control_test_owner();
+    let id = owner
+        .state
+        .admit_url("held".into(), "http://127.0.0.1:9/held.nzb", None, 0);
+    owner
+        .url_resolutions
+        .cache_source(owner.state.job(id).unwrap(), DISPATCH_NZB.as_bytes())
+        .unwrap();
+    owner.hold_job(
+        id,
+        nzbd_types::HoldCause::StorageUnavailable,
+        "fetch",
+        "test hold",
+    );
+    pump(&mut owner, &mut messages).await;
+    // Exercise the control gate independently of today's legacy Paused
+    // projection, so a future native held status cannot bypass the check.
+    owner.state.job_mut(id).unwrap().status = JobStatus::Fetching;
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    let handle = url_dispatch_test_handle(&owner, adapter);
+    let dispatcher = tokio::spawn(crate::url_dispatch::run_with_retry(
+        handle.clone(),
+        vec![],
+        dispatch_test_backoff,
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), messages.recv())
+            .await
+            .is_err()
+    );
+    assert!(handle.url_fetches.lock().unwrap().is_empty());
+    owner
+        .state
+        .job_mut(id)
+        .unwrap()
+        .params
+        .retain(|(key, _)| key != nzbd_types::CONTROL_PARAM);
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    owner.bump_epoch();
+    drive_url_dispatch_until(&mut owner, &mut messages, &[id]).await;
+    handle.cancel.cancel();
+    dispatcher.await.unwrap();
+}
+
+async fn check_pending_writer_yields_owner_without_rescanning(post_fetch: bool) {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    install_control_test_server(&mut owner);
+    owner.state.max_active_downloads = 1;
+    owner.state.jobs = vec![pending_job(1), pending_job(2)];
+    for id in [JobId(1), JobId(2)] {
+        allocate_for_test(&mut owner, &mut messages, id, false).await;
+    }
+    owner.writer_for(JobId(2), FileId(20));
+    pump(&mut owner, &mut messages).await;
+    assert!(owner.writers.contains_key(&FileId(20)));
+    owner.state.jobs.extend((3..67).map(pending_job));
+    let release = block_control_test_io(&mut owner).await;
+    owner.writer_for(JobId(1), FileId(10));
+    assert!(owner.pending_writer_birth.contains_key(&FileId(10)));
+    assert!(!owner.writers.contains_key(&FileId(10)));
+    if post_fetch {
+        owner
+            .post_fetch_files
+            .insert(JobId(1), HashSet::from([FileId(10)]));
+    }
+    owner.work_selection_attempts = 0;
+    let leases = owner.grant_work(ServerId(1), 1);
+    let attempts = owner.work_selection_attempts;
+    let birth_still_pending = owner.pending_writer_birth.contains_key(&FileId(10));
+    let blocked_segment = owner.state.job(JobId(1)).unwrap().files[0].segments[0].state;
+    let second_segment = owner.state.job(JobId(2)).unwrap().files[0].segments[0].state;
+    let extra_births = owner
+        .pending_writer_birth
+        .keys()
+        .any(|file| *file != FileId(10));
+    release.send(()).unwrap();
+    pump(&mut owner, &mut messages).await;
+
+    assert!(leases.is_empty());
+    assert_eq!(
+        attempts, 1,
+        "unready writer must yield the owner, not rescan once per queued job"
+    );
+    assert!(matches!(blocked_segment, SegmentState::Pending));
+    assert!(
+        matches!(second_segment, SegmentState::Pending),
+        "active-download cap must remain in force"
+    );
+    assert!(birth_still_pending);
+    assert!(
+        !extra_births,
+        "a blocked head must not start writers across the whole queue"
+    );
+    assert!(owner.writers.contains_key(&FileId(10)));
+    let ready = owner.grant_work(ServerId(1), 1);
+    assert_eq!(
+        ready.len(),
+        1,
+        "durable birth completion must resume normal leasing"
+    );
+    assert_eq!(ready[0].r.job, JobId(1));
+}
+
+#[tokio::test]
+async fn pending_writer_birth_yields_owner_without_rescanning_queue() {
+    check_pending_writer_yields_owner_without_rescanning(false).await;
+}
+
+#[tokio::test]
+async fn pending_post_fetch_writer_yields_owner_without_rescanning_queue() {
+    check_pending_writer_yields_owner_without_rescanning(true).await;
+}
+
+#[tokio::test]
+async fn pending_next_writer_returns_already_granted_leases() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    install_control_test_server(&mut owner);
+    let mut job = pending_job(1);
+    let mut second = job.files[0].clone();
+    second.id = FileId(11);
+    second.filename = "next.bin".into();
+    job.files.push(second);
+    recompute_job_totals(&mut job);
+    owner.state.jobs = vec![job];
+    allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
+    owner.writer_for(JobId(1), FileId(10));
+    pump(&mut owner, &mut messages).await;
+    let release = block_control_test_io(&mut owner).await;
+    owner.work_selection_attempts = 0;
+    let leases = owner.grant_work(ServerId(1), 2);
+    let attempts = owner.work_selection_attempts;
+    let next_pending = owner.pending_writer_birth.contains_key(&FileId(11));
+    release.send(()).unwrap();
+    pump(&mut owner, &mut messages).await;
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].r.file, FileId(10));
+    assert_eq!(
+        attempts, 2,
+        "one ready lease then one blocked candidate must end the batch"
+    );
+    assert!(next_pending);
 }

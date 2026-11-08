@@ -82,6 +82,10 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("inventory data: {0}")]
     Json(#[from] serde_json::Error),
+    /// The operation did not acquire execution capacity; retry without
+    /// treating unchanged artifact metadata as an ownership conflict.
+    #[error("operation deferred: {0}")]
+    Busy(&'static str),
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]

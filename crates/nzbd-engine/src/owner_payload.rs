@@ -11,17 +11,28 @@ const PAYLOAD_WORKERS: usize = 2;
 const PAYLOAD_QUEUE: usize = 64;
 
 impl Owner {
+    pub(super) fn payload_capacity_available(&self) -> bool {
+        !self.cancel.is_cancelled() && self.payload_waiting.len() < PAYLOAD_QUEUE
+    }
+
+    pub(super) fn payload_recovery_capacity_available(&self) -> bool {
+        // Metadata lookups already in flight will also need payload slots.
+        // Count those reservations conservatively before admitting more work.
+        self.payload_capacity_available()
+            && self.allocating_jobs.len() + self.payload_waiting.len() < PAYLOAD_QUEUE
+    }
+
     pub(super) fn payload_then<T: Send + 'static>(
         &mut self,
         root: PathBuf,
         action: impl FnOnce() -> Result<T, nzbd_state::StateError> + Send + 'static,
         continuation: impl FnOnce(&mut Owner, Result<T, nzbd_state::StateError>) + Send + 'static,
     ) {
-        if self.cancel.is_cancelled() || self.payload_waiting.len() >= PAYLOAD_QUEUE {
+        if !self.payload_capacity_available() {
             continuation(
                 self,
-                Err(nzbd_state::StateError::Corrupt(
-                    "payload lane unavailable; operation remains unadmitted".into(),
+                Err(nzbd_state::StateError::Busy(
+                    "payload lane capacity unavailable; operation remains unadmitted",
                 )),
             );
             return;
@@ -119,13 +130,18 @@ impl Owner {
         self.payload_active.remove(&root);
         self.io_finished(revision, result);
         self.start_payload_work();
+        // Completion is the capacity wakeup. Pending durable rows should not
+        // wait for a timer or be converted into allocation/corruption holds.
+        self.retry_payload_recoveries();
+        self.start_verifications();
+        self.bump_epoch();
     }
     pub(super) fn cancel_payload_work(&mut self) {
         while let Some(work) = self.payload_waiting.pop_front() {
             self.io_finished(
                 work.revision,
-                Err(nzbd_state::StateError::Corrupt(
-                    "payload operation cancelled before admission".into(),
+                Err(nzbd_state::StateError::Busy(
+                    "payload operation cancelled before admission",
                 )),
             );
         }
