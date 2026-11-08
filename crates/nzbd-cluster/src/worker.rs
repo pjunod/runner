@@ -1067,6 +1067,7 @@ fn next_pending_completion(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn replay_completion_outbox(
     cfg: &ClusterConfig,
     engine: &EngineHandle,
@@ -1108,6 +1109,7 @@ async fn replay_completion_outbox(
         }
     }
 }
+#[allow(clippy::too_many_arguments)]
 async fn submit_completion(
     cfg: &ClusterConfig,
     engine: &EngineHandle,
