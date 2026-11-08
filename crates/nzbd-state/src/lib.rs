@@ -25,6 +25,8 @@ pub mod fileops;
 mod fsx;
 pub mod history;
 mod snapshot_codec;
+mod snapshot_encoder;
+pub use snapshot_encoder::{SnapshotEncoder, SnapshotEncoderStats};
 pub mod torrent_sources;
 #[cfg(windows)]
 mod windows_secret;
@@ -701,8 +703,24 @@ impl SnapshotStore {
             )));
         }
         let bytes = snapshot_codec::encode(serde_json::to_vec(doc)?)?;
+        self.commit_encoded(&bytes, guard)
+    }
+
+    /// Encode an owned document with a bounded, byte-equivalence cache. The
+    /// cache never substitutes for the complete atomic durability sequence.
+    pub fn save_cached_guarded(
+        &self,
+        doc: QueueSnapshotDoc,
+        encoder: &mut SnapshotEncoder,
+        guard: &dyn Fn() -> bool,
+    ) -> Result<u64, StateError> {
+        let bytes = encoder.encode(doc)?;
+        self.commit_encoded(&bytes, guard)
+    }
+
+    fn commit_encoded(&self, bytes: &[u8], guard: &dyn Fn() -> bool) -> Result<u64, StateError> {
         let mut f = fsx::create(&self.tmp)?;
-        fsx::write_whole(&mut f, &bytes, &self.tmp)?;
+        fsx::write_whole(&mut f, bytes, &self.tmp)?;
         fsx::sync_data(&f, &self.tmp)?;
         drop(f);
         if !guard() {
@@ -729,6 +747,12 @@ impl SnapshotStore {
     /// Decode already-read snapshot bytes without creating directories or
     /// changing the document. Migration callers retain the original bytes for
     /// their fingerprint and backup, regardless of the filesystem encoding.
+    /// Decode the storage envelope without interpreting or reserializing its
+    /// JSON. This preserves exact bytes for offline inspection and conversion.
+    pub fn decode_json_bytes(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, StateError> {
+        snapshot_codec::decode(bytes)
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<QueueSnapshotDoc, StateError> {
         let bytes = snapshot_codec::decode(bytes)?;
         match serde_json::from_slice::<QueueSnapshotDoc>(&bytes) {
@@ -1580,6 +1604,22 @@ mod tests {
         assert_eq!(
             loaded.jobs[1].files[0].segments[0].message_id,
             doc.jobs[1].files[0].segments[0].message_id
+        );
+        let mut encoder = SnapshotEncoder::default();
+        let first = encoder.encode(doc.clone()).unwrap();
+        assert_eq!(
+            SnapshotStore::decode_json_bytes(&first).unwrap().as_ref(),
+            raw
+        );
+        let second = encoder.encode(doc).unwrap();
+        assert_eq!(
+            SnapshotStore::decode_json_bytes(&second).unwrap().as_ref(),
+            raw
+        );
+        assert_eq!(
+            encoder.stats().reused_jobs,
+            4,
+            "all production-shaped jobs reused by full equality"
         );
     }
 

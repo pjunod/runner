@@ -186,6 +186,8 @@ impl Persistence {
             // successfully captures the owner state. Never compact on failure.
             let mut append_failure: Option<nzbd_state::StateError> = None;
             let mut deferred = None;
+            let mut authority_encoder = nzbd_state::SnapshotEncoder::default();
+            let mut worker_encoder = nzbd_state::SnapshotEncoder::with_budget(64 * 1024 * 1024);
             'requests: while let Some(request) = deferred.take().or_else(|| rx.blocking_recv()) {
                 let started = std::time::Instant::now();
                 let snapshot=matches!(&request,Request::Snapshot{..});
@@ -219,14 +221,15 @@ impl Persistence {
                     Request::Snapshot {revision, doc, delegated, authoritative, guard} => {
                         let result = (|| {
                             journal.sync()?;
-                            let target=if authoritative {&store} else {&worker_store};
-                            match guard { Some(g) => target.save_guarded(&doc, &move || g()), None => target.save(&doc) }?;
+                            let jobs = doc.jobs.iter().map(|job| job.id).collect::<Vec<_>>();
+                            let (target, encoder)=if authoritative {(&store, &mut authority_encoder)} else {(&worker_store, &mut worker_encoder)};
+                            match guard { Some(g) => target.save_cached_guarded(doc, encoder, &move || g()), None => target.save_cached_guarded(doc, encoder, &|| true) }?;
                             // Only this lane appends local records. Foreign live
                             // journals remain untouched, including unknown jobs.
                             // Preserve the failed incarnation as evidence;
                             // normal healthy checkpoints still compact locally.
-                            for job in doc.jobs.iter().filter(|_|authoritative && append_failure.is_none()) {
-                                if !delegated.contains(&job.id) { if let Err(error)=journal.compact_local(job.id) {tracing::warn!(job=job.id.0,%error,"snapshot durable; journal compaction deferred");} }
+                            for job in jobs.into_iter().filter(|_|authoritative && append_failure.is_none()) {
+                                if !delegated.contains(&job) { if let Err(error)=journal.compact_local(job) {tracing::warn!(job=job.0,%error,"snapshot durable; journal compaction deferred");} }
                             }
                             if append_failure.is_some() {
                                 // Worker saves and delegated rows intentionally
@@ -245,8 +248,8 @@ impl Persistence {
                         let result = (|| {
                             journal.sync()?;
                             if let Some(doc) = doc {
-                                let target=if authoritative {&store} else {&worker_store};
-                                match guard {Some(g)=>target.save_guarded(&doc,&move||g()),None=>target.save(&doc)}?;
+                                let (target, encoder)=if authoritative {(&store, &mut authority_encoder)} else {(&worker_store, &mut worker_encoder)};
+                                match guard {Some(g)=>target.save_cached_guarded(doc,encoder,&move||g()),None=>target.save_cached_guarded(doc,encoder,&||true)}?;
                             } else if let Some(error) = &append_failure {
                                 return Err(copy_commit_error(error));
                             }
@@ -1080,7 +1083,7 @@ mod tests {
         assert_eq!(JobJournals::replay_job(dir.path(), job).unwrap().len(), 1);
         assert!(std::fs::read(dir.path().join("queue.json.tmp"))
             .unwrap()
-            .starts_with(b"NZBDQZ01"));
+            .starts_with(b"NZBDQZ02"));
         assert!(SnapshotStore::open(dir.path())
             .unwrap()
             .load()
