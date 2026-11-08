@@ -1056,13 +1056,13 @@ async fn assess_and_publish_salvage(
             }
         }
     };
-    let unsettled = |error: String| async move {
-        if nzbd_engine::is_out_of_space(&error) || nzbd_engine::is_storage_unavailable(&error) {
+    let unsettled = |error: PostError| async move {
+        if storage_hold_cause(&error).is_some() {
             tracing::warn!(job = job.0, %error, "salvage waits for storage; obligation stays pending");
             None
         } else {
             tracing::warn!(job = job.0, %error, "salvage assessment failed; nothing published");
-            Some(error)
+            Some(error.to_string())
         }
     };
     // A crash between a salvage publication's relocation and its delivery
@@ -1099,7 +1099,7 @@ async fn assess_and_publish_salvage(
             }
             Ok(Ok(None)) => {}
             Ok(Err(error)) => {
-                if let Some(error) = unsettled(error.to_string()).await {
+                if let Some(error) = unsettled(error).await {
                     settle(nzbd_state::artifacts::SalvageOutcome::None { error: Some(error) })
                         .await;
                 }
@@ -1328,10 +1328,11 @@ async fn dispose_failed_source(
             (!source.exists() && observed.note != "kept").then(|| Disposition {
                 note: "already gone".into(),
                 files_at: None,
+                ..Default::default()
             })
         })
     else {
-        if nzbd_engine::is_out_of_space(&observed.note) {
+        if observed.out_of_space {
             engine.report_out_of_space(format!(
                 "failed-file disposition for job {}: {}",
                 job.0, observed.note
@@ -1381,17 +1382,30 @@ struct EarlyArchiveAssessment {
 /// A health failure does not preclude repair of an independent PAR set. Only
 /// sets whose validated recovery blocks cover the measured damaged slices
 /// enter the normal private repair workspace and durable transform journal.
+/// A salvage input that resolved outside its own source directory.
+fn outside_source(error: std::path::StripPrefixError) -> PostError {
+    PostError::Artifact(nzbd_state::artifacts::Error::Conflict(format!(
+        "salvage input outside its source: {error}"
+    )))
+}
+
+/// A salvage step refused because the job's post-processing claim moved.
+fn authority_changed(during: &str) -> PostError {
+    PostError::Artifact(nzbd_state::artifacts::Error::Conflict(format!(
+        "post-processing authority changed during {during}"
+    )))
+}
+
 async fn repair_failed_health_par_sets(
     engine: &EngineHandle,
     cfg: &PostConfig,
     job: &Job,
     gate: &PpGate,
-) -> Result<HashMap<String, String>, String> {
+) -> Result<HashMap<String, String>, PostError> {
     let inventory = engine.artifacts();
     let source = inventory
-        .for_job(job.id.0)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "failed job has no source artifact".to_string())?;
+        .for_job(job.id.0)?
+        .ok_or(PostError::Artifact(nzbd_state::artifacts::Error::NotFound))?;
     let root = source.path.clone();
     let entries = source.files.clone();
     let partial_paths = sealed_partial_paths(job, &source);
@@ -1407,8 +1421,7 @@ async fn repair_failed_health_par_sets(
         })
     })
     .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())?
+    .map_err(|error| PostError::Subprocess(error.to_string()))??
     .1;
     let tool = Par2Tool {
         cmd: cfg.par2_cmd.clone(),
@@ -1436,7 +1449,7 @@ async fn repair_failed_health_par_sets(
     let mut failures = HashMap::new();
     for set in sets {
         if gate.as_ref().is_some_and(|claim| !claim(job.id)) {
-            return Err("post-processing authority changed during PAR salvage".into());
+            return Err(authority_changed("PAR salvage"));
         }
         let result = crate::repair_workspace::repair(
             &inventory,
@@ -1457,16 +1470,15 @@ async fn repair_failed_health_par_sets(
                 "PAR tool could not restore this measured repairable set; inspect tool output and retry repair"
                     .to_string()
             }
-            Err(error) => return Err(format!("PAR repair requires retry: {error}")),
+            Err(error) => return Err(error),
         };
         for file in &set.files {
-            let relative =
-                crate::namespace::relative(&file.name).map_err(|error| error.to_string())?;
+            let relative = crate::namespace::relative(&file.name)?;
             let source_relative = set
                 .root
                 .join(relative)
                 .strip_prefix(&source.path)
-                .map_err(|error| error.to_string())?
+                .map_err(outside_source)?
                 .to_string_lossy()
                 .into_owned();
             failures.insert(source_relative, reason.clone());
@@ -1485,21 +1497,17 @@ async fn extract_complete_failed_archives(
     cfg: &PostConfig,
     job: &Job,
     gate: &PpGate,
-) -> Result<EarlyArchiveAssessment, String> {
+) -> Result<EarlyArchiveAssessment, PostError> {
     let mut assessment = EarlyArchiveAssessment::default();
     if !cfg.unpack {
         return Ok(assessment);
     }
     let inventory = engine.artifacts();
     let source = inventory
-        .for_job(job.id.0)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "failed job has no source artifact".to_string())?;
-    let evidence = inventory
-        .verified_custody_evidence(job.id.0, || Ok(()))
-        .map_err(|error| error.to_string())?;
-    let mut complete = verified_direct_payload_paths(job, &source, &evidence.restored, || Ok(()))
-        .map_err(|error| error.to_string())?;
+        .for_job(job.id.0)?
+        .ok_or(PostError::Artifact(nzbd_state::artifacts::Error::NotFound))?;
+    let evidence = inventory.verified_custody_evidence(job.id.0, || Ok(()))?;
+    let mut complete = verified_direct_payload_paths(job, &source, &evidence.restored, || Ok(()))?;
     let already_consumed = evidence.consumed_inputs;
     complete.extend(evidence.verified_outputs);
     let extractors = Extractors {
@@ -1515,7 +1523,7 @@ async fn extract_complete_failed_archives(
     for (archive, kind) in detect_archives(&source.path) {
         use sha2::{Digest, Sha256};
         if gate.as_ref().is_some_and(|claim| !claim(job.id)) {
-            return Err("post-processing authority changed during archive salvage".into());
+            return Err(authority_changed("archive salvage"));
         }
         let inputs = archive_input_set(&source.path, &archive, kind);
         let paths = inputs
@@ -1525,7 +1533,7 @@ async fn extract_complete_failed_archives(
                     .map(|relative| relative.to_string_lossy().into_owned())
             })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
+            .map_err(outside_source)?;
         if paths.is_empty()
             || !paths.iter().all(|path| complete.contains(path))
             || paths.iter().all(|path| already_consumed.contains(path))
@@ -1533,58 +1541,43 @@ async fn extract_complete_failed_archives(
             continue;
         }
         let token = format!("{:x}", Sha256::digest(archive.to_string_lossy().as_bytes()));
-        let mut workspace = inventory
-            .workspace(job.id.0, "extract", &token)
-            .map_err(|error| error.to_string())?;
-        inventory
-            .bind_extraction_inputs(&mut workspace, &inputs)
-            .map_err(|error| error.to_string())?;
-        if inventory
-            .extraction_published(&workspace)
-            .map_err(|error| error.to_string())?
-        {
+        let mut workspace = inventory.workspace(job.id.0, "extract", &token)?;
+        inventory.bind_extraction_inputs(&mut workspace, &inputs)?;
+        if inventory.extraction_published(&workspace)? {
             continue;
         }
-        let _capacity = nzbd_state::capacity::reserve(&workspace.scratch.path, job.totals.size)
-            .map_err(|error| error.to_string())?;
-        let attempt = inventory
-            .begin_workspace_attempt(&mut workspace)
-            .map_err(|error| error.to_string())?;
+        let _capacity = nzbd_state::capacity::reserve(&workspace.scratch.path, job.totals.size)?;
+        let attempt = inventory.begin_workspace_attempt(&mut workspace)?;
         let staging = attempt.join("output");
-        std::fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&staging)?;
         let result = extractors
             .extract(&archive, kind, &staging, password)
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
         if result.disk_space_error {
-            inventory
-                .abandon_workspace(&workspace)
-                .map_err(|error| error.to_string())?;
-            return Err(
-                "archive salvage needs free capacity; retry extraction when space is available"
-                    .into(),
-            );
+            inventory.abandon_workspace(&workspace)?;
+            // The extractor reported a full volume: a capacity wait, not a
+            // verdict on the bytes (the obligation stays pending).
+            return Err(PostError::Io(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "archive salvage needs free capacity; retry extraction when space is available",
+            )));
         }
         if result.password_error {
             assessment.password_required.extend(paths);
-            inventory
-                .abandon_workspace(&workspace)
-                .map_err(|error| error.to_string())?;
+            inventory.abandon_workspace(&workspace)?;
             continue;
         }
         if result.retryable_error {
-            inventory
-                .abandon_workspace(&workspace)
-                .map_err(|error| error.to_string())?;
+            inventory.abandon_workspace(&workspace)?;
             let detail = result
                 .attempts
                 .iter()
                 .map(|attempt| attempt.diagnostic.as_str())
                 .collect::<Vec<_>>()
                 .join("; ");
-            return Err(format!(
+            return Err(PostError::Subprocess(format!(
                 "archive extractor storage or tool failure requires retry: {detail}"
-            ));
+            )));
         }
         let shortfall = result
             .success
@@ -1592,9 +1585,7 @@ async fn extract_complete_failed_archives(
             .flatten();
         if !result.success || shortfall.is_some() {
             assessment.terminal.extend(paths);
-            inventory
-                .abandon_workspace(&workspace)
-                .map_err(|error| error.to_string())?;
+            inventory.abandon_workspace(&workspace)?;
             continue;
         }
         let output = result.output_dir;
@@ -1611,8 +1602,7 @@ async fn extract_complete_failed_archives(
             inventory.finish_extraction(&workspace, &output)?;
             Ok(())
         })
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     }
     Ok(assessment)
 }
@@ -1625,17 +1615,12 @@ fn salvage_failed_delivery(
     failure_stage: &str,
     failure_cause: &str,
     archive_assessment: &EarlyArchiveAssessment,
-) -> Result<Option<FailedSalvage>, String> {
+) -> Result<Option<FailedSalvage>, PostError> {
     // Contract §2.5: a salvage move a crash left open is finished or unwound
     // first; one that committed is completed from its journal, never
     // selected again from what is now the publication.
-    inventory
-        .reconcile_job_intents(job.id.0)
-        .map_err(|error| error.to_string())?;
-    if let Some(moved) = inventory
-        .committed_intent_publication(job.id.0)
-        .map_err(|error| error.to_string())?
-    {
+    inventory.reconcile_job_intents(job.id.0)?;
+    if let Some(moved) = inventory.committed_intent_publication(job.id.0)? {
         return finish_salvage_receipt(
             inventory,
             job,
@@ -1647,26 +1632,20 @@ fn salvage_failed_delivery(
         )
         .map(Some);
     }
-    let source = inventory
-        .refresh_for_delivery(job.id.0)
-        .map_err(|error| error.to_string())?;
+    let source = inventory.refresh_for_delivery(job.id.0)?;
     if !source.automatic_cleanup_eligible || !source.owned {
-        return Err(
+        return Err(PostError::Artifact(nzbd_state::artifacts::Error::Conflict(
             "failed source is not an owned eligible generation for bounded recovery assessment"
                 .into(),
-        );
+        )));
     }
-    let evidence = inventory
-        .verified_custody_evidence(job.id.0, || Ok(()))
-        .map_err(|error| error.to_string())?;
+    let evidence = inventory.verified_custody_evidence(job.id.0, || Ok(()))?;
     let verified_direct =
-        verified_direct_payload_paths(job, &source, &evidence.restored, || Ok(()))
-            .map_err(|error| error.to_string())?;
+        verified_direct_payload_paths(job, &source, &evidence.restored, || Ok(()))?;
     let (consumed, extracted) = (evidence.consumed_inputs, evidence.verified_outputs);
     let verified = verified_direct.into_iter().chain(extracted).collect();
     let probed = probe_payload_kinds(&source.path, &source.files, &verified);
-    let mut diagnostics = assess_file_inputs(job, &source, &verified)
-        .map_err(|error| format!("source diagnostic read requires retry: {error}"))?;
+    let mut diagnostics = assess_file_inputs(job, &source, &verified)?;
     for path in &archive_assessment.password_required {
         diagnostics.insert(
             path.clone(),
@@ -1689,7 +1668,7 @@ fn salvage_failed_delivery(
     if selected.is_empty() {
         return Ok(None);
     }
-    std::fs::create_dir_all(completed_root).map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(completed_root)?;
     let name = nzbd_engine::queue::sanitize_name(&job.name);
     let target = completed_root.join(format!(
         "{name}.job-{}.runner-{}",
@@ -1701,17 +1680,15 @@ fn salvage_failed_delivery(
         .iter()
         .find(|(key, _)| key == "monarr-transfer")
         .map(|(_, value)| value.as_str());
-    let moved = inventory
-        .publish_selected_with_transfer(
-            job.id.0,
-            &target,
-            selected,
-            outcomes,
-            transfer,
-            delivery_lifecycle,
-            &|| Ok(()),
-        )
-        .map_err(|error| error.to_string())?;
+    let moved = inventory.publish_selected_with_transfer(
+        job.id.0,
+        &target,
+        selected,
+        outcomes,
+        transfer,
+        delivery_lifecycle,
+        &|| Ok(()),
+    )?;
     finish_salvage_receipt(
         inventory,
         job,
@@ -1734,11 +1711,10 @@ fn finish_salvage_receipt(
     terminal_outcome: &str,
     failure_stage: &str,
     failure_cause: &str,
-) -> Result<FailedSalvage, String> {
+) -> Result<FailedSalvage, PostError> {
     let delivery_lifecycle = job.delivery_lifecycle;
     if let Some(delivery) = inventory
-        .delivery_for_job(job.id.0)
-        .map_err(|error| error.to_string())?
+        .delivery_for_job(job.id.0)?
         .filter(|delivery| delivery.publication_generation == moved.generation)
     {
         return Ok(FailedSalvage {
@@ -1747,35 +1723,29 @@ fn finish_salvage_receipt(
             generation: moved.generation,
         });
     }
-    inventory
-        .finish(
-            job.id.0,
-            &moved.published_path,
-            moved.published_path.parent().unwrap_or(completed_root),
-            "completed",
-        )
-        .map_err(|error| error.to_string())?;
+    inventory.finish(
+        job.id.0,
+        &moved.published_path,
+        moved.published_path.parent().unwrap_or(completed_root),
+        "completed",
+    )?;
     let delivery = if delivery_lifecycle {
         let token = job
             .params
             .iter()
             .find(|(key, _)| key == "monarr-transfer")
             .map(|(_, value)| value.as_str());
-        Some(
-            inventory
-                .create_delivery_with_lifecycle_snapshot(
-                    job.id.0,
-                    true,
-                    token,
-                    terminal_outcome,
-                    Some(failure_stage),
-                    Some(failure_cause),
-                    job_keeps_failed_source(job),
-                    delivery_stage_snapshot(inventory, job),
-                    nzbd_engine::frozen_lifecycle_timing(job),
-                )
-                .map_err(|error| error.to_string())?,
-        )
+        Some(inventory.create_delivery_with_lifecycle_snapshot(
+            job.id.0,
+            true,
+            token,
+            terminal_outcome,
+            Some(failure_stage),
+            Some(failure_cause),
+            job_keeps_failed_source(job),
+            delivery_stage_snapshot(inventory, job),
+            nzbd_engine::frozen_lifecycle_timing(job),
+        )?)
     } else {
         None
     };
@@ -1846,10 +1816,12 @@ fn canonical_failed_disposition(
             Ok(true) => Some(Disposition {
                 note: "kept".into(),
                 files_at: Some(source.to_path_buf()),
+                ..Default::default()
             }),
             Ok(false) => Some(Disposition {
                 note: "already gone".into(),
                 files_at: None,
+                ..Default::default()
             }),
             Err(_) => None,
         },
@@ -1857,6 +1829,7 @@ fn canonical_failed_disposition(
             Ok(false) => Some(Disposition {
                 note: "deleted".into(),
                 files_at: None,
+                ..Default::default()
             }),
             _ => None,
         },
@@ -1870,6 +1843,7 @@ fn canonical_failed_disposition(
                 (Ok(false), Ok(true)) => Some(Disposition {
                     note: format!("parked at {}", target.display()),
                     files_at: Some(target),
+                    ..Default::default()
                 }),
                 _ => None,
             }
@@ -2304,7 +2278,7 @@ fn spawn_job(
                     // move, script output. An ENOSPC here is the same ground
                     // truth about the volume and must stop intake too, not
                     // just fail this job.
-                    if nzbd_engine::is_out_of_space(&e.to_string()) {
+                    if nzbd_engine::out_of_space(storage_hold_cause(&e).as_ref()) {
                         engine.report_out_of_space(format!("post-processing job {}: {e}", job.0));
                     }
                     tracing::error!(job = job.0, error = %e, "post-processing crashed");
@@ -3520,7 +3494,9 @@ async fn process_job_ctx_from_inner(
                     // A retryable extractor failure retries on its own only
                     // when the volume stopped answering; re-running an
                     // extractor on the same bytes forever is not recovery.
-                    if nzbd_engine::is_storage_unavailable(&detail) {
+                    if nzbd_engine::stderr_hold_cause(&detail)
+                        == Some(HoldCause::StorageUnavailable)
+                    {
                         let _ = engine
                             .hold_job(job_id, HoldCause::StorageUnavailable, "unpack", &detail)
                             .await;
@@ -3591,7 +3567,9 @@ async fn process_job_ctx_from_inner(
                     // A retryable extractor failure retries on its own only
                     // when the volume stopped answering; re-running an
                     // extractor on the same bytes forever is not recovery.
-                    if nzbd_engine::is_storage_unavailable(&detail) {
+                    if nzbd_engine::stderr_hold_cause(&detail)
+                        == Some(HoldCause::StorageUnavailable)
+                    {
                         let _ = engine
                             .hold_job(job_id, HoldCause::StorageUnavailable, "unpack", &detail)
                             .await;
@@ -5186,6 +5164,22 @@ pub enum PpVerdict {
     Fail(nzbd_types::FailureReason),
 }
 
+/// The environmental hold a post-processing error's errno names, whatever
+/// wrapper it crossed: a typed error by its `source()` chain (io errno,
+/// SQLite result code); a subprocess's words — and an engine lifecycle
+/// error, which arrives already rendered — by the stderr rule.
+pub fn storage_hold_cause(error: &PostError) -> Option<HoldCause> {
+    match error {
+        PostError::Subprocess(text)
+        | PostError::Unquiesced(text)
+        | PostError::Engine {
+            source: nzbd_engine::EngineError::Lifecycle(text),
+            ..
+        } => nzbd_engine::stderr_hold_cause(text),
+        other => nzbd_engine::error_hold_cause(other),
+    }
+}
+
 /// Decided by the error's type and, where one exists, its errno. A release
 /// title can never steer it: `NothingPublishable` names payload files and
 /// is matched by variant before any message is read.
@@ -5209,25 +5203,8 @@ pub fn pp_verdict(error: &PostError, stage: Option<PostStage>) -> PpVerdict {
     if matches!(error, PostError::ToolMissing(_)) {
         return PpVerdict::Hold(HoldCause::MissingTool);
     }
-    let detail = error.to_string();
-    if nzbd_engine::is_out_of_space(&detail) {
-        return PpVerdict::Hold(if detail.to_lowercase().contains("quota") {
-            HoldCause::Quota
-        } else {
-            HoldCause::Capacity
-        });
-    }
-    if nzbd_engine::is_storage_unavailable(&detail)
-        // SQLite reports a failing volume as SQLITE_IOERR, whose message has
-        // no errno suffix; matched only on the inventory's SQL variant.
-        || (matches!(
-            error,
-            PostError::Artifact(nzbd_state::artifacts::Error::Sql(_))
-        ) && detail.contains("disk I/O error"))
-    {
-        // Whatever wrapper the error crossed, a volume that stopped
-        // answering is not a verdict on the job's content.
-        return PpVerdict::Hold(HoldCause::StorageUnavailable);
+    if let Some(cause) = storage_hold_cause(error) {
+        return PpVerdict::Hold(cause);
     }
     match error {
         PostError::Io(_)
@@ -6612,10 +6589,13 @@ async fn repair_loop(
 
 /// What became of a failed job's files: what to tell the history row, and
 /// where the bytes are now (`None` = gone).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Disposition {
     pub note: String,
     pub files_at: Option<PathBuf>,
+    /// The step stopped on a full volume or exhausted quota (by errno):
+    /// intake stops too, not just this disposal.
+    pub out_of_space: bool,
 }
 
 async fn dispose_failed(
@@ -6637,6 +6617,7 @@ async fn dispose_failed(
         return Disposition {
             note: "deleted".into(),
             files_at: None,
+            ..Default::default()
         };
     }
     if cfg.failure_action == FailureAction::Delete {
@@ -6644,15 +6625,19 @@ async fn dispose_failed(
             checkpoint()?;
             inventory
                 .delete_failed_payload(guard, job.0, checkpoint)
-                .map_err(|e| PostError::Subprocess(e.to_string()))
+                .map_err(PostError::from)
         })
         .await;
         return match result {
             Ok(op) if op.state == "succeeded" => Disposition {
                 note: "deleted".into(),
                 files_at: None,
+                ..Default::default()
             },
             other => Disposition {
+                out_of_space: other.as_ref().is_err_and(|error| {
+                    nzbd_engine::out_of_space(storage_hold_cause(error).as_ref())
+                }),
                 note: format!("checked deletion pending: {other:?}"),
                 files_at: Some(dir.into()),
             },
@@ -6667,15 +6652,19 @@ async fn dispose_failed(
         let moved = terminal_worker(inventory, job, move |inventory, _, checkpoint| {
             inventory
                 .relocate_checked(job.0, &to, checkpoint)
-                .map_err(|e| PostError::Subprocess(e.to_string()))
+                .map_err(PostError::from)
         })
         .await;
         return match moved {
             Ok(result) => Disposition {
                 note: format!("parked at {}", result.published_path.display()),
                 files_at: Some(result.published_path),
+                ..Default::default()
             },
             other => Disposition {
+                out_of_space: other.as_ref().is_err_and(|error| {
+                    nzbd_engine::out_of_space(storage_hold_cause(error).as_ref())
+                }),
                 note: format!("checked move pending: {other:?}"),
                 files_at: Some(dir.into()),
             },
@@ -6684,6 +6673,7 @@ async fn dispose_failed(
     Disposition {
         note: "kept".into(),
         files_at: Some(dir.into()),
+        ..Default::default()
     }
 }
 
@@ -7787,7 +7777,7 @@ mod decision_tests {
             .await
             .err()
             .expect("storage failure must enter retry lane");
-        assert!(error.contains("requires retry"), "{error}");
+        assert!(error.to_string().contains("requires retry"), "{error}");
         assert!(source.join("episode.zip").exists());
         assert!(inventory.delivery_for_job(41).unwrap().is_none());
     }
@@ -8709,8 +8699,9 @@ mod decision_tests {
             PostError::Subprocess(
                 "restore /processing/x -> /processing/y: Transport endpoint is not connected (os error 107)".into(),
             ),
-            PostError::Io(std::io::Error::other(
-                "read /processing/x: Input/output error (os error 5)",
+            PostError::Io(std::io::Error::from_raw_os_error(libc::EIO)),
+            PostError::Artifact(nzbd_state::artifacts::Error::Io(
+                std::io::Error::from_raw_os_error(libc::ESTALE),
             )),
         ] {
             assert_eq!(
@@ -8737,6 +8728,30 @@ mod decision_tests {
             ),
             PpVerdict::Fail(nzbd_types::FailureReason::Io),
             "a missing file is not a dropped volume: it is a terminal failed/io"
+        );
+        // M6: an io::Error is classified by its errno, never its message.
+        assert_eq!(
+            pp_verdict(
+                &PostError::Io(std::io::Error::other(
+                    "read /processing/x: Input/output error (os error 5)"
+                )),
+                Some(PostStage::Move)
+            ),
+            PpVerdict::Fail(nzbd_types::FailureReason::Io),
+        );
+        assert_eq!(
+            pp_verdict(
+                &PostError::Io(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+                Some(PostStage::Unpack)
+            ),
+            PpVerdict::Hold(HoldCause::Capacity),
+        );
+        assert_eq!(
+            pp_verdict(
+                &PostError::Io(std::io::Error::from_raw_os_error(libc::EDQUOT)),
+                Some(PostStage::Unpack)
+            ),
+            PpVerdict::Hold(HoldCause::Quota),
         );
     }
 

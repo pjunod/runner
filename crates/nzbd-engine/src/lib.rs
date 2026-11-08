@@ -59,23 +59,6 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use volumes::DiskGuardRoot;
 
-/// Does this error message name an out-of-space condition?
-///
-/// Matched on the message because that is what survives every layer this
-/// has to cross — `std::io::Error` stringified by a writer task, the fsx
-/// wrappers' `op path: source`, a subprocess's stderr. ENOSPC and the
-/// quota variant both count: a gluster or NFS mount answers `EDQUOT` for
-/// exactly the same condition, and the whole point of this signal is that
-/// it does not depend on which lie statvfs is telling.
-pub fn is_out_of_space(msg: &str) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    lower.contains("no space left on device")
-        || lower.contains("os error 28")
-        || lower.contains("disk quota exceeded")
-        || lower.contains("os error 122")
-        || lower.contains("no storage space")
-}
-
 #[cfg(test)]
 type UrlPreparationGate = Option<(
     String,
@@ -127,26 +110,125 @@ fn url_storage_error(error: nzbd_state::artifacts::Error) -> EngineError {
     }
 }
 
-/// The storage under a path stopped answering: a network or FUSE mount lost
-/// its transport, a stale handle after a server-side remount, a device that
-/// went away, a remote that timed out or reset, or the generic EIO such
-/// mounts report meanwhile. Nothing about the job is wrong; the same
-/// operation succeeds once the volume is back, so these holds retry on
-/// their own ([`nzbd_types::HoldCause::StorageUnavailable`]).
+/// Contract §2.3 — the environmental hold an errno names, or `None` when
+/// retrying the same call cannot help (a refused permission, a missing file:
+/// the job's terminal `failed/io`, §2.2).
 ///
-/// Matched only on the std `(os error N)` suffix every `io::Error` Display
-/// ends with — the error has usually crossed a `to_string()` by the time a
-/// hold is classified, and free text (payload names, extractor output) must
-/// not steer the cause.
-pub fn is_storage_unavailable(msg: &str) -> bool {
-    // EIO ENXIO EAGAIN ENODEV ENOLINK ECONNABORTED ECONNRESET ENOTCONN
-    // ETIMEDOUT ECONNREFUSED EHOSTDOWN EHOSTUNREACH ESTALE EREMOTEIO
-    const ERRNOS: [u16; 14] = [
-        5, 6, 11, 19, 67, 103, 104, 107, 110, 111, 112, 113, 116, 121,
-    ];
-    ERRNOS
-        .iter()
-        .any(|n| msg.contains(&format!("(os error {n})")))
+/// A full volume is `capacity` (`ENOSPC`) or `quota` (`EDQUOT`; a gluster or
+/// NFS mount answers it for the same condition). A volume that stopped
+/// answering is `storage_unavailable`: a network or FUSE mount that lost its
+/// transport, a stale handle after a server-side remount, a device that went
+/// away, a remote that timed out or reset, or the generic `EIO` such mounts
+/// report meanwhile. Nothing about the job is wrong in either case; the same
+/// call succeeds once the volume is back, so these holds retry on their own.
+pub fn errno_hold_cause(errno: i32) -> Option<nzbd_types::HoldCause> {
+    use nzbd_types::HoldCause;
+    match errno {
+        libc::ENOSPC => Some(HoldCause::Capacity),
+        libc::EDQUOT => Some(HoldCause::Quota),
+        libc::EIO
+        | libc::ENXIO
+        | libc::EAGAIN
+        | libc::ENODEV
+        | libc::ENOLINK
+        | libc::ECONNABORTED
+        | libc::ECONNRESET
+        | libc::ENOTCONN
+        | libc::ETIMEDOUT
+        | libc::ECONNREFUSED
+        | libc::EHOSTDOWN
+        | libc::EHOSTUNREACH
+        | libc::ESTALE => Some(HoldCause::StorageUnavailable),
+        #[cfg(target_os = "linux")]
+        libc::EREMOTEIO => Some(HoldCause::StorageUnavailable),
+        _ => None,
+    }
+}
+
+/// [`errno_hold_cause`] for an `io::Error`: its `raw_os_error()`, else the
+/// kind std mapped it to (an error built from a kind carries no errno), else
+/// the error it wraps.
+pub fn io_error_hold_cause(error: &std::io::Error) -> Option<nzbd_types::HoldCause> {
+    if let Some(errno) = error.raw_os_error() {
+        return errno_hold_cause(errno);
+    }
+    match error.kind() {
+        std::io::ErrorKind::StorageFull => Some(nzbd_types::HoldCause::Capacity),
+        std::io::ErrorKind::QuotaExceeded => Some(nzbd_types::HoldCause::Quota),
+        _ => error
+            .get_ref()
+            .and_then(|inner| error_hold_cause(inner as &(dyn std::error::Error + 'static))),
+    }
+}
+
+/// [`errno_hold_cause`] for any error: the first `io::Error` (by errno) or
+/// SQLite failure (by result code — a full or failing volume under the
+/// state database) along its `source()` chain. Typed errors only; a message
+/// is never read, so a payload name can never steer the cause.
+pub fn error_hold_cause(
+    error: &(dyn std::error::Error + 'static),
+) -> Option<nzbd_types::HoldCause> {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            return io_error_hold_cause(io);
+        }
+        if let Some(rusqlite::Error::SqliteFailure(failure, _)) =
+            error.downcast_ref::<rusqlite::Error>()
+        {
+            return match failure.code {
+                rusqlite::ErrorCode::DiskFull => Some(nzbd_types::HoldCause::Capacity),
+                rusqlite::ErrorCode::SystemIoFailure => {
+                    Some(nzbd_types::HoldCause::StorageUnavailable)
+                }
+                _ => None,
+            };
+        }
+        current = error.source();
+    }
+    None
+}
+
+/// The one text classifier: a subprocess's stderr (par2, unrar, 7z, a post
+/// script) reaches this process as words, with no `io::Error` behind them,
+/// so the errno is read from what the tool printed — the std
+/// `(os error N)` suffix, or the libc wording of `ENOSPC`/`EDQUOT`.
+///
+/// Also the last resort, named at each call site, for the few errors that
+/// arrive here already rendered with no errno attached: a torrent backend's
+/// error string, a persisted operation error, an `EngineError::Lifecycle`
+/// message. Everything holding an `io::Error` uses [`io_error_hold_cause`].
+pub fn stderr_hold_cause(stderr: &str) -> Option<nzbd_types::HoldCause> {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("disk quota exceeded") {
+        return Some(nzbd_types::HoldCause::Quota);
+    }
+    if lower.contains("no space left on device") || lower.contains("no storage space") {
+        return Some(nzbd_types::HoldCause::Capacity);
+    }
+    // Only the std suffix names an errno; free text (payload names,
+    // extractor chatter) must not.
+    let mut rest = stderr;
+    while let Some(at) = rest.find("(os error ") {
+        let tail = &rest[at + "(os error ".len()..];
+        let digits = tail.split(')').next().unwrap_or("");
+        if let Ok(errno) = digits.parse::<i32>() {
+            if let Some(cause) = errno_hold_cause(errno) {
+                return Some(cause);
+            }
+        }
+        rest = tail;
+    }
+    None
+}
+
+/// True for a full volume or exhausted quota — the ground truth that stops
+/// intake as well as holding the job.
+pub fn out_of_space(cause: Option<&nzbd_types::HoldCause>) -> bool {
+    matches!(
+        cause,
+        Some(nzbd_types::HoldCause::Capacity | nzbd_types::HoldCause::Quota)
+    )
 }
 
 /// How long a hold release waits on a filesystem probe (custody check,
@@ -204,24 +286,6 @@ async fn bounded_probe_deadline<T: Send + 'static>(
 
 /// The param a failed URL resolution carries its typed fetch cause in.
 pub const FETCH_CAUSE_PARAM: &str = "*Fetch:Cause";
-
-/// The hold cause for a failed write or filesystem step, by errno — or
-/// `None` when the failure is not environmental (a digest or size mismatch,
-/// a missing file, a refused permission): that is a terminal
-/// `failed/io`, not a hold (contract §2.2).
-pub fn io_hold_cause(msg: &str) -> Option<nzbd_types::HoldCause> {
-    if is_out_of_space(msg) {
-        Some(if msg.to_lowercase().contains("quota") {
-            nzbd_types::HoldCause::Quota
-        } else {
-            nzbd_types::HoldCause::Capacity
-        })
-    } else if is_storage_unavailable(msg) {
-        Some(nzbd_types::HoldCause::StorageUnavailable)
-    } else {
-        None
-    }
-}
 
 fn fetch_retry_state(job: &Job) -> crate::fetch::FetchRetryState {
     let value = |key: &str| {
@@ -3109,17 +3173,120 @@ mod hold_probe_tests {
 #[cfg(test)]
 mod out_of_space_tests {
     use super::*;
+    use nzbd_types::HoldCause;
+
+    const UNAVAILABLE: [i32; 14] = [
+        libc::EIO,
+        libc::ENXIO,
+        libc::EAGAIN,
+        libc::ENODEV,
+        libc::ENOLINK,
+        libc::ECONNABORTED,
+        libc::ECONNRESET,
+        libc::ENOTCONN,
+        libc::ETIMEDOUT,
+        libc::ECONNREFUSED,
+        libc::EHOSTDOWN,
+        libc::EHOSTUNREACH,
+        libc::ESTALE,
+        libc::EREMOTEIO,
+    ];
 
     #[test]
-    fn storage_unavailable_matches_dropped_volumes_by_errno_only() {
-        for n in [
-            5, 6, 11, 19, 67, 103, 104, 107, 110, 111, 112, 113, 116, 121,
-        ] {
-            let msg = format!("write /processing/x.part: whatever (os error {n})");
-            assert!(is_storage_unavailable(&msg), "{msg}");
+    fn io_errors_are_classified_by_errno_not_by_message() {
+        for errno in UNAVAILABLE {
+            let error = std::io::Error::from_raw_os_error(errno);
             assert_eq!(
-                io_hold_cause(&msg),
-                Some(nzbd_types::HoldCause::StorageUnavailable)
+                io_error_hold_cause(&error),
+                Some(HoldCause::StorageUnavailable),
+                "{error}"
+            );
+        }
+        let full = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        assert_eq!(io_error_hold_cause(&full), Some(HoldCause::Capacity));
+        let quota = std::io::Error::from_raw_os_error(libc::EDQUOT);
+        assert_eq!(io_error_hold_cause(&quota), Some(HoldCause::Quota));
+        for errno in [libc::EACCES, libc::ENOENT, libc::EPERM, libc::EINVAL] {
+            let error = std::io::Error::from_raw_os_error(errno);
+            assert_eq!(io_error_hold_cause(&error), None, "{error} is failed/io");
+        }
+        // A message that reads like a full disk is not one.
+        let lying = std::io::Error::other("No space left on device (os error 28)");
+        assert_eq!(io_error_hold_cause(&lying), None);
+        // A kind without an errno, and an errno wrapped in a custom error.
+        let kind = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        assert_eq!(io_error_hold_cause(&kind), Some(HoldCause::Capacity));
+        let wrapped = std::io::Error::other(std::io::Error::from_raw_os_error(libc::ESTALE));
+        assert_eq!(
+            io_error_hold_cause(&wrapped),
+            Some(HoldCause::StorageUnavailable)
+        );
+    }
+
+    #[test]
+    fn error_chains_reach_the_io_error_and_sqlite_codes() {
+        let state = nzbd_state::StateError::Io {
+            op: "write",
+            path: "/processing/x.part".into(),
+            source: std::io::Error::from_raw_os_error(libc::ENOSPC),
+        };
+        assert_eq!(error_hold_cause(&state), Some(HoldCause::Capacity));
+        let artifact =
+            nzbd_state::artifacts::Error::Io(std::io::Error::from_raw_os_error(libc::ENOTCONN));
+        assert_eq!(
+            error_hold_cause(&artifact),
+            Some(HoldCause::StorageUnavailable)
+        );
+        let sqlite = |code| {
+            nzbd_state::artifacts::Error::Sql(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ))
+        };
+        assert_eq!(
+            error_hold_cause(&sqlite(rusqlite::ffi::SQLITE_FULL)),
+            Some(HoldCause::Capacity)
+        );
+        assert_eq!(
+            error_hold_cause(&sqlite(rusqlite::ffi::SQLITE_IOERR)),
+            Some(HoldCause::StorageUnavailable)
+        );
+        assert_eq!(
+            error_hold_cause(&sqlite(rusqlite::ffi::SQLITE_CONSTRAINT)),
+            None
+        );
+        let conflict =
+            nzbd_state::artifacts::Error::Conflict("payload (os error 28) no space left".into());
+        assert_eq!(error_hold_cause(&conflict), None, "messages are never read");
+    }
+
+    /// Every shape a subprocess prints a full or dropped volume in.
+    #[test]
+    fn stderr_is_read_for_the_errno_suffix_and_the_libc_wording() {
+        assert_eq!(
+            stderr_hold_cause("No space left on device (os error 28)"),
+            Some(HoldCause::Capacity)
+        );
+        assert_eq!(
+            stderr_hold_cause(
+                "write /working/monarr/completed/x.part05.rar.part: no storage space"
+            ),
+            Some(HoldCause::Capacity)
+        );
+        assert_eq!(
+            stderr_hold_cause("io: No space left on device"),
+            Some(HoldCause::Capacity)
+        );
+        assert_eq!(
+            stderr_hold_cause("Disk quota exceeded (os error 122)"),
+            Some(HoldCause::Quota)
+        );
+        for errno in UNAVAILABLE {
+            let line = format!("write /processing/x.part: whatever (os error {errno})");
+            assert_eq!(
+                stderr_hold_cause(&line),
+                Some(HoldCause::StorageUnavailable),
+                "{line}"
             );
         }
         for no in [
@@ -3129,34 +3296,12 @@ mod out_of_space_tests {
             "(os error 1107)",
             "a release named Transport endpoint is not connected",
             "finalize: complete checkpoint digest differs",
+            "connection reset by peer",
         ] {
-            assert!(!is_storage_unavailable(no), "{no}");
-            assert_eq!(io_hold_cause(no), None, "{no} is a terminal failed/io");
+            assert_eq!(stderr_hold_cause(no), None, "{no} is not environmental");
         }
-        assert_eq!(
-            io_hold_cause("No space left on device (os error 28)"),
-            Some(nzbd_types::HoldCause::Capacity)
-        );
-        assert_eq!(
-            io_hold_cause("Disk quota exceeded (os error 122)"),
-            Some(nzbd_types::HoldCause::Quota)
-        );
-    }
-    use super::is_out_of_space;
-
-    /// Every shape this string arrives in — the writer's stringified
-    /// `io::Error`, the fsx wrapper's `op path: source`, the quota variant
-    /// a gluster/NFS mount answers instead of ENOSPC.
-    #[test]
-    fn recognises_the_shapes_a_full_volume_arrives_in() {
-        assert!(is_out_of_space("No space left on device (os error 28)"));
-        assert!(is_out_of_space(
-            "write /working/monarr/completed/x.part05.rar.part: no storage space"
-        ));
-        assert!(is_out_of_space("io: No space left on device"));
-        assert!(is_out_of_space("Disk quota exceeded (os error 122)"));
-        assert!(!is_out_of_space("Permission denied (os error 13)"));
-        assert!(!is_out_of_space("connection reset by peer"));
+        assert!(out_of_space(Some(&HoldCause::Quota)));
+        assert!(!out_of_space(Some(&HoldCause::StorageUnavailable)));
     }
 }
 

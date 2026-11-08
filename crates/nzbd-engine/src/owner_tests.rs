@@ -2992,6 +2992,7 @@ async fn storage_errno_writer_error_schedules_itself() {
             job: JobId(1),
             file: FileId(10),
             error: "write /processing/x/.runner-file-10.part: Transport endpoint is not connected (os error 107)".into(),
+            cause: Some(nzbd_types::HoldCause::StorageUnavailable),
         });
     pump(&mut owner, &mut messages).await;
     let held = owner.state.jobs[0].control().unwrap();
@@ -3097,6 +3098,7 @@ async fn permanent_writer_error_is_a_terminal_io_failure() {
         job: JobId(1),
         file: FileId(10),
         error: "finalize: complete checkpoint digest differs".into(),
+        cause: None,
     });
     for _ in 0..20 {
         pump(&mut owner, &mut messages).await;
@@ -3529,6 +3531,34 @@ async fn reobserve_refusal_records_why_without_moving_its_cadence() {
 }
 
 #[test]
+fn retired_cleanup_clock_params_are_dropped_on_load() {
+    let mut job = pending_job(7);
+    job.params = vec![
+        ("*PP:failure-disposition-attempts".into(), "2".into()),
+        ("*PP:failed-cleanup-next-retry".into(), "1794076138".into()),
+        (
+            "*PP:failed-cleanup-blocked-since".into(),
+            "1794070000".into(),
+        ),
+        ("*PP:failed-cleanup-last-error".into(), "EIO".into()),
+        ("monarr-transfer".into(), "t-1".into()),
+    ];
+    assert!(drop_retired_params(&mut job));
+    assert_eq!(
+        job.params,
+        vec![
+            ("*PP:failure-disposition-attempts".into(), "2".into()),
+            ("monarr-transfer".into(), "t-1".into()),
+        ]
+    );
+    assert!(!drop_retired_params(&mut job), "idempotent");
+    assert_eq!(
+        crate::snapshot::failed_cleanup_progress(&job).map(|p| p.attempts),
+        Some(2)
+    );
+}
+
+#[test]
 fn rearm_reclassifies_by_errno_and_derives_policy() {
     let hold = |cause: &str, policy: &str, message: &str| nzbd_types::JobControl {
         version: 1,
@@ -3834,6 +3864,7 @@ async fn writer_resource_errors_hold_pending_segments_and_latch_out_of_space() {
         job: JobId(2),
         file: FileId(20),
         error: "write payload.bin: No space left on device (os error 28)".into(),
+        cause: Some(nzbd_types::HoldCause::Capacity),
     });
     pump(&mut owner, &mut messages).await;
     let job = owner.state.job(JobId(2)).unwrap();
@@ -3852,12 +3883,14 @@ async fn writer_resource_errors_hold_pending_segments_and_latch_out_of_space() {
         job: JobId(2),
         file: FileId(20),
         error: "permission denied".into(),
+        cause: None,
     });
     pump(&mut owner, &mut messages).await;
     owner.on_msg(EngineMsg::WriterError {
         job: JobId(2),
         file: FileId(999),
         error: "gone".into(),
+        cause: None,
     });
     pump(&mut owner, &mut messages).await;
     owner.on_msg(EngineMsg::SegmentWritten {

@@ -164,7 +164,7 @@ impl Par2Tool {
         let name = main_par2.file_name().unwrap().to_string_lossy();
         let out = run_tool(&self.cmd, &["verify", "-q", &name], dir, self.timeout).await?;
         let text = format!("{}\n{}", out.stdout, out.stderr);
-        if nzbd_engine::is_out_of_space(&text) {
+        if nzbd_engine::out_of_space(nzbd_engine::stderr_hold_cause(&text).as_ref()) {
             return Err(PostError::Subprocess(text.chars().take(4096).collect()));
         }
         Ok(parse_verify_output(&text, out.code))
@@ -175,7 +175,7 @@ impl Par2Tool {
         let name = main_par2.file_name().unwrap().to_string_lossy();
         let out = run_tool(&self.cmd, &["repair", "-q", &name], dir, self.timeout).await?;
         let text = format!("{}\n{}", out.stdout, out.stderr);
-        if nzbd_engine::is_out_of_space(&text) {
+        if nzbd_engine::out_of_space(nzbd_engine::stderr_hold_cause(&text).as_ref()) {
             return Err(PostError::Subprocess(text.chars().take(4096).collect()));
         }
         if out.code == 0
@@ -700,9 +700,10 @@ impl Extractors {
                     .any(|m| all.contains(m));
                 let lower = all.to_lowercase();
                 let quota_error = lower.contains("quota exceeded") || lower.contains("disk quota");
-                let capacity = nzbd_engine::is_out_of_space(&all)
-                    || lower.contains("there is not enough space")
-                    || lower.contains("disk full");
+                let capacity =
+                    nzbd_engine::out_of_space(nzbd_engine::stderr_hold_cause(&all).as_ref())
+                        || lower.contains("there is not enough space")
+                        || lower.contains("disk full");
                 let diagnostic = match password {
                     Some(secret) if !secret.is_empty() => all.replace(secret, "[redacted]"),
                     _ => all.clone(),
@@ -746,9 +747,10 @@ impl Extractors {
                 // 7z requires the literal success line (nzbget does the same).
                 let lower = all.to_lowercase();
                 let quota_error = lower.contains("quota exceeded") || lower.contains("disk quota");
-                let capacity = nzbd_engine::is_out_of_space(&all)
-                    || lower.contains("there is not enough space")
-                    || lower.contains("disk full");
+                let capacity =
+                    nzbd_engine::out_of_space(nzbd_engine::stderr_hold_cause(&all).as_ref())
+                        || lower.contains("there is not enough space")
+                        || lower.contains("disk full");
                 let diagnostic = match password {
                     Some(secret) if !secret.is_empty() => all.replace(secret, "[redacted]"),
                     _ => all.clone(),

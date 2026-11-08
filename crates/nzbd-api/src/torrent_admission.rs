@@ -420,16 +420,16 @@ impl TorrentAdmissionService {
             {
                 (Some(nzbd_types::HoldCause::StorageUnavailable), None, false)
             }
-            AdmissionError::Io(error) => {
-                (nzbd_engine::io_hold_cause(&error.to_string()), None, false)
-            }
+            AdmissionError::Io(error) => (nzbd_engine::io_error_hold_cause(error), None, false),
+            // A lifecycle error is an inventory error already rendered to
+            // text, with no errno attached; the stderr rule reads it.
             AdmissionError::Engine(nzbd_engine::EngineError::Lifecycle(message))
-                if nzbd_engine::io_hold_cause(message).is_some() =>
+                if nzbd_engine::stderr_hold_cause(message).is_some() =>
             {
-                (nzbd_engine::io_hold_cause(message), None, false)
+                (nzbd_engine::stderr_hold_cause(message), None, false)
             }
             AdmissionError::State(nzbd_state::StateError::Io { source, .. }) => {
-                (nzbd_engine::io_hold_cause(&source.to_string()), None, false)
+                (nzbd_engine::io_error_hold_cause(source), None, false)
             }
             // Contract §2.3: only environmental causes hold; anything else
             // ends the acquisition rather than waiting on a review.
@@ -1262,9 +1262,10 @@ impl TorrentAdmissionService {
         // A managed seed runs after its terminal; its recovery is retried
         // as storage (contract §2.1: seed retirement never ends the job).
         let mut cause = match error {
-            AdmissionError::Io(error) => nzbd_engine::io_hold_cause(&error.to_string()),
+            AdmissionError::Io(error) => nzbd_engine::io_error_hold_cause(error),
+            // Rendered inventory text, no errno attached: the stderr rule.
             AdmissionError::Engine(nzbd_engine::EngineError::Lifecycle(message)) => {
-                nzbd_engine::io_hold_cause(message)
+                nzbd_engine::stderr_hold_cause(message)
             }
             _ => None,
         }
@@ -1616,7 +1617,7 @@ impl TorrentAdmissionService {
                                 Some(nzbd_types::HoldCause::StorageUnavailable)
                             }
                             Ok(Err(nzbd_state::artifacts::Error::Io(error))) => {
-                                nzbd_engine::io_hold_cause(&error.to_string())
+                                nzbd_engine::io_error_hold_cause(error)
                             }
                             _ => None,
                         };
@@ -1997,11 +1998,14 @@ async fn publish_backend_state(
         }
 
         if let Some(error) = error {
-            let reason = if nzbd_engine::is_out_of_space(&error) {
-                StopReason::StorageFull
-            } else {
-                StopReason::Transient
-            };
+            // The torrent backend reports its error as text with no errno
+            // attached; the stderr rule reads it.
+            let reason =
+                if nzbd_engine::out_of_space(nzbd_engine::stderr_hold_cause(&error).as_ref()) {
+                    StopReason::StorageFull
+                } else {
+                    StopReason::Transient
+                };
             if adapter
                 .structural(BackendFact::Stopped { job, reason })
                 .await

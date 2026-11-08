@@ -885,6 +885,9 @@ pub(crate) enum EngineMsg {
         job: JobId,
         file: FileId,
         error: String,
+        /// The hold the writer's `io::Error` named by errno
+        /// ([`crate::io_error_hold_cause`]); `None` is a terminal `failed/io`.
+        cause: Option<nzbd_types::HoldCause>,
     },
     /// A real write ran out of space (ENOSPC/EDQUOT). Reported from
     /// wherever it happened — writer, finalize, post-processing — and
@@ -2012,13 +2015,18 @@ impl Owner {
                 combined_crc,
             } => self.on_writer_finalized(job, file, ok, final_path, combined_crc),
             EngineMsg::OutOfSpace { whence } => self.observe_out_of_space(&whence),
-            EngineMsg::WriterError { job, file, error } => {
+            EngineMsg::WriterError {
+                job,
+                file,
+                error,
+                cause,
+            } => {
                 tracing::warn!(job = job.0, file = file.0, %error, "writer error; failing file");
                 // The errno decides whether retrying can help: a full disk
                 // waits for space, a dropped mount retries on its own, and
-                // anything else (a digest or size mismatch) waits for a
-                // person rather than re-checking a whole file forever.
-                if crate::is_out_of_space(&error) {
+                // anything else (a digest or size mismatch) is the job's
+                // terminal failure rather than a re-check forever.
+                if crate::out_of_space(cause.as_ref()) {
                     self.observe_out_of_space(&error);
                 }
                 let stage = if error.starts_with("finalize") {
@@ -2026,7 +2034,7 @@ impl Owner {
                 } else {
                     "download_write"
                 };
-                match crate::io_hold_cause(&error) {
+                match cause {
                     Some(cause) => {
                         self.hold_job(job, cause, stage, &error);
                     }
@@ -5437,7 +5445,7 @@ impl Owner {
                 if let Err(error) = result {
                     owner.hold_job(
                         job,
-                        allocation_hold_cause(&error.to_string()),
+                        allocation_hold_cause(&error),
                         "download_write",
                         &format!("payload allocation: {error}"),
                     );
@@ -6083,12 +6091,7 @@ impl Owner {
                     continue;
                 }
                 let message = format!("payload allocation: {e}");
-                self.hold_job(
-                    r.job,
-                    allocation_hold_cause(&message),
-                    "download_write",
-                    &message,
-                );
+                self.hold_job(r.job, allocation_hold_cause(&e), "download_write", &message);
                 continue;
             }
             let writer = self.writer_for(r.job, r.file);
@@ -6365,12 +6368,17 @@ impl Owner {
                     }
                 });
             }
-            WriterFact::Error { error } => {
+            WriterFact::Error { error, cause } => {
                 if let Some(writer) = self.writers.remove(&file) {
                     self.retire_writer_handle(job, writer);
                 }
                 self.writer_epochs.remove(&file);
-                self.on_msg(EngineMsg::WriterError { job, file, error });
+                self.on_msg(EngineMsg::WriterError {
+                    job,
+                    file,
+                    error,
+                    cause,
+                });
             }
             WriterFact::Rejected {
                 seg_number,
@@ -7953,7 +7961,7 @@ impl Owner {
                     Err(error) => {
                         owner.hold_job(
                             job,
-                            allocation_hold_cause(&error.to_string()),
+                            allocation_hold_cause(&error),
                             "download_write",
                             &error.to_string(),
                         );
@@ -10197,7 +10205,13 @@ pub(crate) fn rearmed_hold(
     // A pre-v2 `io` hold whose message names an unavailable volume was
     // environmental all along; keep it a hold. Every other legacy terminal
     // cause is left for the boot conversion (`convert_legacy_holds`).
-    if control.cause == "io" && crate::is_storage_unavailable(&control.message) {
+    // The pre-v2 message is rendered text with no errno attached; the
+    // stderr rule reads its `(os error N)` suffix (removed with the legacy
+    // causes in M6b).
+    if control.cause == "io"
+        && crate::stderr_hold_cause(&control.message)
+            == Some(nzbd_types::HoldCause::StorageUnavailable)
+    {
         cause = nzbd_types::HoldCause::StorageUnavailable;
     }
     // A pre-v2 unverified-coverage hold is a re-verification, not a
@@ -10246,8 +10260,8 @@ pub(crate) fn rearmed_hold(
 
 /// An allocation that failed because the volume stopped answering retries on
 /// its own; any other allocation refusal waits for space or a person.
-fn allocation_hold_cause(message: &str) -> nzbd_types::HoldCause {
-    if crate::is_storage_unavailable(message) {
+fn allocation_hold_cause(error: &(dyn std::error::Error + 'static)) -> nzbd_types::HoldCause {
+    if crate::error_hold_cause(error) == Some(nzbd_types::HoldCause::StorageUnavailable) {
         nzbd_types::HoldCause::StorageUnavailable
     } else {
         nzbd_types::HoldCause::Allocation

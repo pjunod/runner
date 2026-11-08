@@ -1260,8 +1260,8 @@ fn verify_job_batch(
                 format!("file {} has conflicting payload identities", file.id.0),
                 checked,
             ),
-            recovery::ResolveError::Unavailable(reason) => {
-                VerificationFailure::unavailable(reason, checked)
+            recovery::ResolveError::Unavailable { message, .. } => {
+                VerificationFailure::unavailable(message, checked)
             }
         })?;
         let Some(resolved) = resolved else {
