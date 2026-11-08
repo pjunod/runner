@@ -3641,7 +3641,10 @@ fn rearm_reclassifies_by_errno_and_derives_policy() {
         hold(
             "io",
             "review",
-            "write /processing/x.part: Transport endpoint is not connected (os error 107)"
+            &format!(
+                "write /processing/x.part: {}",
+                std::io::Error::from_raw_os_error(libc::ENOTCONN)
+            )
         ),
         1000
     )
@@ -3688,7 +3691,10 @@ async fn adopting_authority_rearms_holds() {
         cause: "io".into(),
         stage: "download_write".into(),
         retry_policy: "review".into(),
-        message: "write x: Transport endpoint is not connected (os error 107)".into(),
+        message: format!(
+            "write x: {}",
+            std::io::Error::from_raw_os_error(libc::ENOTCONN)
+        ),
         instance: "i".into(),
         previous_status: Some(JobStatus::Downloading),
         manual_pause: false,
