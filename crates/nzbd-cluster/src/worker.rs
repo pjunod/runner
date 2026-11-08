@@ -417,7 +417,7 @@ pub fn spawn_worker(
                 let current=view.borrow().clone();
                 if !current.is_me {
                     if let Some(url)=current.leader_url().map(str::to_owned) {
-                        replay_completion_outbox(&cfg,&engine,&client,&active,&pp,&url,&mut completion_order).await;
+                        replay_completion_outbox(&cfg,&engine,&client,&active,&pp,&url,&dest_dir,&mut completion_order).await;
                         report_completions(&cfg,&engine,&client,&active,&pp,&url,&dest_dir,&retirement_tracker,&cancel,&mut completion_order).await;
                     }
                 }
@@ -548,7 +548,6 @@ async fn recover_download_holds(
             .filter(|control| {
                 control.lifecycle == "held"
                     && !control.manual_pause
-                    && control.hold_cause().policy().automatic()
                     && (control
                         .next_retry_at_unix
                         .is_some_and(|deadline| deadline <= now)
@@ -890,6 +889,7 @@ async fn report_completions(
             active,
             pp,
             leader_url,
+            dest_dir,
             (lease.kind, &req),
         )
         .await
@@ -1067,6 +1067,7 @@ fn next_pending_completion(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn replay_completion_outbox(
     cfg: &ClusterConfig,
     engine: &EngineHandle,
@@ -1074,6 +1075,7 @@ async fn replay_completion_outbox(
     active: &ActiveLeases,
     pp: &Option<PpSetup>,
     leader_url: &str,
+    dest_dir: &std::path::Path,
     order: &mut CompletionOrder,
 ) {
     let directory = cfg.control_dir.join("completion-outbox");
@@ -1098,6 +1100,7 @@ async fn replay_completion_outbox(
             active,
             pp,
             leader_url,
+            dest_dir,
             (pending.kind, &pending.request),
         )
         .await
@@ -1106,6 +1109,7 @@ async fn replay_completion_outbox(
         }
     }
 }
+#[allow(clippy::too_many_arguments)]
 async fn submit_completion(
     cfg: &ClusterConfig,
     engine: &EngineHandle,
@@ -1113,6 +1117,7 @@ async fn submit_completion(
     active: &ActiveLeases,
     pp: &Option<PpSetup>,
     leader_url: &str,
+    dest_dir: &std::path::Path,
     completion: (LeaseKind, &CompleteRequest),
 ) -> bool {
     let (kind, req) = completion;
@@ -1147,11 +1152,19 @@ async fn submit_completion(
                 }
                 let history_result = match (pp, resp.accepted_at_unix_ms) {
                     (Some(setup), Some(accepted_at_ms)) => {
-                        record_published_pp_history(
+                        // Contract §2.1: the authority holds no history
+                        // store, so this node — which writes the history row —
+                        // records the job's one terminal through the shared
+                        // chain (row, history, stamp, job_pp_finished).
+                        crate::leader::record_remote_terminal(
+                            engine,
                             setup.history.clone(),
                             &history_job,
-                            (!resp.cleanup_only).then_some(final_dir.as_str()),
-                            accepted_at_ms,
+                            published_pp_history_entry(
+                                &history_job,
+                                (!resp.cleanup_only).then_some(final_dir.as_str()),
+                                accepted_at_ms,
+                            ),
                         )
                         .await
                     }
@@ -1166,6 +1179,20 @@ async fn submit_completion(
                 if let Err(error) = accept_worker_retirement(engine, req, &resp).await {
                     tracing::warn!(job=job_id.0,%error,"remote workspace retirement awaits durable acceptance recording");
                     return false;
+                }
+                // Contract §2.6: the failure's terminal is durable on the
+                // leader now; this node disposes of its own attempt copy.
+                if let Some(setup) = pp {
+                    if !nzbd_post::manager::dispose_remote_failure(
+                        engine,
+                        &setup.post,
+                        dest_dir,
+                        &req.job,
+                    )
+                    .await
+                    {
+                        tracing::warn!(job = job_id.0, "remote failure disposal remains pending; the cleanup ledger retries it");
+                    }
                 }
             }
             tracing::info!(job = job_id.0, %lease_id, "completion handed to leader");
@@ -1375,13 +1402,26 @@ async fn record_published_pp_history(
     result_ref: Option<&str>,
     accepted_at_ms: i64,
 ) -> Result<(), String> {
+    let entry = published_pp_history_entry(job, result_ref, accepted_at_ms);
+    tokio::task::spawn_blocking(move || history.record_seq(&entry))
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn published_pp_history_entry(
+    job: &nzbd_types::Job,
+    result_ref: Option<&str>,
+    accepted_at_ms: i64,
+) -> nzbd_state::HistoryEntry {
     let status = job
         .params
         .iter()
         .find(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
         .map(|(_, value)| value.clone())
         .unwrap_or_else(|| "SUCCESS".into());
-    let entry = nzbd_state::HistoryEntry {
+    nzbd_state::HistoryEntry {
         job: job.id,
         name: job.name.clone(),
         category: job.category.clone(),
@@ -1407,12 +1447,7 @@ async fn record_published_pp_history(
         record: Some(nzbd_state::JobRecord::from_job(job)),
         stages: job.stages.clone(),
         seq: 0,
-    };
-    tokio::task::spawn_blocking(move || history.record_seq(&entry))
-        .await
-        .map_err(|error| format!("join durable history write: {error}"))?
-        .map(|_| ())
-        .map_err(|error| format!("write durable PP history: {error}"))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1855,7 +1890,7 @@ fn run_pp_lease(
             // Restored checkpoints keep their original absolute deadline and
             // first blocked time. Heartbeats run independently while waiting.
             if let Some(control)=engine.export_job(job_id).await.ok().flatten().and_then(|job|job.control()).filter(|control|control.lifecycle=="held") {
-                if !control.hold_cause().policy().automatic() || control.manual_pause {
+                if control.manual_pause {
                     tokio::select!{_=initial.cancel.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_secs(1))=>{}}
                     continue;
                 }

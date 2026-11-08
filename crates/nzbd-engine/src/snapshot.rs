@@ -48,6 +48,13 @@ pub struct JobSummary {
     pub repair_progress: Option<RepairProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control: Option<nzbd_types::JobControl>,
+    /// Contract §2.3: the native status, `held` when the job is held (the
+    /// persisted `status` stays `paused` until M6).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status_projected: String,
+    /// The curator transfer token (`params["monarr-transfer"]`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer: Option<String>,
     #[serde(skip_serializing_if = "is_false")]
     pub lifecycle_eligible: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -351,6 +358,8 @@ mod mobile_queue_contract_tests {
                 verification: None,
                 repair_progress: None,
                 control: None,
+                status_projected: String::new(),
+                transfer: None,
                 lifecycle_eligible: false,
                 url_fetch: None,
                 failed_cleanup: None,

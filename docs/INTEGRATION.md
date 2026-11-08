@@ -200,8 +200,9 @@ or answers `reset` if the boot id changed or the cursor fell out of the ring.
 Event names nzbd emits: `job_added` · `job_finished` · `job_deleted` ·
 `file_finished` · `segment_exhausted` · `server_blocked` ·
 `queue_pause_changed` · `speed_limit_changed` · `job_assigned` ·
-`job_pp_stage` · `job_pp_finished`, plus the stream-level frames `reset` ·
-`lagged` · `tick` · `hb` · `log`.
+`job_pp_stage` · `job_pp_finished` · `job_status_changed` ·
+`job_publication_ready`, plus the stream-level frames `reset` · `lagged` ·
+`tick` · `hb` · `log`.
 
 monarr acts on exactly six: `job_pp_stage` (step trace), `job_pp_finished`
 (completed or failed, carrying `final_dir`), `job_deleted` (failed, "removed
@@ -218,6 +219,56 @@ using `final_dir` from `job_pp_finished` or the durable history row; a queue row
 does not carry an import path. Failed post-processing is terminal (`pp_done:
 true`) but never ready; its history row may still name a parked directory, which
 is evidence for recovery, not an importable payload.
+
+### Terminal events (pipeline contract v2, runner 0.3.0)
+
+Every job ends in exactly one terminal, and the terminal is durable before it
+is announced. Runner writes one `job_terminals` row (with any salvage
+obligation, in the same transaction), appends the history row, stamps the
+queue row, and only then emits `job_pp_finished`. A crash anywhere in that
+chain is replayed at boot and every 30 s, so a consumer sees the event at
+least once and every copy carries the same `history_seq`. Operator delete is a
+terminal too: `job_pp_finished{outcome:"cancelled"}` with the transfer, from
+the same record as its `DELETED` history row; `job_deleted` is still sent but
+is advisory.
+
+`job_pp_finished` fields:
+
+| Field | Meaning |
+|---|---|
+| `job`, `name`, `category` | as before |
+| `transfer` | the `monarr-transfer` param, or null |
+| `outcome` | `completed` · `failed` · `cancelled` |
+| `reason` | `failed` only: `health` · `fetch` · `par` · `unpack` · `script` · `publish` · `io` · `identity` · `hold_expired` |
+| `fetch_cause` | `fetch` only: `gone` (404/410 — blames the release) or `indexer_unavailable` |
+| `stage` | `failed` only: a post stage name, or `download` · `health` · `fetch` |
+| `message` | `failed` only: human text, at most 2048 characters |
+| `blames_release` | whether the consumer should blocklist the release: true for `health` · `par` · `unpack` · `identity` and for `fetch{gone}` |
+| `salvage` | `pending` when Runner will assess the failed job's bytes and may publish the usable part later; otherwise `none` |
+| `keep_on_failure` | the job asked for its source to be kept; retention only, it never changes the terminal |
+| `fetched` | `{success_articles, total_articles, bytes}` |
+| `publication` | `completed` only: `{path, generation, manifest_digest, files, cross_volume}` |
+| `history_seq`, `history_incarnation` | the durable history row; the history cursor is the pair |
+| `pp_status`, `final_dir`, `size_bytes`, `health`, `params` | legacy names kept for old consumers (removed in M6); `params` carries `*Control:v1` |
+
+`job_status_changed{job, transfer, status, stage, control}` fires on every
+status transition, including into and out of `held`. `status` is the
+projected native status: a job held on an environmental cause reads `held`
+(the persisted status stays `Paused` until M6), and `control.deadline_in_s` /
+`deadline_unix` say when the hold ends on its own. The queue listing carries
+the same projection as `status_projected`, plus `transfer`.
+
+`job_publication_ready{job, transfer, publication}` announces a salvage
+publication of a failed job. It is not a terminal; the job stays failed. The
+matching `/api/v1/deliveries` row has `kind: "salvage"` (completed jobs are
+`kind: "completed"`), with the same manifest body. `POST …/accept` is a 200
+no-op since 0.3.0 — see [CURATOR_DELIVERY.md](CURATOR_DELIVERY.md).
+
+`GET /api/v1/history` now answers `incarnation`, `head_seq` and
+`retained_min_seq` beside the rows. A consumer that stores `since_seq` must
+store the incarnation with it: a new incarnation means the index was rebuilt
+and the stored cursor no longer names the same rows, so rescan from
+`retained_min_seq`.
 
 **Where you see it.**
 

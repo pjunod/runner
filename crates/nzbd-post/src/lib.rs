@@ -53,6 +53,12 @@ pub enum PostError {
     /// evidence publication requires. Nothing failed to run.
     #[error("nothing publishable: {0}")]
     NothingPublishable(String),
+    /// Contract §2.2 `identity`: the release's own evidence disagrees with
+    /// itself (conflicting PAR descriptions or slice checksums, SFV entries
+    /// naming one archive with two checksums). Blames the release; nothing
+    /// is salvageable from evidence that contradicts itself.
+    #[error("identity: {0}")]
+    Identity(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("artifact inventory: {0}")]

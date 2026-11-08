@@ -1284,30 +1284,92 @@ async fn park_write(st: &ApiState, mut parked: Parked) -> bool {
     };
     let inventory = st.engine.artifacts();
     let job = parked.entry.job;
+    if let Some(bytes) = parked.nzb.clone() {
+        let spool = db.clone();
+        let spooled = tokio::task::spawn_blocking(move || spool.spool_nzb(job, &bytes)).await;
+        if !matches!(spooled, Ok(Ok(()))) {
+            tracing::warn!(job = job.0, "could not park the deleted job's NZB");
+            return false;
+        }
+    }
+    // Contract §2.2: an operator delete is a real terminal — `cancelled`,
+    // with the transfer — written through the one terminal chain, so the
+    // `DELETED` history row and `job_pp_finished{cancelled}` come from the
+    // same record. A job that already has its terminal (a failed row
+    // awaiting salvage or disposal) keeps it: no second terminal.
+    let terminal = cancelled_terminal(&parked.entry);
+    let recorded = match st
+        .engine
+        .record_terminal_in(terminal, Some(db.clone()))
+        .await
+    {
+        Ok(Some(row)) if row.outcome == nzbd_types::TerminalOutcome::Cancelled => {
+            Some(row.history_seq.unwrap_or(0))
+        }
+        Ok(Some(_)) => None,
+        Ok(None) | Err(_) => {
+            tracing::warn!(job = job.0, "could not record the cancelled terminal");
+            db.drop_spool(job);
+            return false;
+        }
+    };
     tokio::task::spawn_blocking(move || {
-        if let Some(bytes) = &parked.nzb {
-            if let Err(e) = db.spool_nzb(job, bytes) {
-                tracing::warn!(job = job.0, error = %e, "could not park the deleted job's NZB");
-                return false;
-            }
-        }
-        match db.record_seq_durable(&parked.entry) {
-            Ok((sequence, mut entry)) => {
-                entry.seq = sequence;
-                if let Err(error) = inventory.finalize_deleted_workspaces(&entry) {
-                    tracing::warn!(job = job.0, %error, "deleted job scratch awaits maintenance replay");
+        let sequence = match recorded {
+            Some(sequence) => sequence,
+            None => match db.record_seq_durable(&parked.entry) {
+                Ok((sequence, _)) => sequence,
+                Err(e) => {
+                    tracing::warn!(job = job.0, error = %e, "could not write the DELETED history entry");
+                    db.drop_spool(job);
+                    return false;
                 }
-                true
-            }
-            Err(e) => {
-                tracing::warn!(job = job.0, error = %e, "could not write the DELETED history entry");
-                db.drop_spool(job);
-                false
-            }
+            },
+        };
+        let mut entry = parked.entry;
+        entry.seq = sequence;
+        if let Err(error) = inventory.finalize_deleted_workspaces(&entry) {
+            tracing::warn!(job = job.0, %error, "deleted job scratch awaits maintenance replay");
         }
+        true
     })
     .await
     .unwrap_or(false)
+}
+
+/// The `cancelled` terminal for a deleted job's `DELETED` history entry.
+fn cancelled_terminal(entry: &nzbd_state::HistoryEntry) -> nzbd_state::artifacts::JobTerminal {
+    nzbd_state::artifacts::JobTerminal {
+        job: entry.job.0,
+        transfer: nzbd_types::transfer_of(&entry.params),
+        outcome: nzbd_types::TerminalOutcome::Cancelled,
+        reason: None,
+        fetch_cause: None,
+        stage: None,
+        message: Some("deleted by the operator".into()),
+        blames_release: false,
+        salvage: nzbd_state::artifacts::SalvageState::None,
+        keep_on_failure: false,
+        fetched: entry
+            .record
+            .as_ref()
+            .map(|record| nzbd_types::Fetched {
+                success_articles: u64::from(record.success_articles),
+                total_articles: u64::from(record.total_articles),
+                bytes: 0,
+            })
+            .unwrap_or_default(),
+        publication: None,
+        markers: Vec::new(),
+        entry: entry.clone(),
+        history_seq: None,
+        history_incarnation: None,
+        markers_stamped: false,
+        emitted: false,
+        disposal: None,
+        salvage_error: None,
+        created_at: 0,
+        updated_at: 0,
+    }
 }
 
 async fn job_action(
@@ -1905,25 +1967,73 @@ fn event_json(ev: &nzbd_engine::Event) -> (&'static str, serde_json::Value) {
             job,
             name,
             category,
+            transfer,
+            outcome,
+            reason,
+            fetch_cause,
+            stage,
+            message,
+            blames_release,
+            salvage,
+            keep_on_failure,
+            fetched,
+            publication,
             pp_status,
             final_dir,
             size_bytes,
             health,
             params,
             history_seq,
+            history_incarnation,
         } => (
             "job_pp_finished",
             json!({
                 "job": job.0,
                 "name": name,
                 "category": category,
+                "transfer": transfer,
+                "outcome": outcome.as_str(),
+                "reason": reason.map(|r| r.as_str()),
+                "fetch_cause": fetch_cause.map(|c| c.as_str()),
+                "stage": stage,
+                "message": message,
+                "blames_release": blames_release,
+                "salvage": salvage.as_str(),
+                "keep_on_failure": keep_on_failure,
+                "fetched": fetched,
+                "publication": publication,
                 "pp_status": pp_status,
                 "final_dir": final_dir,
                 "size_bytes": size_bytes,
                 "health": health,
                 "params": params,
                 "history_seq": history_seq,
+                "history_incarnation": history_incarnation,
             }),
+        ),
+        E::JobStatusChanged {
+            job,
+            transfer,
+            status,
+            stage,
+            control,
+        } => (
+            "job_status_changed",
+            json!({
+                "job": job.0,
+                "transfer": transfer,
+                "status": status,
+                "stage": stage,
+                "control": control,
+            }),
+        ),
+        E::JobPublicationReady {
+            job,
+            transfer,
+            publication,
+        } => (
+            "job_publication_ready",
+            json!({"job": job.0, "transfer": transfer, "publication": publication}),
         ),
     }
 }
@@ -2169,75 +2279,86 @@ async fn get_history(
     let consumer = consumer_name(&headers);
     let now = unix_now();
     let entries = tokio::task::spawn_blocking(move || {
-        db.read_page(limit, offset, since).map(|(entries, total)| {
-            // Record the pull before decorating: this poll SAW these
-            // entries. Both shapes count — a `since_seq` catch-up walk is
-            // still the consumer reading them. A failure here is not worth
-            // failing the read over; the observation is diagnostic, the
-            // response is the job.
-            if consumer.is_some() {
-                let jobs: Vec<crate::JobId> = entries.iter().map(|e| e.job).collect();
-                if !jobs.is_empty() {
-                    let _ = db.mark_seen(&jobs, consumer.as_deref(), now);
-                }
-            }
-            // `can_requeue` is derived, not stored: it answers "is the
-            // requeue source still on this node?", which only a look at the
-            // spool (or the parked `*URL`) can honestly say.
-            //
-            // ONE directory listing for the page, not one `stat` per row:
-            // the spool lives beside the state dir, which on a network
-            // mount made this loop the bulk of a history read (250 ms for
-            // 179 rows, nuc3 2026-07-29).
-            let spooled = db.spooled_ids();
-            let entries = entries
-                .into_iter()
-                .map(|e| {
-                    let reason = history_requeue_refusal(&e);
-                    let can = reason.is_none()
-                        && (spooled.contains(&e.job.0)
-                            || e.params.iter().any(|(k, _)| k == "*URL"));
-                    let mut v = serde_json::to_value(&e).unwrap_or_else(|_| json!({}));
-                    if let Some(o) = v.as_object_mut() {
-                        o.insert(
-                            "torrent_role".into(),
-                            json!(e
-                                .record
-                                .as_ref()
-                                .and_then(|record| record.torrent_role.as_deref())),
-                        );
-                        o.insert(
-                            "seed_donor_job_id".into(),
-                            json!(e
-                                .record
-                                .as_ref()
-                                .and_then(|record| record.seed_donor_job_id)),
-                        );
-                        o.insert("can_requeue".into(), json!(can));
-                        o.insert("requeue_reason".into(), json!(reason));
-                        o.insert(
-                            "kind".into(),
-                            json!(e
-                                .record
-                                .as_ref()
-                                .map(|record| record.kind)
-                                .unwrap_or(nzbd_types::JobKind::Nzb)),
-                        );
+        db.read_page(limit, offset, since)
+            .map(|(entries, total)| {
+                // Record the pull before decorating: this poll SAW these
+                // entries. Both shapes count — a `since_seq` catch-up walk is
+                // still the consumer reading them. A failure here is not worth
+                // failing the read over; the observation is diagnostic, the
+                // response is the job.
+                if consumer.is_some() {
+                    let jobs: Vec<crate::JobId> = entries.iter().map(|e| e.job).collect();
+                    if !jobs.is_empty() {
+                        let _ = db.mark_seen(&jobs, consumer.as_deref(), now);
                     }
-                    v
-                })
-                .collect::<Vec<_>>();
-            (entries, total, db.sync_status())
-        })
+                }
+                // `can_requeue` is derived, not stored: it answers "is the
+                // requeue source still on this node?", which only a look at the
+                // spool (or the parked `*URL`) can honestly say.
+                //
+                // ONE directory listing for the page, not one `stat` per row:
+                // the spool lives beside the state dir, which on a network
+                // mount made this loop the bulk of a history read (250 ms for
+                // 179 rows, nuc3 2026-07-29).
+                let spooled = db.spooled_ids();
+                let entries = entries
+                    .into_iter()
+                    .map(|e| {
+                        let reason = history_requeue_refusal(&e);
+                        let can = reason.is_none()
+                            && (spooled.contains(&e.job.0)
+                                || e.params.iter().any(|(k, _)| k == "*URL"));
+                        let mut v = serde_json::to_value(&e).unwrap_or_else(|_| json!({}));
+                        if let Some(o) = v.as_object_mut() {
+                            o.insert(
+                                "torrent_role".into(),
+                                json!(e
+                                    .record
+                                    .as_ref()
+                                    .and_then(|record| record.torrent_role.as_deref())),
+                            );
+                            o.insert(
+                                "seed_donor_job_id".into(),
+                                json!(e
+                                    .record
+                                    .as_ref()
+                                    .and_then(|record| record.seed_donor_job_id)),
+                            );
+                            o.insert("can_requeue".into(), json!(can));
+                            o.insert("requeue_reason".into(), json!(reason));
+                            o.insert(
+                                "kind".into(),
+                                json!(e
+                                    .record
+                                    .as_ref()
+                                    .map(|record| record.kind)
+                                    .unwrap_or(nzbd_types::JobKind::Nzb)),
+                            );
+                        }
+                        v
+                    })
+                    .collect::<Vec<_>>();
+                (entries, total, db.sync_status())
+            })
+            .and_then(|(entries, total, sync)| {
+                // Contract §2.5: the cursor is `(incarnation, seq)`. A consumer
+                // whose stored incarnation differs, or whose cursor is below
+                // `retained_min_seq`, has lost continuity and must reconcile.
+                let continuity = (db.incarnation()?, db.head_seq()?, db.retained_min_seq()?);
+                Ok((entries, total, sync, continuity))
+            })
     })
     .await;
     match entries {
-        Ok(Ok((entries, total, sync))) => Json(json!({
+        Ok(Ok((entries, total, sync, (incarnation, head_seq, retained_min_seq)))) => Json(json!({
             "entries": entries,
             "total": total,
             "offset": offset,
             "limit": limit,
             "sync": sync,
+            "incarnation": incarnation,
+            "head_seq": head_seq,
+            "retained_min_seq": retained_min_seq,
         }))
         .into_response(),
         Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -2254,8 +2375,8 @@ async fn openapi() -> Response {
         "paths": {
             "/api/v1/status": { "get": { "summary": "Queue + rate + guard status" } },
             "/api/v1/request-admissions/{token}": { "get": { "summary": "Read the durable outcome of one transfer-token URL admission" } },
-            "/api/v1/deliveries": { "get": { "summary": "Durable pending publication deliveries; rescan after=0 or persist every receipt before advancing the cursor" } },
-            "/api/v1/deliveries/{id}/accept": { "post": { "summary": "Persist an idempotent consumer receipt for an immutable publication generation and manifest" } },
+            "/api/v1/deliveries": { "get": { "summary": "Read-only reconciliation feed of publications (kind completed|salvage, manifest body); pass includeAccepted=true" } },
+            "/api/v1/deliveries/{id}/accept": { "post": { "summary": "Deprecated no-op (pipeline contract v2): answers 200 with the unchanged row; removed in M3" } },
             "/api/v1/jobs": {
                 "get": { "summary": "List queue jobs" },
                 "post": { "summary": "Add a job (NZB body, or ?url=)",
@@ -3127,7 +3248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_routes_page_accept_refresh_and_retry_source_cleanup() {
+    async fn accept_answers_200_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = test_engine(&tmp).await;
         let root = tmp.path().join("processing");
@@ -3180,13 +3301,16 @@ mod tests {
             )
             .await
             .unwrap();
+        // Contract §2.5 / plan M1 (h): there is no acceptance. `accept`
+        // answers 200 with the unchanged row so an old curator's retry loop
+        // settles; nothing is recorded and the row stays on the feed.
         assert_eq!(accepted.status(), StatusCode::OK);
-        assert_eq!(
-            body_json(accepted).await["consumerReceiptId"],
-            "curator-receipt-fixture"
-        );
+        let accepted = body_json(accepted).await;
+        assert!(accepted["consumerReceiptId"].is_null());
+        assert!(accepted["acceptedAt"].is_null());
+        assert_eq!(accepted["kind"], "completed");
 
-        let hidden_after_accept = app
+        let still_listed = app
             .clone()
             .oneshot(
                 axum::http::Request::get("/api/v1/deliveries?after=0&limit=1")
@@ -3195,56 +3319,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let hidden_after_accept = body_json(hidden_after_accept).await;
-        assert!(hidden_after_accept["deliveries"]
-            .as_array()
-            .unwrap()
-            .is_empty());
-        assert_eq!(hidden_after_accept["nextCursor"], delivery.sequence);
-
-        let accepted_page = app
-            .clone()
-            .oneshot(
-                axum::http::Request::get("/api/v1/deliveries?after=0&limit=1&includeAccepted=true")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            body_json(accepted_page).await["deliveries"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-
-        let refreshed = app
-            .clone()
-            .oneshot(
-                axum::http::Request::get(format!("/api/v1/deliveries/{}", delivery.delivery_id))
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(refreshed.status(), StatusCode::OK);
-        assert!(body_json(refreshed).await["acceptedAt"].is_number());
-
-        let replay = app
-            .clone()
-            .oneshot(
-                axum::http::Request::post(format!(
-                    "/api/v1/deliveries/{}/accept",
-                    delivery.delivery_id
-                ))
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body.to_string()))
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(replay.status(), StatusCode::OK);
+        let still_listed = body_json(still_listed).await;
+        let row = &still_listed["deliveries"][0];
+        assert_eq!(row["deliveryId"], delivery.delivery_id);
+        assert_eq!(row["kind"], "completed");
+        assert_eq!(row["manifestDigest"], delivery.manifest_digest);
+        assert_eq!(row["files"].as_array().unwrap().len(), 1);
 
         let conflicting = serde_json::json!({
             "protocolVersion": 1,
@@ -3252,7 +3332,7 @@ mod tests {
             "manifestDigest": delivery.manifest_digest,
             "consumerReceiptId": "different-receipt"
         });
-        let conflict = app
+        let replay = app
             .clone()
             .oneshot(
                 axum::http::Request::post(format!(
@@ -3265,7 +3345,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(replay.status(), StatusCode::OK, "a no-op never conflicts");
+        assert_eq!(
+            artifacts.delivery(&delivery.delivery_id).unwrap(),
+            artifacts.delivery(&delivery.delivery_id).unwrap()
+        );
+        assert!(artifacts
+            .delivery(&delivery.delivery_id)
+            .unwrap()
+            .accepted_at
+            .is_none());
 
         let retry_cleanup = app
             .oneshot(
@@ -3319,6 +3408,8 @@ mod tests {
             verification: None,
             repair_progress: None,
             control: None,
+            status_projected: status.as_str().into(),
+            transfer: None,
             lifecycle_eligible: false,
             url_fetch: None,
             failed_cleanup: None,
@@ -3577,9 +3668,9 @@ mod tests {
         engine
             .hold_job(
                 id,
-                nzbd_types::HoldCause::IdentityConflict,
+                nzbd_types::HoldCause::MountUnavailable,
                 "download_write",
-                "conflicting yEnc declared size",
+                "configured root identity changed",
             )
             .await
             .unwrap();
@@ -3909,6 +4000,169 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body_json(response).await["available"], false);
+        engine.shutdown().await;
+    }
+
+    /// Contract §2.2 / IMPL §5.4: an operator delete is a real `cancelled`
+    /// terminal with the transfer, from the same record as its `DELETED`
+    /// history row; `job_deleted` stays advisory.
+    #[tokio::test]
+    async fn operator_delete_emits_cancelled_terminal_with_transfer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let db = Arc::new(HistoryDb::open(&tmp.path().join("history.sqlite"), None).unwrap());
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: Some(db.clone()),
+            torrent: None,
+            log: None,
+            setup: None,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+        let id = engine
+            .add_nzb_opts(
+                "to-delete",
+                NZB.as_bytes(),
+                nzbd_engine::AddOpts {
+                    params: vec![("monarr-transfer".into(), "t-cancel-1".into())],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut events = engine.subscribe();
+        let response = app
+            .oneshot(
+                axum::http::Request::post(format!("/api/v1/jobs/{}/actions/delete", id.0))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let entry = db.get(id).unwrap().unwrap();
+        assert_eq!(entry.status, "DELETED");
+        let terminal = engine.artifacts().terminal(id.0).unwrap().unwrap();
+        assert_eq!(terminal.outcome, nzbd_types::TerminalOutcome::Cancelled);
+        assert_eq!(terminal.transfer.as_deref(), Some("t-cancel-1"));
+        assert_eq!(terminal.history_seq, Some(entry.seq));
+        assert!(terminal.emitted);
+        let (mut deleted, mut cancelled) = (false, false);
+        while let Ok(event) = events.try_recv() {
+            match event {
+                nzbd_engine::Event::JobDeleted { job } if job == id => deleted = true,
+                nzbd_engine::Event::JobPpFinished {
+                    job,
+                    outcome,
+                    transfer,
+                    history_seq,
+                    blames_release,
+                    ..
+                } if job == id => {
+                    assert_eq!(outcome, nzbd_types::TerminalOutcome::Cancelled);
+                    assert_eq!(transfer.as_deref(), Some("t-cancel-1"));
+                    assert_eq!(history_seq, entry.seq);
+                    assert!(!blames_release);
+                    cancelled = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(deleted, "job_deleted is still emitted");
+        assert!(
+            cancelled,
+            "job_pp_finished{{cancelled}} reaches the consumer"
+        );
+        engine.shutdown().await;
+    }
+
+    /// Plan M1 (h): a consumer built against v1 still reads the new event —
+    /// the legacy `pp_status`/`final_dir`/`params`/`history_seq` keep their
+    /// names and the `*Control:v1` it carries parses with the v1 fixture
+    /// consumer — and `GET /history` carries the cursor's incarnation.
+    #[tokio::test]
+    async fn old_curator_fixture_parses_new_event() {
+        let fixture: nzbd_types::JobControl = serde_json::from_str(include_str!(
+            "../../nzbd-types/fixtures/job-control-v1.json"
+        ))
+        .unwrap();
+        let (name, data) = event_json(&nzbd_engine::Event::JobPpFinished {
+            job: JobId(7),
+            name: "Show".into(),
+            category: Some("tv".into()),
+            transfer: Some("t-7".into()),
+            outcome: nzbd_types::TerminalOutcome::Failed,
+            reason: Some(nzbd_types::FailureReason::Unpack),
+            fetch_cause: None,
+            stage: Some("unpack".into()),
+            message: Some("extractor failed".into()),
+            blames_release: true,
+            salvage: nzbd_types::Salvage::Pending,
+            keep_on_failure: false,
+            fetched: Default::default(),
+            publication: None,
+            pp_status: "UNPACK_FAILURE".into(),
+            final_dir: None,
+            size_bytes: 1,
+            health: 1000,
+            params: vec![
+                ("monarr-transfer".into(), "t-7".into()),
+                (
+                    nzbd_types::CONTROL_PARAM.into(),
+                    serde_json::to_string(&fixture).unwrap(),
+                ),
+            ],
+            history_seq: 12,
+            history_incarnation: "abc".into(),
+        });
+        assert_eq!(name, "job_pp_finished");
+        // What an old consumer reads, by name.
+        assert_eq!(data["pp_status"], "UNPACK_FAILURE");
+        assert!(data["pp_status"].as_str().unwrap().contains("FAILURE"));
+        assert!(data["final_dir"].is_null());
+        assert_eq!(data["history_seq"], 12);
+        let control = data["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pair| pair[0] == nzbd_types::CONTROL_PARAM)
+            .unwrap()[1]
+            .as_str()
+            .unwrap();
+        let parsed: nzbd_types::JobControl = serde_json::from_str(control).unwrap();
+        assert_eq!(parsed, fixture);
+        // The history cursor carries its identity.
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let db = Arc::new(HistoryDb::open(&tmp.path().join("history.sqlite"), None).unwrap());
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: Some(db.clone()),
+            torrent: None,
+            log: None,
+            setup: None,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/history?since_seq=0")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let page = body_json(response).await;
+        assert_eq!(page["incarnation"].as_str().unwrap().len(), 32);
+        assert_eq!(page["head_seq"], 0);
+        assert_eq!(page["retained_min_seq"], 0);
         engine.shutdown().await;
     }
 
@@ -5227,12 +5481,34 @@ mod tests {
             job: JobId(7),
             name: "Show.S01E01".into(),
             category: Some("tv".into()),
+            transfer: Some("t-42-a3f9c1".into()),
+            outcome: nzbd_types::TerminalOutcome::Completed,
+            reason: None,
+            fetch_cause: None,
+            stage: None,
+            message: None,
+            blames_release: false,
+            salvage: nzbd_types::Salvage::None,
+            keep_on_failure: false,
+            fetched: nzbd_types::Fetched {
+                success_articles: 10,
+                total_articles: 10,
+                bytes: 42,
+            },
+            publication: Some(nzbd_types::Publication {
+                path: "/dest/Show.S01E01".into(),
+                generation: "29c8".into(),
+                manifest_digest: "a0ac".into(),
+                files: 1,
+                cross_volume: false,
+            }),
             pp_status: "SUCCESS".into(),
             final_dir: Some("/dest/Show.S01E01".into()),
             size_bytes: 42,
             health: 1000,
             params: vec![("monarr-transfer".into(), "t-42-a3f9c1".into())],
             history_seq: 913,
+            history_incarnation: "7f3a".into(),
         });
         assert_eq!(name, "job_pp_finished");
         assert!(
@@ -5244,5 +5520,70 @@ mod tests {
             data.contains("monarr-transfer"),
             "the transfer id must survive to the wire: {data}"
         );
+        for field in [
+            "\"transfer\":\"t-42-a3f9c1\"",
+            "\"outcome\":\"completed\"",
+            "\"salvage\":\"none\"",
+            "\"history_incarnation\":\"7f3a\"",
+            "\"manifest_digest\":\"a0ac\"",
+            "\"cross_volume\":false",
+            "\"success_articles\":10",
+        ] {
+            assert!(data.contains(field), "{field} missing: {data}");
+        }
+        let (name, data) = wire(&E::JobPpFinished {
+            job: JobId(8),
+            name: "Show.S01E02".into(),
+            category: None,
+            transfer: Some("t-43".into()),
+            outcome: nzbd_types::TerminalOutcome::Failed,
+            reason: Some(nzbd_types::FailureReason::Fetch),
+            fetch_cause: Some(nzbd_types::FetchCause::IndexerUnavailable),
+            stage: Some("fetch".into()),
+            message: Some("http: status 503".into()),
+            blames_release: false,
+            salvage: nzbd_types::Salvage::None,
+            keep_on_failure: false,
+            fetched: Default::default(),
+            publication: None,
+            pp_status: "FAILURE/FETCH".into(),
+            final_dir: None,
+            size_bytes: 0,
+            health: 0,
+            params: vec![],
+            history_seq: 914,
+            history_incarnation: "7f3a".into(),
+        });
+        assert_eq!(name, "job_pp_finished");
+        for field in [
+            "\"reason\":\"fetch\"",
+            "\"fetch_cause\":\"indexer_unavailable\"",
+            "\"blames_release\":false",
+            "\"publication\":null",
+        ] {
+            assert!(data.contains(field), "{field} missing: {data}");
+        }
+        let (name, data) = wire(&E::JobStatusChanged {
+            job: JobId(9),
+            transfer: None,
+            status: "held".into(),
+            stage: None,
+            control: None,
+        });
+        assert_eq!(name, "job_status_changed");
+        assert!(data.contains("\"status\":\"held\""), "{data}");
+        let (name, data) = wire(&E::JobPublicationReady {
+            job: JobId(9),
+            transfer: Some("t-9".into()),
+            publication: nzbd_types::Publication {
+                path: "/c/x.runner-1".into(),
+                generation: "1".into(),
+                manifest_digest: "ab".into(),
+                files: 2,
+                cross_volume: false,
+            },
+        });
+        assert_eq!(name, "job_publication_ready");
+        assert!(data.contains("\"files\":2"), "{data}");
     }
 }

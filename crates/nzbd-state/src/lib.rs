@@ -514,6 +514,16 @@ pub struct UrlAdmissionReceipt {
     pub source_artifact_id: Option<String>,
     #[serde(default)]
     pub source_generation: Option<String>,
+    /// Contract §2.2, for the continuity-loss reconcile: the terminal's typed
+    /// reason (`Failure:Reason`), not a status string to re-parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_cause: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blames_release: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salvage: Option<String>,
 }
 
 /// Everything needed to reconstruct the queue after a restart.
@@ -1085,6 +1095,10 @@ mod tests {
                 publication_path: None,
                 source_artifact_id: Some("source-artifact".into()),
                 source_generation: Some("source-generation".into()),
+                failure_reason: None,
+                fetch_cause: None,
+                blames_release: None,
+                salvage: None,
             }],
             jobs: vec![],
             next_job_id: 7,

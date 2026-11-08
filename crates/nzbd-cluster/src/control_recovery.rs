@@ -25,6 +25,10 @@ fn business_params(job: &Job) -> impl Iterator<Item = &(String, String)> {
                         | "*Cluster:AutomaticControl"
                         | "*Runner:LifecycleTiming"
                         | "*Recovery:journal-loading"
+                        // The leader's own terminal chain stamps its history
+                        // cursor on the row (contract §2.1); it is not
+                        // source intent.
+                        | "*PP:history-seq"
                 )
     })
 }

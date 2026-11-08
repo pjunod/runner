@@ -10,7 +10,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-const MAX_SOURCE: usize = 64 * 1024 * 1024;
+/// The largest fetched NZB the URL cache stores durably.
+pub const MAX_SOURCE: usize = 64 * 1024 * 1024;
 const MAX_RECORD: usize = 16 * 1024 * 1024;
 const MAX_OUTBOX_PAGE: usize = 32 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);

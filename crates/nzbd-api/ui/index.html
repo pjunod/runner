@@ -2142,10 +2142,9 @@ function rowModel(j, ctx) {
   const torrent = isSeedTorrent(j);
   const acquisition = isTorrentAcquisition(j);
   const hold = j.control && j.control.lifecycle === "held" ? j.control : null;
-  const reviewHold = hold && !["resume_same_job", "reobserve_mount", "scheduled_retry"].includes(hold.retry_policy);
-  // An automatic hold Runner is still retrying offers "pause"; a review hold
-  // or one the operator paused offers "retry". Every hold has one of the two.
-  const holdRetrying = !!hold && !reviewHold && !hold.manual_pause;
+  // Every hold is automatic and ends by its deadline (contract v2). One Runner
+  // is still retrying offers "pause"; one the operator paused offers "retry".
+  const holdRetrying = !!hold && !hold.manual_pause;
   const phase = torrentPhase(j);
   const seed = phase === "seeding" || phase === "paused_seed";
   const seedPaused = phase === "paused_seed";
@@ -2202,7 +2201,7 @@ function rowModel(j, ctx) {
   }
 
   if (hold) {
-    rest.push(" · " + (hold.message || "job on hold") + (reviewHold ? " · needs review" : hold.manual_pause ? " · retries paused" : ""));
+    rest.push(" · " + (hold.message || "job on hold") + (hold.manual_pause ? " · retries paused" : ""));
     if (hold.retry_policy === "reobserve_mount")
       rest.push(" · waiting for the configured storage source; Runner will resume when it returns");
     if (!hold.manual_pause && ["scheduled_retry", "resume_same_job"].includes(hold.retry_policy) && hold.blocked_since_unix != null) {
@@ -2212,6 +2211,8 @@ function rowModel(j, ctx) {
       if (hold.next_retry_at_unix != null)
         rest.push(" · next retry in " + fmtDur(Math.max(0, hold.next_retry_at_unix * 1000 - (ctx.nowMs || Date.now()))));
     }
+    if (hold.deadline_unix != null)
+      rest.push(" · fails as hold expired in " + fmtDur(Math.max(0, hold.deadline_unix * 1000 - (ctx.nowMs || Date.now()))) + " unless it recovers");
   }
   if (j.verification) rest.push(" · " + recoveryVerificationText(j));
   const shownSt = over || controlPendingLabel(j) || (hold ? "held" : j.verification && st !== "paused" ? "verifying" : acquisitionStatus(j) || st);
@@ -2275,8 +2276,7 @@ function rowModel(j, ctx) {
     pauseAction: torrent ? (torrentAction ? torrentAction.action : "") : holdRetrying ? "pause" : ((over || st) === "paused" || hold ? "resume" : "pause"),
     pauseTip: torrent || !hold ? ""
       : holdRetrying ? "Runner is retrying this on its own. Pause stops the retries until you retry it yourself."
-      : "Retry now: the job goes back to the step it stopped in. If the cause is still there it is held again, with the reason."
-        + (hold.cause === "identity_conflict" ? " Retrying re-downloads the conflicting data over the retained evidence." : ""),
+      : "Retry now: the job goes back to the step it stopped in. If the cause is still there it is held again, with the reason.",
     deleteLabel: torrent ? "remove torrent" : "delete",
     deleteTip: acquisition ? "Remove this acquisition only; the separate seed source is unchanged." : torrent ? "Remove this torrent from the queue, keeping its downloaded files." :
       "Remove this job from the queue. One click — no dialog; you get 8 seconds to undo it.",
@@ -2768,7 +2768,7 @@ function pipelineModels(j, nowMs) {
 // skip the very work being recovered and could delete its source archives.
 function recoveryMax(j) {
   if (j.pp_done) return "";
-  if (j.control && j.control.lifecycle === "held" && ["unknown", "post_failure"].includes(j.control.cause)
+  if (j.control && j.control.lifecycle === "held" && j.control.cause === "unknown"
       && ["par_rename", "rar_rename", "par_verify", "par_repair", "unpack", "extract", "cleanup", "post_unpack_rename", "publication_verify", "move"].includes(j.control.stage)) return "all";
 
   // The open stage remains useful observability during a delayed-PAR

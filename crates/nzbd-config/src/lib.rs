@@ -233,6 +233,13 @@ pub struct PostSection {
     pub script_timeout_secs: u64,
     /// How long to wait for delayed par-block downloads during repair.
     pub par_fetch_timeout_secs: u64,
+    /// Seconds an environmental hold (storage, capacity, mount, tool…) may
+    /// last before runner ends the job `failed/hold_expired` with its bytes
+    /// parked (pipeline contract v2 §2.3).
+    pub hold_deadline_secs: u64,
+    /// The same deadline for `password_required` holds, which wait on a
+    /// person.
+    pub password_hold_deadline_secs: u64,
 }
 
 impl Default for PostSection {
@@ -252,6 +259,8 @@ impl Default for PostSection {
             tool_timeout_secs: 3600,
             script_timeout_secs: 3600,
             par_fetch_timeout_secs: 600,
+            hold_deadline_secs: 86_400,
+            password_hold_deadline_secs: 604_800,
         }
     }
 }

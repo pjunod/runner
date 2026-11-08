@@ -1703,6 +1703,26 @@ async fn url_jobs_fetch_then_download() {
     let (status, _) = wait_finished(&mut rx, dead, 30).await;
     assert_eq!(status, JobStatus::Failed);
     dead_response.join().unwrap();
+    // Contract §2.2 / plan M1 (l): the fetcher types its own terminal. A
+    // 404 is the indexer answering for this item: `fetch{gone}`, blamed.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let terminal = loop {
+        if let Some(terminal) = engine
+            .artifacts()
+            .terminal(dead.0)
+            .unwrap()
+            .filter(|t| t.emitted)
+        {
+            break terminal;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no fetch terminal");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Fetch));
+    assert_eq!(terminal.fetch_cause, Some(nzbd_types::FetchCause::Gone));
+    assert!(terminal.blames_release);
+    assert_eq!(terminal.salvage, nzbd_state::artifacts::SalvageState::None);
+    assert_eq!(terminal.stage.as_deref(), Some("fetch"));
     engine.shutdown().await;
 }
 
@@ -2232,14 +2252,13 @@ async fn public_resume_releases_allocation_and_identity_holds() {
     assert!(engine
         .hold_job(
             job,
-            nzbd_types::HoldCause::IdentityConflict,
+            nzbd_types::HoldCause::PasswordRequired,
             "extract",
-            "review required",
+            "password required",
         )
         .await
         .unwrap());
-    // A review hold never retries by itself, but an operator resume is
-    // always an exit (docs/HELD_JOBS_PLAN.md §4.6).
+    // An operator resume is always an exit (docs/HELD_JOBS_PLAN.md §4.6).
     assert!(engine.resume_job(job).await.unwrap());
     assert!(!engine.export_ready(job).await.unwrap().unwrap().held());
     engine.shutdown().await;
@@ -2281,6 +2300,8 @@ async fn legacy_coverage_hold_recovers_without_repeating_valid_articles() {
             next_retry_at_unix: None,
             blocked_since_unix: None,
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         });
         job.status = JobStatus::Paused;
         engine.import_ready(job, false, false).await.unwrap();
@@ -2310,6 +2331,107 @@ async fn legacy_coverage_hold_recovers_without_repeating_valid_articles() {
         assert!(!dir.join("legacy-partial.bin").exists());
         assert_eq!(job.file_needs_repair(file), !manual);
         assert!(!job.ready());
+        engine.shutdown().await;
+    }
+}
+
+/// Contract §2.3 / plan M1 (g): a control persisted by a pre-v2 build with
+/// the terminal cause `identity_conflict` is converted at boot — before hold
+/// recovery — into the terminal `failed/identity`, with its history row and
+/// `job_pp_finished`, whatever the operator's pause said. It is not retried.
+#[tokio::test]
+async fn legacy_identity_conflict_hold_converts_at_boot() {
+    for manual in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = spawn_engine(tmp.path(), vec![]).await;
+        // Nothing downloaded yet: no partial for startup verification to
+        // judge, so the conversion below is the boot conversion's alone.
+        let mut job = transfer_job(991, "legacy-partial", JobStatus::Queued);
+        job.set_control(&nzbd_types::JobControl {
+            version: 1,
+            revision: "7".into(),
+            lifecycle: "held".into(),
+            cause: "identity_conflict".into(),
+            stage: "finalize".into(),
+            retry_policy: "review".into(),
+            message: "conflicting yEnc declared size".into(),
+            instance: "legacy".into(),
+            previous_status: Some(JobStatus::Downloading),
+            manual_pause: manual,
+            retry_attempt: 0,
+            next_retry_at_unix: None,
+            blocked_since_unix: None,
+            released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
+        });
+        job.status = JobStatus::Paused;
+        engine.import_ready(job, false, false).await.unwrap();
+        engine.shutdown().await;
+
+        let history = std::sync::Arc::new(
+            nzbd_state::history::HistoryDb::open(
+                &tmp.path().join("history.sqlite"),
+                Some(tmp.path()),
+            )
+            .unwrap(),
+        );
+        let mut cfg = EngineConfig::single_node(
+            vec![],
+            tmp.path().join("state"),
+            tmp.path().join("dest"),
+            test_tuning(),
+            None,
+        );
+        cfg.history = Some(history.clone());
+        let engine = Engine::spawn(cfg).await.expect("engine spawn");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let terminal = loop {
+            if let Some(terminal) = engine
+                .artifacts()
+                .terminal(991)
+                .unwrap()
+                .filter(|t| t.emitted)
+            {
+                break terminal;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "legacy hold was not converted: {:?}",
+                engine.snapshot().jobs
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(terminal.outcome, nzbd_types::TerminalOutcome::Failed);
+        assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Identity));
+        assert_eq!(terminal.stage.as_deref(), Some("finalize"));
+        assert_eq!(
+            terminal.message.as_deref(),
+            Some("conflicting yEnc declared size"),
+            "converted from the stored control, not re-diagnosed"
+        );
+        assert!(terminal.blames_release);
+        assert!(terminal.reason.unwrap().park_always());
+        assert_eq!(terminal.salvage, nzbd_state::artifacts::SalvageState::None);
+        let seq = terminal.history_seq.unwrap();
+        assert!(seq > 0, "the event is sent only once history is durable");
+        let row = history.get_sequence(seq).unwrap().unwrap();
+        assert_eq!(row.status, "FAILURE/IDENTITY");
+        assert!(row
+            .params
+            .iter()
+            .any(|(key, value)| key == "Failure:Reason" && value == "identity"));
+        let summary = engine
+            .snapshot()
+            .jobs
+            .iter()
+            .find(|job| job.id == JobId(991))
+            .cloned()
+            .unwrap();
+        assert!(summary.pp_done);
+        assert_eq!(summary.status, JobStatus::Failed);
+        assert_ne!(summary.status_projected, "held");
+        assert_eq!(engine.run_hold_recovery_pass().await.unwrap(), 0);
         engine.shutdown().await;
     }
 }
@@ -2345,6 +2467,8 @@ async fn stranded_storage_hold_recovers_after_restart_without_a_click() {
             next_retry_at_unix: None,
             blocked_since_unix: Some(1),
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         });
         job.status = JobStatus::Paused;
         engine.import_ready(job, false, false).await.unwrap();
@@ -2391,13 +2515,12 @@ async fn stranded_storage_hold_recovers_after_restart_without_a_click() {
 /// The recovery pass end to end on the post side (#2181's path): a held
 /// post-processing job whose payload passes the custody check goes back to
 /// post-processing; one whose payload is gone stays held, rescheduled, with
-/// the refusal on the job. A review hold is never touched.
+/// the refusal on the job.
 #[tokio::test]
-async fn recovery_pass_releases_post_holds_through_custody_and_skips_review() {
+async fn recovery_pass_releases_post_holds_through_custody() {
     for (cause, payload_present) in [
         ("storage_unavailable", true),
         ("storage_unavailable", false),
-        ("identity_conflict", true),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let engine = spawn_engine(tmp.path(), vec![]).await;
@@ -2415,12 +2538,7 @@ async fn recovery_pass_releases_post_holds_through_custody_and_skips_review() {
             lifecycle: "held".into(),
             cause: cause.into(),
             stage: "post_unpack_rename".into(),
-            retry_policy: if cause == "identity_conflict" {
-                "review"
-            } else {
-                "scheduled_retry"
-            }
-            .into(),
+            retry_policy: "scheduled_retry".into(),
             message: "io: read /processing/post-held/x: Input/output error (os error 5)".into(),
             instance: "field".into(),
             previous_status: Some(JobStatus::Post {
@@ -2431,6 +2549,8 @@ async fn recovery_pass_releases_post_holds_through_custody_and_skips_review() {
             next_retry_at_unix: None,
             blocked_since_unix: Some(1),
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         });
         job.status = JobStatus::Paused;
         engine.import_ready(job, false, false).await.unwrap();
@@ -2456,11 +2576,6 @@ async fn recovery_pass_releases_post_holds_through_custody_and_skips_review() {
             .unwrap();
         let control = job.control().unwrap();
         match (cause, payload_present) {
-            ("identity_conflict", _) => {
-                assert_eq!(released, 0, "a review hold waits for a person");
-                assert!(job.held());
-                assert!(!control.message.contains("retry refused"));
-            }
             (_, true) => {
                 assert_eq!(released, 1, "{}", control.message);
                 assert!(!job.held());

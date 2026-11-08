@@ -117,6 +117,7 @@ impl Drop for NamespaceUse<'_> {
                 .lock()
                 .unwrap()
                 .remove(key);
+            self.inventory.reconciliation_released.notify_all();
         }
     }
 }
@@ -596,6 +597,7 @@ impl Inventory {
                             files,
                             error: None,
                             inspected_at: Some(now()),
+                            salvage: None,
                         });
                     }
                 }
@@ -637,6 +639,7 @@ impl Inventory {
                     files: Vec::new(),
                     error: None,
                     inspected_at: Some(now()),
+                    salvage: None,
                 };
                 drop(db);
                 let record = Materialization {

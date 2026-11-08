@@ -278,7 +278,7 @@ fn load_one(
     for (path, scan) in &par_files {
         if scan.slice_size > 0 {
             if slice_size != 0 && slice_size != scan.slice_size {
-                return Err(PostError::Subprocess("inconsistent PAR slice size".into()));
+                return Err(PostError::Identity("inconsistent PAR slice size".into()));
             }
             slice_size = scan.slice_size;
         }
@@ -287,7 +287,7 @@ fn load_one(
             let description = (d.name.clone(), d.length, d.md5_16k, d.md5_full);
             if let Some(previous) = descs.get(&d.id) {
                 if *previous != description {
-                    return Err(PostError::Subprocess(
+                    return Err(PostError::Identity(
                         "conflicting PAR file descriptions".into(),
                     ));
                 }
@@ -299,9 +299,7 @@ fn load_one(
         for (id, v) in &scan.crcs {
             if let Some(previous) = crcs.get(id) {
                 if previous != v {
-                    return Err(PostError::Subprocess(
-                        "conflicting PAR slice evidence".into(),
-                    ));
+                    return Err(PostError::Identity("conflicting PAR slice evidence".into()));
                 }
             } else {
                 crcs.insert(*id, v.clone());

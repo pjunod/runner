@@ -227,6 +227,19 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Contract §2.2: why an exhausted fetch failed. The retried branch of
+/// [`retry_delay`] (429/503, I/O, timeouts, transport) ran out on an indexer
+/// that was unavailable; everything it does not retry (404/410/403 and the
+/// other non-retried statuses, a bad URL, a redirect loop) is the indexer
+/// answering for this item: `gone`.
+pub fn cause_of(error: &FetchError) -> nzbd_types::FetchCause {
+    if retry_delay(error, 0).is_some() {
+        nzbd_types::FetchCause::IndexerUnavailable
+    } else {
+        nzbd_types::FetchCause::Gone
+    }
+}
+
 fn retry_delay(error: &FetchError, retries: u32) -> Option<Duration> {
     match error {
         FetchError::HttpStatus {
@@ -343,6 +356,42 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    /// Contract §2.2 / plan M1 (l): the retried classes are an unavailable
+    /// indexer; what the fetcher does not retry is the indexer answering for
+    /// this item.
+    #[test]
+    fn fetch_404_is_gone_fetch_503_exhausted_is_indexer_unavailable() {
+        use nzbd_types::FetchCause;
+        let status = |code: u16| FetchError::HttpStatus {
+            status: hyper::StatusCode::from_u16(code).unwrap(),
+            retry_after: None,
+        };
+        for code in [404, 410, 403, 400, 500] {
+            assert_eq!(cause_of(&status(code)), FetchCause::Gone, "{code}");
+        }
+        for code in [429, 503] {
+            assert_eq!(
+                cause_of(&status(code)),
+                FetchCause::IndexerUnavailable,
+                "{code}"
+            );
+        }
+        assert_eq!(
+            cause_of(&FetchError::Timeout),
+            FetchCause::IndexerUnavailable
+        );
+        assert_eq!(
+            cause_of(&FetchError::TransientNetwork("reset".into())),
+            FetchCause::IndexerUnavailable
+        );
+        assert_eq!(cause_of(&FetchError::TooManyRedirects), FetchCause::Gone);
+        assert_eq!(cause_of(&FetchError::BadUrl("x".into())), FetchCause::Gone);
+        assert!(nzbd_types::FailureReason::Fetch.blames_release(Some(FetchCause::Gone)));
+        assert!(
+            !nzbd_types::FailureReason::Fetch.blames_release(Some(FetchCause::IndexerUnavailable))
+        );
+    }
     use super::*;
     use std::io::{Read as _, Write as _};
 

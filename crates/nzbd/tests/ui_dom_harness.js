@@ -383,8 +383,8 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   const doomed2 = T.rowModel(job(1, { health: 700 }), { idx: 0, count: 1, healthAbortArmed: false });
   eq(doomed2.hNote, "below estimated repair threshold", "…and so is the un-armed case");
   const held = job(1, { status: "paused", control: {
-    lifecycle: "held", cause: "identity_conflict", retry_policy: "review",
-    message: "conflicting yEnc declared size",
+    lifecycle: "held", cause: "storage_unavailable", retry_policy: "scheduled_retry",
+    message: "conflicting yEnc declared size", deadline_unix: 3600 + 86400,
   } });
   eq(T.sectionOf({ ...held, stages: [{ stage: "unpack", started_at_unix: 1 }] }), "attention", "hold overrides a stale stage");
   eq(T.sectionOf(job(2, { status: "completed", pp_done: false })), "post_queued", "completed download awaits post-processing");
@@ -395,12 +395,15 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   ok(heldRow.dRest.includes("conflicting yEnc declared size"), "the hold reason appears in the row");
   // Field report 2026-11-01: two HELD jobs with only "delete" to click.
   // Every hold now offers exactly one of: pause (Runner is retrying it)
-  // or retry (a person decides, or the retries were paused).
-  eq(heldRow.pauseHidden, false, "every hold, review included, offers an exit");
-  eq(heldRow.pauseLabel, "retry", "a review hold offers retry");
-  eq(heldRow.pauseAction, "resume", "retry rides the resume action the engine accepts for holds");
-  ok(heldRow.pauseTip.includes("held again"), "the tip says a persisting cause re-holds");
-  ok(heldRow.pauseTip.includes("retained evidence"), "an identity-conflict retry says it overwrites evidence");
+  // or retry (the retries were paused). Contract v2: no hold waits for a
+  // person, and every hold says when it runs out.
+  eq(heldRow.pauseHidden, false, "every hold offers an exit");
+  eq(heldRow.pauseLabel, "pause", "a retried hold offers pause");
+  ok(!heldRow.dRest.includes("needs review"), "no hold is a review item");
+  const deadlined = T.rowModel(held, { mixedSection: false, nowMs: 3600 * 1000 });
+  ok(deadlined.dRest.includes("fails as hold expired in"), "a hold shows its deadline");
+  const legacyReview = T.rowModel({ ...held, control: { ...held.control, retry_policy: "review" } });
+  eq(legacyReview.pauseLabel, "pause", "a policy from an older build is still an automatic hold");
   const storageHold = { ...held.control, cause: "storage_unavailable", stage: "download_write",
     retry_policy: "scheduled_retry", message: "write /processing/x.part: Transport endpoint is not connected (os error 107)",
     blocked_since_unix: 0, next_retry_at_unix: 3600 + 90 };
@@ -412,6 +415,8 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   ok(!retrying.dRest.includes("needs review"), "an automatically retried hold is not a review item");
   const paused = T.rowModel({ ...held, control: { ...storageHold, manual_pause: true } }, { nowMs: 3600 * 1000 });
   eq(paused.pauseLabel, "retry", "a paused automatic hold offers retry");
+  eq(paused.pauseAction, "resume", "retry rides the resume action the engine accepts for holds");
+  ok(paused.pauseTip.includes("held again"), "the tip says a persisting cause re-holds");
   ok(paused.dRest.includes("retries paused") && !paused.dRest.includes("next retry in"),
     "a paused hold says its retries are paused, not when the next one fires");
   const capacityRow = T.rowModel({ ...held, control: { ...held.control,

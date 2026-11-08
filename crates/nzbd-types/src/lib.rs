@@ -494,6 +494,24 @@ pub enum JobStatus {
     Deleted,
 }
 
+impl JobStatus {
+    /// The native wire name. `Post { .. }` is `post_processing`; the stage
+    /// travels separately.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobStatus::Fetching => "fetching",
+            JobStatus::Queued => "queued",
+            JobStatus::Downloading => "downloading",
+            JobStatus::Paused => "paused",
+            JobStatus::PostQueued => "post_queued",
+            JobStatus::Post { .. } => "post_processing",
+            JobStatus::Completed => "completed",
+            JobStatus::Failed => "failed",
+            JobStatus::Deleted => "deleted",
+        }
+    }
+}
+
 /// One stage a job passed through, and how long it stayed there.
 ///
 /// The post manager has always measured this — `Stages::enter` stamps an
@@ -553,6 +571,15 @@ pub struct JobControl {
     /// new episode and starts fresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub released_at_unix: Option<i64>,
+    /// Seconds until runner ends this hold as `failed/hold_expired`
+    /// (contract §2.3). Relative, because hosts share no clock; rewritten on
+    /// every control write and every published snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_in_s: Option<i64>,
+    /// The same deadline as a unix time, for display only. The hold-recovery
+    /// task enforces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_unix: Option<i64>,
 }
 impl JobControl {
     pub fn hold_cause(&self) -> HoldCause {
@@ -574,10 +601,11 @@ pub const CONTROL_PARAM: &str = "*Control:v1";
 /// cause cannot compile without saying how a hold for it ends. The wire
 /// form stays the string in `JobControl::cause`.
 ///
-/// A cause states whether retrying can help, not merely where it failed: a
-/// volume that stopped answering is [`HoldCause::StorageUnavailable`] and
-/// heals by itself; a checksum that disagrees is [`HoldCause::Io`] and fails
-/// the same way every time.
+/// Every cause is *environmental*: something that comes back by itself or
+/// from a person (storage, space, a mount, a tool, a password). A failure
+/// that would fail the same way every time is not a hold — it is a terminal
+/// [`FailureReason`] (pipeline contract v2 §2.2–2.3). Every hold carries a
+/// deadline after which runner ends the job `failed/hold_expired`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HoldCause {
     /// The queue owner did not answer a control request in time.
@@ -596,23 +624,17 @@ pub enum HoldCause {
     MountUnavailable,
     /// An extractor or script binary is missing.
     MissingTool,
-    /// An encrypted archive needs a password a person has to supply.
+    /// An encrypted archive needs a password a person has to supply. Retried
+    /// on the ladder; its (longer) deadline is what ends it.
     PasswordRequired,
-    /// An I/O failure retrying will not fix (a digest or size mismatch,
-    /// a missing file, a refused permission).
-    Io,
-    /// The evidence disagrees with itself (foreign journal bytes, unsafe or
-    /// conflicting yEnc metadata, unverified coverage).
-    IdentityConflict,
-    /// Post-processing failed on its input.
-    PostFailure,
-    /// A cause written by another build. Never produced here.
+    /// A cause written by another build (or a legacy terminal cause that the
+    /// boot conversion did not recognise). Treated as storage: scheduled
+    /// retry with a deadline, never a dead end.
     Unrecognized(String),
 }
 
 /// How a hold ends without an operator. Every policy also answers an
-/// operator retry, so `Review` means "nothing retries this by itself",
-/// never "stuck".
+/// operator retry, and every hold has a deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoldPolicy {
     /// Retried on [`HOLD_RETRY_DELAYS_SECONDS`] for as long as it is held.
@@ -621,8 +643,6 @@ pub enum HoldPolicy {
     ResumeSameJob,
     /// The configured volume's identity is re-checked every recovery pass.
     ReobserveMount,
-    /// A person decides.
-    Review,
 }
 
 impl HoldPolicy {
@@ -631,12 +651,7 @@ impl HoldPolicy {
             HoldPolicy::ScheduledRetry => "scheduled_retry",
             HoldPolicy::ResumeSameJob => "resume_same_job",
             HoldPolicy::ReobserveMount => "reobserve_mount",
-            HoldPolicy::Review => "review",
         }
-    }
-    /// Whether the recovery task releases this hold without a person.
-    pub fn automatic(self) -> bool {
-        self != HoldPolicy::Review
     }
     /// Whether the hold waits for a time (`next_retry_at_unix`) rather than
     /// being re-checked every pass.
@@ -647,7 +662,7 @@ impl HoldPolicy {
 
 impl HoldCause {
     /// Every cause this build writes, for tests that must cover the set.
-    pub const ALL: [HoldCause; 11] = [
+    pub const ALL: [HoldCause; 8] = [
         HoldCause::EngineUnavailable,
         HoldCause::StorageUnavailable,
         HoldCause::Capacity,
@@ -656,9 +671,6 @@ impl HoldCause {
         HoldCause::MountUnavailable,
         HoldCause::MissingTool,
         HoldCause::PasswordRequired,
-        HoldCause::Io,
-        HoldCause::IdentityConflict,
-        HoldCause::PostFailure,
     ];
 
     pub fn as_str(&self) -> &str {
@@ -671,9 +683,6 @@ impl HoldCause {
             HoldCause::MountUnavailable => "mount_unavailable",
             HoldCause::MissingTool => "missing_tool",
             HoldCause::PasswordRequired => "password_required",
-            HoldCause::Io => "io",
-            HoldCause::IdentityConflict => "identity_conflict",
-            HoldCause::PostFailure => "post_failure",
             HoldCause::Unrecognized(s) => s,
         }
     }
@@ -691,18 +700,26 @@ impl HoldCause {
         match self {
             HoldCause::EngineUnavailable
             | HoldCause::StorageUnavailable
-            | HoldCause::MissingTool => HoldPolicy::ScheduledRetry,
+            | HoldCause::MissingTool
+            | HoldCause::Unrecognized(_) => HoldPolicy::ScheduledRetry,
             HoldCause::Capacity | HoldCause::Quota | HoldCause::Allocation => {
                 HoldPolicy::ResumeSameJob
             }
             HoldCause::MountUnavailable => HoldPolicy::ReobserveMount,
-            // A password has to come from a person; until it does a retry
-            // fails the same way.
-            HoldCause::PasswordRequired
-            | HoldCause::Io
-            | HoldCause::IdentityConflict
-            | HoldCause::PostFailure
-            | HoldCause::Unrecognized(_) => HoldPolicy::Review,
+            // Retried on the ladder; the (longer) deadline is what ends it.
+            HoldCause::PasswordRequired => HoldPolicy::ScheduledRetry,
+        }
+    }
+
+    /// The pre-v2 terminal causes a persisted control may still carry. The
+    /// boot conversion turns each into the terminal failure the contract
+    /// (§2.3) specifies for it; nothing writes these strings any more.
+    pub fn legacy_terminal(s: &str) -> Option<FailureReason> {
+        match s {
+            "io" => Some(FailureReason::Io),
+            "identity_conflict" => Some(FailureReason::Identity),
+            "post_failure" => Some(FailureReason::Publish),
+            _ => None,
         }
     }
 
@@ -731,6 +748,233 @@ pub const HOLD_RETRY_DELAYS_SECONDS: [i64; 4] = [30, 60, 120, 300];
 /// well past the longest backoff step, so a mount that flaps keeps backing
 /// off, while a job that ran fine for an hour starts its next blip at 30 s.
 pub const HOLD_EPISODE_SECONDS: i64 = 3600;
+
+/// Contract §2.3 defaults for `[post] hold_deadline_secs` and
+/// `[post] password_hold_deadline_secs`.
+pub const HOLD_DEADLINE_SECONDS_DEFAULT: i64 = 24 * 3600;
+pub const PASSWORD_HOLD_DEADLINE_SECONDS_DEFAULT: i64 = 7 * 24 * 3600;
+
+/// Why a job ended `failed` (contract §2.2). Closed; the serde form is the
+/// wire form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureReason {
+    Health,
+    Fetch,
+    Par,
+    Unpack,
+    Script,
+    Publish,
+    Io,
+    Identity,
+    HoldExpired,
+}
+
+impl FailureReason {
+    pub const ALL: [FailureReason; 9] = [
+        FailureReason::Health,
+        FailureReason::Fetch,
+        FailureReason::Par,
+        FailureReason::Unpack,
+        FailureReason::Script,
+        FailureReason::Publish,
+        FailureReason::Io,
+        FailureReason::Identity,
+        FailureReason::HoldExpired,
+    ];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailureReason::Health => "health",
+            FailureReason::Fetch => "fetch",
+            FailureReason::Par => "par",
+            FailureReason::Unpack => "unpack",
+            FailureReason::Script => "script",
+            FailureReason::Publish => "publish",
+            FailureReason::Io => "io",
+            FailureReason::Identity => "identity",
+            FailureReason::HoldExpired => "hold_expired",
+        }
+    }
+    pub fn parse(s: &str) -> Option<FailureReason> {
+        FailureReason::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+    /// The legacy history status string. The `SUCCESS`/`FAILURE` prefix
+    /// rule consumers match on still holds for the new strings.
+    pub fn history_status(self) -> &'static str {
+        match self {
+            FailureReason::Health => "FAILURE/HEALTH",
+            FailureReason::Fetch => "FAILURE/FETCH",
+            FailureReason::Par => "PAR_FAILURE",
+            FailureReason::Unpack => "UNPACK_FAILURE",
+            FailureReason::Script => "SCRIPT_FAILURE",
+            FailureReason::Publish => "FAILURE/PUBLISH",
+            FailureReason::Io => "FAILURE/IO",
+            FailureReason::Identity => "FAILURE/IDENTITY",
+            FailureReason::HoldExpired => "FAILURE/HOLD_EXPIRED",
+        }
+    }
+    /// Contract §2.2: the bytes are intact or uncertain and the policy or the
+    /// environment failed, so the source is parked whatever
+    /// `[post] failure_action` says.
+    pub fn park_always(self) -> bool {
+        matches!(
+            self,
+            FailureReason::Publish
+                | FailureReason::Io
+                | FailureReason::Identity
+                | FailureReason::HoldExpired
+        )
+    }
+    /// Contract §2.2: whether curator should blocklist the release.
+    pub fn blames_release(self, fetch_cause: Option<FetchCause>) -> bool {
+        match self {
+            FailureReason::Health
+            | FailureReason::Par
+            | FailureReason::Unpack
+            | FailureReason::Identity => true,
+            FailureReason::Fetch => fetch_cause == Some(FetchCause::Gone),
+            FailureReason::Script
+            | FailureReason::Publish
+            | FailureReason::Io
+            | FailureReason::HoldExpired => false,
+        }
+    }
+    /// Contract §2.2: whether runner may assess and publish salvage.
+    pub fn salvage_possible(self) -> bool {
+        !matches!(self, FailureReason::Fetch | FailureReason::Identity)
+    }
+}
+
+impl std::fmt::Display for FailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why a `fetch` failure happened — decides blame (contract §2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FetchCause {
+    /// The indexer answered 404/410/403 (or another non-retried status) for
+    /// this item.
+    Gone,
+    /// Retries through 429/503/timeouts/transport ran out.
+    IndexerUnavailable,
+}
+
+impl FetchCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FetchCause::Gone => "gone",
+            FetchCause::IndexerUnavailable => "indexer_unavailable",
+        }
+    }
+    pub fn parse(s: &str) -> Option<FetchCause> {
+        match s {
+            "gone" => Some(FetchCause::Gone),
+            "indexer_unavailable" => Some(FetchCause::IndexerUnavailable),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TerminalOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TerminalOutcome::Completed => "completed",
+            TerminalOutcome::Failed => "failed",
+            TerminalOutcome::Cancelled => "cancelled",
+        }
+    }
+    pub fn parse(s: &str) -> Option<TerminalOutcome> {
+        match s {
+            "completed" => Some(TerminalOutcome::Completed),
+            "failed" => Some(TerminalOutcome::Failed),
+            "cancelled" => Some(TerminalOutcome::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+/// The salvage field of `job_pp_finished` (contract §2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Salvage {
+    None,
+    Pending,
+}
+
+impl Salvage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Salvage::None => "none",
+            Salvage::Pending => "pending",
+        }
+    }
+}
+
+/// What the download phase fetched, for curator's re-grab budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fetched {
+    pub success_articles: u64,
+    pub total_articles: u64,
+    pub bytes: u64,
+}
+
+impl Fetched {
+    pub fn of(job: &Job) -> Fetched {
+        let mut fetched = Fetched::default();
+        for file in &job.files {
+            for segment in &file.segments {
+                fetched.total_articles += 1;
+                if let SegmentState::Done { len, .. } = segment.state {
+                    fetched.success_articles += 1;
+                    fetched.bytes += u64::from(len);
+                }
+            }
+        }
+        fetched
+    }
+}
+
+/// A committed publication (contract §2.1 `publication`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Publication {
+    pub path: String,
+    pub generation: String,
+    /// The deployed `runner-manifest-v1` digest, bare lowercase hex.
+    pub manifest_digest: String,
+    pub files: u32,
+    pub cross_volume: bool,
+}
+
+/// The job param carrying the curator transfer token.
+pub const TRANSFER_PARAM: &str = "monarr-transfer";
+
+pub fn transfer_of(params: &[(String, String)]) -> Option<String> {
+    params
+        .iter()
+        .find(|(key, _)| key == TRANSFER_PARAM)
+        .map(|(_, value)| value.clone())
+}
+
+/// Contract §2.3: the native API and SSE show `held`; the persisted status
+/// stays `Paused` (with `control.lifecycle == "held"`) until M6.
+pub fn projected_status(job: &Job) -> &'static str {
+    if job.held() {
+        "held"
+    } else {
+        job.status.as_str()
+    }
+}
 
 pub fn hold_retry_delay_seconds(attempts_made: u8) -> i64 {
     HOLD_RETRY_DELAYS_SECONDS[usize::from(attempts_made).min(HOLD_RETRY_DELAYS_SECONDS.len() - 1)]

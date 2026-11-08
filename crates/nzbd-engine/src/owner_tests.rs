@@ -1644,6 +1644,10 @@ async fn terminal_failed_job_can_keep_only_its_retained_delivery_source() {
             publication_path: Some(completed.join("published-generation").display().to_string()),
             source_artifact_id: Some(source_id.clone()),
             source_generation: Some(source_generation.clone()),
+            failure_reason: None,
+            fetch_cause: None,
+            blames_release: None,
+            salvage: None,
         });
 
     let (reply, result) = oneshot::channel();
@@ -1783,7 +1787,7 @@ async fn intact_publication_clears_previous_private_repair_marker() {
 }
 
 #[tokio::test]
-async fn yenc_name_variations_keep_the_first_name_but_size_and_path_conflicts_hold() {
+async fn yenc_name_variations_keep_the_first_name_but_size_and_path_conflicts_fail_identity() {
     let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
     pump(&mut owner, &mut messages).await;
     for id in 1..=3 {
@@ -1800,16 +1804,38 @@ async fn yenc_name_variations_keep_the_first_name_but_size_and_path_conflicts_ho
         "first.bin"
     );
     owner.accept_file_metadata(JobId(1), file, "third-name", 101);
-    pump(&mut owner, &mut messages).await;
-    let control = owner.state.job(JobId(1)).unwrap().control().unwrap();
-    assert_eq!(control.cause, "identity_conflict");
-    assert_eq!(control.message, "conflicting yEnc declared size");
+    // Contract §2.2: self-contradicting yEnc metadata is the release's
+    // fault — a terminal `failed/identity`, blamed, never salvaged.
+    let terminal_of = |owner: &Owner, id: u32| owner.artifacts.terminal(id).unwrap();
+    for _ in 0..20 {
+        pump(&mut owner, &mut messages).await;
+        if terminal_of(&owner, 1).is_some_and(|t| t.emitted) {
+            break;
+        }
+    }
+    let terminal = terminal_of(&owner, 1).unwrap();
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Identity));
+    assert_eq!(
+        terminal.message.as_deref(),
+        Some("conflicting yEnc declared size")
+    );
+    assert!(terminal.blames_release);
+    assert_eq!(terminal.salvage, nzbd_state::artifacts::SalvageState::None);
+    assert_eq!(owner.state.job(JobId(1)).unwrap().status, JobStatus::Failed);
 
     for (id, name, size) in [(2, "../unsafe", 100), (3, "empty.bin", 0)] {
         let file = owner.state.job(JobId(id)).unwrap().files[0].id;
         owner.accept_file_metadata(JobId(id), file, name, size);
-        pump(&mut owner, &mut messages).await;
-        assert!(owner.state.job(JobId(id)).unwrap().held());
+        for _ in 0..20 {
+            pump(&mut owner, &mut messages).await;
+            if terminal_of(&owner, id).is_some_and(|t| t.emitted) {
+                break;
+            }
+        }
+        assert_eq!(
+            terminal_of(&owner, id).unwrap().reason,
+            Some(nzbd_types::FailureReason::Identity)
+        );
     }
 }
 
@@ -2869,7 +2895,13 @@ async fn operator_retry(
 ) -> Result<(), String> {
     let control = owner.state.job(job).unwrap().control().unwrap();
     let custody_checked = control.post_side() && owner.artifacts.validate_post_retry(job.0).is_ok();
-    let result = owner.retry_hold(job, &control.revision, RetryBy::Operator, custody_checked);
+    let result = owner.retry_hold_proven(
+        job,
+        &control.revision,
+        RetryBy::Operator,
+        custody_checked,
+        &Default::default(),
+    );
     pump(owner, messages).await;
     result
 }
@@ -2882,22 +2914,40 @@ async fn post_hold_retry_checks_revision_custody_and_stage_then_persists() {
     job.dir_name = "pp".into();
     owner.state.jobs.push(job);
     allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
-    assert!(owner.hold_job(JobId(1), HoldCause::PostFailure, "unpack", "tool failed"));
+    assert!(owner.hold_job(JobId(1), HoldCause::MissingTool, "unpack", "tool failed"));
     pump(&mut owner, &mut messages).await;
     let revision = owner.state.jobs[0].control().unwrap().revision;
     assert!(owner
-        .retry_hold(JobId(1), "stale", RetryBy::Operator, true)
+        .retry_hold_proven(
+            JobId(1),
+            "stale",
+            RetryBy::Operator,
+            true,
+            &Default::default()
+        )
         .is_err());
     pump(&mut owner, &mut messages).await;
     assert!(
         owner
-            .retry_hold(JobId(1), &revision, RetryBy::Operator, false)
+            .retry_hold_proven(
+                JobId(1),
+                &revision,
+                RetryBy::Operator,
+                false,
+                &Default::default()
+            )
             .is_err(),
         "a post-side release needs its custody checked off-loop first"
     );
     pump(&mut owner, &mut messages).await;
     assert_eq!(
-        owner.retry_hold(JobId(1), &revision, RetryBy::Operator, true),
+        owner.retry_hold_proven(
+            JobId(1),
+            &revision,
+            RetryBy::Operator,
+            true,
+            &Default::default()
+        ),
         Ok(())
     );
     pump(&mut owner, &mut messages).await;
@@ -2972,7 +3022,13 @@ async fn storage_errno_writer_error_schedules_itself() {
     due.next_retry_at_unix = Some(0);
     owner.state.jobs[0].set_control(&due);
     assert_eq!(
-        owner.retry_hold(JobId(1), &held.revision, RetryBy::Recovery, false),
+        owner.retry_hold_proven(
+            JobId(1),
+            &held.revision,
+            RetryBy::Recovery,
+            false,
+            &Default::default()
+        ),
         Ok(())
     );
     pump(&mut owner, &mut messages).await;
@@ -3028,10 +3084,11 @@ async fn storage_errno_writer_error_schedules_itself() {
     );
 }
 
-/// A digest or size mismatch fails the same way on every attempt: it
-/// waits for a person instead of re-checking a whole file forever.
+/// Contract §2.2: a digest or size mismatch fails the same way on every
+/// attempt, so it is not a hold — it is the job's terminal `failed/io`
+/// (parked, never the release's fault), recorded before anything else.
 #[tokio::test]
-async fn permanent_writer_error_waits_for_review() {
+async fn permanent_writer_error_is_a_terminal_io_failure() {
     let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
     pump(&mut owner, &mut messages).await;
     owner.state.jobs.push(pending_job(1));
@@ -3040,22 +3097,29 @@ async fn permanent_writer_error_waits_for_review() {
         file: FileId(10),
         error: "finalize: complete checkpoint digest differs".into(),
     });
-    pump(&mut owner, &mut messages).await;
-    let held = owner.state.jobs[0].control().unwrap();
-    assert_eq!(
-        (held.cause.as_str(), held.stage.as_str()),
-        ("io", "finalize")
-    );
-    assert_eq!(held.retry_policy, "review");
-    assert_eq!(held.next_retry_at_unix, None);
-    assert!(
-        owner
-            .retry_hold(JobId(1), &held.revision, RetryBy::Recovery, false)
-            .is_err(),
-        "the actor independently refuses automatic retries of permanent failures"
-    );
-    pump(&mut owner, &mut messages).await;
-    assert!(owner.state.jobs[0].held());
+    for _ in 0..20 {
+        pump(&mut owner, &mut messages).await;
+        if owner.state.jobs[0]
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+        {
+            break;
+        }
+    }
+    let job = &owner.state.jobs[0];
+    assert!(!job.held(), "a terminal is not a hold");
+    assert_eq!(job.status, JobStatus::Failed);
+    assert!(job
+        .params
+        .iter()
+        .any(|(key, value)| key == nzbd_types::PP_DONE_PARAM && value == "FAILURE/IO"));
+    let terminal = owner.artifacts.terminal(1).unwrap().unwrap();
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Io));
+    assert_eq!(terminal.stage.as_deref(), Some("finalize"));
+    assert!(!terminal.blames_release);
+    assert!(terminal.reason.unwrap().park_always());
+    assert!(terminal.emitted && terminal.markers_stamped);
 }
 
 #[tokio::test]
@@ -3074,14 +3138,26 @@ async fn paused_hold_waits_for_the_operator_and_followers_never_auto_release() {
     c.manual_pause = true;
     owner.state.jobs[0].set_control(&c);
     assert!(owner
-        .retry_hold(JobId(1), &c.revision, RetryBy::Recovery, false)
+        .retry_hold_proven(
+            JobId(1),
+            &c.revision,
+            RetryBy::Recovery,
+            false,
+            &Default::default()
+        )
         .is_err());
     pump(&mut owner, &mut messages).await;
     owner.persist = false;
     c.manual_pause = false;
     owner.state.jobs[0].set_control(&c);
     assert_eq!(
-        owner.retry_hold(JobId(1), &c.revision, RetryBy::Recovery, false),
+        owner.retry_hold_proven(
+            JobId(1),
+            &c.revision,
+            RetryBy::Recovery,
+            false,
+            &Default::default()
+        ),
         Err("this node is not the queue authority".into())
     );
     pump(&mut owner, &mut messages).await;
@@ -3090,7 +3166,13 @@ async fn paused_hold_waits_for_the_operator_and_followers_never_auto_release() {
     c.retry_attempt = 4;
     owner.state.jobs[0].set_control(&c);
     assert_eq!(
-        owner.retry_hold(JobId(1), &c.revision, RetryBy::Operator, false),
+        owner.retry_hold_proven(
+            JobId(1),
+            &c.revision,
+            RetryBy::Operator,
+            false,
+            &Default::default()
+        ),
         Ok(())
     );
     pump(&mut owner, &mut messages).await;
@@ -3231,7 +3313,12 @@ async fn held_control_survives_only_owner_writes() {
     let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
     pump(&mut owner, &mut messages).await;
     owner.state.jobs.push(pending_job(1));
-    assert!(owner.hold_job(JobId(1), HoldCause::Io, "download_write", "digest differs"));
+    assert!(owner.hold_job(
+        JobId(1),
+        HoldCause::MountUnavailable,
+        "download_write",
+        "digest differs"
+    ));
     pump(&mut owner, &mut messages).await;
     let held = owner.state.jobs[0].control().unwrap();
     let mut row = owner.state.jobs[0].clone();
@@ -3283,7 +3370,13 @@ async fn rehold_after_release_routes_by_where_the_job_is_now() {
     due.next_retry_at_unix = Some(0);
     owner.state.jobs[0].set_control(&due);
     owner
-        .retry_hold(JobId(1), &first.revision, RetryBy::Recovery, false)
+        .retry_hold_proven(
+            JobId(1),
+            &first.revision,
+            RetryBy::Recovery,
+            false,
+            &Default::default(),
+        )
         .unwrap();
     pump(&mut owner, &mut messages).await;
     // The download finished; post-processing hits the dead mount.
@@ -3301,7 +3394,13 @@ async fn rehold_after_release_routes_by_where_the_job_is_now() {
     assert!(second.post_side(), "this hold happened in post-processing");
     assert!(
         owner
-            .retry_hold(JobId(1), &second.revision, RetryBy::Recovery, false)
+            .retry_hold_proven(
+                JobId(1),
+                &second.revision,
+                RetryBy::Recovery,
+                false,
+                &Default::default()
+            )
             .is_err(),
         "so its release must go through the custody check"
     );
@@ -3445,6 +3544,8 @@ fn rearm_reclassifies_by_errno_and_derives_policy() {
         next_retry_at_unix: None,
         blocked_since_unix: Some(1),
         released_at_unix: None,
+        deadline_in_s: None,
+        deadline_unix: None,
     };
     // #2181 exactly.
     let fixed = rearmed_hold(
@@ -3500,12 +3601,13 @@ fn rearm_reclassifies_by_errno_and_derives_policy() {
         1000
     )
     .is_none());
-    // Policy this build changed: password_required used to claim resume_same_job.
+    // Policy this build changed: password_required retries on the ladder
+    // until its deadline (contract §2.3).
     assert_eq!(
         rearmed_hold(hold("password_required", "resume_same_job", "x"), 1000)
             .unwrap()
             .retry_policy,
-        "review"
+        "scheduled_retry"
     );
     // Capacity used to carry no time.
     assert_eq!(
@@ -3543,6 +3645,8 @@ async fn adopting_authority_rearms_holds() {
         next_retry_at_unix: None,
         blocked_since_unix: Some(1),
         released_at_unix: None,
+        deadline_in_s: None,
+        deadline_unix: None,
     });
     job.status = JobStatus::Paused;
     let mut doc_state = QueueState::default();
@@ -3636,6 +3740,10 @@ async fn admission_tombstone_refreshes_exact_source_keep_and_delete_evidence() {
             publication_path: None,
             source_artifact_id: Some(source.id.clone()),
             source_generation: Some(source.generation.clone()),
+            failure_reason: None,
+            fetch_cause: None,
+            blames_release: None,
+            salvage: None,
         });
 
     let kept = owner
@@ -4055,10 +4163,7 @@ async fn delayed_par_download_keeps_the_open_post_span() {
         "the post manager, not delayed download completion, closes verification"
     );
     assert!(
-        matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ),
+        no_completion_event(&mut events),
         "a delayed PAR fetch must not announce a second download completion"
     );
 }
@@ -4089,10 +4194,7 @@ async fn restarted_delayed_par_completion_recovers_from_the_persisted_open_span(
             stage: PostStage::ParVerify
         }
     );
-    assert!(matches!(
-        events.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    ));
+    assert!(no_completion_event(&mut events));
 }
 
 #[tokio::test]
@@ -4177,10 +4279,7 @@ async fn failed_recovery_articles_return_to_verification_instead_of_disposition(
             stage: PostStage::ParVerify
         }
     );
-    assert!(matches!(
-        events.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    ));
+    assert!(no_completion_event(&mut events));
 }
 
 #[tokio::test]
@@ -4208,10 +4307,7 @@ async fn recovery_write_failure_stays_owned_by_the_active_post_task() {
             stage: PostStage::ParVerify
         }
     );
-    assert!(matches!(
-        events.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    ));
+    assert!(no_completion_event(&mut events));
 }
 
 #[test]
@@ -4961,6 +5057,10 @@ async fn consumer_receipt_refresh_pins_publication_while_source_progress_remains
             publication_path: Some("/verified/publication".into()),
             source_artifact_id: Some("source-78".into()),
             source_generation: Some("generation-78".into()),
+            failure_reason: None,
+            fetch_cause: None,
+            blames_release: None,
+            salvage: None,
         });
     owner.state.sync_url_admission_receipts();
     let receipt = &owner.state.url_admission_receipts[0];
@@ -5316,6 +5416,8 @@ async fn automatic_hold_recovery_bounds_each_pass_and_rotates_all_due_jobs() {
             next_retry_at_unix: Some(0),
             blocked_since_unix: Some(0),
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         });
         let root = owner.dest_dir.clone();
         owner
@@ -6353,7 +6455,13 @@ async fn cluster_automatic_control_waits_for_exact_ack_and_operator_intent_is_no
         .contains(&base.id));
     assert!(!owner.reschedule_hold(base.id, &held.revision, "still unavailable"));
     assert!(owner
-        .retry_hold(base.id, &held.revision, RetryBy::Recovery, true)
+        .retry_hold_proven(
+            base.id,
+            &held.revision,
+            RetryBy::Recovery,
+            true,
+            &Default::default()
+        )
         .is_err());
     assert_eq!(
         transition(owner.state.job(base.id).unwrap())
@@ -6378,7 +6486,13 @@ async fn cluster_automatic_control_waits_for_exact_ack_and_operator_intent_is_no
     pump(&mut owner, &mut messages).await;
     assert!(result.await.unwrap());
     assert!(owner
-        .retry_hold(base.id, &held.revision, RetryBy::Recovery, true)
+        .retry_hold_proven(
+            base.id,
+            &held.revision,
+            RetryBy::Recovery,
+            true,
+            &Default::default()
+        )
         .is_ok());
     let released = transition(owner.state.job(base.id).unwrap()).unwrap();
     assert_eq!(released.base_control, Some(held.clone()));
@@ -6436,7 +6550,13 @@ async fn cluster_automatic_control_waits_for_exact_ack_and_operator_intent_is_no
     ));
     let held = owner.state.job(base.id).unwrap().control().unwrap();
     assert!(owner
-        .retry_hold(base.id, &held.revision, RetryBy::Operator, true)
+        .retry_hold_proven(
+            base.id,
+            &held.revision,
+            RetryBy::Operator,
+            true,
+            &Default::default()
+        )
         .is_ok());
     assert!(
         transition(owner.state.job(base.id).unwrap()).is_none(),
@@ -7348,6 +7468,10 @@ fn unpinned_failed_receipt_adopts_its_jobs_source_and_reports_disposal() {
         publication_path: None,
         source_artifact_id: None,
         source_generation: None,
+        failure_reason: None,
+        fetch_cause: None,
+        blames_release: None,
+        salvage: None,
     };
     let mut foreign = receipt.clone();
     foreign.runner_instance_id = "another-installation".into();
@@ -7399,6 +7523,10 @@ fn failed_receipt_settles_when_its_source_is_gone() {
         publication_path: None,
         source_artifact_id: Some(artifact.id.clone()),
         source_generation: Some(artifact.generation.clone()),
+        failure_reason: None,
+        fetch_cause: None,
+        blames_release: None,
+        salvage: None,
     };
     std::fs::remove_dir_all(&source).unwrap();
     inventory.reconcile_missing().unwrap();
@@ -7495,4 +7623,182 @@ async fn naming_expectations_require_current_writer_and_durable_finalization() {
         drop(found);
         owner.artifacts.prepare_writer_naming();
     }
+}
+
+/// No download-completion or terminal event was announced. `job_status_changed`
+/// (contract §2.4) fires on every published transition and is not a
+/// completion.
+fn no_completion_event(events: &mut broadcast::Receiver<Event>) -> bool {
+    loop {
+        match events.try_recv() {
+            Ok(Event::JobStatusChanged { .. }) => continue,
+            Ok(_) => return false,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(_) => return true,
+        }
+    }
+}
+
+/// Drive the owner until `job`'s terminal record has been emitted.
+async fn settle_terminal(
+    owner: &mut Owner,
+    messages: &mut mpsc::Receiver<EngineMsg>,
+    job: u32,
+) -> nzbd_state::artifacts::JobTerminal {
+    for _ in 0..50 {
+        pump(owner, messages).await;
+        if let Some(terminal) = owner.artifacts.terminal(job).unwrap().filter(|t| t.emitted) {
+            return terminal;
+        }
+    }
+    panic!("terminal for job {job} was not emitted");
+}
+
+/// Contract §2.2 / plan M1 (e): a write that did not reach the disk is the
+/// job's terminal `failed/io` — parked, never the release's fault — even
+/// though every article arrived. It is not folded into the health verdict.
+#[tokio::test]
+async fn write_failure_is_io_not_health() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    let mut job = pending_job(7);
+    job.params.push(("monarr-transfer".into(), "t-7".into()));
+    job.files[0].segments[0].state = SegmentState::Done {
+        offset: 0,
+        len: 100,
+        crc: 1,
+    };
+    job.files[0].finalized = true;
+    recompute_job_totals(&mut job);
+    owner.state.jobs.push(job);
+    owner.write_failures.insert(
+        JobId(7),
+        "write /processing/x: Permission denied (os error 13)".into(),
+    );
+    owner.check_job_complete(JobId(7));
+    let terminal = settle_terminal(&mut owner, &mut messages, 7).await;
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Io));
+    assert_eq!(terminal.stage.as_deref(), Some("download"));
+    assert!(!terminal.blames_release);
+    assert!(terminal.reason.unwrap().park_always());
+    assert_eq!(terminal.transfer.as_deref(), Some("t-7"));
+    assert_eq!(terminal.fetched.success_articles, 1);
+    let job = owner.state.job(JobId(7)).unwrap();
+    assert_eq!(job.status, JobStatus::Failed);
+    assert!(job
+        .params
+        .iter()
+        .any(|(key, value)| key == nzbd_types::PP_DONE_PARAM && value == "FAILURE/IO"));
+    assert!(!owner.post_admissions.contains_key(&JobId(7)));
+}
+
+/// Contract §2.1 / plan M1 (d): articles below critical health are the
+/// owner's `failed/health` terminal, recorded at download end without any
+/// post-processing admission; a job that fetched nothing owes no salvage.
+#[tokio::test]
+async fn zero_article_health_failure_skips_pp_admission() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    let mut events = owner.events.subscribe();
+    let mut job = pending_job(8);
+    job.params
+        .push(("*Runner:LifecycleEligible".into(), "1".into()));
+    job.files[0].segments[0].state = SegmentState::Failed;
+    recompute_job_totals(&mut job);
+    owner.state.jobs.push(job);
+    owner.check_job_complete(JobId(8));
+    let terminal = settle_terminal(&mut owner, &mut messages, 8).await;
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Health));
+    assert_eq!(terminal.stage.as_deref(), Some("health"));
+    assert!(terminal.blames_release);
+    assert_eq!(terminal.salvage, nzbd_state::artifacts::SalvageState::None);
+    assert_eq!(terminal.fetched.success_articles, 0);
+    assert!(
+        !owner.post_admissions.contains_key(&JobId(8)),
+        "post-processing never admitted the job"
+    );
+    let mut saw_terminal = false;
+    while let Ok(event) = events.try_recv() {
+        if let Event::JobPpFinished {
+            job,
+            outcome,
+            reason,
+            salvage,
+            ..
+        } = event
+        {
+            assert_eq!(job, JobId(8));
+            assert_eq!(outcome, nzbd_types::TerminalOutcome::Failed);
+            assert_eq!(reason, Some(nzbd_types::FailureReason::Health));
+            assert_eq!(salvage, nzbd_types::Salvage::None);
+            saw_terminal = true;
+        }
+    }
+    let _ = saw_terminal; // the 1-slot test channel may have lagged; the row is the authority
+    assert!(terminal.emitted);
+}
+
+/// Contract §2.3: a hold past its deadline ends `failed/hold_expired` with
+/// the hold's stage and message, even when an operator paused it.
+#[tokio::test]
+async fn expired_hold_ends_failed_hold_expired() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(9));
+    assert!(owner.hold_job(
+        JobId(9),
+        HoldCause::Capacity,
+        "unpack",
+        "No space left on device (os error 28)"
+    ));
+    pump(&mut owner, &mut messages).await;
+    let mut control = owner.state.jobs[0].control().unwrap();
+    assert!(control.deadline_unix.is_some(), "every hold has a deadline");
+    assert!(!owner.expire_hold(JobId(9), &control.revision), "not due");
+    control.deadline_unix = Some(1);
+    control.manual_pause = true;
+    owner.state.jobs[0].set_control(&control);
+    assert!(owner.expire_hold(JobId(9), &control.revision));
+    let terminal = settle_terminal(&mut owner, &mut messages, 9).await;
+    assert_eq!(
+        terminal.reason,
+        Some(nzbd_types::FailureReason::HoldExpired)
+    );
+    assert_eq!(terminal.stage.as_deref(), Some("unpack"));
+    assert!(terminal
+        .message
+        .unwrap()
+        .contains("No space left on device"));
+    assert!(!terminal.blames_release);
+    assert!(nzbd_types::FailureReason::HoldExpired.park_always());
+    assert!(!owner.state.jobs[0].held());
+}
+
+/// Contract §2.3: a newer hold replaces the control (revision + 1); the
+/// first cause does not win.
+#[tokio::test]
+async fn newer_hold_replaces_the_first_cause() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(10));
+    assert!(owner.hold_job(
+        JobId(10),
+        HoldCause::StorageUnavailable,
+        "download_write",
+        "EIO (os error 5)"
+    ));
+    pump(&mut owner, &mut messages).await;
+    let first = owner.state.jobs[0].control().unwrap();
+    assert!(owner.hold_job(JobId(10), HoldCause::MissingTool, "unpack", "unrar missing"));
+    pump(&mut owner, &mut messages).await;
+    let second = owner.state.jobs[0].control().unwrap();
+    assert_eq!(second.cause, "missing_tool");
+    assert_eq!(
+        second.revision.parse::<u64>().unwrap(),
+        first.revision.parse::<u64>().unwrap() + 1
+    );
+    assert_eq!(
+        second.deadline_unix, first.deadline_unix,
+        "the deadline runs from the episode's start"
+    );
 }

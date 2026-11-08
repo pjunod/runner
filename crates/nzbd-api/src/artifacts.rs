@@ -120,7 +120,7 @@ async fn deliveries(State(st): State<ApiState>, Query(page): Query<DeliveryPage>
 
 async fn delivery(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
     let db = st.engine.artifacts();
-    work(move || db.delivery(&id)).await
+    work(move || Ok(db.delivery(&id)?.feed_value()?)).await
 }
 
 async fn retry_delivery_cleanup(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
@@ -128,36 +128,12 @@ async fn retry_delivery_cleanup(State(st): State<ApiState>, Path(id): Path<Strin
     work(move || db.retry_delivery_source_cleanup(&id)).await
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeliveryAcceptance {
-    protocol_version: u8,
-    publication_generation: String,
-    manifest_digest: String,
-    consumer_receipt_id: String,
-}
-
-async fn accept_delivery(
-    State(st): State<ApiState>,
-    Path(id): Path<String>,
-    Json(body): Json<DeliveryAcceptance>,
-) -> Response {
+/// Contract §2.5: there is no acceptance. For one release `accept` answers
+/// `200` with the unchanged row, so an old curator's acknowledgement retry
+/// settles instead of retrying forever; it records nothing. Removed in M3.
+async fn accept_delivery(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
     let db = st.engine.artifacts();
-    if body.protocol_version != 1 {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "unsupported delivery protocol version",
-        );
-    }
-    work(move || {
-        db.accept_delivery(
-            &id,
-            &body.publication_generation,
-            &body.manifest_digest,
-            &body.consumer_receipt_id,
-        )
-    })
-    .await
+    work(move || Ok(db.delivery(&id)?.feed_value()?)).await
 }
 fn failure(e: Error) -> Response {
     let status = match e {
@@ -1423,11 +1399,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
-        assert!(response_json(unsupported).await["error"]
-            .as_str()
-            .unwrap()
-            .contains("unsupported delivery protocol"));
+        // The no-op `accept` reads no body; a missing row is still 404.
+        assert_eq!(unsupported.status(), StatusCode::NOT_FOUND);
 
         let missing = app
             .clone()

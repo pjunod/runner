@@ -77,35 +77,65 @@ pub enum Event {
         name: String,
         stage: PostStage,
     },
-    /// Post-processing finished AND the history row is durably written.
+    /// The job's one terminal fact (pipeline contract v2 §2.1).
     ///
-    /// Ordering is normative (docs/INTEGRATION_PLAN.md §1): this is
-    /// emitted only after `HistoryDb::record` returns, so a consumer may
-    /// react to it and immediately read
-    /// `GET /api/v1/history?since_seq=<history_seq - 1>` and be certain the
-    /// row is there. Emitting before the write would hand every consumer a
-    /// race it cannot see.
+    /// Emitted exactly once per job, from the job's `job_terminals` record,
+    /// after that record and the history row are durable and before any
+    /// salvage, disposal or retention touches the bytes. Constructed in one
+    /// place: the emit step of `terminal::record_terminal`'s replay.
+    /// `history_seq` is never 0: a failed history write holds the job
+    /// `storage_unavailable` on stage `persistence` and the event is sent
+    /// when the write lands.
     JobPpFinished {
         job: JobId,
         name: String,
         category: Option<String>,
-        /// The history status string verbatim — `SUCCESS`, `PAR_FAILURE`,
-        /// `UNPACK_FAILURE`, `SCRIPT_FAILURE` for jobs that reached PP, and
-        /// the pre-PP terminal strings `FAILURE/HEALTH` / `FAILURE/FETCH`
-        /// for jobs that never did. Consumers match on the `SUCCESS` /
-        /// `FAILURE` prefix; no value here is invented for the event.
+        /// `params["monarr-transfer"]`; absent only for jobs curator did not add.
+        transfer: Option<String>,
+        outcome: nzbd_types::TerminalOutcome,
+        /// `failed` only: the closed reason, typed by the producer.
+        reason: Option<nzbd_types::FailureReason>,
+        /// `fetch` only: `gone` or `indexer_unavailable`.
+        fetch_cause: Option<nzbd_types::FetchCause>,
+        /// `failed` only: a `PostStage` name or `download` | `health` | `fetch`.
+        stage: Option<String>,
+        /// `failed` only: human text, at most 2048 characters.
+        message: Option<String>,
+        blames_release: bool,
+        /// `pending` when runner will assess and publish usable partial
+        /// output (announced later by [`Event::JobPublicationReady`]).
+        salvage: nzbd_types::Salvage,
+        keep_on_failure: bool,
+        fetched: nzbd_types::Fetched,
+        /// `completed` only.
+        publication: Option<nzbd_types::Publication>,
+        /// Legacy (removed in M6): the history status string verbatim.
         pp_status: String,
-        /// Where the files actually are — absent on the failure paths that
-        /// never produced a directory.
+        /// Legacy (removed in M6): `publication.path` on success.
         final_dir: Option<String>,
         size_bytes: u64,
         health: u16,
-        /// Consumer params plus `*Control:v1`, preserving missed hold resolution.
+        /// Consumer params plus `*Control:v1`.
         params: Vec<(String, String)>,
-        /// Rowid of the history entry just written: the cursor value a
-        /// consumer passes to `?since_seq=`. 0 when the write failed —
-        /// the event still fires, because "PP ended and history did not
-        /// record it" is precisely the moment a consumer must not miss.
+        /// Rowid of the durable history entry; the `since_seq` cursor value.
         history_seq: i64,
+        /// The history index's identity: the cursor is `(incarnation, seq)`.
+        history_incarnation: String,
+    },
+    /// Every `JobStatus` transition, including into and out of `held`
+    /// (contract §2.4). `status` is the projected native status.
+    JobStatusChanged {
+        job: JobId,
+        transfer: Option<String>,
+        status: String,
+        stage: Option<String>,
+        control: Option<nzbd_types::JobControl>,
+    },
+    /// A salvage publication of a failed job is ready (contract §2.2). Not a
+    /// terminal: the job stays `failed`.
+    JobPublicationReady {
+        job: JobId,
+        transfer: Option<String>,
+        publication: nzbd_types::Publication,
     },
 }
