@@ -360,6 +360,57 @@ async fn partial_recovery_batches_continue_without_owner_ticks() {
 }
 
 #[tokio::test]
+async fn cached_pristine_recovery_backlog_retries_after_capacity_deferral() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut owner, _adapter, mut messages) = owner_fixture(&temp);
+    pump_idle(&mut owner, &mut messages).await;
+    let root = owner.dest_dir.clone();
+    // Owner::recover seeds this advisory cache from Inventory before startup
+    // reconciliation. Cached metadata is not a validated payload capability.
+    for id in 1..=80 {
+        let record = pending_job(id, FileId(id));
+        let allocation = owner
+            .artifacts
+            .allocate(id, &root, &root.join(&record.dir_name))
+            .unwrap();
+        owner.allocation_cache.insert(JobId(id), allocation);
+        owner.state.jobs.push(record);
+    }
+    for id in 1..=80 {
+        owner.queue_payload_recovery(JobId(id));
+    }
+    assert_eq!(owner.allocating_jobs.len(), 64);
+    assert!(
+        owner.allocation_cache.is_empty(),
+        "all recovery obligations invalidate advisory cache, including deferred rows"
+    );
+    assert!(owner.allocated_jobs.is_empty());
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        while !owner.verification.is_empty() || !owner.allocating_jobs.is_empty() {
+            assert!(
+                owner.verification_roots.is_empty(),
+                "pristine rows must not hash payload"
+            );
+            owner.on_msg(messages.recv().await.unwrap());
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "cached recovery stalled: loading={} allocating={} cached={}",
+        owner
+            .verification
+            .values()
+            .filter(|state| state.phase == "loading")
+            .count(),
+        owner.allocating_jobs.len(),
+        owner.allocation_cache.len()
+    );
+    assert_eq!(owner.allocation_cache.len(), 80);
+    owner.drain_shutdown_results(&mut messages).await;
+}
+
+#[tokio::test]
 async fn pristine_recovery_backlog_is_bounded_and_drains_without_checksum_workers() {
     let temp = tempfile::tempdir().unwrap();
     let (mut owner, _adapter, mut messages) = owner_fixture(&temp);
