@@ -173,8 +173,8 @@ impl Owner {
         } else {
             callback(
                 self,
-                Err(nzbd_state::StateError::Corrupt(
-                    "bounded persistence lane unavailable".into(),
+                Err(nzbd_state::StateError::Busy(
+                    "bounded persistence lane unavailable",
                 )),
             );
         }
@@ -183,6 +183,11 @@ impl Owner {
         if let Some(callback) = self.io_callbacks.remove(&revision) {
             callback(self, result);
         }
+        // State-lane completions free admission capacity too. Give retained
+        // journal facts priority, then resume bounded recovery prerequisites.
+        self.retry_journal_checkpoint();
+        self.retry_payload_recoveries();
+        self.start_verifications();
     }
 
     pub(super) fn persist_then(
@@ -241,6 +246,13 @@ impl Owner {
         record: JournalRecord,
         provenance: Option<serde_json::Value>,
     ) {
+        if self.journal_checkpoint.is_some() {
+            // The actor's segment/proof state retains every accepted fact.
+            // A later checkpoint must include this one before leasing resumes.
+            self.journal_checkpoint = Some(fresh_epoch());
+            self.dirty = true;
+            return;
+        }
         let job = record.job;
         let epoch = self.job_epochs.get(&job).copied();
         let revision = fresh_epoch();
@@ -262,9 +274,59 @@ impl Owner {
         }) {
             self.persistence_callbacks.insert(revision, completion);
         } else {
-            completion(self, false);
+            // Admission pressure is not a failed write. Retain the fact in
+            // owner state, fence new leases, and checkpoint when the ordered
+            // lane has capacity. No second queue of segment records is needed.
+            self.journal_checkpoint = Some(fresh_epoch());
+            self.dirty = true;
+            tracing::warn!(
+                job = job.0,
+                "journal admission saturated; progress retained for a coalesced checkpoint"
+            );
         }
     }
+    pub(super) fn retry_journal_checkpoint(&mut self) {
+        let Some(epoch) = self.journal_checkpoint else {
+            return;
+        };
+        if self.journal_checkpoint_inflight
+            || self.persistence_fenced
+            || self.cancel.is_cancelled()
+            || self.persistence.tx.capacity() == 0
+            || Instant::now() < self.journal_checkpoint_retry_at
+        {
+            return;
+        }
+        self.journal_checkpoint_inflight = true;
+        self.persist_then(move |owner, committed| {
+            owner.journal_checkpoint_inflight = false;
+            if !committed {
+                // A genuine storage refusal must not create an immediate
+                // failed-save loop. Keep the fence and use the existing
+                // recovery cadence before another checkpoint attempt.
+                owner.journal_checkpoint_retry_at = Instant::now() + Duration::from_secs(30);
+                return;
+            }
+            owner.journal_checkpoint_retry_at = Instant::now();
+            if owner.journal_checkpoint == Some(epoch) {
+                owner.journal_checkpoint = None;
+                let jobs = owner
+                    .state
+                    .jobs
+                    .iter()
+                    .map(|job| job.id)
+                    .collect::<Vec<_>>();
+                for job in jobs {
+                    owner.check_job_complete(job);
+                }
+                owner.publish_now();
+                owner.bump_epoch();
+            }
+            // A newer completion while this save was in flight needs another
+            // checkpoint. persistence_finished retries after this callback.
+        });
+    }
+
     pub(super) fn sync_journal(&mut self) {
         if self.persistence.in_flight() != 0 {
             return;
@@ -294,6 +356,7 @@ impl Owner {
         if let Some(callback) = self.persistence_callbacks.remove(&revision) {
             callback(self, ok);
         }
+        self.retry_journal_checkpoint();
     }
     pub(super) async fn flush_shutdown_state(&mut self) -> bool {
         self.state.sync_url_admission_receipts();

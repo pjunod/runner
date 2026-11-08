@@ -52,6 +52,10 @@ pub enum StateError {
     },
     #[error("serialize: {0}")]
     Serde(#[from] serde_json::Error),
+    /// The operation was not admitted. Its owner may retry when capacity or
+    /// lifecycle prerequisites change; this says nothing about stored bytes.
+    #[error("operation deferred: {0}")]
+    Busy(&'static str),
     #[error("corrupt state: {0}")]
     Corrupt(String),
 }

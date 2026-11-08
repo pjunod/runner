@@ -1055,6 +1055,11 @@ pub(crate) struct Owner {
     state_dir: PathBuf,
     persistence: Persistence,
     persistence_callbacks: HashMap<u64, Continuation>,
+    // Saturated journal admission is covered by one coalesced owner snapshot.
+    // Stop leasing until that snapshot durably covers the latest accepted fact.
+    journal_checkpoint: Option<u64>,
+    journal_checkpoint_inflight: bool,
+    journal_checkpoint_retry_at: Instant,
     journal_suffix: String,
     payload_waiting: VecDeque<PayloadWork>,
     payload_active: HashSet<PathBuf>,
@@ -1526,6 +1531,9 @@ impl Owner {
                 engine_tx.clone(),
             ),
             persistence_callbacks: HashMap::new(),
+            journal_checkpoint: None,
+            journal_checkpoint_inflight: false,
+            journal_checkpoint_retry_at: Instant::now(),
             io_callbacks: HashMap::new(),
             payload_waiting: VecDeque::new(),
             payload_active: HashSet::new(),
@@ -6041,7 +6049,11 @@ impl Owner {
     // -- scheduling ----------------------------------------------------------
 
     fn grant_work(&mut self, server_id: ServerId, max: usize) -> Vec<Lease> {
-        if self.cancel.is_cancelled() || self.disk_low || self.is_blocked(server_id) {
+        if self.cancel.is_cancelled()
+            || self.disk_low
+            || self.is_blocked(server_id)
+            || self.journal_checkpoint.is_some()
+        {
             return Vec::new();
         }
         let servers = self.servers.clone();
@@ -6127,6 +6139,12 @@ impl Owner {
             let Some(r) = lease else { break };
 
             if let Err(e) = self.ensure_allocation(r.job, false) {
+                if matches!(e, nzbd_state::artifacts::Error::Busy(_)) {
+                    // No allocation was admitted and no callback owns this
+                    // row. Retain it in the queue and yield this bounded batch
+                    // until the payload-capacity wakeup; preserve prior leases.
+                    break;
+                }
                 if self.retiring_writers.contains_key(&r.job)
                     || self.allocating_jobs.contains(&r.job)
                 {
@@ -7571,6 +7589,7 @@ impl Owner {
 
     fn check_job_complete(&mut self, job_id: JobId) {
         if self.pending_control_commits.contains(&job_id)
+            || self.journal_checkpoint.is_some()
             || self.cancel.is_cancelled()
             || self.verification.contains_key(&job_id)
             || self.retiring_writers.contains_key(&job_id)
@@ -7934,6 +7953,11 @@ impl Owner {
                 "payload allocation pending".into(),
             ));
         }
+        if !self.payload_capacity_available() {
+            return Err(nzbd_state::artifacts::Error::Busy(
+                "payload allocation awaits lane capacity",
+            ));
+        }
         // Cache hits need only the plan above, not a clone of every file and
         // segment. Own the descriptor only when scheduling an actual allocation.
         let record = record.clone();
@@ -7993,6 +8017,10 @@ impl Owner {
                         owner.allocation_cache.insert(job, allocation);
                         owner.allocated_jobs.insert(job);
                         owner.bump_epoch();
+                    }
+                    Err(nzbd_state::StateError::Busy(_)) => {
+                        // The action never started. The scheduler retains the
+                        // row and will retry on the payload capacity wakeup.
                     }
                     Err(error) => {
                         owner.hold_job(
@@ -8823,6 +8851,7 @@ impl Owner {
         let publish_ms = t.elapsed().as_millis() as u64;
 
         let sync_started = Instant::now();
+        self.retry_journal_checkpoint();
         self.sync_journal();
         let sync_ms = sync_started.elapsed().as_millis() as u64;
 
@@ -9912,7 +9941,7 @@ impl Owner {
     }
 
     fn save_snapshot(&mut self) {
-        if self.background_save_pending {
+        if self.background_save_pending || self.journal_checkpoint.is_some() {
             return;
         }
         self.background_save_pending = true;
