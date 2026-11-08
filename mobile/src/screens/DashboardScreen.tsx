@@ -56,6 +56,7 @@ import { urlFetchDetail, useNow } from '../urlFetchPresentation';
 import { HistoryView } from './HistoryView';
 import { LogsView } from './LogsView';
 import { holdAction } from '../holdAction';
+import { holdDeadlineText, holdHeadline } from '../holdPresentation';
 
 type AppSection = 'queue' | 'history' | 'logs';
 
@@ -642,7 +643,7 @@ export function JobCard({
   // says why it is waiting instead (urlFetchDetail).
   const fetchingNzb = statusKey === 'fetching' && !phase && !acquisition;
   const fetchingAcquisition = statusKey === 'fetching' && acquisition;
-  const now = useNow(30_000, fetchingNzb && !hold);
+  const now = useNow(30_000, fetchingNzb || !!hold);
   const showProgress = !fetchingNzb && !fetchingAcquisition && !postProcessing && !seed && !['fetching_source', 'fetching_metadata', 'failed', 'missing_files'].includes(phase ?? '');
   return (
     <View
@@ -681,7 +682,8 @@ export function JobCard({
             </Text>
           ) : null}
           {pendingLabel ? <Text style={job.controlPending?.state === 'review_required' ? styles.statusFailed : styles.metaText}>{controlPendingText(job)}</Text> : null}
-          {hold ? <Text style={styles.statusFailed}>{hold.message}</Text> : null}
+          {hold ? <Text style={styles.statusFailed}>{holdHeadline(hold)}{hold.manual_pause ? ' · retries paused' : ''}</Text> : null}
+          {hold && holdDeadlineText(hold, now) ? <Text style={styles.metaText}>{holdDeadlineText(hold, now)}</Text> : null}
           {job.verification ? (
             <Text style={styles.metaText}>
               Recovery verification: {job.verification.state}

@@ -49,6 +49,12 @@ export interface JobControl {
   instance: string;
   previous_status?: JobStatus | null;
   manual_pause?: boolean;
+  blocked_since_unix?: number | null;
+  next_retry_at_unix?: number | null;
+  /** Seconds until Runner ends this hold as failed/hold_expired (relative: hosts share no clock). */
+  deadline_in_s?: number | null;
+  /** The same deadline as a unix time, for display. */
+  deadline_unix?: number | null;
 }
 
 export interface ControlPending {

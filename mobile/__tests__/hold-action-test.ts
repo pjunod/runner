@@ -2,13 +2,16 @@ import { holdAction } from '../src/holdAction';
 import { JobControl } from '../src/api/types';
 
 const held = (patch: Partial<JobControl>): JobControl => ({
-  version: 1, revision: '1', lifecycle: 'held', cause: 'identity_conflict', stage: 'download_write',
-  retry_policy: 'review', message: 'why', instance: 'i', ...patch,
+  version: 1, revision: '1', lifecycle: 'held', cause: 'storage_unavailable', stage: 'download_write',
+  retry_policy: 'scheduled_retry', message: 'why', instance: 'i', ...patch,
 });
 
 // Field report 2026-11-01: HELD jobs whose only action was delete.
-test('a review hold offers retry', () => {
-  expect(holdAction(held({}))).toEqual({ action: 'resume', label: 'Retry' });
+test('a hold whose retries were paused offers retry', () => {
+  expect(holdAction(held({ manual_pause: true }))).toEqual({ action: 'resume', label: 'Retry' });
+});
+test('no hold waits for a person: a policy from an older build is still automatic', () => {
+  expect(holdAction(held({ retry_policy: 'review' }))).toEqual({ action: 'pause', label: 'Pause retries' });
 });
 test('a hold Runner is retrying offers pause, and once paused offers retry', () => {
   const storage = held({ cause: 'storage_unavailable', retry_policy: 'scheduled_retry' });

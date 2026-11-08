@@ -247,6 +247,17 @@ fn set_artifact_salvage(tx: &Connection, job: u32, salvage: SalvageState) -> Res
     })?)
 }
 
+/// Mirror the failure reason onto the job's **source** artifact (display
+/// only; `job_terminals` stays the authority). The source is picked by role,
+/// not recency: a publication (state `transferred`, or any artifact a delivery
+/// row names as its published one) belongs to Curator and is never marked.
+fn set_artifact_failure_reason(tx: &Connection, job: u32, reason: FailureReason) -> Result<usize> {
+    Ok(tx.execute(
+        "UPDATE artifacts SET data=json_set(data,'$.failure_reason',?2) WHERE id=(SELECT id FROM artifacts WHERE job=?1 AND json_extract(data,'$.state')<>'transferred' AND id NOT IN (SELECT artifact FROM deliveries) ORDER BY updated_at DESC LIMIT 1)",
+        rusqlite::params![job, reason.as_str()],
+    )?)
+}
+
 impl Inventory {
     /// Contract §2.1 step one: insert the terminal row and the artifact's
     /// salvage obligation in one transaction. Idempotent: when a row for the
@@ -283,6 +294,9 @@ impl Inventory {
         let at = now();
         row.created_at = at;
         row.updated_at = at;
+        if let (TerminalOutcome::Failed, Some(reason)) = (row.outcome, row.reason) {
+            set_artifact_failure_reason(&tx, row.job, reason)?;
+        }
         if row.salvage == SalvageState::Pending {
             let has_artifact: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM artifacts WHERE job=?1)",
@@ -630,5 +644,51 @@ mod tests {
         assert_eq!(inventory.pending_disposal().unwrap().len(), 1);
         inventory.record_disposal(7, "parked at /x").unwrap();
         assert!(inventory.pending_disposal().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failure_reason_is_mirrored_onto_the_source_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("processing");
+        let path = root.join("job-9");
+        std::fs::create_dir_all(&root).unwrap();
+        let inventory = Inventory::open(dir.path()).unwrap();
+        let artifact = inventory.allocate(9, &root, &path).unwrap();
+        assert_eq!(artifact.failure_reason, None);
+        inventory
+            .record_terminal(&failed(9, SalvageState::Pending))
+            .unwrap();
+        let after = inventory.get(&artifact.id).unwrap();
+        assert_eq!(after.failure_reason.as_deref(), Some("unpack"));
+        assert_eq!(after.salvage.as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn failure_reason_skips_a_publication_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("processing");
+        std::fs::create_dir_all(&root).unwrap();
+        let inventory = Inventory::open(dir.path()).unwrap();
+        let source = inventory.allocate(11, &root, &root.join("job-11")).unwrap();
+        // A newer artifact for the same job that is a publication.
+        let publication = inventory
+            .allocate(12, &root, &root.join("job-11-pub"))
+            .unwrap();
+        {
+            let db = inventory.db.lock().unwrap();
+            db.execute(
+                "UPDATE artifacts SET job=11,data=json_set(data,'$.job',11,'$.state','transferred','$.owned',json('false')),updated_at=?2 WHERE id=?1",
+                rusqlite::params![publication.id, now() + 100],
+            )
+            .unwrap();
+        }
+        inventory
+            .record_terminal(&failed(11, SalvageState::None))
+            .unwrap();
+        assert_eq!(
+            inventory.get(&source.id).unwrap().failure_reason.as_deref(),
+            Some("unpack")
+        );
+        assert_eq!(inventory.get(&publication.id).unwrap().failure_reason, None);
     }
 }
