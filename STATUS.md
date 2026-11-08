@@ -30,6 +30,24 @@ visible on `/api/v1/artifacts`. The old in-memory, three-attempt budget —
 which retired the queue row with a `delete failed: …` note after about 60 s —
 is gone. A failed row stays queued until its disposal is recorded.
 
+**Retry-now on the disposal ladder** (`claude/pipeline-v2-m1a-tests`):
+- Test: `retry_now_runs_a_failed_source_follow_up_past_its_disposal_ladder`
+  (v2 of the deleted `retry_now_releases_a_due_failed_source…`). A park
+  relocate hits EIO before commit and goes onto its own ladder. The
+  manager's rescan waits for it; Retry now parks and records it at once.
+- Fixed: a park that moved its bytes but did not commit was recorded as
+  `no payload`. Disposal now treats an unresolved delete/relocate operation
+  as holding the payload (`Inventory::disposal_in_flight`).
+- Fixed: Retry now could not complete such a park before `next_retry`.
+  Terminal custody verifies the pre-move path, which is gone. A forced
+  follow-up now resumes the pending relocation first
+  (`Inventory::retry_disposal_now`, the post-retry resume path).
+- Open, not fixed: a park whose destination root cannot be created fails
+  before its operation is written. It has no durable ladder and is not
+  visible on `/api/v1/artifacts`; only the 30 s rescan retries it. The
+  relocate request records the destination root's identity, so fixing this
+  means reworking that request. That is a relocation change, outside M1a.
+
 **Tests changed to v2 behaviour (contract clause):**
 - `terminal_unusable_cluster_completion_…` → `…_parks_raw_copies_and_drains_sealed_generations`:
   §2.2, publish always parks.
