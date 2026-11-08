@@ -174,8 +174,10 @@ pub(super) fn allocate_imported_payload(
             .allocate(record.id.0, &allocation.root, &allocation.path)
             .map_err(failure)?;
     } else {
+        // Review #283-1: behind a restart's reconciliation pass on this
+        // source (its publication move being finished), not against it.
         let _custody = inventory
-            .acquire_terminal_use(record.id.0, &|| Ok(()))
+            .acquire_terminal_use_after_reconciliation(record.id.0, &|| Ok(()))
             .map_err(failure)?
             .ok_or_else(|| failure("retained allocation has no custody evidence"))?;
     }

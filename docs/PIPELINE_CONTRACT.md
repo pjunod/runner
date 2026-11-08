@@ -257,6 +257,12 @@ diffing ticks to discover transitions.
   property today's "always stage privately" branch (`relocation.rs:1140-1152`)
   exists for — unresolved siblings never enter `<completed>` — without the
   full copy and the 4–5 hash passes.
+  *Note (runner M3, review #283):* "rename" admits a **hard link** for one
+  case — a selected file that is still an input of a PAR set the rest of
+  the source needs for repair (`repairDependency`) is `linkat`-ed into the
+  publication on the same volume, so the source name stays and the set stays
+  repairable after curator removes the publication. The publication is
+  identical either way; the source's extra name is retired with the source.
 - **The move is journaled before it starts.** The relocation intent
   (generation, target directory, every selected file's identity — inode,
   size, journaled digest — and its destination name) is written to the

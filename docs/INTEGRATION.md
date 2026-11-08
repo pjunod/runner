@@ -105,6 +105,7 @@ instead of the same fact configured per-container and easy to get half-right.
 |---|---|---|---|---|
 | 1 | Native job API | inbound | HTTP `/api/v1/*` | monarr |
 | 2 | Event stream | inbound (held open) | SSE `/api/v1/events` | monarr |
+| 2a | Publication + reconciliation feed | outbound on disk / inbound read | `.runner-manifest.json`, HTTP `/api/v1/deliveries` | nzbd writes, monarr reads |
 | 3 | Transfer-id passthrough | inbound → echoed back | job `params` | monarr |
 | 4 | Status / capacity | inbound | HTTP `/api/v1/status` | monarr |
 | 5 | Client registry | observation | HTTP `/api/v1/clients` | you |
@@ -269,8 +270,9 @@ The Files tab reads these to say why a source is parked.
 `job_publication_ready{job, transfer, publication}` announces a salvage
 publication of a failed job. It is not a terminal; the job stays failed. The
 matching `/api/v1/deliveries` row has `kind: "salvage"` (completed jobs are
-`kind: "completed"`), with the same manifest body. `POST …/accept` is a 200
-no-op since 0.3.0 — see [CURATOR_DELIVERY.md](CURATOR_DELIVERY.md).
+`kind: "completed"`), with the same manifest body. There is no acceptance:
+`POST …/accept` was a 200 no-op in 0.3.0 and answers `410 Gone` since 0.4.0
+(see [Publication, manifest and the move journal](#2a-publication-manifest-and-the-move-journal-pipeline-contract-v2-runner-040)).
 
 `GET /api/v1/history` now answers `incarnation`, `head_seq` and
 `retained_min_seq` beside the rows. A consumer that stores `since_seq` must
@@ -310,6 +312,146 @@ and nothing else. monarr reconnects forever with `1s → 60s` jittered backoff
 and injects a synthetic reset on every reconnect, because a gap in the stream
 is a gap in knowledge regardless of why it happened. `live` going to `polling`
 is a performance regression, not an outage.
+
+---
+
+## 2a. Publication, manifest and the move journal (pipeline contract v2, runner 0.4.0)
+
+A publication is a directory `<completed>/<name>.job-<id>.runner-<gen>/`
+holding **only the selected files** and `.runner-manifest.json`. The
+manifest is written **last** and is the commit marker: a directory without
+it is not a publication — curator ignores it and runner's restart
+reconciliation finishes or unwinds it. From the moment the manifest exists
+the directory is curator's; runner never deletes anything under
+`<completed>`.
+
+**How the files get there.** Before the first file moves, runner journals
+the move intent — generation, target directory, and for every selected file
+its source path, destination, inode/device/size/mtime identity and its
+digest if one is already journaled — in the `relocation_intents` table, in
+the same transaction as the relocation operation. Then, file by file:
+
+- **Same volume:** `renameat2(RENAME_NOREPLACE)`, falling back to
+  `linkat` + `unlink` on mounts that refuse it (NFS, FUSE — the PR #247
+  chain). A file without a journaled digest gets exactly one read pass, to
+  compute it. Nothing is copied.
+- **Different volume:** one streaming copy per file into `<dst>.part` that
+  computes the SHA-256 as it writes, `fsync`, then an exclusive rename.
+- One exception: a selected file that is still an input of a PAR set needed
+  to repair the rest of the source (`repairDependency` in its file outcome)
+  is *linked* into the publication on the same volume instead of renamed, so
+  its source name stays and the set remains repairable after curator removes
+  the publication.
+- Each file is marked moved in the journal as it lands. Then
+  `.runner-manifest.json` is written (`.part`, `fsync`, exclusive rename).
+
+The processing directory keeps only the unselected siblings (PAR sets,
+samples, consumed archives, NFOs); runner disposes of it once the delivery
+row exists. The delivery record reuses the journaled digests — the old
+private staging tree and its four-to-five hash passes are gone.
+
+In a cluster, the leader lands the worker's sealed payload in its own
+publication directory and writes the manifest there last, through the same
+writer; its `generation` is the cluster result id, `cross_volume` is `true`
+(the payload was copied) and its digest is the cluster delivery row's
+`manifestDigest`.
+
+**`.runner-manifest.json`:**
+
+```json
+{
+  "generation": "5f0c6b1e9a2d4c8e8b7a6d5c4b3a2918",
+  "job": 2333,
+  "transfer": "t-2333-00112233445566778899aabbccddeeff",
+  "created_at": 1794076138,
+  "cross_volume": false,
+  "files": [{"path": "Movie.2020.mkv", "bytes": 8123456789, "sha256": "…"}],
+  "digest": "<bare lowercase hex>"
+}
+```
+
+`files` is in bytewise path order. `digest` is the deployed
+`runner-manifest-v1` algorithm, unchanged: SHA-256 over
+`runner-manifest-v1\n` and then, per file, `<len(path)>:<path>\n<bytes>\n<sha256>\n`
+— the same value as `Delivery:ManifestDigest`, the delivery row's
+`manifestDigest` and `job_pp_finished.publication.manifest_digest`.
+`crates/nzbd-state/tests/fixtures/runner_manifest_v1.json` holds a manifest
+and the digest curator's own `ports.ManifestDigest` computes for it; the test
+`manifest_digest_matches_curator_fixture` keeps the two languages equal.
+Curator re-verifies the digest once, at import, only when `cross_volume` is
+true.
+
+**Crash safety.** On every start (and on each 30 s tick, and before a
+post-processing retry) runner reconciles each intent that is still open:
+
+- the manifest exists → the publication committed; record it;
+- every selected file is accounted for, unchanged, either in the target
+  (same object, or same size and digest across volumes) or in the source
+  (same identity, and same digest when one was journaled) → **finish**:
+  move the rest, write the manifest;
+- any file missing from both sides, or changed → **unwind**: move the moved
+  files back by identity, remove the target directory, and fail the job
+  `failed/io` (parked, no blame) on its next publication attempt.
+
+Exactly one of finish or unwind runs, and the decision is logged with the
+per-file evidence. A restart that had already decided to finish and stopped
+again re-locates every file the journal does not yet record as moved (a
+rename can land before its journal update), so finishing is idempotent too.
+While an intent is open, neither the source nor the target can be disposed
+of, deleted or retired.
+
+**What identity proves.** A file with a journaled digest is checked by its
+bytes. A same-volume file the journal has no digest for yet (the crash came
+before its one read pass) is matched by **inode, device, size, mtime and
+ctime only** — the same check a rename preserves. That detects replacement
+and ordinary writes (both change ctime) but not bit rot under unchanged
+metadata; such a file's digest is computed as it is published, and curator
+re-verifies only cross-volume publications. Legacy records without a ctime
+are matched on inode, size and mtime.
+
+**An unwind never deletes the only copy.** A cross-volume copy is removed
+only while the source still holds the journaled original, and a linked PAR
+repair input loses its publication name only while the source name is the
+same inode. Otherwise the unwind stops for review (the operation's error is
+mirrored onto the artifact, so Files and Attention show it).
+
+**Operator exit.** A move stuck in review or on its retry ladder can be
+abandoned from the Files detail (*Abandon move and retain original*), i.e.
+`POST /api/v1/artifact-operations/<op>/abandon-relocation` with the
+artifact's `revision` and `generation`. Runner unwinds the move — the source
+is complete and stays runner's — and the job's next publication attempt fails
+`failed/io`, parking the source. If the move cannot be put back safely,
+abandoning closes it without deleting anything: the files stay where they are
+and the publication directory (no manifest, so never curator's) is registered
+in the inventory for an explicit disposition.
+
+**The reconciliation feed.** `GET /api/v1/deliveries?after=<cursor>&limit=<1..100>`
+is a read-only feed of immutable publication rows in sequence order: job,
+`requestToken` (the transfer), `publicationPath`, `publicationGeneration`,
+`manifestDigest`, `readyAt`, `kind` (`completed` | `salvage`), and the
+manifest body (`files`, plus `manifest` — the `.runner-manifest.json` as
+written, for publications since 0.4.0). Curator reads it on the poll to
+catch a `completed` or `publication_ready` it missed. Every row is returned;
+`includeAccepted` is accepted and ignored for one release. The v1 delivery
+record is still written for one release so a rolled-back curator finds what
+it expects (contract §6).
+
+`GET /api/v1/request-admissions/<token>` keeps `outcome` and the typed
+`failureReason` for the continuity-loss lookup; `custodyState` and
+`sourceCleanupStatus` are deprecated (OpenAPI `deprecated: true`) and go in
+M6.
+
+**How to verify.**
+
+```bash
+# no open intents after a restart (post-deploy check)
+curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/artifacts?filter=attention" \
+  | python3 -m json.tool | grep -c '"state": "transitioning"'
+# a publication's manifest and its feed row agree
+jq -r .digest "<completed>/<publication>/.runner-manifest.json"
+curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/deliveries?after=0&limit=100" \
+  | jq -r '.deliveries[] | [.publicationPath, .manifestDigest, .kind] | @tsv'
+```
 
 ---
 

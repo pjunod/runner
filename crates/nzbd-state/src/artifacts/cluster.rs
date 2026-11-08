@@ -851,14 +851,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        inventory
-            .accept_delivery(
-                &receipt.delivery_id,
-                &receipt.publication_generation,
-                &receipt.manifest_digest,
-                "durable-consumer-mapping",
-            )
-            .unwrap();
+        assert_eq!(receipt.kind(), "completed");
         assert_eq!(inventory.execute_delete(&op.id).unwrap().state, "review");
         assert!(source.exists());
         assert!(inventory
@@ -977,18 +970,21 @@ mod tests {
             .retention(&selected.id, selected.revision, true, None)
             .unwrap();
         inventory.set_keep_on_failure(7, true).unwrap();
+        // Contract §2.5 (M3): the selection was renamed into the private
+        // generation, not copied — it holds the only copy of the episode, so
+        // the kept cancellation retains it rather than removing it.
         assert_eq!(
             inventory
                 .delete_cancelled_cluster_unpublished_publication(&copy, proof(), &files)
                 .unwrap()
                 .status,
-            "removed"
+            "retained"
         );
-        assert!(!target.exists());
         assert_eq!(
-            std::fs::read(source.join("episode.mkv")).unwrap(),
+            std::fs::read(target.join("episode.mkv")).unwrap(),
             b"verified payload"
         );
+        assert!(!source.join("episode.mkv").exists(), "never in two places");
         assert_eq!(std::fs::read(source.join("readme.txt")).unwrap(), b"junk");
         assert!(inventory.get(&copy.source.artifact).unwrap().keep);
         drop(inventory);
@@ -998,9 +994,9 @@ mod tests {
                 .delete_cancelled_cluster_unpublished_publication(&copy, proof(), &files)
                 .unwrap()
                 .status,
-            "removed"
+            "retained"
         );
-        assert!(source.join("episode.mkv").exists());
+        assert!(target.join("episode.mkv").exists());
     }
     #[test]
     fn explicit_cancel_private_selection_refuses_any_durable_unaccepted_handoff() {
@@ -1035,7 +1031,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert!(delivery.accepted_at.is_none() && delivery.consumer_receipt_id.is_none());
+        assert_eq!(delivery.kind(), "completed");
         // A historical partially-applied state update cannot erase the durable
         // handoff. The executor must recheck the receipt, not only ownership.
         let mut stale_owned = inventory.get(&artifact.id).unwrap();
@@ -1053,10 +1049,8 @@ mod tests {
             std::fs::read(target.join("episode.mkv")).unwrap(),
             b"verified payload"
         );
-        assert_eq!(
-            std::fs::read(source.join("episode.mkv")).unwrap(),
-            b"verified payload"
-        );
+        // M3: the selected file was moved, not copied.
+        assert!(!source.join("episode.mkv").exists());
     }
     #[test]
     fn accepted_selected_cluster_copy_drains_and_replays_without_payload() {

@@ -2374,9 +2374,31 @@ async fn openapi() -> Response {
         "info": { "title": "nzbd native API", "version": env!("CARGO_PKG_VERSION") },
         "paths": {
             "/api/v1/status": { "get": { "summary": "Queue + rate + guard status" } },
-            "/api/v1/request-admissions/{token}": { "get": { "summary": "Read the durable outcome of one transfer-token URL admission" } },
-            "/api/v1/deliveries": { "get": { "summary": "Read-only reconciliation feed of publications (kind completed|salvage, manifest body); pass includeAccepted=true" } },
-            "/api/v1/deliveries/{id}/accept": { "post": { "summary": "Deprecated no-op (pipeline contract v2): answers 200 with the unchanged row; removed in M3" } },
+            "/api/v1/request-admissions/{token}": { "get": {
+                "summary": "Did a POST /jobs with this transfer token land, and as which job; after a history continuity loss, what happened to that transfer (outcome, failure_reason). Not consulted to settle a terminal in normal operation",
+                "responses": { "200": { "description": "The admission receipt", "content": { "application/json": { "schema": {
+                    "type": "object",
+                    "properties": {
+                        "jobId": { "type": "integer" },
+                        "outcome": { "type": "string" },
+                        "terminalOutcome": { "type": "string", "nullable": true },
+                        "failureReason": { "type": "string", "nullable": true },
+                        "fetchCause": { "type": "string", "nullable": true },
+                        "custodyState": { "type": "string", "deprecated": true,
+                                          "description": "Deprecated (pipeline contract v2 §2.5): runner never holds bytes for curator; removed in M6" },
+                        "sourceCleanupStatus": { "type": "string", "nullable": true, "deprecated": true,
+                                                 "description": "Deprecated (pipeline contract v2 §2.5): source cleanup no longer gates curator; removed in M6" }
+                    } } } } } }
+            } },
+            "/api/v1/deliveries": { "get": {
+                "summary": "Read-only reconciliation feed of publications (contract v2 §2.5): immutable rows in sequence order — job, transfer (requestToken), publicationPath, publicationGeneration, manifestDigest, readyAt, kind completed|salvage, and the manifest body (files, manifest). Curator reads it on the poll to catch a completed or publication_ready it missed",
+                "parameters": [
+                    {"name": "after", "in": "query", "description": "Cursor: rows with sequence > N (nextCursor of the previous page)"},
+                    {"name": "limit", "in": "query", "description": "1..=100, default 50"},
+                    {"name": "includeAccepted", "in": "query", "deprecated": true,
+                     "description": "Accepted and ignored for one release: there is no acceptance, every row is returned"}
+                ] } },
+            "/api/v1/deliveries/{id}/accept": { "post": { "summary": "Removed (pipeline contract v2 §2.5): answers 410 Gone", "deprecated": true } },
             "/api/v1/jobs": {
                 "get": { "summary": "List queue jobs" },
                 "post": { "summary": "Add a job (NZB body, or ?url=)",
@@ -3248,7 +3270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_answers_200_noop() {
+    async fn accept_is_gone() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = test_engine(&tmp).await;
         let root = tmp.path().join("processing");
@@ -3282,12 +3304,9 @@ mod tests {
         assert_eq!(pending["deliveries"][0]["deliveryId"], delivery.delivery_id);
         assert_eq!(pending["nextCursor"], delivery.sequence);
 
-        let body = serde_json::json!({
-            "protocolVersion": 1,
-            "publicationGeneration": delivery.publication_generation,
-            "manifestDigest": delivery.manifest_digest,
-            "consumerReceiptId": "curator-receipt-fixture"
-        });
+        // IMPL §7.4 / contract §2.5: there is no acceptance. M1a answered
+        // 200 as a no-op for one release; now the route is gone (410) and
+        // the row stays on the feed, unchanged.
         let accepted = app
             .clone()
             .oneshot(
@@ -3296,24 +3315,25 @@ mod tests {
                     delivery.delivery_id
                 ))
                 .header("content-type", "application/json")
-                .body(axum::body::Body::from(body.to_string()))
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "protocolVersion": 1,
+                        "publicationGeneration": delivery.publication_generation,
+                        "manifestDigest": delivery.manifest_digest,
+                        "consumerReceiptId": "curator-receipt-fixture"
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
             )
             .await
             .unwrap();
-        // Contract §2.5 / plan M1 (h): there is no acceptance. `accept`
-        // answers 200 with the unchanged row so an old curator's retry loop
-        // settles; nothing is recorded and the row stays on the feed.
-        assert_eq!(accepted.status(), StatusCode::OK);
-        let accepted = body_json(accepted).await;
-        assert!(accepted["consumerReceiptId"].is_null());
-        assert!(accepted["acceptedAt"].is_null());
-        assert_eq!(accepted["kind"], "completed");
+        assert_eq!(accepted.status(), StatusCode::GONE);
 
         let still_listed = app
             .clone()
             .oneshot(
-                axum::http::Request::get("/api/v1/deliveries?after=0&limit=1")
+                axum::http::Request::get("/api/v1/deliveries?after=0&limit=1&includeAccepted=true")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -3325,36 +3345,15 @@ mod tests {
         assert_eq!(row["kind"], "completed");
         assert_eq!(row["manifestDigest"], delivery.manifest_digest);
         assert_eq!(row["files"].as_array().unwrap().len(), 1);
-
-        let conflicting = serde_json::json!({
-            "protocolVersion": 1,
-            "publicationGeneration": delivery.publication_generation,
-            "manifestDigest": delivery.manifest_digest,
-            "consumerReceiptId": "different-receipt"
-        });
-        let replay = app
-            .clone()
-            .oneshot(
-                axum::http::Request::post(format!(
-                    "/api/v1/deliveries/{}/accept",
-                    delivery.delivery_id
-                ))
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(conflicting.to_string()))
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(replay.status(), StatusCode::OK, "a no-op never conflicts");
+        assert!(row.get("status").is_none(), "no acceptance state: {row}");
+        assert!(
+            row.get("acceptedAt").is_none(),
+            "no acceptance state: {row}"
+        );
         assert_eq!(
             artifacts.delivery(&delivery.delivery_id).unwrap(),
             artifacts.delivery(&delivery.delivery_id).unwrap()
         );
-        assert!(artifacts
-            .delivery(&delivery.delivery_id)
-            .unwrap()
-            .accepted_at
-            .is_none());
 
         let retry_cleanup = app
             .oneshot(

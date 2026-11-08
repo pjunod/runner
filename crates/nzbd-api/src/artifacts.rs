@@ -73,7 +73,10 @@ struct DeliveryPage {
     #[serde(default)]
     after: i64,
     limit: Option<u32>,
+    /// Accepted and ignored for one release (contract §2.5): there is no
+    /// acceptance, so the feed always returns every row.
     #[serde(default)]
+    #[allow(dead_code)]
     include_accepted: bool,
 }
 
@@ -104,10 +107,8 @@ async fn deliveries(State(st): State<ApiState>, Query(page): Query<DeliveryPage>
     }
     let db = st.engine.artifacts();
     let limit = page.limit.unwrap_or(50);
-    let include_accepted = page.include_accepted;
     work(move || {
-        let (deliveries, next_cursor) =
-            db.deliveries_discovery_page(page.after, limit, include_accepted)?;
+        let (deliveries, next_cursor) = db.deliveries_discovery_page(page.after, limit)?;
         Ok(json!({
             "protocolVersion": 1,
             "deliveries": deliveries,
@@ -128,12 +129,13 @@ async fn retry_delivery_cleanup(State(st): State<ApiState>, Path(id): Path<Strin
     work(move || db.retry_delivery_source_cleanup(&id)).await
 }
 
-/// Contract §2.5: there is no acceptance. For one release `accept` answers
-/// `200` with the unchanged row, so an old curator's acknowledgement retry
-/// settles instead of retrying forever; it records nothing. Removed in M3.
-async fn accept_delivery(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
-    let db = st.engine.artifacts();
-    work(move || Ok(db.delivery(&id)?.feed_value()?)).await
+/// Contract §2.5, IMPL §7.4: there is no acceptance. M1a answered `200` as a
+/// no-op for one release; curator M2 no longer calls it, so it is gone.
+async fn accept_delivery() -> Response {
+    error(
+        StatusCode::GONE,
+        "delivery acceptance was removed (pipeline contract v2 §2.5); publications are owned by curator once .runner-manifest.json exists",
+    )
 }
 fn failure(e: Error) -> Response {
     let status = match e {
@@ -1399,8 +1401,9 @@ mod tests {
             )
             .await
             .unwrap();
-        // The no-op `accept` reads no body; a missing row is still 404.
-        assert_eq!(unsupported.status(), StatusCode::NOT_FOUND);
+        // There is no acceptance (contract §2.5): `accept` is gone for
+        // every id and body.
+        assert_eq!(unsupported.status(), StatusCode::GONE);
 
         let missing = app
             .clone()
@@ -1422,7 +1425,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing.status(), StatusCode::GONE);
 
         let retry_missing = app
             .oneshot(

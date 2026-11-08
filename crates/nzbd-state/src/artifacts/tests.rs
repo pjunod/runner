@@ -99,7 +99,7 @@ fn unavailable_root_becoming_available_again_recovers_same_artifact() {
 }
 
 #[test]
-fn delivery_manifest_and_acceptance_survive_history_independently() {
+fn delivery_manifest_survives_history_independently() {
     let (_tmp, db, root) = fixture();
     let path = root.join("published");
     db.allocate_for_delivery(44, &root, &path, true, true)
@@ -129,35 +129,12 @@ fn delivery_manifest_and_acceptance_survive_history_independently() {
     let (pending, cursor) = db.deliveries_after(0, 10).unwrap();
     assert_eq!(cursor, 1);
     assert_eq!(pending, vec![delivery.clone()]);
-    let accepted = db
-        .accept_delivery(
-            &delivery.delivery_id,
-            &delivery.publication_generation,
-            &delivery.manifest_digest,
-            "curator-receipt-44",
-        )
-        .unwrap();
-    assert!(accepted.accepted_at.is_some());
+    // Contract §2.5: there is no acceptance; the row stays on the feed.
     assert_eq!(
-        db.accept_delivery(
-            &delivery.delivery_id,
-            &delivery.publication_generation,
-            &delivery.manifest_digest,
-            "curator-receipt-44",
-        )
-        .unwrap(),
-        accepted
+        db.deliveries_after(0, 10).unwrap().0,
+        vec![delivery.clone()]
     );
-    assert!(db
-        .accept_delivery(
-            &delivery.delivery_id,
-            &delivery.publication_generation,
-            &delivery.manifest_digest,
-            "different-receipt",
-        )
-        .is_err());
-    assert!(db.deliveries_after(0, 10).unwrap().0.is_empty());
-    assert_eq!(db.delivery(&delivery.delivery_id).unwrap(), accepted);
+    assert_eq!(db.delivery(&delivery.delivery_id).unwrap(), delivery);
 }
 
 #[test]
@@ -444,17 +421,22 @@ fn selected_delivery_retains_published_par_repair_dependency_without_keep() {
         .unwrap();
     let cleanup = db.retire_delivery_source(&delivery.delivery_id).unwrap();
     assert_eq!(cleanup.source_cleanup.status, "blocked");
+    // A published repair input keeps its source name (linked, not renamed):
+    // the PAR set stays repairable after curator removes the publication.
     assert!(source.join("episode.mkv").exists());
+    assert!(target.join("episode.mkv").exists());
     assert!(source.join("set.par2").exists());
-    assert_eq!(
+    let status = |path: &str| {
         cleanup
             .file_outcomes
             .iter()
-            .find(|outcome| outcome.source_path == "episode.mkv")
+            .find(|outcome| outcome.source_path == path)
             .unwrap()
-            .source_cleanup_status,
-        "retained_repair_dependency"
-    );
+            .source_cleanup_status
+            .clone()
+    };
+    assert_eq!(status("episode.mkv"), "retained_repair_dependency");
+    assert_eq!(status("set.par2"), "retained_repair_dependency");
     assert!(!db.get(&delivery.artifact_id).unwrap().keep_on_failure);
 }
 
@@ -562,7 +544,7 @@ fn selected_publication_io_failure_keeps_source_for_same_attempt_retry() {
     let target_parent = tmp.path().join("not-yet-mounted-completed");
     let target = target_parent.join("release-generation");
     relocation::FAULTS.with(|faults| {
-        faults.borrow_mut().insert("copy_chunk", libc::EIO);
+        faults.borrow_mut().insert("move_file", libc::EIO);
     });
     assert!(db
         .publish_selected_for_delivery_checked(
@@ -602,7 +584,8 @@ fn selected_publication_io_failure_keeps_source_for_same_attempt_retry() {
     let delivery = db.create_delivery(50, true, Some("retry-50")).unwrap();
     assert_eq!(delivery.files.len(), 1);
     assert!(target.join("episode.mkv").exists());
-    assert!(source.join("episode.mkv").exists());
+    // Contract §2.5 (M3): the selected file is moved, never in two places.
+    assert!(!source.join("episode.mkv").exists());
 }
 
 #[test]
@@ -1231,7 +1214,7 @@ fn legacy_whole_source_relocation_replays_only_owned_private_staging() {
 }
 
 #[test]
-fn selected_publication_resumes_a_partial_private_copy_after_restart() {
+fn selected_publication_resumes_an_interrupted_move_after_restart() {
     let (tmp, db, root) = fixture();
     let source = root.join("copy-resume");
     db.allocate_for_delivery(55, &root, &source, true, true)
@@ -1260,13 +1243,13 @@ fn selected_publication_resumes_a_partial_private_copy_after_restart() {
     std::fs::create_dir(&target_root).unwrap();
     let target = target_root.join("private-target");
     relocation::FAULTS.with(|faults| {
-        faults.borrow_mut().insert("copy_chunk", libc::EIO);
+        faults.borrow_mut().insert("move_file", libc::EIO);
     });
     assert!(db
         .publish_selected_for_delivery_checked(55, &target, selected, outcomes, &|| Ok(()))
         .is_err());
     assert!(source.join("episode.mkv").exists());
-    assert!(!target.exists());
+    assert!(!target.join("episode.mkv").exists());
     drop(db);
 
     let reopened = Inventory::open(&tmp.path().join("state")).unwrap();
@@ -1282,12 +1265,12 @@ fn selected_publication_resumes_a_partial_private_copy_after_restart() {
         .unwrap();
     reopened.reconcile_relocations().unwrap();
     assert_eq!(std::fs::read(target.join("episode.mkv")).unwrap(), payload);
-    assert!(source.join("episode.mkv").exists());
+    assert!(!source.join("episode.mkv").exists(), "moved, not copied");
     assert!(reopened.selected_publication_for_job(55).unwrap().is_some());
 }
 
 #[test]
-fn selected_publication_hardlink_fallback_keeps_original_source_identity() {
+fn selected_publication_link_fallback_moves_and_keeps_source_generation() {
     let (tmp, db, root) = fixture();
     let source = root.join("hardlink-original");
     db.allocate_for_delivery(58, &root, &source, true, true)
@@ -1329,72 +1312,10 @@ fn selected_publication_hardlink_fallback_keeps_original_source_identity() {
         std::fs::read(target.join("Season 1/episode.mkv")).unwrap(),
         b"verified payload"
     );
-    assert!(source.join("Season 1/episode.mkv").exists());
+    // The EINVAL rename took the link + unlink fallback: one name, in the
+    // publication (contract §2.5, PR #247 chain).
+    assert!(!source.join("Season 1/episode.mkv").exists());
     assert_eq!(delivery.source_generation, artifact.generation);
-}
-
-#[test]
-fn selected_publication_retries_capacity_failure_before_scratch_exists() {
-    let (tmp, db, root) = fixture();
-    let source = root.join("capacity-retry");
-    db.allocate_for_delivery(57, &root, &source, true, true)
-        .unwrap();
-    std::fs::write(source.join("episode.mkv"), b"verified payload").unwrap();
-    db.finish(57, &source, &root, "active").unwrap();
-    let selected = db
-        .for_job(57)
-        .unwrap()
-        .unwrap()
-        .files
-        .into_iter()
-        .filter(|entry| entry.path == "episode.mkv")
-        .collect::<Vec<_>>();
-    let outcomes = vec![DeliveryFileOutcome {
-        source_path: "episode.mkv".into(),
-        publication_path: Some("episode.mkv".into()),
-        classification: "video".into(),
-        outcome: "published".into(),
-        reason: None,
-        repair_dependency: false,
-        source_cleanup_status: "pending".into(),
-    }];
-    let completed = tmp.path().join("capacity-completed");
-    std::fs::create_dir(&completed).unwrap();
-    let target = completed.join("release-generation");
-    crate::capacity::FAIL_NEXT_RESERVATION.with(|fail| fail.set(true));
-    assert!(db
-        .publish_selected_for_delivery_checked(57, &target, selected, outcomes, &|| Ok(()))
-        .is_err());
-    assert!(source.join("episode.mkv").exists());
-    assert!(!target.exists());
-
-    let artifact_id = db.for_job(57).unwrap().unwrap().id;
-    let pending_id: String = db
-        .db
-        .lock()
-        .unwrap()
-        .query_row(
-            "SELECT id FROM operations WHERE artifact=?1 AND json_extract(data,'$.kind')='relocate'",
-            [&artifact_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    db.db
-        .lock()
-        .unwrap()
-        .execute(
-            "UPDATE operations SET state='retry', data=json_set(data,'$.next_retry',0) WHERE id=?1",
-            [&pending_id],
-        )
-        .unwrap();
-    drop(db);
-    let reopened = Inventory::open(&tmp.path().join("state")).unwrap();
-    reopened.reconcile_relocations().unwrap();
-    assert_eq!(
-        std::fs::read(target.join("episode.mkv")).unwrap(),
-        b"verified payload"
-    );
-    assert!(source.join("episode.mkv").exists());
 }
 
 #[test]
@@ -1419,7 +1340,7 @@ fn resumed_relocation_does_not_restore_artifact_after_concurrent_delete() {
     std::fs::create_dir(&completed).unwrap();
     let target = completed.join("generation");
     relocation::FAULTS.with(|faults| {
-        faults.borrow_mut().insert("copy_chunk", libc::EIO);
+        faults.borrow_mut().insert("move_file", libc::EIO);
     });
     assert!(db
         .publish_selected_for_delivery_checked(
@@ -1503,7 +1424,7 @@ fn resumed_relocation_does_not_restore_artifact_after_concurrent_delete() {
 }
 
 #[test]
-fn unaccepted_older_delivery_remains_discoverable_after_newer_acceptance() {
+fn every_delivery_stays_on_the_reconciliation_feed() {
     let (_tmp, db, root) = fixture();
     let make = |job: u32, name: &str| {
         let path = root.join(name);
@@ -1516,17 +1437,9 @@ fn unaccepted_older_delivery_remains_discoverable_after_newer_acceptance() {
     };
     let old = make(50, "old");
     let newer = make(51, "newer");
-    db.accept_delivery(
-        &newer.delivery_id,
-        &newer.publication_generation,
-        &newer.manifest_digest,
-        "receipt-newer",
-    )
-    .unwrap();
-
-    let (pending, cursor) = db.deliveries_after(0, 10).unwrap();
+    let (feed, cursor) = db.deliveries_after(0, 10).unwrap();
     assert_eq!(cursor, 2);
-    assert_eq!(pending, vec![old]);
+    assert_eq!(feed, vec![old, newer]);
 }
 
 #[test]
@@ -2698,7 +2611,7 @@ fn selected_publication_io_failure_resumes_in_process_on_tick() {
     let target_parent = tmp.path().join("not-yet-mounted-completed");
     let target = target_parent.join("release-generation");
     relocation::FAULTS.with(|faults| {
-        faults.borrow_mut().insert("copy_chunk", libc::EIO);
+        faults.borrow_mut().insert("move_file", libc::EIO);
     });
     assert!(db
         .publish_selected_for_delivery_checked(
@@ -2733,7 +2646,7 @@ fn selected_publication_io_failure_resumes_in_process_on_tick() {
         )
         .unwrap();
     relocation::FAULTS.with(|faults| {
-        faults.borrow_mut().insert("copy_chunk", libc::ENOSPC);
+        faults.borrow_mut().insert("move_file", libc::ENOSPC);
     });
     db.tick().unwrap();
     let retry = db.operation(&relocation_id).unwrap();
@@ -2763,7 +2676,7 @@ fn selected_publication_io_failure_resumes_in_process_on_tick() {
     let delivery = db.create_delivery(50, true, Some("retry-50")).unwrap();
     assert_eq!(delivery.files.len(), 1);
     assert!(target.join("episode.mkv").exists());
-    assert!(source.join("episode.mkv").exists());
+    assert!(!source.join("episode.mkv").exists(), "moved, not copied");
 }
 
 #[test]
@@ -3057,7 +2970,7 @@ fn delivery_discovery_skips_malformed_row_with_trusted_cursor() {
             [&deliveries[0].delivery_id],
         )
         .unwrap();
-    let (page, cursor) = db.deliveries_discovery_page(0, 100, false).unwrap();
+    let (page, cursor) = db.deliveries_discovery_page(0, 100).unwrap();
     assert_eq!(page.len(), 2);
     assert_eq!(page[0]["deliveryId"], deliveries[0].delivery_id);
     assert_eq!(page[0]["sequence"], deliveries[0].sequence);
@@ -3234,7 +3147,11 @@ fn completed_relocation_retirement_requires_released_exact_generation() {
         .unwrap();
         let retired_source_id = format!("source-{}", publication.operation_id);
         assert!(inventory.retire_completed_relocations(&generation).is_err());
-        assert!(source_path.join("episode.mkv").exists());
+        assert!(
+            source_path.exists(),
+            "the source directory waits for release"
+        );
+        assert!(published_path.join("episode.mkv").exists());
 
         let delivery = with_delivery.then(|| {
             inventory
@@ -3255,7 +3172,7 @@ fn completed_relocation_retirement_requires_released_exact_generation() {
                 generation: "another-generation".into(),
             })
             .unwrap();
-        assert!(source_path.join("episode.mkv").exists());
+        assert!(source_path.exists());
         assert_ne!(inventory.get(&retired_source_id).unwrap().state, "deleted");
 
         inventory.retire_completed_relocations(&generation).unwrap();
@@ -3351,4 +3268,71 @@ fn external_output_observation_never_adopts_owned_associated_or_replaced_paths()
         std::fs::read(replaced.join("foreign.bin")).unwrap(),
         b"foreign bytes"
     );
+}
+
+/// Contract §2.6 (orchestrator addition to M3): a park whose destination
+/// root cannot be created is journaled as the move's first step — an
+/// operation on the retry ladder, visible with the artifact (Attention) and
+/// to the disposal gate's `disposal_retry_at` — and the same request
+/// succeeds once the root can be made.
+#[test]
+fn park_root_creation_failure_lands_on_the_operation_ladder() {
+    let (tmp, db, root) = fixture();
+    let source = root.join("failed-source");
+    db.allocate_for_delivery(88, &root, &source, true, true)
+        .unwrap();
+    std::fs::write(source.join("episode.mkv"), b"failed bytes").unwrap();
+    db.finish(88, &source, &root, "active").unwrap();
+    // The park root's parent is a regular file: create_dir_all fails.
+    let blocker = tmp.path().join("parked");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let target = blocker.join("failed").join("failed-source");
+    let error = db.relocate(88, &target).unwrap_err();
+    assert!(matches!(error, Error::Io(_)), "{error}");
+    let artifact = db.for_job(88).unwrap().unwrap();
+    let operations = db.pending_relocations(&artifact.id).unwrap();
+    assert_eq!(operations.len(), 1, "the failure is journaled");
+    let operation = &operations[0];
+    assert_eq!(operation.state, "retry");
+    assert_eq!(operation.attempts, 1);
+    assert!(operation.next_retry > now(), "on the ladder");
+    assert!(operation
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("could not be created")));
+    assert_eq!(
+        db.disposal_retry_at(88).unwrap(),
+        Some(operation.next_retry)
+    );
+    assert!(artifact
+        .error
+        .as_deref()
+        .is_some_and(|error| error.starts_with("destination root ")));
+    let attention = db
+        .list_page(&ListQuery {
+            limit: 50,
+            filter: ListFilter::Attention,
+            ..ListQuery::default()
+        })
+        .unwrap();
+    assert!(
+        attention
+            .rows
+            .iter()
+            .any(|row| row.artifact.id == artifact.id),
+        "visible under Attention"
+    );
+    assert!(source.join("episode.mkv").exists(), "nothing moved");
+    // A second failure climbs the ladder.
+    assert!(db.relocate(88, &target).is_err());
+    let again = db.pending_relocations(&artifact.id).unwrap();
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].attempts, 2);
+    // Once the root can be created, the same request parks the source.
+    std::fs::remove_file(&blocker).unwrap();
+    let moved = db.relocate(88, &target).unwrap();
+    assert_eq!(moved.published_path, target);
+    assert!(target.join("episode.mkv").exists());
+    assert!(db.pending_relocations(&artifact.id).unwrap().is_empty());
+    assert!(db.for_job(88).unwrap().unwrap().error.is_none());
 }

@@ -430,10 +430,14 @@ impl Inventory {
         Ok(())
     }
 
-    /// The disposal gate (contract §2.6): `Some(terminal)` only when the
-    /// job has a terminal record, its event has been emitted and its salvage
-    /// obligation is no longer pending.
+    /// The disposal gate (contract §2.5–2.6): `Some(terminal)` only when the
+    /// job has a terminal record, its event has been emitted, its salvage
+    /// obligation is no longer pending and no publication move of the job is
+    /// still open (reconciliation has not yet finished or unwound it).
     pub fn disposal_allowed(&self, job: u32) -> Result<Option<JobTerminal>> {
+        if self.open_intent_for_job(job)? {
+            return Ok(None);
+        }
         Ok(self
             .terminal(job)?
             .filter(|t| t.emitted && t.salvage != SalvageState::Pending))
@@ -644,6 +648,56 @@ mod tests {
         assert_eq!(inventory.pending_disposal().unwrap().len(), 1);
         inventory.record_disposal(7, "parked at /x").unwrap();
         assert!(inventory.pending_disposal().unwrap().is_empty());
+    }
+
+    /// Contract §2.5: with the terminal emitted and salvage settled, an open
+    /// publication intent alone still refuses disposal; once reconciliation
+    /// resolves it, disposal is allowed.
+    #[test]
+    fn open_intent_alone_blocks_disposal() {
+        let dir = tempfile::tempdir().unwrap();
+        let inventory = Inventory::open(dir.path()).unwrap();
+        inventory
+            .record_terminal(&failed(8, SalvageState::None))
+            .unwrap();
+        for step in [
+            TerminalStep::HistoryWritten {
+                seq: 3,
+                incarnation: "abc".into(),
+            },
+            TerminalStep::MarkersStamped,
+            TerminalStep::Emitted,
+        ] {
+            inventory.mark_terminal_step(8, &step).unwrap();
+        }
+        assert!(inventory.disposal_allowed(8).unwrap().is_some());
+        let intent = super::super::RelocationIntent {
+            generation: "g8".into(),
+            job: 8,
+            transfer: None,
+            artifact: "a8".into(),
+            operation: "op8".into(),
+            source_dir: dir.path().join("src"),
+            target_dir: dir.path().join("dst"),
+            cross_volume: false,
+            files: Vec::new(),
+            state: super::super::IntentState::Open,
+            evidence: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        super::super::intents::insert_intent(&inventory.db.lock().unwrap(), &intent).unwrap();
+        assert!(inventory.disposal_allowed(8).unwrap().is_none());
+        inventory
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE relocation_intents SET state='unwound' WHERE generation='g8'",
+                [],
+            )
+            .unwrap();
+        assert!(inventory.disposal_allowed(8).unwrap().is_some());
     }
 
     #[test]

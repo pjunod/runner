@@ -348,7 +348,6 @@ async fn removed_exact_result_gets_private_cleanup_and_raw_owner_must_ack() {
     assert!(record.cleanup_only);
     assert!(record.delivery.files.is_empty());
     assert!(record.delivery.publication_path.is_empty());
-    assert!(record.delivery.accepted_at.is_none() && record.delivery.consumer_receipt_id.is_none());
     let raw = record
         .copies
         .iter()
@@ -689,8 +688,6 @@ async fn existing_consumer_publication_is_never_replaced_by_cancellation() {
     let mut record =
         cancellation_record(&f.request, &proof, &removal, &d, "cancel-instance".into()).unwrap();
     record.cleanup_only = false;
-    record.delivery.status = "accepted".into();
-    record.delivery.consumer_receipt_id = Some("actual-consumer-receipt".into());
     f.control.commit_delivery(&record).await.unwrap();
     assert!(f
         .decide()
@@ -701,16 +698,13 @@ async fn existing_consumer_publication_is_never_replaced_by_cancellation() {
         .await
         .unwrap()
         .is_none());
-    assert_eq!(
-        f.control
+    assert!(
+        !f.control
             .cluster_delivery(&d.cleanup_id)
             .await
             .unwrap()
             .unwrap()
-            .delivery
-            .consumer_receipt_id
-            .as_deref(),
-        Some("actual-consumer-receipt")
+            .cleanup_only
     );
     assert!(f.raw_path().exists());
     f.close().await;

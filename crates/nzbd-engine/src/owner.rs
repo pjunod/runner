@@ -9568,7 +9568,6 @@ impl Owner {
 
     fn publish_snapshot(&mut self, rate: u64) {
         self.sync_lifecycle_timings();
-        self.emit_status_changes();
         let jobs = self
             .state
             .jobs
@@ -9937,7 +9936,18 @@ impl Owner {
             remaining_bytes,
             jobs,
         };
+        let projected = snap
+            .jobs
+            .iter()
+            .map(|summary| (summary.id, summary.status))
+            .collect::<Vec<_>>();
         self.shared.store(Arc::new(snap));
+        // Review #283-1: status changes are announced from the projection
+        // just published, after it is readable. A consumer that wakes on the
+        // event and reads the snapshot sees the status the event names — in
+        // particular a job boot verification returns from `queued` to
+        // `post_processing` (the owner's own status never left `Post`).
+        self.emit_status_changes(&projected);
     }
 
     fn save_snapshot(&mut self) {

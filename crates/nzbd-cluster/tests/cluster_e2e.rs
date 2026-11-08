@@ -1838,6 +1838,23 @@ async fn delivery_receipts_survive_authority_restart_and_consumer_removed_public
         std::fs::read(path.join(delivery["files"][0]["path"].as_str().unwrap())).unwrap(),
         bytes
     );
+    // Contract §2.5: the leader's publication directory is a publication —
+    // `.runner-manifest.json` written last, its digest the row's.
+    let runner_manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(path.join(".runner-manifest.json")).expect("cluster publication manifest"),
+    )
+    .unwrap();
+    assert_eq!(runner_manifest["digest"], delivery["manifestDigest"]);
+    assert_eq!(
+        runner_manifest["generation"],
+        delivery["publicationGeneration"]
+    );
+    assert_eq!(runner_manifest["transfer"], "cluster-ready-token");
+    assert_eq!(runner_manifest["cross_volume"], true);
+    assert_eq!(
+        runner_manifest["files"].as_array().map(Vec::len),
+        delivery["files"].as_array().map(Vec::len)
+    );
     let id = delivery["deliveryId"].as_str().unwrap();
     let acceptance=serde_json::to_vec(&serde_json::json!({"protocolVersion":1,"publicationGeneration":delivery["publicationGeneration"],"manifestDigest":delivery["manifestDigest"],"consumerReceiptId":"curator-accepted-cluster"})).unwrap();
     let (status, accepted) = http_with_headers(
@@ -1847,8 +1864,11 @@ async fn delivery_receipts_survive_authority_restart_and_consumer_removed_public
         &acceptance,
         &[("Content-Type", "application/json")],
     );
-    assert_eq!(status, 200, "acceptance through worker proxy: {accepted}");
-    assert!(accepted.contains("sourceCopies"));
+    // Contract §2.5 (v2, runner M3): there is no acceptance. The route is
+    // gone, and answers so through the worker's proxy as well; source cleanup
+    // does not wait for a consumer receipt.
+    assert_eq!(status, 410, "acceptance through worker proxy: {accepted}");
+    assert!(accepted.contains("acceptance was removed"), "{accepted}");
     // Consumer is entitled to remove its transferred publication immediately.
     std::fs::remove_dir_all(&path).unwrap();
     let last_cleanup_progress = std::cell::RefCell::new(String::new());
@@ -2213,8 +2233,11 @@ async fn delivery_receipts_and_copy_acks_survive_actual_majority_authority_chang
         &acceptance,
         &[("Content-Type", "application/json")],
     );
-    assert_eq!(status, 200, "acceptance through worker proxy: {accepted}");
-    assert!(accepted.contains("sourceCopies"));
+    // Contract §2.5 (v2, runner M3): there is no acceptance. The route is
+    // gone, and answers so through the worker's proxy as well; source cleanup
+    // does not wait for a consumer receipt.
+    assert_eq!(status, 410, "acceptance through worker proxy: {accepted}");
+    assert!(accepted.contains("acceptance was removed"), "{accepted}");
     // Consumer is entitled to remove its transferred publication immediately.
     std::fs::remove_dir_all(&path).unwrap();
     let last_cleanup_progress = std::cell::RefCell::new(String::new());
@@ -2947,7 +2970,9 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
         &format!("/api/v1/deliveries/{id}/accept"),
         b"{}",
     );
-    assert_eq!(code, 409);
+    // Contract §2.5: there is no acceptance; the route is gone for every id
+    // (it answered 409 for a private cleanup row under v1).
+    assert_eq!(code, 410);
     worker.kill().await;
     downloader.kill().await;
     authority.kill().await;
