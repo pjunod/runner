@@ -573,14 +573,18 @@ journal appends. It retains the first non-append request as the next FIFO
 barrier. Per-revision completions follow the shared sync, with the original
 filesystem error context preserved on failure. An append or sync failure fences
 later append groups until a successful complete snapshot establishes durable
-owner state. No timer, input-capacity increase, early acknowledgement, or
+owner state and rotates local append descriptors to a fresh journal incarnation.
+Recovery checkpoints retain the old journal files, including torn tails, and
+foreign writers remain untouched; healthy checkpoint compaction is unchanged. No timer, input-capacity increase, early acknowledgement, or
 relaxation of payload or journal durability is introduced.
 
 Regression coverage adds six writer tests for shared sync and final identity,
 cancellation ordering, failed sync, control barriers, duplicates/rejected
 overlaps, and external mutation during sync. Six persistence tests cover prefix
 bounds/barriers, shared-sync completion, append and sync failures, and the
-cross-batch failure fence. Combined validation and deployment evidence belong
+cross-batch failure fence. A real torn-tail replay regression covers worker,
+delegated, and ordinary authoritative recovery checkpoints; a state test checks
+incarnation rotation, stable lease identity, and retained foreign journal access. Combined validation and deployment evidence belong
 with the PR. Runtime acceptance still requires untraced sustained measurements
 on nuc3 with one active download, unchanged provider settings, and verified
 binary provenance. The target remains 109 MiB/s; a passing test suite alone
