@@ -318,7 +318,7 @@ impl HistoryDb {
     /// this node's own file is compacted, but another node's is not, and
     /// every poll would re-import what the last prune just dropped —
     /// exactly the resurrect-with-a-new-cursor shape that
-    /// `docs/DEFECT_HISTORY_DELETE.md` documents for `delete`. The floor
+    /// `docs/archive/DEFECT_HISTORY_DELETE.md` documents for `delete`. The floor
     /// only ever rises, so it can't flap.
     fn rebuild_from_jsonl(&self, quiet: bool) -> Result<(), StateError> {
         let before = self.head_seq()?;
@@ -509,7 +509,7 @@ impl HistoryDb {
     /// 3. **The watermark rises**, so ingest refuses to re-import what just
     ///    went (see `rebuild_from_jsonl`).
     ///
-    /// `docs/DEFECT_HISTORY_DELETE.md` rejects "delete the JSONL line" as a
+    /// `docs/archive/DEFECT_HISTORY_DELETE.md` rejects "delete the JSONL line" as a
     /// fix for `delete`, and rightly: rewriting an append-only log on a
     /// shared volume *under other nodes' concurrent appends* to service a
     /// UI click. Compaction is not that. A node rewrites only the file it

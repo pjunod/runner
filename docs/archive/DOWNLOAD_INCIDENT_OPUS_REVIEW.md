@@ -1,5 +1,7 @@
 # Independent review — DOWNLOAD_INCIDENT_REVIEW.md (incl. §10–12)
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: the "Download incident recovery" entry in [STATUS.md](../../STATUS.md); current behaviour in [ARCHITECTURE.md](../ARCHITECTURE.md).
+
 **Reviewer:** Claude (Cowork session) · **Date:** 2026-10-01 ~21:20–21:45 UTC
 **Method:** production reads on nuc3 (API, `docker logs`, `stat`/`ls`, RAR header
 listings of the parked byte copies in throwaway `--network none` containers with

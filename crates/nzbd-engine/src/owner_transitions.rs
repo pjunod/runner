@@ -269,9 +269,6 @@ fn cleanup_metadata_key(key: &str) -> bool {
         nzbd_types::PP_DONE_PARAM
             | "*PP:history-seq"
             | "*PP:failure-disposition-attempts"
-            | "*PP:failed-cleanup-next-retry"
-            | "*PP:failed-cleanup-blocked-since"
-            | "*PP:failed-cleanup-last-error"
             | "Failure:Stage"
             | "Failure:Reason"
             | "Failure:KeepOnFailure"

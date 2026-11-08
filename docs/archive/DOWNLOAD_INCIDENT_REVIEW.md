@@ -1,6 +1,8 @@
 # Download incident — root causes, proposed fixes, and review status
 
-Companion to [CONFIGURATION.md](CONFIGURATION.md): this document explains the
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: the "Download incident recovery" entry in [STATUS.md](../../STATUS.md); current behaviour in [ARCHITECTURE.md](../ARCHITECTURE.md).
+
+Companion to [CONFIGURATION.md](../CONFIGURATION.md): this document explains the
 October 1 Runner incident and the changes needed to correct it. It incorporates
 [Opus review v1](DOWNLOAD_INCIDENT_OPUS_REVIEW.md) and
 [Opus review v2](DOWNLOAD_INCIDENT_OPUS_REVIEW_V2.md). Earlier sections 1–13
@@ -186,7 +188,7 @@ behavior described above exposed downloads within `DestDir`; it is superseded
 for new allocations by this fallback change. Nonempty `inter_dir` remains an
 explicit processing-root override. Successful global/category publication and
 existing recorded custody paths remain unchanged. See
-[CONFIGURATION.md](CONFIGURATION.md#usenet-download-and-completion-paths).
+[CONFIGURATION.md](../CONFIGURATION.md#usenet-download-and-completion-paths).
 
 ## 5. Recovery transitions
 

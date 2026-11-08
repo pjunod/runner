@@ -1,5 +1,118 @@
 # nzbd — Project Status
 
+## Pipeline contract v2 M6a — one clock per job, errno not text, docs from the contract — 2026-11-08
+
+**Status:** draft PR [#296](https://github.com/pjunod/runner/pull/296) on `claude/pipeline-v2-m6a-runner` (runner 0.5.0),
+base `main` (M3 #283 merged in). Adversarial review r1 (Fable): REQUEST
+CHANGES, all seven findings fixed (fb59323, 50ae889, 43d9408, c50432d) —
+re-review requested. Not merged, not deployed.
+
+- **Review r1 fixes.** An io error rebuilt from its kind kept no errno, so a
+  dropped mount on the deobfuscate stage parked as `failed/io`:
+  `nzbd_state::io_context` now wraps the original as `source()` (deobfuscate,
+  recovery `at`/`at_dir`), and `io_error_hold_cause` reads the wrapped error
+  before falling back to a kind table that mirrors the errno table. Policy
+  (Paul's call via the orchestrator): `EROFS` and `ENETDOWN`/`ENETUNREACH`
+  hold `storage_unavailable`; `EMFILE`/`ENFILE`/`ENOMEM` stay `failed/io`.
+  A full state volume under the terminal store latches out-of-space instead
+  of reading as corruption. CI: `make fast-check-docs` (the two doc contract
+  tests) runs in the Rust lane and, for a docs-only diff, in its own lane.
+  Not fixed here, filed as issues by the orchestrator: worker-leased hold
+  deadline enforcement; salvage retry-every-scan on a full volume.
+Safe to merge right after M3: no wire field is removed and nothing persisted
+changes shape. Plan: `IMPL_RUNNER.md` §8 / `PIPELINE_REWRITE_PLAN.md` M6.
+M6b (wire removals, persisted `Held`) is stacked on this branch and merges
+only after deploy confirmation.
+
+- **Backoff clocks collapsed** to the hold ladder and the disposal ladder.
+  Holds: the owner's `HOLD_RETRY_DELAYS_SECONDS` only — the PP manager's
+  second scheduler (`schedule_recoverable_post_retry` /
+  `prepare_recoverable_post_retry`, `POST_RETRY_DELAYS_SECONDS`, its jitter)
+  and `QueueCommand::SchedulePostRetry` / `EngineHandle::schedule_post_retry`
+  are deleted; the owner already schedules every timed hold it writes and
+  re-arms an unscheduled one on load. Disposal: `Operation.next_retry`. The
+  `*PP:failed-cleanup-next-retry/blocked-since/last-error` params (no writer
+  since M1a) are dropped when the queue loads (`drop_retired_params`);
+  `failed_cleanup` on the job summary keeps the attempt count. The
+  verification backoff (`owner_recovery.rs`) is unchanged.
+- **Errno, not text.** `is_out_of_space` / `is_storage_unavailable` /
+  `io_hold_cause` are replaced by `errno_hold_cause`, `io_error_hold_cause`
+  (`raw_os_error()`, else the std kind, else the wrapped error),
+  `error_hold_cause` (walks `source()` to the io error or a SQLite
+  `DiskFull`/`SystemIoFailure` code) and `stderr_hold_cause` — the one text
+  rule, for subprocess output. Writer errors, payload resolution, allocation,
+  terminal write faults, `pp_verdict`, salvage (now `Result<_, PostError>`),
+  disposal and torrent io errors are typed. Still text, each named at its
+  call site: par2/unrar/7z output and `PostError::Subprocess`,
+  `EngineError::Lifecycle` messages, a torrent backend's error string, a
+  persisted operation error, and the pre-v2 `io` hold message (goes in M6b).
+- **cfg(test) twins deleted** where a test-only wrapper carried the doc
+  comment of the production path: `Owner::reschedule_hold`,
+  `Inventory::reconcile_deleted_artifacts`, `reconcile_transforms(_root)`,
+  `ControlStore::commit_url_outbox`, `tls::server_config`. `spawn_writer`
+  stays as test support and says so.
+- **Docs.** `docs/INTEGRATION.md` rewritten from the contract with every
+  literal read from `event_json` and the handlers (deprecated fields marked
+  "removed in M6b"); 29 superseded plans and finished status/review records
+  moved to `docs/archive/` with one-line pointers; `docs/README.md` indexes
+  every file; ADR-20 (`docs/adr/0020-pipeline-contract-v2.md`, row in
+  `ARCHITECTURE.md` §15).
+- **Accept tests.** `nzbd-api` `integration_doc_names_every_sse_event` (doc
+  event tables == `event_json` names and the SSE handler's frame literals;
+  a new `Event` variant does not compile until listed);
+  `crates/nzbd/tests/docs_index.rs` (index lists every doc; every relative
+  link in `docs/` and `README.md` resolves).
+- **Rolling-upgrade read for M6b:** `JobStatus::Paused` deserializes
+  `"held"` (`#[serde(alias = "held")]`), so a node on this release reads the
+  persisted `held` status an M6b node writes as today's representation
+  (`Paused` + `control.lifecycle == "held"`). M6b therefore needs every node
+  on **0.5.0 (M6a)**, not merely M1a: an M1a/M3 node cannot decode `held`.
+- **Found doing it:** the web job detail read `post_timing`, `url_fetch` and
+  `failed_cleanup` under camelCase keys the API never sends, so none of the
+  three lines ever rendered; fixed, asserted in the UI DOM harness. An
+  extractor's full-disk report during salvage settled the obligation empty;
+  it is now a `StorageFull` io error and the obligation waits for space.
+
+**Deleted (non-test, approx.):** PP retry scheduler ~95 lines,
+`SchedulePostRetry` command/handle ~70, failed-cleanup progress fields and
+param list ~15, text classifiers ~30, cfg(test) wrappers ~35. Whole-branch
+non-test diff under `crates/`: +901 / −614 (includes the new classifier,
+its tests in `lib.rs`, and the 198-line doc test).
+
+**Behaviour change to review:** an `io::Error` whose *message* names a full
+or dropped volume but whose errno does not (e.g. `io::Error::other("… (os
+error 5)")`) is now a terminal `failed/io` (parked, no blame) instead of a
+hold. Real errno-bearing errors classify exactly as before.
+
+**Fast lane run:** `cargo clippy -p nzbd-post -p nzbd-engine -p nzbd-api
+-p nzbd-cluster -p nzbd-state -p nzbd --all-targets --features
+nzbd-state/test-support -- -D warnings` clean; `cargo test -p nzbd-engine
+--lib` 336/337 (the failure is `volumes::…inaccessible_path…`, a mode-000
+directory check that cannot fail as root in this sandbox; file untouched);
+`cargo test -p nzbd-post --lib` 120/120; `nzbd-post` `failure_regressions`
+6/6, `terminal_first` 15/15, `pp_pipeline` capacity hold 1/1; `nzbd-engine`
+e2e enospc/stranded/post-hold 3/3; `nzbd-state --lib` transforms /
+writer_naming / relocation_failure / artifacts tests 123 passed; `nzbd-api
+--lib` torrent_admission 25/25 and the doc test; `nzbd` `docs_index` 2/2
+and `tls` 6/6; `nzbd-cluster --lib delivery` 3/3. Full suite not run (the
+orchestrator's merge gate).
+
+**Not verified:** the UI DOM harness assertion (`crates/nzbd/tests/ui_dom.rs`
+needs the full `nzbd` test build; left to the gate); behaviour on macOS
+(`EREMOTEIO` is Linux-only and gated); anchors inside doc links (the link
+test checks paths only).
+
+**Decisions for Paul:** versions — M6a 0.5.0, M6b 0.6.0.
+`FILE_LIFECYCLE_OPERATIONS.md` stays live (it is the operations reference
+M3 updated), while `FILE_LIFECYCLE_PLAN/REVIEW/STATUS` are archived. The
+BitTorrent reports stay in place because the release-review script reads
+them. Out-of-repo links in the archived file-lifecycle docs (to a sibling
+`monarr` checkout) became code spans.
+
+**Post-deploy checks:** none new — no wire or schema change. A held job's
+`control.next_retry_at_unix` still advances 30 s → 1 m → 2 m → 5 m
+(`curl -s $NZBD/api/v1/jobs | jq '.jobs[] | select(.status_projected=="held") | .control | {cause, retry_attempt, next_retry_at_unix}'`).
+
 ## Pipeline contract v2 M3 — journaled per-file publication, one hash, no ack — 2026-11-07
 
 **Status:** draft PR [#283](https://github.com/pjunod/runner/pull/283) on
@@ -467,7 +580,7 @@ first class citizen between the two apps. time to act like it".
 ## Held jobs with no way out — 2026-11-01
 
 **Status:** fixed on `fix/held-jobs-always-have-an-exit`; plan and root cause
-in [docs/HELD_JOBS_PLAN.md](docs/HELD_JOBS_PLAN.md). Field report: #2181 and
+in [docs/archive/HELD_JOBS_PLAN.md](docs/archive/HELD_JOBS_PLAN.md). Field report: #2181 and
 #2183 on nuc3 sat `HELD` with only *delete* after a sub-six-minute
 `/processing` outage (ENOTCONN, EIO) — "this keeps happening".
 
@@ -548,7 +661,7 @@ retry, time waited, attempt) instead of empty byte counters, and
 
 ## Download incident recovery — 2026-10-01
 
-Implementation in progress in an isolated agent clone. See [live progress and merge status](docs/DOWNLOAD_INCIDENT_STATUS.md). One combined PR; adversarial review at merge readiness, followed by required validation.
+Implementation in progress in an isolated agent clone. See [live progress and merge status](docs/archive/DOWNLOAD_INCIDENT_STATUS.md). One combined PR; adversarial review at merge readiness, followed by required validation.
 
 ## Files tab rework — 2026-09-28
 
@@ -622,7 +735,7 @@ read only complete suffix lines, preserving sorted-file merge semantics.
 
 **Status:** adversarial review findings addressed; local affected checks passed.
 Live CI and merge status are tracked in PR [#237](https://github.com/pjunod/runner/pull/237).
-[Live delivery status](docs/HISTORY_LOADING_STATUS.md) tracks review, final
+[Live delivery status](docs/archive/HISTORY_LOADING_STATUS.md) tracks review, final
 verification, and merge. Indexed page reads no longer await replay; an owned
 worker handles shared reconciliation and local repair. Local index relocation,
 consistent pagination, and Dev enable controls preserve the recovery contracts
@@ -633,7 +746,7 @@ in the [reviewed proposal](docs/HISTORY_LOADING_PLAN.md).
 
 **Status:** `nuc3` service restored after three saved magnets delayed API
 readiness for about six minutes; PR [#236](https://github.com/pjunod/runner/pull/236)
-contains the code fix and [review record](docs/STARTUP_RECOVERY_REVIEW.md).
+contains the code fix and [review record](docs/archive/STARTUP_RECOVERY_REVIEW.md).
 Not merged or deployed. The code restores local torrents, opens the API, then
 retries pending network sources in a cancellable background task. Review
 findings added a real-daemon regression, accurate concurrent-removal logs,
@@ -687,7 +800,7 @@ Docs: CONFIGURATION `[torrent]` client identity; ADR-19 amendment item 12.
 **Status:** adversarial review approved after fixes. UI boot, 599 DOM
 assertions, formatting, and diff checks pass. Required CI and merge state are
 tracked in [PR #232](https://github.com/pjunod/nzbd/pull/232).
-See [the live work status](docs/TORRENT_QUEUE_STATUS.md) for scope, decisions,
+See [the live work status](docs/archive/TORRENT_QUEUE_STATUS.md) for scope, decisions,
 review findings, validation, and merge progress. Existing queue layout retained;
 seeding and completion gain distinct sections, metrics, and durable controls.
 
@@ -897,7 +1010,7 @@ unrun in this pass.
 - ✅ Mobile BitTorrent prerequisites (2026-08-06): Android release artifacts now fail closed unless a private upload key is fully configured outside version control, Basic auth encodes non-ASCII credentials as UTF-8, and Node 22 CI pins the mobile typecheck, Jest suite, and secretless release refusal. The future M3 mobile surface no longer inherits those P0 defects; M3 torrent UI work remains downstream of completing the tracked M2 slices #154–#160 and final activation #163
 - ✅ Operator documentation (2026-07-18): reworked `README` (accurate status, quickstart, doc index) + `docs/INSTALL.md` (binaries/Docker/Homebrew/source/musl), `docs/CONFIGURATION.md` (full annotated `nzbd.toml` reference), `docs/USAGE.md` (CLI, UI, *arr hookup, feed filter language, scripts, deobfuscation), `docs/DEPLOY.md` (copy-paste recipes: Docker by hand incl. volume map + lifecycle, Compose, Kubernetes, systemd, multi-node cluster)
 - ✅ Docker config mount fixed (2026-07-25): the shipped Compose recipe delivered the config through a Compose `configs:` entry — always mounted **read-only** — so every settings-editor save failed with `Read-only file system (os error 30)`; `docs/INSTALL.md`, `docs/DEPLOY.md` and the README used `:ro` config binds for the same net effect. All four now bind the config **directory** read-write (`./config:/etc/nzbd`), which also sidesteps the Docker-invents-a-directory trap for a missing config file and lets the first-run wizard write one. `dev/docker-compose.yml`'s ownership hint corrected to `chown -R 1000:1000` (the container runs as UID 1000; `$USER` only works if you happen to be 1000). Guard test `shipped_compose_files_mount_the_config_writable` fails the build if a shipped compose file goes read-only again; Kubernetes stays deliberately read-only and DEPLOY.md now says the editor is view-and-copy there
-- ✅ Dev discovery image build fix (2026-09-19): the single adversarial review found no actionable P0–P3 issues and the scoped fast lane is green, as recorded in [`docs/DEV_COMPOSE_BUILD_STATUS.md`](docs/DEV_COMPOSE_BUILD_STATUS.md). The dev Compose file now assigns its local build definition to both services so a clean host never tries to pull the checkout-only `nzbd:dev` tag while `docker compose up --build` is building it.
+- ✅ Dev discovery image build fix (2026-09-19): the single adversarial review found no actionable P0–P3 issues and the scoped fast lane is green, as recorded in [`docs/archive/DEV_COMPOSE_BUILD_STATUS.md`](docs/archive/DEV_COMPOSE_BUILD_STATUS.md). The dev Compose file now assigns its local build definition to both services so a clean host never tries to pull the checkout-only `nzbd:dev` tag while `docker compose up --build` is building it.
 - ✅ Deployable examples under `examples/`: `docker-compose/` (compose + `nzbd.toml.example`), `kubernetes/` (namespace/secret/PVC/deployment/service/kustomization + README incl. RWX cluster shape), `systemd/` (hardened unit)
 - ✅ `dev/` local-build compose (image from the repo Dockerfile, `compose watch` rebuilds, throwaway `dev/data/`, gitignored dev config) + root `.dockerignore` (target/ was going into every build context); example configs are parse-tested against the real validator (`nzbd-config/tests/examples.rs`)
 
@@ -1006,7 +1119,7 @@ unrun in this pass.
 
 - ✅ Version identifies the build, from the footer (field request 2026-07-26: a version pinned at the top that never changes identifies nothing — "which build is nuc3 running?" burned three debugging rounds in one evening): the header chip moved into the footer (`nzbd v0.1.0+g729114f — …`), and the string now carries **build identity**: `nzbd-api/build.rs` emits `NZBD_VERSION_FULL` (Cargo version `+g<9-char hash>`, `-dirty` when the tree was, bare when the build saw no git — the Docker context strips `.git` deliberately) and `NZBD_BUILT` (UTC compile stamp, dependency-free civil-from-days; layer-cached rebuilds keep their stamp — same binary, same build). Status DTO gains `built`; the footer tooltip shows it. Tests: build-env shape (api), footer placement + version/tooltip render (DOM harness, 218 assertions)
 
-- ✅ **Integration phase 1 — nzbd's side of the monarr pipeline** (N1–N7 of [docs/INTEGRATION_PLAN.md](docs/INTEGRATION_PLAN.md); master plan lives in the monarr repo). The seam between nzbd and its consumer was a 30 s timer plus an inference: an *arr polled history and guessed from rows. Everything here is additive and the compat surface is untouched (golden tests pass unmodified) — current consumers keep working against every intermediate state.
+- ✅ **Integration phase 1 — nzbd's side of the monarr pipeline** (N1–N7 of [docs/archive/INTEGRATION_PLAN.md](docs/archive/INTEGRATION_PLAN.md); master plan lives in the monarr repo). The seam between nzbd and its consumer was a 30 s timer plus an inference: an *arr polled history and guessed from rows. Everything here is additive and the compat surface is untouched (golden tests pass unmodified) — current consumers keep working against every intermediate state.
   - ✅ **N1 post-processing events** — `job_finished` fires at *download* completion, so verify/repair/unpack/move/scripts were log lines only and no event ever carried a path. `job_pp_stage` marks each transition; `job_pp_finished` carries `final_dir`, `pp_status`, the job's params and a `history_seq` cursor, published through the new `EngineHandle::emit` onto the engine's own broadcast (a second bus would mean a second ordering). **The ordering is normative**: the event is emitted only after `HistoryDb::record` returns, so a consumer can react and immediately read `?since_seq=<history_seq-1>` with no race and no retry loop. The terminal paths that never reach PP — health gate, failed fetch — emit it too with their existing `FAILURE/*` strings, because an event that *usually* fires teaches consumers to add a timeout instead of trusting it
   - ✅ **N2 SSE resume** — engine frames carry `id: <seq>` (also `"seq"` in the body), stamped by one pump task so every consumer sees the same numbers in the same order; the last 1024 are replayed on `Last-Event-ID`, and a gap the ring cannot cover — or an id from a previous process, since `seq` resets on restart — answers `event: reset` rather than a stream that looks contiguous and is not. `tick`/`hb`/`log` stay unnumbered: stream-local views, not engine facts
   - ✅ **N3 history cursor** — `seq` on history entries (the local rowid) and `?since_seq=N` returning newer rows ascending, hidden included (hidden means *another* client imported it, not that it never happened). Kept out of the portable JSONL, which is re-imported into indices that assign their own rowids. `?limit=` is byte-identical to before
@@ -1020,7 +1133,7 @@ unrun in this pass.
 
 - ✅ The settings editor could delete a password and report success (field report 2026-07-26, minutes after the durability fix landed: "suddenly having issues connecting to my newsgroup server even though my newsgroup account is still fine" → "it imported the config file but lost my password"). Secrets are plaintext in `nzbd.toml`; the editor masks them to `***unchanged***` for display and `merge_masked_secrets()` swaps the real ones back on save. Two silent holes. **(1)** An unresolvable mask — renamed server, newly added server, a running config that never held that secret — was written through as `None`: the password was *deleted*, the save returned **200**, and nothing said a word. Masks that cannot be resolved are now left in place, the merge returns the list of them (`#[must_use]`), and `PUT /api/v1/config` answers 422 naming the exact field to retype; the strict validator is a second net behind it. **(2)** Nothing on the boot path rejected a config that still contained the mask, so a file restored from a copy taken out of the editor left the daemon authenticating with the literal string `***unchanged***` against a perfectly healthy account — the symptom pointing at the provider, the cause three days earlier in a text editor. `Config::validate()` now refuses any masked secret and names both the field and where such a file comes from; `Config::parse_toml_unvalidated()` is the single seam that skips validation, for the editor's merge path only. And the trap that produced the bad file is gone at the source: the editor's **Download** used to hand back the masked text named `nzbd.toml` — the exact filename you drop into `/etc/nzbd` — and now names it `nzbd-masked.toml` behind a "NOT A USABLE CONFIG" header, with an inline warning in the editor itself. This mattered more than it looked: the mirror shipped hours earlier would have replicated a password-less config onto the data volume and restored it on every boot. Tests: masked-config-refused-at-boot (per field, with a near-miss string that must still parse), unresolvable-mask-reported-not-blanked (index fallback still works; the second server is reported, left masked, and fails validation), the masked round trip re-pinned through the unvalidated seam, a daemon e2e that PUTs an unresolvable mask and demands 422 + the real secret still on disk (verified to return `{"ok":true}` against the old merge), and DOM harness 272→278 on the download naming/header. ARCHITECTURE §11 + CONFIGURATION.md updated
 
-  - ✅ **History forget is durable everywhere (2026-08-05)** — [the confirmed delete-resurrection defect](docs/DEFECT_HISTORY_DELETE.md) is closed with portable JSONL tombstones. `HistoryDb::delete` appends one mutation per `(job, completed_at)` before removing the derived SQLite row; every upgraded node projects those mutations into `history_tombstones`, and inserts refuse a covered key. File order cannot act as a cluster clock, so the tombstone is monotone and compaction keeps it even after the obsolete entry line disappears. The UI no longer brings a forgotten row back on refresh, `?since_seq=` never publishes it under a fresh cursor, and delete → Undo/requeue leaves no lying `DELETED` record. Tests cover three replay cycles, hidden re-appends, lexically later peer files, fresh-index convergence, compaction, the native API requeue flow, and the unchanged NZBGet golden surface
+  - ✅ **History forget is durable everywhere (2026-08-05)** — [the confirmed delete-resurrection defect](docs/archive/DEFECT_HISTORY_DELETE.md) is closed with portable JSONL tombstones. `HistoryDb::delete` appends one mutation per `(job, completed_at)` before removing the derived SQLite row; every upgraded node projects those mutations into `history_tombstones`, and inserts refuse a covered key. File order cannot act as a cluster clock, so the tombstone is monotone and compaction keeps it even after the obsolete entry line disappears. The UI no longer brings a forgotten row back on refresh, `?since_seq=` never publishes it under a fresh cursor, and delete → Undo/requeue leaves no lying `DELETED` record. Tests cover three replay cycles, hidden re-appends, lexically later peer files, fresh-index convergence, compaction, the native API requeue flow, and the unchanged NZBGet golden surface
   - ⬜ Next: monarr phase 2 (native client + push subscription) consumes all of this; nothing here waits on it
 
 - ✅ A client chip is a glance, not a User-Agent dump (field report 2026-07-27, screenshot: one chip in the API-clients strip ran the full width of the page). The strip renders whatever `User-Agent` each client sent, and an open browser tab sends ~130 characters of Mozilla-compatibility archaeology — so the browser's own chip dwarfed and pushed down the two chips that answer the question the strip exists for (*is the \*arr connected?*). `clientLabel()` now collapses a browser agent to browser + major version + platform (`Chrome 150 (macOS)`), matching most-specific-first so Edge and Opera are not read as Chrome and Chrome's own `Safari/` token is not read as Safari; a product token (`Monarr/0.7.0`, `Sonarr/4.0.0.748`) is already the short name and is passed through untouched, capped only against an absurd one. The raw agent is not lost — it moved to the first line of the tooltip, where length costs nothing — and the chip's reconciler **key stays the raw agent**, because two browsers can collapse to the same label and a duplicate key would merge two clients into one row. Chip CSS tightened (11 px, 2×9 padding, 6 px gap) with a `max-width` + ellipsis belt so no future agent can stretch the strip past the table above it; the empty-state chip is a chip again, its sentence of explanation moved to its own tooltip. Tests: DOM harness 272→303 — Chrome/Firefox/Edge/Safari-on-iOS labels, the unrecognised-Mozilla fallback, product tokens and the absurd-token cap, missing agent, the chip text/tooltip split, quiet vs live, and two same-label browsers still reconciling to two chips
@@ -1031,14 +1144,14 @@ unrun in this pass.
 
 - ✅ The requestor placeholder stopped eating its own tail, and one directory means one job (field report 2026-07-29, screenshot: **sixteen queued jobs, every one of them titled `monarr/0.11.0 · drunkenslug · monarr/0`** — "it's not getting the names correctly"). Went and looked, and the daemon's own log had both renames three seconds apart. **(1) `requestor_name` took its discriminator from `job.name` — the field the rename it feeds then overwrites.** It runs twice for a URL job, once at admission and once when the fetch completes, and the second call read the first's output: the first eight characters of `monarr/0.11.0 · drunkenslug · e44dbc35` are `monarr/0`. That is a fixed point, and the *same* fixed point for every job from one client and one indexer. The ident now comes from `original_name` — what the client called it, which nothing overwrites — and falls back to `#<job id>` when that is missing or merely repeats a part already in the name. **(2) A provisional name masked the NZB.** `complete_url_fetch` re-ran the evidence pass with the *current* name as the hint, and a provisional name reads as perfectly informative — that is its whole design — so `name_from_evidence` handed it straight back and the par2 set sitting right there in the NZB was never consulted. Sixteen jobs whose recovery sets named them exactly (`72.Hours.2026.2160p.NF.WEB-DL…`, `The.Death.of.Robin.Hood.2026…`) were titled after their requestor instead. A provisional name now offers **no** hint at all: ask the NZB alone, and if it has nothing, keep the placeholder. **(3) The consequence, which was the real damage: `rename_job(storage_too)` writes `dir_name` from the name, so sixteen jobs shared one download directory** — `/working/monarr/completed/monarr_0.11.0 · drunkenslug · monarr_0/` — two releases interleaved in a folder, post-processing verifying and moving them as though they were one. A name can never be relied on to be unique (a placeholder is built from client + indexer, identical across every add; and a duplicate add is legitimate anyway), so uniqueness is no longer left to luck: `QueueState::unique_dir_name` appends the job id on collision, admission and every rename go through it, and the owner loop renames via `set_job_name` rather than the free function. **(4) The queue already in this state repairs itself on boot** rather than needing fifteen deletes by hand: a job with an open name is told what it is by its own stored file list (`name_from_files` — the same evidence pass, asked of `FileEntry` names instead of a parsed NZB), and a shared directory is split — but only for a job that has written nothing, because moving the folder of one with bytes in it orphans them. Tests: 7 new — the placeholder is stable under repetition (three passes), two jobs from one requestor stay distinct, a provisional name no longer masks the NZB, a fetch with no evidence still keeps its placeholder, two jobs never share a directory (duplicate add *and* colliding rename), boot repairs names and splits directories while leaving a part-written job's folder alone, and `name_from_files` agrees with the NZB pass. Suite 326→333
 
-- 🔶 **The re-grab loop (field report 2026-07-31: ~1 TB of duplicates — "5 copies of true lies?")** — diagnosed live on nuc3, four defects feeding one loop. **(1)** repair asks for delayed par blocks it can never receive: `unpause_par_blocks` prices vols via `vol_par_blocks`'s `.volXX+NN.` filename parse, which obfuscated posts don't carry, so `freed==0` → silent "nothing left to fetch" → every job with ≥1 failed article (of ~116k) dies PAR_FAILURE with 4–5 GB of recovery data paused beside it — repair has NEVER succeeded on nuc3. **(2)** terminal failures leave their full dirs in the category tree: ~523 GB of corpses in the last 100 history rows alone. **(3)** dozens of observed ENOSPC (writer/finalize/PP) never flip the disk-low guard — statvfs said fine, intake ran at wire speed into a full volume, 725 GB burned in one day. **(4)** monarr half-imports successful season packs on the same full disk, surfaces nothing, cleans up nothing, re-grabs (five True Lies in 10 h; the same NZB twice in 6 min). Handoff plan with evidence, guardrails, milestones (nzbd F1–F3 · monarr M1–M4 · nuc3 runbook R1–R7): **[docs/REGRAB_LOOP_PLAN.md](docs/REGRAB_LOOP_PLAN.md)**. No code changed in this commit — the plan is the handoff. Also verified healthy while in there: the `2453665` dir-uniquifier live, monarr 0.13.0 params + pickup on 100/100 rows (the rename-breaks-matching hypothesis is dead).
+- 🔶 **The re-grab loop (field report 2026-07-31: ~1 TB of duplicates — "5 copies of true lies?")** — diagnosed live on nuc3, four defects feeding one loop. **(1)** repair asks for delayed par blocks it can never receive: `unpause_par_blocks` prices vols via `vol_par_blocks`'s `.volXX+NN.` filename parse, which obfuscated posts don't carry, so `freed==0` → silent "nothing left to fetch" → every job with ≥1 failed article (of ~116k) dies PAR_FAILURE with 4–5 GB of recovery data paused beside it — repair has NEVER succeeded on nuc3. **(2)** terminal failures leave their full dirs in the category tree: ~523 GB of corpses in the last 100 history rows alone. **(3)** dozens of observed ENOSPC (writer/finalize/PP) never flip the disk-low guard — statvfs said fine, intake ran at wire speed into a full volume, 725 GB burned in one day. **(4)** monarr half-imports successful season packs on the same full disk, surfaces nothing, cleans up nothing, re-grabs (five True Lies in 10 h; the same NZB twice in 6 min). Handoff plan with evidence, guardrails, milestones (nzbd F1–F3 · monarr M1–M4 · nuc3 runbook R1–R7): **[docs/archive/REGRAB_LOOP_PLAN.md](docs/archive/REGRAB_LOOP_PLAN.md)**. No code changed in this commit — the plan is the handoff. Also verified healthy while in there: the `2453665` dir-uniquifier live, monarr 0.13.0 params + pickup on 100/100 rows (the rename-breaks-matching hypothesis is dead).
 
 ## Operator checklist 👤
 
 - ✅ Push `main` (done — CI ran; `badges` branch is CI-owned, never push it: `git branch -D badges && git fetch --prune`)
 - ✅ Enable hooks on your clone (done — your pre-push ran the suite)
-- ⬜ **Redeploy nuc3** on a current image. The missing `./config:/etc/nzbd` bind is no longer load-bearing — this build keeps a durable copy of the config on `/data` and restores it on boot, so the wizard cannot eat the install again — but add the mount anyway and the warning banner goes away: `mkdir config && docker cp nzbd:/etc/nzbd/nzbd.toml ./config/ && chown 1000 config/nzbd.toml`, add the volume line, `docker compose up -d --build`. Deployed 2026-07-29 18:49 UTC as `0.2.0+unknown`: the running code is current through `2453665`, but the deploy drops the build arg and the deploy checkout is stale (`make docker-build` "missing" there = pre-`30e811b` Makefile) — pull + rebuild per [REGRAB_LOOP_PLAN.md](docs/REGRAB_LOOP_PLAN.md) §8 R5 until the footer stops saying `+unknown`
-- ⬜ **Drain the re-grab loop** (before any redeploy): pause the queue, reclaim ~530 GB of confirmed-failure corpses (exact `rm` list in [REGRAB_LOOP_PLAN.md](docs/REGRAB_LOOP_PLAN.md) §8 R2 — do NOT touch the EPSiLON S04 / Bates S01 dirs), answer the `df`/gluster-quota question (§9 Q1), then have monarr re-import the two half-landed packs
+- ⬜ **Redeploy nuc3** on a current image. The missing `./config:/etc/nzbd` bind is no longer load-bearing — this build keeps a durable copy of the config on `/data` and restores it on boot, so the wizard cannot eat the install again — but add the mount anyway and the warning banner goes away: `mkdir config && docker cp nzbd:/etc/nzbd/nzbd.toml ./config/ && chown 1000 config/nzbd.toml`, add the volume line, `docker compose up -d --build`. Deployed 2026-07-29 18:49 UTC as `0.2.0+unknown`: the running code is current through `2453665`, but the deploy drops the build arg and the deploy checkout is stale (`make docker-build` "missing" there = pre-`30e811b` Makefile) — pull + rebuild per [REGRAB_LOOP_PLAN.md](docs/archive/REGRAB_LOOP_PLAN.md) §8 R5 until the footer stops saying `+unknown`
+- ⬜ **Drain the re-grab loop** (before any redeploy): pause the queue, reclaim ~530 GB of confirmed-failure corpses (exact `rm` list in [REGRAB_LOOP_PLAN.md](docs/archive/REGRAB_LOOP_PLAN.md) §8 R2 — do NOT touch the EPSiLON S04 / Bates S01 dirs), answer the `df`/gluster-quota question (§9 Q1), then have monarr re-import the two half-landed packs
 - ⬜ Optional stopgap until F2 ships: `[post] health_action = "delete"` so health-gated failures stop leaving partials
 - ⬜ Optional: `brew install par2 p7zip` for full local test coverage (without them the tool-backed tests self-skip; CI always runs them)
 - ⬜ Branch protection for `main`

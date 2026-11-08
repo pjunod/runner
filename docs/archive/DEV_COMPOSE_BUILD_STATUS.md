@@ -1,9 +1,11 @@
 # Dev Compose build status — local image ownership
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [DEPLOY.md](../DEPLOY.md).
+
 **Status:** reviewed, qualified, and merge approved · **Branch:**
 `codex/fix-dev-compose-build` · **Updated:** 2026-09-19
 
-Companion to [STATUS.md](../STATUS.md), which owns the project-wide ledger.
+Companion to [STATUS.md](../../STATUS.md), which owns the project-wide ledger.
 This page records the isolated fix for the dev Compose build failure reported on
 `nuc3`; it is not a general Docker operations guide.
 

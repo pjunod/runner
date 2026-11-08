@@ -220,7 +220,7 @@ pub struct PostSection {
     /// that name. It only ever governed the health gate, so a par failure
     /// left its whole directory in the category tree forever — which is
     /// how ~523 GB of known-bad downloads accumulated under an importer's
-    /// watch folder (docs/REGRAB_LOOP_PLAN.md D2). The default is
+    /// watch folder (docs/archive/REGRAB_LOOP_PLAN.md D2). The default is
     /// `delete`: the bytes are known-bad and the job's NZB is parked with
     /// its history entry, so `requeue` gets them back.
     #[serde(alias = "health_action")]

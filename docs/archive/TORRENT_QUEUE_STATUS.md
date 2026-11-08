@@ -1,12 +1,14 @@
 # Torrent queue — implementation and merge status
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [BITTORRENT_PROPOSAL.md](../BITTORRENT_PROPOSAL.md).
+
 **Status:** adversarial review approved; local UI/format checks passed.
 Required CI and merge status: [PR #232](https://github.com/pjunod/nzbd/pull/232).
 **Updated:** 2026-09-20 · **Branch:** `codex/torrent-queue-lifecycle`.
 **PR:** [#232](https://github.com/pjunod/nzbd/pull/232) (combined candidate).
 
-Companion to [USAGE.md](USAGE.md) (operator behavior) and
-[CONFIGURATION.md](CONFIGURATION.md) (seeding defaults). This page records
+Companion to [USAGE.md](../USAGE.md) (operator behavior) and
+[CONFIGURATION.md](../CONFIGURATION.md) (seeding defaults). This page records
 progress, decisions, review findings, and final validation for the queue work.
 
 ## Delivery progress

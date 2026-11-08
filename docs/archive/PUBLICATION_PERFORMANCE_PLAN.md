@@ -1,5 +1,7 @@
 # Publication performance — root cause and proposed fix
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [INTEGRATION.md](../INTEGRATION.md) §Publication (per-file, journaled, one hash pass).
+
 **Status:** implementation merged in [PR #270](https://github.com/pjunod/runner/pull/270);
 Astra findings addressed and required CI green. Remaining baseline qualification
 and rollout are tracked in [integration recovery](INTEGRATION_RECOVERY_STATUS.md).
@@ -7,7 +9,7 @@ and rollout are tracked in [integration recovery](INTEGRATION_RECOVERY_STATUS.md
 `codex/runner-publication-performance`
 
 Companion to [the file lifecycle contract](FILE_LIFECYCLE_PLAN.md) and
-[storage configuration](CONFIGURATION.md): this document explains the observed
+[storage configuration](../CONFIGURATION.md): this document explains the observed
 slowdown, separates necessary integrity checks from redundant work, and defines
 the correction and its qualification gates. Implement the milestones in order.
 Preserve existing custody, collision, crash-recovery, and completion guarantees;
@@ -74,18 +76,18 @@ payload. The primitive repeats content verification already owned by the
 restoration journal. An ordinary successful first attempt therefore performs
 five full reads, before repair, extraction, or completed publication.
 
-Owners: [PAR matching](../crates/nzbd-post/src/rename.rs),
-[`restore_file`](../crates/nzbd-state/src/artifacts/transforms.rs), and
-[`rename_exclusive`](../crates/nzbd-state/src/artifacts/fs.rs).
+Owners: [PAR matching](../../crates/nzbd-post/src/rename.rs),
+[`restore_file`](../../crates/nzbd-state/src/artifacts/transforms.rs), and
+[`rename_exclusive`](../../crates/nzbd-state/src/artifacts/fs.rs).
 
 ### 1.3 Copy and publication independently rescan the same payload
 
-[`populate_relocation_scratch`](../crates/nzbd-state/src/artifacts/relocation.rs)
+[`populate_relocation_scratch`](../../crates/nzbd-state/src/artifacts/relocation.rs)
 copies each file in 64 KiB chunks, flushes it, rereads the source to hash it,
 and rereads the copy to compare hashes. Renaming the verified temporary file
 can then take the three-scan regular-file fallback from §1.2.
 
-[`publish_directory_unlocked_checked`](../crates/nzbd-state/src/artifacts/publication.rs)
+[`publish_directory_unlocked_checked`](../../crates/nzbd-state/src/artifacts/publication.rs)
 then independently hashes each regular file while capturing its manifest,
 checking it before rename, checking it for the link fallback, checking before
 and after linking, and verifying the final directory. That is six directory
@@ -97,7 +99,7 @@ physical reads. Replays, native rename support, and cache residency differ.
 
 ### 1.4 Two cleanup schedulers disagree about blocked work
 
-[`retire_delivery_source`](../crates/nzbd-state/src/artifacts/relocation.rs)
+[`retire_delivery_source`](../../crates/nzbd-state/src/artifacts/relocation.rs)
 records blocked cleanup and exponential delays for transient errors. The
 relocation reconciler separately selects succeeded moves with
 `cleanup_done=false`, in batches of 25, without respecting the Delivery's
@@ -107,7 +109,7 @@ later cleanup obligations.
 
 ### 1.5 The move occurs after the job snapshot used for history
 
-[`process_job_ctx_from_inner`](../crates/nzbd-post/src/manager.rs) closes the prior
+[`process_job_ctx_from_inner`](../../crates/nzbd-post/src/manager.rs) closes the prior
 stage timeline and exports `fin`. Selected publication then enters `Move` and
 does its work, but terminal history is built from that earlier `fin` snapshot.
 Later importing it can also overwrite the updated live timeline. The result is
@@ -156,9 +158,9 @@ pub fn copy_publish_checked(
 pub fn restore_file(&self, job: u32, from: &Path, to: &Path) -> Result<()>;
 ```
 
-Definitions live in [filesystem primitives](../crates/nzbd-state/src/artifacts/fs.rs),
-[file publication](../crates/nzbd-state/src/fileops.rs), and
-[transforms](../crates/nzbd-state/src/artifacts/transforms.rs).
+Definitions live in [filesystem primitives](../../crates/nzbd-state/src/artifacts/fs.rs),
+[file publication](../../crates/nzbd-state/src/fileops.rs), and
+[transforms](../../crates/nzbd-state/src/artifacts/transforms.rs).
 
 ### 3.1 Namespace operations prove object identity without independent scans
 
@@ -276,8 +278,8 @@ than claiming a source-once result.
 
 ### 3.3 Same-filesystem extraction should publish its existing inode
 
-[`commit_staging`](../crates/nzbd-post/src/manager.rs) calls
-[`copy_publish_checked`](../crates/nzbd-state/src/fileops.rs) even for extraction
+[`commit_staging`](../../crates/nzbd-post/src/manager.rs) calls
+[`copy_publish_checked`](../../crates/nzbd-state/src/fileops.rs) even for extraction
 output already staged on the job filesystem. Prefer an exclusive hard link or
 rename appropriate to the workspace's retention contract. Keep the source if
 its journal requires retention. This avoids a full second write of extracted
@@ -329,7 +331,7 @@ items followed by eligible work. Do not mark retained data as deleted to quiet
 warnings.
 
 Wire exact-generation re-evaluation into supported changes in
-[`set_keep_on_failure`, `set_failure_assessment`, and `release_review`](../crates/nzbd-state/src/artifacts/mod.rs),
+[`set_keep_on_failure`, `set_failure_assessment`, and `release_review`](../../crates/nzbd-state/src/artifacts/mod.rs),
 plus explicit cleanup retry/rescan. Preserve Keep-off's existing distinction
 between ordinary blocked work and review/identity conflicts: a policy change
 cannot clear a review requirement or create new deletion authority. A new
@@ -427,7 +429,7 @@ whether the run is warm or cold. Never drop host caches or load-test live
 payloads to improve a benchmark result.
 
 Deployment follows passing tests and required CI, through the existing media
-Ansible workflow described in [deployment](DEPLOY.md), scoped to Runner on
+Ansible workflow described in [deployment](../DEPLOY.md), scoped to Runner on
 nuc3. Preserve the previous image/source revision and active work before
 restart. Stamp and verify the build identity; `+unknown` cannot establish
 which binary was qualified. Check the current playbook's variables rather
@@ -450,12 +452,12 @@ nuc3's wall-clock slowdown.
 
 | Priority / path | Finding | Disposition and validation |
 |---|---|---|
-| P1 · [extraction commit](../crates/nzbd-post/src/manager.rs) | `commit_staging` always uses the three-read copy helper, adding an unnecessary complete write when workspace and payload are on the same filesystem. | Included in §3.3. Count physical copy calls and payload reads; retain collision/replay and cross-device tests. |
-| P1 · [PAR output publication](../crates/nzbd-post/src/repair_workspace.rs) | Its per-chunk copy checkpoint calls `fingerprint::stamp`, which reopens/stats the full output path. Three 64 KiB passes over 89 GB trigger about 4.1 million complete path walks, with path depth multiplying descriptor opens. | Include in the shared copy-boundary correction: cancellation/authority checks per chunk, descriptor checks around the operation, anchored path revalidation before publication. Test metadata work stays bounded per file, including source replacement/mutation. |
-| P1 · [writer finalization](../crates/nzbd-engine/src/writer.rs) and [range validation](../crates/nzbd-engine/src/recovery.rs) | Async finalization calls blocking full-file CRC validation directly on a Tokio worker. `SealPartial` similarly scans ranges synchronously. | Separate scoped fix after the publication work: tracked blocking worker, cooperative cancellation, and join before custody release. A single-thread runtime regression must prove timers/controls progress during a gated scan. Keep CRC verification. |
-| P2 · [PAR preparation/publication](../crates/nzbd-post/src/repair_workspace.rs) | SHA copy verification is followed by additional MD5 reads; validated repaired output is copied and hashed again by the workspace journal. | Carry combined MD5/SHA evidence through the shared boundary where exact identity permits. Keep independent writable repair inputs: hard-linking them would let the PAR tool damage originals. Count preparation/publication bytes separately. |
-| P2 · [torrent acquisition](../crates/nzbd-state/src/artifacts/torrent.rs) | A fresh private copy is fully compared to the donor before rename and again afterward, excluding independent torrent piece verification. | Separate follow-up using the reviewed copy proof. Preserve seed isolation and full replay verification; assert one fresh final readback. |
-| P2 · [writer extent admission](../crates/nzbd-engine/src/writer.rs) | Each segment scans the accumulated range vector twice. At 20,000 unique segments this is roughly 400 million comparisons; out-of-order large direct media is especially exposed. | Separate follow-up: segment-number lookup plus ordered extent index. Compare against the current acceptance rules with randomized order/overlap tests and work counters. |
+| P1 · [extraction commit](../../crates/nzbd-post/src/manager.rs) | `commit_staging` always uses the three-read copy helper, adding an unnecessary complete write when workspace and payload are on the same filesystem. | Included in §3.3. Count physical copy calls and payload reads; retain collision/replay and cross-device tests. |
+| P1 · [PAR output publication](../../crates/nzbd-post/src/repair_workspace.rs) | Its per-chunk copy checkpoint calls `fingerprint::stamp`, which reopens/stats the full output path. Three 64 KiB passes over 89 GB trigger about 4.1 million complete path walks, with path depth multiplying descriptor opens. | Include in the shared copy-boundary correction: cancellation/authority checks per chunk, descriptor checks around the operation, anchored path revalidation before publication. Test metadata work stays bounded per file, including source replacement/mutation. |
+| P1 · [writer finalization](../../crates/nzbd-engine/src/writer.rs) and [range validation](../../crates/nzbd-engine/src/recovery.rs) | Async finalization calls blocking full-file CRC validation directly on a Tokio worker. `SealPartial` similarly scans ranges synchronously. | Separate scoped fix after the publication work: tracked blocking worker, cooperative cancellation, and join before custody release. A single-thread runtime regression must prove timers/controls progress during a gated scan. Keep CRC verification. |
+| P2 · [PAR preparation/publication](../../crates/nzbd-post/src/repair_workspace.rs) | SHA copy verification is followed by additional MD5 reads; validated repaired output is copied and hashed again by the workspace journal. | Carry combined MD5/SHA evidence through the shared boundary where exact identity permits. Keep independent writable repair inputs: hard-linking them would let the PAR tool damage originals. Count preparation/publication bytes separately. |
+| P2 · [torrent acquisition](../../crates/nzbd-state/src/artifacts/torrent.rs) | A fresh private copy is fully compared to the donor before rename and again afterward, excluding independent torrent piece verification. | Separate follow-up using the reviewed copy proof. Preserve seed isolation and full replay verification; assert one fresh final readback. |
+| P2 · [writer extent admission](../../crates/nzbd-engine/src/writer.rs) | Each segment scans the accumulated range vector twice. At 20,000 unique segments this is roughly 400 million comparisons; out-of-order large direct media is especially exposed. | Separate follow-up: segment-number lookup plus ordered extent index. Compare against the current acceptance rules with randomized order/overlap tests and work counters. |
 
 The audit also identified per-segment `sync_data` as expensive but necessary
 for the present durable-acknowledgement contract. Do not remove it. A later

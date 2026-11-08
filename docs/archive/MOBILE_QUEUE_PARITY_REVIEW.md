@@ -1,11 +1,13 @@
 # Mobile queue parity — review of the port plan
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [MOBILE_QUEUE_PARITY_PLAN.md](../MOBILE_QUEUE_PARITY_PLAN.md).
+
 **Status:** approved with four required changes · **Reviews:**
-[MOBILE_QUEUE_PARITY_PLAN.md](MOBILE_QUEUE_PARITY_PLAN.md) · **Written:**
+[MOBILE_QUEUE_PARITY_PLAN.md](../MOBILE_QUEUE_PARITY_PLAN.md) · **Written:**
 2026-09-27 · **Verified against:** `origin/main` at
 `5b683d6a1f29101f13b7c8f853e6346693963d22`
 
-Companion to [MOBILE_QUEUE_PARITY_PLAN.md](MOBILE_QUEUE_PARITY_PLAN.md) (the
+Companion to [MOBILE_QUEUE_PARITY_PLAN.md](../MOBILE_QUEUE_PARITY_PLAN.md) (the
 plan) — this is *what the reviewer checked, what was wrong, and what is now
 decided*. Every claim below was read out of the source at `5b683d6`, not
 inferred from the plan; file and line references are to that commit.

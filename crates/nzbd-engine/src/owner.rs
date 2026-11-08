@@ -580,15 +580,6 @@ pub(crate) enum QueueCommand {
         generation: String,
         reply: oneshot::Sender<Result<nzbd_state::artifacts::Artifact, String>>,
     },
-    SchedulePostRetry {
-        job: JobId,
-        revision: String,
-        retry_attempt: u8,
-        next_retry: i64,
-        blocked_since: i64,
-        message: String,
-        reply: oneshot::Sender<bool>,
-    },
     BeginResourceProbe {
         job: JobId,
         revision: String,
@@ -894,6 +885,9 @@ pub(crate) enum EngineMsg {
         job: JobId,
         file: FileId,
         error: String,
+        /// The hold the writer's `io::Error` named by errno
+        /// ([`crate::io_error_hold_cause`]); `None` is a terminal `failed/io`.
+        cause: Option<nzbd_types::HoldCause>,
     },
     /// A real write ran out of space (ENOSPC/EDQUOT). Reported from
     /// wherever it happened — writer, finalize, post-processing — and
@@ -1377,6 +1371,7 @@ impl Owner {
                 if j.held() {
                     j.status = JobStatus::Paused;
                 }
+                drop_retired_params(j);
             }
             state.recompute_all_totals();
             // Holds re-derive their recovery from their cause on every load
@@ -2020,13 +2015,18 @@ impl Owner {
                 combined_crc,
             } => self.on_writer_finalized(job, file, ok, final_path, combined_crc),
             EngineMsg::OutOfSpace { whence } => self.observe_out_of_space(&whence),
-            EngineMsg::WriterError { job, file, error } => {
+            EngineMsg::WriterError {
+                job,
+                file,
+                error,
+                cause,
+            } => {
                 tracing::warn!(job = job.0, file = file.0, %error, "writer error; failing file");
                 // The errno decides whether retrying can help: a full disk
                 // waits for space, a dropped mount retries on its own, and
-                // anything else (a digest or size mismatch) waits for a
-                // person rather than re-checking a whole file forever.
-                if crate::is_out_of_space(&error) {
+                // anything else (a digest or size mismatch) is the job's
+                // terminal failure rather than a re-check forever.
+                if crate::out_of_space(cause.as_ref()) {
                     self.observe_out_of_space(&error);
                 }
                 let stage = if error.starts_with("finalize") {
@@ -2034,7 +2034,7 @@ impl Owner {
                 } else {
                     "download_write"
                 };
-                match crate::io_hold_cause(&error) {
+                match cause {
                     Some(cause) => {
                         self.hold_job(job, cause, stage, &error);
                     }
@@ -2498,70 +2498,6 @@ impl Owner {
                     } else {
                         owner.publish_now();
                         owner.bump_epoch();
-                    }
-                    let _ = reply.send(ok);
-                });
-            }
-            QueueCommand::SchedulePostRetry {
-                job,
-                revision,
-                retry_attempt,
-                next_retry,
-                blocked_since,
-                message,
-                reply,
-            } => {
-                let before = self.state.job(job).cloned();
-                let mut changed = false;
-                if !self.persistence_fenced {
-                    if let Some(row) = self.state.job_mut(job) {
-                        if row.lifecycle_eligible() {
-                            if let Some(mut control) = row.control().filter(|control| {
-                                control.revision == revision
-                                    && control.lifecycle == "held"
-                                    && !control.manual_pause
-                                    && retry_attempt == control.retry_attempt.saturating_add(1)
-                                    && next_retry >= control.next_retry_at_unix.unwrap_or(0)
-                            }) {
-                                if let Some(next_revision) = control
-                                    .revision
-                                    .parse::<u64>()
-                                    .ok()
-                                    .and_then(|value| value.checked_add(1))
-                                {
-                                    control.revision = next_revision.to_string();
-                                    control.retry_attempt = retry_attempt;
-                                    control.next_retry_at_unix = Some(next_retry);
-                                    control.blocked_since_unix = Some(
-                                        control
-                                            .blocked_since_unix
-                                            .unwrap_or(blocked_since)
-                                            .min(blocked_since),
-                                    );
-                                    control.retry_policy = "scheduled_retry".into();
-                                    control.message = message.chars().take(2048).collect();
-                                    row.set_control(&control);
-                                    changed = true;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if !changed {
-                    let _ = reply.send(false);
-                    return;
-                }
-                self.pending_control_commits.insert(job);
-                self.commit_control_change_then(job, before.clone(), move |owner, ok| {
-                    owner.pending_control_commits.remove(&job);
-                    if ok {
-                        owner.publish_now();
-                        owner.bump_epoch();
-                    } else if let Some(before) = before {
-                        if let Some(current) = owner.state.job_mut(job) {
-                            *current = before;
-                        }
                     }
                     let _ = reply.send(ok);
                 });
@@ -5509,7 +5445,7 @@ impl Owner {
                 if let Err(error) = result {
                     owner.hold_job(
                         job,
-                        allocation_hold_cause(&error.to_string()),
+                        allocation_hold_cause(&error),
                         "download_write",
                         &format!("payload allocation: {error}"),
                     );
@@ -6155,12 +6091,7 @@ impl Owner {
                     continue;
                 }
                 let message = format!("payload allocation: {e}");
-                self.hold_job(
-                    r.job,
-                    allocation_hold_cause(&message),
-                    "download_write",
-                    &message,
-                );
+                self.hold_job(r.job, allocation_hold_cause(&e), "download_write", &message);
                 continue;
             }
             let writer = self.writer_for(r.job, r.file);
@@ -6437,12 +6368,17 @@ impl Owner {
                     }
                 });
             }
-            WriterFact::Error { error } => {
+            WriterFact::Error { error, cause } => {
                 if let Some(writer) = self.writers.remove(&file) {
                     self.retire_writer_handle(job, writer);
                 }
                 self.writer_epochs.remove(&file);
-                self.on_msg(EngineMsg::WriterError { job, file, error });
+                self.on_msg(EngineMsg::WriterError {
+                    job,
+                    file,
+                    error,
+                    cause,
+                });
             }
             WriterFact::Rejected {
                 seg_number,
@@ -7074,11 +7010,6 @@ impl Owner {
     /// Push an automatic hold's next attempt out on the same backoff, keeping
     /// the original reason and recording the refusal beside it. The new time
     /// lives in memory even if this save fails; the next snapshot carries it.
-    #[cfg(test)]
-    fn reschedule_hold(&mut self, job: JobId, revision: &str, reason: &str) -> bool {
-        self.reschedule_hold_proven(job, revision, reason, &Default::default())
-    }
-
     fn reschedule_hold_proven(
         &mut self,
         job: JobId,
@@ -8025,7 +7956,7 @@ impl Owner {
                     Err(error) => {
                         owner.hold_job(
                             job,
-                            allocation_hold_cause(&error.to_string()),
+                            allocation_hold_cause(&error),
                             "download_write",
                             &error.to_string(),
                         );
@@ -10271,7 +10202,13 @@ pub(crate) fn rearmed_hold(
     // A pre-v2 `io` hold whose message names an unavailable volume was
     // environmental all along; keep it a hold. Every other legacy terminal
     // cause is left for the boot conversion (`convert_legacy_holds`).
-    if control.cause == "io" && crate::is_storage_unavailable(&control.message) {
+    // The pre-v2 message is rendered text with no errno attached; the
+    // stderr rule reads its `(os error N)` suffix (removed with the legacy
+    // causes in M6b).
+    if control.cause == "io"
+        && crate::stderr_hold_cause(&control.message)
+            == Some(nzbd_types::HoldCause::StorageUnavailable)
+    {
         cause = nzbd_types::HoldCause::StorageUnavailable;
     }
     // A pre-v2 unverified-coverage hold is a re-verification, not a
@@ -10320,12 +10257,31 @@ pub(crate) fn rearmed_hold(
 
 /// An allocation that failed because the volume stopped answering retries on
 /// its own; any other allocation refusal waits for space or a person.
-fn allocation_hold_cause(message: &str) -> nzbd_types::HoldCause {
-    if crate::is_storage_unavailable(message) {
+fn allocation_hold_cause(error: &(dyn std::error::Error + 'static)) -> nzbd_types::HoldCause {
+    if crate::error_hold_cause(error) == Some(nzbd_types::HoldCause::StorageUnavailable) {
         nzbd_types::HoldCause::StorageUnavailable
     } else {
         nzbd_types::HoldCause::Allocation
     }
+}
+
+/// Params earlier builds persisted for a clock this build no longer runs.
+/// The failed-source cleanup retry (`*PP:failed-cleanup-*`) lives on the
+/// disposal `Operation.next_retry` since M6; a row an older build wrote
+/// still carries these, so they are dropped when the queue loads and are
+/// never written or read again.
+pub(crate) const RETIRED_PARAMS: [&str; 3] = [
+    "*PP:failed-cleanup-next-retry",
+    "*PP:failed-cleanup-blocked-since",
+    "*PP:failed-cleanup-last-error",
+];
+
+/// Drop [`RETIRED_PARAMS`] from a loaded row; true when any was present.
+pub(crate) fn drop_retired_params(job: &mut Job) -> bool {
+    let before = job.params.len();
+    job.params
+        .retain(|(key, _)| !RETIRED_PARAMS.contains(&key.as_str()));
+    job.params.len() != before
 }
 
 /// Apply [`rearmed_hold`] to every held job; returns how many changed.

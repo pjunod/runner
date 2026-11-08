@@ -1,5 +1,7 @@
 # Superseded investigation — historical evidence and proposals
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: the "Download incident recovery" entry in [STATUS.md](../../STATUS.md); current behaviour in [ARCHITECTURE.md](../ARCHITECTURE.md).
+
 **Not the current plan.** Read [the reconciled incident review](DOWNLOAD_INCIDENT_REVIEW.md).
 This preserves earlier reasoning, including rejected diagnoses and stale implementation status.
 
@@ -18,7 +20,7 @@ filesystem failures, and extraction are superseded by the review and the
 corrections below. In particular, an empty `InterDir` must not acquire a new
 `MainDir` fallback. The original extension-only archive guard was inadequate.
 
-Companion to [CONFIGURATION.md](CONFIGURATION.md). This document records the
+Companion to [CONFIGURATION.md](../CONFIGURATION.md). This document records the
 incident at `http://nuc3:6789/`, corrects earlier overstatements, and proposes
 work for review. Treat the working-tree patch as a candidate to challenge,
 not an approved fix. Review baseline source separately from the patch.
@@ -213,12 +215,12 @@ not been established. No raw source URLs or credentials are included here.
 
 ### 4.1 URL admission omits collision handling present in direct admission
 
-In baseline [owner.rs](../crates/nzbd-engine/src/owner.rs), `AddParsed`
+In baseline [owner.rs](../../crates/nzbd-engine/src/owner.rs), `AddParsed`
 chooses a fresh suffixed directory when the preferred path already exists.
 `CompleteUrlFetch` finalizes the name and queues the job without that step.
 Later `ensure_allocation` attempts `self.dest_dir.join(job_dir_name(job))`.
 
-[Inventory::allocate](../crates/nzbd-state/src/artifacts/mod.rs) rejects
+[Inventory::allocate](../../crates/nzbd-state/src/artifacts/mod.rs) rejects
 an existing filesystem entry with the exact logged error. The scheduler
 logs that error and breaks out of lease generation before setting the job
 to downloading. It leaves the visible job queued.
@@ -234,10 +236,10 @@ empty lease response and missing wake-up are hypotheses to test.
 
 ### 4.2 Usenet payload and completed destination are conflated
 
-Baseline [main.rs](../crates/nzbd/src/main.rs), lines 791–797 at the
+Baseline [main.rs](../../crates/nzbd/src/main.rs), lines 791–797 at the
 baseline commit, supplies `cfg.dest_dir()` as the single-node engine's
 payload root. Baseline `writer_for` joins that root with the job directory.
-[Config::state_dir](../crates/nzbd-config/src/lib.rs) separately derives
+[Config::state_dir](../../crates/nzbd-config/src/lib.rs) separately derives
 `<main_dir>/queue` when `queue_dir` is absent.
 
 **Assessment:** the local baseline explains both simultaneous observations:
@@ -257,16 +259,16 @@ receive retention/review state. History records failure and the actual
 remaining path. That chain is consistent with the history and staging
 directory evidence.
 
-[relocation.rs](../crates/nzbd-state/src/artifacts/relocation.rs) contains
+[relocation.rs](../../crates/nzbd-state/src/artifacts/relocation.rs) contains
 cross-device rename/copy, `std::io::copy`, file synchronization, and
 directory synchronization. Any diagnosis naming a specific failing syscall
 without further evidence is premature. Existing buffered-copy fixes in
-[recovery.rs](../crates/nzbd-state/src/artifacts/recovery.rs) concern a
+[recovery.rs](../../crates/nzbd-state/src/artifacts/recovery.rs) concern a
 separate path; do not assume they cover relocation or prove this failure.
 
 ### 4.4 Files UI is missing a bulk-selection control
 
-The screenshot and baseline [UI](../crates/nzbd-api/ui/index.html) show
+The screenshot and baseline [UI](../../crates/nzbd-api/ui/index.html) show
 individual file selection without select-all. Retention state also needs
 to explain the failure/hold reason without implying successful processing.
 These are usability defects distinct from payload placement.
@@ -562,7 +564,7 @@ source snapshot inode: 3735597
 source snapshot generation: 71b074a841a43f18650c881714191917
 ```
 
-In local [reconcile_relocations](../crates/nzbd-state/src/artifacts/relocation.rs),
+In local [reconcile_relocations](../../crates/nzbd-state/src/artifacts/relocation.rs),
 an unsuccessful reconciliation of a running/review move retrieves the
 current artifact and unconditionally sets its state to `retained`, sets
 `review: interrupted move`, and increments its revision. That error branch
@@ -676,11 +678,11 @@ observed old-artifact/new-allocation distinction.
 
 The correction is confined to:
 
-- [mod.rs](../crates/nzbd-state/src/artifacts/mod.rs): when deletion starts,
+- [mod.rs](../../crates/nzbd-state/src/artifacts/mod.rs): when deletion starts,
   atomically cancel outstanding relocations in the same transaction that
   transfers the artifact to deleting. At startup, reconcile committed
   deletion records before unfinished operations.
-- [relocation.rs](../crates/nzbd-state/src/artifacts/relocation.rs): both
+- [relocation.rs](../../crates/nzbd-state/src/artifacts/relocation.rs): both
   publication commit and failure/reconciliation paths require the operation
   to still own its source generation, location, identity, and live state.
   Obsolete operations become cancelled without mutating the artifact or
@@ -701,7 +703,7 @@ inconsistent state in the existing startup reconciliation sequence.
 ### 12.2 Verification and deployment status
 
 New tests in
-[relocation_failure_tests.rs](../crates/nzbd-state/src/artifacts/relocation_failure_tests.rs)
+[relocation_failure_tests.rs](../../crates/nzbd-state/src/artifacts/relocation_failure_tests.rs)
 cover deleted sources followed by replacement, legacy revived records,
 idempotent startup repair, valid publication whose source authority has
 ended, and pending deletion/undo. Existing successful interrupted-move and

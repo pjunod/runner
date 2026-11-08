@@ -77,6 +77,9 @@ pub(crate) enum WriterFact {
     },
     Error {
         error: String,
+        /// The hold the failing `io::Error` named by errno; `None` for a
+        /// refusal with no errno (an identity conflict, a bad range).
+        cause: Option<nzbd_types::HoldCause>,
     },
     Rejected {
         seg_number: u32,
@@ -87,7 +90,8 @@ pub(crate) enum WriterFact {
 
 const WRITER_QUEUE: usize = 8;
 
-/// Compatibility entry point for direct callers without durable scoped evidence.
+/// Test support: an unscoped writer that reports plain `EngineMsg` facts.
+/// Every production writer is scoped ([`spawn_writer_scoped`]).
 #[cfg(test)]
 pub fn spawn_writer(
     tracker: &TaskTracker,
@@ -215,15 +219,17 @@ impl Reporter {
                         combined_crc,
                     }
                 }
-                WriterFact::Error { error } => EngineMsg::WriterError {
+                WriterFact::Error { error, cause } => EngineMsg::WriterError {
                     job: self.job,
                     file: self.file,
                     error,
+                    cause,
                 },
                 WriterFact::Rejected { reason, .. } => EngineMsg::WriterError {
                     job: self.job,
                     file: self.file,
                     error: reason,
+                    cause: None,
                 },
             }
         };
@@ -245,11 +251,26 @@ impl Reporter {
             }
         }
     }
+    /// A refusal with no errno behind it: the job's terminal `failed/io`.
     async fn error(&self, error: impl ToString) {
         self.send(WriterFact::Error {
             error: error.to_string(),
+            cause: None,
         })
         .await;
+    }
+    /// A failed filesystem call: the errno along its error chain decides
+    /// the hold ([`crate::error_hold_cause`]).
+    async fn io_error(
+        &self,
+        context: &str,
+        error: &(dyn std::error::Error + Send + Sync + 'static),
+    ) {
+        let fact = WriterFact::Error {
+            error: format!("{context}: {error}"),
+            cause: crate::error_hold_cause(error),
+        };
+        self.send(fact).await;
     }
 }
 
@@ -333,7 +354,7 @@ impl PendingWrites {
             };
             if let Err(error) = result {
                 report
-                    .error(format!("write {}: {error}", part_path.display()))
+                    .io_error(&format!("write {}", part_path.display()), &error)
                     .await;
                 return false;
             }
@@ -345,7 +366,9 @@ impl PendingWrites {
         let identity = match file_identity(file).await {
             Ok(identity) => identity,
             Err(error) => {
-                report.error(error).await;
+                report
+                    .io_error(&format!("identity {}", part_path.display()), &error)
+                    .await;
                 return false;
             }
         };
@@ -402,9 +425,21 @@ async fn writer_task(
     let resolved = match recovery::resolve_payload(&dir, file_id, &final_name) {
         Ok(payload) => payload,
         Err(error) => {
-            report
-                .error(format!("write admission / payload resolution: {error:?}"))
-                .await;
+            match error {
+                recovery::ResolveError::Unavailable { message, cause } => {
+                    report
+                        .send(WriterFact::Error {
+                            error: format!("write admission / payload resolution: {message}"),
+                            cause,
+                        })
+                        .await;
+                }
+                recovery::ResolveError::IdentityConflict => {
+                    report
+                        .error("write admission / payload resolution: identity conflict")
+                        .await;
+                }
+            }
             return;
         }
     };
@@ -419,9 +454,7 @@ async fn writer_task(
         }
         if !payload.published && payload.path != part_path {
             if let Err(error) = nzbd_state::fileops::link(&payload.path, &part_path) {
-                report
-                    .error(format!("legacy partial migration: {error}"))
-                    .await;
+                report.io_error("legacy partial migration", &error).await;
                 return;
             }
         }
@@ -443,14 +476,14 @@ async fn writer_task(
             let opened = match nzbd_state::fileops::open(&payload.path) {
                 Ok(opened) => opened,
                 Err(error) => {
-                    report.error(error).await;
+                    report.io_error("open partial", &error).await;
                     return;
                 }
             };
-            expected = match recovery::capture_identity(&opened) {
+            expected = match nzbd_state::fileops::identity(&opened) {
                 Ok(identity) => Some(identity),
                 Err(error) => {
-                    report.error(error).await;
+                    report.io_error("partial identity", &error).await;
                     return;
                 }
             };
@@ -570,7 +603,7 @@ async fn writer_task(
                 }
                 if let Err(error) = ensure_open(&dir, &part_path, &mut out, &expected).await {
                     report
-                        .error(format!("write {}: {error}", part_path.display()))
+                        .io_error(&format!("write {}", part_path.display()), &error)
                         .await;
                     return;
                 }
@@ -593,7 +626,7 @@ async fn writer_task(
                             Ok(claim) => reservation = Some(claim),
                             Err(error) => {
                                 report
-                                    .error(format!("write admission {}: {error}", dir.display()))
+                                    .io_error(&format!("write admission {}", dir.display()), &error)
                                     .await;
                                 return;
                             }
@@ -607,10 +640,7 @@ async fn writer_task(
                     #[cfg(test)]
                     if let Some(("write", code)) = injected {
                         report
-                            .error(format!(
-                                "write: {}",
-                                std::io::Error::from_raw_os_error(code)
-                            ))
+                            .io_error("write", &std::io::Error::from_raw_os_error(code))
                             .await;
                         return;
                     }
@@ -633,7 +663,7 @@ async fn writer_task(
                     }
                     if let Err(error) = result {
                         report
-                            .error(format!("write {}: {error}", part_path.display()))
+                            .io_error(&format!("write {}", part_path.display()), &error)
                             .await;
                         return;
                     }
@@ -642,7 +672,7 @@ async fn writer_task(
                 let identity = match file_identity(out.as_ref().unwrap()).await {
                     Ok(identity) => identity,
                     Err(error) => {
-                        report.error(error).await;
+                        report.io_error("write identity", &error).await;
                         return;
                     }
                 };
@@ -693,7 +723,7 @@ async fn writer_task(
                             })
                             .await;
                     }
-                    Err(error) => report.error(format!("seal partial: {error}")).await,
+                    Err(error) => report.io_error("seal partial", &error).await,
                 }
                 return;
             }
@@ -704,10 +734,7 @@ async fn writer_task(
                 #[cfg(test)]
                 if let Some(("finalize", code)) = fault.take() {
                     report
-                        .error(format!(
-                            "finalize: {}",
-                            std::io::Error::from_raw_os_error(code)
-                        ))
+                        .io_error("finalize", &std::io::Error::from_raw_os_error(code))
                         .await;
                     return;
                 }
@@ -762,7 +789,7 @@ async fn writer_task(
                     }
                     Err(error) => {
                         report
-                            .error(format!("finalize identity/publication: {error}"))
+                            .io_error("finalize identity/publication", &error)
                             .await
                     }
                 }
@@ -1495,7 +1522,9 @@ mod tests {
             .await
             .unwrap();
         match engine_rx.recv().await {
-            Some(EngineMsg::WriterError { job, file, error }) => {
+            Some(EngineMsg::WriterError {
+                job, file, error, ..
+            }) => {
                 assert_eq!(job, JobId(1));
                 assert_eq!(file, FileId(2));
                 assert!(error.contains("write admission"));
@@ -1953,7 +1982,10 @@ mod tests {
         let facts = batch_facts(&mut events).await;
         task.await.unwrap();
         assert_eq!(facts.len(), 1);
-        assert!(matches!(&facts[0],WriterFact::Error{error} if error.contains("os error 28")));
+        assert!(
+            matches!(&facts[0], WriterFact::Error { error, cause: Some(nzbd_types::HoldCause::Capacity) } if error.contains("os error 28")),
+            "a failed shared sync on a full volume holds for capacity, not failed/io: {facts:?}"
+        );
         assert_eq!(
             std::fs::read(temp.path().join(".runner-file-2.part")).unwrap(),
             [1, 2, 3, 4]
@@ -2069,7 +2101,9 @@ mod tests {
         let (mut events, _, task) = queued_writer(temp.path(), commands, scope);
         let facts = batch_facts(&mut events).await;
         task.await.unwrap();
-        assert!(matches!(&facts[..], [WriterFact::Error {error}] if error.contains("identity")));
+        assert!(
+            matches!(&facts[..], [WriterFact::Error { error, cause: None }] if error.contains("identity"))
+        );
         assert_eq!(std::fs::read(part).unwrap(), b"foreign mutation");
         assert!(!temp.path().join("out").exists());
     }

@@ -670,7 +670,9 @@ impl crate::EngineHandle {
                 // Seed retirement is a lifecycle after the job's terminal; it
                 // never ends the job. Anything that is not space is retried
                 // as storage (seed-retirement holds carry no deadline).
-                let cause = crate::io_hold_cause(&message)
+                // The operation's error is persisted text with no errno
+                // attached; the stderr rule reads it.
+                let cause = crate::stderr_hold_cause(&message)
                     .unwrap_or(nzbd_types::HoldCause::StorageUnavailable);
                 self.hold_job_until(
                     id,
@@ -687,7 +689,7 @@ impl crate::EngineHandle {
                 let cause = if error.kind() == std::io::ErrorKind::WouldBlock {
                     nzbd_types::HoldCause::StorageUnavailable
                 } else {
-                    crate::io_hold_cause(&error.to_string())
+                    crate::io_error_hold_cause(&error)
                         .unwrap_or(nzbd_types::HoldCause::StorageUnavailable)
                 };
                 self.hold_job(id, cause, "torrent_seed_retire", &error.to_string())

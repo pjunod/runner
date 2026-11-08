@@ -3,7 +3,7 @@
 **Status:** implementation candidate; plan approved by Astra · **Written:** 2026-11-04
 (America/New_York) · **Base:** `01750d85` · **Branch:** `codex/rename-performance`
 
-Companion to [publication performance](PUBLICATION_PERFORMANCE_PLAN.md) and
+Companion to [publication performance](archive/PUBLICATION_PERFORMANCE_PLAN.md) and
 [the I/O audit](IO_EFFICIENCY_AUDIT.md). Follow these milestones in order.
 Changes to the final verification or crash-recovery contract require another
 design review before implementation.

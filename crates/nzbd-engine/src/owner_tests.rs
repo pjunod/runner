@@ -2992,6 +2992,7 @@ async fn storage_errno_writer_error_schedules_itself() {
             job: JobId(1),
             file: FileId(10),
             error: "write /processing/x/.runner-file-10.part: Transport endpoint is not connected (os error 107)".into(),
+            cause: Some(nzbd_types::HoldCause::StorageUnavailable),
         });
     pump(&mut owner, &mut messages).await;
     let held = owner.state.jobs[0].control().unwrap();
@@ -3062,17 +3063,27 @@ async fn storage_errno_writer_error_schedules_itself() {
 
     // A refusal pushes it out again and says why.
     let revision = again.revision.clone();
-    assert!(owner.reschedule_hold(JobId(1), &revision, "volume still unavailable"));
+    assert!(owner.reschedule_hold_proven(
+        JobId(1),
+        &revision,
+        "volume still unavailable",
+        &Default::default()
+    ));
     let pushed = owner.state.jobs[0].control().unwrap();
     assert_eq!(pushed.retry_attempt, 3);
     assert!(pushed
         .message
         .ends_with("; retry refused: volume still unavailable"));
     assert!(
-        !owner.reschedule_hold(JobId(1), &revision, "stale"),
+        !owner.reschedule_hold_proven(JobId(1), &revision, "stale", &Default::default()),
         "a reschedule is a new revision; a second actor on the old one is refused"
     );
-    assert!(owner.reschedule_hold(JobId(1), &pushed.revision, "and again"));
+    assert!(owner.reschedule_hold_proven(
+        JobId(1),
+        &pushed.revision,
+        "and again",
+        &Default::default()
+    ));
     assert_eq!(
         owner.state.jobs[0]
             .control()
@@ -3097,6 +3108,7 @@ async fn permanent_writer_error_is_a_terminal_io_failure() {
         job: JobId(1),
         file: FileId(10),
         error: "finalize: complete checkpoint digest differs".into(),
+        cause: None,
     });
     for _ in 0..20 {
         pump(&mut owner, &mut messages).await;
@@ -3346,7 +3358,12 @@ async fn held_control_survives_only_owner_writes() {
     storage.cause = "storage_unavailable".into();
     storage.retry_policy = "scheduled_retry".into();
     owner.state.jobs[0].set_control(&storage);
-    assert!(owner.reschedule_hold(JobId(1), &storage.revision, "still down"));
+    assert!(owner.reschedule_hold_proven(
+        JobId(1),
+        &storage.revision,
+        "still down",
+        &Default::default()
+    ));
     assert_ne!(owner.state.jobs[0].control().unwrap(), storage);
 }
 
@@ -3511,7 +3528,12 @@ async fn reobserve_refusal_records_why_without_moving_its_cadence() {
     pump(&mut owner, &mut messages).await;
     let c = owner.state.jobs[0].control().unwrap();
     assert_eq!(c.next_retry_at_unix, None);
-    assert!(owner.reschedule_hold(JobId(1), &c.revision, "wrong root mounted"));
+    assert!(owner.reschedule_hold_proven(
+        JobId(1),
+        &c.revision,
+        "wrong root mounted",
+        &Default::default()
+    ));
     let after = owner.state.jobs[0].control().unwrap();
     assert_eq!(
         after.next_retry_at_unix, None,
@@ -3523,8 +3545,36 @@ async fn reobserve_refusal_records_why_without_moving_its_cadence() {
         .ends_with("; retry refused: wrong root mounted"));
     owner.persist = false;
     assert!(
-        !owner.reschedule_hold(JobId(1), &c.revision, "follower"),
+        !owner.reschedule_hold_proven(JobId(1), &c.revision, "follower", &Default::default()),
         "a node that is not the authority writes nothing"
+    );
+}
+
+#[test]
+fn retired_cleanup_clock_params_are_dropped_on_load() {
+    let mut job = pending_job(7);
+    job.params = vec![
+        ("*PP:failure-disposition-attempts".into(), "2".into()),
+        ("*PP:failed-cleanup-next-retry".into(), "1794076138".into()),
+        (
+            "*PP:failed-cleanup-blocked-since".into(),
+            "1794070000".into(),
+        ),
+        ("*PP:failed-cleanup-last-error".into(), "EIO".into()),
+        ("monarr-transfer".into(), "t-1".into()),
+    ];
+    assert!(drop_retired_params(&mut job));
+    assert_eq!(
+        job.params,
+        vec![
+            ("*PP:failure-disposition-attempts".into(), "2".into()),
+            ("monarr-transfer".into(), "t-1".into()),
+        ]
+    );
+    assert!(!drop_retired_params(&mut job), "idempotent");
+    assert_eq!(
+        crate::snapshot::failed_cleanup_progress(&job).map(|p| p.attempts),
+        Some(2)
     );
 }
 
@@ -3824,6 +3874,31 @@ fn restarted_recovery_job(id: u32, state: SegmentState) -> Job {
     job
 }
 
+/// Review #296-4: a full state volume under the terminal store latches
+/// out-of-space instead of reading as corruption.
+#[tokio::test]
+async fn a_full_terminal_store_latches_out_of_space() {
+    let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    let full = nzbd_state::artifacts::Error::Sql(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+        Some("database or disk is full".into()),
+    ));
+    let fault = terminal_owner::StoreFault::of(&full);
+    assert_eq!(fault.cause, Some(nzbd_types::HoldCause::Capacity));
+    owner.terminal_store_fault("terminal emitted flag", &fault);
+    assert!(owner.enospc_latched);
+    assert_eq!(owner.enospc_observed, 1);
+    // Anything else is logged and replayed, not a latch.
+    let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    owner.terminal_store_fault(
+        "terminal replay",
+        &terminal_owner::StoreFault::of(&nzbd_state::artifacts::Error::NotFound),
+    );
+    assert!(!owner.enospc_latched);
+}
+
 #[tokio::test]
 async fn writer_resource_errors_hold_pending_segments_and_latch_out_of_space() {
     let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
@@ -3834,6 +3909,7 @@ async fn writer_resource_errors_hold_pending_segments_and_latch_out_of_space() {
         job: JobId(2),
         file: FileId(20),
         error: "write payload.bin: No space left on device (os error 28)".into(),
+        cause: Some(nzbd_types::HoldCause::Capacity),
     });
     pump(&mut owner, &mut messages).await;
     let job = owner.state.job(JobId(2)).unwrap();
@@ -3852,12 +3928,14 @@ async fn writer_resource_errors_hold_pending_segments_and_latch_out_of_space() {
         job: JobId(2),
         file: FileId(20),
         error: "permission denied".into(),
+        cause: None,
     });
     pump(&mut owner, &mut messages).await;
     owner.on_msg(EngineMsg::WriterError {
         job: JobId(2),
         file: FileId(999),
         error: "gone".into(),
+        cause: None,
     });
     pump(&mut owner, &mut messages).await;
     owner.on_msg(EngineMsg::SegmentWritten {
@@ -6474,7 +6552,12 @@ async fn cluster_automatic_control_waits_for_exact_ack_and_operator_intent_is_no
         .load()
         .pending_automatic_controls
         .contains(&base.id));
-    assert!(!owner.reschedule_hold(base.id, &held.revision, "still unavailable"));
+    assert!(!owner.reschedule_hold_proven(
+        base.id,
+        &held.revision,
+        "still unavailable",
+        &Default::default()
+    ));
     assert!(owner
         .retry_hold_proven(
             base.id,
@@ -6694,10 +6777,11 @@ async fn worker_reschedule_refuses_expiry_and_same_revision_regrant() {
         !authority_guard.matches(&owner.artifacts, &row, false),
         "an authority fence is not a worker grant"
     );
-    assert!(!owner.reschedule_hold(
+    assert!(!owner.reschedule_hold_proven(
         row.id,
         &original.revision,
-        "unchecked worker cannot reschedule"
+        "unchecked worker cannot reschedule",
+        &Default::default(),
     ));
     live.store(false, Ordering::SeqCst);
     let (reply, result) = oneshot::channel();
@@ -6787,7 +6871,12 @@ async fn worker_reschedule_refuses_expiry_and_same_revision_regrant() {
     let mut held = owner.state.job(row.id).unwrap().control().unwrap();
     held.next_retry_at_unix = Some(0);
     owner.state.job_mut(row.id).unwrap().set_control(&held);
-    assert!(!owner.reschedule_hold(row.id, &held.revision, "late authority pass"));
+    assert!(!owner.reschedule_hold_proven(
+        row.id,
+        &held.revision,
+        "late authority pass",
+        &Default::default()
+    ));
     let current = owner.state.job(row.id).unwrap().clone();
     let authority_guard = crate::hold_release::HoldReleaseGuard::prepare_queue_owner(
         &current,
@@ -6969,23 +7058,14 @@ async fn worker_retry_schedule_survives_regrant_without_overriding_new_leader_in
         "move",
         "destination full"
     ));
-    let control = owner.state.jobs[0].control().unwrap();
-    let deadline = unix_now() + 300;
-    let (reply, result) = oneshot::channel();
-    owner.on_command(QueueCommand::SchedulePostRetry {
-        job: JobId(77),
-        revision: control.revision,
-        retry_attempt: control.retry_attempt.saturating_add(1),
-        next_retry: deadline,
-        blocked_since: unix_now(),
-        message: "retry scheduled".into(),
-        reply,
-    });
     pump(&mut owner, &mut messages).await;
-    assert!(
-        result.await.unwrap(),
-        "worker must commit to local inventory rather than a shared snapshot"
-    );
+    // The hold's own schedule (the owner's ladder, the only hold clock) is
+    // committed to the worker's local inventory, not a shared snapshot.
+    let deadline = owner.state.jobs[0]
+        .control()
+        .unwrap()
+        .next_retry_at_unix
+        .expect("a capacity hold is timed");
     let durable = owner
         .artifacts
         .worker_control(77, &context)

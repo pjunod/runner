@@ -2,15 +2,15 @@
 
 **Status:** proposed; implementation has not started · **Written:** 2026-11-01
 · **Incident:** `nuc3`, 2026-11-01 · **Review:** revised after
-[Opus's third review](STARTUP_VERIFICATION_OPUS_THIRD_REVIEW.md); these
+[Opus's third review](archive/STARTUP_VERIFICATION_OPUS_THIRD_REVIEW.md); these
 amendments supersede the previously approved draft and were approved by
 Astra on scoped re-review against `a253562`.
 Implementation has not started. See
-[findings and disposition](STARTUP_VERIFICATION_REVIEW.md).
+[findings and disposition](archive/STARTUP_VERIFICATION_REVIEW.md).
 
 Companion to [DEPLOY.md](DEPLOY.md) (container operation),
 [ARCHITECTURE.md](ARCHITECTURE.md) (engine and persistence), and
-[STARTUP_RECOVERY_REVIEW.md](STARTUP_RECOVERY_REVIEW.md) (the earlier pending
+[STARTUP_RECOVERY_REVIEW.md](archive/STARTUP_RECOVERY_REVIEW.md) (the earlier pending
 magnet startup defect). This proposal addresses local recovery work that
 still keeps the service offline. Read the evidence and operation contract
 before implementing the milestones. Preserve the existing durable ownership

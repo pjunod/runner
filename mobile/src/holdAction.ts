@@ -2,7 +2,7 @@ import { JobControl } from './api/types';
 
 /**
  * The one control a held job's card offers. Mirrors the web queue row and
- * docs/HELD_JOBS_PLAN.md §4.6: every hold has an exit.
+ * docs/archive/HELD_JOBS_PLAN.md §4.6: every hold has an exit.
  *
  * Contract v2: every hold is environmental and automatic, and Runner ends it
  * at a deadline. So there is no hold that waits for a person.

@@ -5,7 +5,7 @@
 Runner records payload ownership separately from History. Removing a History
 row does not abandon its files. Unknown folders are retained for review, and
 failed or pending deletion preserves the retry record. See the
-[delivery status](FILE_LIFECYCLE_STATUS.md) for review and test results.
+[delivery status](archive/FILE_LIFECYCLE_STATUS.md) for review and test results.
 
 ## 1. Enable and inspect
 

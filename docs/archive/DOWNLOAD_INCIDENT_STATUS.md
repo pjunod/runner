@@ -1,5 +1,7 @@
 # Download incident — implementation and merge status
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: the "Download incident recovery" entry in [STATUS.md](../../STATUS.md); current behaviour in [ARCHITECTURE.md](../ARCHITECTURE.md).
+
 Companion to [the incident review](DOWNLOAD_INCIDENT_REVIEW.md), which records
 causes, evidence, and design decisions. This page tracks execution.
 

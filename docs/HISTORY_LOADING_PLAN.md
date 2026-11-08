@@ -2,12 +2,12 @@
 
 **Status:** first release implemented; final qualification in progress · **Updated:** 2026-09-25 ·
 **Diagnosis base:** `f959cf922b47c581713df9401003c7c6f96cf5f7` ·
-**Delivery status:** [HISTORY_LOADING_STATUS.md](HISTORY_LOADING_STATUS.md)
+**Delivery status:** [HISTORY_LOADING_STATUS.md](archive/HISTORY_LOADING_STATUS.md)
 
 Companion to [ARCHITECTURE.md](ARCHITECTURE.md#86-crash-recovery) §8.6
 (Crash recovery, including history storage),
-[DEFECT_HISTORY_DELETE.md](DEFECT_HISTORY_DELETE.md) (durable deletion),
-and [INTEGRATION_PLAN.md](INTEGRATION_PLAN.md) (consumer cursors). This
+[DEFECT_HISTORY_DELETE.md](archive/DEFECT_HISTORY_DELETE.md) (durable deletion),
+and [INTEGRATION_PLAN.md](archive/INTEGRATION_PLAN.md) (consumer cursors). This
 document explains why browsing history can stall, proposes a staged fix,
 and identifies the evidence needed before shipping it. Read the deletion
 contract before changing ingestion. If an optimization requires changing
@@ -60,7 +60,7 @@ cargo test -p nzbd-state history_loading_probe -- --ignored --nocapture
 
 [CONFIGURATION.md](CONFIGURATION.md) documents restart, migration, rollback,
 and operator controls. Final review and verification results are tracked in
-[HISTORY_LOADING_STATUS.md](HISTORY_LOADING_STATUS.md).
+[HISTORY_LOADING_STATUS.md](archive/HISTORY_LOADING_STATUS.md).
 
 ## 1. Finding — page reads pay for replaying the entire history
 
@@ -282,7 +282,7 @@ and reinserting all rows in a running index.
 **Deletion:** tombstones win over all entry copies, regardless of file order.
 Keep the insertion-time tombstone guard. A refresh must not expose an entry
 whose tombstone it has already ingested. A failed durable delete append must
-not remove the indexed row. See [the deletion contract](DEFECT_HISTORY_DELETE.md).
+not remove the indexed row. See [the deletion contract](archive/DEFECT_HISTORY_DELETE.md).
 
 **Retention:** ingestion must honor the node's monotone retention floor, even
 when a peer still retains old entries. Compaction uses atomic replacement and

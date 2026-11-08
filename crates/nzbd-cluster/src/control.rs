@@ -1009,13 +1009,6 @@ impl ControlStore {
     /// Drain the durable URL outbox against current replicated intent. Events
     /// are wake hints only; the immutable resolution ID is the command key.
     /// True means durable acceptance/replay or a definite durable cancellation.
-    #[cfg(test)]
-    pub(crate) async fn commit_url_outbox(
-        &self,
-        record: &nzbd_state::artifacts::UrlResolutionRecord,
-    ) -> Result<bool, String> {
-        self.commit_url_outbox_with_source(record, None).await
-    }
     pub(crate) async fn commit_url_outbox_with_source(
         &self,
         record: &nzbd_state::artifacts::UrlResolutionRecord,
