@@ -709,6 +709,19 @@ mod tests {
         assert_eq!(encoder.stats().estimated_cache_bytes, 0);
     }
     #[test]
+    fn queue_beyond_cache_job_limit_drops_retention_and_remains_readable() {
+        let mut encoder = SnapshotEncoder::default();
+        exact(&mut encoder, doc());
+        assert!(!encoder.entries.is_empty());
+        let mut larger = QueueSnapshotDoc::default();
+        larger.jobs = (1..=MAX_JOBS as u32 + 1).map(job).collect();
+        let bytes = exact(&mut encoder, larger);
+        assert!(!bytes.starts_with(snapshot_codec::MAGIC_V2));
+        assert!(encoder.entries.is_empty());
+        assert_eq!(encoder.stats().estimated_cache_bytes, 0);
+    }
+
+    #[test]
     fn v2_frame_count_corruption_truncation_and_extra_frames_are_refused() {
         let bytes = exact(&mut SnapshotEncoder::default(), doc());
         for count in [0, 1, 4099, 4, 6] {
