@@ -1690,7 +1690,19 @@ async fn test_server(State(st): State<ApiState>, Json(body): Json<TestServerBody
 /// exactly the "page frozen until I hit refresh" field report. Header
 /// stats and per-job rows come from the SAME snapshot, so they can never
 /// disagree the way two separately-cached endpoints did.
-async fn sse_events(State(st): State<ApiState>, headers: axum::http::HeaderMap) -> Response {
+///
+/// `?storage_io=1` adds a `storage_io` event: each storage filesystem's
+/// read/write throughput (`{"storage": [{path, io}]}`), at most once a
+/// second and only when it changed. The tick leaves `io` out of its
+/// storage rows, because disk counters move every second on a busy box and
+/// would otherwise defeat the tick's de-duplication for every subscriber,
+/// including phones that never draw the graph. `/api/v1/status` keeps `io`.
+async fn sse_events(
+    State(st): State<ApiState>,
+    Query(query): Query<EventsQuery>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let storage_io = query.wants_storage_io();
     use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
     use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 
@@ -1736,6 +1748,7 @@ async fn sse_events(State(st): State<ApiState>, headers: axum::http::HeaderMap) 
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_tick_payload: Option<String> = None;
+        let mut last_storage_io: Option<String> = None;
         // Staleness clock for the `hb` event, and the log cursor. A new
         // stream tails the log from "now": replaying the whole ring on
         // every connect would flood a page that has not opened the Logs
@@ -1797,7 +1810,20 @@ async fn sse_events(State(st): State<ApiState>, headers: axum::http::HeaderMap) 
                             last_frame = std::time::Instant::now();
                         }
                     }
-                    let payload = tick_payload(&engine.snapshot());
+                    let snap = engine.snapshot();
+                    if storage_io {
+                        // Not a liveness frame: it leaves `last_frame` alone so
+                        // an idle queue still gets its `hb` on schedule.
+                        let payload = storage_io_payload(&snap);
+                        if last_storage_io.as_deref() != Some(payload.as_str()) {
+                            let sse = SseEvent::default().event("storage_io").data(&payload);
+                            if tx.send(Ok(sse)).await.is_err() {
+                                break;
+                            }
+                            last_storage_io = Some(payload);
+                        }
+                    }
+                    let payload = tick_payload(&snap);
                     if last_tick_payload.as_deref() != Some(payload.as_str()) {
                         let sse = SseEvent::default().event("tick").data(&payload);
                         if tx.send(Ok(sse)).await.is_err() {
@@ -1928,6 +1954,30 @@ fn unix_now() -> i64 {
 }
 
 /// The 1 Hz SSE `tick` body: header status + job rows from one snapshot.
+#[derive(Debug, Default, Deserialize)]
+struct EventsQuery {
+    #[serde(default)]
+    storage_io: Option<String>,
+}
+
+impl EventsQuery {
+    fn wants_storage_io(&self) -> bool {
+        self.storage_io
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "" | "0" | "false"))
+    }
+}
+
+/// The `storage_io` SSE body: throughput only, keyed by path in the same
+/// order as the status rows.
+fn storage_io_payload(snap: &QueueSnapshot) -> String {
+    let storage = storage_from_snapshot(snap)
+        .into_iter()
+        .map(|row| json!({ "path": row.path, "io": row.io }))
+        .collect::<Vec<_>>();
+    json!({ "storage": storage }).to_string()
+}
+
 fn tick_payload(snap: &QueueSnapshot) -> String {
     let jobs = snap
         .jobs
@@ -1936,7 +1986,18 @@ fn tick_payload(snap: &QueueSnapshot) -> String {
             control_pending::render(job, snap.pending_automatic_controls.contains(&job.id), None)
         })
         .collect::<Vec<_>>();
-    json!({ "status": status_dto(snap), "jobs": jobs }).to_string()
+    let mut status = serde_json::to_value(status_dto(snap)).unwrap_or_default();
+    if let Some(rows) = status
+        .get_mut("storage")
+        .and_then(|rows| rows.as_array_mut())
+    {
+        for row in rows {
+            if let Some(row) = row.as_object_mut() {
+                row.remove("io");
+            }
+        }
+    }
+    json!({ "status": status, "jobs": jobs }).to_string()
 }
 
 /// Resolve when the daemon is shutting down; pend forever if no shutdown
@@ -3605,6 +3666,49 @@ mod tests {
     }
 
     #[test]
+    fn the_tick_leaves_storage_io_to_its_own_frame() {
+        let snap = QueueSnapshot {
+            storage_volumes: vec![nzbd_engine::snapshot::StorageVolumeSnapshot {
+                name: "processing".into(),
+                label: "working".into(),
+                path: "/processing".into(),
+                available_bytes: Some(10),
+                total_bytes: Some(100),
+                current: true,
+                io: Some(nzbd_engine::snapshot::StorageIoSnapshot {
+                    source: "block",
+                    detail: "sda1".into(),
+                    read_bps: Some(7),
+                    write_bps: Some(9),
+                }),
+            }],
+            ..Default::default()
+        };
+        let tick: serde_json::Value = serde_json::from_str(&tick_payload(&snap)).unwrap();
+        let row = &tick["status"]["storage"][0];
+        assert_eq!(row["name"], "processing", "the tick keeps the capacity row");
+        assert!(
+            row.get("io").is_none(),
+            "the tick does not carry I/O: {row}"
+        );
+        let io: serde_json::Value = serde_json::from_str(&storage_io_payload(&snap)).unwrap();
+        assert_eq!(io["storage"][0]["path"], "/processing");
+        assert_eq!(io["storage"][0]["io"]["write_bps"], 9);
+        for (raw, wants) in [
+            (None, false),
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("0"), false),
+            (Some(""), false),
+        ] {
+            let query = EventsQuery {
+                storage_io: raw.map(str::to_owned),
+            };
+            assert_eq!(query.wants_storage_io(), wants, "{raw:?}");
+        }
+    }
+
+    #[test]
     fn status_storage_carries_the_dashboard_name_and_io() {
         let snap = QueueSnapshot {
             storage_volumes: vec![
@@ -4920,6 +5024,42 @@ mod tests {
             text.contains("download_rate_bps") && text.contains("tickjob"),
             "tick carries status + job rows: {text:?}"
         );
+        engine.shutdown().await;
+    }
+
+    /// The dashboard opts in to the per-second storage throughput frame;
+    /// it arrives beside the tick without being part of it.
+    #[tokio::test]
+    async fn storage_io_frames_are_opt_in() {
+        use tokio_stream::StreamExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let resp = router(engine.clone())
+            .oneshot(
+                axum::http::Request::get("/api/v1/events?storage_io=1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = resp.into_body().into_data_stream();
+        let mut text = String::new();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(chunk) = body.next().await {
+                text.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+                if text.contains("event: storage_io") && text.contains("event: tick") {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(
+            got,
+            Ok(true),
+            "no storage_io frame beside the tick: {text:?}"
+        );
+        assert!(text.contains("\"storage\":"), "got: {text:?}");
         engine.shutdown().await;
     }
 

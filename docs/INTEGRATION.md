@@ -255,6 +255,7 @@ Stream frames — local to one connection, no `id:`, never replayed:
 |---|---|---|
 | `tick` | `{status, jobs}` | 1 Hz progress snapshot, sent only when it changed |
 | `hb` | `{now_unix}` | heartbeat when an idle stream sent nothing for a while |
+| `storage_io` | `{storage: [{path, io}]}` | per-filesystem read/write throughput, 1 Hz when changed; only with `?storage_io=1`, and not counted as stream activity (an idle stream still gets `hb`). `tick` omits `io` from its storage rows; `/api/v1/status` carries it |
 | `log` | `{entries, dropped}` | new log lines |
 | `reset` | `{reason}` | the resume cursor could not be honoured; reconcile from §3 |
 | `lagged` | `{skipped}` | this connection fell behind; frames were skipped |
