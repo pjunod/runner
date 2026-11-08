@@ -172,6 +172,9 @@ type StorageTarget = nzbd_config::StorageRoot;
 /// Values are optional when no existing ancestor can be measured.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StoragePathDto {
+    /// The dashboard name: `processing`, `completed`, or
+    /// `processing · completed` when one filesystem holds both.
+    pub name: String,
     pub label: String,
     pub path: String,
     pub available_bytes: Option<u64>,
@@ -179,6 +182,22 @@ pub struct StoragePathDto {
     /// False means the current cycle could not measure this row. Non-None
     /// capacity is last-known evidence; None means it has never been known.
     pub current: bool,
+    /// Read/write throughput, sampled once a second. `null` when the
+    /// platform gives the filesystem no device identity.
+    pub io: Option<StorageIoDto>,
+}
+
+/// Throughput for one filesystem. `source` says what the numbers mean:
+/// `block` is device-wide (every program on that disk), `nfs` is this
+/// machine's traffic to the server, `unsupported` has no counters (`detail`
+/// names the filesystem type), and `stale` means the sampler stopped.
+/// Rates are `null` until a second sample exists.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StorageIoDto {
+    pub source: &'static str,
+    pub detail: String,
+    pub read_bps: Option<u64>,
+    pub write_bps: Option<u64>,
 }
 
 #[cfg(test)]
@@ -199,11 +218,13 @@ fn measure_storage(targets: &[StorageTarget]) -> Vec<StoragePathDto> {
 #[cfg(test)]
 fn storage_path_dto(reading: nzbd_engine::volumes::StorageVolumeReading) -> StoragePathDto {
     StoragePathDto {
+        name: reading.kinds.name(&reading.label),
         label: reading.label,
         path: reading.path.to_string_lossy().into_owned(),
         available_bytes: reading.available_bytes,
         total_bytes: reading.total_bytes,
         current: reading.current,
+        io: None,
     }
 }
 
@@ -538,11 +559,18 @@ fn storage_from_snapshot(snap: &QueueSnapshot) -> Vec<StoragePathDto> {
     snap.storage_volumes
         .iter()
         .map(|volume| StoragePathDto {
+            name: volume.name.clone(),
             label: volume.label.clone(),
             path: volume.path.clone(),
             available_bytes: volume.available_bytes,
             total_bytes: volume.total_bytes,
             current: volume.current,
+            io: volume.io.as_ref().map(|io| StorageIoDto {
+                source: io.source,
+                detail: io.detail.clone(),
+                read_bps: io.read_bps,
+                write_bps: io.write_bps,
+            }),
         })
         .collect()
 }
@@ -3577,6 +3605,48 @@ mod tests {
     }
 
     #[test]
+    fn status_storage_carries_the_dashboard_name_and_io() {
+        let snap = QueueSnapshot {
+            storage_volumes: vec![
+                nzbd_engine::snapshot::StorageVolumeSnapshot {
+                    name: "processing".into(),
+                    label: "state · working · failed".into(),
+                    path: "/processing".into(),
+                    available_bytes: Some(10),
+                    total_bytes: Some(100),
+                    current: true,
+                    io: Some(nzbd_engine::snapshot::StorageIoSnapshot {
+                        source: "block",
+                        detail: "nvme0n1p2".into(),
+                        read_bps: Some(1_000),
+                        write_bps: Some(2_000),
+                    }),
+                },
+                nzbd_engine::snapshot::StorageVolumeSnapshot {
+                    name: "completed".into(),
+                    label: "downloads".into(),
+                    path: "/completed".into(),
+                    available_bytes: None,
+                    total_bytes: None,
+                    current: false,
+                    io: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let value = serde_json::to_value(status_dto(&snap)).unwrap();
+        let storage = &value["storage"];
+        assert_eq!(storage[0]["name"], "processing");
+        assert_eq!(storage[0]["label"], "state · working · failed");
+        assert_eq!(storage[0]["io"]["source"], "block");
+        assert_eq!(storage[0]["io"]["detail"], "nvme0n1p2");
+        assert_eq!(storage[0]["io"]["read_bps"], 1_000);
+        assert_eq!(storage[0]["io"]["write_bps"], 2_000);
+        assert_eq!(storage[1]["name"], "completed");
+        assert!(storage[1]["io"].is_null());
+    }
+
+    #[test]
     fn storage_probe_covers_configured_paths_and_missing_destinations() {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = nzbd_config::Config::default();
@@ -3614,6 +3684,10 @@ mod tests {
                 "state · downloads · working · failed · temporary · category: tv"
             );
             assert_eq!(measured[0].path, tmp.path().to_string_lossy());
+            assert_eq!(
+                measured[0].name, "processing · completed",
+                "one filesystem holding work and output is named for both"
+            );
         }
         #[cfg(windows)]
         assert_eq!(
