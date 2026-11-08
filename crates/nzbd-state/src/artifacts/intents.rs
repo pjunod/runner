@@ -1198,7 +1198,26 @@ impl Inventory {
             update_intent(&self.db.lock().unwrap(), &intent)?;
         }
         match intent.state {
-            IntentState::Finishing => self.finish_intent(intent, checkpoint, scope).map(|_| ()),
+            IntentState::Finishing => {
+                // The copies still to make hold their capacity for the
+                // rest of the move (review #283-5).
+                let _capacity = if intent.cross_volume {
+                    let bytes = intent
+                        .files
+                        .iter()
+                        .filter(|file| !file.moved)
+                        .map(|file| file.bytes)
+                        .sum();
+                    let root = intent
+                        .target_dir
+                        .parent()
+                        .ok_or_else(|| Error::Conflict("publication has no parent".into()))?;
+                    Some(crate::capacity::reserve(root, bytes)?)
+                } else {
+                    None
+                };
+                self.finish_intent(intent, checkpoint, scope).map(|_| ())
+            }
             IntentState::Unwinding => self.unwind_intent(intent),
             _ => Ok(()),
         }
@@ -2124,6 +2143,209 @@ mod tests {
                 assert!(!target.exists());
             }
         }
+    }
+
+    /// One large file on a second volume: (base, target base, db, source,
+    /// selected, outcomes, completed).
+    #[allow(clippy::type_complexity)]
+    fn large_cross_volume(
+        test: &str,
+        job_id: u32,
+        bytes: usize,
+    ) -> Option<(
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Inventory,
+        PathBuf,
+        Vec<FileEntry>,
+        Vec<DeliveryFileOutcome>,
+        PathBuf,
+    )> {
+        let base = tempfile::tempdir().unwrap();
+        let target_base = second_volume(base.path(), test)?;
+        let (db, root) = fixture_in(base.path());
+        let payload = vec![23u8; bytes];
+        let (source, selected, outcomes) = job(
+            &db,
+            &root,
+            job_id,
+            &[("media.mkv", payload.as_slice())],
+            &[],
+        );
+        let completed = target_base.path().join("completed");
+        std::fs::create_dir(&completed).unwrap();
+        Some((base, target_base, db, source, selected, outcomes, completed))
+    }
+
+    /// Review #283-7 (re-covers the removed
+    /// `recovery_copies_reject_corruption_against_the_streamed_source_digest`):
+    /// a recovery copy whose streamed bytes disagree with the journaled
+    /// digest is refused and never lands. The source rots mid-copy under
+    /// metadata the journal cannot tell apart (a legacy identity without a
+    /// change time, mtime restored), so only the digest catches it.
+    #[test]
+    fn cross_volume_copy_rejects_bytes_that_disagree_with_the_journaled_digest() {
+        use std::io::{Seek, Write};
+        let size = 700 * 1024;
+        let Some((base, _target_base, db, source, selected, outcomes, completed)) =
+            large_cross_volume(
+                "cross_volume_copy_rejects_bytes_that_disagree_with_the_journaled_digest",
+                71,
+                size,
+            )
+        else {
+            return;
+        };
+        let target = completed.join("release.job-71.runner-g");
+        super::super::relocation::FAULTS
+            .with(|faults| faults.borrow_mut().insert("after_first_rename", libc::EIO));
+        assert!(db
+            .publish_selected_with_transfer(71, &target, selected, outcomes, None, true, &|| Ok(()))
+            .is_err());
+        let generation = db.for_job(71).unwrap().unwrap().generation;
+        let mut intent = db.relocation_intent(&generation).unwrap().unwrap();
+        assert!(intent.files[0].moved && intent.files[0].sha256.is_some());
+        // The copy is lost; the journal's identity is a legacy one.
+        std::fs::remove_file(target.join("media.mkv")).unwrap();
+        intent.files[0].identity.changed = String::new();
+        update_intent(&db.db.lock().unwrap(), &intent).unwrap();
+        db.close().unwrap();
+        let db = Inventory::open(&base.path().join("state")).unwrap();
+        let rotting = source.join("media.mkv");
+        super::super::relocation::COPY_CHUNK_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let modified = std::fs::metadata(&rotting).unwrap().modified().unwrap();
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&rotting)
+                    .unwrap();
+                file.seek(std::io::SeekFrom::Start(600 * 1024)).unwrap();
+                file.write_all(b"rot").unwrap();
+                file.set_modified(modified).unwrap();
+            }))
+        });
+        db.reconcile_relocations().unwrap();
+        let intent = db.relocation_intent(&generation).unwrap().unwrap();
+        assert_ne!(intent.state, IntentState::Committed, "{intent:?}");
+        assert!(
+            !target.join("media.mkv").exists(),
+            "the disagreeing copy never lands"
+        );
+        assert!(!target.join(RUNNER_MANIFEST_NAME).exists());
+        let op = db.operation(&intent.operation).unwrap();
+        assert_eq!(op.state, "review");
+        assert!(
+            op.error
+                .as_deref()
+                .unwrap()
+                .contains("no longer matches its journaled digest"),
+            "{:?}",
+            op.error
+        );
+        assert!(db.delivery_for_job(71).unwrap().is_none());
+    }
+
+    /// Review #283-7 (re-covers `checked_relocation_stops_on_midcopy_lease_expiry`):
+    /// a lease that expires in the middle of a cross-volume copy stops the
+    /// copy at its next chunk; the same attempt then finishes from a fresh
+    /// `.part`, and the published bytes are the source's.
+    #[test]
+    fn cross_volume_copy_stops_mid_file_on_lease_expiry_then_finishes() {
+        let size = 700 * 1024;
+        let Some((_base, _target_base, db, source, selected, outcomes, completed)) =
+            large_cross_volume(
+                "cross_volume_copy_stops_mid_file_on_lease_expiry_then_finishes",
+                72,
+                size,
+            )
+        else {
+            return;
+        };
+        let target = completed.join("release.job-72.runner-g");
+        let expired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = expired.clone();
+        super::super::relocation::COPY_CHUNK_HOOK
+            .with(|hook| *hook.borrow_mut() = Some(Box::new(move || flag.set(true))));
+        let checkpoint = || {
+            if expired.get() {
+                Err(std::io::Error::other("lease expired"))
+            } else {
+                Ok(())
+            }
+        };
+        db.reset_fs_ops();
+        let error = db
+            .publish_selected_with_transfer(
+                72,
+                &target,
+                selected,
+                outcomes,
+                None,
+                true,
+                &checkpoint,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("lease expired"), "{error}");
+        let copied = db.fs_ops().get("copy_bytes").copied().unwrap_or(0);
+        assert!(
+            copied > 0 && copied < size as u64,
+            "stopped mid-file after {copied} bytes"
+        );
+        assert!(!target.join("media.mkv").exists());
+        assert!(db.open_intent_for_job(72).unwrap());
+        // The same attempt, lease renewed.
+        expired.set(false);
+        db.reconcile_job_intents(72).unwrap();
+        let generation = db.for_job(72).unwrap().unwrap().generation;
+        assert_eq!(
+            db.relocation_intent(&generation).unwrap().unwrap().state,
+            IntentState::Committed
+        );
+        assert_eq!(
+            std::fs::read(target.join("media.mkv")).unwrap(),
+            vec![23u8; size]
+        );
+        assert!(!target.join("media.mkv.part").exists());
+        assert!(source.join("media.mkv").exists(), "kept until retirement");
+    }
+
+    /// Review #283-5: a cross-volume move holds its capacity reservation
+    /// for the whole copy, so a concurrent writer cannot claim the same
+    /// headroom mid-move.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn cross_volume_capacity_is_held_through_the_copy() {
+        let size = 300 * 1024;
+        let Some((_base, _target_base, db, _source, selected, outcomes, completed)) =
+            large_cross_volume("cross_volume_capacity_is_held_through_the_copy", 73, size)
+        else {
+            return;
+        };
+        let _limit = crate::capacity::inject_available_test_limit(
+            &completed,
+            1024 * 1024 * 1024 + size as u64,
+        )
+        .unwrap();
+        let competing = std::rc::Rc::new(std::cell::Cell::new(None));
+        let seen = competing.clone();
+        let root = completed.clone();
+        super::super::relocation::COPY_CHUNK_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                seen.set(Some(crate::capacity::reserve(&root, 1).is_ok()));
+            }))
+        });
+        let target = completed.join("release.job-73.runner-g");
+        db.publish_selected_with_transfer(73, &target, selected, outcomes, None, true, &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            competing.get(),
+            Some(false),
+            "the move's reservation is held mid-copy"
+        );
+        assert!(
+            crate::capacity::reserve(&completed, 1).is_ok(),
+            "released once the move returned"
+        );
     }
 
     /// A cross-volume move reserves its bytes before anything is journaled:

@@ -93,7 +93,7 @@ thread_local! { pub(super) static FAIL_SOURCE_UNLINK_REFRESH: std::cell::Cell<bo
 type RefreshHook = Box<dyn FnMut(&str)>;
 #[cfg(test)]
 thread_local! {
-    static COPY_CHUNK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static COPY_CHUNK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static CLEANUP_SETTLE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static DELIVERY_SETTLE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static REFRESH_FILE_HOOK: std::cell::RefCell<Option<RefreshHook>> = const { std::cell::RefCell::new(None) };
@@ -1302,6 +1302,9 @@ impl Inventory {
         };
         // Contract §2.5: a selected publication moves file by file under a
         // journaled intent, inserted with the operation, before any rename.
+        // Review #283-5: a cross-volume move's capacity reservation is held
+        // until the move returns, not dropped once granted.
+        let mut _capacity = None;
         let intent = match &publication_files {
             Some(selected) => {
                 let intent = self.new_relocation_intent(
@@ -1316,7 +1319,7 @@ impl Inventory {
                 relocation.intent = Some(intent.generation.clone());
                 if intent.cross_volume {
                     let bytes = intent.files.iter().map(|file| file.bytes).sum();
-                    crate::capacity::reserve(root, bytes)?;
+                    _capacity = Some(crate::capacity::reserve(root, bytes)?);
                 }
                 Some(intent)
             }
