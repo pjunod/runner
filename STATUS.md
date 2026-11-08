@@ -2,9 +2,9 @@
 
 ## Storage I/O in the overview — 2026-11-08
 
-**Status:** branch `feat/storage-io` (runner 0.8.0), not yet pushed: this
-session has no GitHub write access, so Paul pushes it and the draft PR opens
-from his machine. Owner: Claude (Opus 5.5 session). Not deployed — deploy is
+**Status:** draft [#303](https://github.com/pjunod/runner/pull/303) (runner
+0.8.0). Next: the full fast lane once, then merge. Owner: Claude (Opus 5.5
+session). Not deployed — deploy is
 Paul's. The adversarial review was cut short at Paul's call to hurry and did
 not report; nothing from it is folded in.
 
