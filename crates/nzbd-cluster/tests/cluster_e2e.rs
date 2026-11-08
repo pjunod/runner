@@ -1626,7 +1626,29 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
     })
     .await;
 
+    // The authority's post pause holds remote post-processing too: the
+    // download finishes on b, but no worker is granted the post lease
+    // until the lane resumes.
+    let (code, body) = http(&a.url, "POST", "/api/v1/queue/actions/pause-post", b"");
+    assert_eq!(code, 200, "pause-post: {body}");
     add_job(&a.url, "pardl", post.nzb.as_bytes()).await;
+    wait_for("download finished while post is paused", 45, || {
+        get_json(&a.url, "/api/v1/jobs")["jobs"]
+            .as_array()
+            .and_then(|j| j.first().cloned())
+            .is_some_and(|j| j["remaining_bytes"] == 0 && j["status"] == "completed")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !tmp.path()
+            .join(".nzbd-cluster/history/history.c.jsonl")
+            .exists(),
+        "no remote post-processing may run while the post lane is paused"
+    );
+    assert_eq!(get_json(&a.url, "/api/v1/status")["post_paused"], true);
+    let (code, body) = http(&a.url, "POST", "/api/v1/queue/actions/resume-post", b"");
+    assert_eq!(code, 200, "resume-post: {body}");
 
     // Download completes on b (c can't download); PP is assigned to c,
     // executes there, and the stamped job comes back and is RETIRED to

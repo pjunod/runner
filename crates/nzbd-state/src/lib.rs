@@ -595,6 +595,10 @@ pub struct QueueSnapshotDoc {
     pub next_job_id: u32,
     pub next_file_id: u32,
     pub download_paused: bool,
+    /// Post-processing lane paused. Absent in snapshots written before the
+    /// lanes split, which read as "running" — the old behavior.
+    #[serde(default)]
+    pub post_paused: bool,
     pub speed_limit_bps: Option<u64>,
     /// How many jobs may download at once. Absent in snapshots written
     /// before the setting existed; `QueueState::from_doc` clamps the
@@ -613,6 +617,7 @@ impl Default for QueueSnapshotDoc {
             next_job_id: 0,
             next_file_id: 0,
             download_paused: false,
+            post_paused: false,
             speed_limit_bps: None,
             max_active_downloads: 0,
         }
@@ -1267,6 +1272,7 @@ mod tests {
             next_job_id: 7,
             next_file_id: 42,
             download_paused: true,
+            post_paused: true,
             speed_limit_bps: Some(1_000_000),
             max_active_downloads: 3,
         };
@@ -1283,6 +1289,10 @@ mod tests {
         assert_eq!(loaded.next_job_id, 7);
         assert_eq!(loaded.next_file_id, 42);
         assert!(loaded.download_paused);
+        assert!(
+            loaded.post_paused,
+            "the post lane's pause survives a restart"
+        );
         assert_eq!(loaded.speed_limit_bps, Some(1_000_000));
         assert_eq!(loaded.url_admission_receipts.len(), 1);
         assert_eq!(loaded.url_admission_receipts[0].request_token, "token-7");
@@ -1303,6 +1313,7 @@ mod tests {
             next_job_id: 1,
             next_file_id: 1,
             download_paused: false,
+            post_paused: false,
             speed_limit_bps: None,
             max_active_downloads: 1,
         };
@@ -1326,6 +1337,10 @@ mod tests {
         assert_eq!(loaded.next_job_id, 7);
         assert_eq!(loaded.next_file_id, 9);
         assert_eq!(loaded.max_active_downloads, 0);
+        assert!(
+            !loaded.post_paused,
+            "a document from before the lanes split leaves post-processing running"
+        );
     }
 
     #[test]
@@ -1340,6 +1355,7 @@ mod tests {
             next_job_id: 7,
             next_file_id: 0,
             download_paused: false,
+            post_paused: false,
             speed_limit_bps: None,
             max_active_downloads: 1,
         })
@@ -1576,6 +1592,7 @@ mod tests {
             next_job_id: 5,
             next_file_id: 400,
             download_paused: false,
+            post_paused: false,
             speed_limit_bps: None,
             max_active_downloads: 1,
         };

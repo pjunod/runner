@@ -250,11 +250,22 @@ try {
   button:hover { border-color: var(--accent); }
   button:disabled { opacity: .45; cursor: default; }
   button:disabled:hover { border-color: var(--line); }
-  /* The queue-state button that is currently in effect (e.g. "Pause
-     queue" while paused): stays visibly latched, not just disabled. */
+  /* A queue state that is currently in effect (a paused lane): stays
+     visibly latched. */
   button.active { color: var(--warn); font-weight: 600;
     border-color: color-mix(in srgb, var(--warn) 55%, transparent);
     background: color-mix(in srgb, var(--warn) 10%, transparent); opacity: 1; }
+  /* The two pause lanes. One toggle per lane, same latched style as any
+     state in effect: amber means paused. The glyph is what a click does —
+     bars while it runs, a play triangle once paused. */
+  .lane-glyph { display: inline-block; box-sizing: border-box; margin-right: 6px;
+    vertical-align: -1px; width: 9px; height: 11px;
+    border-left: 3px solid currentColor; border-right: 3px solid currentColor; }
+  button.lane-toggle.active .lane-glyph { width: 0; height: 0; border-right: 0;
+    border-left: 9px solid currentColor;
+    border-top: 5.5px solid transparent; border-bottom: 5.5px solid transparent; }
+  .sec-held { margin-left: 10px; }
+  .sec-held[hidden] { display: none; }
   button.small { padding: 2px 9px; font-size: 12px; }
   input[type=number] { width: 90px; background: var(--panel); color: var(--ink);
            border: 1px solid var(--line); border-radius: 7px; padding: 6px 8px; font: inherit; }
@@ -1110,8 +1121,8 @@ try {
   <div id="hold"></div>
 
   <div class="controls">
-    <button id="btn-pause">Pause queue</button>
-    <button id="btn-resume">Resume queue</button>
+    <button id="btn-pause" class="lane-toggle" aria-pressed="false"><span class="lane-glyph" aria-hidden="true"></span>Downloads</button>
+    <button id="btn-pause-post" class="lane-toggle" aria-pressed="false"><span class="lane-glyph" aria-hidden="true"></span>Post-processing</button>
     <button id="btn-addnzb" title="Upload .nzb files straight into the queue.">+ add nzb</button>
     <input type="file" id="nzb-file" accept=".nzb,application/x-nzb" multiple hidden>
     <span id="addnzb-msg"></span>
@@ -1542,7 +1553,8 @@ const store = {
   jobFiles: null,      // open job's file list
   jobLogs: null,       // open job's activity tail
   conn: "connecting",  // connecting | live | stalled | reconnecting | unreachable
-  pauseSource: null,   // who last (un)paused the queue (from the event)
+  pauseSource: null,   // who last (un)paused downloads (from the event)
+  postPauseSource: null, // who last (un)paused post-processing
   healthAbort: false,  // [post] health_action arms the critical-health abort
 };
 
@@ -1835,6 +1847,10 @@ function statusLabel(st, stageOverride, ready) {
 /// status/timeline pair. Delayed PAR downloads used to reset `Post { stage }`
 /// to Completed while leaving its open span intact; treating the open span as
 /// the durable activity fact keeps upgraded/restored jobs out of Waiting too.
+function lastSpanClosed(j) {
+  const spans = (j && j.stages) || [];
+  return !!spans.length && spans[spans.length - 1].ms != null;
+}
 function currentPostStage(j) {
   if (j && j.pp_done) return null;
   const st = j && j.status;
@@ -2220,6 +2236,11 @@ function rowModel(j, ctx) {
       rest.push(" · fails as hold expired in " + fmtDur(left) + " unless it recovers");
   }
   if (j.verification) rest.push(" · " + recoveryVerificationText(j));
+  // Post lane paused: a job between stages is parked (its last span is
+  // closed), one mid-stage will park as soon as that stage ends.
+  const inPostStage = !j.pp_done && !!j.status && typeof j.status === "object" && !!j.status.post;
+  if (ctx.postPaused && inPostStage)
+    rest.push(lastSpanClosed(j) ? " · held — post-processing paused" : " · holds after this stage");
   const shownSt = over || controlPendingLabel(j) || (hold ? "held" : j.verification && st !== "paused" ? "verifying" : acquisitionStatus(j) || st);
   const shownCls = over ? (STATUS_CLASS[over] || "dim") : cls;
   return {
@@ -2433,6 +2454,8 @@ function buildSectionRow(d) {
   c.label = d.append(td, d.create("span", "sec-label"));
   c.count = d.append(td, d.create("span", "sec-count"));
   c.summary = d.append(td, d.create("span", "sec-summary"));
+  c.held = d.append(td, d.create("span", "st warn sec-held"));
+  d.prop(c.held, "hidden", true);
   tr.__c = c;
   return tr;
 }
@@ -2446,6 +2469,7 @@ function applySectionRow(tr, m, d) {
   w("toggleLabel", (m.collapsed ? "▸ " : "▾ ") + m.label, v => d.text(c.toggle, v));
   w("expanded", !m.collapsed, v => d.attr(c.toggle, "aria-expanded", String(v)));
   w("summary", m.summary || "", v => d.text(c.summary, v));
+  w("held", m.held || "", v => { d.text(c.held, v); d.prop(c.held, "hidden", !v); });
   w("tip", m.tip || "", v => { d.prop(c.label, "title", v); d.prop(c.toggle, "title", v); });
 }
 KINDS.section = { build: buildSectionRow, apply: applySectionRow };
@@ -3180,6 +3204,7 @@ function queueModels() {
   renderPager(p);
   const visible = new Set(p.shown.map(x => x.j.id));
   const nowMs = Date.now();
+  const postPaused = !!(store.status && store.status.post_paused);
   const out = [];
   for (const sec of SECTIONS) {
     const g = groups.get(sec.key);
@@ -3187,6 +3212,9 @@ function queueModels() {
     out.push({
       key: "sec:" + sec.key, kind: "section",
       label: sec.label, count: String(g.length), tip: sec.tip,
+      // Jobs waiting for a slot are not waiting for capacity while the post
+      // lane is paused — say which it is, right on the heading.
+      held: sec.key === "post_queued" && postPaused ? "held · post-processing paused" : "",
       section: sec.key, collapsible: !!sec.collapsible, collapsed: collapsedSections.has(sec.key),
       summary: sec.key === "seeding"
         ? "↑ " + fmtRate(g.reduce((n, x) => n + (x.j.upload_rate_bps || 0), 0)) + " · " +
@@ -3209,6 +3237,7 @@ function queueModels() {
         mixedSection: ["waiting", "attention"].includes(sec.key),
         section: sec.key,
         nowMs,
+        postPaused,
       }));
       // The detail panel belongs to its row, so it only exists while that
       // row is on screen. Reopening on the way back is instant — `openJob`
@@ -3238,11 +3267,18 @@ KINDS.badge = { build: buildBadge, apply: applyBadge };
 
 function statusModels(s) {
   const out = [];
+  const pauseTip = "Every pause/resume is a client command — the daemon never flips this itself. The name here is whoever sent the last one.";
   if (s.download_paused)
     out.push({
       key: "paused", kind: "badge", cls: "badge on-warn",
-      text: "paused" + (store.pauseSource ? " · by " + store.pauseSource : ""),
-      tip: "Every pause/resume is a client command — the daemon never flips this itself. The name here is whoever sent the last one.",
+      text: "downloads paused" + (store.pauseSource ? " · by " + store.pauseSource : ""),
+      tip: pauseTip,
+    });
+  if (s.post_paused)
+    out.push({
+      key: "post-paused", kind: "badge", cls: "badge on-warn",
+      text: "post-processing paused" + (store.postPauseSource ? " · by " + store.postPauseSource : ""),
+      tip: pauseTip + " Downloaded jobs wait; a job mid-way finishes its current stage first.",
     });
   if (s.speed_limit_bps)
     out.push({
@@ -3451,7 +3487,7 @@ function renderStatus() {
   const s = store.status;
   if (!s) return;
   store.healthAbort = !!s.health_abort;
-  setPauseButtons(!!s.download_paused);
+  setPauseButtons(!!s.download_paused, !!s.post_paused);
   // The footer version identifies the BUILD, not the project: version,
   // git hash when the build had one, and the compile stamp in the tooltip
   // — "which build is this box actually running?" must be answerable from
@@ -3521,16 +3557,32 @@ function setText(el, v) { if (el && el.__t !== v) { el.__t = v; el.textContent =
 function setClass(el, v) { if (el && el.__c !== v) { el.__c = v; el.className = v; } }
 function setProp(el, k, v) { if (el && el["__p_" + k] !== v) { el["__p_" + k] = v; el[k] = v; } }
 
-// The button matching the current state latches (disabled + amber) so the
-// pair reads as a state indicator, and a click flips it before the server
-// even answers — "did anything happen?" must never require a reload.
-function setPauseButtons(paused) {
-  const p = $("btn-pause"), r = $("btn-resume");
-  p.disabled = paused;
-  p.classList.toggle("active", paused);
-  p.title = paused ? "The queue is paused." : "Stop all downloading (jobs stay queued).";
-  r.disabled = !paused;
-  r.title = paused ? "Start downloading again." : "The queue is already running.";
+// Two independent lanes, one toggle each. A paused lane latches amber so
+// the button doubles as the state indicator, and a click flips it before the
+// server even answers — "did anything happen?" must never require a reload.
+const LANES = {
+  download: {
+    id: "btn-pause", pause: "pause", resume: "resume", noun: "downloads",
+    runTip: "Pause downloads. Jobs stay queued; post-processing carries on.",
+    pausedTip: "Downloads are paused. Click to resume.",
+  },
+  post: {
+    id: "btn-pause-post", pause: "pause-post", resume: "resume-post", noun: "post-processing",
+    runTip: "Pause post-processing. A job mid-way finishes its current stage, then waits; downloads carry on.",
+    pausedTip: "Post-processing is paused. Click to resume.",
+  },
+};
+function setLane(lane, paused) {
+  const L = LANES[lane], b = $(L.id);
+  if (!b) return;
+  b.classList.toggle("active", paused);
+  b.setAttribute("aria-pressed", String(paused));
+  b.title = paused ? L.pausedTip : L.runTip;
+  b.dataset.paused = paused ? "1" : "";
+}
+function setPauseButtons(downloadPaused, postPaused) {
+  setLane("download", downloadPaused);
+  if (postPaused !== undefined) setLane("post", postPaused);
 }
 
 // ---- history ------------------------------------------------------------
@@ -4644,22 +4696,25 @@ const PAGE_MOVES = {
 
 // ---- controls -----------------------------------------------------------
 // Optimistic: flip the visible state the instant the button is clicked
-// (buttons latch, the time-left tile says "paused"), then let the server's
-// answer — the refresh plus the queue_pause_changed SSE event — confirm or
-// correct it.
-async function queueAction(action, paused) {
-  setPauseButtons(paused);
-  setText($("s-eta"), paused ? "paused" : "—");
-  if (paused) store.pauseSource = "web-ui";
+// (the lane latches; for downloads the time-left tile says "paused"), then
+// let the server's answer — the refresh plus the lane's *_pause_changed SSE
+// event — confirm or correct it.
+async function laneAction(lane) {
+  const L = LANES[lane];
+  const paused = !$(L.id).dataset.paused;   // the click flips the lane
+  setLane(lane, paused);
+  if (lane === "download") setText($("s-eta"), paused ? "paused" : "—");
+  if (paused) store[lane === "download" ? "pauseSource" : "postPauseSource"] = "web-ui";
+  const action = paused ? L.pause : L.resume;
   const res = await post("/api/v1/queue/actions/" + action);
   if (!res.ok) {
-    setPauseButtons(!paused); // the server never agreed — put it back
-    toast({ text: action + " queue failed — " + res.error, kind: "error", ttlMs: 10000 });
+    setLane(lane, !paused); // the server never agreed — put it back
+    toast({ text: (paused ? "pause " : "resume ") + L.noun + " failed — " + res.error, kind: "error", ttlMs: 10000 });
   }
   refreshAll();
 }
-$("btn-pause").onclick = () => queueAction("pause", true);
-$("btn-resume").onclick = () => queueAction("resume", false);
+$("btn-pause").onclick = () => laneAction("download");
+$("btn-pause-post").onclick = () => laneAction("post");
 $("btn-limit").onclick = async () => {
   const kib = parseInt($("limit").value || "0", 10);
   const res = await post("/api/v1/queue/speed-limit", {
@@ -5045,6 +5100,10 @@ function startStream() {
   // always a client name, shown right on the paused badge.
   es.addEventListener("queue_pause_changed", (e) => {
     try { store.pauseSource = JSON.parse(e.data).source || null; } catch {}
+    nudge();
+  });
+  es.addEventListener("post_pause_changed", (e) => {
+    try { store.postPauseSource = JSON.parse(e.data).source || null; } catch {}
     nudge();
   });
   // The 1 Hz tick carries the whole read model (status + job rows from a
@@ -6957,7 +7016,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     armButton, armIsSet, disarmButton, histKey, renderHistory, renderStatus,
     deleteJob, requeueJob, jobAction, histAction, post,
     failureKeepModel, refreshFailureKeep, toggleFailureKeep, failureKeepState,
-    pushRate, pushRateSampled, rateSeries, spark, SPARK_N, titleFor,
+    pushRate, pushRateSampled, rateSeries, spark, SPARK_N, titleFor, setPauseButtons, LANES,
     appendLogs, logMatches, renderLogs, serverChipModels, renderStorage, LOG_RING_MAX,
     trimLogRing, logClass, logLineText, scheduleLogRender, refreshLogs,
     histDetailModel, histFileModel, toggleHist, getOpenHist: () => openHist,

@@ -555,6 +555,37 @@ async fn queue_controls_apply_atomically_and_report_missing_targets() {
         } if source == "coverage-client"
     ));
 
+    // The post-processing lane pauses on its own and never touches the
+    // download lane, in either direction.
+    engine.pause_post("coverage-client").await.unwrap();
+    assert!(matches!(
+        next_fixture_event(&mut events).await,
+        Event::PostPauseChanged {
+            paused: true,
+            ref source
+        } if source == "coverage-client"
+    ));
+    assert!(engine.snapshot().post_paused);
+    assert!(!engine.snapshot().download_paused);
+    assert!(engine.recovery_document().await.unwrap().post_paused);
+    engine.pause_all("coverage-client").await.unwrap();
+    let _ = next_fixture_event(&mut events).await;
+    engine.resume_post("coverage-client").await.unwrap();
+    assert!(matches!(
+        next_fixture_event(&mut events).await,
+        Event::PostPauseChanged {
+            paused: false,
+            ref source
+        } if source == "coverage-client"
+    ));
+    assert!(!engine.snapshot().post_paused);
+    assert!(
+        engine.snapshot().download_paused,
+        "resuming post leaves downloads paused"
+    );
+    engine.resume_all("coverage-client").await.unwrap();
+    let _ = next_fixture_event(&mut events).await;
+
     engine.set_speed_limit(Some(12_345)).await.unwrap();
     assert_eq!(engine.snapshot().speed_limit_bps, Some(12_345));
     engine.set_speed_limit(None).await.unwrap();

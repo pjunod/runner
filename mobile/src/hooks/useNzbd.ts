@@ -24,7 +24,7 @@ interface HookResult {
   busyKey: string | null;
   lastUpdated: number | null;
   refresh: () => Promise<void>;
-  queueAction: (action: 'pause' | 'resume') => Promise<void>;
+  queueAction: (action: 'pause' | 'resume' | 'pause-post' | 'resume-post') => Promise<void>;
   jobAction: (
     id: number,
     action:

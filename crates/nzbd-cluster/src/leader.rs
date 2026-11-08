@@ -1322,6 +1322,12 @@ async fn grant_post_candidate(
     req: &PollRequest,
     snap: &nzbd_engine::QueueSnapshot,
 ) -> Option<Grant> {
+    // The post-processing pause is the authority's: while it is set no
+    // worker is handed new post work. A lease already running finishes the
+    // attempt it holds; the local manager parks at stage boundaries.
+    if snap.post_paused {
+        return None;
+    }
     // PP grants (C2): completed jobs the scheduler assigned to this node
     // for post-processing, not yet leased, PP not yet done.
     let pp_candidates: Vec<JobId> = snap

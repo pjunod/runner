@@ -244,7 +244,8 @@ Engine facts — exactly the names `event_json` emits, each with an `id:`
 | `file_finished` | `{job, file, filename, ok}` | one file of a job finished |
 | `segment_exhausted` | `{job, file, segment}` | an article ran out of servers |
 | `server_blocked` | `{server, seconds}` | a news server was blocked for `seconds` |
-| `queue_pause_changed` | `{paused, source}` | the whole queue was paused or resumed |
+| `queue_pause_changed` | `{paused, source}` | downloading was paused or resumed |
+| `post_pause_changed` | `{paused, source}` | post-processing was paused or resumed (independent of downloads) |
 | `speed_limit_changed` | `{bytes_per_sec}` | the speed limit changed |
 | `max_active_downloads_changed` | `{n}` | the concurrency limit changed |
 
@@ -397,7 +398,8 @@ transitions.
 ```bash
 curl -sSN -H "Authorization: Bearer $TOK" -H "Accept: text/event-stream" \
      -H "X-Nzbd-Client: curl/manual" "$NZBD/api/v1/events"
-# pause and resume the queue in the UI: queue_pause_changed appears
+# pause and resume downloads in the UI: queue_pause_changed appears
+# (the Post-processing toggle emits post_pause_changed)
 ```
 
 ---

@@ -2806,6 +2806,57 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     T.store.files = null; T.setFilesDetailForTest(null, null);
   }
 
+  // --- split pause lanes ---------------------------------------------------
+  // Downloads and post-processing pause independently: one toggle and one
+  // attributed badge per lane, and the queue says why post work is waiting.
+  {
+    const st0 = T.store.status, src0 = T.store.pauseSource, psrc0 = T.store.postPauseSource;
+    T.store.pauseSource = "web-ui"; T.store.postPauseSource = "curator";
+    const badges = (s) => T.statusModels(s).filter(m => /paused/.test(m.text)).map(m => m.text);
+    eq(badges({ download_paused: false, post_paused: false }).length, 0, "no lane paused → no pause badge");
+    eq(JSON.stringify(badges({ download_paused: true, post_paused: false })),
+      JSON.stringify(["downloads paused · by web-ui"]), "download lane badge names its sender");
+    eq(JSON.stringify(badges({ download_paused: false, post_paused: true })),
+      JSON.stringify(["post-processing paused · by curator"]), "post lane badge names its sender");
+    eq(badges({ download_paused: true, post_paused: true }).length, 2, "both lanes → two badges");
+    eq(badges({ download_paused: false }).length, 0, "an older daemon without post_paused reads as running");
+
+    const dl = sandbox.document.getElementById("btn-pause");
+    const pp = sandbox.document.getElementById("btn-pause-post");
+    ok(dl && pp, "one toggle per lane");
+    ok(!/id="btn-resume"/.test(html), "the old resume button is gone");
+    T.setPauseButtons(false, true);
+    ok(!dl.dataset.paused && pp.dataset.paused === "1", "only the paused lane latches");
+    eq(pp.attrs["aria-pressed"], "true", "the latched lane reports pressed");
+    eq(dl.attrs["aria-pressed"], "false", "…and the running one does not");
+    eq(pp.title, T.LANES.post.pausedTip, "a paused lane says a click resumes it");
+    T.setPauseButtons(true, false);
+    ok(dl.dataset.paused === "1" && !pp.dataset.paused, "lanes flip independently");
+    eq(dl.title, T.LANES.download.pausedTip, "the download lane's tip follows its state");
+    T.setPauseButtons(false, false);
+
+    // Queue: a parked job (last span closed) vs one still finishing its stage.
+    const running = job(71, { status: { post: { stage: "par_repair" } }, remaining_bytes: 0,
+      stages: [{ stage: "par_repair", started_at_unix: 1 }] });
+    const parked = job(72, { status: { post: { stage: "par_verify" } }, remaining_bytes: 0,
+      stages: [{ stage: "par_verify", started_at_unix: 1, ms: 4000 }] });
+    const detail = (j, postPaused) => JSON.stringify(T.rowModel(j, { idx: 0, count: 1, postPaused }));
+    ok(/holds after this stage/.test(detail(running, true)), "a running stage finishes, then holds");
+    ok(/held — post-processing paused/.test(detail(parked, true)), "a parked job says it is held");
+    ok(!/post-processing paused|holds after/.test(detail(running, false)), "no hold text while the lane runs");
+
+    T.store.jobsLoaded = true; T.pending.clear();
+    T.store.jobs = [job(73, { status: "post_queued", remaining_bytes: 0 })];
+    T.store.status = Object.assign({}, st0 || {}, { post_paused: true });
+    const sec = T.queueModels().find(m => m.kind === "section" && m.section === "post_queued");
+    eq(sec && sec.held, "held · post-processing paused", "the waiting-to-post-process heading says why");
+    T.store.status = Object.assign({}, st0 || {}, { post_paused: false });
+    const sec2 = T.queueModels().find(m => m.kind === "section" && m.section === "post_queued");
+    eq(sec2 && sec2.held, "", "…and nothing when the lane runs");
+
+    T.store.status = st0; T.store.jobs = []; T.store.pauseSource = src0; T.store.postPauseSource = psrc0;
+  }
+
   if (failures.length) {
     console.error("UI DOM FAILURES:");
     for (const f of failures) console.error("  - " + f);

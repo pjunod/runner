@@ -25,7 +25,7 @@ exclude = ["contrib/rqbit/vendor", "vendor/hiqlite", "vendor/hiqlite-wal"]
 # Releases are git tags `v<this>` — see docs/DEPLOY.md, "Cutting a
 # release". What the daemon reports comes from `git describe`, so it moves
 # on every commit; this is only the release the count is measured from.
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.95"
 # License note: this code is written from scratch against a behavioral spec
@@ -35,23 +35,23 @@ license = "MIT OR Apache-2.0"
 repository = "https://example.invalid/nzbd"
 
 [workspace.dependencies]
-nzbd-types = { version = "=0.6.0", path = "crates/nzbd-types" }
-nzbd-nzb = { version = "=0.6.0", path = "crates/nzbd-nzb" }
-nzbd-yenc = { version = "=0.6.0", path = "crates/nzbd-yenc" }
-nzbd-par2 = { version = "=0.6.0", path = "crates/nzbd-par2" }
-nzbd-nntp = { version = "=0.6.0", path = "crates/nzbd-nntp" }
-nzbd-engine = { version = "=0.6.0", path = "crates/nzbd-engine" }
-nzbd-feed = { version = "=0.6.0", path = "crates/nzbd-feed" }
-nzbd-post = { version = "=0.6.0", path = "crates/nzbd-post" }
-nzbd-state = { version = "=0.6.0", path = "crates/nzbd-state" }
-nzbd-config = { version = "=0.6.0", path = "crates/nzbd-config" }
-nzbd-api = { version = "=0.6.0", path = "crates/nzbd-api" }
-nzbd-compat = { version = "=0.6.0", path = "crates/nzbd-compat" }
+nzbd-types = { version = "=0.7.0", path = "crates/nzbd-types" }
+nzbd-nzb = { version = "=0.7.0", path = "crates/nzbd-nzb" }
+nzbd-yenc = { version = "=0.7.0", path = "crates/nzbd-yenc" }
+nzbd-par2 = { version = "=0.7.0", path = "crates/nzbd-par2" }
+nzbd-nntp = { version = "=0.7.0", path = "crates/nzbd-nntp" }
+nzbd-engine = { version = "=0.7.0", path = "crates/nzbd-engine" }
+nzbd-feed = { version = "=0.7.0", path = "crates/nzbd-feed" }
+nzbd-post = { version = "=0.7.0", path = "crates/nzbd-post" }
+nzbd-state = { version = "=0.7.0", path = "crates/nzbd-state" }
+nzbd-config = { version = "=0.7.0", path = "crates/nzbd-config" }
+nzbd-api = { version = "=0.7.0", path = "crates/nzbd-api" }
+nzbd-compat = { version = "=0.7.0", path = "crates/nzbd-compat" }
 
-nzbd-nserv = { version = "=0.6.0", path = "crates/nzbd-nserv" }
-nzbd-cluster = { version = "=0.6.0", path = "crates/nzbd-cluster" }
-nzbd-torrent = { version = "=0.6.0", path = "crates/nzbd-torrent" }
-nzbd-qbit-compat = { version = "=0.6.0", path = "crates/nzbd-qbit-compat" }
+nzbd-nserv = { version = "=0.7.0", path = "crates/nzbd-nserv" }
+nzbd-cluster = { version = "=0.7.0", path = "crates/nzbd-cluster" }
+nzbd-torrent = { version = "=0.7.0", path = "crates/nzbd-torrent" }
+nzbd-qbit-compat = { version = "=0.7.0", path = "crates/nzbd-qbit-compat" }
 
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }

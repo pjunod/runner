@@ -57,6 +57,7 @@ import { HistoryView } from './HistoryView';
 import { LogsView } from './LogsView';
 import { holdAction } from '../holdAction';
 import { holdDeadlineText, holdHeadline } from '../holdPresentation';
+import { QUEUE_LANES, QueueLane, laneNotice, lanePaused, laneToggleAction, laneToggleLabel, pausedIndicator } from '../queueLanes';
 
 type AppSection = 'queue' | 'history' | 'logs';
 
@@ -163,12 +164,12 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
     }
   };
 
-  const toggleQueue = async () => {
+  const toggleLane = async (lane: QueueLane) => {
     if (!status) return;
-    const action = status.download_paused ? 'resume' : 'pause';
+    const action = laneToggleAction(lane, lanePaused(status, lane));
     try {
       await queueAction(action);
-      setNotice(action === 'pause' ? 'Queue paused.' : 'Queue resumed.');
+      setNotice(laneNotice(action));
     } catch {
       // The hook owns the visible error banner.
     }
@@ -257,13 +258,21 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
         <View style={styles.headerActions}>
           <ThemeSwitcher compact />
           {activeSection === 'queue' ? (
-            <ActionButton
-              compact
-              disabled={!status || busyKey !== null}
-              label={status?.download_paused ? 'Resume' : 'Pause'}
-              loading={busyKey?.startsWith('queue:')}
-              onPress={() => void toggleQueue()}
-            />
+            QUEUE_LANES.map(({ lane, name }) => {
+              const paused = !!status && lanePaused(status, lane);
+              return (
+                <ActionButton
+                  accessibilityLabel={laneToggleLabel(lane, paused)}
+                  compact
+                  disabled={!status || busyKey !== null}
+                  key={lane}
+                  label={`${paused ? '\u25B6' : '\u23F8'} ${name}`}
+                  loading={busyKey === `queue:${laneToggleAction(lane, paused)}`}
+                  onPress={() => void toggleLane(lane)}
+                  variant={paused ? 'latched' : 'secondary'}
+                />
+              );
+            })
           ) : null}
           <ActionButton compact label="Add" onPress={() => setAddOpen(true)} variant="primary" />
           <ActionButton compact label="Server" onPress={onEditConnection} variant="ghost" />
@@ -433,6 +442,7 @@ function Overview({
   styles: ReturnType<typeof makeStyles>;
   wide: boolean;
 }) {
+  const pausedText = pausedIndicator(status);
   const eta = status.download_paused
     ? 'paused'
     : status.download_rate_bps > 0
@@ -445,6 +455,7 @@ function Overview({
     <View style={styles.overviewBlocks}>
       <View style={styles.queueSummaryBlock}>
         <Text style={styles.overviewBlockTitle}>Queue</Text>
+        {pausedText ? <Text style={styles.queuePausedText}>{pausedText}</Text> : null}
         <View style={[styles.queueSummaryGrid, wide && styles.queueSummaryGridWide]}>
           <SummaryMetric
             label="Speed"
@@ -1218,7 +1229,8 @@ export const makeStyles = (theme: Theme) =>
     connectionRow: { flexDirection: 'row', alignItems: 'center', gap: 5 },
     connectionDot: { width: 7, height: 7, borderRadius: 4 },
     serverName: { color: theme.textMuted, fontSize: 10, flexShrink: 1 },
-    headerActions: { flexDirection: 'row', alignItems: 'center', gap: 5 },
+    headerActions: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 5 },
+    queuePausedText: { color: theme.warning, fontSize: 12, fontWeight: '700' },
     errorBanner: {
       paddingHorizontal: 18,
       paddingVertical: 10,
