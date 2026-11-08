@@ -1,5 +1,5 @@
 //! Immutable, checksummed URL inputs and resolution outbox in shared state.
-use super::{Error, Result};
+use super::{retry_delay, Error, Result};
 use nzbd_types::Job;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -93,7 +93,7 @@ pub fn url_storage_retry_deadline(
     previous: i64,
     not_before: Option<i64>,
 ) -> i64 {
-    let base = [30, 60, 120, 300][attempts.min(3) as usize];
+    let base = retry_delay(attempts.saturating_add(1));
     let seed = u64::from_str_radix(id.get(..16).unwrap_or("0"), 16).unwrap_or(0)
         ^ now as u64
         ^ attempts as u64;

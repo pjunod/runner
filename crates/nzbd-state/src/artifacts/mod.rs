@@ -420,6 +420,16 @@ impl Drop for AllocationReservation<'_> {
     }
 }
 
+/// The Operation retry ladder, seconds after the Nth failed attempt
+/// (review #283-12: one ladder, not a copy per caller).
+pub(crate) const RETRY_LADDER_SECONDS: [i64; 4] = [30, 60, 120, 300];
+
+/// Backoff after `attempts` failed attempts (1-based; the last rung
+/// repeats).
+pub(crate) fn retry_delay(attempts: u32) -> i64 {
+    RETRY_LADDER_SECONDS[(attempts.saturating_sub(1) as usize).min(RETRY_LADDER_SECONDS.len() - 1)]
+}
+
 pub fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2741,7 +2751,7 @@ impl Inventory {
                     a.hold = Some("review".into());
                 }
                 let delay = if a.automatic_cleanup_eligible {
-                    [30, 60, 120, 300][(op.attempts.saturating_sub(1) as usize).min(3)]
+                    retry_delay(op.attempts)
                 } else {
                     [60, 300, 1800, 21600][(op.attempts.saturating_sub(1) as usize).min(3)]
                 };

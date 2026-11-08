@@ -1991,7 +1991,7 @@ impl Inventory {
                 op.error = Some(error.to_string());
                 if matches!(error, Error::Io(_)) {
                     op.attempts = op.attempts.saturating_add(1);
-                    let delay = [30, 60, 120, 300][op.attempts.saturating_sub(1).min(3) as usize];
+                    let delay = retry_delay(op.attempts);
                     op.state = "retry".into();
                     op.next_retry = now().saturating_add(delay);
                     save_operation(&self.db.lock().unwrap(), &op)?;

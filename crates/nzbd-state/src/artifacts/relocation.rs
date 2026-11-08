@@ -1058,7 +1058,7 @@ impl Inventory {
             next_retry: if unsupported {
                 0
             } else {
-                now().saturating_add([30, 60, 120, 300][attempts.saturating_sub(1).min(3) as usize])
+                now().saturating_add(retry_delay(attempts))
             },
             error: Some(message.clone()),
         };
@@ -1511,7 +1511,7 @@ impl Inventory {
             }
             let unsupported = matches!(&e, Error::Io(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)));
             if matches!(e, Error::Io(_)) && !unsupported {
-                let delay = [30, 60, 120, 300][op.attempts.saturating_sub(1).min(3) as usize];
+                let delay = retry_delay(op.attempts);
                 op.state = "retry".into();
                 op.next_retry = now().saturating_add(delay);
             } else {
@@ -1914,8 +1914,7 @@ impl Inventory {
                 movement.cleanup.state = CleanupState::Retry;
                 movement.cleanup.retry_on_release =
                     matches!(&error,Error::Io(e) if e.kind()==std::io::ErrorKind::WouldBlock);
-                let delay =
-                    [30, 60, 120, 300][movement.cleanup.attempts.saturating_sub(1).min(3) as usize];
+                let delay = retry_delay(movement.cleanup.attempts);
                 movement.cleanup.next_retry = now().saturating_add(delay);
                 movement.cleanup.error = Some(error.to_string());
                 Err(error)
@@ -3335,7 +3334,7 @@ impl Inventory {
                 }
                 if matches!(e, Error::Io(_)) {
                     op.attempts = op.attempts.saturating_add(1);
-                    let delay = [30, 60, 120, 300][op.attempts.saturating_sub(1).min(3) as usize];
+                    let delay = retry_delay(op.attempts);
                     op.state = "retry".into();
                     op.next_retry = now().saturating_add(delay);
                 } else {

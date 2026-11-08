@@ -316,6 +316,21 @@ impl RawIntent {
 const COLUMNS: &str = "generation,job,transfer,artifact,operation,source_dir,target_dir,cross_volume,files,state,evidence,created_at,updated_at";
 
 pub(super) fn insert_intent(db: &Connection, intent: &RelocationIntent) -> Result<()> {
+    // Review #283-9: one selected publication per source generation. A
+    // second is a conflict the caller can act on, not a constraint error.
+    let existing: Option<String> = db
+        .query_row(
+            "SELECT state FROM relocation_intents WHERE generation=?1",
+            [&intent.generation],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(state) = existing {
+        return Err(Error::Conflict(format!(
+            "generation {} already has a selected publication ({state})",
+            intent.generation
+        )));
+    }
     db.execute(
         &format!("INSERT INTO relocation_intents({COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"),
         params![
@@ -1037,9 +1052,18 @@ impl Inventory {
             if artifact.is_some_and(|artifact| artifact != intent.artifact) {
                 continue;
             }
+            // Review #283-10: an intent whose source artifact or operation
+            // is gone has nothing left to finish or put back into; it is
+            // closed with that evidence rather than skipped forever.
             let source = match self.get(&intent.artifact) {
                 Ok(source) => source,
-                Err(Error::NotFound) => continue,
+                Err(Error::NotFound) => {
+                    self.close_orphaned_intent(
+                        intent,
+                        "its source artifact is no longer in the inventory",
+                    )?;
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
             if root.is_some_and(|root| root != source.root) {
@@ -1047,7 +1071,13 @@ impl Inventory {
             }
             let op = match self.operation(&intent.operation) {
                 Ok(op) => op,
-                Err(Error::NotFound) => continue,
+                Err(Error::NotFound) => {
+                    self.close_orphaned_intent(
+                        intent,
+                        "its operation is no longer in the journal",
+                    )?;
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
             if let Some(snapshot) = snapshot {
@@ -1065,16 +1095,16 @@ impl Inventory {
             if artifact.is_none() && snapshot.is_none() && op.state == "review" {
                 continue;
             }
-            // An admitted deletion keeps its undo window; it is refused
-            // while the intent is open, so this is only a pre-M3 admission.
+            // A deletion is refused while the intent is open, so an admitted
+            // one is a pre-M3 admission. Review #283-10: the operator chose
+            // to dispose of the source, so the move is unwound (every file
+            // back in the source the deletion will remove), not finished
+            // and not skipped forever.
             let deletion_pending: bool = self.db.lock().unwrap().query_row(
                 "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state='queued' AND json_extract(data,'$.kind')='delete')",
                 [&intent.artifact],
                 |row| row.get(0),
             )?;
-            if deletion_pending {
-                continue;
-            }
             if !self
                 .relocation_active
                 .lock()
@@ -1098,13 +1128,24 @@ impl Inventory {
             };
             // Re-read under the single flight: the live attempt may have
             // committed between the listing and the claim.
-            let Some(intent) = self
+            let Some(mut intent) = self
                 .relocation_intent(&intent.generation)?
                 .filter(|intent| intent.state.is_open())
             else {
                 continue;
             };
-            if let Err(error) = self.resolve_intent(intent, checkpoint, source.identity.as_ref()) {
+            let resolved = if deletion_pending {
+                if intent.state != IntentState::Unwinding {
+                    intent.state = IntentState::Unwinding;
+                    intent.evidence = Some(
+                        "an admitted deletion of the source was queued before the move".into(),
+                    );
+                }
+                self.unwind_intent(intent)
+            } else {
+                self.resolve_intent(intent, checkpoint, source.identity.as_ref())
+            };
+            if let Err(error) = resolved {
                 if take_injected_crash() {
                     return Err(error);
                 }
@@ -1114,8 +1155,7 @@ impl Inventory {
                 if matches!(op.state.as_str(), "running" | "retry" | "review") {
                     if matches!(error, Error::Io(_) | Error::Sql(_)) {
                         op.attempts = op.attempts.saturating_add(1);
-                        let delay =
-                            [30, 60, 120, 300][op.attempts.saturating_sub(1).min(3) as usize];
+                        let delay = retry_delay(op.attempts);
                         op.state = "retry".into();
                         op.next_retry = now().saturating_add(delay);
                     } else {
@@ -1126,6 +1166,26 @@ impl Inventory {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Close an intent nothing in the inventory owns any more: no file is
+    /// touched (there is no source record to put them back into), and the
+    /// evidence names the target directory for review.
+    fn close_orphaned_intent(&self, mut intent: RelocationIntent, why: &str) -> Result<()> {
+        let evidence = format!(
+            "{why}; closed without finishing or unwinding, {} left for review",
+            intent.target_dir.display()
+        );
+        tracing::warn!(generation = %intent.generation, %evidence, "orphaned publication intent");
+        intent.state = IntentState::Unwound;
+        intent.evidence = Some(evidence.clone());
+        let _guard = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        update_intent(&tx, &intent)?;
+        event(&tx, &intent.artifact, "publication_unwound", &evidence)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1426,7 +1486,11 @@ impl Inventory {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         if let Some(mut current) = current {
-            current.state = "active".into();
+            // The source is runner's again; a state the move did not set
+            // (a pre-M3 deletion's) is left as it is.
+            if current.state == "transitioning" {
+                current.state = "active".into();
+            }
             current.error = Some(format!("publication unwound: {evidence}"));
             current.files = fs::manifest(&source_root, 100_000)?;
             current.revision += 1;
@@ -1857,6 +1921,114 @@ mod tests {
             matches!(&error, Error::Io(io) if io.to_string().contains("publication unwound")),
             "{error}"
         );
+    }
+
+    /// Review #283-9: a second selected publication of one generation is a
+    /// conflict, not a raw constraint error.
+    #[test]
+    fn second_publication_of_a_generation_is_a_conflict() {
+        let base = tempfile::tempdir().unwrap();
+        let (db, root) = fixture_in(base.path());
+        let (_source, selected, outcomes) = job(&db, &root, 74, SELECTED, SIBLINGS);
+        let completed = base.path().join("completed");
+        std::fs::create_dir(&completed).unwrap();
+        let generation = db.for_job(74).unwrap().unwrap().generation;
+        let first = completed.join("release.job-74.runner-g");
+        db.publish_selected_with_transfer(
+            74,
+            &first,
+            selected.clone(),
+            outcomes.clone(),
+            None,
+            true,
+            &|| Ok(()),
+        )
+        .unwrap();
+        let mut intent = db.relocation_intent(&generation).unwrap().unwrap();
+        intent.target_dir = completed.join("release.job-74.runner-again");
+        let error = insert_intent(&db.db.lock().unwrap(), &intent).unwrap_err();
+        assert!(
+            matches!(&error, Error::Conflict(message) if message.contains("already has a selected publication (committed)")),
+            "{error}"
+        );
+    }
+
+    /// Review #283-10: an intent whose source artifact is gone is closed
+    /// with evidence instead of being skipped by every sweep; one whose
+    /// source has a (pre-M3) admitted deletion is unwound so the deletion
+    /// removes a whole source.
+    #[test]
+    fn orphaned_and_deletion_owned_intents_are_closed() {
+        for case in ["artifact_gone", "deletion_queued"] {
+            let base = tempfile::tempdir().unwrap();
+            let (db, root) = fixture_in(base.path());
+            let (source, selected, outcomes) = job(&db, &root, 75, SELECTED, SIBLINGS);
+            let completed = base.path().join("completed");
+            std::fs::create_dir(&completed).unwrap();
+            let target = completed.join("release.job-75.runner-g");
+            super::super::relocation::FAULTS
+                .with(|faults| faults.borrow_mut().insert("after_first_rename", libc::EIO));
+            assert!(db
+                .publish_selected_with_transfer(
+                    75,
+                    &target,
+                    selected,
+                    outcomes,
+                    None,
+                    true,
+                    &|| Ok(())
+                )
+                .is_err());
+            let artifact = db.for_job(75).unwrap().unwrap();
+            match case {
+                "artifact_gone" => {
+                    // Another source keeps the root in the startup sweep.
+                    job(&db, &root, 76, &[("other.mkv", b"other")], &[]);
+                    db.db
+                        .lock()
+                        .unwrap()
+                        .execute("DELETE FROM artifacts WHERE id=?1", [&artifact.id])
+                        .unwrap();
+                }
+                _ => save_operation(
+                    &db.db.lock().unwrap(),
+                    &Operation {
+                        id: "pre-m3-delete".into(),
+                        artifact: artifact.id.clone(),
+                        kind: "delete".into(),
+                        state: "queued".into(),
+                        request: "[]".into(),
+                        created_at: now(),
+                        not_before: now() + 60,
+                        attempts: 0,
+                        next_retry: 0,
+                        error: None,
+                    },
+                )
+                .unwrap(),
+            }
+            db.reconcile_relocations().unwrap();
+            let intent = db.relocation_intent(&artifact.generation).unwrap().unwrap();
+            assert_eq!(intent.state, IntentState::Unwound, "{case}");
+            assert!(db.open_relocation_intents().unwrap().is_empty(), "{case}");
+            let evidence = intent.evidence.unwrap();
+            if case == "artifact_gone" {
+                assert!(
+                    evidence.contains("no longer in the inventory"),
+                    "{evidence}"
+                );
+                assert!(
+                    target.exists(),
+                    "nothing is touched without a source record"
+                );
+            } else {
+                assert!(evidence.contains("admitted deletion"), "{evidence}");
+                assert!(!target.exists());
+                for (path, bytes) in SELECTED {
+                    assert_eq!(std::fs::read(source.join(path)).unwrap(), *bytes, "{path}");
+                }
+            }
+        }
     }
 
     /// Plan M3 (d): no NFS fixture exists in CI, so the PR #247 fallback
