@@ -97,7 +97,9 @@ fn group_status(j: &JobSummary) -> &'static str {
     match j.status {
         JobStatus::Queued => "QUEUED",
         JobStatus::Downloading => "DOWNLOADING",
-        JobStatus::Paused => "PAUSED",
+        // NZBGet has no held state; a hold reads as paused here (contract
+        // §2.3). Native clients see `held`.
+        JobStatus::Paused | JobStatus::Held => "PAUSED",
         JobStatus::Fetching => "FETCHING",
         JobStatus::PostQueued => "PP_QUEUED",
         JobStatus::Post { stage } => match stage {

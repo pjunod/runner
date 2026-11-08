@@ -1597,7 +1597,7 @@ async fn poll_for_work(
                 {
                     Ok(Ok(Some(adoption))) => {
                         grant.job.set_control(&adoption.control);
-                        grant.job.status = JobStatus::Paused;
+                        grant.job.stop();
                         for (key, value) in adoption.probe_params {
                             grant.job.params.retain(|(existing, _)| existing != &key);
                             grant.job.params.push((key, value));
@@ -2002,7 +2002,7 @@ async fn prepare_pp_attempt(
             }
             job.dir_name = private.to_string_lossy().into_owned();
             job.set_control(&adoption.control);
-            job.status = JobStatus::Paused;
+            job.stop();
             for (key, value) in adoption.probe_params {
                 job.params.retain(|(existing, _)| existing != &key);
                 job.params.push((key, value));

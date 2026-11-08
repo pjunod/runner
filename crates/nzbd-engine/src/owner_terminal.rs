@@ -504,11 +504,9 @@ impl Owner {
                 continue;
             };
             seen.insert(job.id);
-            let status = if job.held() {
-                "held"
-            } else {
-                published.as_str()
-            };
+            // A held job's status is `Held` (M6b), so the published status
+            // is the projection.
+            let status = published.as_str();
             let stage = match published {
                 JobStatus::Post { stage } => Some(stage.as_str()),
                 _ => None,

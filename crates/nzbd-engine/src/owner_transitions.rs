@@ -187,8 +187,10 @@ pub(super) fn allocate_imported_payload(
 /// This classification is used only after journal replay and fresh allocation
 /// reconciliation. A display byte counter is never sufficient evidence.
 fn pristine_download(job: &Job) -> bool {
-    matches!(job.status, JobStatus::Queued | JobStatus::Paused)
-        && job.stages.is_empty()
+    matches!(
+        job.status,
+        JobStatus::Queued | JobStatus::Paused | JobStatus::Held
+    ) && job.stages.is_empty()
         && !job.files.iter().any(|file| {
             file.finalized
                 || file.crc32.is_some()
@@ -349,7 +351,9 @@ fn preserve_user_intent(old: &mut Job, current: &Job) {
     if let Some(control) = current.control() {
         old.set_control(&control);
     }
-    if current.status == JobStatus::Paused || current.held() {
+    if current.held() {
+        old.status = JobStatus::Held;
+    } else if current.status == JobStatus::Paused {
         old.status = JobStatus::Paused;
     }
     for file in &mut old.files {
@@ -386,7 +390,10 @@ pub(super) fn preserve_intent_changes(restored: &mut Job, current: &Job, provisi
         restored.status = current.status;
     }
     if restored.held() {
-        restored.status = JobStatus::Paused;
+        restored.status = JobStatus::Held;
+    } else {
+        // The durable row's hold may have been released since.
+        restored.normalize_hold_status();
     }
     for file in &mut restored.files {
         if let Some((current, provisional)) = current
@@ -1126,9 +1133,9 @@ impl Owner {
                     Ok(Some(checkpoint)) => {
                         worker_control_restored = true;
                         job.set_control(&checkpoint.control);
-                        job.status = if checkpoint.control.lifecycle == "held"
-                            || checkpoint.control.manual_pause
-                        {
+                        job.status = if checkpoint.control.lifecycle == "held" {
+                            JobStatus::Held
+                        } else if checkpoint.control.manual_pause {
                             JobStatus::Paused
                         } else if matches!(
                             checkpoint.control.previous_status,
@@ -1170,7 +1177,7 @@ impl Owner {
         {
             // Remote/exported legacy snapshots cannot erase a newer local fence.
             job.set_control(&control);
-            job.status = JobStatus::Paused;
+            job.status = JobStatus::Held;
             job.params.retain(|(k, _)| k != nzbd_types::PP_DONE_PARAM);
         }
         Ok((false, preserve_publication))
@@ -1208,6 +1215,8 @@ impl Owner {
         callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
     ) {
         let job = candidate.id;
+        // An imported row may come from a 0.5.0 node (a hold as `paused`).
+        candidate.normalize_hold_status();
         if require_existing && self.state.job(job).is_none() {
             callback(self, Err(failure("replacement target no longer exists")));
             return;
@@ -1410,6 +1419,10 @@ impl Owner {
         adopted_speed: Option<(u64, Option<u64>)>,
         callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
     ) {
+        // Replicated rows may come from a 0.5.0 node (a hold as `paused`).
+        for job in &mut jobs {
+            job.normalize_hold_status();
+        }
         if !self.post_admissions.is_empty()
             || !self.allocating_jobs.is_empty()
             || self

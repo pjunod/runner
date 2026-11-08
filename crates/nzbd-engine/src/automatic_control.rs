@@ -58,8 +58,25 @@ fn read(job: &Job) -> Option<AutomaticControlTransition> {
     if value.len() > MAX_AUTOMATIC_CONTROL_BYTES || values.next().is_some() {
         return None;
     }
-    let marker: AutomaticControlTransition = serde_json::from_str(value).ok()?;
-    (marker.job == job.id && marker.valid_identity()).then_some(marker)
+    let mut marker: AutomaticControlTransition = serde_json::from_str(value).ok()?;
+    if marker.job != job.id || !marker.valid_identity() {
+        return None;
+    }
+    // A marker a 0.5.0 node stamped records a hold as `Paused` with its
+    // held control; the rows it is compared with load as `Held`. The
+    // identity hashes what was stamped, so the statuses are read as the
+    // projection after it is checked, not rewritten in the param. Markers
+    // live only until the cluster acknowledges them.
+    let held = |control: Option<&JobControl>| {
+        control.is_some_and(|c| c.lifecycle == "held" || c.version != 1)
+    };
+    if marker.base_status == JobStatus::Paused && held(marker.base_control.as_ref()) {
+        marker.base_status = JobStatus::Held;
+    }
+    if marker.result_status == JobStatus::Paused && held(Some(&marker.result_control)) {
+        marker.result_status = JobStatus::Held;
+    }
+    Some(marker)
 }
 /// A marker is actionable only while its exact result is still current.
 pub fn transition(job: &Job) -> Option<AutomaticControlTransition> {

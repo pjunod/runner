@@ -1660,7 +1660,10 @@ async fn work_heartbeat(
             None => None,
         };
         if !intent.is_some_and(|(status, revision)| {
-            !matches!(status, JobStatus::Paused | JobStatus::Deleted) && revision == lp.job_revision
+            !matches!(
+                status,
+                JobStatus::Paused | JobStatus::Held | JobStatus::Deleted
+            ) && revision == lp.job_revision
         }) {
             tracing::debug!(job = lp.job.0, lease = %lp.lease_id,
                 expected_revision = lp.job_revision, current_intent = ?intent,

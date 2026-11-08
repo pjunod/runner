@@ -382,7 +382,7 @@ impl Owner {
                             set_owner_param(&mut record.params,"*Recovery:publication-repair-intent",Some(raw));
                             // Restore only this helper's own release revision.
                             if record.control().is_some_and(|current|current.lifecycle=="running" && current.revision.parse::<u64>().ok()==control.revision.parse::<u64>().ok().and_then(|revision|revision.checked_add(1))) {
-                                record.set_control(&control);record.status=JobStatus::Paused;
+                                record.set_control(&control);record.status=JobStatus::Held;
                             }
                         }
                         owner.block_verification(job,VerificationFailure::conflict("repair namespace is safe but its completion checkpoint is not durable; retry is idempotent",0));
@@ -556,7 +556,7 @@ impl Owner {
                         .iter()
                         .any(|file| self.writers.contains_key(&file.id)))
                 .then_some((
-                    job.status == JobStatus::Paused || job.held(),
+                    matches!(job.status, JobStatus::Paused | JobStatus::Held) || job.held(),
                     std::cmp::Reverse(job.priority),
                     state.turn,
                     position,

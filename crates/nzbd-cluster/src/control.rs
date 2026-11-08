@@ -711,7 +711,7 @@ impl ControlStore {
         let row=self.client.query_consistent_map::<ControlJobRow,_>("SELECT intent_json,revision,incarnation FROM control_jobs WHERE job_id=?1 AND result_id=?2 AND deleted=0",params!(i64::from(job),result)).await.map_err(|error|error.to_string())?.into_iter().next();
         row.map(|row| {
             Ok((
-                serde_json::from_str(&row.intent_json).map_err(|error| error.to_string())?,
+                decode_intent(&row.intent_json).map_err(|error| error.to_string())?,
                 u64::try_from(row.revision).map_err(|error| error.to_string())?,
             ))
         })
@@ -729,7 +729,7 @@ impl ControlStore {
             .map_err(|error| format!("load replicated jobs: {error}"))?;
         rows.into_iter()
             .map(|row| {
-                let job = serde_json::from_str(&row.intent_json)
+                let job = decode_intent(&row.intent_json)
                     .map_err(|error| format!("decode replicated job: {error}"))?;
                 let revision = u64::try_from(row.revision)
                     .map_err(|error| format!("invalid replicated job revision: {error}"))?;
@@ -971,7 +971,7 @@ impl ControlStore {
             .into_iter()
             .next()
             .ok_or_else(|| "URL placeholder is not durable".to_owned())?;
-        let prior: nzbd_types::Job = serde_json::from_str(&row.intent_json)
+        let prior: nzbd_types::Job = decode_intent(&row.intent_json)
             .map_err(|error| format!("decode URL placeholder: {error}"))?;
         if row.deleted
             || prior.status != nzbd_types::JobStatus::Fetching
@@ -1041,13 +1041,15 @@ impl ControlStore {
             return Ok(true);
         }
         let prior: nzbd_types::Job =
-            serde_json::from_str(&row.intent_json).map_err(|error| error.to_string())?;
+            decode_intent(&row.intent_json).map_err(|error| error.to_string())?;
         if url_source_identity(&prior).ok().as_deref() != Some(record.source_identity.as_str()) {
             return Ok(true); // The durable row names another request/incarnation.
         }
         if !matches!(
             prior.status,
-            nzbd_types::JobStatus::Fetching | nzbd_types::JobStatus::Paused
+            nzbd_types::JobStatus::Fetching
+                | nzbd_types::JobStatus::Paused
+                | nzbd_types::JobStatus::Held
         ) || !prior.files.is_empty()
         {
             // A previous authority already resolved this exact admission (or
@@ -1071,11 +1073,11 @@ impl ControlStore {
         next.totals = record.resolved.totals;
         next.status = if record.resolved.status == nzbd_types::JobStatus::Failed {
             nzbd_types::JobStatus::Failed
+        } else if prior.held() {
+            nzbd_types::JobStatus::Held
         } else if prior.status == nzbd_types::JobStatus::Paused
             || prior.params.iter().any(|(key, _)| key == "*AddPaused")
-            || prior
-                .control()
-                .is_some_and(|control| control.manual_pause || control.lifecycle == "held")
+            || prior.control().is_some_and(|control| control.manual_pause)
         {
             nzbd_types::JobStatus::Paused
         } else {
@@ -1940,6 +1942,14 @@ fn expiry(now: i64, ttl: Duration) -> Result<i64, String> {
 
 pub(crate) fn unix_ms_public() -> i64 {
     unix_ms().unwrap_or(0)
+}
+
+/// A replicated job row, its status agreeing with its hold record: a row a
+/// 0.5.0 node wrote stores a hold as `paused` + a held control.
+pub(crate) fn decode_intent(json: &str) -> serde_json::Result<nzbd_types::Job> {
+    let mut job: nzbd_types::Job = serde_json::from_str(json)?;
+    job.normalize_hold_status();
+    Ok(job)
 }
 
 #[cfg(test)]

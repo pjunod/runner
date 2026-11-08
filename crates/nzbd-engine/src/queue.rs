@@ -231,18 +231,7 @@ impl QueueState {
                     .any(|(key, value)| key == "monarr-transfer" && value == &receipt.request_token)
             }) {
                 if receipt.custody_state != "curator" {
-                    receipt.outcome = match job.status {
-                        JobStatus::Fetching => "fetching",
-                        JobStatus::Queued => "queued",
-                        JobStatus::Downloading => "downloading",
-                        JobStatus::Paused => "paused",
-                        JobStatus::PostQueued => "post_queued",
-                        JobStatus::Post { .. } => "post_processing",
-                        JobStatus::Completed => "completed",
-                        JobStatus::Failed => "failed",
-                        JobStatus::Deleted => "deleted",
-                    }
-                    .to_string();
+                    receipt.outcome = job.status.as_str().to_string();
                 }
                 let param = |name: &str| {
                     job.params
@@ -667,7 +656,8 @@ impl QueueState {
                 record.payload_root = record
                     .payload_root
                     .join(format!(".runner-seed-{}", donor_id.0));
-                let gated = original.status == JobStatus::Paused || original.held();
+                let gated = matches!(original.status, JobStatus::Paused | JobStatus::Held)
+                    || original.held();
                 if gated {
                     record.control_intent = nzbd_types::TorrentControlIntent::Paused;
                 }
@@ -969,7 +959,10 @@ impl QueueState {
             .filter(|j| {
                 matches!(
                     j.status,
-                    JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused
+                    JobStatus::Queued
+                        | JobStatus::Downloading
+                        | JobStatus::Paused
+                        | JobStatus::Held
                 )
             })
             .map(|j| {
@@ -1717,10 +1710,13 @@ pub(crate) fn jobs_to_requeue_with_recovery(
         .collect()
 }
 
+/// Force priority overrides a person's pause (NZBGet semantics), never a
+/// hold: a held job waits for its own release.
 fn job_schedulable(job: &Job, download_paused: bool) -> bool {
     match job.status {
         JobStatus::Queued | JobStatus::Downloading => job.force_priority() || !download_paused,
         JobStatus::Paused => job.force_priority(),
+        JobStatus::Held => false,
         _ => false,
     }
 }

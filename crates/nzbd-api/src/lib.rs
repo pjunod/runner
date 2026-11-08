@@ -568,7 +568,12 @@ fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -
         health_abort: snap.health_abort,
         speed_limit_bps: snap.speed_limit_bps,
         max_active_downloads: snap.max_active_downloads,
-        jobs_queued: count(&|j| matches!(j.status, JobStatus::Queued | JobStatus::Paused)),
+        jobs_queued: count(&|j| {
+            matches!(
+                j.status,
+                JobStatus::Queued | JobStatus::Paused | JobStatus::Held
+            )
+        }),
         jobs_downloading: count(&|j| {
             matches!(
                 j.status,
@@ -1023,7 +1028,7 @@ async fn get_failure_keep(State(st): State<ApiState>, Path(id): Path<u32>) -> Re
         Ok(Ok((Some(source),_)))=>Json(json!({"available":true,"keep":source.keep_on_failure,"sourceArtifactId":source.id,"sourceGeneration":source.generation})).into_response(),
         Ok(Ok((None,true)))=>Json(json!({"available":false,"keep":false})).into_response(),
         Ok(Ok((None,false)))=>match st.engine.export_job(JobId(id)).await {
-            Ok(Some(job)) if matches!(job.status,nzbd_types::JobStatus::Fetching|nzbd_types::JobStatus::Queued|nzbd_types::JobStatus::Paused)
+            Ok(Some(job)) if matches!(job.status,nzbd_types::JobStatus::Fetching|nzbd_types::JobStatus::Queued|nzbd_types::JobStatus::Paused|nzbd_types::JobStatus::Held)
                 || (nzbd_engine::torrent_acquisitions::is_acquisition(&job)
                     && !job.params.iter().any(|(key,value)|key == "Delivery:SourceCleanup" && matches!(value.as_str(),"deleting"|"deleted")))=>Json(json!({"available":true,"keep":job.params.iter().any(|(key,value)|key=="*Runner:KeepOnFailure"&&value=="1")})).into_response(),
             Ok(_)=>Json(json!({"available":false,"keep":false})).into_response(),
@@ -2043,6 +2048,7 @@ async fn metrics(State(st): State<ApiState>) -> Response {
             JobStatus::Queued => "queued",
             JobStatus::Downloading => "downloading",
             JobStatus::Paused => "paused",
+            JobStatus::Held => "held",
             JobStatus::Fetching => "fetching",
             JobStatus::PostQueued | JobStatus::Post { .. } => "post_processing",
             JobStatus::Completed => "completed",

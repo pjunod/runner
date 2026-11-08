@@ -485,13 +485,14 @@ impl Inventory {
                                     local.control.revision.parse::<u64>().unwrap_or(0);
                                 if local_revision >= completed_revision {
                                     checkpoint.job.set_control(&local.control);
-                                    checkpoint.job.status = if local.control.lifecycle == "held"
-                                        || local.control.manual_pause
-                                    {
+                                    checkpoint.job.status = if local.control.lifecycle == "held" {
+                                        nzbd_types::JobStatus::Held
+                                    } else if local.control.manual_pause {
                                         nzbd_types::JobStatus::Paused
                                     } else {
                                         checkpoint.job.status
                                     };
+                                    checkpoint.job.normalize_hold_status();
                                     probe_params = local.probe_params.clone();
                                     local.context = context.clone();
                                     tx.execute(
