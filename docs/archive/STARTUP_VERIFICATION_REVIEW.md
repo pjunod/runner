@@ -1,10 +1,12 @@
 # Startup verification review — findings and disposition
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [STARTUP_RECOVERY_BACKPRESSURE.md](../STARTUP_RECOVERY_BACKPRESSURE.md) and [STARTUP_VERIFICATION_PLAN.md](../STARTUP_VERIFICATION_PLAN.md).
+
 **Status:** Opus third review incorporated; Astra approved the amended specification;
 implementation has not started · **Updated:** 2026-11-01 ·
 **Reviewers:** GPT-6 Astra, high reasoning, and user-supplied Opus review
 
-Companion to [STARTUP_VERIFICATION_PLAN.md](STARTUP_VERIFICATION_PLAN.md)
+Companion to [STARTUP_VERIFICATION_PLAN.md](../STARTUP_VERIFICATION_PLAN.md)
 (incident evidence, runtime recovery contract, and acceptance criteria).
 This record preserves the independent reviews and their disposition.
 The initial Astra review was read-only against local source

@@ -349,7 +349,9 @@ fn successful_delete_never_tombstones_a_recreated_artifact_id() {
     next.state = "retained".into();
     inventory.sidecar(&next).unwrap();
     save_artifact(&inventory.db.lock().unwrap(), &next).unwrap();
-    inventory.reconcile_deleted_artifacts().unwrap();
+    inventory
+        .reconcile_deleted_artifacts_snapshot(None)
+        .unwrap();
     assert_eq!(
         serde_json::to_value(inventory.get(&next.id).unwrap()).unwrap(),
         serde_json::to_value(&next).unwrap()
@@ -375,7 +377,9 @@ fn pending_delete_cannot_cross_generations_and_legacy_success_cannot_repair_them
     legacy.state = "succeeded".into();
     legacy.request = serde_json::to_string(&(&old.id, old.revision, 0u64, false)).unwrap();
     save_operation(&inventory.db.lock().unwrap(), &legacy).unwrap();
-    inventory.reconcile_deleted_artifacts().unwrap();
+    inventory
+        .reconcile_deleted_artifacts_snapshot(None)
+        .unwrap();
     assert_eq!(
         inventory.get(&old.id).unwrap().generation,
         changed.generation

@@ -1,11 +1,13 @@
 # File lifecycle — implementation status
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [FILE_LIFECYCLE_OPERATIONS.md](../FILE_LIFECYCLE_OPERATIONS.md).
+
 **Status:** implementation and adversarial review complete; final CI in progress.
 **Updated:** 2026-09-25.
 
 Companion to [the implementation plan](FILE_LIFECYCLE_PLAN.md),
 [design review](FILE_LIFECYCLE_REVIEW.md), and
-[operations guide](FILE_LIFECYCLE_OPERATIONS.md).
+[operations guide](../FILE_LIFECYCLE_OPERATIONS.md).
 
 ## 1. Delivery
 

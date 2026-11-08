@@ -1,5 +1,7 @@
 # Integration plan — nzbd's side of the monarr pipeline
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [INTEGRATION.md](../INTEGRATION.md), written from [PIPELINE_CONTRACT.md](../PIPELINE_CONTRACT.md).
+
 **Status:** ✅ N1–N7 built and tested (2026-07-26) · **Written:** 2026-07-26 ·
 **Master plan:** `monarr/docs/plan-integration.md` (contract §3, phasing §7)
 

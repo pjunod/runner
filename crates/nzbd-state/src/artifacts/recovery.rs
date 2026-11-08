@@ -70,22 +70,16 @@ fn digest(file: &mut File) -> Result<String> {
 /// 2026-09-28: a 46.8 GiB staging copy across two network mounts ran for 24
 /// minutes and then recorded "filesystem: Invalid argument (os error 22)" —
 /// no operation, no path, nothing to act on.
+/// The original error stays its `source()`, so its errno still decides a
+/// hold (`crate::io_context`).
 fn at<T>(r: std::io::Result<T>, op: &str, path: &Path) -> Result<T> {
-    r.map_err(|e| {
-        Error::Io(std::io::Error::new(
-            e.kind(),
-            format!("{op} {}: {e}", path.display()),
-        ))
-    })
+    r.map_err(|e| Error::Io(crate::io_context(e, format!("{op} {}", path.display()))))
 }
 
 /// Same, for a step that already returns this module's `Result`.
 fn at_dir<T>(r: Result<T>, op: &str, path: &Path) -> Result<T> {
     r.map_err(|e| match e {
-        Error::Io(io) => Error::Io(std::io::Error::new(
-            io.kind(),
-            format!("{op} {}: {io}", path.display()),
-        )),
+        Error::Io(io) => Error::Io(crate::io_context(io, format!("{op} {}", path.display()))),
         other => other,
     })
 }

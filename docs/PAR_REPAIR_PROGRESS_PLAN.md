@@ -5,7 +5,7 @@ earlier pause/review/test sequencing · **Written:**
 2026-10-06 · **Design owner:** originating chat · **Builder:** GPT-6.1 Sol
 
 Companion to [ARCHITECTURE.md](ARCHITECTURE.md), which describes the
-post-processing pipeline, and [FILE_LIFECYCLE_PLAN.md](FILE_LIFECYCLE_PLAN.md),
+post-processing pipeline, and [FILE_LIFECYCLE_PLAN.md](archive/FILE_LIFECYCLE_PLAN.md),
 which explains file custody. This document specifies the repair performance,
 recovery correctness, and progress changes requested after job #1757 on nuc3.
 Implement milestone by milestone, record actual validation here, and deliver
@@ -644,7 +644,7 @@ The user requires proper cohesive commits batched into one substantial PR.
 Do not use or leave files in the user's `~/code` checkouts. The design owner
 works in `/private/tmp/nzbd-repair-design`; the builder uses its isolated clone
 and worktrees. Copy the finalized plan into the implementation branch. Keep
-`docs/PAR_REPAIR_PROGRESS_STATUS.md` updated at meaningful milestones with
+`docs/archive/PAR_REPAIR_PROGRESS_STATUS.md` updated at meaningful milestones with
 branch/PR, implemented scope, decisions, blockers, review, and validation.
 
 Build the complete change before requesting an adversarial agent review.

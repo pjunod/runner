@@ -1,5 +1,5 @@
 //! Acceptance tests for the monarr integration surface
-//! (docs/INTEGRATION_PLAN.md N1–N6), driven against a real daemon over
+//! (docs/archive/INTEGRATION_PLAN.md N1–N6), driven against a real daemon over
 //! real sockets.
 //!
 //! These assert the contract a consumer is entitled to rely on, not the

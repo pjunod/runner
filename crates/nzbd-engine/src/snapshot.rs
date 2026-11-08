@@ -147,13 +147,13 @@ pub struct UrlFetchProgress {
     pub last_error: Option<String>,
 }
 
+/// How many disposal attempts a failed source has had. The schedule and
+/// the last error are the disposal operation's own (`Operation.next_retry`,
+/// `error`), shown on `GET /api/v1/artifacts` and in Files → Attention.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FailedCleanupProgress {
     pub attempts: u32,
-    pub next_retry_at_unix: Option<i64>,
-    pub blocked_since_unix: Option<i64>,
-    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -174,12 +174,7 @@ pub(crate) fn failed_cleanup_progress(job: &nzbd_types::Job) -> Option<FailedCle
             .map(|(_, value)| value.as_str())
     };
     let attempts = value("*PP:failure-disposition-attempts")?.parse().ok()?;
-    Some(FailedCleanupProgress {
-        attempts,
-        next_retry_at_unix: value("*PP:failed-cleanup-next-retry").and_then(|v| v.parse().ok()),
-        blocked_since_unix: value("*PP:failed-cleanup-blocked-since").and_then(|v| v.parse().ok()),
-        last_error: value("*PP:failed-cleanup-last-error").map(str::to_owned),
-    })
+    Some(FailedCleanupProgress { attempts })
 }
 
 pub(crate) fn post_timing(job: &nzbd_types::Job, now_unix: i64) -> Option<PostTiming> {

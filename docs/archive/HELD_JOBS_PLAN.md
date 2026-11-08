@@ -1,6 +1,8 @@
 # Held jobs — why a hold can strand a job, and the fix
 
-**Status:** superseded by [PIPELINE_CONTRACT.md](PIPELINE_CONTRACT.md) — 2026-11-07
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [PIPELINE_CONTRACT.md](../PIPELINE_CONTRACT.md) §2.3 (holds are environmental, with a deadline) and [INTEGRATION.md](../INTEGRATION.md).
+
+**Status:** superseded by [PIPELINE_CONTRACT.md](../PIPELINE_CONTRACT.md) — 2026-11-07
 
 **Previous status:** built on `fix/held-jobs-always-have-an-exit` (rev 2, after
 adversarial review; §8 lists where the build differs) · **Base:**

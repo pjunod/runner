@@ -6,8 +6,8 @@
 `5b683d6a1f29101f13b7c8f853e6346693963d22` (mobile build 9 metadata).
 
 Companion to [MOBILE.md](MOBILE.md) (native app operation),
-[Fable's review](MOBILE_QUEUE_PARITY_REVIEW.md) (findings and decisions), and
-[the web queue delivery record](https://github.com/pjunod/nzbd/blob/a4ef575/docs/TORRENT_QUEUE_STATUS.md)
+[Fable's review](archive/MOBILE_QUEUE_PARITY_REVIEW.md) (findings and decisions), and
+[the web queue delivery record](https://github.com/pjunod/nzbd/blob/a4ef575/docs/archive/TORRENT_QUEUE_STATUS.md)
 (the behavior being ported). Read §3 before changing rendering, then execute
 the milestones in §7. Re-verify the referenced source against the implementation
 base: the working checkout is on `f959cf9`, before the web queue changes.
@@ -450,7 +450,7 @@ distribution limitation explicitly instead of marking delivery complete.
 
 ## 8. Fable review — accepted decisions and source clarifications
 
-[Fable's review](MOBILE_QUEUE_PARITY_REVIEW.md), supplied on 2026-09-27,
+[Fable's review](archive/MOBILE_QUEUE_PARITY_REVIEW.md), supplied on 2026-09-27,
 approved the plan with four required action changes. All four are incorporated
 in §5 and the §6/§7 acceptance checks. The checkmarks below record design
 decisions, not implementation or release completion.

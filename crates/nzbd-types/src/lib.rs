@@ -485,10 +485,19 @@ impl PostStage {
 pub enum JobStatus {
     Queued,
     Downloading,
+    /// Read-side preparation for 0.6.0 (M6b), which persists a held job's
+    /// status as `held` (beside `control.lifecycle == "held"`). This release
+    /// writes a hold as `paused` + that control, and reads a 0.6.0 `held` as
+    /// `Paused`, so during a rolling upgrade a node still on it decodes rows
+    /// an upgraded node wrote; the control carries the hold either way, and
+    /// 0.6.0 turns `paused` + a held control back into `held` on load.
+    #[serde(alias = "held")]
     Paused,
     Fetching, // URL fetch
     PostQueued,
-    Post { stage: PostStage },
+    Post {
+        stage: PostStage,
+    },
     Completed,
     Failed,
     Deleted,
@@ -1297,5 +1306,15 @@ mod tests {
         ] {
             assert_eq!(wire[key], value[key]);
         }
+    }
+
+    #[test]
+    fn held_status_written_by_m6b_reads_as_paused() {
+        let status: JobStatus = serde_json::from_str("\"held\"").unwrap();
+        assert_eq!(status, JobStatus::Paused);
+        assert_eq!(
+            serde_json::to_string(&JobStatus::Paused).unwrap(),
+            "\"paused\""
+        );
     }
 }

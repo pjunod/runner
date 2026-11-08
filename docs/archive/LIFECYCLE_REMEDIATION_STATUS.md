@@ -1,5 +1,7 @@
 # Lifecycle remediation — delivery status
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [PIPELINE_CONTRACT.md](../PIPELINE_CONTRACT.md) and [FILE_LIFECYCLE_OPERATIONS.md](../FILE_LIFECYCLE_OPERATIONS.md).
+
 **Updated:** 2026-11-02. **Scope:** Runner and Curator lifecycle fixes; production
 backlog cleanup remains separate and unapproved.
 

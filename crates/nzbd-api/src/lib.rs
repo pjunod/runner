@@ -5586,3 +5586,201 @@ mod tests {
         assert!(data.contains("\"files\":2"), "{data}");
     }
 }
+
+#[cfg(test)]
+mod integration_doc_tests {
+    use super::event_json;
+    use nzbd_engine::Event as E;
+    use nzbd_types::{FileId, JobId, JobStatus, PostStage, ServerId};
+    use std::collections::BTreeSet;
+
+    /// One of every engine event. The match below stops compiling when a
+    /// variant is added, so a new event cannot skip the doc check.
+    fn every_event() -> Vec<E> {
+        let job = JobId(1);
+        let control = nzbd_types::JobControl {
+            version: 1,
+            revision: "1".into(),
+            lifecycle: "held".into(),
+            cause: "capacity".into(),
+            stage: "unpack".into(),
+            retry_policy: "resume_same_job".into(),
+            message: String::new(),
+            instance: String::new(),
+            previous_status: None,
+            manual_pause: false,
+            retry_attempt: 0,
+            next_retry_at_unix: None,
+            blocked_since_unix: None,
+            released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
+        };
+        let publication = nzbd_types::Publication {
+            path: "/completed/x".into(),
+            generation: "g".into(),
+            manifest_digest: "d".into(),
+            files: 1,
+            cross_volume: false,
+        };
+        let events = vec![
+            E::JobControlChanged {
+                job,
+                control: control.clone(),
+            },
+            E::JobAdded {
+                job,
+                name: "x".into(),
+            },
+            E::JobFinished {
+                job,
+                name: "x".into(),
+                status: JobStatus::Completed,
+                health: 1000,
+            },
+            E::JobDeleted { job },
+            E::UrlFetchResolved { job },
+            E::FileFinished {
+                job,
+                file: FileId(1),
+                filename: "x".into(),
+                ok: true,
+            },
+            E::SegmentExhausted {
+                job,
+                file: FileId(1),
+                segment: 1,
+            },
+            E::ServerBlocked {
+                server: ServerId(0),
+                seconds: 1,
+            },
+            E::QueuePauseChanged {
+                paused: true,
+                source: "test".into(),
+            },
+            E::SpeedLimitChanged {
+                bytes_per_sec: None,
+            },
+            E::MaxActiveDownloadsChanged { n: 1 },
+            E::JobAssigned { job, node: None },
+            E::JobPpStage {
+                job,
+                name: "x".into(),
+                stage: PostStage::Unpack,
+            },
+            E::JobPpFinished {
+                job,
+                name: "x".into(),
+                category: None,
+                transfer: None,
+                outcome: nzbd_types::TerminalOutcome::Completed,
+                reason: None,
+                fetch_cause: None,
+                stage: None,
+                message: None,
+                blames_release: false,
+                salvage: nzbd_types::Salvage::None,
+                keep_on_failure: false,
+                fetched: nzbd_types::Fetched {
+                    success_articles: 0,
+                    total_articles: 0,
+                    bytes: 0,
+                },
+                publication: Some(publication.clone()),
+                pp_status: "SUCCESS".into(),
+                final_dir: None,
+                size_bytes: 0,
+                health: 1000,
+                params: Vec::new(),
+                history_seq: 1,
+                history_incarnation: "i".into(),
+            },
+            E::JobStatusChanged {
+                job,
+                transfer: None,
+                status: "held".into(),
+                stage: None,
+                control: Some(control),
+            },
+            E::JobPublicationReady {
+                job,
+                transfer: None,
+                publication,
+            },
+        ];
+        for event in &events {
+            match event {
+                E::JobControlChanged { .. }
+                | E::JobAdded { .. }
+                | E::JobFinished { .. }
+                | E::JobDeleted { .. }
+                | E::UrlFetchResolved { .. }
+                | E::FileFinished { .. }
+                | E::SegmentExhausted { .. }
+                | E::ServerBlocked { .. }
+                | E::QueuePauseChanged { .. }
+                | E::SpeedLimitChanged { .. }
+                | E::MaxActiveDownloadsChanged { .. }
+                | E::JobAssigned { .. }
+                | E::JobPpStage { .. }
+                | E::JobPpFinished { .. }
+                | E::JobStatusChanged { .. }
+                | E::JobPublicationReady { .. } => {}
+            }
+        }
+        events
+    }
+
+    /// The backticked first-column names of the tables in `docs/INTEGRATION.md`
+    /// "### Event reference", split at the "Stream frames" paragraph.
+    fn documented() -> (BTreeSet<String>, BTreeSet<String>) {
+        let doc = include_str!("../../../docs/INTEGRATION.md");
+        let start = doc
+            .find("### Event reference")
+            .expect("INTEGRATION.md has an Event reference section");
+        let section = &doc[start + 1..];
+        let section = &section[..section.find("\n### ").unwrap_or(section.len())];
+        let split = section
+            .find("Stream frames")
+            .expect("the section names its stream frames");
+        let names = |part: &str| {
+            part.lines()
+                .filter_map(|line| line.strip_prefix("| `"))
+                .filter_map(|rest| rest.split('`').next())
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+        };
+        (names(&section[..split]), names(&section[split..]))
+    }
+
+    #[test]
+    fn integration_doc_names_every_sse_event() {
+        let emitted: BTreeSet<String> = every_event()
+            .iter()
+            .map(|event| event_json(event).0.to_owned())
+            .collect();
+        let (engine, frames) = documented();
+        assert_eq!(
+            emitted, engine,
+            "docs/INTEGRATION.md engine events differ from event_json"
+        );
+        // Stream-local frames: every literal SSE event name this file writes.
+        let source = include_str!("lib.rs");
+        let mut literal = BTreeSet::new();
+        let mut rest = source;
+        let needle = concat!(".event", "(\"");
+        while let Some(at) = rest.find(needle) {
+            let tail = &rest[at + needle.len()..];
+            if let Some(end) = tail.find('"') {
+                literal.insert(tail[..end].to_owned());
+            }
+            rest = tail;
+        }
+        assert_eq!(
+            literal, frames,
+            "docs/INTEGRATION.md stream frames differ from the SSE handler"
+        );
+        assert!(engine.is_disjoint(&frames));
+    }
+}

@@ -194,8 +194,22 @@ pub(crate) struct ResolvedPayload {
 }
 #[derive(Debug)]
 pub(crate) enum ResolveError {
-    Unavailable(String),
+    /// The payload could not be inspected; `cause` is the hold its errno
+    /// names (`None`: a failure retrying cannot fix).
+    Unavailable {
+        message: String,
+        cause: Option<nzbd_types::HoldCause>,
+    },
     IdentityConflict,
+}
+
+impl ResolveError {
+    fn unavailable(error: &(dyn std::error::Error + 'static)) -> Self {
+        ResolveError::Unavailable {
+            message: error.to_string(),
+            cause: crate::error_hold_cause(error),
+        }
+    }
 }
 
 /// Inspect every alias, including the expected publication name. Never fall
@@ -217,15 +231,16 @@ pub(crate) fn resolve_payload(
     for (i, path) in paths.into_iter().enumerate() {
         match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(ResolveError::Unavailable(error.to_string())),
+            Err(error) => return Err(ResolveError::unavailable(&error)),
             Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
                 return Err(ResolveError::IdentityConflict);
             }
             Ok(_) => {}
         }
-        let opened = nzbd_state::fileops::open(&path)
-            .map_err(|error| ResolveError::Unavailable(error.to_string()))?;
-        let identity = capture_identity(&opened).map_err(ResolveError::Unavailable)?;
+        let opened =
+            nzbd_state::fileops::open(&path).map_err(|error| ResolveError::unavailable(&error))?;
+        let identity = nzbd_state::fileops::identity(&opened)
+            .map_err(|error| ResolveError::unavailable(&error))?;
         if let Some(previous) = &found {
             if previous.identity != identity {
                 return Err(ResolveError::IdentityConflict);

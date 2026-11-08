@@ -131,7 +131,7 @@ impl Owner {
             move || {
                 let Some(history) = history else {
                     return Ok(Err(TerminalError::Persistence(
-                        "no history store for the terminal".into(),
+                        terminal::TerminalFault::plain("no history store for the terminal"),
                     )));
                 };
                 Ok(terminal::persist_terminal(&inventory, &history, &terminal))
@@ -149,17 +149,17 @@ impl Owner {
                         .deferred_terminals
                         .entry(job)
                         .or_insert((terminal_retry, history_retry));
-                    owner.terminal_not_durable(job, &error, callback)
+                    owner.terminal_not_durable(job, error, callback)
                 }
                 Ok(Err(TerminalError::Persistence(error))) => {
-                    owner.terminal_not_durable(job, &error, callback)
+                    owner.terminal_not_durable(job, error, callback)
                 }
                 Err(error) => {
                     owner
                         .deferred_terminals
                         .entry(job)
                         .or_insert((terminal_retry, history_retry));
-                    owner.terminal_not_durable(job, &error.to_string(), callback)
+                    owner.terminal_not_durable(job, terminal::TerminalFault::of(&error), callback)
                 }
             },
         );
@@ -200,13 +200,27 @@ impl Owner {
         self.bump_epoch();
     }
 
+    /// A terminal-store write or read that failed after the terminal itself
+    /// is settled (the replay finishes it later). A full state volume still
+    /// latches out-of-space, so downloads stop filling it.
+    pub(super) fn terminal_store_fault(&mut self, whence: &str, fault: &StoreFault) {
+        if crate::out_of_space(fault.cause.as_ref()) {
+            self.observe_out_of_space(whence);
+        }
+    }
+
     /// Contract §2.1: a terminal that could not be written holds the job
     /// `storage_unavailable` on stage `persistence`; the row (if it landed)
     /// is replayed and the event goes out when the write lands.
-    fn terminal_not_durable(&mut self, job: JobId, error: &str, callback: TerminalCallback) {
+    fn terminal_not_durable(
+        &mut self,
+        job: JobId,
+        error: terminal::TerminalFault,
+        callback: TerminalCallback,
+    ) {
         self.release_terminal(job);
         tracing::error!(job = job.0, %error, "terminal record is not durable; holding the job until storage answers");
-        if crate::is_out_of_space(error) {
+        if crate::out_of_space(error.cause.as_ref()) {
             self.observe_out_of_space("terminal record");
         }
         if self.state.job(job).is_some() {
@@ -237,16 +251,23 @@ impl Owner {
             let inventory = self.artifacts.clone();
             self.io_then(
                 move || {
-                    inventory
+                    Ok(inventory
                         .mark_terminal_step(row.job, &TerminalStep::MarkersStamped)
-                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
-                    let mut row = row;
-                    row.markers_stamped = true;
-                    Ok(row)
+                        .map(|()| {
+                            let mut row = row;
+                            row.markers_stamped = true;
+                            row
+                        })
+                        .map_err(|error| terminal::TerminalFault::of(&error)))
                 },
                 move |owner, result| match result {
-                    Ok(row) => owner.emit_terminal_then(row, callback),
-                    Err(error) => owner.terminal_not_durable(job, &error.to_string(), callback),
+                    Ok(Ok(row)) => owner.emit_terminal_then(row, callback),
+                    Ok(Err(error)) => owner.terminal_not_durable(job, error, callback),
+                    Err(error) => owner.terminal_not_durable(
+                        job,
+                        terminal::TerminalFault::of(&error),
+                        callback,
+                    ),
                 },
             );
             return;
@@ -273,21 +294,32 @@ impl Owner {
                 if let (Some(before), Some(current)) = (before, owner.state.job_mut(job)) {
                     *current = before;
                 }
-                owner.terminal_not_durable(job, "the queue snapshot did not commit", callback);
+                owner.terminal_not_durable(
+                    job,
+                    terminal::TerminalFault::plain("the queue snapshot did not commit"),
+                    callback,
+                );
                 return;
             }
             owner.io_then(
                 move || {
-                    inventory
+                    Ok(inventory
                         .mark_terminal_step(row.job, &TerminalStep::MarkersStamped)
-                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
-                    let mut row = row;
-                    row.markers_stamped = true;
-                    Ok(row)
+                        .map(|()| {
+                            let mut row = row;
+                            row.markers_stamped = true;
+                            row
+                        })
+                        .map_err(|error| terminal::TerminalFault::of(&error)))
                 },
                 move |owner, result| match result {
-                    Ok(row) => owner.emit_terminal_then(row, callback),
-                    Err(error) => owner.terminal_not_durable(job, &error.to_string(), callback),
+                    Ok(Ok(row)) => owner.emit_terminal_then(row, callback),
+                    Ok(Err(error)) => owner.terminal_not_durable(job, error, callback),
+                    Err(error) => owner.terminal_not_durable(
+                        job,
+                        terminal::TerminalFault::of(&error),
+                        callback,
+                    ),
                 },
             );
         });
@@ -320,17 +352,27 @@ impl Owner {
         let inventory = self.artifacts.clone();
         self.io_then(
             move || {
-                inventory
+                // The store error is classified here, before it is rendered:
+                // a full state volume is the out-of-space latch, not
+                // corruption (review #296-4).
+                Ok(inventory
                     .mark_terminal_step(row.job, &TerminalStep::Emitted)
-                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
-                let mut row = row;
-                row.emitted = true;
-                Ok(row)
+                    .map(|()| {
+                        let mut row = row;
+                        row.emitted = true;
+                        row
+                    })
+                    .map_err(|error| StoreFault::of(&error)))
             },
             move |owner, result| {
                 owner.release_terminal(job);
                 match result {
-                    Ok(row) => callback(owner, Some(row)),
+                    Ok(Ok(row)) => callback(owner, Some(row)),
+                    Ok(Err(fault)) => {
+                        owner.terminal_store_fault("terminal emitted flag", &fault);
+                        tracing::warn!(job = job.0, error = %fault.message, "terminal emitted; its emitted flag will be replayed");
+                        callback(owner, None);
+                    }
                     Err(error) => {
                         tracing::warn!(job = job.0, %error, "terminal emitted; its emitted flag will be replayed");
                         callback(owner, None);
@@ -351,12 +393,16 @@ impl Owner {
         let inventory = self.artifacts.clone();
         self.io_then(
             move || {
-                inventory
+                Ok(inventory
                     .unfinished_terminals()
-                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))
+                    .map_err(|error| StoreFault::of(&error)))
             },
             |owner, result| match result {
-                Ok(rows) => {
+                Ok(Err(fault)) => {
+                    owner.terminal_store_fault("terminal replay", &fault);
+                    tracing::warn!(error = %fault.message, "terminal replay could not read job_terminals")
+                }
+                Ok(Ok(rows)) => {
                     for row in rows {
                         let job = JobId(row.job);
                         if owner.terminals_in_flight.contains(&job) {
@@ -504,6 +550,21 @@ impl Owner {
         self.last_status.retain(|job, _| seen.contains(job));
         for change in changes {
             self.emit(change);
+        }
+    }
+}
+
+/// A terminal-store failure, classified while the typed error is in hand.
+#[derive(Debug)]
+pub(super) struct StoreFault {
+    pub(super) cause: Option<nzbd_types::HoldCause>,
+    pub(super) message: String,
+}
+impl StoreFault {
+    pub(super) fn of(error: &nzbd_state::artifacts::Error) -> Self {
+        StoreFault {
+            cause: crate::error_hold_cause(error),
+            message: error.to_string(),
         }
     }
 }

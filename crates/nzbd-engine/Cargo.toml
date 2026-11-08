@@ -20,6 +20,7 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 httpdate = { workspace = true }
 libc = { workspace = true }
+rusqlite = { workspace = true }
 crc32fast.workspace = true
 arc-swap = { workspace = true }
 serde = { workspace = true }

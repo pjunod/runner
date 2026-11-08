@@ -1,5 +1,7 @@
 # Independent Astra implementation review
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [STARTUP_RECOVERY_BACKPRESSURE.md](../STARTUP_RECOVERY_BACKPRESSURE.md) and [STARTUP_VERIFICATION_PLAN.md](../STARTUP_VERIFICATION_PLAN.md).
+
 Source: Hermes card `t_6c60a23f`, delivered by `hdr-astra` (gpt-6-astra).
 The exact reviewer handoff follows; fixes and validation are tracked in [STARTUP_VERIFICATION_STATUS.md](STARTUP_VERIFICATION_STATUS.md).
 

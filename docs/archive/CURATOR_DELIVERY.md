@@ -1,8 +1,10 @@
 # Curator delivery — durable publication and receipt protocol (draft)
 
-**Status:** superseded by [PIPELINE_CONTRACT.md](PIPELINE_CONTRACT.md) — 2026-11-07
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [PIPELINE_CONTRACT.md](../PIPELINE_CONTRACT.md) §2.5 (no acceptance) and [INTEGRATION.md](../INTEGRATION.md).
 
-Companion to [INTEGRATION.md](INTEGRATION.md) (the app boundary) — this is
+**Status:** superseded by [PIPELINE_CONTRACT.md](../PIPELINE_CONTRACT.md) — 2026-11-07
+
+Companion to [INTEGRATION.md](../INTEGRATION.md) (the app boundary) — this is
 the restart-safe contract for transferring one completed Runner publication to
 Curator.
 

@@ -1495,7 +1495,7 @@ async fn failed_job_is_not_stamped_when_durable_history_write_fails() {
 }
 
 // ---------------------------------------------------------------------------
-// N6 — category destination honesty (docs/INTEGRATION_PLAN.md)
+// N6 — category destination honesty (docs/archive/INTEGRATION_PLAN.md)
 // ---------------------------------------------------------------------------
 
 /// `[[category]] dest_dir` was parsed and advertised to compat clients as

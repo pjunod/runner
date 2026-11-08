@@ -1,8 +1,10 @@
 # Third review: nzbd startup availability and runtime verification
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [STARTUP_RECOVERY_BACKPRESSURE.md](../STARTUP_RECOVERY_BACKPRESSURE.md) and [STARTUP_VERIFICATION_PLAN.md](../STARTUP_VERIFICATION_PLAN.md).
+
 **Status:** independent third review preserved; see disposition · **Received:** 2026-11-01
 
-Companion to [STARTUP_VERIFICATION_PLAN.md](STARTUP_VERIFICATION_PLAN.md)
+Companion to [STARTUP_VERIFICATION_PLAN.md](../STARTUP_VERIFICATION_PLAN.md)
 and [STARTUP_VERIFICATION_REVIEW.md](STARTUP_VERIFICATION_REVIEW.md).
 The user supplied this review; its body is preserved verbatim. Claims of
 source-supported interleavings are not runtime reproduction results.

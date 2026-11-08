@@ -1,9 +1,11 @@
 # Mobile queue parity — implementation and delivery status
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [MOBILE.md](../MOBILE.md).
+
 **Status:** final validation · **Updated:** 2026-09-28 · **Branch:**
 `codex/mobile-queue-parity` · **Base:** `5b683d6`
 
-Companion to [the implementation plan](MOBILE_QUEUE_PARITY_PLAN.md) and
+Companion to [the implementation plan](../MOBILE_QUEUE_PARITY_PLAN.md) and
 [Fable's plan review](MOBILE_QUEUE_PARITY_REVIEW.md). Work uses an independent
 clone at `/private/tmp/nzbd-mobile-queue-parity`; the original checkout is intact.
 

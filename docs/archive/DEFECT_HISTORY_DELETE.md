@@ -1,5 +1,7 @@
 # Defect — "forget" doesn't forget, and the history cursor pays for it
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [HISTORY_INCREMENTAL.md](../HISTORY_INCREMENTAL.md).
+
 **Status:** resolved with shared JSONL tombstones · **Resolved:** 2026-08-05 ·
 **Confirmed:** probe 2026-07-26 · **Found:** during the post-build review of
 integration phase 1 ([INTEGRATION_PLAN.md](INTEGRATION_PLAN.md)) ·
@@ -8,7 +10,7 @@ first shipped together — though until `9f402d8` (same day, cluster C2) added
 the throttled `refresh()` on the read path, the entry only came back at the
 next daemon start, which is rare enough to look like something else
 
-Companion to [ARCHITECTURE.md](ARCHITECTURE.md) §8.6 (how history is
+Companion to [ARCHITECTURE.md](../ARCHITECTURE.md) §8.6 (how history is
 stored) — this is *one specific thing that store got wrong, the decision that
 fixed it, and the tests that keep it fixed*.
 

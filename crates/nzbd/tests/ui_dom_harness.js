@@ -455,6 +455,18 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     "unchanged storage readings do not rewrite their rows");
 }
 
+// The summary's progress blocks arrive under snake_case keys (their fields
+// are camelCase); the detail line reads them from where the API puts them.
+{
+  const fetching = job(92, { url_fetch: { attempts: 2, nextRetryAtUnix: null, blockedSinceUnix: null, lastError: "HTTP 503" } });
+  ok(T.detailModel(fetching).lifecycleStatus.startsWith("NZB fetch retry 2") &&
+    T.detailModel(fetching).lifecycleStatus.includes("HTTP 503"), "url_fetch retry is shown");
+  const post = job(93, { post_timing: { startedAtUnix: 1, elapsedMs: 4000, workMs: 3000, waitMs: 1000, attempts: 1 } });
+  ok(T.detailModel(post).lifecycleStatus.startsWith("Post-processing: "), "post_timing is shown");
+  const cleanup = job(94, { failed_cleanup: { attempts: 3 } });
+  ok(T.detailModel(cleanup).lifecycleStatus.startsWith("Source cleanup attempt 3"), "failed_cleanup attempts are shown");
+}
+
 // Repair progress is an optional, stable text node; old snapshots stay valid.
 {
   const j = job(91);

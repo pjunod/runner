@@ -298,15 +298,45 @@ pub fn terminal_from_stamped(
     Some(terminal)
 }
 
+/// Why a terminal write did not land: its message, and the hold its errno
+/// names ([`crate::error_hold_cause`]) — a full volume also stops intake.
+#[derive(Debug, Clone)]
+pub struct TerminalFault {
+    pub message: String,
+    pub cause: Option<nzbd_types::HoldCause>,
+}
+
+impl TerminalFault {
+    pub fn of(error: &(dyn std::error::Error + 'static)) -> Self {
+        TerminalFault {
+            message: error.to_string(),
+            cause: crate::error_hold_cause(error),
+        }
+    }
+    /// A refusal with no errno behind it.
+    pub fn plain(message: impl Into<String>) -> Self {
+        TerminalFault {
+            message: message.into(),
+            cause: None,
+        }
+    }
+}
+
+impl std::fmt::Display for TerminalFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Why a terminal step did not land.
 #[derive(Debug)]
 pub enum TerminalError {
     /// The `job_terminals` row itself did not land: nothing durable exists
     /// to replay, so the owner keeps the terminal and retries it.
-    NotRecorded(String),
+    NotRecorded(TerminalFault),
     /// A step after the row failed: the job holds `storage_unavailable` on
     /// stage `persistence` and the stored row is replayed.
-    Persistence(String),
+    Persistence(TerminalFault),
     /// Test support: an injected crash stopped the replay after a step.
     InjectedCrash,
 }
@@ -330,24 +360,24 @@ pub fn persist_terminal(
 ) -> Result<JobTerminal, TerminalError> {
     let mut row = inventory
         .record_terminal(terminal)
-        .map_err(|error| TerminalError::NotRecorded(error.to_string()))?;
+        .map_err(|error| TerminalError::NotRecorded(TerminalFault::of(&error)))?;
     if inventory.take_injected_terminal_crash(row.job, &TerminalStep::Recorded) {
         return Err(TerminalError::InjectedCrash);
     }
     if row.history_seq.is_none() {
         let (seq, _) = history
             .record_seq_durable(&row.entry)
-            .map_err(|error| TerminalError::Persistence(error.to_string()))?;
+            .map_err(|error| TerminalError::Persistence(TerminalFault::of(&error)))?;
         let incarnation = history
             .incarnation()
-            .map_err(|error| TerminalError::Persistence(error.to_string()))?;
+            .map_err(|error| TerminalError::Persistence(TerminalFault::of(&error)))?;
         let step = TerminalStep::HistoryWritten {
             seq,
             incarnation: incarnation.clone(),
         };
         inventory
             .mark_terminal_step(row.job, &step)
-            .map_err(|error| TerminalError::Persistence(error.to_string()))?;
+            .map_err(|error| TerminalError::Persistence(TerminalFault::of(&error)))?;
         row.history_seq = Some(seq);
         row.history_incarnation = Some(incarnation);
         if inventory.take_injected_terminal_crash(row.job, &step) {
