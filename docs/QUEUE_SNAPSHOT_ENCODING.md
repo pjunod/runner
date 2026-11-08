@@ -148,8 +148,9 @@ nested Vec capacities, String capacities, boxed message IDs and frame capacities
 with double-capacity plus per-allocation headroom and a map reserve. Oversized
 entries are not retained. This is not an RSS cap: the owned incoming document,
 encoded output and temporary changed fragment also occupy memory. Staging is
-bounded to 256 MiB of compressed fragments and 128 MiB per changed job or root fragment;
-oversized documents fall back to the original complete encoding after releasing
+bounded to 256 MiB of staged compressed fragments. A changed job or root fragment
+over 128 MiB selects fallback after serialization; that threshold is not a hard
+cap on its temporary serialization Vec. Oversized documents fall back to the original complete encoding after releasing
 staged/cache buffers. Queues beyond the 1 GiB compressed-document limit remain
 supported as plain JSON. The read-only native benchmark reports actual process
 RSS separately, including its comparison documents and buffers.
@@ -172,3 +173,24 @@ cold-cache, warm-cache and largest-job-changed timings, exact byte round trips,
 reuse counts, structural memory estimates and benchmark peak RSS. It starts no
 engine and writes no state. A live deployment is justified only after measured
 benefit, full durability qualification and review.
+
+### Native CPU qualification
+
+A read-only, network-isolated benchmark on nuc3's actual 240,853,207-byte
+document produced exact byte round trips for every case:
+
+| Encoding work | Seconds |
+|---|---:|
+| Whole-document JSON plus zstd | 0.764 |
+| Cold per-job encoder | 0.695 |
+| Unchanged document, warm encoder | 0.082 |
+| Largest job changed | 0.152 |
+
+The warm run reused all 249 current job encodings; the largest-job change reused
+244 and encoded five (including entries not retained under the conservative
+capacity budget). The result occupied 62,352,834 bytes versus 62,457,984 bytes
+for the monolithic envelope. Estimated retained capacity stayed within the
+768 MiB budget. The entire benchmark process peaked at 1,795,796 KiB RSS,
+including its several comparison documents and buffers; this is not production
+cache-only memory. Runtime 109 MiB/s acceptance still requires deployment and
+clean sustained measurement.

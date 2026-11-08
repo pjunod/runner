@@ -724,3 +724,27 @@ See [Queue snapshot encoding](QUEUE_SNAPSHOT_ENCODING.md) for the versioned
 format, integrity limits, old-binary refusal, offline rollback, alternatives and
 runtime acceptance gate. Neither the compression ratio nor successful unit
 checks establishes 109 MiB/s; deployment measurement is still required.
+
+
+## 14. Remaining CPU cost — repeatedly encoding unchanged jobs
+
+Lossless compression reduced measured write time from 10.57 to 3.68 seconds per
+20-second diagnostic sample. The next sample's 16 saves still consumed 17.40
+seconds, mostly in CPU encoding rather than filesystem calls. The active queue
+contains roughly two million segment records, although only a small part changes
+at a file barrier.
+
+A bounded encoder now reuses a complete job fragment only after full field
+equality, rebuilding fresh root/admission fields and preserving exact order.
+Every output is a self-contained full snapshot with checked frame count, decoded
+length and checksum; no prior file or cache is part of recovery authority.
+Ownership transfer avoids cloning jobs merely for cache retention. Structural
+capacity accounting and independent per-store budgets bound retained entries;
+temporary buffers and actual process RSS are measured separately.
+
+On the actual nuc3 document, read-only native encoding fell from 0.764 seconds
+to 0.082 seconds for an unchanged document, or 0.152 seconds with the largest
+job changed. All reconstructed bytes matched ordinary serialization. See
+[Queue snapshot encoding](QUEUE_SNAPSHOT_ENCODING.md) for memory accounting,
+version-2 compatibility and mandatory offline conversion before downgrade.
+This establishes encoder benefit, not restored download throughput.

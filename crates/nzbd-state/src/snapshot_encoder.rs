@@ -713,8 +713,10 @@ mod tests {
         let mut encoder = SnapshotEncoder::default();
         exact(&mut encoder, doc());
         assert!(!encoder.entries.is_empty());
-        let mut larger = QueueSnapshotDoc::default();
-        larger.jobs = (1..=MAX_JOBS as u32 + 1).map(job).collect();
+        let larger = QueueSnapshotDoc {
+            jobs: (1..=MAX_JOBS as u32 + 1).map(job).collect(),
+            ..Default::default()
+        };
         let bytes = exact(&mut encoder, larger);
         assert!(!bytes.starts_with(snapshot_codec::MAGIC_V2));
         assert!(encoder.entries.is_empty());
