@@ -482,6 +482,28 @@ impl Inventory {
         }
     }
 
+    /// Whether a failed-source disposal operation (`delete`, or a park
+    /// `relocate`) for any of the job's artifacts is still unresolved. Its
+    /// payload is then held by that operation — possibly already moved but
+    /// not committed — not absent.
+    pub fn disposal_in_flight(&self, job: u32) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        Ok(db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations o JOIN artifacts a ON a.id=o.artifact WHERE a.job=?1 AND o.state NOT IN ('succeeded','cancelled') AND json_extract(o.data,'$.kind') IN ('delete','relocate'))",
+            [job],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Operator Retry now for a failed source's disposal: the job's pending
+    /// park relocation becomes due on its own ladder and is replayed now
+    /// (the same single-operation resume a post-processing retry uses). A
+    /// move that ran but did not commit is committed where its bytes are;
+    /// anything the relocation cannot resume is left on its ladder.
+    pub fn retry_disposal_now(&self, job: u32) -> Result<()> {
+        self.resume_post_relocation_checked(job, &|| Ok(()), true)
+    }
+
     /// Test support: the next `record_terminal` for `job` fails before the
     /// row is written, as a refused write would.
     #[cfg(feature = "test-support")]
