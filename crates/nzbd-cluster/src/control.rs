@@ -1943,9 +1943,9 @@ pub(crate) fn unix_ms_public() -> i64 {
 }
 
 #[cfg(test)]
-mod coordinator_protocol_tests {
+pub(crate) mod coordinator_protocol_tests {
     use super::*;
-    async fn test_store(temp: &tempfile::TempDir, cluster_id: &str) -> ControlStore {
+    pub(crate) async fn test_store(temp: &tempfile::TempDir, cluster_id: &str) -> ControlStore {
         let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let cfg = ClusterConfig {

@@ -119,6 +119,17 @@ async fn replicated_election_task(
                     tracing::warn!("replicated leader lease was rejected; demoting");
                     publish(&tx, projected_leader(&layout, None), false);
                 }
+                Err(error) if cancel.is_cancelled() => {
+                    // Shutdown cancels this task and then stops the control
+                    // store before the engine's final checkpoint. A renewal
+                    // already in flight fails because of that stop, which is
+                    // not lost office: the lease stays valid until its
+                    // deadline. Demoting here would fence the final
+                    // checkpoint. A rejection (`Ok(None)`) still demotes.
+                    tracing::debug!(%error, "leader renewal interrupted by shutdown");
+                    token = Some(current);
+                    break;
+                }
                 Err(error) => {
                     tracing::warn!(%error, "replicated leader renewal failed; demoting");
                     publish(&tx, projected_leader(&layout, None), false);
@@ -528,5 +539,59 @@ mod tests {
             .unwrap();
         assert!(!guard());
         drop(tx);
+    }
+
+    /// Shutdown cancels the election, then stops the replicated control
+    /// store before the engine writes its final checkpoint. A renewal that
+    /// was already in flight then fails with "raft stopped". That error is
+    /// this node's own shutdown, not lost office: the lease is still valid
+    /// until its deadline, so the view must stay "me" and the final
+    /// checkpoint must not be fenced. A one-millisecond interval keeps a
+    /// renewal in flight almost continuously, so the race is hit on nearly
+    /// every round.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn renewal_error_after_shutdown_cancel_does_not_demote() {
+        for round in 0..3 {
+            let temp = tempfile::tempdir().unwrap();
+            let control = crate::control::coordinator_protocol_tests::test_store(
+                &temp,
+                &format!("shutdown-renewal-{round}"),
+            )
+            .await;
+            let layout = SharedLayout::new(&temp.path().join("shared"), "new").unwrap();
+            let mut election = cfg("new", 0);
+            election.lease_interval = Duration::from_millis(1);
+            let tracker = TaskTracker::new();
+            let cancel = CancellationToken::new();
+            let mut view = spawn_replicated_election(
+                layout,
+                election,
+                control.clone(),
+                "boot".into(),
+                cancel.clone(),
+                &tracker,
+            );
+            tokio::time::timeout(Duration::from_secs(10), view.wait_for(|v| v.is_me))
+                .await
+                .expect("single voter takes office")
+                .unwrap();
+            // Let several renewals commit so one is in flight below.
+            let renewed = view.borrow().record.as_ref().map_or(0, |r| r.seq);
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                view.wait_for(|v| v.record.as_ref().is_some_and(|r| r.seq >= renewed + 3)),
+            )
+            .await
+            .expect("renewals commit")
+            .unwrap();
+            cancel.cancel();
+            control.shutdown().await.unwrap();
+            tracker.close();
+            tracker.wait().await;
+            assert!(
+                view.borrow().is_me,
+                "round {round}: shutdown's own control stop demoted the leader"
+            );
+        }
     }
 }
