@@ -653,10 +653,14 @@ impl Inventory {
             .transpose()
     }
     fn scratch_operation(&self, scratch: &str) -> Result<Option<(Operation, Workspace)>> {
-        let raw: Option<String> = self.db.lock().unwrap().query_row(
-            "SELECT data FROM operations WHERE json_extract(data,'$.kind') IN ('extract','par_repair') AND json_extract(json_extract(data,'$.request'),'$.scratch.id')=?1 LIMIT 1",
-            [scratch], |row| row.get(0),
-        ).optional()?;
+        let raw: Option<String> = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(operation_queries::TRANSFORM_SCRATCH, [scratch], |row| {
+                row.get(0)
+            })
+            .optional()?;
         raw.map(|raw| {
             let op: Operation = serde_json::from_str(&raw)?;
             let workspace = serde_json::from_str(&op.request)?;

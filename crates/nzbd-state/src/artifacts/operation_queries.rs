@@ -1,0 +1,19 @@
+//! Shared production SQL: query-plan regression tests exercise these exact statements.
+
+pub(super) const TRANSFORM_SCRATCH: &str = "SELECT data FROM operations WHERE json_extract(data,'$.kind') IN ('extract','par_repair') AND json_extract(json_extract(data,'$.request'),'$.scratch.id')=?1 LIMIT 1";
+
+pub(super) const TRANSFORM_SCRATCH_GENERATION: &str = "SELECT data FROM operations WHERE json_extract(data,'$.kind') IN ('extract','par_repair') AND json_extract(json_extract(data,'$.request'),'$.scratch.id')=?1 AND json_extract(json_extract(data,'$.request'),'$.scratch.generation')=?2 LIMIT 1";
+
+pub(super) const TORRENT_TRANSFORM_SCRATCH: &str = "SELECT data FROM operations WHERE artifact=?1 AND state='succeeded' AND json_extract(data,'$.kind') IN ('extract','par_repair') AND json_extract(json_extract(data,'$.request'),'$.scratch.id')=?2 LIMIT 1";
+
+pub(super) const DISCOVERY_STATUS: &str = "SELECT data FROM operations WHERE json_extract(data,'$.kind')='scan' ORDER BY json_extract(data,'$.created_at') DESC LIMIT 1";
+
+pub(super) const COMPLETED_RELOCATIONS: &str = "SELECT id FROM operations WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.id')=?1 AND json_extract(json_extract(data,'$.request'),'$.source.generation')=?2 AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup_done'),0)=0 ORDER BY rowid";
+
+pub(super) const WAKE_RELOCATION_CLEANUP: &str = "SELECT data FROM operations WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.generation')=?1";
+
+pub(super) const RELOCATION_CLEANUP_CANDIDATES: &str = "SELECT data FROM operations o WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.root')=?1 AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup_done'),0)=0 AND json_extract(json_extract(data,'$.request'),'$.source.automatic_cleanup_eligible')=1 AND (COALESCE(json_extract(json_extract(data,'$.request'),'$.defer_source_retirement'),0)=0 OR EXISTS (SELECT 1 FROM deliveries d WHERE d.artifact=o.artifact AND d.generation=json_extract(json_extract(o.data,'$.request'),'$.source.generation')) OR EXISTS (SELECT 1 FROM workspace_finalizations f WHERE f.source=o.artifact AND f.generation=json_extract(json_extract(o.data,'$.request'),'$.source.generation') AND f.activated=1 AND json_extract(f.proof,'$.kind')='cluster')) AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup.state'),'pending') NOT IN ('blocked','running') AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup.next_retry'),0)<=unixepoch() AND NOT EXISTS(SELECT 1 FROM deliveries d WHERE d.artifact=o.artifact AND d.generation=json_extract(json_extract(o.data,'$.request'),'$.source.generation') AND (d.cleanup_status IN ('blocked','running','succeeded') OR COALESCE(d.cleanup_next_retry_at,0)>unixepoch())) ORDER BY o.rowid LIMIT 25";
+
+pub(super) const TORRENT_STAGE_CLEANUP: &str = "SELECT o.rowid,json_extract(json_extract(o.data,'$.request'),'$.job') FROM operations o JOIN artifacts a ON a.id=o.artifact LEFT JOIN operations s ON s.id='torrent-stage-status-job-'||json_extract(json_extract(o.data,'$.request'),'$.job') WHERE o.rowid>?1 AND json_extract(o.data,'$.kind')='torrent-copy' AND a.state='deleted' AND COALESCE(json_extract(json_extract(o.data,'$.request'),'$.stage_cleanup_complete'),0)=0 AND (s.id IS NULL OR (s.state!='review' AND COALESCE(json_extract(s.data,'$.next_retry'),0)<=?2)) ORDER BY o.rowid LIMIT 64";
+
+pub(super) const TORRENT_COPY_COMPACTION: &str = "SELECT rowid,id,artifact FROM operations WHERE rowid>?1 AND state='succeeded' AND json_extract(data,'$.kind')='torrent-copy' AND json_extract(json_extract(data,'$.request'),'$.compacted_delivery') IS NULL ORDER BY rowid LIMIT 64";

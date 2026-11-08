@@ -257,7 +257,15 @@ status transition, including into and out of `held`. `status` is the
 projected native status: a job held on an environmental cause reads `held`
 (the persisted status stays `Paused` until M6), and `control.deadline_in_s` /
 `deadline_unix` say when the hold ends on its own. The queue listing carries
-the same projection as `status_projected`, plus `transfer`.
+the same projection as `status_projected`, plus `transfer`. `deadline_in_s` is
+the time remaining as of the control's last write, not a live countdown; use
+`deadline_unix` for one.
+
+`GET /api/v1/artifacts` (and `/artifacts/{id}`) rows for a failed source
+carry `failure_reason` (the same wire string as `job_pp_finished.reason`, set
+when the terminal is recorded) and `salvage` (`pending`, `published` or
+`settled_none`); `failure_assessment.reason` is the assessment's own text.
+The Files tab reads these to say why a source is parked.
 
 `job_publication_ready{job, transfer, publication}` announces a salvage
 publication of a failed job. It is not a terminal; the job stays failed. The

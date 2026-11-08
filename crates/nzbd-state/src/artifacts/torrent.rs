@@ -1728,7 +1728,7 @@ impl Inventory {
                 .and_then(|value| value.parse::<i64>().ok())
                 .unwrap_or(0);
             let query_page = |after: i64| -> Result<Vec<(i64, u32)>> {
-                let mut query=db.prepare("SELECT o.rowid,json_extract(json_extract(o.data,'$.request'),'$.job') FROM operations o JOIN artifacts a ON a.id=o.artifact LEFT JOIN operations s ON s.id='torrent-stage-status-job-'||json_extract(json_extract(o.data,'$.request'),'$.job') WHERE o.rowid>?1 AND json_extract(o.data,'$.kind')='torrent-copy' AND a.state='deleted' AND COALESCE(json_extract(json_extract(o.data,'$.request'),'$.stage_cleanup_complete'),0)=0 AND (s.id IS NULL OR (s.state!='review' AND COALESCE(json_extract(s.data,'$.next_retry'),0)<=?2)) ORDER BY o.rowid LIMIT 64")?;
+                let mut query = db.prepare(operation_queries::TORRENT_STAGE_CLEANUP)?;
                 let rows =
                     query.query_map(params![after, now()], |row| Ok((row.get(0)?, row.get(1)?)))?;
                 Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1770,7 +1770,7 @@ impl Inventory {
                 .and_then(|value| value.parse::<i64>().ok())
                 .unwrap_or(0);
             let page = |after: i64| -> Result<Vec<(i64, String, String)>> {
-                let mut query=db.prepare("SELECT rowid,id,artifact FROM operations WHERE rowid>?1 AND state='succeeded' AND json_extract(data,'$.kind')='torrent-copy' AND json_extract(json_extract(data,'$.request'),'$.compacted_delivery') IS NULL ORDER BY rowid LIMIT 64")?;
+                let mut query = db.prepare(operation_queries::TORRENT_COPY_COMPACTION)?;
                 let rows =
                     query.query_map([after], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
                 Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1865,7 +1865,16 @@ impl Inventory {
         let scratch = if direct || relocated {
             false
         } else {
-            let raw:Option<String>=self.db.lock().unwrap().query_row("SELECT data FROM operations WHERE artifact=?1 AND state='succeeded' AND json_extract(data,'$.kind') IN ('extract','par_repair') AND json_extract(json_extract(data,'$.request'),'$.scratch.id')=?2 LIMIT 1",params![op.artifact,delivery.artifact_id],|row|row.get(0)).optional()?;
+            let raw: Option<String> = self
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    operation_queries::TORRENT_TRANSFORM_SCRATCH,
+                    params![op.artifact, delivery.artifact_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
             if let Some(raw) = raw {
                 let transform: Operation = serde_json::from_str(&raw)?;
                 let workspace: Workspace = serde_json::from_str(&transform.request)?;

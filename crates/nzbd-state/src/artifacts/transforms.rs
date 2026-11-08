@@ -482,10 +482,16 @@ impl Inventory {
         if artifact.job.is_some() {
             return Ok(false);
         }
-        let raw: Option<String> = self.db.lock().unwrap().query_row(
-            "SELECT data FROM operations WHERE json_extract(data,'$.kind') IN ('extract','par_repair') AND json_extract(json_extract(data,'$.request'),'$.scratch.id')=?1 AND json_extract(json_extract(data,'$.request'),'$.scratch.generation')=?2 LIMIT 1",
-            params![artifact.id, artifact.generation], |row| row.get(0),
-        ).optional()?;
+        let raw: Option<String> = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                operation_queries::TRANSFORM_SCRATCH_GENERATION,
+                params![artifact.id, artifact.generation],
+                |row| row.get(0),
+            )
+            .optional()?;
         let Some(raw) = raw else {
             return Ok(false);
         };

@@ -188,6 +188,32 @@ rewrite in `commit_intent` (`intents.rs`).
 day; `GET /api/v1/artifacts?filter=attention` lists no `transitioning`
 sources after the first restart (no open intents).
 
+## Pipeline contract v2 M1b — surfaces — 2026-11-07
+
+**Status:** built on `claude/pipeline-v2-m1b-runner` (stacked on M1a, mobile
+1.1.5, iOS build 17, Android 16), not merged, not deployed. Plan:
+`IMPL_RUNNER.md` §6.
+
+- **Web queue row:** a held job names its cause, then Runner's message, the
+  retry timing and the deadline countdown (`deadline_unix`, else
+  `deadline_in_s`), with the existing pause/retry button.
+- **Web Files tab:** a parked source shows why (failure reason, assessment
+  text, `salvage pending`) on the row and in the details panel. To carry the
+  reason, `Artifact` gains `failure_reason`, written in the same transaction
+  as the terminal row (`artifacts/terminals.rs`).
+- **Mobile:** held cards show cause + message, `retries paused`, and the
+  deadline countdown; `holdAction` no longer models a review policy. The app
+  has no Files tab, so there is no parked-source surface there.
+- **Docs:** USAGE (held row, parked sources), MOBILE (held card), INTEGRATION
+  (`failure_reason`/`salvage` on artifact rows, `deadline_in_s` semantics).
+- **Deleted:** the mobile review-hold special case (`AUTOMATIC` list and the
+  "a person decides" branch).
+- **Not verified:** no screenshots of a held row or a parked Files row (no
+  browser or device in the build workspace); full `ui_dom` Rust gate not run
+  (the node harness was run directly).
+- **Decision for Paul:** `controlPending: review_required` ("Source needs
+  review") is a control-acceptance state, not a hold, and was left alone.
+
 ## Pipeline contract v2 M1a — review rounds (#280, #281) — 2026-11-08
 
 **Status:** all #280 findings fixed on `claude/pipeline-v2-m1a-runner`
