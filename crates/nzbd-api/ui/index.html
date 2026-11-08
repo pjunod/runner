@@ -2806,14 +2806,15 @@ function detailModel(j, nowMs) {
     .map(([k, v]) => k + " = " + v);
   if (acquisition) bits.unshift("Torrent acquisition · separate seed source" + (j.seed_donor_job_id != null ? " #" + j.seed_donor_job_id : ""));
   const recoverMax = recoveryMax(j);
-  const postTiming = j.postTiming;
-  const cleanupRetry = j.failedCleanup;
-  const urlRetry = j.urlFetch;
+  // The summary's own keys are snake_case; only their fields are camelCase.
+  const postTiming = j.post_timing;
+  const cleanupRetry = j.failed_cleanup;
+  const urlRetry = j.url_fetch;
   const heldControl = j.control && j.control.lifecycle === "held" ? j.control : null;
   const lifecycleStatus = controlPendingText(j) || (j.verification ? recoveryVerificationText(j) : postTiming
     ? "Post-processing: " + fmtDur(postTiming.elapsedMs) + " elapsed · " + fmtDur(postTiming.workMs) + " work · " + fmtDur(postTiming.waitMs) + " waiting · " + postTiming.attempts + " retries"
     : cleanupRetry
-      ? "Source cleanup retry " + cleanupRetry.attempts + (cleanupRetry.blockedSinceUnix ? " · blocked " + fmtDur(Math.max(0, nowMs - cleanupRetry.blockedSinceUnix * 1000)) : "") + (cleanupRetry.lastError ? " · " + cleanupRetry.lastError : "")
+      ? "Source cleanup attempt " + cleanupRetry.attempts + " · schedule and last error in Files → Attention"
       : urlRetry
         ? "NZB fetch retry " + urlRetry.attempts + (urlRetry.blockedSinceUnix ? " · waiting " + fmtDur(Math.max(0, nowMs - urlRetry.blockedSinceUnix * 1000)) : "") + (urlRetry.nextRetryAtUnix ? " · next " + new Date(urlRetry.nextRetryAtUnix * 1000).toLocaleTimeString() : "") + (urlRetry.lastError ? " · " + urlRetry.lastError : "")
         : heldControl

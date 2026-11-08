@@ -580,15 +580,6 @@ pub(crate) enum QueueCommand {
         generation: String,
         reply: oneshot::Sender<Result<nzbd_state::artifacts::Artifact, String>>,
     },
-    SchedulePostRetry {
-        job: JobId,
-        revision: String,
-        retry_attempt: u8,
-        next_retry: i64,
-        blocked_since: i64,
-        message: String,
-        reply: oneshot::Sender<bool>,
-    },
     BeginResourceProbe {
         job: JobId,
         revision: String,
@@ -1377,6 +1368,7 @@ impl Owner {
                 if j.held() {
                     j.status = JobStatus::Paused;
                 }
+                drop_retired_params(j);
             }
             state.recompute_all_totals();
             // Holds re-derive their recovery from their cause on every load
@@ -2498,70 +2490,6 @@ impl Owner {
                     } else {
                         owner.publish_now();
                         owner.bump_epoch();
-                    }
-                    let _ = reply.send(ok);
-                });
-            }
-            QueueCommand::SchedulePostRetry {
-                job,
-                revision,
-                retry_attempt,
-                next_retry,
-                blocked_since,
-                message,
-                reply,
-            } => {
-                let before = self.state.job(job).cloned();
-                let mut changed = false;
-                if !self.persistence_fenced {
-                    if let Some(row) = self.state.job_mut(job) {
-                        if row.lifecycle_eligible() {
-                            if let Some(mut control) = row.control().filter(|control| {
-                                control.revision == revision
-                                    && control.lifecycle == "held"
-                                    && !control.manual_pause
-                                    && retry_attempt == control.retry_attempt.saturating_add(1)
-                                    && next_retry >= control.next_retry_at_unix.unwrap_or(0)
-                            }) {
-                                if let Some(next_revision) = control
-                                    .revision
-                                    .parse::<u64>()
-                                    .ok()
-                                    .and_then(|value| value.checked_add(1))
-                                {
-                                    control.revision = next_revision.to_string();
-                                    control.retry_attempt = retry_attempt;
-                                    control.next_retry_at_unix = Some(next_retry);
-                                    control.blocked_since_unix = Some(
-                                        control
-                                            .blocked_since_unix
-                                            .unwrap_or(blocked_since)
-                                            .min(blocked_since),
-                                    );
-                                    control.retry_policy = "scheduled_retry".into();
-                                    control.message = message.chars().take(2048).collect();
-                                    row.set_control(&control);
-                                    changed = true;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if !changed {
-                    let _ = reply.send(false);
-                    return;
-                }
-                self.pending_control_commits.insert(job);
-                self.commit_control_change_then(job, before.clone(), move |owner, ok| {
-                    owner.pending_control_commits.remove(&job);
-                    if ok {
-                        owner.publish_now();
-                        owner.bump_epoch();
-                    } else if let Some(before) = before {
-                        if let Some(current) = owner.state.job_mut(job) {
-                            *current = before;
-                        }
                     }
                     let _ = reply.send(ok);
                 });
@@ -10324,6 +10252,25 @@ fn allocation_hold_cause(message: &str) -> nzbd_types::HoldCause {
     } else {
         nzbd_types::HoldCause::Allocation
     }
+}
+
+/// Params earlier builds persisted for a clock this build no longer runs.
+/// The failed-source cleanup retry (`*PP:failed-cleanup-*`) lives on the
+/// disposal `Operation.next_retry` since M6; a row an older build wrote
+/// still carries these, so they are dropped when the queue loads and are
+/// never written or read again.
+pub(crate) const RETIRED_PARAMS: [&str; 3] = [
+    "*PP:failed-cleanup-next-retry",
+    "*PP:failed-cleanup-blocked-since",
+    "*PP:failed-cleanup-last-error",
+];
+
+/// Drop [`RETIRED_PARAMS`] from a loaded row; true when any was present.
+pub(crate) fn drop_retired_params(job: &mut Job) -> bool {
+    let before = job.params.len();
+    job.params
+        .retain(|(key, _)| !RETIRED_PARAMS.contains(&key.as_str()));
+    job.params.len() != before
 }
 
 /// Apply [`rearmed_hold`] to every held job; returns how many changed.

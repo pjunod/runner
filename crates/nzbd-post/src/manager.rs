@@ -2039,76 +2039,6 @@ async fn scan_queue(
     deferred
 }
 
-async fn schedule_recoverable_post_retry(engine: &EngineHandle, job: JobId) {
-    let Ok(Some(row)) = engine.export_job(job).await else {
-        return;
-    };
-    if !row.lifecycle_eligible() {
-        return;
-    }
-    let Some(mut control) = row.control().filter(|control| {
-        control.lifecycle == "held"
-            && control.hold_cause().policy().timed()
-            && !control.manual_pause
-    }) else {
-        return;
-    };
-
-    if control.next_retry_at_unix.is_some()
-        && control.retry_policy == control.hold_cause().policy().as_str()
-    {
-        return;
-    }
-    prepare_recoverable_post_retry(&mut control, job, now());
-    if !engine
-        .schedule_post_retry(
-            job,
-            control.revision,
-            control.retry_attempt,
-            control.next_retry_at_unix.expect("scheduled deadline"),
-            control.blocked_since_unix.expect("blocked time"),
-            control.message,
-        )
-        .await
-        .unwrap_or(false)
-    {
-        tracing::warn!(job = job.0, "recoverable retry schedule was not committed");
-    }
-}
-
-fn prepare_recoverable_post_retry(control: &mut nzbd_types::JobControl, job: JobId, at: i64) {
-    let delay = retry_delay_with_jitter(
-        post_retry_delay_seconds(control.retry_attempt),
-        job,
-        u32::from(control.retry_attempt),
-    );
-    control.retry_attempt = control.retry_attempt.saturating_add(1);
-    control.next_retry_at_unix = Some(
-        at.saturating_add(delay)
-            .max(control.next_retry_at_unix.unwrap_or(0)),
-    );
-    control.blocked_since_unix.get_or_insert(at);
-    control.retry_policy = "scheduled_retry".into();
-    let reason = control
-        .message
-        .split("; retry ")
-        .next()
-        .unwrap_or("recoverable post-processing error")
-        .chars()
-        .take(1200)
-        .collect::<String>();
-    control.message = format!(
-        "{reason}; retry {} scheduled in {} seconds; source retained while Runner retries{}",
-        control.retry_attempt,
-        delay,
-        if at.saturating_sub(control.blocked_since_unix.unwrap_or(at)) >= 30 * 60 {
-            "; warning: blocked for at least 30 minutes"
-        } else {
-            ""
-        },
-    );
-}
-
 /// Retain the exact leased worker attempt through recoverable post failures.
 /// Scheduling itself is an owner CAS and, on cluster workers, a durable local
 /// inventory checkpoint rather than a volatile queue import.
@@ -2138,7 +2068,6 @@ pub async fn retain_worker_post_retry(
             }
         }
     }
-    schedule_recoverable_post_retry(engine, job).await;
     engine
         .export_job(job)
         .await
@@ -2150,18 +2079,6 @@ pub async fn retain_worker_post_retry(
                 && control.next_retry_at_unix.is_some()
                 && !control.manual_pause
         })
-}
-
-fn retry_delay_with_jitter(base: i64, job: JobId, attempt: u32) -> i64 {
-    let seed = u64::from(job.0).wrapping_mul(0x9e3779b97f4a7c15)
-        ^ u64::from(attempt).wrapping_mul(0xbf58476d1ce4e5b9)
-        ^ now() as u64;
-    base.saturating_add((seed % (base.max(1) as u64 / 10 + 1)) as i64)
-}
-
-const POST_RETRY_DELAYS_SECONDS: [i64; 4] = [30, 60, 120, 300];
-fn post_retry_delay_seconds(retry_attempt: u8) -> i64 {
-    POST_RETRY_DELAYS_SECONDS[usize::from(retry_attempt).min(POST_RETRY_DELAYS_SECONDS.len() - 1)]
 }
 
 /// Replay a crash after the terminal stamp using the exact history cursor,
@@ -10566,7 +10483,9 @@ mod decision_tests {
         engine.shutdown().await;
     }
     #[tokio::test]
-    async fn recoverable_post_schedule_preserves_deadlines_first_block_and_restart() {
+    async fn held_rows_keep_the_owner_schedule_on_import_and_restart() {
+        // M6: the owner's hold ladder is the only clock a held PP job runs
+        // on; importing a row re-derives its policy without moving it.
         let temp = tempfile::tempdir().unwrap();
         let config = || {
             nzbd_engine::EngineConfig::single_node(
@@ -10610,7 +10529,6 @@ mod decision_tests {
                 .import_fixture_job(request.clone(), false, false)
                 .await
                 .unwrap();
-            schedule_recoverable_post_retry(&engine, request.id).await;
             let scheduled = engine
                 .export_job(request.id)
                 .await
@@ -10640,19 +10558,6 @@ mod decision_tests {
             .unwrap()
             .control()
             .unwrap();
-        // Exercise scheduling itself separately from import's policy migration.
-        let mut unscheduled = expected.clone();
-        unscheduled.retry_attempt = 0;
-        unscheduled.next_retry_at_unix = None;
-        unscheduled.message = "temporarily blocked".into();
-        let scheduled_at = now();
-        prepare_recoverable_post_retry(&mut unscheduled, JobId(44), scheduled_at);
-        assert_eq!(unscheduled.retry_attempt, 1);
-        assert!(unscheduled.next_retry_at_unix.unwrap() > scheduled_at);
-        assert_eq!(unscheduled.blocked_since_unix, Some(first_block));
-        assert!(unscheduled
-            .message
-            .contains("warning: blocked for at least 30 minutes"));
         let mut paused = job(vec![], vec![]);
         paused.id = JobId(45);
         paused.delivery_lifecycle = true;
@@ -10664,7 +10569,6 @@ mod decision_tests {
             .import_fixture_job(paused, false, false)
             .await
             .unwrap();
-        schedule_recoverable_post_retry(&engine, JobId(45)).await;
         assert_eq!(
             engine
                 .export_job(JobId(45))
@@ -10688,11 +10592,5 @@ mod decision_tests {
         assert_eq!(control.blocked_since_unix, expected.blocked_since_unix);
         assert_eq!(control.retry_attempt, expected.retry_attempt);
         reopened.shutdown().await;
-        for base in [30, 60, 120, 300] {
-            for attempt in 0..100 {
-                let delay = retry_delay_with_jitter(base, JobId(attempt), attempt);
-                assert!((base..=base + base / 10).contains(&delay));
-            }
-        }
     }
 }

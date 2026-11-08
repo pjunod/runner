@@ -6969,23 +6969,14 @@ async fn worker_retry_schedule_survives_regrant_without_overriding_new_leader_in
         "move",
         "destination full"
     ));
-    let control = owner.state.jobs[0].control().unwrap();
-    let deadline = unix_now() + 300;
-    let (reply, result) = oneshot::channel();
-    owner.on_command(QueueCommand::SchedulePostRetry {
-        job: JobId(77),
-        revision: control.revision,
-        retry_attempt: control.retry_attempt.saturating_add(1),
-        next_retry: deadline,
-        blocked_since: unix_now(),
-        message: "retry scheduled".into(),
-        reply,
-    });
     pump(&mut owner, &mut messages).await;
-    assert!(
-        result.await.unwrap(),
-        "worker must commit to local inventory rather than a shared snapshot"
-    );
+    // The hold's own schedule (the owner's ladder, the only hold clock) is
+    // committed to the worker's local inventory, not a shared snapshot.
+    let deadline = owner.state.jobs[0]
+        .control()
+        .unwrap()
+        .next_retry_at_unix
+        .expect("a capacity hold is timed");
     let durable = owner
         .artifacts
         .worker_control(77, &context)

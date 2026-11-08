@@ -2731,29 +2731,6 @@ impl EngineHandle {
         owner_reply(rx).await
     }
 
-    /// Persist an automatic retry schedule only while the observed hold still owns this job.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn schedule_post_retry(
-        &self,
-        job: JobId,
-        revision: String,
-        retry_attempt: u8,
-        next_retry: i64,
-        blocked_since: i64,
-        message: String,
-    ) -> Result<bool, EngineError> {
-        self.roundtrip_bool(|reply| QueueCommand::SchedulePostRetry {
-            job,
-            revision,
-            retry_attempt,
-            next_retry,
-            blocked_since,
-            message,
-            reply,
-        })
-        .await
-    }
-
     /// Operator retry from post-processing's own surfaces (restart, Retry):
     /// the same release as `resume` on a held job.
     pub async fn retry_post_hold(&self, job: JobId, revision: String) -> Result<bool, EngineError> {
