@@ -485,10 +485,12 @@ impl PostStage {
 pub enum JobStatus {
     Queued,
     Downloading,
-    /// M6a reads `held` as `Paused`: runner M6b persists held jobs as
-    /// their own `held` status, and a node still on this release must
-    /// decode what an M6b node wrote during a rolling upgrade (the job's
-    /// `control.lifecycle == "held"` carries the hold either way).
+    /// Read-side preparation for 0.6.0 (M6b), which persists a held job's
+    /// status as `held` (beside `control.lifecycle == "held"`). This release
+    /// writes a hold as `paused` + that control, and reads a 0.6.0 `held` as
+    /// `Paused`, so during a rolling upgrade a node still on it decodes rows
+    /// an upgraded node wrote; the control carries the hold either way, and
+    /// 0.6.0 turns `paused` + a held control back into `held` on load.
     #[serde(alias = "held")]
     Paused,
     Fetching, // URL fetch
