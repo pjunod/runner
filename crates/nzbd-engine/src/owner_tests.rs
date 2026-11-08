@@ -206,10 +206,10 @@ async fn blocked_io_lane_preserves_actor_reads_and_noop_controls_without_faking_
             .status,
         JobStatus::Paused
     );
-    let verification_after = owner.verification[&JobId(1)].progress();
-    assert_eq!(verification_after.reason, None);
-    assert_eq!(verification_after.checked_bytes, 0);
-    assert_eq!(verification_after.total_bytes, 0);
+    assert!(
+        !owner.verification.contains_key(&JobId(1)),
+        "after metadata recovery, this zero-claim row needs no checksum ticket"
+    );
 }
 
 #[tokio::test]
@@ -5317,10 +5317,18 @@ async fn public_delete_cancels_pending_verification_and_retains_payload() {
     row.status = JobStatus::Paused;
     let source = owner.dest_dir.join(&row.dir_name);
     let payload = source.join("payload.bin");
-    owner
+    let allocation = owner
         .artifacts
         .allocate_for_delivery(41, &owner.dest_dir, &source, true, false)
         .unwrap();
+    owner.allocation_cache.insert(JobId(41), allocation);
+    owner.allocated_jobs.insert(JobId(41));
+    row.files[0].segments[0].state = SegmentState::Done {
+        offset: 0,
+        len: 17,
+        crc: crc32fast::hash(b"retained download"),
+    };
+    recompute_job_totals(&mut row);
     std::fs::write(&payload, b"retained download").unwrap();
     owner.state.jobs.push(row);
     owner.queue_verification(JobId(41));

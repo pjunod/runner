@@ -713,6 +713,9 @@ impl Owner {
             }
             self.publish_now();
             self.bump_epoch();
+            // The reader has joined and released its root. Refill immediately;
+            // a bounded batch is a fairness boundary, not a one-second throttle.
+            self.start_verifications();
             return;
         }
         let original = self.state.job(job).unwrap().clone();

@@ -217,23 +217,6 @@ async fn same_root_verification_yields_to_resumed_job_after_publishing_progress(
         matches!(&first_batch, EngineMsg::VerificationFinished { job, .. } if *job == paused_id),
         "the first result is the paused job's verification batch"
     );
-    owner.on_msg(first_batch);
-
-    let paused_progress = owner
-        .verification
-        .get(&paused_id)
-        .expect("paused verification remains scheduled after a partial batch");
-    assert!(!paused_progress.running, "the batch releases the root slot");
-    assert_eq!(paused_progress.phase, "pending");
-    assert!(
-        paused_progress.checked_bytes > 0,
-        "intermediate progress is visible before the job completes"
-    );
-    assert!(
-        (1..=64).contains(&paused_progress.checked_bytes),
-        "the time or range budget bounds each progress batch"
-    );
-
     let resumed_id = JobId(2);
     let resumed_file = FileId(20);
     let mut resumed = pending_job(resumed_id.0, resumed_file);
@@ -267,7 +250,24 @@ async fn same_root_verification_yields_to_resumed_job_after_publishing_progress(
     owner.state.jobs.push(resumed);
     owner.queue_verification(resumed_id);
 
-    owner.start_verifications();
+    // Make the newly eligible row visible before processing the completed
+    // batch: the completion itself must fairly refill the freed root slot.
+    owner.on_msg(first_batch);
+
+    let paused_progress = owner
+        .verification
+        .get(&paused_id)
+        .expect("paused verification remains scheduled after a partial batch");
+    assert!(!paused_progress.running, "the batch releases the root slot");
+    assert_eq!(paused_progress.phase, "pending");
+    assert!(
+        paused_progress.checked_bytes > 0,
+        "intermediate progress is visible before the job completes"
+    );
+    assert!(
+        (1..=64).contains(&paused_progress.checked_bytes),
+        "the time or range budget bounds each progress batch"
+    );
 
     assert!(
         owner.verification[&resumed_id].running,
@@ -297,4 +297,275 @@ async fn same_root_verification_yields_to_resumed_job_after_publishing_progress(
     )
     .await
     .expect("fixture owner drains its workers before the temporary payload root is removed");
+}
+
+#[tokio::test]
+async fn partial_recovery_batches_continue_without_owner_ticks() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut owner, _adapter, mut messages) = owner_fixture(&temp);
+    pump_idle(&mut owner, &mut messages).await;
+    let root = temp.path().join("payloads");
+    std::fs::create_dir(&root).unwrap();
+    let allocation = owner
+        .artifacts
+        .allocate(1, &root, &root.join("partial-batches"))
+        .unwrap();
+    let mut job = pending_job(1, FileId(1));
+    job.status = JobStatus::Paused;
+    let bytes = vec![0x5a; 129];
+    job.files[0].segments = bytes
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| nzbd_types::Segment {
+            message_id: format!("range-{index}").into(),
+            number: index as u32 + 1,
+            size: 1,
+            state: SegmentState::Done {
+                offset: index as u64,
+                len: 1,
+                crc: crc32fast::hash(&[*byte]),
+            },
+        })
+        .collect();
+    job.params
+        .push(("*File:size:1".into(), bytes.len().to_string()));
+    recompute_job_totals(&mut job);
+    std::fs::write(allocation.path.join(".runner-file-1.part"), &bytes).unwrap();
+    owner.allocation_cache.insert(job.id, allocation);
+    owner.state.jobs.push(job);
+    owner.queue_verification(JobId(1));
+    owner.start_verifications();
+    let mut batches = 0;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while owner.verification.contains_key(&JobId(1)) {
+            let message = messages.recv().await.unwrap();
+            if matches!(message, EngineMsg::VerificationFinished { .. }) {
+                batches += 1;
+            }
+            owner.on_msg(message);
+            assert!(owner.verification_roots.len() <= 1);
+        }
+    })
+    .await
+    .expect("partial batches must refill on completion without any owner tick");
+    assert!(
+        batches >= 3,
+        "the real 64-range batch boundary must be exercised"
+    );
+    assert_eq!(
+        owner.state.job(JobId(1)).unwrap().totals.success_articles,
+        129
+    );
+    owner.drain_shutdown_results(&mut messages).await;
+}
+
+#[tokio::test]
+async fn pristine_recovery_backlog_is_bounded_and_drains_without_checksum_workers() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut owner, _adapter, mut messages) = owner_fixture(&temp);
+    pump_idle(&mut owner, &mut messages).await;
+    for id in 1..=160 {
+        owner.state.jobs.push(pending_job(id, FileId(id)));
+    }
+    for id in 1..=160 {
+        owner.queue_payload_recovery(JobId(id));
+    }
+    assert!(
+        owner.allocating_jobs.len() <= 64,
+        "metadata operations reserve bounded future payload capacity"
+    );
+    let drained = tokio::time::timeout(Duration::from_secs(60), async {
+        while !owner.verification.is_empty() || !owner.allocating_jobs.is_empty() {
+            assert!(
+                owner.verification_roots.is_empty(),
+                "zero-claim rows require custody checks, not CRC workers"
+            );
+            assert!(owner.payload_waiting.len() <= 64);
+            assert!(owner.state.jobs.iter().all(|job| !job.held()));
+            owner.on_msg(messages.recv().await.unwrap());
+        }
+    })
+    .await;
+    assert!(drained.is_ok(), "recovery stalled: allocated={} allocating={} queued={} active={} callbacks={} pending={:?}",
+        owner.allocation_cache.len(), owner.allocating_jobs.len(), owner.payload_waiting.len(), owner.payload_active.len(), owner.io_callbacks.len(),
+        owner.verification.iter().take(4).map(|(id,state)|(id,state.phase.clone(),state.reason.clone())).collect::<Vec<_>>());
+    assert_eq!(owner.allocation_cache.len(), 160);
+    assert!(owner
+        .state
+        .jobs
+        .iter()
+        .all(|job| job.totals.success_articles == 0 && job.status == JobStatus::Queued));
+    owner.drain_shutdown_results(&mut messages).await;
+}
+
+#[tokio::test]
+async fn payload_capacity_refusal_is_deferred_and_does_not_hold_a_download() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut owner, _adapter, mut messages) = owner_fixture(&temp);
+    pump_idle(&mut owner, &mut messages).await;
+    let root = temp.path().join("blocked-root");
+    let (release, gate) = std::sync::mpsc::channel();
+    let (entered, started) = oneshot::channel();
+    owner.payload_then(
+        root.clone(),
+        move || {
+            entered.send(()).unwrap();
+            gate.recv().unwrap();
+            Ok(())
+        },
+        |_, result| result.unwrap(),
+    );
+    started.await.unwrap();
+    for _ in 0..64 {
+        owner.payload_then(root.clone(), || Ok(()), |_, result| result.unwrap());
+    }
+    let (reply, refusal) = oneshot::channel();
+    owner.payload_then(
+        root,
+        || -> Result<(), nzbd_state::StateError> { panic!("unadmitted work must not execute") },
+        move |_, result| {
+            reply.send(result).unwrap();
+        },
+    );
+    let error = refusal.await.unwrap().unwrap_err();
+    assert!(matches!(error, nzbd_state::StateError::Busy(_)));
+    assert!(!error.to_string().contains("corrupt"));
+    owner.state.jobs.push(pending_job(1, FileId(1)));
+    assert!(owner.ensure_allocation(JobId(1), false).is_err());
+    assert!(!owner.state.job(JobId(1)).unwrap().held());
+    assert!(!owner.allocating_jobs.contains(&JobId(1)));
+    release.send(()).unwrap();
+    pump_idle(&mut owner, &mut messages).await;
+    assert!(owner.payload_waiting.is_empty());
+    owner.drain_shutdown_results(&mut messages).await;
+}
+
+#[tokio::test]
+async fn zero_display_totals_do_not_skip_real_done_range_validation() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut owner, _adapter, mut messages) = owner_fixture(&temp);
+    pump_idle(&mut owner, &mut messages).await;
+    let allocation = owner
+        .artifacts
+        .allocate(1, &owner.dest_dir, &owner.dest_dir.join("batch-1"))
+        .unwrap();
+    std::fs::write(allocation.path.join(".runner-file-1.part"), b"x").unwrap();
+    let mut job = pending_job(1, FileId(1));
+    job.status = JobStatus::Paused;
+    job.files[0].segments[0].state = SegmentState::Done {
+        offset: 0,
+        len: 1,
+        crc: crc32fast::hash(b"y"),
+    };
+    // Deliberately stale display counters cannot discharge a real byte claim.
+    job.totals = Default::default();
+    owner.state.jobs.push(job);
+    owner.queue_payload_recovery(JobId(1));
+    let mut validated = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while owner.verification.contains_key(&JobId(1)) {
+            let message = messages.recv().await.unwrap();
+            if matches!(message, EngineMsg::VerificationFinished { .. }) {
+                validated = true;
+            }
+            owner.on_msg(message);
+        }
+    })
+    .await
+    .expect("a real Done range must pass through the existing verifier");
+    assert!(validated);
+    assert!(
+        matches!(
+            owner.state.job(JobId(1)).unwrap().files[0].segments[0].state,
+            SegmentState::Pending
+        ),
+        "the bad legacy CRC must be rejected even with zero displayed totals"
+    );
+    owner.drain_shutdown_results(&mut messages).await;
+}
+
+#[tokio::test]
+async fn saturated_journal_admission_checkpoints_latest_progress_without_false_holds() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut owner, _adapter, mut messages) = owner_fixture(&temp);
+    pump_idle(&mut owner, &mut messages).await;
+    let mut job = pending_job(1, FileId(1));
+    job.status = JobStatus::Paused;
+    job.files[0].segments = (1..=302)
+        .map(|number| nzbd_types::Segment {
+            message_id: format!("journal-{number}").into(),
+            number,
+            size: 1,
+            state: SegmentState::Pending,
+        })
+        .collect();
+    recompute_job_totals(&mut job);
+    owner.state.jobs.push(job);
+    let (release, gate) = std::sync::mpsc::channel();
+    let (entered, started) = oneshot::channel();
+    owner.io_then(
+        move || {
+            entered.send(()).unwrap();
+            gate.recv().unwrap();
+            Ok(())
+        },
+        |_, result| result.unwrap(),
+    );
+    started.await.unwrap();
+    // Simulate already accepted writer facts while the real ordered lane is
+    // blocked. More than its 256 slots must remain represented by owner state.
+    for number in 1..=300 {
+        owner.on_segment_written(
+            JobId(1),
+            FileId(1),
+            number,
+            u64::from(number - 1),
+            1,
+            42,
+            302,
+            ServerId(1),
+        );
+    }
+    assert!(owner.journal_checkpoint.is_some());
+    assert!(!owner.state.job(JobId(1)).unwrap().held());
+    assert_eq!(
+        owner.state.job(JobId(1)).unwrap().totals.success_articles,
+        300
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !owner.journal_checkpoint_inflight { owner.on_msg(messages.recv().await.unwrap()); }
+        let captured = owner.journal_checkpoint;
+        // Another in-flight segment finishes after the snapshot was captured.
+        // Its newer generation must keep the backpressure fence in place.
+        owner.on_segment_written(JobId(1), FileId(1), 301, 300, 1, 42, 302, ServerId(1));
+        assert_ne!(owner.journal_checkpoint, captured);
+        loop {
+            let message = messages.recv().await.unwrap();
+            let first_checkpoint = matches!(&message, EngineMsg::PersistenceFinished { result, .. } if result.snapshot);
+            owner.on_msg(message);
+            if first_checkpoint {
+                assert!(owner.journal_checkpoint.is_some(), "an older checkpoint cannot release newer undurable progress");
+                break;
+            }
+        }
+        while owner.journal_checkpoint.is_some() { owner.on_msg(messages.recv().await.unwrap()); }
+        pump_idle(&mut owner, &mut messages).await;
+    }).await.expect("available persistence capacity must checkpoint retained facts without a timer");
+    assert!(!owner.state.job(JobId(1)).unwrap().held());
+    let saved = SnapshotStore::open(&owner.state_dir)
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap();
+    let done = saved.jobs[0].files[0]
+        .segments
+        .iter()
+        .filter(|segment| matches!(segment.state, SegmentState::Done { .. }))
+        .count();
+    assert_eq!(
+        done, 301,
+        "the durable snapshot must cover all accepted facts, including refused append admission"
+    );
+    owner.drain_shutdown_results(&mut messages).await;
 }

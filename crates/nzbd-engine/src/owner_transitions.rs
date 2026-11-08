@@ -182,6 +182,27 @@ pub(super) fn allocate_imported_payload(
     Ok(allocation)
 }
 
+/// This classification is used only after journal replay and fresh allocation
+/// reconciliation. A display byte counter is never sufficient evidence.
+fn pristine_download(job: &Job) -> bool {
+    matches!(job.status, JobStatus::Queued | JobStatus::Paused)
+        && job.stages.is_empty()
+        && !job.files.iter().any(|file| {
+            file.finalized
+                || file.crc32.is_some()
+                || file
+                    .segments
+                    .iter()
+                    .any(|segment| matches!(segment.state, SegmentState::Done { .. }))
+        })
+        && !job.params.iter().any(|(key, _)| {
+            key.starts_with("*File:proof:")
+                || key.starts_with("*File:retired-proof:")
+                || key.starts_with("*File:publication:")
+                || key.starts_with("*Recovery:publication-repair")
+        })
+}
+
 fn needs_payload(job: &Job) -> bool {
     job.torrent.is_none()
         && !failed_cleanup_only(job)
@@ -1709,6 +1730,20 @@ impl Owner {
         if self.allocating_jobs.contains(&job) {
             return;
         }
+        if !self.payload_recovery_capacity_available() {
+            // Keep the row as the deferred work obligation. Avoid recursively
+            // asking queue_verification to allocate while creating its ticket.
+            if !self.verification.contains_key(&job) {
+                self.allocating_jobs.insert(job);
+                self.queue_verification(job);
+                self.allocating_jobs.remove(&job);
+            }
+            if let Some(state) = self.verification.get_mut(&job) {
+                state.phase = "loading".into();
+                state.reason = None;
+            }
+            return;
+        }
         let plan = match imported_payload_plan(&record, &self.dest_dir) {
             Ok(plan) => plan,
             Err(error) => {
@@ -1778,13 +1813,45 @@ impl Owner {
                 owner.payload_then(
                     root.clone(),
                     move || {
-                        allocate_imported_payload(
+                        let allocation = allocate_imported_payload(
                             &inventory,
                             &record,
                             &fallback_root,
                             &plan,
                             allocation,
-                        )
+                        )?;
+                        let transformed = inventory
+                            .has_transform_custody(record.id.0)
+                            .map_err(failure)?;
+                        if !transformed && pristine_download(&record) {
+                            // Keep the verifier's fresh allocation and anchored
+                            // custody checks even when there are no ranges to hash.
+                            let current = inventory
+                                .for_job(record.id.0)
+                                .map_err(failure)?
+                                .ok_or_else(|| {
+                                    failure("allocation disappeared during preparation")
+                                })?;
+                            if current.id != allocation.id
+                                || current.generation != allocation.generation
+                                || current.path != allocation.path
+                                || current.root != allocation.root
+                            {
+                                return Err(failure(
+                                    "allocation authority changed during preparation",
+                                ));
+                            }
+                            let custody = inventory
+                                .acquire_terminal_use(record.id.0, &|| Ok(()))
+                                .map_err(failure)?
+                                .ok_or_else(|| failure("allocation custody is unavailable"))?;
+                            if custody.source().artifact != allocation.id
+                                || custody.source().generation != allocation.generation
+                            {
+                                return Err(failure("allocation custody generation differs"));
+                            }
+                        }
+                        Ok((allocation, transformed))
                     },
                     move |owner, result| {
                         owner.allocating_jobs.remove(&job);
@@ -1792,12 +1859,39 @@ impl Owner {
                             return;
                         }
                         match result {
-                            Ok(allocation) => {
+                            Ok((allocation, transformed)) => {
                                 if allocation.state == "active" {
                                     owner.allocated_jobs.insert(job);
                                 }
                                 owner.allocation_cache.insert(job, allocation);
-                                owner.queue_verification(job);
+                                let journal_pending = owner
+                                    .pending_journal_loads
+                                    .get(&job)
+                                    .is_some_and(|loading| loading.0 == epoch);
+                                if !transformed
+                                    && !journal_pending
+                                    && owner.state.job(job).is_some_and(pristine_download)
+                                {
+                                    // Journal replay and allocation/custody reconciliation
+                                    // established that there are no payload claims to read.
+                                    // No proof or segment transition needs a per-job save.
+                                    owner.verification.remove(&job);
+                                    if let Some(record) = owner.state.job_mut(job) {
+                                        set_owner_param(
+                                            &mut record.params,
+                                            "*Recovery:pending",
+                                            None,
+                                        );
+                                        set_owner_param(
+                                            &mut record.params,
+                                            "*Recovery:reason",
+                                            None,
+                                        );
+                                    }
+                                    owner.dirty = true;
+                                } else {
+                                    owner.queue_verification(job);
+                                }
                             }
                             Err(error) => owner.payload_recovery_failed(job, error),
                         }
@@ -1812,6 +1906,14 @@ impl Owner {
 
     fn payload_recovery_failed(&mut self, job: JobId, error: nzbd_state::StateError) {
         self.allocating_jobs.remove(&job);
+        if matches!(error, nzbd_state::StateError::Busy(_)) {
+            if let Some(state) = self.verification.get_mut(&job) {
+                state.phase = "loading".into();
+                state.reason = None;
+                state.retry_at = Instant::now();
+            }
+            return;
+        }
         if let Some(state) = self.verification.get_mut(&job) {
             state.phase = "blocked".into();
             state.reason = Some(error.to_string());
@@ -1855,7 +1957,9 @@ impl Owner {
                     && !self.allocating_jobs.contains(&job.id)
                     && !self.pending_control_commits.contains(&job.id)
                     && self.verification.get(&job.id).is_some_and(|state| {
-                        !state.running && state.phase == "blocked" && state.retry_at <= now
+                        !state.running
+                            && matches!(state.phase.as_str(), "blocked" | "loading")
+                            && state.retry_at <= now
                     })
             })
             .map(|job| job.id)
