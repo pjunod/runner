@@ -56,6 +56,12 @@ pub enum Event {
         /// this; the engine never flips the flag on its own.
         source: String,
     },
+    /// The post-processing lane's pause, attributed like
+    /// [`Event::QueuePauseChanged`]; the two lanes are independent.
+    PostPauseChanged {
+        paused: bool,
+        source: String,
+    },
     SpeedLimitChanged {
         bytes_per_sec: Option<u64>,
     },

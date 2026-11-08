@@ -362,6 +362,7 @@ fn root_fragments(doc: &QueueSnapshotDoc) -> Result<(Vec<u8>, Vec<u8>), StateErr
         next_job_id,
         next_file_id,
         download_paused,
+        post_paused,
         speed_limit_bps,
         max_active_downloads,
     } = doc;
@@ -376,6 +377,7 @@ fn root_fragments(doc: &QueueSnapshotDoc) -> Result<(Vec<u8>, Vec<u8>), StateErr
         next_job_id: u32,
         next_file_id: u32,
         download_paused: bool,
+        post_paused: bool,
         speed_limit_bps: Option<u64>,
         max_active_downloads: u32,
     }
@@ -390,6 +392,7 @@ fn root_fragments(doc: &QueueSnapshotDoc) -> Result<(Vec<u8>, Vec<u8>), StateErr
         next_job_id: *next_job_id,
         next_file_id: *next_file_id,
         download_paused: *download_paused,
+        post_paused: *post_paused,
         speed_limit_bps: *speed_limit_bps,
         max_active_downloads: *max_active_downloads,
     })?;

@@ -419,6 +419,16 @@ pub(crate) enum QueueCommand {
         source: String,
         reply: oneshot::Sender<()>,
     },
+    /// Post-processing lane, independent of the download pause above:
+    /// no new post stage starts while set (the running stage finishes).
+    PausePost {
+        source: String,
+        reply: oneshot::Sender<()>,
+    },
+    ResumePost {
+        source: String,
+        reply: oneshot::Sender<()>,
+    },
     SetSpeedLimit {
         bytes_per_sec: Option<u64>,
         reply: oneshot::Sender<()>,
@@ -4389,6 +4399,14 @@ impl Owner {
                 self.publish_now();
                 let _ = reply.send(());
             }
+            QueueCommand::PausePost { source, reply } => {
+                self.set_post_paused(true, source);
+                let _ = reply.send(());
+            }
+            QueueCommand::ResumePost { source, reply } => {
+                self.set_post_paused(false, source);
+                let _ = reply.send(());
+            }
             QueueCommand::SetSpeedLimit {
                 bytes_per_sec,
                 reply,
@@ -5957,6 +5975,7 @@ impl Owner {
                     owner.state.next_job_id = owner.state.next_job_id.max(state.next_job_id);
                     owner.state.next_file_id = owner.state.next_file_id.max(state.next_file_id);
                     owner.state.download_paused = state.download_paused;
+                    owner.state.post_paused = state.post_paused;
                     adopted_speed = Some(state.speed_limit_bps);
                     for job in state.jobs {
                         if !jobs.iter().any(|current| current.id == job.id) {
@@ -9441,6 +9460,27 @@ impl Owner {
         }
     }
 
+    /// The post-processing lane switch. Like the download pause it is only
+    /// ever flipped by a client command, so the source is logged and carried
+    /// on the event. The epoch bump wakes the post manager, which parks at
+    /// stage boundaries on `queue_changes` while the flag is set.
+    fn set_post_paused(&mut self, paused: bool, source: String) {
+        tracing::info!(
+            %source,
+            was_paused = self.state.post_paused,
+            paused,
+            "post-processing pause change requested"
+        );
+        self.state.post_paused = paused;
+        self.dirty = true;
+        self.emit(Event::PostPauseChanged { paused, source });
+        // Snapshot first, then the wake: a parked stage re-reads the
+        // snapshot when the epoch moves, so the reverse order could wake it
+        // onto the stale flag with nothing left to wake it again.
+        self.publish_now();
+        self.bump_epoch();
+    }
+
     fn publish_now(&mut self) {
         self.repair_progress.retain(|id, _| {
             self.state.job(*id).is_some_and(|job| {
@@ -9802,6 +9842,7 @@ impl Owner {
                 })
                 .collect(),
             download_paused: self.state.download_paused,
+            post_paused: self.state.post_paused,
             quota_reached: self.quota_reached,
             disk_low: self.disk_low,
             disk_guard_free_bytes: disk_guard.available_bytes,

@@ -25,6 +25,8 @@ pub struct QueueState {
     pub next_job_id: u32,
     pub next_file_id: u32,
     pub download_paused: bool,
+    /// The post-processing lane's pause — independent of `download_paused`.
+    pub post_paused: bool,
     pub speed_limit_bps: Option<u64>,
     /// How many jobs may download at once. `1` is the historical
     /// behavior: one job takes every connection until it runs out of
@@ -72,6 +74,7 @@ impl Default for QueueState {
             next_job_id: 0,
             next_file_id: 0,
             download_paused: false,
+            post_paused: false,
             speed_limit_bps: None,
             max_active_downloads: MIN_ACTIVE_DOWNLOADS,
         }
@@ -116,6 +119,7 @@ impl QueueState {
             next_job_id: doc.next_job_id,
             next_file_id: doc.next_file_id,
             download_paused: doc.download_paused,
+            post_paused: doc.post_paused,
             speed_limit_bps: doc.speed_limit_bps,
             // A snapshot written before this existed deserializes as 0,
             // which would read as "no job may download". Clamp on the way
@@ -217,6 +221,7 @@ impl QueueState {
             next_job_id: self.next_job_id,
             next_file_id: self.next_file_id,
             download_paused: self.download_paused,
+            post_paused: self.post_paused,
             speed_limit_bps: self.speed_limit_bps,
             max_active_downloads: self.max_active_downloads,
         }
@@ -2655,6 +2660,7 @@ mod tests {
             next_job_id: 1,
             next_file_id: 1,
             download_paused: false,
+            post_paused: false,
             speed_limit_bps: None,
             max_active_downloads: 0,
         };

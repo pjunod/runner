@@ -2397,6 +2397,18 @@ impl EngineHandle {
             .await
     }
 
+    pub async fn pause_post(&self, source: &str) -> Result<(), EngineError> {
+        let source = source.to_string();
+        self.roundtrip_unit(|reply| QueueCommand::PausePost { source, reply })
+            .await
+    }
+
+    pub async fn resume_post(&self, source: &str) -> Result<(), EngineError> {
+        let source = source.to_string();
+        self.roundtrip_unit(|reply| QueueCommand::ResumePost { source, reply })
+            .await
+    }
+
     pub async fn set_speed_limit(&self, bytes_per_sec: Option<u64>) -> Result<(), EngineError> {
         self.roundtrip_unit(|reply| QueueCommand::SetSpeedLimit {
             bytes_per_sec,

@@ -270,6 +270,9 @@ pub struct QueueSnapshot {
     pub native_seed_retirements:
         std::collections::HashMap<JobId, crate::torrent_acquisitions::ManagedSeedRetirement>,
     pub download_paused: bool,
+    /// Post-processing lane paused: downloaded jobs wait in `PostQueued`
+    /// and a running job holds at its next stage boundary.
+    pub post_paused: bool,
     /// Daily/monthly quota exhausted (force-priority jobs still run).
     pub quota_reached: bool,
     /// Intake is held by a below-floor reading, an observed write failure, an
