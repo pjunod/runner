@@ -500,10 +500,6 @@ impl Inventory {
     /// could overwrite its tombstone with a stale move's review state. Restore
     /// the journal's result before interpreting any unfinished operations;
     /// never inspect or delete the bytes now occupying the old pathname.
-    #[cfg(test)]
-    pub(super) fn reconcile_deleted_artifacts(&self) -> Result<()> {
-        self.reconcile_deleted_artifacts_snapshot(None)
-    }
     pub(super) fn reconcile_deleted_artifacts_snapshot(
         &self,
         snapshot: Option<&StartupReconciliation>,

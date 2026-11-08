@@ -7010,11 +7010,6 @@ impl Owner {
     /// Push an automatic hold's next attempt out on the same backoff, keeping
     /// the original reason and recording the refusal beside it. The new time
     /// lives in memory even if this save fails; the next snapshot carries it.
-    #[cfg(test)]
-    fn reschedule_hold(&mut self, job: JobId, revision: &str, reason: &str) -> bool {
-        self.reschedule_hold_proven(job, revision, reason, &Default::default())
-    }
-
     fn reschedule_hold_proven(
         &mut self,
         job: JobId,

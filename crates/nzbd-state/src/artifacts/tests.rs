@@ -1097,7 +1097,9 @@ fn legacy_four_field_restore_journal_is_fenced_without_startup_failure() {
     };
     save_operation(&db.db.lock().unwrap(), &operation).unwrap();
 
-    assert!(db.reconcile_transforms().is_ok());
+    for root in db.startup_reconciliation_roots().unwrap() {
+        assert!(db.reconcile_transforms_root_snapshot(&root, None).is_ok());
+    }
     let fenced = db.operation("legacy-restore-four-tuple").unwrap();
     assert_eq!(fenced.state, "review");
     assert!(fenced

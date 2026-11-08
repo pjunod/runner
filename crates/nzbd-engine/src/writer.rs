@@ -88,7 +88,8 @@ pub(crate) enum WriterFact {
 
 const WRITER_QUEUE: usize = 8;
 
-/// Compatibility entry point for direct callers without durable scoped evidence.
+/// Test support: an unscoped writer that reports plain `EngineMsg` facts.
+/// Every production writer is scoped ([`spawn_writer_scoped`]).
 #[cfg(test)]
 pub fn spawn_writer(
     tracker: &TaskTracker,

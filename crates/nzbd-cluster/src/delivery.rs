@@ -1734,7 +1734,10 @@ mod tests {
             .iter()
             .any(|row| row.resolution_id == prepared.resolution_id));
         // Crash boundary: replicated commit won, old process died before ACK.
-        assert!(store.commit_url_outbox(&prepared).await.unwrap());
+        assert!(store
+            .commit_url_outbox_with_source(&prepared, None)
+            .await
+            .unwrap());
         drop(serial);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while runtime

@@ -3063,17 +3063,27 @@ async fn storage_errno_writer_error_schedules_itself() {
 
     // A refusal pushes it out again and says why.
     let revision = again.revision.clone();
-    assert!(owner.reschedule_hold(JobId(1), &revision, "volume still unavailable"));
+    assert!(owner.reschedule_hold_proven(
+        JobId(1),
+        &revision,
+        "volume still unavailable",
+        &Default::default()
+    ));
     let pushed = owner.state.jobs[0].control().unwrap();
     assert_eq!(pushed.retry_attempt, 3);
     assert!(pushed
         .message
         .ends_with("; retry refused: volume still unavailable"));
     assert!(
-        !owner.reschedule_hold(JobId(1), &revision, "stale"),
+        !owner.reschedule_hold_proven(JobId(1), &revision, "stale", &Default::default()),
         "a reschedule is a new revision; a second actor on the old one is refused"
     );
-    assert!(owner.reschedule_hold(JobId(1), &pushed.revision, "and again"));
+    assert!(owner.reschedule_hold_proven(
+        JobId(1),
+        &pushed.revision,
+        "and again",
+        &Default::default()
+    ));
     assert_eq!(
         owner.state.jobs[0]
             .control()
@@ -3348,7 +3358,12 @@ async fn held_control_survives_only_owner_writes() {
     storage.cause = "storage_unavailable".into();
     storage.retry_policy = "scheduled_retry".into();
     owner.state.jobs[0].set_control(&storage);
-    assert!(owner.reschedule_hold(JobId(1), &storage.revision, "still down"));
+    assert!(owner.reschedule_hold_proven(
+        JobId(1),
+        &storage.revision,
+        "still down",
+        &Default::default()
+    ));
     assert_ne!(owner.state.jobs[0].control().unwrap(), storage);
 }
 
@@ -3513,7 +3528,12 @@ async fn reobserve_refusal_records_why_without_moving_its_cadence() {
     pump(&mut owner, &mut messages).await;
     let c = owner.state.jobs[0].control().unwrap();
     assert_eq!(c.next_retry_at_unix, None);
-    assert!(owner.reschedule_hold(JobId(1), &c.revision, "wrong root mounted"));
+    assert!(owner.reschedule_hold_proven(
+        JobId(1),
+        &c.revision,
+        "wrong root mounted",
+        &Default::default()
+    ));
     let after = owner.state.jobs[0].control().unwrap();
     assert_eq!(
         after.next_retry_at_unix, None,
@@ -3525,7 +3545,7 @@ async fn reobserve_refusal_records_why_without_moving_its_cadence() {
         .ends_with("; retry refused: wrong root mounted"));
     owner.persist = false;
     assert!(
-        !owner.reschedule_hold(JobId(1), &c.revision, "follower"),
+        !owner.reschedule_hold_proven(JobId(1), &c.revision, "follower", &Default::default()),
         "a node that is not the authority writes nothing"
     );
 }
@@ -6507,7 +6527,12 @@ async fn cluster_automatic_control_waits_for_exact_ack_and_operator_intent_is_no
         .load()
         .pending_automatic_controls
         .contains(&base.id));
-    assert!(!owner.reschedule_hold(base.id, &held.revision, "still unavailable"));
+    assert!(!owner.reschedule_hold_proven(
+        base.id,
+        &held.revision,
+        "still unavailable",
+        &Default::default()
+    ));
     assert!(owner
         .retry_hold_proven(
             base.id,
@@ -6727,10 +6752,11 @@ async fn worker_reschedule_refuses_expiry_and_same_revision_regrant() {
         !authority_guard.matches(&owner.artifacts, &row, false),
         "an authority fence is not a worker grant"
     );
-    assert!(!owner.reschedule_hold(
+    assert!(!owner.reschedule_hold_proven(
         row.id,
         &original.revision,
-        "unchecked worker cannot reschedule"
+        "unchecked worker cannot reschedule",
+        &Default::default(),
     ));
     live.store(false, Ordering::SeqCst);
     let (reply, result) = oneshot::channel();
@@ -6820,7 +6846,12 @@ async fn worker_reschedule_refuses_expiry_and_same_revision_regrant() {
     let mut held = owner.state.job(row.id).unwrap().control().unwrap();
     held.next_retry_at_unix = Some(0);
     owner.state.job_mut(row.id).unwrap().set_control(&held);
-    assert!(!owner.reschedule_hold(row.id, &held.revision, "late authority pass"));
+    assert!(!owner.reschedule_hold_proven(
+        row.id,
+        &held.revision,
+        "late authority pass",
+        &Default::default()
+    ));
     let current = owner.state.job(row.id).unwrap().clone();
     let authority_guard = crate::hold_release::HoldReleaseGuard::prepare_queue_owner(
         &current,

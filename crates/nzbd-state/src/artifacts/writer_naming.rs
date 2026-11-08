@@ -783,7 +783,11 @@ mod tests {
             expected
         );
         assert!(inventory.validate_post_retry(1).is_err());
-        inventory.reconcile_transforms().unwrap();
+        for root in inventory.startup_reconciliation_roots().unwrap() {
+            inventory
+                .reconcile_transforms_root_snapshot(&root, None)
+                .unwrap();
+        }
         assert_eq!(inventory.operation(&op.id).unwrap().state, "review");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(
@@ -894,7 +898,11 @@ mod tests {
             }
         }).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"data");
-        inventory.reconcile_transforms().unwrap();
+        for root in inventory.startup_reconciliation_roots().unwrap() {
+            inventory
+                .reconcile_transforms_root_snapshot(&root, None)
+                .unwrap();
+        }
         let state: String = inventory
             .db
             .lock()
@@ -944,7 +952,11 @@ mod tests {
         assert!(reopened
             .take_writer_naming(1, &[candidate(&target, 1)])
             .is_empty());
-        reopened.reconcile_transforms().unwrap();
+        for root in reopened.startup_reconciliation_roots().unwrap() {
+            reopened
+                .reconcile_transforms_root_snapshot(&root, None)
+                .unwrap();
+        }
         let state: String = reopened
             .db
             .lock()

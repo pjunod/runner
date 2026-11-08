@@ -1710,18 +1710,8 @@ impl Inventory {
 }
 
 impl Inventory {
-    /// Reconcile journaled mappings before new queue or PP operations start.
-    #[cfg(test)]
-    pub(super) fn reconcile_transforms(&self) -> Result<()> {
-        for root in self.startup_reconciliation_roots()? {
-            self.reconcile_transforms_root(&root)?;
-        }
-        Ok(())
-    }
-    #[cfg(test)]
-    pub(super) fn reconcile_transforms_root(&self, root: &Path) -> Result<()> {
-        self.reconcile_transforms_root_snapshot(root, None)
-    }
+    /// Reconcile one root's journaled mappings before new queue or PP
+    /// operations start (startup runs it for every reconciliation root).
     pub(super) fn reconcile_transforms_root_snapshot(
         &self,
         root: &Path,
@@ -2201,7 +2191,11 @@ mod tests {
         };
         save_operation(&inventory.db.lock().unwrap(), &op).unwrap();
         std::fs::hard_link(path.join("old"), path.join("new")).unwrap();
-        inventory.reconcile_transforms().unwrap();
+        for root in inventory.startup_reconciliation_roots().unwrap() {
+            inventory
+                .reconcile_transforms_root_snapshot(&root, None)
+                .unwrap();
+        }
         assert_eq!(inventory.operation(&op.id).unwrap().state, "succeeded");
         assert!(!path.join("old").exists());
         assert_eq!(std::fs::read(path.join("new")).unwrap(), b"original");
