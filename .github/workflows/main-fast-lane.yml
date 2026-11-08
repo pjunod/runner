@@ -23,6 +23,7 @@ jobs:
       rust: ${{ steps.scope.outputs.rust }}
       mobile: ${{ steps.scope.outputs.mobile }}
       torrent: ${{ steps.scope.outputs.torrent }}
+      docs: ${{ steps.scope.outputs.docs }}
       docs_only: ${{ steps.scope.outputs.docs_only }}
     steps:
       - uses: actions/checkout@v5
@@ -48,7 +49,7 @@ jobs:
         run: make ui-test
       - name: Documentation-only lane
         if: needs.scope.outputs.docs_only == 'true'
-        run: echo "Documentation-only diff; compiler jobs are skipped."
+        run: echo "Documentation-only diff; only the documentation contract tests run."
 
   rust:
     name: Rust merge candidate
@@ -74,9 +75,27 @@ jobs:
       - name: Torrent transfer and recovery regressions
         if: ${{ !cancelled() && (steps.rust_checks.outcome == 'success' || steps.rust_checks.outcome == 'failure') && needs.scope.outputs.torrent == 'true' }}
         run: make fast-check-torrent
+      - name: Documentation contract tests
+        if: ${{ !cancelled() && (steps.rust_checks.outcome == 'success' || steps.rust_checks.outcome == 'failure') }}
+        run: make fast-check-docs
       - name: Startup recovery and enrollment regressions
         if: ${{ !cancelled() && (steps.rust_checks.outcome == 'success' || steps.rust_checks.outcome == 'failure') }}
         run: make fast-check-startup
+
+  docs:
+    name: Documentation contract tests
+    needs: [scope, preflight]
+    # The Rust lane runs these itself; a docs-only change runs just these.
+    if: needs.scope.outputs.docs == 'true' && needs.scope.outputs.rust != 'true'
+    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@v2
+      - run: make fast-check-docs
 
   mobile:
     name: Mobile compile and unit lane
@@ -101,7 +120,7 @@ jobs:
   gate:
     name: Main promotion gate
     if: always() && github.event.pull_request.draft == false
-    needs: [scope, preflight, rust, mobile]
+    needs: [scope, preflight, rust, docs, mobile]
     runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
     timeout-minutes: 2
     steps:
@@ -110,9 +129,10 @@ jobs:
           SCOPE: ${{ needs.scope.result }}
           PREFLIGHT: ${{ needs.preflight.result }}
           RUST: ${{ needs.rust.result }}
+          DOCS: ${{ needs.docs.result }}
           MOBILE: ${{ needs.mobile.result }}
         run: |
-          for result in "$SCOPE" "$PREFLIGHT" "$RUST" "$MOBILE"; do
+          for result in "$SCOPE" "$PREFLIGHT" "$RUST" "$DOCS" "$MOBILE"; do
             case "$result" in
               success|skipped) ;;
               *) echo "Selected lane ended with: $result"; exit 1 ;;

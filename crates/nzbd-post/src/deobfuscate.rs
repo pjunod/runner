@@ -267,7 +267,7 @@ pub fn restore_media_extensions_owned(
     }
     let mut plan = Vec::new();
     let listed = crate::namespace::files(dir)
-        .map_err(|e| std::io::Error::new(e.kind(), format!("list {}: {e}", dir.display())))?;
+        .map_err(|e| nzbd_state::io_context(e, format!("list {}", dir.display())))?;
     for path in listed {
         if path.extension().is_some()
             || protected.contains(
@@ -283,11 +283,18 @@ pub fn restore_media_extensions_owned(
         let mut bytes = Vec::new();
         // Name the file: on a dropped mount this is the first read of the
         // stage, and a bare errno says nothing about where.
+        // The original error stays the `source()`: its errno decides
+        // whether this is a hold (a dropped mount) or `failed/io`.
         nzbd_state::fileops::open(&path)
-            .map_err(|e| crate::PostError::Subprocess(e.to_string()))?
+            .map_err(|e| match e {
+                nzbd_state::artifacts::Error::Io(io) => crate::PostError::Io(
+                    nzbd_state::io_context(io, format!("open {}", path.display())),
+                ),
+                other => crate::PostError::Artifact(other),
+            })?
             .take(4096)
             .read_to_end(&mut bytes)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("read {}: {e}", path.display())))?;
+            .map_err(|e| nzbd_state::io_context(e, format!("read {}", path.display())))?;
         if let Some(ext) = kind(&bytes) {
             plan.push((path.clone(), path.with_extension(ext)));
         }
@@ -396,6 +403,30 @@ pub fn deobfuscate_dir_owned(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review #296-1: the stage names the path without rebuilding the error,
+    /// so the errno a dropped mount answers still reaches `pp_verdict`.
+    #[cfg(unix)]
+    #[test]
+    fn a_listing_failure_keeps_its_errno_under_the_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let not_a_dir = temp.path().join("file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let error = restore_media_extensions(&not_a_dir, &Default::default()).unwrap_err();
+        assert!(error.to_string().contains("list "), "{error}");
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        let mut errno = None;
+        while let Some(e) = current {
+            if let Some(io) = e.downcast_ref::<std::io::Error>() {
+                if let Some(code) = io.raw_os_error() {
+                    errno = Some(code);
+                    break;
+                }
+            }
+            current = e.source();
+        }
+        assert_eq!(errno, Some(libc::ENOTDIR), "{error:?}");
+    }
 
     #[test]
     fn existing_incidental_names_keep_their_identity_through_deobfuscation() {

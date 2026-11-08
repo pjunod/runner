@@ -118,9 +118,19 @@ fn url_storage_error(error: nzbd_state::artifacts::Error) -> EngineError {
 /// NFS mount answers it for the same condition). A volume that stopped
 /// answering is `storage_unavailable`: a network or FUSE mount that lost its
 /// transport, a stale handle after a server-side remount, a device that went
-/// away, a remote that timed out or reset, or the generic `EIO` such mounts
-/// report meanwhile. Nothing about the job is wrong in either case; the same
-/// call succeeds once the volume is back, so these holds retry on their own.
+/// away, a remote that timed out or reset, a network that went down under a
+/// network mount, the generic `EIO` such mounts report meanwhile, or a
+/// volume that turned read-only (`EROFS`: ext4 `errors=remount-ro`, an
+/// export flipped read-only — both heal on remount). Nothing about the job is
+/// wrong in any of these; the same call succeeds once the volume is back, so
+/// these holds retry on their own (and end `failed/hold_expired` at their
+/// deadline if it never is).
+///
+/// Everything else is terminal `failed/io`, bytes parked. That includes
+/// `EACCES`/`EPERM`/`ENOENT` (a configuration or a vanished file, which a
+/// retry repeats; a vanished *root* is caught earlier by the volume guard as
+/// `mount_unavailable`) and `EMFILE`/`ENFILE`/`ENOMEM`: those name a fault
+/// in this daemon or host, not the volume, and a hold would hide it.
 pub fn errno_hold_cause(errno: i32) -> Option<nzbd_types::HoldCause> {
     use nzbd_types::HoldCause;
     match errno {
@@ -138,7 +148,10 @@ pub fn errno_hold_cause(errno: i32) -> Option<nzbd_types::HoldCause> {
         | libc::ECONNREFUSED
         | libc::EHOSTDOWN
         | libc::EHOSTUNREACH
-        | libc::ESTALE => Some(HoldCause::StorageUnavailable),
+        | libc::ENETDOWN
+        | libc::ENETUNREACH
+        | libc::ESTALE
+        | libc::EROFS => Some(HoldCause::StorageUnavailable),
         #[cfg(target_os = "linux")]
         libc::EREMOTEIO => Some(HoldCause::StorageUnavailable),
         _ => None,
@@ -146,18 +159,37 @@ pub fn errno_hold_cause(errno: i32) -> Option<nzbd_types::HoldCause> {
 }
 
 /// [`errno_hold_cause`] for an `io::Error`: its `raw_os_error()`, else the
-/// kind std mapped it to (an error built from a kind carries no errno), else
-/// the error it wraps.
+/// error it wraps, else the kind std mapped the errno to. An error built
+/// from a kind (`io::Error::new(e.kind(), ..)`) carries no errno, so the
+/// kind table mirrors the errno table; `EIO` has no kind of its own
+/// (`Uncategorized`) and survives only by keeping the original error as a
+/// `source()` — which is why storage paths must not rewrap.
 pub fn io_error_hold_cause(error: &std::io::Error) -> Option<nzbd_types::HoldCause> {
+    use std::io::ErrorKind as K;
     if let Some(errno) = error.raw_os_error() {
         return errno_hold_cause(errno);
     }
+    if let Some(cause) = error
+        .get_ref()
+        .and_then(|inner| error_hold_cause(inner as &(dyn std::error::Error + 'static)))
+    {
+        return Some(cause);
+    }
     match error.kind() {
-        std::io::ErrorKind::StorageFull => Some(nzbd_types::HoldCause::Capacity),
-        std::io::ErrorKind::QuotaExceeded => Some(nzbd_types::HoldCause::Quota),
-        _ => error
-            .get_ref()
-            .and_then(|inner| error_hold_cause(inner as &(dyn std::error::Error + 'static))),
+        K::StorageFull => Some(nzbd_types::HoldCause::Capacity),
+        K::QuotaExceeded => Some(nzbd_types::HoldCause::Quota),
+        K::StaleNetworkFileHandle
+        | K::NotConnected
+        | K::TimedOut
+        | K::ConnectionReset
+        | K::ConnectionAborted
+        | K::ConnectionRefused
+        | K::HostUnreachable
+        | K::NetworkUnreachable
+        | K::NetworkDown
+        | K::WouldBlock
+        | K::ReadOnlyFilesystem => Some(nzbd_types::HoldCause::StorageUnavailable),
+        _ => None,
     }
 }
 
@@ -3175,7 +3207,7 @@ mod out_of_space_tests {
     use super::*;
     use nzbd_types::HoldCause;
 
-    const UNAVAILABLE: [i32; 14] = [
+    const UNAVAILABLE: &[i32] = &[
         libc::EIO,
         libc::ENXIO,
         libc::EAGAIN,
@@ -3188,13 +3220,17 @@ mod out_of_space_tests {
         libc::ECONNREFUSED,
         libc::EHOSTDOWN,
         libc::EHOSTUNREACH,
+        libc::ENETDOWN,
+        libc::ENETUNREACH,
         libc::ESTALE,
+        libc::EROFS,
+        #[cfg(target_os = "linux")]
         libc::EREMOTEIO,
     ];
 
     #[test]
     fn io_errors_are_classified_by_errno_not_by_message() {
-        for errno in UNAVAILABLE {
+        for &errno in UNAVAILABLE {
             let error = std::io::Error::from_raw_os_error(errno);
             assert_eq!(
                 io_error_hold_cause(&error),
@@ -3206,7 +3242,15 @@ mod out_of_space_tests {
         assert_eq!(io_error_hold_cause(&full), Some(HoldCause::Capacity));
         let quota = std::io::Error::from_raw_os_error(libc::EDQUOT);
         assert_eq!(io_error_hold_cause(&quota), Some(HoldCause::Quota));
-        for errno in [libc::EACCES, libc::ENOENT, libc::EPERM, libc::EINVAL] {
+        for errno in [
+            libc::EACCES,
+            libc::ENOENT,
+            libc::EPERM,
+            libc::EINVAL,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+        ] {
             let error = std::io::Error::from_raw_os_error(errno);
             assert_eq!(io_error_hold_cause(&error), None, "{error} is failed/io");
         }
@@ -3216,6 +3260,31 @@ mod out_of_space_tests {
         // A kind without an errno, and an errno wrapped in a custom error.
         let kind = std::io::Error::from(std::io::ErrorKind::StorageFull);
         assert_eq!(io_error_hold_cause(&kind), Some(HoldCause::Capacity));
+        // An error rebuilt from its kind (the errno is gone) holds by kind.
+        // (`EIO` & co. map to no kind of their own: only `source()` carries
+        // them, which is why storage paths keep the original error.)
+        for errno in [
+            libc::ESTALE,
+            libc::ENOTCONN,
+            libc::ETIMEDOUT,
+            libc::ECONNRESET,
+            libc::ECONNABORTED,
+            libc::ECONNREFUSED,
+            libc::EHOSTUNREACH,
+            libc::ENETUNREACH,
+            libc::ENETDOWN,
+            libc::EAGAIN,
+            libc::EROFS,
+        ] {
+            let original = std::io::Error::from_raw_os_error(errno);
+            let rebuilt = std::io::Error::new(original.kind(), "context");
+            assert_eq!(
+                io_error_hold_cause(&rebuilt),
+                Some(HoldCause::StorageUnavailable),
+                "{original} rebuilt as {:?}",
+                original.kind()
+            );
+        }
         let wrapped = std::io::Error::other(std::io::Error::from_raw_os_error(libc::ESTALE));
         assert_eq!(
             io_error_hold_cause(&wrapped),

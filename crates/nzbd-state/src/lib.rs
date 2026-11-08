@@ -34,6 +34,32 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+/// An `io::Error` that says what was being done to what, keeping the
+/// original as its `source()`.
+///
+/// Rebuilding an error from its kind (`io::Error::new(e.kind(), format!(..))`)
+/// drops the errno: `EIO` becomes an uncategorized error with no number, and
+/// the hold classifier (contract §2.3) can no longer tell a dropped mount from
+/// a bad file. This keeps the kind (callers that match it still work), shows
+/// `"<context>: <original>"`, and lets `source()` reach the errno.
+pub fn io_context(error: std::io::Error, context: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        IoContext {
+            context: context.into(),
+            source: error,
+        },
+    )
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{context}: {source}")]
+struct IoContext {
+    context: String,
+    #[source]
+    source: std::io::Error,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
     /// A filesystem call failed. `op` is the human verb ("create

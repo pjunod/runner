@@ -329,14 +329,20 @@ History status strings, per reason: `FAILURE/HEALTH` · `FAILURE/FETCH` ·
 failure, only when its errno says the environment will heal: `ENOSPC` →
 `capacity`, `EDQUOT` → `quota`, a dropped volume (`EIO`, `ENXIO`, `EAGAIN`,
 `ENODEV`, `ENOLINK`, `ECONNABORTED`, `ECONNRESET`, `ENOTCONN`, `ETIMEDOUT`,
-`ECONNREFUSED`, `EHOSTDOWN`, `EHOSTUNREACH`, `ESTALE`, `EREMOTEIO`, or SQLite
-`SQLITE_IOERR`) → `storage_unavailable`; a missing tool → `missing_tool`; an
-unavailable engine → `engine_unavailable`; a wrong or missing archive
-password → `password_required`; a replaced or absent mount →
-`mount_unavailable`. The errno is read from the `io::Error`
-(`raw_os_error()`) wherever one exists; only a subprocess's stderr is read as
-text (`nzbd_engine::stderr_hold_cause`). Everything else is the job's
-terminal failure.
+`ECONNREFUSED`, `EHOSTDOWN`, `EHOSTUNREACH`, `ENETDOWN`, `ENETUNREACH`,
+`ESTALE`, `EREMOTEIO`, or SQLite `SQLITE_IOERR`) or a volume that turned
+read-only (`EROFS` — ext4 `errors=remount-ro`, an export flipped read-only;
+both heal on remount) → `storage_unavailable` (SQLite `SQLITE_FULL` →
+`capacity`); a missing tool → `missing_tool`; an unavailable engine →
+`engine_unavailable`; a wrong or missing archive password →
+`password_required`; a replaced or absent mount → `mount_unavailable`. The
+errno is read from the `io::Error` (`raw_os_error()`, or the error it wraps)
+wherever one exists, and from its kind when only the kind survived; only a
+subprocess's stderr is read as text (`nzbd_engine::stderr_hold_cause`).
+Everything else is the job's terminal failure — `failed/io`, parked, for a
+filesystem error. That deliberately includes `EACCES`/`EPERM`/`ENOENT` (a
+retry repeats them) and `EMFILE`/`ENFILE`/`ENOMEM`: those are a fault in the
+daemon or the host, not the volume, and a hold would hide it.
 
 **Salvage** is a second fact, not part of the terminal: with `salvage:
 pending`, runner assesses the failed job's bytes after the terminal and
