@@ -15,6 +15,219 @@ fn parked(db: &Inventory, root: &Path) -> Artifact {
     db.finish(1, &path, root, "parked_failed").unwrap()
 }
 
+fn expected_custody(artifact: &Artifact) -> ArtifactCustody {
+    ArtifactCustody {
+        generation: artifact.generation.clone(),
+        state: artifact.state.clone(),
+        owned: artifact.owned,
+        keep: artifact.keep,
+        keep_on_failure: artifact.keep_on_failure,
+    }
+}
+
+#[test]
+fn receipt_custody_matches_full_header_without_loading_large_manifest() {
+    let (_tmp, db, root) = fixture();
+    let mut artifact = db.allocate(1, &root, &root.join("large-manifest")).unwrap();
+    artifact.state = "retained".into();
+    artifact.keep = true;
+    artifact.keep_on_failure = true;
+    let mut identity = artifact.root_identity.clone();
+    identity.directory = false;
+    artifact.files = (0..5_000)
+        .map(|index| FileEntry {
+            path: format!("disc-{index}/episode-{index}.mkv"),
+            identity: identity.clone(),
+            digest: Some("ab".repeat(32)),
+        })
+        .collect();
+    save_artifact(&db.db.lock().unwrap(), &artifact).unwrap();
+    let full = db.get(&artifact.id).unwrap();
+    assert_eq!(
+        db.receipt_custody(&artifact.id).unwrap(),
+        expected_custody(&full)
+    );
+    let raw: String = db
+        .db
+        .lock()
+        .unwrap()
+        .query_row(RECEIPT_CUSTODY_QUERY, [&artifact.id], |row| row.get(0))
+        .unwrap();
+    assert!(!serde_json::from_str::<serde_json::Value>(&raw)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .contains_key("files"));
+    assert!(raw.len() * 100 < serde_json::to_string(&full).unwrap().len());
+    // Report reproducible Rust decode/query costs without a timing assertion.
+    let started = Instant::now();
+    for _ in 0..100 {
+        std::hint::black_box(db.get(&artifact.id).unwrap());
+    }
+    let full_elapsed = started.elapsed();
+    let started = Instant::now();
+    for _ in 0..100 {
+        std::hint::black_box(db.receipt_custody(&artifact.id).unwrap());
+    }
+    eprintln!("custody large manifest: files={} full_bytes={} projected_bytes={} iterations=100 full_us={} custody_us={}",full.files.len(),serde_json::to_string(&full).unwrap().len(),raw.len(),full_elapsed.as_micros(),started.elapsed().as_micros());
+}
+
+#[test]
+fn receipt_custody_reads_only_its_covering_index() {
+    let (_tmp, inventory, root) = fixture();
+    let artifact = inventory
+        .allocate(1, &root, &root.join("index-plan"))
+        .unwrap();
+    let db = inventory.db.lock().unwrap();
+    let plan: String = db
+        .query_row(
+            &format!("EXPLAIN QUERY PLAN {RECEIPT_CUSTODY_QUERY}"),
+            [&artifact.id],
+            |row| row.get(3),
+        )
+        .unwrap();
+    assert!(plan.contains("artifacts_receipt_custody"), "{plan}");
+    let table_root: i64 = db
+        .query_row(
+            "SELECT rootpage FROM sqlite_master WHERE type='table' AND name='artifacts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let index_root: i64 = db.query_row("SELECT rootpage FROM sqlite_master WHERE type='index' AND name='artifacts_receipt_custody'", [], |row| row.get(0)).unwrap();
+    let operations = db
+        .prepare(&format!("EXPLAIN {RECEIPT_CUSTODY_QUERY}"))
+        .unwrap()
+        .query_map([&artifact.id], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let table_cursors = operations
+        .iter()
+        .filter(|(op, _, root)| op == "OpenRead" && *root == table_root)
+        .map(|(_, cursor, _)| *cursor)
+        .collect::<std::collections::HashSet<_>>();
+    assert!(operations
+        .iter()
+        .any(|(op, _, root)| op == "OpenRead" && *root == index_root));
+    assert!(
+        !operations.iter().any(
+            |(op, cursor, _)| matches!(op.as_str(), "Column" | "RowData")
+                && table_cursors.contains(cursor)
+        ),
+        "must not fetch the table's manifest blob: {operations:?}"
+    );
+}
+
+#[test]
+fn receipt_custody_is_fresh_after_keep_generation_and_state_changes() {
+    let (_tmp, db, root) = fixture();
+    let mut artifact = db.allocate(1, &root, &root.join("fresh-custody")).unwrap();
+    assert_eq!(
+        db.receipt_custody(&artifact.id).unwrap(),
+        expected_custody(&artifact)
+    );
+    assert!(db.set_keep_on_failure(1, true).unwrap());
+    artifact = db.get(&artifact.id).unwrap();
+    assert!(db.receipt_custody(&artifact.id).unwrap().keep_on_failure);
+    for (state, owned, keep) in [
+        ("source_gone", true, true),
+        ("deleted", false, false),
+        ("active", true, false),
+    ] {
+        artifact.generation = format!("changed-{state}");
+        artifact.state = state.into();
+        artifact.owned = owned;
+        artifact.keep = keep;
+        artifact.keep_on_failure = false;
+        save_artifact(&db.db.lock().unwrap(), &artifact).unwrap();
+        assert_eq!(
+            db.receipt_custody(&artifact.id).unwrap(),
+            expected_custody(&db.get(&artifact.id).unwrap())
+        );
+    }
+    assert!(matches!(db.receipt_custody("absent"), Err(Error::NotFound)));
+}
+
+#[test]
+fn receipt_custody_preserves_header_defaults_and_malformed_field_errors() {
+    let (_tmp, db, root) = fixture();
+    let artifact = db.allocate(1, &root, &root.join("typed-header")).unwrap();
+    let original = serde_json::to_value(&artifact).unwrap();
+    let mut legacy = original.clone();
+    legacy.as_object_mut().unwrap().remove("keep_on_failure");
+    legacy.as_object_mut().unwrap().remove("files");
+    db.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE artifacts SET data=?1 WHERE id=?2",
+            params![legacy.to_string(), artifact.id],
+        )
+        .unwrap();
+    assert_eq!(
+        db.receipt_custody(&artifact.id).unwrap(),
+        expected_custody(&db.get(&artifact.id).unwrap())
+    );
+    for (key, value) in [
+        ("owned", serde_json::json!("not-bool")),
+        ("generation", serde_json::Value::Null),
+        ("root_identity", serde_json::json!({"inode":"invalid"})),
+        ("failure_assessment", serde_json::json!({"disposition":123})),
+    ] {
+        let mut malformed = original.clone();
+        malformed[key] = value;
+        db.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE artifacts SET data=?1 WHERE id=?2",
+                params![malformed.to_string(), artifact.id],
+            )
+            .unwrap();
+        assert!(
+            matches!(db.get(&artifact.id), Err(Error::Json(_))),
+            "full {key}"
+        );
+        assert!(
+            matches!(db.receipt_custody(&artifact.id), Err(Error::Json(_))),
+            "header {key}"
+        );
+    }
+}
+
+#[test]
+fn receipt_custody_index_migrates_on_reopen_without_promoting_invalid_json() {
+    let (tmp, inventory, root) = fixture();
+    let good = inventory.allocate(1, &root, &root.join("good")).unwrap();
+    let bad = inventory.allocate(2, &root, &root.join("bad")).unwrap();
+    {
+        let db = inventory.db.lock().unwrap();
+        db.execute("UPDATE artifacts SET data='{broken' WHERE id=?1", [&bad.id])
+            .unwrap();
+        db.execute_batch("DROP INDEX artifacts_receipt_custody")
+            .unwrap();
+    }
+    inventory.close().unwrap();
+    let reopened = Inventory::open(&tmp.path().join("state")).unwrap();
+    assert_eq!(
+        reopened.receipt_custody(&good.id).unwrap(),
+        expected_custody(&good)
+    );
+    assert!(matches!(reopened.get(&bad.id), Err(Error::Json(_))));
+    assert!(matches!(
+        reopened.receipt_custody(&bad.id),
+        Err(Error::Json(_))
+    ));
+    assert_eq!(reopened.db.lock().unwrap().query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='artifacts_receipt_custody'",[],|row| row.get::<_,i64>(0)).unwrap(),1);
+}
+
 #[test]
 fn remount_identity_requires_same_source_type_and_filesystem_root() {
     let identity = |device, mount_id: &str| Identity {
