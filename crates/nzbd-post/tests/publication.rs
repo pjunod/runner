@@ -510,6 +510,12 @@ async fn crash_then_restart(stage: &'static str, manager_at_boot: bool) {
         &tracker,
     );
     let delivery = wait_delivery(&engine, job).await;
+    // Contract §2.1: the terminal (history) is recorded before the
+    // delivery row, on a restart as on the first attempt.
+    assert!(
+        engine.artifacts().terminal(job.0).unwrap().is_some(),
+        "{stage}: the terminal precedes its delivery row"
+    );
     let manifest = assert_one_usable_publication(tmp.path(), &source, stage);
     assert_eq!(delivery.manifest_digest, manifest.digest, "{stage}");
     assert_eq!(delivery.kind(), "completed", "{stage}");
@@ -535,7 +541,9 @@ async fn crash_then_restart(stage: &'static str, manager_at_boot: bool) {
         .filter(|row| row.job == job)
         .count();
     assert_eq!(rows, 1, "{stage}: one history row");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    // Source retirement that loses a race with boot work (verification,
+    // reconciliation) waits for its own cleanup ladder, first rung 30 s.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while source.exists() {
         assert!(
             tokio::time::Instant::now() < deadline,

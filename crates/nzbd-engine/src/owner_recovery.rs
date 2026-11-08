@@ -1146,8 +1146,11 @@ fn verify_job_batch(
             .validate_post_retry(job.id.0)
             .map_err(|error| VerificationFailure::conflict(error, checked))?;
     }
+    // Review #283-1: a restart's reconciliation pass on this source (an open
+    // publication move being finished) holds it momentarily; verification
+    // serializes behind it instead of failing against it and backing off.
     let custody = inventory
-        .acquire_terminal_use(job.id.0, &check)
+        .acquire_terminal_use_after_reconciliation(job.id.0, &check)
         .map_err(|error| VerificationFailure::unavailable(error, checked))?
         .ok_or_else(|| {
             VerificationFailure::conflict("allocation custody is unavailable", checked)

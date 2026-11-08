@@ -243,6 +243,29 @@ impl Inventory {
     ) -> Result<Option<AttemptUse>> {
         self.acquire_use(job, checkpoint, false)
     }
+    /// [`Self::acquire_terminal_use`] for a reader that serializes behind
+    /// reconciliation passes on the source (a restart finishing its
+    /// publication move) instead of failing against them: each blocked
+    /// attempt waits on the lease's release, not on a timer.
+    pub fn acquire_terminal_use_after_reconciliation(
+        self: &Arc<Self>,
+        job: u32,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> Result<Option<AttemptUse>> {
+        loop {
+            if let Some(artifact) = self.for_job(job)? {
+                self.wait_reconciliation_released(&artifact);
+            }
+            match self.acquire_use(job, checkpoint, false) {
+                Err(Error::Io(error))
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && self
+                            .for_job(job)?
+                            .is_some_and(|artifact| self.reconciliation_in_use(&artifact)) => {}
+                other => return other,
+            }
+        }
+    }
     fn acquire_use(
         self: &Arc<Self>,
         job: u32,
