@@ -489,35 +489,39 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
 
 // --- 8c. storage I/O history: gaps stay gaps, three minutes per row -----
 {
-  const at = Date.now;
-  let clock = at() + 60_000; // after any sample the boot sequence already took
-  Date.now = () => clock;
-  try {
-    const sample = (io) => ({ storage: [{ path: "/p", io }] }).storage;
-    const live = (r, w) => ({ source: "block", detail: "sda1", read_bps: r, write_bps: w });
-    T.storageIo.clear();
-    T.pushStorageIoSampled(sample(live(1, 2)));
-    clock += 100;
-    T.pushStorageIoSampled(sample(live(9, 9)));
-    eq(T.storageIo.get("storage:/p").w.length, 1, "samples are taken at most about once a second");
-    clock += 1000;
-    T.pushStorageIoSampled(sample({ source: "unsupported", detail: "cifs", read_bps: null, write_bps: null }));
-    clock += 1000;
-    T.pushStorageIoSampled(sample(live(3, 4)));
-    clock += 1000;
-    T.pushStorageIoSampled(sample(live(5, 6)));
-    const h = T.storageIo.get("storage:/p");
-    eq(JSON.stringify(h.w), "[2,null,4,6]", "an unmeasured second is a gap, not a zero");
-    eq(JSON.stringify(T.storageRuns(h.w)), "[[2,3]]", "a lone sample between gaps draws nothing");
-    for (let i = 0; i < 400; i++) { clock += 1000; T.pushStorageIoSampled(sample(live(1, 1))); }
-    eq(T.storageIo.get("storage:/p").w.length, 180, "history keeps the same three minutes as the rate tile");
-    clock += 1000;
-    T.pushStorageIoSampled([]);
-    ok(!T.storageIo.has("storage:/p"), "a filesystem that leaves the config drops its history");
-  } finally {
-    Date.now = at;
-    T.storageIo.clear();
-  }
+  T.storageIo.clear();
+  T.storageIoLatest.clear();
+  const rows = [{ path: "/p" }];
+  const live = (r, w) => [{ path: "/p", io: { source: "block", detail: "sda1", read_bps: r, write_bps: w } }];
+  let t = 1_000_000;
+  T.noteStorageIo(live(1, 2), t);
+  T.sampleStorageIo(rows, true, t += 1000);
+  T.sampleStorageIo(rows, true, t += 1000);
+  eq(JSON.stringify(T.storageIo.get("storage:/p").w), "[2,2]",
+    "an unchanged rate (not re-sent by the stream) still advances the graph");
+  T.noteStorageIo([{ path: "/p", io: { source: "unsupported", detail: "cifs", read_bps: null, write_bps: null } }], t);
+  T.sampleStorageIo(rows, true, t += 1000);
+  T.noteStorageIo(live(3, 4), t);
+  T.sampleStorageIo(rows, true, t += 1000);
+  T.sampleStorageIo(rows, false, t += 3000);
+  T.sampleStorageIo(rows, false, t += 4000);
+  const h = T.storageIo.get("storage:/p");
+  eq(JSON.stringify(h.w), "[2,2,null,4,4,null]",
+    "unmeasured seconds and a dead stream without a recent poll are gaps, not zeros");
+  eq(JSON.stringify(T.storageRuns(h.w)), "[[0,1],[3,4]]", "each measured run is drawn on its own");
+  for (let i = 0; i < 400; i++) T.sampleStorageIo(rows, true, t += 1000);
+  eq(T.storageIo.get("storage:/p").w.length, 180, "history keeps the same three minutes as the rate tile");
+  T.sampleStorageIo([], true, t += 1000);
+  ok(!T.storageIo.has("storage:/p") && !T.storageIoLatest.has("storage:/p"),
+    "a filesystem that leaves the config drops its history");
+  // A tick's rows carry no io: the row reads the stream's latest instead.
+  T.noteStorageIo(live(5, 6), t);
+  const fromTick = T.storageModels({ storage: [{ name: "completed", path: "/p", available_bytes: 1, total_bytes: 2 }] });
+  eq(fromTick[0].ioA, "W 6 B/s", "a tick row shows the rate from the storage_io frame");
+  const fresh = T.storageModels({ storage: [{ name: "completed", path: "/new", available_bytes: 1, total_bytes: 2 }] });
+  eq(fresh[0].ioA, "measuring…", "a row with no sample yet is measuring, not missing");
+  T.storageIo.clear();
+  T.storageIoLatest.clear();
 }
 
 // The summary's progress blocks arrive under snake_case keys (their fields

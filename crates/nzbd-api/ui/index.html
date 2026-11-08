@@ -3342,7 +3342,8 @@ function storageModels(s) {
         (hasReading
           ? " — " + fmtBytes(used) + " used of " + fmtBytes(total) + " (" + Math.round(pct) + "%)"
           : " — waiting for a capacity reading"),
-      ...storageIoModel(v.io),
+      ...storageIoModel(Object.prototype.hasOwnProperty.call(v, "io")
+        ? v.io : storageIoLatest.get(storageKey(v, i))),
     };
   });
 }
@@ -3353,8 +3354,10 @@ function storageModels(s) {
 // and a filesystem with no counters says so instead of drawing a flat line.
 function storageIoModel(io) {
   const quiet = (text, tip) => ({ ioQuiet: true, ioA: text, ioB: "", ioTip: tip });
+  if (io === undefined) return quiet("measuring…", "Waiting for the first storage I/O sample.");
   if (!io) return quiet("no I/O data",
-    "This platform gives the filesystem no device identity, so Runner cannot sample its I/O.");
+    "Runner has no device identity for this filesystem (its path could not be read, or the " +
+    "platform does not provide one), so it cannot sample its I/O.");
   if (io.source === "unsupported") return quiet("I/O n/a",
     "No transfer counters exist for this filesystem (" + io.detail + "). Runner graphs block " +
     "devices and NFS mounts; SMB, FUSE and overlay mounts expose none.");
@@ -3487,29 +3490,52 @@ function drawSparkline() {
 
 // ---- storage I/O history: three minutes per filesystem -----------------
 // The same window and cadence as the rate sparkline, one ring per storage
-// row. A sample without rates (first reading, unsupported, stalled) is a
-// gap in the line, not a zero: the graph never claims an idle disk it did
-// not measure.
-const storageIo = new Map();
-let storageIoPushedAt = 0, storageIoDrawnAt = 0;
-function pushStorageIoSampled(storage) {
-  const now = Date.now();
-  if (now - storageIoPushedAt < 900) return;
-  storageIoPushedAt = now;
+// row. The latest throughput per row arrives on the stream's `storage_io`
+// frame (sent only when it changed) or with a status poll; a one-second
+// clock turns that into samples, so an unchanged rate still advances the
+// graph. A second with nothing trustworthy (no sample yet, unsupported,
+// stalled sampler, dead stream and no recent poll) is a gap, not a zero:
+// the graph never claims an idle disk it did not measure.
+const storageIo = new Map();        // row key -> { r: [], w: [] }
+const storageIoLatest = new Map();  // row key -> latest io (null = none possible)
+let storageIoNotedAt = 0, storageIoDrawnAt = 0;
+function noteStorageIo(storage, nowMs) {
+  (storage || []).forEach((v, i) => {
+    if (Object.prototype.hasOwnProperty.call(v, "io")) storageIoLatest.set(storageKey(v, i), v.io);
+  });
+  storageIoNotedAt = nowMs == null ? Date.now() : nowMs;
+}
+function applyStorageIoFrame(d) {
+  noteStorageIo(d && d.storage);
+  if (store.status) renderStorage(store.status);
+}
+/// One sample per row from the latest known throughput. `live` says the
+/// stream is up, so a value that has not been re-sent is still current.
+function sampleStorageIo(storage, live, nowMs) {
+  const now = nowMs == null ? Date.now() : nowMs;
+  const fresh = live || now - storageIoNotedAt < 6500;
   const seen = new Set();
   (storage || []).forEach((v, i) => {
     const key = storageKey(v, i);
     seen.add(key);
     let h = storageIo.get(key);
     if (!h) storageIo.set(key, h = { r: [], w: [] });
-    const io = v.io;
-    const ok = !!io && io.read_bps != null && io.write_bps != null &&
+    const io = storageIoLatest.get(key);
+    const ok = fresh && !!io && io.read_bps != null && io.write_bps != null &&
       io.source !== "stale" && io.source !== "unsupported";
     h.r.push(ok ? Math.max(0, Number(io.read_bps) || 0) : null);
     h.w.push(ok ? Math.max(0, Number(io.write_bps) || 0) : null);
     if (h.r.length > SPARK_N) { h.r.shift(); h.w.shift(); }
   });
   for (const key of [...storageIo.keys()]) if (!seen.has(key)) storageIo.delete(key);
+  for (const key of [...storageIoLatest.keys()]) if (!seen.has(key)) storageIoLatest.delete(key);
+}
+function storageIoClock() {
+  const storage = store.status && store.status.storage;
+  if (!storage || !storage.length) return;
+  sampleStorageIo(storage, store.conn === "live");
+  storageIoDrawnAt = 0;
+  drawStorageIo();
 }
 function drawStorageIo() {
   const list = $("storage-list");
@@ -3549,14 +3575,17 @@ function drawStorageGraph(cv, h, ink) {
   if (cv.width !== w || cv.height !== ht) { cv.width = w; cv.height = ht; }
   const ctx = cv.getContext("2d");
   ctx.clearRect(0, 0, w, ht);
+  // Nothing measured in the window (no sample yet, or a filesystem with no
+  // counters): an empty plot, not a scaled chart of nothing.
+  if (!h || !h.w.some((v) => v != null)) return;
   ctx.fillStyle = ink.grid;
   for (let k = 1; k < 4; k++) ctx.fillRect(Math.round(w * k / 4), 0, Math.max(1, dpr * .5), ht);
-  if (!h || h.w.length < 2) return;
-  let peak = 1;
+  let peak = 0;
   for (let i = 0; i < h.w.length; i++) peak = Math.max(peak, h.w[i] || 0, h.r[i] || 0);
+  const scale = Math.max(peak, 1);
   const step = w / (SPARK_N - 1), off = SPARK_N - h.w.length;
   const x = (i) => (i + off) * step;
-  const y = (v) => ht - 1 - (v / peak) * (ht - 2);
+  const y = (v) => ht - 1 - (v / scale) * (ht - 2);
   const lw = Math.max(1, dpr);
   for (const run of storageRuns(h.w)) {
     ctx.beginPath();
@@ -3581,11 +3610,12 @@ function drawStorageGraph(cv, h, ink) {
     ctx.lineWidth = lw * 1.3;
     ctx.stroke();
   }
-  // The scale: this row's busiest second in view.
+  // The scale: this row's busiest second in view ("idle" when every
+  // measured second was zero).
   ctx.font = (9 * dpr) + "px " + ink.font;
   ctx.textBaseline = "top";
   ctx.fillStyle = ink.muted;
-  ctx.fillText(fmtRate(peak), 0, dpr);
+  ctx.fillText(peak > 0 ? fmtRate(peak) : "idle", 0, dpr);
 }
 
 // ---- title ticker -------------------------------------------------------
@@ -4307,7 +4337,7 @@ async function refreshStatus() {
   pollResult(true);
   store.status = await r.json();
   pushRateSampled(store.status.download_rate_bps);
-  pushStorageIoSampled(store.status.storage);
+  noteStorageIo(store.status.storage);
   renderStatus();
 }
 async function refreshQueue() {
@@ -5237,7 +5267,8 @@ function pollResult(ok) {
 let es = null, esRetryMs = 1000, esRetryTimer = null, esRetryPending = false;
 function startStream() {
   if (es) { try { es.close(); } catch {} }
-  es = new EventSource("/api/v1/events");
+  // storage_io: per-filesystem throughput for the Storage panel's graphs.
+  es = new EventSource("/api/v1/events?storage_io=1");
   es.onopen = () => { esRetryMs = 1000; connState("live"); };
   es.onerror = () => {
     if (store.conn !== "unreachable") connState("reconnecting");
@@ -5275,6 +5306,9 @@ function startStream() {
   // the daemon says "still here" without shipping a read model — it is the
   // difference between a quiet queue and a dead stream.
   es.addEventListener("hb", applyHb);
+  es.addEventListener("storage_io", (e) => {
+    try { applyStorageIoFrame(JSON.parse(e.data)); } catch {}
+  });
   // Live log tail. Everything lands in the client ring regardless of the
   // scope toggles (they filter at render time) and the open job's activity
   // panel feeds off the same stream.
@@ -5318,7 +5352,6 @@ function applyTick(d) {
   store.jobsLoaded = true;
   pending.reconcile(d.jobs);
   pushRateSampled(d.status.download_rate_bps);
-  pushStorageIoSampled(d.status.storage);
   renderStatus();
   if (activeTab === "queue") renderQueue();
 }
@@ -7132,6 +7165,7 @@ function pollPass() {
   // The pending-op grace period has to expire even when nothing is arriving
   // — a dead stream must never leave a row invisible forever.
   setInterval(() => pending.sweep(), 1000);
+  setInterval(storageIoClock, 1000);
   // Stage timers advance on the wall clock, not on data arriving. A job in
   // post-processing moves no bytes, so its tick payload is byte-identical
   // second to second and the server suppresses it — meaning the one number
@@ -7160,7 +7194,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     readDisplay, displayMode, applyDisplay, DISPLAY_LAYOUTS, DISPLAY_PALETTES,
     rowModel, reconcileRows, applyRow, differ, KINDS, store,
     controlPendingLabel, controlPendingText, mergePendingJobs, acquisitionStatus, overlayPendingObservations, refreshPendingObservations,
-    histModel, fileModel, statusModels, storageModels, storageIoModel, pushStorageIoSampled, storageRuns, storageIo, queueModels, detailModel,
+    histModel, fileModel, statusModels, storageModels, storageIoModel, noteStorageIo, sampleStorageIo, applyStorageIoFrame, storageRuns, storageIo, storageIoLatest, queueModels, detailModel,
     statusName, statusLabel, healthColor, repairProgressText, fmtBytes, fmtRate, fmtEta, fmtDur, ppSummary,
     sectionOf, currentPostStage, pipelineModels, stageElapsedMs, SECTIONS, ORDERED,
     torrentPrimaryAction, torrentPhase, torrentStatus, seedPolicyText, seedStopText, seedLimitReached, toggleSection, collapsedSections,
