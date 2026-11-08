@@ -374,6 +374,10 @@ pub struct Inventory {
     db: Mutex<Connection>,
     allocation_uses: Mutex<std::collections::HashSet<u32>>,
     reconciliation_uses: Mutex<std::collections::HashSet<(String, String)>>,
+    /// Signalled whenever a reconciliation/namespace use is released, so an
+    /// operator request can wait out a maintenance pass's momentary lease
+    /// instead of failing against it.
+    reconciliation_released: std::sync::Condvar,
     workspace_uses: Mutex<std::collections::HashMap<(String, String), usize>>,
     workspace_cursor: Mutex<String>,
     _process_lock: File,
@@ -786,6 +790,7 @@ impl Inventory {
             db: Mutex::new(db),
             allocation_uses: Mutex::new(std::collections::HashSet::new()),
             reconciliation_uses: Mutex::new(std::collections::HashSet::new()),
+            reconciliation_released: std::sync::Condvar::new(),
             workspace_uses: Mutex::new(std::collections::HashMap::new()),
             workspace_cursor: Mutex::new(String::new()),
             _process_lock: process_lock,
@@ -2057,14 +2062,36 @@ impl Inventory {
     /// consulted at the physical-delete boundary. Explicit artifact deletion
     /// remains a separate user action and is not blocked by this preference.
     pub fn set_keep_on_failure(&self, job: u32, keep: bool) -> Result<bool> {
-        let guard = self.mutation_guard()?;
-        let artifact = self.failure_keep_source(job)?;
-        let Some(artifact) = artifact else {
-            return Ok(false);
-        };
-        let result = self.set_failure_keep_artifact_locked(job, artifact, keep, false);
-        drop(guard);
-        result
+        loop {
+            // An operator's Keep serializes behind a maintenance pass's
+            // momentary reconciliation lease on the source rather than
+            // failing against it (the lease is released under the mutation
+            // guard, so the wait happens without it).
+            if let Some(artifact) = self.failure_keep_source(job)? {
+                self.wait_reconciliation_released(&artifact);
+            }
+            let guard = self.mutation_guard()?;
+            let Some(artifact) = self.failure_keep_source(job)? else {
+                return Ok(false);
+            };
+            if self.reconciliation_in_use(&artifact) {
+                drop(guard);
+                continue;
+            }
+            let result = self.set_failure_keep_artifact_locked(job, artifact, keep, false);
+            drop(guard);
+            return result;
+        }
+    }
+
+    /// Block until no reconciliation/namespace use holds `artifact`'s
+    /// current generation. Call without the mutation guard.
+    pub(super) fn wait_reconciliation_released(&self, artifact: &Artifact) {
+        let key = (artifact.id.clone(), artifact.generation.clone());
+        let mut uses = self.reconciliation_uses.lock().unwrap();
+        while uses.contains(&key) {
+            uses = self.reconciliation_released.wait(uses).unwrap();
+        }
     }
 
     fn set_failure_keep_artifact_locked(
