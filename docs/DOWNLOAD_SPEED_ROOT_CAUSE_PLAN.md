@@ -624,6 +624,12 @@ calls consumed 1.235 seconds. Page reads took only 0.001 seconds and futex waits
 file locks through the GlusterFS volume. A projection alone cannot remove
 those per-query lock round trips.
 
+A separate read-only nuc3 comparison fetched the same 200 artifact records
+(360,536 bytes per sweep) without the proposed index: 200 individual SELECTs
+took 681–806 ms; one bound `json_each` SELECT took 3.8–4.9 ms. This isolates
+transaction/lock round trips from manifest projection and changes no runtime
+state. It is not a download-throughput result.
+
 The follow-up reads all checkpoint receipt headers with one bound JSON-array
 query and one SQLite read statement/transaction, then applies the same custody
 rules to each receipt. Missing rows and per-row decoding failures leave only
