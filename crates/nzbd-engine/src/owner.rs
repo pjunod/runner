@@ -6139,6 +6139,12 @@ impl Owner {
             let Some(r) = lease else { break };
 
             if let Err(e) = self.ensure_allocation(r.job, false) {
+                if matches!(e, nzbd_state::artifacts::Error::Busy(_)) {
+                    // No allocation was admitted and no callback owns this
+                    // row. Retain it in the queue and yield this bounded batch
+                    // until the payload-capacity wakeup; preserve prior leases.
+                    break;
+                }
                 if self.retiring_writers.contains_key(&r.job)
                     || self.allocating_jobs.contains(&r.job)
                 {
@@ -7948,8 +7954,8 @@ impl Owner {
             ));
         }
         if !self.payload_capacity_available() {
-            return Err(nzbd_state::artifacts::Error::Conflict(
-                "payload allocation awaits lane capacity".into(),
+            return Err(nzbd_state::artifacts::Error::Busy(
+                "payload allocation awaits lane capacity",
             ));
         }
         // Cache hits need only the plan above, not a clone of every file and

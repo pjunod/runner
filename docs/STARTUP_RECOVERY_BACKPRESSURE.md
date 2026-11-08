@@ -83,7 +83,10 @@ No unbounded overflow queue or age-based watchdog is introduced.
 
 Normal download allocation also checks capacity before scheduling work. A
 refusal leaves the row queued; its callback does not create an allocation
-hold for `Busy`. Actual allocation, namespace, mount, or identity failures
+hold for `Busy`. The scheduler also recognizes this typed deferral at its
+caller boundary and yields the current batch without inventing an in-flight
+allocation or creating a hold. The real `grant_work` regression covers that
+boundary as well as the allocator itself. Actual allocation, namespace, mount, or identity failures
 continue through the existing failure policy.
 
 ## 5. Zero claims still receive custody checks

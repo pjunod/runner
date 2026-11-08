@@ -434,10 +434,33 @@ async fn payload_capacity_refusal_is_deferred_and_does_not_hold_a_download() {
     assert!(owner.ensure_allocation(JobId(1), false).is_err());
     assert!(!owner.state.job(JobId(1)).unwrap().held());
     assert!(!owner.allocating_jobs.contains(&JobId(1)));
+    owner.servers = Arc::new(vec![nzbd_types::ServerDef {
+        id: ServerId(1),
+        name: "test".into(),
+        host: "localhost".into(),
+        port: 119,
+        tls: nzbd_types::TlsMode::None,
+        username: None,
+        password: None,
+        active: true,
+        tier: 0,
+        group: 0,
+        fill: false,
+        max_connections: 2,
+        pipeline_depth: 1,
+        retention_days: 0,
+        cert_verification: nzbd_types::CertLevel::Strict,
+    }]);
+    assert!(owner.grant_work(ServerId(1), 1).is_empty());
+    let scheduler_held_the_job = owner.state.job(JobId(1)).unwrap().held();
     release.send(()).unwrap();
     pump_idle(&mut owner, &mut messages).await;
     assert!(owner.payload_waiting.is_empty());
     owner.drain_shutdown_results(&mut messages).await;
+    assert!(
+        !scheduler_held_the_job,
+        "grant_work must defer a full payload lane instead of holding the download"
+    );
 }
 
 #[tokio::test]
