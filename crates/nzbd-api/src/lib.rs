@@ -470,6 +470,10 @@ pub struct StatusDto {
     pub remaining_bytes: u64,
     pub session_downloaded_bytes: u64,
     pub download_paused: bool,
+    /// Post-processing lane paused — independent of `download_paused`.
+    /// Downloaded jobs wait in `post_queued`; a running job holds at its
+    /// next stage boundary.
+    pub post_paused: bool,
     /// Queue-hold reasons (why nothing is downloading right now).
     pub disk_low: bool,
     /// Lowest measured free bytes across all configured write roots.
@@ -555,6 +559,7 @@ fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -
         remaining_bytes: snap.remaining_bytes,
         session_downloaded_bytes: snap.session_downloaded_bytes,
         download_paused: snap.download_paused,
+        post_paused: snap.post_paused,
         disk_low: snap.disk_low,
         disk_guard_free_bytes: snap.disk_guard_free_bytes,
         disk_guard_label: snap.disk_guard_label.clone(),
@@ -1495,9 +1500,17 @@ async fn queue_action(
     let engine = &st.engine;
     let source = client_source(&headers);
     let result = match action.as_str() {
+        // `pause`/`resume` are the download lane, as they always were.
         "pause" => engine.pause_all(&source).await,
         "resume" => engine.resume_all(&source).await,
-        _ => return error(StatusCode::BAD_REQUEST, "unknown action (pause|resume)"),
+        "pause-post" => engine.pause_post(&source).await,
+        "resume-post" => engine.resume_post(&source).await,
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "unknown action (pause|resume|pause-post|resume-post)",
+            )
+        }
     };
     match result {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
@@ -1958,6 +1971,10 @@ fn event_json(ev: &nzbd_engine::Event) -> (&'static str, serde_json::Value) {
             "queue_pause_changed",
             json!({"paused": paused, "source": source}),
         ),
+        E::PostPauseChanged { paused, source } => (
+            "post_pause_changed",
+            json!({"paused": paused, "source": source}),
+        ),
         E::SpeedLimitChanged { bytes_per_sec } => (
             "speed_limit_changed",
             json!({"bytes_per_sec": bytes_per_sec}),
@@ -2080,6 +2097,8 @@ async fn metrics(State(st): State<ApiState>) -> Response {
     );
     let _ = writeln!(m, "# TYPE nzbd_download_paused gauge");
     let _ = writeln!(m, "nzbd_download_paused {}", snap.download_paused as u8);
+    let _ = writeln!(m, "# TYPE nzbd_post_paused gauge");
+    let _ = writeln!(m, "nzbd_post_paused {}", snap.post_paused as u8);
     let _ = writeln!(m, "# TYPE nzbd_speed_limit_bytes_per_second gauge");
     let _ = writeln!(
         m,
@@ -2419,7 +2438,7 @@ async fn openapi() -> Response {
             "/api/v1/jobs/{id}/retry": { "post": { "summary": "Retry the same job's held post-processing or failed-source cleanup" } },
             "/api/v1/jobs/{id}/torrent/seed-policy": { "put": { "summary": "Set stop_on_complete, positive ratio_limit/time_limit_secs (null = unlimited), or use_defaults; never starts a stopped torrent" } },
             "/api/v1/jobs/{id}/actions/{action}": { "post": { "summary": "pause|resume|delete|delete-files|move-*|post-restart-*; delete answers {ok, parked}" } },
-            "/api/v1/queue/actions/{action}": { "post": { "summary": "pause|resume" } },
+            "/api/v1/queue/actions/{action}": { "post": { "summary": "pause|resume (downloads) · pause-post|resume-post (post-processing)" } },
             "/api/v1/queue/speed-limit": { "put": { "summary": "Set speed limit (bytes_per_sec)" } },
             "/api/v1/servers/test": { "post": { "summary": "Live news-server connectivity probe (connect + greeting + AUTHINFO)" } },
             "/api/v1/jobs/{id}/files": { "get": { "summary": "Per-file detail (segments done/failed, sizes, paused, par2)" } },
@@ -4411,6 +4430,51 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["jobs_queued"], 1);
         assert_eq!(v["remaining_bytes"], 1000);
+        assert_eq!(v["post_paused"], false);
+
+        // The two pause lanes: `pause-post` touches only post-processing,
+        // and an unknown lane is a client error rather than a silent no-op.
+        let queue_action = |action: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::post(format!("/api/v1/queue/actions/{action}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let status = || {
+            let app = app.clone();
+            async move {
+                body_json(
+                    app.oneshot(
+                        axum::http::Request::get("/api/v1/status")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                )
+                .await
+            }
+        };
+        assert_eq!(queue_action("pause-post").await.status(), StatusCode::OK);
+        let v = status().await;
+        assert_eq!(v["post_paused"], true);
+        assert_eq!(v["download_paused"], false);
+        assert_eq!(queue_action("pause").await.status(), StatusCode::OK);
+        assert_eq!(queue_action("resume-post").await.status(), StatusCode::OK);
+        let v = status().await;
+        assert_eq!(v["post_paused"], false);
+        assert_eq!(v["download_paused"], true);
+        assert_eq!(queue_action("resume").await.status(), StatusCode::OK);
+        assert_eq!(
+            queue_action("pause-everything").await.status(),
+            StatusCode::BAD_REQUEST
+        );
 
         // Pause + resume + delete.
         for (action, expect) in [("pause", true), ("resume", true), ("delete", true)] {
@@ -5715,6 +5779,7 @@ mod integration_doc_tests {
                 | E::SegmentExhausted { .. }
                 | E::ServerBlocked { .. }
                 | E::QueuePauseChanged { .. }
+                | E::PostPauseChanged { .. }
                 | E::SpeedLimitChanged { .. }
                 | E::MaxActiveDownloadsChanged { .. }
                 | E::JobAssigned { .. }

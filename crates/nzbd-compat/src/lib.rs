@@ -410,6 +410,16 @@ async fn dispatch_cluster(
             let source = current_client(state);
             Ok(Value::Bool(state.engine.resume_all(&source).await.is_ok()))
         }
+        // NZBGet's post-processing pause maps onto runner's post lane: the
+        // running stage finishes, no new one starts, downloads carry on.
+        "pausepost" => {
+            let source = current_client(state);
+            Ok(Value::Bool(state.engine.pause_post(&source).await.is_ok()))
+        }
+        "resumepost" => {
+            let source = current_client(state);
+            Ok(Value::Bool(state.engine.resume_post(&source).await.is_ok()))
+        }
         "writelog" => {
             // writelog(Kind, Text) — scripts and clients inject log lines.
             if let Some(buf) = &state.log {
@@ -450,7 +460,7 @@ fn status_json(state: &CompatState) -> Value {
         "DownloadLimit": snap.speed_limit_bps.unwrap_or(0).min(u32::MAX as u64) as u32,
         "DownloadPaused": snap.download_paused,
         "Download2Paused": snap.download_paused, // deprecated alias
-        "PostPaused": false,
+        "PostPaused": snap.post_paused,
         "ScanPaused": false,
         "ServerStandBy": snap.download_rate_bps == 0,
         "UpTimeSec": uptime,
@@ -1595,6 +1605,23 @@ mod tests {
             .await
             .unwrap();
         assert!(!state.engine.snapshot().download_paused);
+
+        // NZBGet's post-processing pause is the post lane, not a no-op.
+        assert_eq!(
+            dispatch(&state, "pausepost", &Value::Null).await.unwrap(),
+            json!(true)
+        );
+        assert!(state.engine.snapshot().post_paused);
+        assert!(!state.engine.snapshot().download_paused);
+        assert_eq!(
+            dispatch(&state, "status", &Value::Null).await.unwrap()["PostPaused"],
+            json!(true)
+        );
+        assert_eq!(
+            dispatch(&state, "resumepost", &Value::Null).await.unwrap(),
+            json!(true)
+        );
+        assert!(!state.engine.snapshot().post_paused);
         state.engine.shutdown().await;
     }
 
