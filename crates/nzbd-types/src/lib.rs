@@ -238,7 +238,7 @@ pub enum DupeMode {
     Force,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DupeInfo {
     pub key: String,
     pub score: i32,
@@ -246,7 +246,7 @@ pub struct DupeInfo {
 }
 
 /// Byte/article accounting for a job. All sizes in bytes.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobTotals {
     pub size: u64,
     pub par_size: u64,
@@ -275,7 +275,7 @@ pub enum SegmentState {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Segment {
     pub message_id: Box<str>,
     pub number: u32,
@@ -284,7 +284,7 @@ pub struct Segment {
     pub state: SegmentState,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
     pub id: FileId,
     pub subject: String,
@@ -988,7 +988,7 @@ pub fn has_delivery_intent(params: &[(String, String)]) -> bool {
         .any(|(key, value)| key == DELIVERY_INTENT_PARAM && value == "1")
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Job {
     pub id: JobId,
     pub kind: JobKind,
