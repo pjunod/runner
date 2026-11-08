@@ -1,5 +1,65 @@
 # nzbd — Project Status
 
+## Pipeline contract v2 M6b — legacy wire fields removed — 2026-11-08
+
+**Merge only after deploy confirmation.** Paul confirms that every node runs
+curator M2 and runner **0.5.0 (M6a)** — not merely M1a/M3 — before this
+merges. **Status:** draft PR (#PR) on `claude/pipeline-v2-m6b-runner`
+(runner 0.6.0), stacked on M6a (base `claude/pipeline-v2-m6a-runner`). Not
+reviewed, not merged, not deployed.
+
+- **`pp_status` / `final_dir` removed** from `Event::JobPpFinished` and
+  `event_json`. Every curator since M2 applies a Runner event only as a typed
+  fact (`outcome`/`reason`/`publication`). The failed-cleanup admission's
+  event filter now matches a failed terminal whose reason's history status is
+  `FAILURE/`-prefixed — the same set it matched by string. History rows keep
+  their own `status` and `final_dir`.
+- **v1 delivery shims removed:** the stored row's `status: "ready"` (local
+  and cluster private rows), the local `deliveries.accepted_at` /
+  `consumer_receipt_id` columns (dropped on open, rows kept; test
+  `v1_acceptance_columns_are_dropped_on_open`), and `includeAccepted` (query
+  types and OpenAPI; a request that still sends it is answered). The
+  `deliveries` rows themselves stay: they are the contract §2.5
+  reconciliation feed curator reads.
+- Docs: `INTEGRATION.md`, ADR-20.
+
+**Not built in this branch (decisions for Paul / plan defects):**
+- **Persisted `JobStatus::Held`.** Holds are still persisted as `Paused` with
+  `control.lifecycle == "held"`. Doing it means revisiting ~107 non-test
+  `JobStatus::Paused` sites in engine and cluster (manual-pause inference at
+  hold time, previous-status restore, grant statuses) — a state-machine change
+  that needs its own review, not a rename. Its rollout prerequisite is
+  already in M6a: 0.5.0 reads a persisted `held` as `Paused`. Plan defect:
+  IMPL_RUNNER §8 gates it on "every node runs M1a+", but an M1a/M3 node
+  cannot decode `held`; the gate is every node on 0.5.0.
+- **`custodyState` / `sourceCleanupStatus` receipt fields.** They are not
+  just wire fields: `custody_state == "curator"` guards receipt outcome
+  updates, source pinning and publication paths in the engine (`queue.rs`
+  `sync_url_admission_receipts`, `owner.rs`
+  `refresh_pinned_url_admission_custody` / `pin_unpinned_failed_source`, the
+  admission merge) and the cluster admission path, fed by the
+  `Delivery:Custody` / `Artifact:Custody` / `Delivery:SourceCleanup` params.
+  Removing them is deleting that custody tracking, with a replacement rule
+  for the guards (proposed: a receipt with a recorded `terminalOutcome` is
+  settled). Left deprecated on the wire.
+- `cluster_deliveries.accepted_at` stays in the replicated schema (always
+  NULL): dropping it is a cluster-wide hiqlite schema change with no
+  correctness benefit.
+- The `review: interrupted move` hold clear in `commit_intent` stays:
+  `relocation.rs` still writes that hold for non-intent moves, so the clear
+  is live code, not a rollback shim.
+
+**Fast lane run:** `cargo check --workspace --all-targets` clean;
+`nzbd-api --lib` deliveries/accept/pp_finished 5/5 and the doc test;
+`nzbd-cluster --lib` delivery/keep 9/9; `nzbd-post` `terminal_first` 15/15;
+`nzbd-state --lib` delivery + migration 22/22; `nzbd` `docs_index` 2/2.
+
+**Post-deploy checks:** `curl -sN -H "Authorization: Bearer $TOK"
+$NZBD/api/v1/events | grep -m1 job_pp_finished` carries no `pp_status`;
+`sqlite3 <state>/artifacts.sqlite "SELECT name FROM pragma_table_info('deliveries')"`
+lists no `accepted_at`; curator's Activity shows the next completion
+importing.
+
 ## Pipeline contract v2 M6a — one clock per job, errno not text, docs from the contract — 2026-11-08
 
 **Status:** draft PR (#PR) on `claude/pipeline-v2-m6a-runner` (runner 0.5.0),

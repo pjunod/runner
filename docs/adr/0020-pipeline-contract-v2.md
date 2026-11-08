@@ -62,7 +62,9 @@ person removed while they sat in a review hold.
   the next release without waiting on runner's bytes.
 - `publish`, `io`, `identity` and `hold_expired` always park, whatever
   `failure_action` says (decision for Paul, adopted by both reviewers).
-- The legacy wire fields (`pp_status`, `final_dir`, `custodyState`,
-  `sourceCleanupStatus`, `includeAccepted`) and the persisted `Paused`-for-held
-  representation ride one release for mixed-version safety and are removed in
-  M6b, which merges only after every node runs curator M2 and runner M1a/M3.
+- The legacy wire fields rode one release for mixed-version safety. M6b
+  (0.6.0) removes `pp_status`, `final_dir`, `includeAccepted` and the v1
+  delivery-row shims, and deploys only after every node runs curator M2 and
+  runner 0.5.0. Still to go: `custodyState`/`sourceCleanupStatus` with the
+  receipt custody tracking behind them, and the persisted `held` status
+  (0.5.0 already reads one).
