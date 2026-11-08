@@ -8696,6 +8696,21 @@ mod decision_tests {
     #[test]
     fn dropped_volume_errors_hold_as_storage_unavailable_through_any_wrapper() {
         for error in [
+            // Review #296-1: an error rebuilt from its kind has no errno.
+            PostError::Io(std::io::Error::new(
+                std::io::ErrorKind::StaleNetworkFileHandle,
+                "x",
+            )),
+            // ... and one given context keeps it, EIO included.
+            PostError::Io(nzbd_state::io_context(
+                std::io::Error::from_raw_os_error(libc::EIO),
+                "read /processing/x",
+            )),
+            PostError::Artifact(nzbd_state::artifacts::Error::Io(nzbd_state::io_context(
+                std::io::Error::from_raw_os_error(libc::ENOTCONN),
+                "copy /processing/x",
+            ))),
+            PostError::Io(std::io::Error::from_raw_os_error(libc::EROFS)),
             PostError::Subprocess(
                 "restore /processing/x -> /processing/y: Transport endpoint is not connected (os error 107)".into(),
             ),
