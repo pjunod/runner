@@ -33,6 +33,16 @@ speed limit control, history, log tail, settings, layouts and color schemes. It 
 over SSE at 1 Hz — progress bars, rates and the sparkline move without
 you touching anything.
 
+**Pausing: two lanes.** The **Downloads** and **Post-processing** toggles
+pause independently. Pausing downloads stops pulling articles; jobs stay
+queued and anything already downloaded keeps post-processing. Pausing
+post-processing lets downloads run while finished jobs wait in *Waiting to
+post-process*; a job that is mid-way finishes the stage it is in (a repair or
+extract is never cut off) and then holds — its row says *holds after this
+stage*, then *held*. A paused lane latches amber with a ▶; click it to resume.
+Each paused lane gets its own badge naming the client that paused it, and
+both survive a restart. The mobile app has the same two toggles.
+
 **Adding downloads.** **+ add nzb** uploads one or more local NZB files.
 **+ add torrent** opens an inline form for a magnet link, remote `.torrent`
 URL, or local `.torrent` file, with category, priority, and add-paused options.
@@ -243,7 +253,8 @@ Everything the *arr apps use is implemented against NZBGet's real wire
 behavior and locked with golden tests: `version`, `append` (v13+ and
 legacy call forms), `listgroups`, `history`, `editqueue`
 (`Group*`/`File*`/`History*` verbs), `status`, `config`, `rate`, pause
-family, `listfiles`, `log`/`writelog`, `scan`, `servervolumes`,
+family (`pausedownload` is the download lane, `pausepost` the post lane;
+`PostPaused` in `status` reflects it), `listfiles`, `log`/`writelog`, `scan`, `servervolumes`,
 `sysinfo`, `testserver`. Duplicate handling (dupe key/score/mode) and
 per-job passwords (`*Unpack:Password`) behave like NZBGet. XML-RPC
 (including `system.multicall`) is served on `/xmlrpc` for older tooling.
@@ -374,7 +385,7 @@ GET  /api/v1/jobs/{id}/nzb          the job's NZB, regenerated from queue state
 GET  /api/v1/jobs/{id}/torrent      torrent lifecycle and effective policy
 PUT  /api/v1/jobs/{id}/torrent/seed-policy   edit the effective policy
 POST /api/v1/jobs/{id}/actions/{action}     pause|resume|delete|delete-files|move-*
-POST /api/v1/queue/actions/{action}
+POST /api/v1/queue/actions/{action}    pause|resume (downloads) · pause-post|resume-post (post-processing)
 PUT  /api/v1/queue/speed-limit
 GET  /api/v1/history
 POST /api/v1/history/{id}/actions/{action}  hide|restore|delete|delete-files|requeue

@@ -1,5 +1,46 @@
 # nzbd — Project Status
 
+## Split pause: downloads and post-processing pause independently — 2026-11-08
+
+**Status:** draft PR on `feat/split-pause` (runner 0.7.0, mobile 1.1.7),
+base `main` at 0.6.0. Owner: Claude (Opus 5.5 session). Next: adversarial
+review → fixes → `make fast-check` once → merge. Not deployed.
+
+Paul asked for downloads and post-processing to pause separately, without
+disturbing the UI. The approved mockup is what shipped.
+
+- **Engine.** `post_paused` sits beside `download_paused`: persisted in
+  `queue.json` (absent reads as running, so old documents behave as before),
+  carried on the snapshot, adopted on failover, flipped only by
+  `PausePost`/`ResumePost` client commands and attributed on
+  `PostPauseChanged`. The snapshot is published before the epoch bump so a
+  parked stage never wakes onto the stale flag.
+- **Post-processing.** Enforced at `Stages::enter`, the one place a stage
+  begins. The running stage finishes and its span closes, then the job parks
+  before the next stage. Jobs not yet started wait before taking a slot or
+  owner admission and stay `post_queued`. Cancelling a parked job starts no
+  further stage.
+- **API / compat.** `POST /api/v1/queue/actions/pause-post|resume-post`;
+  `pause|resume` still mean downloads. `post_paused` is on `/api/v1/status`
+  and the tick, `post_pause_changed` on SSE, `nzbd_post_paused` on
+  `/metrics`. NZBGet `pausepost`/`resumepost` previously fell through to
+  "Invalid procedure" with `PostPaused` hardcoded false; both now drive the
+  lane.
+- **Web UI.** "Pause queue / Resume queue" become **Downloads** and
+  **Post-processing** toggles in the same spot (the row is narrower than
+  before). A paused lane latches amber with a ▶. Each lane has its own
+  "paused · by <client>" badge. The waiting-to-post-process heading shows
+  "held · post-processing paused"; a post job reads "holds after this stage"
+  while its stage runs and "held" once parked.
+- **Mobile.** The same two lane toggles and a paused indicator.
+
+**Decision made without Paul (review later):** the post pause takes effect at
+a stage boundary rather than interrupting a running stage, because cutting
+off par2 or an extract means redoing the whole stage. In cluster mode the
+flag lives on the authority's snapshot; a worker running a leased post
+attempt does not see it yet. There is one runner node today, so this is noted
+rather than built.
+
 ## Pipeline contract v2 M6b — legacy wire fields removed, persisted `held` — 2026-11-08
 
 **Merge only after deploy confirmation.** Before this merges, Paul confirms
