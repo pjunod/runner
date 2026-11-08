@@ -141,7 +141,7 @@ impl ControlStore {
     ) -> Result<Option<(Job, u64, String)>, String> {
         let limit = crate::proto::MAX_DESCRIPTOR_BYTES as i64;
         let row=self.client.query_consistent_map::<IntentRow,_>("SELECT CASE WHEN length(CAST(intent_json AS BLOB))<=?2 THEN intent_json ELSE '' END AS data,length(CAST(intent_json AS BLOB)) AS bytes,revision,incarnation FROM control_jobs WHERE job_id=?1 AND deleted=0",params!(i64::from(job),limit)).await.map_err(|e|e.to_string())?.into_iter().next();
-        row.map(|row|{if row.bytes>limit{return Err("current job descriptor exceeds16MiB; source retained, reduce metadata before retrying".into());}Ok((serde_json::from_str(&row.data).map_err(|e|e.to_string())?,u64::try_from(row.revision).map_err(|e|e.to_string())?,row.incarnation))}).transpose()
+        row.map(|row|{if row.bytes>limit{return Err("current job descriptor exceeds16MiB; source retained, reduce metadata before retrying".into());}Ok((crate::control::decode_intent(&row.data).map_err(|e|e.to_string())?,u64::try_from(row.revision).map_err(|e|e.to_string())?,row.incarnation))}).transpose()
     }
 }
 

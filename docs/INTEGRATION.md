@@ -1,6 +1,6 @@
 # Integration — runner's seam with curator and cinema
 
-**Status:** current for runner 0.5.0 (pipeline contract v2, M6a) · **Written
+**Status:** current for runner 0.6.0 (pipeline contract v2, M6b) · **Written
 from:** [PIPELINE_CONTRACT.md](PIPELINE_CONTRACT.md) and the shipped code
 (`crates/nzbd-api/src/lib.rs` `event_json`, the handlers named per section) ·
 **Updated:** 2026-11-08
@@ -13,9 +13,11 @@ Every event name, field name and status string below was read from the code;
 `crates/nzbd-api/src/lib.rs` `integration_doc_names_every_sse_event` fails
 when the event tables here and `event_json` disagree.
 
-Fields marked **deprecated, removed in M6b** are still sent so a curator or
-consumer that has not moved to contract v2 keeps working; runner M6b drops
-them once every node runs curator M2 and runner M1a/M3 (see `STATUS.md`).
+Since 0.6.0 (M6b) the event no longer carries `pp_status`/`final_dir`, the
+deliveries feed no longer takes `includeAccepted`, and the stored delivery
+row no longer carries the v1 `status`; a curator older than M2 is not
+supported. Fields still marked **deprecated** are sent until a later
+release removes them.
 
 For connecting the classic \*arr apps over the NZBGet-compatible shim, see
 [USAGE.md](USAGE.md); for every config key, [CONFIGURATION.md](CONFIGURATION.md);
@@ -177,10 +179,11 @@ curator uses:
 Keys starting with `*` are runner's own and are refused.
 
 **Queue rows** (`GET /api/v1/jobs`) carry `status` (the persisted status:
-`queued` · `fetching` · `downloading` · `paused` · `post_queued` ·
-`post_processing` · `completed` · `failed` · `deleted`), `status_projected`
-(the same, except `held` while a job is held on an environmental cause —
-§2.3), `transfer`, `control` (§2.3) and `ready`. `completed` alone means the
+`queued` · `fetching` · `downloading` · `paused` · `held` · `post_queued` ·
+`post_processing` · `completed` · `failed` · `deleted`; `paused` is a
+person's pause, `held` an environmental hold — §2.3), `status_projected`
+(the same value since 0.6.0; kept for consumers that read it), `transfer`,
+`control` (§2.3) and `ready`. `completed` alone means the
 articles finished downloading, not that a payload is importable: import on
 `job_pp_finished{outcome: completed}` (§2.1) or the history row, never on the
 queue status.
@@ -194,11 +197,11 @@ never consulted to settle a terminal in normal operation.
 | Receipt field | Meaning |
 |---|---|
 | `protocolVersion`, `requestToken`, `jobId`, `generation`, `runnerInstanceId`, `submissionSha256` | identity of the admission |
-| `outcome` | the admission's outcome (the continuity-loss lookup) |
+| `outcome` | the admission's outcome (the continuity-loss lookup): the job's queue status while it is queued — `fetching` · `queued` · `downloading` · `paused` · `held` (since 0.6.0; a hold read `paused` before) · `post_queued` · `post_processing` · `completed` · `failed` — then `completed`, `failed` or `deleted` once it leaves the queue |
 | `terminalOutcome`, `failureStage`, `failureCause` | the terminal's history status string and failure detail |
 | `failureReason`, `fetchCause`, `blamesRelease`, `salvage` | the typed terminal (§2.2), from the `Failure:Reason` / `Failure:FetchCause` / `Failure:BlamesRelease` / `Failure:Salvage` params |
 | `publicationPath`, `sourceArtifactId`, `sourceGeneration`, `keepSourceOnFailure` | where the bytes went |
-| `custodyState`, `sourceCleanupStatus` | **deprecated, removed in M6b** (OpenAPI `deprecated: true`) — runner never holds bytes for curator, and source cleanup gates nothing |
+| `custodyState`, `sourceCleanupStatus` | **deprecated** (OpenAPI `deprecated: true`) — runner never holds bytes for curator, and source cleanup gates nothing; still sent (their removal takes the receipt custody tracking with it and is not in 0.6.0) |
 
 ```bash
 curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/status"        # the probe curator runs
@@ -292,8 +295,6 @@ transfer from the same record as its `DELETED` history row.
 | `history_seq`, `history_incarnation` | the durable history row; never 0. The history cursor is the pair (§3) |
 | `params` | the job's params (including `*Control:v1`) |
 | `size_bytes`, `health` | the job's size and download health (per mille) |
-| `pp_status` | **deprecated, removed in M6b** — the history status string (`SUCCESS`, `FAILURE/HEALTH`, …); read `outcome` and `reason` |
-| `final_dir` | **deprecated, removed in M6b** — equals `publication.path` on success; read `publication` |
 
 ```json
 {"job": 2333, "name": "Dry.Wind.2020…", "category": "movies",
@@ -301,7 +302,7 @@ transfer from the same record as its `DELETED` history row.
  "fetch_cause": null, "stage": "unpack", "message": "…", "blames_release": true,
  "salvage": "pending", "keep_on_failure": false,
  "fetched": {"success_articles": 1204, "total_articles": 1204, "bytes": 8123456789},
- "publication": null, "pp_status": "UNPACK_FAILURE", "final_dir": null,
+ "publication": null,
  "size_bytes": 8123456789, "health": 1000, "params": [["monarr-transfer", "t-591-a3f9c1…"]],
  "history_seq": 4412, "history_incarnation": "7f3a…"}
 ```
@@ -356,10 +357,13 @@ purposes.
 A held job is waiting on something environmental: `storage_unavailable` ·
 `capacity` · `quota` · `allocation` · `mount_unavailable` · `missing_tool` ·
 `engine_unavailable` · `password_required`. It is visible as
-`status_projected: "held"` on `/api/v1/jobs` and `status: "held"` on
-`job_status_changed`; the persisted `status` stays `paused` with
-`control.lifecycle == "held"` until M6b. The NZBGet-compat shim shows
-`paused`.
+`status: "held"` (and `status_projected: "held"`) on `/api/v1/jobs` and
+`status: "held"` on `job_status_changed`, with `control.lifecycle == "held"`.
+Since 0.6.0 `held` is the persisted status: a job is `held` exactly while
+its control holds. 0.5.0 stored a hold as `paused` + a held control; 0.6.0
+loads such a row as `held`, and 0.5.0 reads a 0.6.0 `held` as `paused`. A
+person's pause is `paused` and is never a hold — force priority overrides a
+pause, never a hold. The NZBGet-compat shim shows both as `PAUSED`.
 
 `control` (`*Control:v1`): `version`, `revision`, `lifecycle`, `cause`,
 `stage`, `retry_policy` (`scheduled_retry` · `resume_same_job` ·
@@ -379,7 +383,9 @@ A held job is waiting on something environmental: `storage_unavailable` ·
 - **The newest cause wins**: a new hold on a held job replaces the control
   (revision + 1).
 - **`manual_pause`**: an operator who pauses a held job suspends its
-  automatic recovery until they resume it; the deadline keeps running.
+  automatic recovery until they resume it; the deadline keeps running. The
+  status stays `held`. A job a person paused before it was held keeps the
+  pause: when its storage comes back it returns to `paused`, not `queued`.
 
 ### 2.4 Status and progress
 
@@ -542,12 +548,11 @@ publications since 0.4.0). `GET /api/v1/deliveries/{id}` answers one row.
 Curator reads the feed on the poll to catch a `completed` or
 `job_publication_ready` it missed; every row is returned.
 
-Deprecated, **removed in M6b**: the `includeAccepted` query parameter
-(accepted and ignored — there is no acceptance). Not on the wire but kept for
-rollback until M6b: the stored row's v1 `status: "ready"` and the
-`deliveries.accepted_at` / `consumer_receipt_id` columns, so an M1a build
-rolled back onto this state can still read it. `POST
-/api/v1/deliveries/{id}/accept` answers `410 Gone`.
+There is no acceptance: `POST /api/v1/deliveries/{id}/accept` answers
+`410 Gone`, the `includeAccepted` query parameter is gone (a request that
+still sends it is answered), and since 0.6.0 the local `deliveries` table has
+no `accepted_at` / `consumer_receipt_id` columns (dropped on open). The
+replicated `cluster_deliveries.accepted_at` column remains, always NULL.
 
 ```bash
 # no open intents after a restart (post-deploy check)
@@ -768,8 +773,9 @@ stream is not established — check §8 first.
 | Runner | Curator | Works because |
 |---|---|---|
 | this build | curator M2+ | the contract |
-| this build | curator before M2 | `pp_status`/`final_dir` still on the event, `accept` refused with `410` (an old curator's ack retries but import completes), `/request-admissions` still answers. Runner M3 must not reach a node before curator M2 is deployed there |
-| M6b | curator before M2 | **not supported** — M6b merges only after every node runs curator M2 and runner M1a/M3 |
+| this build | curator before M2 | **not supported**: the event has no `pp_status`/`final_dir` |
+| this build | a runner node before 0.5.0 (cluster) | **not supported**: it cannot decode a persisted `held`. 0.6.0 deploys only after every curator runs M2+ and every runner node runs 0.5.0 (which is itself ≥ M3/0.4.0) |
+| this build | a runner node on 0.5.0 (cluster) | rolling upgrade: 0.5.0 reads `held` as `paused` (the control carries the hold); this build loads 0.5.0's `paused` + held control as `held` |
 
 ## What runner deliberately does not do
 

@@ -485,13 +485,22 @@ impl Inventory {
                                     local.control.revision.parse::<u64>().unwrap_or(0);
                                 if local_revision >= completed_revision {
                                     checkpoint.job.set_control(&local.control);
-                                    checkpoint.job.status = if local.control.lifecycle == "held"
-                                        || local.control.manual_pause
-                                    {
+                                    checkpoint.job.status = if local.control.lifecycle == "held" {
+                                        nzbd_types::JobStatus::Held
+                                    } else if local.control.manual_pause {
                                         nzbd_types::JobStatus::Paused
                                     } else {
                                         checkpoint.job.status
                                     };
+                                    if checkpoint.job.normalize_hold_status()
+                                        == nzbd_types::HoldStatusChange::LostHold
+                                    {
+                                        tracing::warn!(
+                                            job,
+                                            control = ?checkpoint.job.control(),
+                                            "an adopted held job has no holding control; it is now paused"
+                                        );
+                                    }
                                     probe_params = local.probe_params.clone();
                                     local.context = context.clone();
                                     tx.execute(
@@ -1062,7 +1071,7 @@ mod tests {
         );
         assert_eq!(
             adopted.completed_job.as_ref().unwrap().status,
-            nzbd_types::JobStatus::Paused
+            nzbd_types::JobStatus::Held
         );
         let late = adopted.completed_job.as_ref().unwrap().clone();
         let source = SourceGeneration {

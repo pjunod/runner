@@ -1187,7 +1187,7 @@ fn open_post_stage(job: &Job) -> Option<PostStage> {
 fn recovered_post_fetch_files(job: &Job) -> Option<HashSet<FileId>> {
     if !matches!(
         job.status,
-        JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused
+        JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused | JobStatus::Held
     ) || open_post_stage(job).is_none()
     {
         return None;
@@ -1368,9 +1368,8 @@ impl Owner {
                         file_sizes.insert(f.id, size);
                     }
                 }
-                if j.held() {
-                    j.status = JobStatus::Paused;
-                }
+                // A 0.5.0 snapshot stores a hold as `paused` + a held control.
+                crate::normalize_stored_hold_status(j, "queue snapshot");
                 drop_retired_params(j);
             }
             state.recompute_all_totals();
@@ -1930,8 +1929,10 @@ impl Owner {
             }
             EngineMsg::ScopedEvent { admission, event } => {
                 let cleanup_event = !self.failed_cleanup_admissions.contains_key(&admission.job)
-                    || (matches!(&event, Event::JobPpFinished { job, pp_status, .. }
-                            if *job == admission.job && pp_status.starts_with("FAILURE/"))
+                    || (matches!(&event, Event::JobPpFinished { job, outcome, reason, .. }
+                            if *job == admission.job
+                                && *outcome == nzbd_types::TerminalOutcome::Failed
+                                && reason.is_some_and(|reason| reason.history_status().starts_with("FAILURE/")))
                         && self.state.job(admission.job).is_some_and(|job| {
                             job.params
                                 .iter()
@@ -3063,7 +3064,7 @@ impl Owner {
                             ),
                             runner_instance_id: self.consumer_instance_id.clone(),
                             terminal_outcome: None,
-                            outcome: job_status_name(existing_job.status).into(),
+                            outcome: existing_job.status.as_str().into(),
                             failure_stage: None,
                             failure_cause: None,
                             custody_state: "runner_owned".into(),
@@ -3775,7 +3776,7 @@ impl Owner {
                                         deadline_in_s: None,
                                         deadline_unix: None,
                                     });
-                                    record.status = JobStatus::Paused;
+                                    record.status = JobStatus::Held;
                                 }
                                 owner.publish_now();
                             }
@@ -3829,11 +3830,13 @@ impl Owner {
                         self.attempts.retain(|reference, _| reference.job != job);
                         self.pending_finalize.retain(|(id, _)| *id != job);
                         if let Some(record) = self.state.job_mut(job) {
+                            // A held job stays held: the writers stop, the hold
+                            // is not this stop's to clear.
                             if !matches!(
                                 record.status,
                                 JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
                             ) {
-                                record.status = JobStatus::Paused;
+                                record.stop();
                             }
                         }
                         self.bump_epoch();
@@ -3899,7 +3902,8 @@ impl Owner {
                             return;
                         }
                         let record = owner.state.job_mut(job).unwrap();
-                        record.status = JobStatus::Paused;
+                        // Fenced for deletion; a hold stays a hold.
+                        record.stop();
                         let file_ids = record.files.iter().map(|file| file.id).collect::<Vec<_>>();
                         owner.allocated_jobs.remove(&job);
                         let writers = owner.retiring_writers.entry(job).or_default();
@@ -4133,7 +4137,10 @@ impl Owner {
                 let early_queue_job = before.as_ref().is_some_and(|record| {
                     matches!(
                         record.status,
-                        JobStatus::Fetching | JobStatus::Queued | JobStatus::Paused
+                        JobStatus::Fetching
+                            | JobStatus::Queued
+                            | JobStatus::Paused
+                            | JobStatus::Held
                     )
                 });
                 self.io_then(
@@ -6533,9 +6540,10 @@ impl Owner {
         let Some(job) = self.state.job(job_id) else {
             return;
         };
+        // A held download still counts its late article failures.
         if !matches!(
             job.status,
-            JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused
+            JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused | JobStatus::Held
         ) {
             return;
         }
@@ -6822,7 +6830,7 @@ impl Owner {
                 );
             }
         }
-        j.status = JobStatus::Paused;
+        j.status = JobStatus::Held;
         for f in &mut j.files {
             for s in &mut f.segments {
                 if matches!(s.state, SegmentState::Leased { .. }) {
@@ -8911,7 +8919,7 @@ impl Owner {
                 job.kind == JobKind::Torrent
                     && !self.pending_control_revisions.contains_key(&job_id)
                     && !self.pending_control_commits.contains(&job_id)
-                    && job.status != JobStatus::Paused
+                    && !matches!(job.status, JobStatus::Paused | JobStatus::Held)
                     && job.torrent.as_ref().is_some_and(|torrent| {
                         torrent.control_intent == TorrentControlIntent::Running
                             && torrent.removal_intent.is_none()
@@ -9041,7 +9049,8 @@ impl Owner {
             let Some(job) = self.state.job_mut(job_id) else {
                 continue;
             };
-            job.status = JobStatus::Paused;
+            // Seed policy stops the backend; a hold on the seed stays a hold.
+            job.stop();
             job.torrent.as_mut().unwrap().control_intent = TorrentControlIntent::Paused;
             job.torrent.as_mut().unwrap().stop_reason = Some(reason);
             self.dirty = true;
@@ -9143,6 +9152,9 @@ impl Owner {
                                             control.lifecycle = "running".into();
                                             control.next_retry_at_unix = None;
                                             row.set_control(&control);
+                                            // The detached seed stays stopped,
+                                            // no longer held.
+                                            row.normalize_hold_status();
                                         }
                                     }
                                     set_owner_param(
@@ -9650,7 +9662,10 @@ impl Owner {
                         Some(exact) => exact,
                         None if matches!(
                             summary.status,
-                            JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused
+                            JobStatus::Queued
+                                | JobStatus::Downloading
+                                | JobStatus::Paused
+                                | JobStatus::Held
                         ) =>
                         {
                             summary
@@ -9681,7 +9696,7 @@ impl Owner {
                     || self.pending_control_commits.contains(&j.id)
                 {
                     summary.ready = false;
-                    if j.status != JobStatus::Paused
+                    if !matches!(j.status, JobStatus::Paused | JobStatus::Held)
                         && !j.held()
                         && !summary.pp_done
                         && !transitions::failed_cleanup_only(j)
@@ -9869,6 +9884,27 @@ impl Owner {
             remaining_bytes,
             jobs,
         };
+        // The status mirrors the hold record (M6b): every path that writes
+        // a held control writes `Held`, every release leaves it.
+        // (A control of an unknown version on a running job is fenced like a
+        // hold but keeps its status; only `Paused`/`Held` must agree.)
+        #[cfg(debug_assertions)]
+        {
+            let agrees = |j: &Job| {
+                (j.status != JobStatus::Held || j.held())
+                    && !(j.status == JobStatus::Paused && j.held())
+            };
+            debug_assert!(
+                self.state.jobs.iter().all(agrees),
+                "status disagrees with hold record: {:?}",
+                self.state
+                    .jobs
+                    .iter()
+                    .filter(|j| !agrees(j))
+                    .map(|j| (j.id, j.status, j.control().map(|c| c.lifecycle)))
+                    .collect::<Vec<_>>()
+            );
+        }
         let projected = snap
             .jobs
             .iter()
@@ -10384,20 +10420,6 @@ fn url_submission_sha256(
 fn url_admission_generation(job: JobId, token: &str, instance: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     format!("{}-url-{}-{:x}", instance, job.0, digest)
-}
-
-fn job_status_name(status: JobStatus) -> &'static str {
-    match status {
-        JobStatus::Fetching => "fetching",
-        JobStatus::Queued => "queued",
-        JobStatus::Downloading => "downloading",
-        JobStatus::Paused => "paused",
-        JobStatus::PostQueued => "post_queued",
-        JobStatus::Post { .. } => "post_processing",
-        JobStatus::Completed => "completed",
-        JobStatus::Failed => "failed",
-        JobStatus::Deleted => "deleted",
-    }
 }
 
 /// A recovered-`Fetching` job that duplicates another job's URL: `job`

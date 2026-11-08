@@ -91,7 +91,7 @@ release contains ever holds a job, and no hold waits for a person: a hold
 that outlives `[post] hold_deadline_secs` (a day; a week for passwords) fails
 with reason `hold_expired` and its files are parked, even while the queue is
 paused. A newer cause replaces the shown one and restarts the clock. Over the
-API and SSE these jobs read `status_projected: "held"` and emit
+API and SSE these jobs read `status: "held"` and emit
 `job_status_changed` on the way in and out.
 
 **Parked sources in Files.** A failed job's folder shows state **failed ·

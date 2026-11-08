@@ -2572,7 +2572,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2607,7 +2607,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-api"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2637,7 +2637,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-cluster"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "axum",
  "crc32fast",
@@ -2666,7 +2666,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-compat"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2687,7 +2687,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-config"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "nzbd-types",
  "serde",
@@ -2700,7 +2700,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-engine"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arc-swap",
  "crc32fast",
@@ -2731,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-feed"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "nzbd-engine",
  "nzbd-types",
@@ -2747,7 +2747,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-nntp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "nzbd-types",
  "rustls",
@@ -2760,7 +2760,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-nserv"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "crc32fast",
  "tokio",
@@ -2769,7 +2769,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-nzb"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "quick-xml 0.41.0",
  "thiserror 2.0.18",
@@ -2777,14 +2777,14 @@ dependencies = [
 
 [[package]]
 name = "nzbd-par2"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "md-5",
 ]
 
 [[package]]
 name = "nzbd-post"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "crc32fast",
  "libc",
@@ -2809,7 +2809,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-qbit-compat"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2832,7 +2832,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-state"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "crc32fast",
  "flate2",
@@ -2852,7 +2852,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-torrent"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2875,7 +2875,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-types"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2883,7 +2883,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-yenc"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "crc32fast",
  "thiserror 2.0.18",

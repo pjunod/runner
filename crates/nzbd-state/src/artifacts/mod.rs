@@ -726,7 +726,7 @@ impl Inventory {
           CREATE INDEX IF NOT EXISTS operations_kind ON operations(json_extract(data,'$.kind'));
           CREATE TABLE IF NOT EXISTS recoveries(id TEXT PRIMARY KEY,artifact TEXT NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS workspace_finalizations(source TEXT NOT NULL,generation TEXT NOT NULL,outcome TEXT NOT NULL,proof TEXT NOT NULL,job INTEGER,activated INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(source,generation));
-          CREATE TABLE IF NOT EXISTS deliveries(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,artifact TEXT NOT NULL,generation TEXT NOT NULL,data TEXT NOT NULL,accepted_at INTEGER,consumer_receipt_id TEXT,cleanup_status TEXT NOT NULL DEFAULT 'pending',cleanup_error TEXT,cleanup_attempts INTEGER NOT NULL DEFAULT 0,cleanup_next_retry_at INTEGER,cleanup_blocked_since INTEGER,cleanup_started_at INTEGER,cleanup_last_attempt_at INTEGER,cleanup_completed_at INTEGER,UNIQUE(artifact,generation));
+          CREATE TABLE IF NOT EXISTS deliveries(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,artifact TEXT NOT NULL,generation TEXT NOT NULL,data TEXT NOT NULL,cleanup_status TEXT NOT NULL DEFAULT 'pending',cleanup_error TEXT,cleanup_attempts INTEGER NOT NULL DEFAULT 0,cleanup_next_retry_at INTEGER,cleanup_blocked_since INTEGER,cleanup_started_at INTEGER,cleanup_last_attempt_at INTEGER,cleanup_completed_at INTEGER,UNIQUE(artifact,generation));
           CREATE TABLE IF NOT EXISTS delivery_cleanup_attempts(delivery_id TEXT NOT NULL,attempt INTEGER NOT NULL,started_at INTEGER NOT NULL,ended_at INTEGER,wait_ms INTEGER NOT NULL DEFAULT 0,outcome TEXT NOT NULL,error TEXT,PRIMARY KEY(delivery_id,attempt));
           CREATE INDEX IF NOT EXISTS deliveries_recent ON deliveries(sequence);
           CREATE TABLE IF NOT EXISTS job_terminals(job INTEGER PRIMARY KEY,transfer TEXT,outcome TEXT NOT NULL,reason TEXT,fetch_cause TEXT,stage TEXT,message TEXT,blames_release INTEGER NOT NULL DEFAULT 0,salvage TEXT NOT NULL,keep_on_failure INTEGER NOT NULL DEFAULT 0,fetched TEXT NOT NULL,publication TEXT,markers TEXT NOT NULL,entry TEXT NOT NULL,history_seq INTEGER,history_incarnation TEXT,markers_stamped INTEGER NOT NULL DEFAULT 0,emitted INTEGER NOT NULL DEFAULT 0,disposal TEXT,salvage_error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
@@ -763,6 +763,18 @@ impl Inventory {
                 [],
             )?;
             tx.commit()?;
+        }
+        // M6b: there is no acceptance (contract §2.5). The v1 columns an M1a
+        // or older build wrote are dropped; nothing reads them.
+        for column in ["accepted_at", "consumer_receipt_id"] {
+            let present: bool = db.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('deliveries') WHERE name=?1",
+                [column],
+                |r| r.get::<_, i64>(0).map(|n| n != 0),
+            )?;
+            if present {
+                db.execute_batch(&format!("ALTER TABLE deliveries DROP COLUMN {column}"))?;
+            }
         }
         let has_cleanup_blocked_since: bool = db.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('deliveries') WHERE name='cleanup_blocked_since'",

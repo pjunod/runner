@@ -1783,12 +1783,16 @@ const pending = {
   },
 };
 
+/// Stopped by a person (`paused`) or by a hold (`held`). Since 0.6.0 a held
+/// job's status is `held`; before, it read `paused` with a held control.
+function isStopped(st) { return st === "paused" || st === "held"; }
+
 function satisfied(op, byId) {
   const j = byId.get(op.jobId);
   if (op.kind === "delete") return j === undefined;
   if (!j) return true; // the job left the queue some other way: stop overriding
-  if (op.kind === "pause") return statusName(j.status) === "paused";
-  if (op.kind === "resume") return statusName(j.status) !== "paused";
+  if (op.kind === "pause") return isStopped(statusName(j.status));
+  if (op.kind === "resume") return !isStopped(statusName(j.status));
   if (op.kind === "move") return [...byId.keys()].indexOf(op.jobId) === op.wantIdx;
   return true;
 }
@@ -1797,7 +1801,7 @@ function satisfied(op, byId) {
 // Post-processing stages in words a human tracks at a glance — the activity
 // view: never wonder what a job is doing.
 const STATUS_CLASS = {
-  downloading: "ok", queued: "dim", paused: "warn", fetching: "dim",
+  downloading: "ok", queued: "dim", paused: "warn", held: "warn", fetching: "dim",
   completed: "ok", failed: "bad", post_queued: "warn",
 };
 const STAGE_LABEL = {
@@ -1988,7 +1992,7 @@ function torrentPhase(j) {
   if (!overlay && phase === "paused_download" && j.torrent_control_intent === "running"
       && j.torrent_error === "storage full") return "storage_hold";
   const paused = overlay ? overlay === "paused" : j.torrent_control_intent
-    ? j.torrent_control_intent === "paused" : j.status === "paused";
+    ? j.torrent_control_intent === "paused" : isStopped(j.status);
   if (j.ready) return paused ? "paused_seed" : "seeding";
   if (paused) return "paused_download";
   if (overlay || (j.torrent_control_intent === "running" && phase === "paused_download")) return "queued";
@@ -2029,10 +2033,10 @@ function torrentPrimaryAction(j) {
   if (!phase || ["failed", "storage_hold"].includes(phase)) return null;
   if (!["fetching_source", "fetching_metadata", "queued", "checking", "downloading",
         "seeding", "paused_download", "paused_seed", "missing_files"].includes(phase)) return null;
-  if (phase === "missing_files") return j.status === "paused"
+  if (phase === "missing_files") return isStopped(j.status)
     ? { action: "resume", label: "re-download missing files" } : null;
   if (phase === "paused_seed" && seedLimitReached(j)) return { action: "seed-options", label: "seeding options" };
-  if (j.status === "paused") return { action: "resume", label: phase === "paused_seed" ? "start seeding" : "resume" };
+  if (isStopped(j.status)) return { action: "resume", label: phase === "paused_seed" ? "start seeding" : "resume" };
   if (j.status === "queued" || j.status === "downloading")
     return { action: "pause", label: phase === "seeding" ? "stop seeding" : "pause" };
   return null;
@@ -2131,7 +2135,7 @@ function rowModel(j, ctx) {
   // finished, and just as misleading under its own heading.
   const isPost = postStage != null || typeof j.status !== "string" || st === "post_queued";
   const cls = isPost ? "warn" : (STATUS_CLASS[st] || "dim");
-  const paused = st === "paused";
+  const paused = isStopped(st);
   const dl = st === "downloading";
   const fetching = st === "fetching";
   const pend = ctx.pendingOps || null;

@@ -136,6 +136,11 @@ export function isJobPaused(status: JobStatus): boolean {
   return jobStatusKey(status) === 'paused';
 }
 
+/// Stopped by a person (`paused`) or by a hold (`held`).
+export function isJobStopped(status: JobStatus): boolean {
+  return isJobPaused(status) || jobStatusKey(status) === 'held';
+}
+
 export function normalizeServerUrl(input: string): string {
   const trimmed = input.trim();
   if (!trimmed) throw new Error('Enter the address of your Runner server.');
@@ -173,7 +178,7 @@ function hasExplicitPort(url: string): boolean {
 }
 
 export function jobEta(job: JobSummary): string {
-  if (isJobPaused(job.status)) return 'paused';
+  if (isJobStopped(job.status)) return 'paused';
   if (job.rate_bps <= 0 || job.remaining_bytes <= 0) return '—';
   return formatDuration(job.remaining_bytes / job.rate_bps);
 }

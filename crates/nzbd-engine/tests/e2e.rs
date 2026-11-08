@@ -2742,3 +2742,108 @@ async fn mirrored_repair_progress_is_optional_node_fenced_and_cleared_on_replace
     assert!(engine.snapshot().jobs[0].repair_progress.is_none());
     engine.shutdown().await;
 }
+
+/// Review #297 r2: a persisted hold survives a restart as `held` and the
+/// hold recovery task releases it; a 0.5.0 snapshot (`paused` + a held
+/// control) loads as `held`; a `held` row that lost its control loads as a
+/// plain pause.
+#[tokio::test]
+async fn a_persisted_hold_reloads_held_and_recovers_and_a_050_snapshot_loads_held() {
+    fn rewrite_snapshot(dir: &Path, job: u32, edit: impl Fn(&mut serde_json::Value)) {
+        let path = dir.join("state/queue.json");
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let row = doc["jobs"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["id"] == job)
+            .unwrap();
+        edit(row);
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    for legacy in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = spawn_engine(tmp.path(), vec![]).await;
+        let mut job = transfer_job(993, "held-restart", JobStatus::Held);
+        job.set_control(&nzbd_types::JobControl {
+            version: 1,
+            revision: "3".into(),
+            lifecycle: "held".into(),
+            cause: "capacity".into(),
+            stage: "download_write".into(),
+            retry_policy: "scheduled_retry".into(),
+            message: "No space left on device (os error 28)".into(),
+            instance: "restart".into(),
+            previous_status: Some(JobStatus::Downloading),
+            manual_pause: false,
+            retry_attempt: 1,
+            // Due now: the first recovery pass after boot releases it.
+            next_retry_at_unix: Some(now - 1),
+            blocked_since_unix: Some(now - 60),
+            released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: Some(now + 86_400),
+        });
+        engine.import_ready(job, false, false).await.unwrap();
+        engine.shutdown().await;
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("state/queue.json")).unwrap())
+                .unwrap();
+        let row = snapshot["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == 993)
+            .unwrap();
+        assert_eq!(
+            row["status"], "held",
+            "the hold is persisted as its own status"
+        );
+        if legacy {
+            rewrite_snapshot(tmp.path(), 993, |row| row["status"] = "paused".into());
+        }
+        let engine = spawn_engine(tmp.path(), vec![]).await;
+        let reloaded = engine.export_ready(JobId(993)).await.unwrap().unwrap();
+        assert!(reloaded.held(), "legacy={legacy}");
+        assert_eq!(reloaded.status, JobStatus::Held, "legacy={legacy}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let job = engine.export_ready(JobId(993)).await.unwrap().unwrap();
+            if !job.held() {
+                assert_eq!(job.status, JobStatus::Queued, "legacy={legacy}");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "hold recovery never released the reloaded hold (legacy={legacy}): {:?}",
+                job.control()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        engine.shutdown().await;
+    }
+
+    // A `held` row whose control is gone: a stop without a hold.
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path(), vec![]).await;
+    engine
+        .import_ready(
+            transfer_job(994, "lost-control", JobStatus::Paused),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    engine.shutdown().await;
+    rewrite_snapshot(tmp.path(), 994, |row| row["status"] = "held".into());
+    let engine = spawn_engine(tmp.path(), vec![]).await;
+    let job = engine.export_ready(JobId(994)).await.unwrap().unwrap();
+    assert!(!job.held());
+    assert_eq!(job.status, JobStatus::Paused);
+    engine.shutdown().await;
+}

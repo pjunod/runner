@@ -109,10 +109,6 @@ pub enum Event {
         fetched: nzbd_types::Fetched,
         /// `completed` only.
         publication: Option<nzbd_types::Publication>,
-        /// Legacy (removed in M6): the history status string verbatim.
-        pp_status: String,
-        /// Legacy (removed in M6): `publication.path` on success.
-        final_dir: Option<String>,
         size_bytes: u64,
         health: u16,
         /// Consumer params plus `*Control:v1`.

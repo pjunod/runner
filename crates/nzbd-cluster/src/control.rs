@@ -711,7 +711,7 @@ impl ControlStore {
         let row=self.client.query_consistent_map::<ControlJobRow,_>("SELECT intent_json,revision,incarnation FROM control_jobs WHERE job_id=?1 AND result_id=?2 AND deleted=0",params!(i64::from(job),result)).await.map_err(|error|error.to_string())?.into_iter().next();
         row.map(|row| {
             Ok((
-                serde_json::from_str(&row.intent_json).map_err(|error| error.to_string())?,
+                decode_intent(&row.intent_json).map_err(|error| error.to_string())?,
                 u64::try_from(row.revision).map_err(|error| error.to_string())?,
             ))
         })
@@ -729,7 +729,7 @@ impl ControlStore {
             .map_err(|error| format!("load replicated jobs: {error}"))?;
         rows.into_iter()
             .map(|row| {
-                let job = serde_json::from_str(&row.intent_json)
+                let job = decode_intent(&row.intent_json)
                     .map_err(|error| format!("decode replicated job: {error}"))?;
                 let revision = u64::try_from(row.revision)
                     .map_err(|error| format!("invalid replicated job revision: {error}"))?;
@@ -971,7 +971,7 @@ impl ControlStore {
             .into_iter()
             .next()
             .ok_or_else(|| "URL placeholder is not durable".to_owned())?;
-        let prior: nzbd_types::Job = serde_json::from_str(&row.intent_json)
+        let prior: nzbd_types::Job = decode_intent(&row.intent_json)
             .map_err(|error| format!("decode URL placeholder: {error}"))?;
         if row.deleted
             || prior.status != nzbd_types::JobStatus::Fetching
@@ -1041,13 +1041,15 @@ impl ControlStore {
             return Ok(true);
         }
         let prior: nzbd_types::Job =
-            serde_json::from_str(&row.intent_json).map_err(|error| error.to_string())?;
+            decode_intent(&row.intent_json).map_err(|error| error.to_string())?;
         if url_source_identity(&prior).ok().as_deref() != Some(record.source_identity.as_str()) {
             return Ok(true); // The durable row names another request/incarnation.
         }
         if !matches!(
             prior.status,
-            nzbd_types::JobStatus::Fetching | nzbd_types::JobStatus::Paused
+            nzbd_types::JobStatus::Fetching
+                | nzbd_types::JobStatus::Paused
+                | nzbd_types::JobStatus::Held
         ) || !prior.files.is_empty()
         {
             // A previous authority already resolved this exact admission (or
@@ -1071,11 +1073,11 @@ impl ControlStore {
         next.totals = record.resolved.totals;
         next.status = if record.resolved.status == nzbd_types::JobStatus::Failed {
             nzbd_types::JobStatus::Failed
+        } else if prior.held() {
+            nzbd_types::JobStatus::Held
         } else if prior.status == nzbd_types::JobStatus::Paused
             || prior.params.iter().any(|(key, _)| key == "*AddPaused")
-            || prior
-                .control()
-                .is_some_and(|control| control.manual_pause || control.lifecycle == "held")
+            || prior.control().is_some_and(|control| control.manual_pause)
         {
             nzbd_types::JobStatus::Paused
         } else {
@@ -1942,9 +1944,73 @@ pub(crate) fn unix_ms_public() -> i64 {
     unix_ms().unwrap_or(0)
 }
 
+/// A replicated job row, its status agreeing with its hold record: a row a
+/// 0.5.0 node wrote stores a hold as `paused` + a held control.
+///
+/// A `held` row without a holding control is logged once per job and
+/// control revision: replicated rows are decoded on every read.
+pub(crate) fn decode_intent(json: &str) -> serde_json::Result<nzbd_types::Job> {
+    /// (job id, control revision) already logged as a lost hold.
+    type Logged = std::sync::Mutex<std::collections::HashSet<(u32, Option<String>)>>;
+    static LOGGED: std::sync::LazyLock<Logged> = std::sync::LazyLock::new(Default::default);
+    let mut job: nzbd_types::Job = serde_json::from_str(json)?;
+    if job.normalize_hold_status() == nzbd_types::HoldStatusChange::LostHold {
+        let control = job.control();
+        let key = (job.id.0, control.as_ref().map(|c| c.revision.clone()));
+        if LOGGED.lock().unwrap().insert(key) {
+            tracing::warn!(
+                job = job.id.0,
+                ?control,
+                "a replicated held job has no holding control; it is now paused"
+            );
+        }
+    }
+    Ok(job)
+}
+
 #[cfg(test)]
 pub(crate) mod coordinator_protocol_tests {
     use super::*;
+
+    /// A row a 0.5.0 node replicated stores a hold as `paused` + a held
+    /// control; it decodes as `held`. A person's pause stays `paused`.
+    #[test]
+    fn a_050_replicated_hold_decodes_as_held() {
+        let mut job = nzbd_types::Job {
+            id: nzbd_types::JobId(7),
+            kind: nzbd_types::JobKind::Nzb,
+            name: "job".into(),
+            dir_name: "job".into(),
+            name_provisional: false,
+            delivery_lifecycle: false,
+            queued_at_unix: 0,
+            original_name: String::new(),
+            category: None,
+            priority: 0,
+            dupe: nzbd_types::DupeInfo::default(),
+            params: Vec::new(),
+            files: Vec::new(),
+            totals: nzbd_types::JobTotals::default(),
+            status: nzbd_types::JobStatus::Paused,
+            torrent: None,
+            stages: Vec::new(),
+        };
+        let paused = serde_json::to_string(&job).unwrap();
+        assert_eq!(
+            decode_intent(&paused).unwrap().status,
+            nzbd_types::JobStatus::Paused
+        );
+        job.params.push((
+            nzbd_types::CONTROL_PARAM.into(),
+            r#"{"version":1,"revision":"3","lifecycle":"held","cause":"capacity","stage":"download_write","retry_policy":"scheduled_retry","message":"","instance":"i"}"#.into(),
+        ));
+        let held = serde_json::to_string(&job).unwrap();
+        assert!(held.contains("\"paused\""));
+        assert_eq!(
+            decode_intent(&held).unwrap().status,
+            nzbd_types::JobStatus::Held
+        );
+    }
     pub(crate) async fn test_store(temp: &tempfile::TempDir, cluster_id: &str) -> ControlStore {
         let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

@@ -424,16 +424,19 @@ fn a_finished_download_announces_its_stages_its_final_dir_and_its_history_row() 
 
     // ---- the completion payload (N1 + N4 + N6) ------------------------
     let done = frames.last().unwrap().json();
-    assert_eq!(done["pp_status"], "SUCCESS", "payload: {done}");
+    assert_eq!(done["outcome"], "completed", "payload: {done}");
     assert_eq!(done["category"], "tv");
-    let final_dir = done["final_dir"].as_str().expect("final_dir").to_string();
+    let final_dir = done["publication"]["path"]
+        .as_str()
+        .expect("publication.path")
+        .to_string();
     assert!(
         final_dir.starts_with(cat_dir.to_str().unwrap()),
         "the category dest_dir must be honored, not merely advertised: {final_dir}"
     );
     assert!(
         std::path::Path::new(&final_dir).is_dir(),
-        "the reported final_dir must be where the files ACTUALLY are: {final_dir}"
+        "the reported publication path must be where the files ACTUALLY are: {final_dir}"
     );
     assert!(
         !d.tmp.path().join("dest/Show.S01E01").exists(),

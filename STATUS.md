@@ -1,5 +1,166 @@
 # nzbd — Project Status
 
+## Pipeline contract v2 M6b — legacy wire fields removed, persisted `held` — 2026-11-08
+
+**Merge only after deploy confirmation.** Before this merges, Paul confirms
+all three: every curator runs **M2+**; every runner node runs at least **M3
+(0.4.0)**; and every runner node runs **0.5.0 (M6a)**. The last is a hard
+gate now that `held` is persisted: a node older than 0.5.0 cannot decode a
+`held` status a 0.6.0 node writes to the shared queue. **Status:** draft PR
+[#297](https://github.com/pjunod/runner/pull/297) on
+`claude/pipeline-v2-m6b-runner` (runner 0.6.0), stacked on M6a
+(now targets `main`; M6a merged as #296 `fb6f1b9`, merged up). Fable
+re-review r2 at `c36d368`: two should-fixes and three minors, all resolved
+(`af35a35`); re-review requested. Not merged, not deployed.
+
+- **Review r2 fixes.**
+  - **Rollback wedge closed.** Automatic-control markers are stamped in
+    the 0.5.0 form (`Held` → `paused`, the held control beside it). Their
+    identity hashes the statuses, so a node rolled back to 0.5.0 still
+    validates, applies or drops a marker 0.6.0 wrote; this build restores
+    `Held` from the control on read. Test:
+    `a_held_marker_is_stamped_in_the_050_form_and_reads_back_held`.
+  - **A lost hold is no longer silent.** `normalize_hold_status` returns a
+    `HoldStatusChange`. A `held` row whose control no longer holds becomes
+    `paused` and logs a warning with the job and the control found. That
+    covers the queue-snapshot load, imports, replicated authority, adopted
+    worker checkpoints, and cluster `decode_intent` (once per job and
+    control revision).
+  - **Minors.** The receipt `outcome` list in `INTEGRATION.md` now includes
+    `held`. The debug-assert diagnostic filter now matches its predicate.
+    The `normalize_hold_status` doc notes the `manual_pause` + unknown
+    control-version checkpoint case.
+  - **New tests.** `a_persisted_hold_reloads_held_and_recovers_and_a_050_snapshot_loads_held`
+    (e2e) covers three things: save→reopen keeps `held` and hold recovery
+    releases it; a 0.5.0 `paused` + held snapshot loads `held`; a `held`
+    row without a control loads `paused`. The owner test now counts exactly
+    one `held` status change per hold, and none for a pause inside it.
+
+- **Persisted `JobStatus::Held`.** A hold is now its own status: `held`
+  exactly while `control.lifecycle == "held"`, `paused` only for a person's
+  (or seed policy's) pause. `hold_job` writes `Held`; every release writes
+  the status it returns to. `projected_status` is the identity, and
+  `status_projected` stays on the wire as the same value. Helpers:
+  `Job::normalize_hold_status` (on every load — the queue snapshot, an
+  imported/adopted row, a replicated cluster row via `decode_intent`, a
+  worker control checkpoint) turns a 0.5.0 `paused` + held control into
+  `held` and a `held` without a holding control into `paused`; `Job::stop`
+  stops a job without deciding why (`Held` if its control holds); and
+  `JobStatus::is_stopped`. Automatic-control markers a 0.5.0 node stamped
+  are read with the same mapping, because their identity hashes the status.
+  A debug assertion at publish checks that status and hold record agree.
+- **Audit of every `JobStatus::Paused` site** (about 80 non-test). Where
+  `Paused` meant "stopped either way", it now reads `Paused | Held`, which
+  keeps the behaviour. Where it meant a person's pause, it stays `Paused`.
+  Where a stop path set `Paused` on a job that might be held (cluster
+  writer stop, deletion fence, seed policy, the torrent fact reducer's
+  storage-full / missing-content / seed-limit stops, worker adoptions), it
+  now calls `stop()`. Sites where the distinction changes behaviour:
+  - **Force priority no longer runs a held job.** `job_schedulable` let a
+    force-priority `Paused` job download, and a hold was `Paused`.
+    Test: `force_priority_runs_a_paused_job_but_not_a_held_one`.
+  - **Seed-policy rollback no longer turns a held seed `Completed`.** It now
+    restores only a `Paused` status.
+  - **A detached seed's released `torrent_seed_forget` hold** leaves it
+    `paused`, not still `held`.
+  - **A torrent `Ready`/`Resumed` fact no longer starts a held torrent.**
+    The reducer's `!= Paused` checks are now `!is_stopped()`.
+  - **A pause inside a hold keeps `held`** (with `manual_pause`), and a job
+    paused before it was held returns to `paused` on a storage release.
+    Test: `a_hold_is_held_and_a_pause_inside_it_is_remembered`.
+  - **Leases.** The leader revokes a lease whose durable intent is `held`,
+    as it did for `paused`.
+- **Wire and clients.** Native API and SSE `status` are `held` for a hold.
+  NZBGet compat shows `PAUSED` for both. `/metrics` gains
+  `nzbd_jobs{status="held"}` (holds were counted under `paused`). A request
+  admission receipt's `outcome` reads `held`. The web UI and the mobile app
+  (1.1.6) treat `held` like the old `paused` wherever they keyed on the
+  status: pending-op resolution, torrent pause state, the resume action,
+  the ETA. Curator already reads holds from `status_projected` /
+  `control`, so it needs no change.
+- **`pp_status` / `final_dir` removed** from `Event::JobPpFinished` and
+  `event_json`. Every curator since M2 applies a Runner event only as a typed
+  fact (`outcome`/`reason`/`publication`). The failed-cleanup admission's
+  event filter now matches a failed terminal whose reason's history status is
+  `FAILURE/`-prefixed — the same set it matched by string. History rows keep
+  their own `status` and `final_dir`.
+- **v1 delivery shims removed:** the stored row's `status: "ready"` (local
+  and cluster private rows), the local `deliveries.accepted_at` /
+  `consumer_receipt_id` columns (dropped on open, rows kept; test
+  `v1_acceptance_columns_are_dropped_on_open`), and `includeAccepted` (query
+  types and OpenAPI; a request that still sends it is answered). The
+  `deliveries` rows themselves stay: contract §2.5 is the authority on that
+  feed (now said in ADR-20).
+- Docs: `INTEGRATION.md` (queue statuses, §2.3 holds, compatibility table),
+  `USAGE.md`, ADR-20.
+
+**Not built in this branch (decisions for Paul / plan defects):**
+- Plan defect, now enforced: IMPL_RUNNER §8 gates the persisted `held` on
+  "every node runs M1a+", but an M1a/M3 node cannot decode `held`. The gate
+  is every node on 0.5.0 (above).
+- **`custodyState` / `sourceCleanupStatus` receipt fields.** They are not
+  just wire fields: `custody_state == "curator"` guards receipt outcome
+  updates, source pinning and publication paths in the engine (`queue.rs`
+  `sync_url_admission_receipts`, `owner.rs`
+  `refresh_pinned_url_admission_custody` / `pin_unpinned_failed_source`, the
+  admission merge) and the cluster admission path, fed by the
+  `Delivery:Custody` / `Artifact:Custody` / `Delivery:SourceCleanup` params.
+  Kept, per the orchestrator after Fable's #297 review: `custody_state ==
+  "curator"` is a monotonic pin. Without it, after a restart, a completed
+  transfer whose queue row retired answers `deleted` on
+  `/request-admissions/<token>`, and cluster projection can overwrite the
+  handoff. Removing them needs a replacement for that pin. The proposed
+  rule (a receipt with a recorded `terminalOutcome` is settled) is not
+  enough on its own. Left deprecated on the wire.
+- `cluster_deliveries.accepted_at` stays in the replicated schema (always
+  NULL): dropping it is a cluster-wide hiqlite schema change with no
+  correctness benefit.
+- The `review: interrupted move` hold clear in `commit_intent` stays:
+  `relocation.rs` still writes that hold for non-intent moves, so the clear
+  is live code, not a rollback shim.
+
+**Fast lane, r2 (after merging `origin/main` `fb6f1b9`):**
+- clippy workspace `-D warnings`: clean.
+- Library tests:
+  - types 14/14;
+  - engine 354/355 (fails only the root-only `volumes` test);
+  - state 340/340;
+  - cluster 58/58.
+- Integration tests:
+  - `cluster_e2e`: 22/22;
+  - engine `e2e` holds (including the new reopen test): 6/6.
+- `make fast-check-docs`: 3/3.
+
+**Fast lane run (head after merging M6a `e14022c`):**
+- `cargo clippy --workspace --all-targets --locked -D warnings`: clean.
+- `nzbd-engine --lib`: 353/354. The one failure is the root-only
+  `volumes::…inaccessible_path…`, untouched.
+- `nzbd-types --lib`: 14/14.
+- `nzbd-post --lib`: 121/121.
+- `nzbd-state --lib`: 339/339 (2 ignored).
+- `nzbd-api --lib`: 89/89.
+- `nzbd-compat --lib`: 18/18.
+- `nzbd-cluster --lib`: 58/58. One fixture there now writes `Held` for a
+  pause inside a hold.
+- `nzbd-post` integration: `terminal_first` 15/15, `publication` 15/15,
+  `failure_regressions` 6/6, `pp_pipeline` hold/capacity 3/3.
+- `nzbd-engine` `e2e` hold/enospc/stranded/paused: 6/6.
+- `nzbd-cluster` `cluster_e2e` (`--test-threads=1`): 22/22.
+- `make fast-check-docs`: 3/3.
+- `make ui-test`: boot ok; DOM 984 assertions.
+- mobile `tsc --noEmit` and jest: 177/177.
+
+**Post-deploy checks:**
+- `curl -sN -H "Authorization: Bearer $TOK" $NZBD/api/v1/events | grep -m1 job_pp_finished`
+  carries no `pp_status`.
+- `sqlite3 <state>/artifacts.sqlite "SELECT name FROM pragma_table_info('deliveries')"`
+  lists no `accepted_at`.
+- `curl -s $NZBD/api/v1/jobs | jq '[.jobs[] | select(.control.lifecycle=="held") | .status] | unique'`
+  is `["held"]` (or `[]`).
+- `curl -s $NZBD/metrics | grep 'nzbd_jobs{status="held"}'` is present.
+- Curator's Activity still shows held downloads as held, and the next
+  completion importing.
+
 ## Pipeline contract v2 M6a — one clock per job, errno not text, docs from the contract — 2026-11-08
 
 **Status:** draft PR [#296](https://github.com/pjunod/runner/pull/296) on `claude/pipeline-v2-m6a-runner` (runner 0.5.0),

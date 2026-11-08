@@ -60,7 +60,8 @@ fn desired(job: &Job, delegated: bool) -> BTreeSet<Stage> {
         JobStatus::Downloading => {
             stages.insert(Stage::Download);
         }
-        JobStatus::Queued | JobStatus::Paused | JobStatus::PostQueued => {
+        // Time held counts as queue time, as time paused does.
+        JobStatus::Queued | JobStatus::Paused | JobStatus::Held | JobStatus::PostQueued => {
             stages.insert(Stage::Queue);
         }
         JobStatus::Completed if !post => {

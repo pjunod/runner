@@ -441,12 +441,6 @@ pub fn event_for(row: &JobTerminal) -> Option<Event> {
         keep_on_failure: row.keep_on_failure,
         fetched: row.fetched,
         publication: row.publication.clone(),
-        pp_status: entry.status.clone(),
-        final_dir: row
-            .publication
-            .as_ref()
-            .map(|p| p.path.clone())
-            .or_else(|| entry.final_dir.clone()),
         size_bytes: entry.size,
         health: entry.health,
         params: entry.params.clone(),

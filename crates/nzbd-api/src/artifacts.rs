@@ -73,11 +73,6 @@ struct DeliveryPage {
     #[serde(default)]
     after: i64,
     limit: Option<u32>,
-    /// Accepted and ignored for one release (contract §2.5): there is no
-    /// acceptance, so the feed always returns every row.
-    #[serde(default)]
-    #[allow(dead_code)]
-    include_accepted: bool,
 }
 
 #[cfg(test)]
@@ -85,12 +80,13 @@ mod delivery_query_tests {
     use super::DeliveryPage;
 
     #[test]
-    fn delivery_query_uses_the_documented_camel_case_flag() {
+    fn delivery_query_reads_the_cursor_and_tolerates_a_retired_flag() {
+        // M6b: `includeAccepted` is gone; a curator that still sends it is
+        // answered, not refused.
         let page: DeliveryPage =
             serde_urlencoded::from_str("after=41&limit=100&includeAccepted=true").unwrap();
         assert_eq!(page.after, 41);
         assert_eq!(page.limit, Some(100));
-        assert!(page.include_accepted);
     }
 }
 

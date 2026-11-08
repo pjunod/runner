@@ -374,18 +374,7 @@ pub(crate) fn bounded_transaction(writes: &[(String, hiqlite::Params)]) -> Resul
     Ok(())
 }
 pub(crate) fn encode_record(record: &ClusterDelivery) -> Result<(String, String), String> {
-    // For one release the private row also carries the `status: "ready"`
-    // the M1a build requires to decode a delivery, so a mixed-version
-    // cluster (or a rollback) can still read what this build wrote. M6.
-    let mut private = serde_json::to_value(record).map_err(|error| error.to_string())?;
-    if let Some(delivery) = private.get_mut("delivery").and_then(Value::as_object_mut) {
-        let status = if record.cleanup_only {
-            "internal_cleanup"
-        } else {
-            "ready"
-        };
-        delivery.insert("status".into(), status.into());
-    }
+    let private = serde_json::to_value(record).map_err(|error| error.to_string())?;
     let data = serde_json::to_string(&private).map_err(|error| error.to_string())?;
     let public =
         serde_json::to_string(&discovery_value(record)).map_err(|error| error.to_string())?;
@@ -533,10 +522,6 @@ struct Page {
     #[serde(default)]
     after: i64,
     limit: Option<u32>,
-    /// Accepted and ignored for one release (contract §2.5).
-    #[serde(default)]
-    #[allow(dead_code)]
-    include_accepted: bool,
 }
 
 fn decode_delivery_segment(raw: &str) -> Result<String, String> {

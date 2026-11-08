@@ -1660,7 +1660,10 @@ async fn work_heartbeat(
             None => None,
         };
         if !intent.is_some_and(|(status, revision)| {
-            !matches!(status, JobStatus::Paused | JobStatus::Deleted) && revision == lp.job_revision
+            !matches!(
+                status,
+                JobStatus::Paused | JobStatus::Held | JobStatus::Deleted
+            ) && revision == lp.job_revision
         }) {
             tracing::debug!(job = lp.job.0, lease = %lp.lease_id,
                 expected_revision = lp.job_revision, current_intent = ?intent,
@@ -5715,14 +5718,15 @@ mod tests {
         paused_control.manual_pause = true;
         paused_control.revision = (paused_control.revision.parse::<u64>().unwrap() + 1).to_string();
         paused.set_control(&paused_control);
-        paused.status = JobStatus::Paused;
+        // A pause inside a hold: the control records it, the job stays held.
+        paused.status = JobStatus::Held;
         control
             .commit_job_delta(&[(92, Some(paused))])
             .await
             .unwrap();
         settle_automatic_control(shared, JobId(92)).await;
         let current = runtime.engine.export_job(JobId(92)).await.unwrap().unwrap();
-        assert_eq!(current.status, JobStatus::Paused);
+        assert_eq!(current.status, JobStatus::Held);
         assert!(current.control().unwrap().manual_pause);
         assert!(nzbd_engine::automatic_control::transition(&current).is_none());
         assert_eq!(

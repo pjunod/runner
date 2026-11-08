@@ -14,6 +14,9 @@ export type JobStatus =
   | 'queued'
   | 'downloading'
   | 'paused'
+  // Runner 0.6.0+: a job on hold (its `control` says why). Older Runners
+  // report a hold as `paused` with a held control.
+  | 'held'
   | 'fetching'
   | 'post_queued'
   | 'completed'

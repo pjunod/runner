@@ -405,6 +405,12 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   ok(deadlined.dRest.includes("storage unavailable: conflicting yEnc"), "a hold names its cause before its message");
   const relative = T.rowModel({ ...held, control: { ...held.control, deadline_unix: undefined, deadline_in_s: 7200 } }, { mixedSection: false });
   ok(relative.dRest.includes("fails as hold expired in 2h"), "a hold with only deadline_in_s still shows its deadline");
+  // 0.6.0: the persisted status of a hold is `held` itself; the row reads
+  // the same as a 0.5.0 `paused` + held control.
+  const held060 = T.rowModel({ ...held, status: "held" }, { mixedSection: false });
+  eq(held060.st, "HELD", "a 0.6.0 held status reads as held");
+  eq(held060.pauseLabel, "pause", "a 0.6.0 retried hold offers pause");
+  eq(T.sectionOf({ ...held, status: "held" }), "attention", "a 0.6.0 hold needs attention");
   const legacyReview = T.rowModel({ ...held, control: { ...held.control, retry_policy: "review" } });
   eq(legacyReview.pauseLabel, "pause", "a policy from an older build is still an automatic hold");
   const storageHold = { ...held.control, cause: "storage_unavailable", stage: "download_write",
@@ -835,6 +841,11 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   ok(T.satisfied({ kind: "delete", jobId: 9 }, byId), "an absent job does");
   ok(T.satisfied({ kind: "pause", jobId: 9 }, byId),
     "a job that left the queue stops being overridden");
+  // 0.6.0 persists a hold as `held`: pausing a held job keeps it held (the
+  // control records the pause), and a retry is done only once it leaves.
+  const held = new Map([[1, job(1, { status: "held", control: { lifecycle: "held", manual_pause: true } })]]);
+  ok(T.satisfied({ kind: "pause", jobId: 1 }, held), "held satisfies a pause");
+  ok(!T.satisfied({ kind: "resume", jobId: 1 }, held), "held does not satisfy a retry");
 }
 
 // --- 19. connection states, including the one the old UI could not see ---

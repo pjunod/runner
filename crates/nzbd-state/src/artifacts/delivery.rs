@@ -93,15 +93,9 @@ pub struct Delivery {
     pub source_cleanup: SourceCleanup,
 }
 
-/// The `deliveries.data` JSON. For one release it also carries the
-/// `status: "ready"` field the M1a build requires to deserialize a row, so
-/// a rollback can still read rows this build wrote (removed in M6).
+/// The `deliveries.data` JSON: the immutable row.
 pub(super) fn delivery_row_json(delivery: &Delivery) -> serde_json::Result<String> {
-    let mut value = serde_json::to_value(delivery)?;
-    if let Some(object) = value.as_object_mut() {
-        object.insert("status".into(), "ready".into());
-    }
-    serde_json::to_string(&value)
+    serde_json::to_string(delivery)
 }
 
 impl Delivery {

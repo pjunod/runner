@@ -485,14 +485,16 @@ impl PostStage {
 pub enum JobStatus {
     Queued,
     Downloading,
-    /// Read-side preparation for 0.6.0 (M6b), which persists a held job's
-    /// status as `held` (beside `control.lifecycle == "held"`). This release
-    /// writes a hold as `paused` + that control, and reads a 0.6.0 `held` as
-    /// `Paused`, so during a rolling upgrade a node still on it decodes rows
-    /// an upgraded node wrote; the control carries the hold either way, and
-    /// 0.6.0 turns `paused` + a held control back into `held` on load.
-    #[serde(alias = "held")]
+    /// Stopped by a person (or by seed policy, for a torrent). Never a hold.
     Paused,
+    /// Stopped by runner on an environmental cause (contract §2.3). The job's
+    /// `control` (`lifecycle == "held"`) records the cause, the retry clock
+    /// and the deadline; `status == Held` exactly when that control holds
+    /// ([`Job::normalize_hold_status`] restores it on every load). A person
+    /// pausing a held job sets `control.manual_pause`; the status stays
+    /// `Held`. Rows written by 0.5.0 (`paused` + a held control) load as
+    /// `Held`; 0.5.0 reads `held` as `paused`.
+    Held,
     Fetching, // URL fetch
     PostQueued,
     Post {
@@ -504,6 +506,11 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
+    /// Stopped by a person or by a hold: the job does not run until one of
+    /// them lets it.
+    pub fn is_stopped(&self) -> bool {
+        matches!(self, JobStatus::Paused | JobStatus::Held)
+    }
     /// The native wire name. `Post { .. }` is `post_processing`; the stage
     /// travels separately.
     pub fn as_str(&self) -> &'static str {
@@ -512,6 +519,7 @@ impl JobStatus {
             JobStatus::Queued => "queued",
             JobStatus::Downloading => "downloading",
             JobStatus::Paused => "paused",
+            JobStatus::Held => "held",
             JobStatus::PostQueued => "post_queued",
             JobStatus::Post { .. } => "post_processing",
             JobStatus::Completed => "completed",
@@ -541,6 +549,17 @@ pub struct StageSpan {
     pub started_at_unix: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ms: Option<u64>,
+}
+
+/// What [`Job::normalize_hold_status`] did to a row's status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldStatusChange {
+    Unchanged,
+    /// `paused` + a held control (a 0.5.0 row) became `held`.
+    Held,
+    /// `held` without a holding control became `paused`: the hold record
+    /// was lost or replaced. Callers reading stored rows log it.
+    LostHold,
 }
 
 /// Job param stamped by post-processing when it finishes (value = final
@@ -975,14 +994,11 @@ pub fn transfer_of(params: &[(String, String)]) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
-/// Contract §2.3: the native API and SSE show `held`; the persisted status
-/// stays `Paused` (with `control.lifecycle == "held"`) until M6.
+/// Contract §2.3. Since M6b the persisted status is the projection (a held
+/// job is `JobStatus::Held`); `status_projected` stays on the wire as the
+/// same value for consumers that read it.
 pub fn projected_status(job: &Job) -> &'static str {
-    if job.held() {
-        "held"
-    } else {
-        job.status.as_str()
-    }
+    job.status.as_str()
 }
 
 pub fn hold_retry_delay_seconds(attempts_made: u8) -> i64 {
@@ -1108,9 +1124,49 @@ impl Job {
             .find(|(k, _)| k == CONTROL_PARAM)
             .and_then(|(_, v)| serde_json::from_str(v).ok())
     }
+    /// The hold record: a held control, or one from a control version this
+    /// build does not know (fenced like a hold). The status mirrors it —
+    /// see [`Job::normalize_hold_status`].
     pub fn held(&self) -> bool {
         self.control()
             .is_some_and(|c| c.lifecycle == "held" || c.version != 1)
+    }
+    /// Stop the job without deciding why: `Held` when its control holds,
+    /// `Paused` otherwise. For paths that quiesce a job (a writer stop, a
+    /// deletion fence, an adopted control) and must not turn a hold into a
+    /// person's pause or the reverse.
+    pub fn stop(&mut self) {
+        self.status = if self.held() {
+            JobStatus::Held
+        } else {
+            JobStatus::Paused
+        };
+    }
+    /// Make the status agree with the hold record, for a row read from
+    /// anywhere this build did not write it in this process: the persisted
+    /// queue, a replicated cluster record, an imported or adopted job.
+    ///
+    /// A 0.5.0 row stores a hold as `paused` + a held control: that is
+    /// `Held` ([`HoldStatusChange::Held`], the expected upgrade path). A
+    /// `held` status whose control no longer holds — a lost or clobbered
+    /// control — is stopped without a hold, which is `Paused`, a person
+    /// resumes it ([`HoldStatusChange::LostHold`]). That second case hides
+    /// damage, so callers reading a row from storage log it.
+    ///
+    /// Only `Paused`/`Held` are rewritten. A worker control checkpoint can
+    /// leave `Paused` (its `manual_pause`) beside a control of a version this
+    /// build does not know (`version != 1`, which [`Job::held`] treats as a
+    /// hold); such a row turns `Held` on its next load. No 0.5.0 write
+    /// produces it.
+    pub fn normalize_hold_status(&mut self) -> HoldStatusChange {
+        let held = self.held();
+        let (status, change) = match self.status {
+            JobStatus::Paused if held => (JobStatus::Held, HoldStatusChange::Held),
+            JobStatus::Held if !held => (JobStatus::Paused, HoldStatusChange::LostHold),
+            status => (status, HoldStatusChange::Unchanged),
+        };
+        self.status = status;
+        change
     }
     pub fn set_control(&mut self, control: &JobControl) {
         self.params.retain(|(k, _)| k != CONTROL_PARAM);
@@ -1309,12 +1365,61 @@ mod tests {
     }
 
     #[test]
-    fn held_status_written_by_m6b_reads_as_paused() {
-        let status: JobStatus = serde_json::from_str("\"held\"").unwrap();
-        assert_eq!(status, JobStatus::Paused);
-        assert_eq!(
-            serde_json::to_string(&JobStatus::Paused).unwrap(),
-            "\"paused\""
-        );
+    fn held_is_its_own_persisted_status_and_a_050_row_loads_as_held() {
+        assert_eq!(serde_json::to_string(&JobStatus::Held).unwrap(), "\"held\"");
+        let control = |lifecycle: &str| JobControl {
+            version: 1,
+            revision: "1".into(),
+            lifecycle: lifecycle.into(),
+            cause: "capacity".into(),
+            stage: "download_write".into(),
+            retry_policy: "scheduled_retry".into(),
+            message: String::new(),
+            instance: "i".into(),
+            previous_status: Some(JobStatus::Downloading),
+            manual_pause: false,
+            retry_attempt: 0,
+            next_retry_at_unix: None,
+            blocked_since_unix: None,
+            released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
+        };
+        let mut job = Job {
+            id: JobId(1),
+            kind: JobKind::Nzb,
+            name: "x".into(),
+            dir_name: String::new(),
+            name_provisional: false,
+            delivery_lifecycle: false,
+            queued_at_unix: 0,
+            original_name: String::new(),
+            category: None,
+            priority: 0,
+            dupe: DupeInfo::default(),
+            params: vec![],
+            files: vec![],
+            totals: JobTotals::default(),
+            status: JobStatus::Paused,
+            torrent: None,
+            stages: Vec::new(),
+        };
+        // A person's pause is not a hold.
+        assert_eq!(job.normalize_hold_status(), HoldStatusChange::Unchanged);
+        assert_eq!(job.status, JobStatus::Paused);
+        // 0.5.0 stored a hold as `paused` + a held control.
+        job.set_control(&control("held"));
+        assert_eq!(job.normalize_hold_status(), HoldStatusChange::Held);
+        assert_eq!(job.status, JobStatus::Held);
+        assert_eq!(projected_status(&job), "held");
+        // A `held` status whose control was released is a plain stop.
+        job.set_control(&control("running"));
+        assert_eq!(job.normalize_hold_status(), HoldStatusChange::LostHold);
+        assert_eq!(job.status, JobStatus::Paused);
+        // Only a stopped status is rewritten.
+        job.status = JobStatus::Queued;
+        job.set_control(&control("held"));
+        assert_eq!(job.normalize_hold_status(), HoldStatusChange::Unchanged);
+        assert_eq!(job.status, JobStatus::Queued);
     }
 }

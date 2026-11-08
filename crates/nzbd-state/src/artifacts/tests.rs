@@ -3666,3 +3666,46 @@ fn park_root_creation_failure_lands_on_the_operation_ladder() {
     assert!(db.pending_relocations(&artifact.id).unwrap().is_empty());
     assert!(db.for_job(88).unwrap().unwrap().error.is_none());
 }
+
+/// M6b: the v1 acknowledgement columns an M1a-or-older build wrote are
+/// dropped on open, and the rows they sat beside survive.
+#[test]
+fn v1_acceptance_columns_are_dropped_on_open() {
+    let (tmp, db, _root) = fixture();
+    db.close().unwrap();
+    drop(db);
+    let path = tmp.path().join("state/artifacts.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE deliveries ADD COLUMN accepted_at INTEGER;
+             ALTER TABLE deliveries ADD COLUMN consumer_receipt_id TEXT;
+             INSERT INTO deliveries(id,artifact,generation,data,accepted_at,consumer_receipt_id)
+               VALUES('d1','a1','g1','{}',1794076138,'receipt');",
+        )
+        .unwrap();
+    }
+    let reopened = Inventory::open(&tmp.path().join("state")).unwrap();
+    reopened.close().unwrap();
+    drop(reopened);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('deliveries')")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert!(
+        !columns
+            .iter()
+            .any(|c| c == "accepted_at" || c == "consumer_receipt_id"),
+        "{columns:?}"
+    );
+    let kept: i64 = conn
+        .query_row("SELECT COUNT(*) FROM deliveries WHERE id='d1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(kept, 1);
+}
