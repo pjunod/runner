@@ -223,13 +223,28 @@ impl RawTerminal {
 }
 
 fn set_artifact_salvage(tx: &Connection, job: u32, salvage: SalvageState) -> Result<usize> {
-    // The job's current artifact: the newest row for it. A job may have
-    // several (a publication beside its source); the obligation is on the
-    // source, which is the one `for_job` answers.
+    // The obligation is on the job's *source*, chosen by role, not recency
+    // (review of #282). Once salvage publishes, the job's own artifact row
+    // is the publication Curator owns (`transferred`, a delivery's
+    // artifact) and the retained source is the delivery's
+    // `sourceArtifactId`, a row with no job column; before that, the source
+    // is the job's row that is not a publication.
     Ok(tx.execute(
-        "UPDATE artifacts SET data=json_set(data,'$.salvage',?2) WHERE id=(SELECT id FROM artifacts WHERE job=?1 ORDER BY updated_at DESC LIMIT 1)",
+        "UPDATE artifacts SET data=json_set(data,'$.salvage',?2) WHERE id=COALESCE(
+            (SELECT json_extract(d.data,'$.sourceArtifactId') FROM deliveries d JOIN artifacts p ON p.id=d.artifact WHERE p.job=?1 ORDER BY d.sequence DESC LIMIT 1),
+            (SELECT a.id FROM artifacts a WHERE a.job=?1 AND json_extract(a.data,'$.state')<>'transferred' AND a.id NOT IN (SELECT artifact FROM deliveries) ORDER BY a.updated_at DESC LIMIT 1))",
         rusqlite::params![job, salvage.as_str()],
-    )?)
+    )
+    .and_then(|updated| {
+        // A relocation keeps the job's artifact id on the publication, so
+        // the obligation written before it moved travels along; the
+        // publication owes nothing.
+        tx.execute(
+            "UPDATE artifacts SET data=json_remove(data,'$.salvage') WHERE job=?1 AND id IN (SELECT artifact FROM deliveries)",
+            [job],
+        )?;
+        Ok(updated)
+    })?)
 }
 
 /// Mirror the failure reason onto the job's **source** artifact (display
@@ -424,19 +439,83 @@ impl Inventory {
             .filter(|t| t.emitted && t.salvage != SalvageState::Pending))
     }
 
-    /// Forget a terminal row once its job is gone for good (a requeue makes
-    /// the job id a fresh attempt).
-    pub fn forget_terminal(&self, job: u32) -> Result<()> {
-        let db = self.db.lock().unwrap();
-        db.execute("DELETE FROM job_terminals WHERE job=?1", [job])?;
-        Ok(())
-    }
-
     /// Test support: the next `record_terminal` replay for `job` stops right
     /// after `after`, as a crash there would.
     #[cfg(feature = "test-support")]
     pub fn inject_terminal_crash(&self, job: u32, after: TerminalStep) {
         TERMINAL_CRASHES.lock().unwrap().insert(job, after.key());
+    }
+
+    /// The job's source artifact by role (see `set_artifact_salvage`): a
+    /// salvage delivery's `sourceArtifactId`, else the job's row that is not
+    /// a publication.
+    pub fn job_source(&self, job: u32) -> Result<Option<super::Artifact>> {
+        let raw: Option<String> = self.db.lock().unwrap().query_row(
+            "SELECT data FROM artifacts WHERE id=COALESCE(
+                (SELECT json_extract(d.data,'$.sourceArtifactId') FROM deliveries d JOIN artifacts p ON p.id=d.artifact WHERE p.job=?1 ORDER BY d.sequence DESC LIMIT 1),
+                (SELECT a.id FROM artifacts a WHERE a.job=?1 AND json_extract(a.data,'$.state')<>'transferred' AND a.id NOT IN (SELECT artifact FROM deliveries) ORDER BY a.updated_at DESC LIMIT 1))",
+            [job],
+            |row| row.get(0),
+        ).optional()?;
+        Ok(raw.map(|raw| serde_json::from_str(&raw)).transpose()?)
+    }
+
+    /// Review #280-7: when the job's failed-source disposal may next run.
+    /// Disposal is an inventory `delete` (or a park `relocate`) operation
+    /// whose own attempts / `next_retry` ladder is durable and listed with
+    /// the artifact (`/api/v1/artifacts`); this is the latest such retry
+    /// still pending for any of the job's artifacts, if one is.
+    pub fn disposal_retry_at(&self, job: u32) -> Result<Option<i64>> {
+        let db = self.db.lock().unwrap();
+        Ok(db.query_row(
+            "SELECT MAX(json_extract(o.data,'$.next_retry')) FROM operations o JOIN artifacts a ON a.id=o.artifact WHERE a.job=?1 AND o.state NOT IN ('succeeded','cancelled') AND json_extract(o.data,'$.kind') IN ('delete','relocate') AND json_extract(o.data,'$.next_retry')>0",
+            [job],
+            |row| row.get::<_, Option<i64>>(0),
+        )?)
+    }
+
+    /// Test support: the next failed-source disposal for `job` loses its
+    /// post-processing admission right after the move/delete, before the
+    /// outcome is recorded (as an owner fence or shutdown would).
+    #[cfg(feature = "test-support")]
+    pub fn inject_disposal_admission_loss(&self, job: u32) {
+        DISPOSAL_ADMISSION_LOSSES.lock().unwrap().insert(job);
+    }
+
+    /// Consulted by disposal after the move. Always false outside the
+    /// `test-support` feature.
+    pub fn take_injected_disposal_admission_loss(&self, job: u32) -> bool {
+        #[cfg(feature = "test-support")]
+        {
+            return DISPOSAL_ADMISSION_LOSSES.lock().unwrap().remove(&job);
+        }
+        #[allow(unreachable_code)]
+        {
+            let _ = job;
+            false
+        }
+    }
+
+    /// Whether a failed-source disposal operation (`delete`, or a park
+    /// `relocate`) for any of the job's artifacts is still unresolved. Its
+    /// payload is then held by that operation — possibly already moved but
+    /// not committed — not absent.
+    pub fn disposal_in_flight(&self, job: u32) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        Ok(db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations o JOIN artifacts a ON a.id=o.artifact WHERE a.job=?1 AND o.state NOT IN ('succeeded','cancelled') AND json_extract(o.data,'$.kind') IN ('delete','relocate'))",
+            [job],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Operator Retry now for a failed source's disposal: the job's pending
+    /// park relocation becomes due on its own ladder and is replayed now
+    /// (the same single-operation resume a post-processing retry uses). A
+    /// move that ran but did not commit is committed where its bytes are;
+    /// anything the relocation cannot resume is left on its ladder.
+    pub fn retry_disposal_now(&self, job: u32) -> Result<()> {
+        self.resume_post_relocation_checked(job, &|| Ok(()), true)
     }
 
     /// Test support: the next `record_terminal` for `job` fails before the
@@ -465,6 +544,9 @@ impl Inventory {
 #[cfg(feature = "test-support")]
 static TERMINAL_CRASHES: std::sync::LazyLock<Mutex<std::collections::HashMap<u32, u8>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+#[cfg(feature = "test-support")]
+static DISPOSAL_ADMISSION_LOSSES: std::sync::LazyLock<Mutex<std::collections::HashSet<u32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 #[cfg(feature = "test-support")]
 static TERMINAL_INSERT_FAILURES: std::sync::LazyLock<Mutex<std::collections::HashSet<u32>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));

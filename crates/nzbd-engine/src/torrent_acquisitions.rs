@@ -168,10 +168,16 @@ impl crate::EngineHandle {
         result.await.map_err(|_| crate::EngineError::Closed)
     }
 
+    /// End a native torrent acquisition as a typed failed terminal
+    /// (contract §2.1/§2.2): its `job_terminals` row, history and
+    /// `job_pp_finished` come from the same chain as every other terminal.
+    #[allow(clippy::too_many_arguments)]
     pub async fn fail_native_torrent(
         &self,
         job: JobId,
         donor: Option<JobId>,
+        reason: nzbd_types::FailureReason,
+        fetch_cause: Option<nzbd_types::FetchCause>,
         stage: String,
         message: String,
         cleanup_complete: bool,
@@ -179,6 +185,8 @@ impl crate::EngineHandle {
         self.roundtrip_bool(|reply| crate::owner::QueueCommand::FailNativeTorrent {
             job,
             donor,
+            reason,
+            fetch_cause,
             stage,
             message,
             cleanup_complete,

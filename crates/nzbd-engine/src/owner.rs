@@ -247,6 +247,8 @@ pub(crate) enum QueueCommand {
     FailNativeTorrent {
         job: JobId,
         donor: Option<JobId>,
+        reason: nzbd_types::FailureReason,
+        fetch_cause: Option<nzbd_types::FetchCause>,
         stage: String,
         message: String,
         cleanup_complete: bool,

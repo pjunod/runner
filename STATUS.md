@@ -26,6 +26,83 @@
 - **Decision for Paul:** `controlPending: review_required` ("Source needs
   review") is a control-acceptance state, not a hold, and was left alone.
 
+## Pipeline contract v2 M1a — review rounds (#280, #281) — 2026-11-08
+
+**Status:** all #280 findings fixed on `claude/pipeline-v2-m1a-runner`
+(PR #281, draft). Highlights since the first entry below:
+
+- Completed terminal before the delivery row and source retirement, with
+  crash repair from the stamped `Delivery:*` markers.
+- `PostError::Identity`; native torrent failures, partial torrents and
+  worker post-processing results are typed terminals through the shared
+  chain. In a cluster exactly one node records each terminal: the leader
+  when it holds the history store, else the worker that writes the history
+  row.
+- Unrecorded terminals are kept and retried on the owner; a stored row is
+  never forgotten.
+- Failed-source assessment restored: `recoverable` / `unknown` (unproven
+  payload) / `unusable`. Only `unusable` is deleted on the default policy.
+- Cluster cleanup ledger: publish/io/identity/hold_expired raw copies are
+  retained (park-always); a worker disposes its own attempt copy after the
+  leader accepts the result.
+- Flakes fixed at the root:
+  - Transforms ran outside attempt custody, racing the artifact tick.
+  - Operator Keep and recovery staging were refused while a maintenance
+    lease was held; they now wait for the lease to be released.
+
+**Behaviour change for Paul:** failed-source disposal now retries on the
+disposal operation's own durable `next_retry` ladder until it succeeds,
+visible on `/api/v1/artifacts`. The old in-memory, three-attempt budget —
+which retired the queue row with a `delete failed: …` note after about 60 s —
+is gone. A failed row stays queued until its disposal is recorded.
+
+**Deleted-scenario coverage:**
+- v2 tests: `a_failed_attempt_that_left_no_files_retains_nothing`,
+  `absent_integrity_proof_is_unknown_not_cleanup_authority` and
+  `failed_park_losing_admission_after_move_is_fenced_and_retried`.
+- The fenced-park test uses a test-support admission-loss injection. In
+  code, disposal no longer records an outcome when the admission was lost
+  after the move.
+
+
+**Open:** `terminal_junk_with_explicit_keep_retains_owned_sources_and_reports_custody`
+failed once in a full `cluster_e2e` run (1 of 22). I could not reproduce it
+in 40 further runs:
+- 2 more full-suite runs.
+- 12 runs as 4 parallel copies.
+- 12 runs as 6 parallel copies with 4 CPU burners.
+- 4 standalone runs.
+
+No failure message was captured. The free disk on this shared VM dropped to
+about 0.7–1.8 GB several times that day (other agents' builds), and several
+unrelated tests then failed with ENOSPC. That is the leading suspect, not
+confirmed.
+
+**Retry-now on the disposal ladder** (`claude/pipeline-v2-m1a-tests`):
+- Test: `retry_now_runs_a_failed_source_follow_up_past_its_disposal_ladder`
+  (v2 of the deleted `retry_now_releases_a_due_failed_source…`). A park
+  relocate hits EIO before commit and goes onto its own ladder. The
+  manager's rescan waits for it; Retry now parks and records it at once.
+- Fixed: a park that moved its bytes but did not commit was recorded as
+  `no payload`. Disposal now treats an unresolved delete/relocate operation
+  as holding the payload (`Inventory::disposal_in_flight`).
+- Fixed: Retry now could not complete such a park before `next_retry`.
+  Terminal custody verifies the pre-move path, which is gone. A forced
+  follow-up now resumes the pending relocation first
+  (`Inventory::retry_disposal_now`, the post-retry resume path).
+- Open, not fixed: a park whose destination root cannot be created fails
+  before its operation is written. It has no durable ladder and is not
+  visible on `/api/v1/artifacts`; only the 30 s rescan retries it. The
+  relocate request records the destination root's identity, so fixing this
+  means reworking that request. That is a relocation change, outside M1a.
+
+**Tests changed to v2 behaviour (contract clause):**
+- `terminal_unusable_cluster_completion_…` → `…_parks_raw_copies_and_drains_sealed_generations`:
+  §2.2, publish always parks.
+- `completed_text_document_is_retained_with_visible_review_action` →
+  `…_is_one_publish_failure_with_bytes_retained`: §2.2/§2.3, a
+  post-processing failure is terminal and there is no review hold.
+
 ## Pipeline contract v2 M1a — terminal first, typed at the source — 2026-11-07
 
 **Status:** built on `claude/pipeline-v2-m1a-runner` (runner 0.3.0), not merged,
@@ -116,6 +193,19 @@ Curator M2 depends on this landing first.
 - **Decisions for Paul:** park-always for publish/io/identity, the contract
   default, which both reviewers recommend. It also applies to
   `hold_expired`, since an expired hold is environmental.
+
+## Pipeline contract v2 — M0 (contract in the repo) — 2026-11-07
+
+**Status:** in progress on `claude/pipeline-v2-m0-runner` · **Owner:** Claude
+(Opus builder session) · **PR:** [#279](https://github.com/pjunod/runner/pull/279) · **Plan:**
+`PIPELINE_REWRITE_PLAN.md` M0 (project doc).
+
+- Added [docs/PIPELINE_CONTRACT.md](docs/PIPELINE_CONTRACT.md), the r4
+  contract that the M1a/M1b/M3/M6 runner work builds to. When code and
+  contract disagree during the rewrite, the contract describes the target.
+- "Being replaced by" banner on `docs/INTEGRATION.md`; `CURATOR_DELIVERY.md`
+  and `HELD_JOBS_PLAN.md` marked superseded.
+- Docs only: no code, no version bump.
 
 ## Empty failed sources retained "for recovery" — 2026-11-02
 

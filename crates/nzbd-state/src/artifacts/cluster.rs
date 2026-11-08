@@ -343,6 +343,22 @@ impl Inventory {
                 error: operation.error,
             });
         }
+        // Contract §2.2: publish/io/identity/hold_expired failures always
+        // keep their bytes, whatever `failure_action` says — every raw copy
+        // of such a job is retained under runner custody for recovery.
+        if !copy.selected
+            && !artifact.terminal()
+            && nzbd_types::FailureReason::ALL
+                .into_iter()
+                .any(|reason| reason.park_always() && reason.history_status() == outcome)
+        {
+            return Ok(ClusterCopyCleanup {
+                status: "retained".into(),
+                error: Some(format!(
+                    "{outcome} always keeps its bytes (contract park-always); retained for recovery"
+                )),
+            });
+        }
         if !copy.selected && outcome != "SUCCESS" && !unusable && !artifact.terminal() {
             return Ok(ClusterCopyCleanup { status: "retained".into(), error: Some(
                 "partial failure publication does not prove every raw source dependency redundant; retain this exact source until recovery is resolved".into()) });

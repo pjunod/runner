@@ -73,6 +73,9 @@ pub(crate) async fn pass(
             job.control
                 .as_ref()
                 .filter(|c| c.lifecycle == "held")
+                // A pre-v2 terminal cause is the boot/adoption conversion's
+                // (contract §2.3), never an expiry or a release.
+                .filter(|c| nzbd_types::HoldCause::legacy_terminal(&c.cause).is_none())
                 .filter(|c| c.deadline_unix.is_some_and(|deadline| deadline <= now))
                 .map(|c| (job.id, c.revision.clone()))
         })
@@ -92,6 +95,11 @@ pub(crate) async fn pass(
         .filter(|job| !snapshot.pending_automatic_controls.contains(&job.id))
         .filter(|job| job.assigned_node.is_none())
         .filter(|job| !expired.iter().any(|(id, _)| *id == job.id))
+        .filter(|job| {
+            job.control
+                .as_ref()
+                .is_none_or(|c| nzbd_types::HoldCause::legacy_terminal(&c.cause).is_none())
+        })
         .filter(|job| {
             job.kind != JobKind::Torrent
                 || job.torrent_role == Some("acquisition")

@@ -151,6 +151,7 @@ impl Drop for ReconciliationLease<'_> {
         for key in &self.keys {
             uses.remove(key);
         }
+        self.inventory.reconciliation_released.notify_all();
     }
 }
 

@@ -117,6 +117,7 @@ impl Drop for NamespaceUse<'_> {
                 .lock()
                 .unwrap()
                 .remove(key);
+            self.inventory.reconciliation_released.notify_all();
         }
     }
 }

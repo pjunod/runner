@@ -244,6 +244,16 @@ async fn unpack_failure_is_terminal_before_salvage() {
         .unwrap()
         .unwrap();
     assert_eq!(delivery.kind(), "salvage");
+    // The job now has both a source and Curator's publication; the
+    // settled obligation is on the source, by role (review of #282).
+    assert_ne!(delivery.source_artifact_id, delivery.artifact_id);
+    let source_row = engine
+        .artifacts()
+        .get(&delivery.source_artifact_id)
+        .unwrap();
+    let publication_row = engine.artifacts().get(&delivery.artifact_id).unwrap();
+    assert_eq!(source_row.salvage.as_deref(), Some("published"));
+    assert_eq!(publication_row.salvage, None);
     cancel.cancel();
     tracker.close();
     tracker.wait().await;
@@ -938,5 +948,399 @@ async fn unrecorded_terminal_is_retried_and_blocks_completion() {
         }
     }
     assert_eq!(finished, 1);
+    engine.shutdown().await;
+}
+
+/// Plan M1a (e), contract §2.1: a torrent that stopped with a partially
+/// verified payload is `failed/io` with `salvage: pending` — no blame, the
+/// verified files owed to salvage. (The acquisition's completion command
+/// records exactly this terminal when its donor seed failed; building a real
+/// piece-verified torrent copy is out of reach for this fixture, so the job
+/// row is the acquisition's post-copy shape.)
+#[tokio::test]
+async fn partial_torrent_is_io_with_salvage_pending() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, _) = admitted_job(
+        &engine,
+        "partial-torrent",
+        &[("Show.S01E01.mkv", Some(b"verified piece".as_slice()))],
+        JobStatus::Failed,
+    )
+    .await;
+    let mut row = export(&engine, job_id).await.unwrap();
+    row.kind = nzbd_types::JobKind::Torrent;
+    for file in &mut row.files {
+        file.segments.clear(); // torrent files carry no articles
+    }
+    engine.import_job(row, false, false).await.unwrap();
+    assert!(engine
+        .fail_job(
+            job_id,
+            FailureReason::Io,
+            None,
+            "torrent_download",
+            "torrent stopped with a partially verified payload; hash-verified files are salvaged",
+        )
+        .await
+        .unwrap());
+    let terminal = engine.artifacts().terminal(job_id.0).unwrap().unwrap();
+    assert_eq!(terminal.reason, Some(FailureReason::Io));
+    assert!(!terminal.blames_release);
+    assert_eq!(terminal.salvage, SalvageState::Pending);
+    assert_eq!(
+        terminal.fetched.success_articles, 0,
+        "no articles: salvage is owed by kind"
+    );
+    assert_eq!(
+        history
+            .get_sequence(terminal.history_seq.unwrap())
+            .unwrap()
+            .unwrap()
+            .status,
+        "FAILURE/IO"
+    );
+    engine.shutdown().await;
+}
+
+/// v2 of the deleted `a_failed_attempt_that_left_no_files_retains_nothing`:
+/// a failed attempt that never wrote a byte is assessed `unusable` after
+/// salvage finds nothing, and its empty source is disposed by policy —
+/// nothing is parked or retained.
+#[tokio::test]
+async fn a_failed_attempt_that_left_no_files_retains_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, _history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, source) = admitted_job(
+        &engine,
+        "nothing-written",
+        &[("episode.mkv", None)],
+        JobStatus::Failed,
+    )
+    .await;
+    assert!(engine
+        .fail_job(
+            job_id,
+            FailureReason::Health,
+            None,
+            "health",
+            "no article arrived"
+        )
+        .await
+        .unwrap());
+    let parked = tmp.path().join("parked");
+    assert!(
+        nzbd_post::manager::follow_up_failure(
+            &engine,
+            &PostConfig {
+                failure_action: FailureAction::Delete,
+                failed_dir: Some(parked.clone()),
+                ..PostConfig::default()
+            },
+            &tmp.path().join("dest"),
+            job_id,
+        )
+        .await
+    );
+    let terminal = engine.artifacts().terminal(job_id.0).unwrap().unwrap();
+    assert!(terminal.disposal.is_some(), "{terminal:?}");
+    assert!(
+        !parked.join("nothing-written").exists(),
+        "nothing is parked"
+    );
+    assert!(
+        !source.exists() || std::fs::read_dir(&source).unwrap().next().is_none(),
+        "nothing is retained"
+    );
+    engine.shutdown().await;
+}
+
+/// v2 of the deleted `absent_integrity_proof_is_unknown_not_cleanup_authority`:
+/// payload bytes whose integrity was never proven are not deletion
+/// authority — with `failure_action = delete` the source is parked, not
+/// deleted (the pre-v2 "unknown → retain" rule, now after the terminal).
+#[tokio::test]
+async fn absent_integrity_proof_is_unknown_not_cleanup_authority() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, _history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, source) = admitted_job(
+        &engine,
+        "unproven",
+        &[(
+            "Movie.2020.mkv",
+            Some(b"\x1a\x45\xdf\xa3 unproven matroska".as_slice()),
+        )],
+        JobStatus::Failed,
+    )
+    .await;
+    // Drop the proof: the bytes arrived, but no file CRC vouches for them.
+    let mut row = export(&engine, job_id).await.unwrap();
+    for file in &mut row.files {
+        file.crc32 = None;
+    }
+    engine.import_job(row, false, false).await.unwrap();
+    assert!(engine
+        .fail_job(
+            job_id,
+            FailureReason::Health,
+            None,
+            "health",
+            "below critical"
+        )
+        .await
+        .unwrap());
+    let parked = tmp.path().join("parked");
+    let cfg = PostConfig {
+        failure_action: FailureAction::Delete,
+        failed_dir: Some(parked.clone()),
+        ..PostConfig::default()
+    };
+    // As the manager's rescans do: follow up until the owner has settled the
+    // re-imported row (its startup verification owns it first).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !nzbd_post::manager::follow_up_failure(&engine, &cfg, &tmp.path().join("dest"), job_id)
+        .await
+    {
+        assert!(tokio::time::Instant::now() < deadline, "follow-up settles");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let terminal = engine.artifacts().terminal(job_id.0).unwrap().unwrap();
+    let disposal = terminal.disposal.clone().unwrap();
+    assert!(disposal.starts_with("parked at"), "{disposal}");
+    let kept = parked.join("unproven").join("Movie.2020.mkv");
+    assert!(
+        kept.exists() || source.join("Movie.2020.mkv").exists(),
+        "unproven payload is retained: {disposal}"
+    );
+    engine.shutdown().await;
+}
+
+/// v2 of the deleted `failed_park_losing_admission_after_move_is_fenced_and_retried`:
+/// the park runs under the post-processing admission; when the admission is
+/// lost right after the move, the outcome is not recorded by the holder that
+/// lost it — the next follow-up finds the parked copy and records it once,
+/// without moving it again.
+#[tokio::test]
+async fn failed_park_losing_admission_after_move_is_fenced_and_retried() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, _history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, source) = admitted_job(
+        &engine,
+        "fenced-park",
+        &[(
+            "Movie.2020.mkv",
+            Some(b"\x1a\x45\xdf\xa3 unproven matroska".as_slice()),
+        )],
+        JobStatus::Failed,
+    )
+    .await;
+    let mut row = export(&engine, job_id).await.unwrap();
+    for file in &mut row.files {
+        file.crc32 = None; // unproven: the source is parked, never deleted
+    }
+    engine.import_job(row, false, false).await.unwrap();
+    assert!(engine
+        .fail_job(
+            job_id,
+            FailureReason::Health,
+            None,
+            "health",
+            "below critical"
+        )
+        .await
+        .unwrap());
+    let parked = tmp.path().join("parked");
+    let cfg = PostConfig {
+        failure_action: FailureAction::Delete,
+        failed_dir: Some(parked.clone()),
+        ..PostConfig::default()
+    };
+    let dest = tmp.path().join("dest");
+    engine.artifacts().inject_disposal_admission_loss(job_id.0);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Until the owner settles the re-imported row, follow-up is refused
+    // before it moves anything; the injected loss fires on the first move.
+    while engine
+        .artifacts()
+        .terminal(job_id.0)
+        .unwrap()
+        .unwrap()
+        .disposal
+        .is_none()
+        && !parked.join("fenced-park").exists()
+    {
+        assert!(!nzbd_post::manager::follow_up_failure(&engine, &cfg, &dest, job_id).await);
+        assert!(tokio::time::Instant::now() < deadline, "the park runs");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let moved = parked.join("fenced-park").join("Movie.2020.mkv");
+    assert!(moved.exists(), "the move itself happened");
+    assert!(!source.join("Movie.2020.mkv").exists());
+    assert!(
+        engine
+            .artifacts()
+            .terminal(job_id.0)
+            .unwrap()
+            .unwrap()
+            .disposal
+            .is_none(),
+        "a holder that lost its admission records nothing"
+    );
+    assert!(nzbd_post::manager::follow_up_failure(&engine, &cfg, &dest, job_id).await);
+    let disposal = engine
+        .artifacts()
+        .terminal(job_id.0)
+        .unwrap()
+        .unwrap()
+        .disposal
+        .unwrap();
+    assert!(disposal.starts_with("parked at"), "{disposal}");
+    assert!(
+        moved.exists(),
+        "recorded where it already is — not moved twice"
+    );
+    let parked_entries = std::fs::read_dir(&parked).unwrap().count();
+    assert_eq!(parked_entries, 1, "one parked copy");
+    engine.shutdown().await;
+}
+
+/// v2 of the deleted `retry_now_releases_a_due_failed_source_and_runs_manager_salvage`:
+/// a failed row whose disposal is waiting on its operation's durable
+/// `next_retry` stays put on the manager's own rescans, and an operator
+/// Retry now runs the follow-up immediately, past that deadline — salvage
+/// settled, then the park replays and is recorded once.
+#[tokio::test]
+async fn retry_now_runs_a_failed_source_follow_up_past_its_disposal_ladder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, source) = admitted_job(
+        &engine,
+        "retry-now",
+        &[(
+            "Movie.2020.mkv",
+            Some(b"\x1a\x45\xdf\xa3 unproven matroska".as_slice()),
+        )],
+        JobStatus::Failed,
+    )
+    .await;
+    let mut row = export(&engine, job_id).await.unwrap();
+    for file in &mut row.files {
+        file.crc32 = None; // unproven: nothing to salvage, the source is parked
+    }
+    engine.import_job(row, false, false).await.unwrap();
+    assert!(engine
+        .fail_job(
+            job_id,
+            FailureReason::Health,
+            None,
+            "health",
+            "below critical"
+        )
+        .await
+        .unwrap());
+    // The park's relocate operation hits an I/O error (EIO) before it
+    // commits, so it goes onto its own durable retry ladder.
+    let parked = tmp.path().join("parked");
+    let fault = engine
+        .artifacts()
+        .inject_relocation_test_fault(job_id.0, "before_commit", 5)
+        .unwrap();
+    let cfg = PostConfig {
+        failure_action: FailureAction::Delete,
+        failed_dir: Some(parked.clone()),
+        ..PostConfig::default()
+    };
+    let dest = tmp.path().join("dest");
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let retry_at = loop {
+        assert!(!nzbd_post::manager::follow_up_failure(&engine, &cfg, &dest, job_id).await);
+        if let Some(at) = engine.artifacts().disposal_retry_at(job_id.0).unwrap() {
+            break at;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the park fails onto its ladder: {:?}",
+            engine.artifacts().terminal(job_id.0).unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        retry_at > now() + 5,
+        "the ladder is in the future: {retry_at}"
+    );
+    let terminal = engine.artifacts().terminal(job_id.0).unwrap().unwrap();
+    assert_ne!(terminal.salvage, SalvageState::Pending, "salvage ran first");
+    assert!(terminal.disposal.is_none(), "{terminal:?}");
+
+    // The storage comes back. The manager's startup rescan honours the
+    // ladder: nothing is recorded before `next_retry`.
+    drop(fault);
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    let manager = spawn_post_manager(
+        engine.clone(),
+        cfg.clone(),
+        history,
+        dest.clone(),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        engine
+            .artifacts()
+            .terminal(job_id.0)
+            .unwrap()
+            .unwrap()
+            .disposal
+            .is_none(),
+        "a rescan waits for the ladder"
+    );
+    assert_eq!(
+        engine.artifacts().disposal_retry_at(job_id.0).unwrap(),
+        Some(retry_at),
+        "the ladder is untouched by the rescan"
+    );
+
+    // Retry now runs the owed follow-up immediately.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match manager.retry_now(job_id).await {
+            Ok(()) => break,
+            // The owner may still be settling the re-imported row.
+            Err(nzbd_post::manager::RestartPostError::NotReady)
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            Err(error) => panic!("retry now: {error}"),
+        }
+    }
+    assert!(now() < retry_at, "ran ahead of the ladder");
+    let terminal = engine.artifacts().terminal(job_id.0).unwrap().unwrap();
+    let disposal = terminal.disposal.clone().unwrap();
+    assert!(disposal.starts_with("parked at"), "{disposal}");
+    assert!(parked.join("retry-now").join("Movie.2020.mkv").exists());
+    assert!(!source.join("Movie.2020.mkv").exists());
+    assert_eq!(
+        std::fs::read_dir(&parked).unwrap().count(),
+        1,
+        "one parked copy"
+    );
+    assert_eq!(
+        engine.artifacts().disposal_retry_at(job_id.0).unwrap(),
+        None,
+        "the ladder's operation settled"
+    );
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
     engine.shutdown().await;
 }
