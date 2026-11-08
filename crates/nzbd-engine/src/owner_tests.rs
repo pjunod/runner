@@ -3135,6 +3135,52 @@ async fn permanent_writer_error_is_a_terminal_io_failure() {
     assert!(terminal.emitted && terminal.markers_stamped);
 }
 
+/// M6b: a hold and a person's pause are two statuses. A paused job that is
+/// held becomes `Held` and remembers the pause; pausing a held job keeps it
+/// `Held`; releasing a remembered pause lands on `Paused`, not `Queued`.
+#[tokio::test]
+async fn a_hold_is_held_and_a_pause_inside_it_is_remembered() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(1));
+    owner.state.jobs.push(pending_job(2));
+    owner.state.jobs[1].status = JobStatus::Paused;
+    for job in [JobId(1), JobId(2)] {
+        assert!(owner.hold_job(job, HoldCause::Capacity, "download_write", "ENOSPC"));
+    }
+    pump(&mut owner, &mut messages).await;
+    for (index, manual) in [(0, false), (1, true)] {
+        let job = &owner.state.jobs[index];
+        assert_eq!(job.status, JobStatus::Held);
+        assert_eq!(nzbd_types::projected_status(job), "held");
+        assert_eq!(job.control().unwrap().manual_pause, manual);
+    }
+    let (reply, paused) = oneshot::channel();
+    owner.on_command(QueueCommand::Pause {
+        job: JobId(1),
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    assert!(paused.await.unwrap());
+    assert_eq!(owner.state.jobs[0].status, JobStatus::Held);
+    assert!(owner.state.jobs[0].control().unwrap().manual_pause);
+    // The storage release keeps the remembered pause (`retry_hold_proven`
+    // is the operator retry, which clears it; this is the capacity path).
+    let (reply, released) = oneshot::channel();
+    let revision = owner.state.jobs[1].control().unwrap().revision;
+    owner.on_command(QueueCommand::ReleaseResourceHold {
+        job: JobId(2),
+        revision,
+        by: RetryBy::Recovery,
+        guard: Default::default(),
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    assert!(released.await.unwrap());
+    assert_eq!(owner.state.jobs[1].status, JobStatus::Paused);
+    assert!(!owner.state.jobs[1].held());
+}
+
 #[tokio::test]
 async fn paused_hold_waits_for_the_operator_and_followers_never_auto_release() {
     let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
@@ -3915,7 +3961,7 @@ async fn writer_resource_errors_hold_pending_segments_and_latch_out_of_space() {
     let job = owner.state.job(JobId(2)).unwrap();
     assert_eq!(job.files[0].segments[0].state, SegmentState::Pending);
     assert!(!job.files[0].finalized);
-    assert_eq!(job.status, JobStatus::Paused);
+    assert_eq!(job.status, JobStatus::Held);
     assert!(job.held());
     assert!(!job.ready());
     assert!(owner.disk_low);
@@ -5491,7 +5537,7 @@ async fn automatic_hold_recovery_bounds_each_pass_and_rotates_all_due_jobs() {
     for id in 101..122 {
         let mut row = pending_job(id);
         mark_new_lifecycle_cohort(&mut row);
-        row.status = JobStatus::Paused;
+        row.status = JobStatus::Held;
         row.dir_name = format!("allocation-{id}");
         row.set_control(&nzbd_types::JobControl {
             version: 1,
@@ -7080,7 +7126,7 @@ async fn worker_retry_schedule_survives_regrant_without_overriding_new_leader_in
         owner.state.jobs[0].control().unwrap().next_retry_at_unix,
         Some(deadline)
     );
-    assert_eq!(owner.state.jobs[0].status, JobStatus::Paused);
+    assert_eq!(owner.state.jobs[0].status, JobStatus::Held);
     let mut newer = original.clone();
     let mut newer_context = context.clone();
     newer_context.control_revision += 1;

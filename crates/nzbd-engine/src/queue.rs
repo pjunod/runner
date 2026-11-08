@@ -2753,6 +2753,23 @@ mod tests {
         );
     }
 
+    /// M6b: force priority overrides a person's pause, never a hold. While a
+    /// hold was persisted as `Paused`, a force-priority held job was handed
+    /// segments the same as a paused one.
+    #[test]
+    fn force_priority_runs_a_paused_job_but_not_a_held_one() {
+        let mut q = QueueState::default();
+        let id = q.admit_nzb("forced".into(), &sample_nzb(&[("a.bin", 2)]), None, 0, true);
+        let job = q.job_mut(id).unwrap();
+        job.priority = nzbd_types::PRIORITY_FORCE;
+        job.status = JobStatus::Paused;
+        assert!(job_schedulable(q.job(id).unwrap(), false));
+        assert!(job_schedulable(q.job(id).unwrap(), true));
+        q.job_mut(id).unwrap().status = JobStatus::Held;
+        assert!(!job_schedulable(q.job(id).unwrap(), false));
+        assert!(!job_schedulable(q.job(id).unwrap(), true));
+    }
+
     #[test]
     fn selection_respects_priority_pause_and_force() {
         let mut q = QueueState::default();
