@@ -943,6 +943,9 @@ pub(crate) struct Owner {
     startup_roots_retry_at: Instant,
     verification: HashMap<JobId, VerificationState>,
     verification_roots: HashSet<PathBuf>,
+    // A joined verifier retains backpressure until its full-queue checkpoint
+    // commits. Otherwise fast/empty recoveries can flood the persistence lane.
+    verification_checkpoints: HashMap<(JobId, u64), PathBuf>,
     allocation_cache: HashMap<JobId, nzbd_state::artifacts::Artifact>,
     owner_heartbeat: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) shutdown_complete: Arc<std::sync::atomic::AtomicBool>,
@@ -1461,6 +1464,7 @@ impl Owner {
             startup_roots_retry_at: Instant::now(),
             verification: HashMap::new(),
             verification_roots: HashSet::new(),
+            verification_checkpoints: HashMap::new(),
             allocation_cache,
             owner_heartbeat,
             shutdown_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),

@@ -539,3 +539,78 @@ builds. No NZB-fetch task logic is changed in this follow-up.
 The remaining acceptance gate is an active-download comparison on nuc3 after
 the reviewed scheduler correction is installed. Do not infer restoration to
 109 MiB/s from the deterministic selection-count improvement alone.
+
+
+## 10. Follow-up — recovery checkpoints can saturate persistence
+
+PR [#285](https://github.com/pjunod/runner/pull/285) merged as `ce1d9c6` after
+all required checks passed. Its exact tested tree is running on nuc3 as
+`0.3.0+speed-b6ec55eb8`. The scheduler correction has not established restoration
+to 109 MiB/s. Before deployment, untraced byte-delta windows averaged 16.7 MiB/s
+with two active slots and 11.1 MiB/s after an intervening deployment reset the
+limit to one. The first post-deployment window averaged 9.4 MiB/s but crossed a
+live setting change from one slot to four and ongoing recovery; it is not a
+controlled regression or improvement result.
+
+The old container exited with status 1 rather than a forced-kill status. Startup
+retained its unclean marker and replayed 145 journal records. The recovered
+queue subsequently exposed approximately 40 GiB of previously received data
+requiring verification, plus historical storage-unavailable holds stating that
+segment journals were not durable. Their recorded timestamps predate the
+scheduler deployment. The new process also logged `bounded persistence lane
+unavailable`, so a full persistence queue is now directly observed.
+
+A 30-second exact-function profile recorded 68 persistence submissions and
+17 full snapshot saves; all 16 completed saves took 1–2 seconds. Twenty owner
+messages took 0.5–2 seconds. A separate 20-second probe recorded 408 persistence
+submissions, two rejected submissions, 12 queue-document clones, and 7,614
+custody-refresh calls. Many refreshes took 1–8 ms and several clones took
+0.25–2 seconds. These are instrumented latency/count observations, not download
+benchmarks. Container memory reached approximately 22.7 GiB. Custody refresh is
+an additional measured owner cost; this follow-up does not claim to remove it.
+
+### Cause and bounded correction
+
+[Recovery scheduling](../crates/nzbd-engine/src/owner_recovery.rs) reserves a
+storage root while a verifier thread reads its bounded batch. A completed batch
+releases that root before enqueuing its full-queue durability checkpoint. The
+job correctly remains fenced in `saving`, but another job on the same root can
+start at the next owner tick. Many cheap or empty recoveries can therefore
+outpace large snapshot saves, retaining many full queue documents, filling the
+256-request persistence lane, and delaying or rejecting unrelated writer and
+journal work. The previous same-root reservation bounded readers, not their
+outstanding durability work.
+
+Keep a separate reservation for each exact `(job, verification generation)`
+checkpoint until its persistence continuation runs. Retain its slot in the
+existing two-worker recovery budget, bounding outstanding readers/checkpoints
+globally as well as per root. Do not start another verifier on that storage root
+while a completed checkpoint is outstanding. Another root can use the second
+slot, and incomplete read batches still release their reader slot
+for the existing priority/fairness policy. Every continuation releases its exact
+reservation before checking for a stale job generation, including failed or
+synchronously rejected persistence. A stale acknowledgement must neither release
+a newer checkpoint nor strand a root.
+
+The deterministic reproduction blocks the real ordered persistence worker,
+completes a zero-byte verification in a 20-job same-root queue, then asks the
+scheduler for more recovery work. It failed before the correction because the
+next verifier started before the previous checkpoint was durable. The corrected
+case must drain all 20 jobs after real acknowledgements without periodic ticks.
+Additional cases cover another root progressing while the first awaits storage,
+the global budget across three roots, failed authority guards retaining their
+existing fence, and replacement of a
+job generation while an older checkpoint waits. Existing partial-batch/resume
+fairness remains part of validation.
+
+No checkpoint is discarded or acknowledged early, no snapshots are coalesced,
+and no journal, CRC, generation, custody or publication check is weakened.
+Deployment and sustained receiving measurements remain required; the remaining
+custody-refresh and snapshot costs may require further work even after this
+feedback loop is removed.
+
+
+Local validation: all 322 engine unit tests passed, including the three new
+checkpoint regressions and existing recovery fairness cases. Strict engine
+Clippy across all targets, formatting, and diff checks passed. Required CI and
+the native Linux build remain release gates for this follow-up.

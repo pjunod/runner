@@ -446,7 +446,10 @@ impl Owner {
     }
 
     pub(super) fn start_verifications(&mut self) {
-        if self.cancel.is_cancelled() || self.verification_roots.len() >= MAX_VERIFICATION_WORKERS {
+        if self.cancel.is_cancelled()
+            || self.verification_roots.len() + self.verification_checkpoints.len()
+                >= MAX_VERIFICATION_WORKERS
+        {
             return;
         }
         let now = Instant::now();
@@ -491,7 +494,9 @@ impl Owner {
         });
         let mut changed = false;
         for (_, _, _, _, job) in candidates {
-            if self.verification_roots.len() >= MAX_VERIFICATION_WORKERS {
+            if self.verification_roots.len() + self.verification_checkpoints.len()
+                >= MAX_VERIFICATION_WORKERS
+            {
                 break;
             }
             let Some(allocation) = self.allocation_cache.get(&job).cloned() else {
@@ -499,7 +504,12 @@ impl Owner {
                 changed = true;
                 continue;
             };
-            if self.verification_roots.contains(&allocation.root) {
+            if self.verification_roots.contains(&allocation.root)
+                || self
+                    .verification_checkpoints
+                    .values()
+                    .any(|root| root == &allocation.root)
+            {
                 continue;
             }
             let Some(snapshot) = self.state.job(job).cloned() else {
@@ -840,7 +850,12 @@ impl Owner {
             state.phase = "saving".into();
             state.running = false;
         }
+        self.verification_checkpoints
+            .insert((job, generation), result.root);
         self.persist_then(move |owner,committed| {
+            // Release the exact queued checkpoint even if its job was replaced
+            // while storage waited. Stale acknowledgements cannot strand a root.
+            owner.verification_checkpoints.remove(&(job, generation));
             if owner.job_epochs.get(&job)!=Some(&generation)
                 || !owner.verification.get(&job).is_some_and(|state|state.generation==generation && state.phase=="saving") {return;}
             if !committed {

@@ -298,3 +298,251 @@ async fn same_root_verification_yields_to_resumed_job_after_publishing_progress(
     .await
     .expect("fixture owner drains its workers before the temporary payload root is removed");
 }
+
+#[tokio::test]
+async fn recovery_checkpoint_backpressures_the_next_same_root_verification() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut owner, _adapter, mut messages) = owner_fixture(&temp);
+    pump_idle(&mut owner, &mut messages).await;
+    let root = temp.path().join("payloads");
+    std::fs::create_dir_all(&root).unwrap();
+    for id in 1..=20 {
+        let allocation = owner
+            .artifacts
+            .allocate(id, &root, &root.join(format!("checkpoint-{id}")))
+            .unwrap();
+        owner.allocation_cache.insert(JobId(id), allocation);
+        owner.state.jobs.push(pending_job(id, FileId(id)));
+        owner.queue_verification(JobId(id));
+    }
+    let (started, started_rx) = oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    owner.io_then(
+        move || {
+            let _ = started.send(());
+            wait.recv().expect("release checkpoint persistence barrier");
+            Ok(())
+        },
+        |_, result| result.unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(5), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    owner.start_verifications();
+    let first = tokio::time::timeout(Duration::from_secs(5), messages.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        &first,
+        EngineMsg::VerificationFinished { job: JobId(1), .. }
+    ));
+    owner.on_msg(first);
+    assert_eq!(owner.verification[&JobId(1)].phase, "saving");
+    assert!(
+        owner.verification.contains_key(&JobId(1)),
+        "uncommitted verification must remain fenced"
+    );
+    // A periodic owner tick must not create another full queue checkpoint
+    // behind this storage root's still-unacknowledged recovery checkpoint.
+    owner.start_verifications();
+    let ran_ahead = owner.verification.values().any(|state| state.running);
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !owner.verification.is_empty() {
+            owner.on_msg(messages.recv().await.expect("recovery completion"));
+        }
+    })
+    .await
+    .expect("acknowledgements resume the bounded recovery backlog");
+    owner.drain_shutdown_results(&mut messages).await;
+    assert!(
+        !ran_ahead,
+        "the next same-root verifier ran before the checkpoint was durable"
+    );
+}
+
+#[tokio::test]
+async fn recovery_checkpoint_preserves_other_root_progress_and_releases_failed_saves() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let temp = tempfile::tempdir().unwrap();
+    let (mut owner, _adapter, mut messages) = owner_fixture(&temp);
+    pump_idle(&mut owner, &mut messages).await;
+    let allowed = Arc::new(AtomicBool::new(true));
+    let guard = allowed.clone();
+    owner.persist_guard = Some(Arc::new(move || guard.load(Ordering::SeqCst)));
+    let first_root = temp.path().join("first");
+    let second_root = temp.path().join("second");
+    for root in [&first_root, &second_root] {
+        std::fs::create_dir_all(root).unwrap();
+    }
+    for id in 1..=2 {
+        let allocation = owner
+            .artifacts
+            .allocate(id, &first_root, &first_root.join(format!("job-{id}")))
+            .unwrap();
+        owner.allocation_cache.insert(JobId(id), allocation);
+        owner.state.jobs.push(pending_job(id, FileId(id)));
+        owner.queue_verification(JobId(id));
+    }
+    let (started, started_rx) = oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    owner.io_then(
+        move || {
+            let _ = started.send(());
+            wait.recv().unwrap();
+            Ok(())
+        },
+        |_, result| result.unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(5), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    owner.start_verifications();
+    let first = tokio::time::timeout(Duration::from_secs(5), messages.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    owner.on_msg(first);
+    assert_eq!(owner.verification_checkpoints.len(), 1);
+    let allocation = owner
+        .artifacts
+        .allocate(3, &second_root, &second_root.join("job-3"))
+        .unwrap();
+    owner.allocation_cache.insert(JobId(3), allocation);
+    owner.state.jobs.push(pending_job(3, FileId(3)));
+    owner.queue_verification(JobId(3));
+    owner.start_verifications();
+    assert!(
+        !owner.verification[&JobId(2)].running,
+        "same-root verification waits for commit"
+    );
+    assert!(
+        owner.verification[&JobId(3)].running,
+        "another storage root remains independent"
+    );
+    let other = tokio::time::timeout(Duration::from_secs(5), messages.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        &other,
+        EngineMsg::VerificationFinished { job: JobId(3), .. }
+    ));
+    owner.on_msg(other);
+    assert_eq!(owner.verification_checkpoints.len(), 2);
+    let third_root = temp.path().join("third");
+    std::fs::create_dir_all(&third_root).unwrap();
+    let allocation = owner
+        .artifacts
+        .allocate(4, &third_root, &third_root.join("job-4"))
+        .unwrap();
+    owner.allocation_cache.insert(JobId(4), allocation);
+    owner.state.jobs.push(pending_job(4, FileId(4)));
+    owner.queue_verification(JobId(4));
+    owner.start_verifications();
+    assert!(
+        !owner.verification[&JobId(4)].running,
+        "completed checkpoints retain the global recovery budget too"
+    );
+    allowed.store(false, Ordering::SeqCst);
+    release.send(()).unwrap();
+    pump_idle(&mut owner, &mut messages).await;
+    assert!(
+        owner.verification_checkpoints.is_empty(),
+        "failed checkpoints release their exact root reservations"
+    );
+    assert_eq!(owner.verification[&JobId(1)].phase, "blocked");
+    assert_eq!(owner.verification[&JobId(3)].phase, "blocked");
+    assert!(
+        owner.persistence_fenced,
+        "a failed authority guard retains the existing persistence fence"
+    );
+    owner.start_verifications();
+    assert!(
+        owner.verification[&JobId(2)].running,
+        "the failed checkpoint no longer reserves this root"
+    );
+    assert!(
+        owner.verification[&JobId(4)].running,
+        "released capacity also admits the third storage root"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while owner.verification.values().any(|state| state.running) {
+            owner.on_msg(messages.recv().await.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        owner.verification[&JobId(2)].phase,
+        "blocked",
+        "released backpressure must not bypass a failed authority fence"
+    );
+    assert!(owner.verification_checkpoints.is_empty());
+    owner.drain_shutdown_results(&mut messages).await;
+}
+
+#[tokio::test]
+async fn stale_recovery_checkpoint_acknowledgement_releases_its_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut owner, _adapter, mut messages) = owner_fixture(&temp);
+    pump_idle(&mut owner, &mut messages).await;
+    let root = temp.path().join("payloads");
+    std::fs::create_dir_all(&root).unwrap();
+    let allocation = owner
+        .artifacts
+        .allocate(1, &root, &root.join("job-1"))
+        .unwrap();
+    owner.allocation_cache.insert(JobId(1), allocation);
+    owner.state.jobs.push(pending_job(1, FileId(1)));
+    owner.queue_verification(JobId(1));
+    let (started, started_rx) = oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    owner.io_then(
+        move || {
+            let _ = started.send(());
+            wait.recv().unwrap();
+            Ok(())
+        },
+        |_, result| result.unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(5), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    owner.start_verifications();
+    let first = tokio::time::timeout(Duration::from_secs(5), messages.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    owner.on_msg(first);
+    let old_generation = owner.job_epochs[&JobId(1)];
+    let new_generation = fresh_epoch();
+    owner.job_epochs.insert(JobId(1), new_generation);
+    owner.queue_verification(JobId(1));
+    owner.start_verifications();
+    assert!(
+        !owner.verification[&JobId(1)].running,
+        "replacement cannot run ahead of an older queued checkpoint"
+    );
+    release.send(()).unwrap();
+    pump_idle(&mut owner, &mut messages).await;
+    assert!(!owner
+        .verification_checkpoints
+        .contains_key(&(JobId(1), old_generation)));
+    assert_eq!(owner.verification[&JobId(1)].generation, new_generation);
+    owner.start_verifications();
+    assert!(owner.verification[&JobId(1)].running);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while owner.verification.contains_key(&JobId(1)) {
+            owner.on_msg(messages.recv().await.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    assert!(owner.verification_checkpoints.is_empty());
+    owner.drain_shutdown_results(&mut messages).await;
+}
