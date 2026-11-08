@@ -3,7 +3,7 @@
 **Status:** approved design, revised after three adversarial review rounds (r4),
 not built · **Supersedes:** curator `docs/plan-integration.md` §3 (contract),
 `docs/DOWNLOAD_LIFECYCLE_PROPOSAL.md` §4.1–4.2 (notification/acknowledgement),
-runner `docs/CURATOR_DELIVERY.md` (acknowledgement protocol), the "Durable job
+runner `docs/archive/CURATOR_DELIVERY.md` (acknowledgement protocol), the "Durable job
 control contract (v1)" section of curator `docs/integration.md` · **Decided:**
 2026-11-07 (Paul: rewrite the seam; keep the manifest; a post-processing
 failure is a failure unless the job itself is marked keep-on-failure) ·

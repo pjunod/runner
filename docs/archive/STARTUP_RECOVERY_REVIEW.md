@@ -1,10 +1,12 @@
 # Startup recovery defect — pending magnets hold the API offline
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [STARTUP_RECOVERY_BACKPRESSURE.md](../STARTUP_RECOVERY_BACKPRESSURE.md) and [STARTUP_VERIFICATION_PLAN.md](../STARTUP_VERIFICATION_PLAN.md).
+
 **Status:** root cause confirmed on `nuc3` 2026-09-25 · immediate service
 restored · review findings addressed in
 [PR #236](https://github.com/pjunod/runner/pull/236) · not yet deployed
 
-Companion to [DEPLOY.md](DEPLOY.md) (container operation) and
+Companion to [DEPLOY.md](../DEPLOY.md) (container operation) and
 [TORRENT_QUEUE_STATUS.md](TORRENT_QUEUE_STATUS.md) (torrent queue authority).
 This document records one startup failure, the proposed code change, and the
 checks a reviewer should require before deployment.
@@ -49,7 +51,7 @@ admissions remained durable for a later retry. No data loss was observed.
 
 ## Root cause — network recovery ran before the listener
 
-Before PR #236, [`run()`](../crates/nzbd/src/main.rs) awaited
+Before PR #236, [`run()`](../../crates/nzbd/src/main.rs) awaited
 `TorrentAdmissionService::recover()` before it reached
 `TcpListener::bind()`. That recovery method restored local descriptors,
 then walked `snapshot.pending_admissions` sequentially. For each magnet it
@@ -76,7 +78,7 @@ the same six minutes, with no fixed upper bound as pending jobs accumulate.
 ## Proposed fix — serve while remote sources retry
 
 PR #236 separates `recover_active()` from `recover_pending()` in
-[`torrent_admission.rs`](../crates/nzbd-api/src/torrent_admission.rs).
+[`torrent_admission.rs`](../../crates/nzbd-api/src/torrent_admission.rs).
 The daemon still restores saved local torrents before accepting requests.
 After binding the API listener it spawns one background pending-admission
 recovery task. Shutdown signals that task to cancel, waits up to 1 s, and

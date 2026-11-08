@@ -100,7 +100,7 @@ source owners**. Desired Keep is not confirmation that protection was applied;
 this pending state survives refresh and reconnect. An already absent source
 remains unavailable: requesting Keep cannot restore deleted bytes.
 
-[The parity status page](MOBILE_QUEUE_PARITY_STATUS.md) separates implementation
+[The parity status page](archive/MOBILE_QUEUE_PARITY_STATUS.md) separates implementation
 and test evidence from iOS/Android distribution evidence.
 
 ## Run it locally

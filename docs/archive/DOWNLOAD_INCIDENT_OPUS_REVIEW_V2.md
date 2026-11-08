@@ -1,5 +1,7 @@
 # Independent review v2 — DOWNLOAD_INCIDENT_REVIEW.md §13 + the in-progress patch
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: the "Download incident recovery" entry in [STATUS.md](../../STATUS.md); current behaviour in [ARCHITECTURE.md](../ARCHITECTURE.md).
+
 **Reviewer:** Claude (Cowork) · **Date:** 2026-10-01 ~22:40–23:00 UTC
 **Supersedes nothing in v1; corrects v1 where noted.** Production reads only.
 I also ran a 1 ms `link`/`mkdir` probe per mount, using dot-named files that I

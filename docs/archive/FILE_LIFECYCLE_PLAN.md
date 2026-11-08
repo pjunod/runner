@@ -1,5 +1,7 @@
 # File lifecycle — retained failures, orphan detection, and recovery
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [FILE_LIFECYCLE_OPERATIONS.md](../FILE_LIFECYCLE_OPERATIONS.md).
+
 **Status:** revised after agent and Opus review; full scope retained;
 implementation in progress; see [delivery status](FILE_LIFECYCLE_STATUS.md) ·
 **Written / reviewed:** 2026-09-25 ·
@@ -10,16 +12,16 @@ recovery handoff · **Existing directory cleanup:** completed by the user.
 Curator `0da1c755da44fdb0cd7bf615997016c8c096dc5c`. These are local source
 revisions, not proof of the deployed containers' revisions.
 
-Companion to [CONFIGURATION.md](CONFIGURATION.md) (failure policy),
-[ARCHITECTURE.md](ARCHITECTURE.md) (queue and post-processing), and
-[INTEGRATION.md](INTEGRATION.md) (Curator handoff). Read §§1–4 for the
+Companion to [CONFIGURATION.md](../CONFIGURATION.md) (failure policy),
+[ARCHITECTURE.md](../ARCHITECTURE.md) (queue and post-processing), and
+[INTEGRATION.md](../INTEGRATION.md) (Curator handoff). Read §§1–4 for the
 problem and decisions, §§5–10 for implementation contracts, and §§11–14
 for delivery and review. Re-verify source symbols before implementation.
 If an implementation changes ordinary download readiness, History cursor
 meaning, or cluster publication authority, review that change separately.
 
 This document is the approved design contract. The [delivery status](FILE_LIFECYCLE_STATUS.md)
-and [operations guide](FILE_LIFECYCLE_OPERATIONS.md) distinguish implemented
+and [operations guide](../FILE_LIFECYCLE_OPERATIONS.md) distinguish implemented
 behavior and verified results from remaining acceptance work. It does not request another cleanup of the user's files.
 The independent findings and their disposition are recorded in
 [FILE_LIFECYCLE_REVIEW.md](FILE_LIFECYCLE_REVIEW.md).
@@ -66,15 +68,15 @@ diagnosed and is not attributed to this defect.
 
 | Existing seam | Behavior and gap |
 |---|---|
-| [`PostSection`](../crates/nzbd-config/src/lib.rs) | `failure_action` supports `none`, `park`, and `delete`; default is `delete`. `failed_dir` defaults to `<main_dir>/failed` through daemon wiring |
-| [`dispose_failed`](../crates/nzbd-post/src/manager.rs) | Moves, keeps, or deletes a failed job's directory and reports the resulting path; there is no parked-payload retention worker |
-| [`handle_failed_job`](../crates/nzbd-post/src/manager.rs) | Persists failure finalization state and retries disposition; stable errors eventually leave files with an explanatory History note |
-| [`HistoryDb::prune`](../crates/nzbd-state/src/history.rs) | Trims records and their spooled NZBs; it does not remove the corresponding media payloads |
-| [`history_action`](../crates/nzbd-api/src/lib.rs) | `delete-files` currently attempts recursive deletion, then deletes the History record even when file removal reports false |
-| [`move_dir` / `copy_dir_all`](../crates/nzbd-post/src/manager.rs) | Uses a scratch directory for cross-filesystem moves; some synchronization errors are discarded. Recovery needs checked durability and operation-specific ownership |
-| [`storage_roots`](../crates/nzbd-config/src/lib.rs) | Lists writable roots for capacity monitoring; this is not evidence that every descendant belongs to Runner |
-| Curator [`ScanImportPath` / `QueueManualImport`](../../monarr/internal/app/acquisition/manualimport.go) | Supports preview and asynchronous imports, but not a Runner recovery manifest or durable cross-service receipt |
-| Curator [`StartImporters`](../../monarr/internal/app/acquisition/importers.go) | Already separates copying from the control loop and recovers interrupted manual imports; reuse this execution model |
+| [`PostSection`](../../crates/nzbd-config/src/lib.rs) | `failure_action` supports `none`, `park`, and `delete`; default is `delete`. `failed_dir` defaults to `<main_dir>/failed` through daemon wiring |
+| [`dispose_failed`](../../crates/nzbd-post/src/manager.rs) | Moves, keeps, or deletes a failed job's directory and reports the resulting path; there is no parked-payload retention worker |
+| [`handle_failed_job`](../../crates/nzbd-post/src/manager.rs) | Persists failure finalization state and retries disposition; stable errors eventually leave files with an explanatory History note |
+| [`HistoryDb::prune`](../../crates/nzbd-state/src/history.rs) | Trims records and their spooled NZBs; it does not remove the corresponding media payloads |
+| [`history_action`](../../crates/nzbd-api/src/lib.rs) | `delete-files` currently attempts recursive deletion, then deletes the History record even when file removal reports false |
+| [`move_dir` / `copy_dir_all`](../../crates/nzbd-post/src/manager.rs) | Uses a scratch directory for cross-filesystem moves; some synchronization errors are discarded. Recovery needs checked durability and operation-specific ownership |
+| [`storage_roots`](../../crates/nzbd-config/src/lib.rs) | Lists writable roots for capacity monitoring; this is not evidence that every descendant belongs to Runner |
+| Curator `ScanImportPath` / `QueueManualImport` (curator `internal/app/acquisition/manualimport.go`) | Supports preview and asynchronous imports, but not a Runner recovery manifest or durable cross-service receipt |
+| Curator `StartImporters` (curator `internal/app/acquisition/importers.go`) | Already separates copying from the control loop and recovers interrupted manual imports; reuse this execution model |
 
 The present system has job execution and historical reporting, but lacks a
 persistent lifecycle for bytes left behind after execution ends. A folder
@@ -149,7 +151,7 @@ Initial delivery covers all four features on **standalone Runner**. Cluster
 mode may expose read-only observations; automatic expiry, adoption,
 recovery, and new inventory-driven deletion are disabled there until they
 use the replicated authority and output-generation contract in
-[CLUSTERING_STATUS.md](CLUSTERING_STATUS.md). A local SQLite lock is not a
+[CLUSTERING_STATUS.md](../CLUSTERING_STATUS.md). A local SQLite lock is not a
 cluster fence. This release boundary requires reviewer acceptance (§14).
 
 Non-goals:
@@ -188,7 +190,7 @@ Non-goals:
    not use hardlinks that let consumers mutate retained source bytes.
 6. **Keep large work off requests and engine ticks.** Scans, hashing, media
    probes, and copies use bounded workers and cached results. The new view
-   must not recreate the failure in [HISTORY_LOADING_PLAN.md](HISTORY_LOADING_PLAN.md).
+   must not recreate the failure in [HISTORY_LOADING_PLAN.md](../HISTORY_LOADING_PLAN.md).
 7. **Ship cluster mutations only with cluster authority.** Standalone
    safety does not generalize to a stale worker on a shared volume.
 
@@ -601,8 +603,8 @@ not importable** until Curator probes it. Staging bytes is not import
 approval. Never rename a retained source to make discovery work.
 
 Curator owns content identification after publication, reusing
-[`probe.File`](../../monarr/internal/infra/probe/probe.go) and its native
-[`mediainfo`](../../monarr/internal/domain/mediainfo/mediainfo.go) readers.
+`probe.File` (curator `internal/infra/probe/probe.go`) and its native
+`mediainfo` (curator `internal/domain/mediainfo/mediainfo.go`) readers.
 The stock Curator image is distroless; `MONARR_FFPROBE` is an optional
 fallback, not a tool known to be installed. Keep native MKV/MP4 byte budgets
 and the existing 30-second optional external timeout; use one bounded
@@ -918,12 +920,12 @@ not log bearer credentials or raw authorization headers.
 ### 9.2 Curator contract additions
 
 Existing endpoints in
-[`acquisition_handlers.go`](../../monarr/internal/api/acquisition_handlers.go)
+`acquisition_handlers.go` (curator `internal/api/acquisition_handlers.go`)
 include `GET /import/scan`, `GET /import/default-path`, and
 `POST /import/manual`; their exact mounted API prefix is determined by
 Curator's router. Existing manual-import admission returns `202` with a
 download ID. Extend the typed API in
-[`openapi.yaml`](../../monarr/internal/api/openapi.yaml) and regenerate
+`openapi.yaml` (curator `internal/api/openapi.yaml`) and regenerate
 bindings; do not hand-edit generated Go types.
 
 Add a recovery-specific admission route, proposed `POST /import/recovery`,
@@ -956,7 +958,7 @@ as its default filter and **All tracked files** available. Each row shows:
   Delete, and Undo controls; disabled controls explain their blocker.
 
 Use the existing in-place rendering conventions in
-[`index.html`](../crates/nzbd-api/ui/index.html). Polls must preserve expanded
+[`index.html`](../../crates/nzbd-api/ui/index.html). Polls must preserve expanded
 rows, selection, filters, and focused controls. Batch actions preview exact
 counts and sizes; stale selections conflict rather than silently broadening
 the action. Do not require a generic confirmation popup for each action;
@@ -1049,9 +1051,9 @@ calls an internal `.tmp` a PP move scratch directory without evidence.
 ### 11.2 F1 — establish inventory and allocation ownership
 
 **Work:** Add the store/schema and typed model in
-[`nzbd-state`](../crates/nzbd-state/src/), with a dedicated module such as
+[`nzbd-state`](../../crates/nzbd-state/src), with a dedicated module such as
 `artifacts.rs`. Wire lifecycle service startup in
-[`main.rs`](../crates/nzbd/src/main.rs). Audit engine allocation/admission,
+[`main.rs`](../../crates/nzbd/src/main.rs). Audit engine allocation/admission,
 writer startup, PP moves/failures, and queue/History deletion. Add UUID
 identity, external sidecars, operation journal, startup reconciliation, and protected
 root resolution. Keep new retention actions disabled.
@@ -1120,10 +1122,10 @@ all recovery scratch and published copies until explicitly selected.
 ### 11.6 F5 — Curator claim, import, and receipt
 
 **Work:** In Curator, extend
-[`internal/adapters/nzbd`](../../monarr/internal/adapters/nzbd/),
-[`manualimport.go`](../../monarr/internal/app/acquisition/manualimport.go),
-[`importers.go`](../../monarr/internal/app/acquisition/importers.go),
-[`internal/infra/sqlite`](../../monarr/internal/infra/sqlite/), and Activity.
+`internal/adapters/nzbd` (curator `internal/adapters/nzbd`),
+`manualimport.go` (curator `internal/app/acquisition/manualimport.go`),
+`importers.go` (curator `internal/app/acquisition/importers.go`),
+`internal/infra/sqlite` (curator `internal/infra/sqlite`), and Activity.
 Add the recovery admission route, existing native media probe integration,
 target preview, path mapping check,
 per-file progress, durable idempotency/outbox, consumer credentials, and
@@ -1228,9 +1230,9 @@ a full offline week earns no credit and extends the displayed estimate.
    remain review-held. Observe a virtual-clock or disposable short-policy
    expiry; do not shorten retention on real files to test it.
 5. **Publish evidence and update docs.** Add the shipped contract to
-   [CONFIGURATION.md](CONFIGURATION.md), [USAGE.md](USAGE.md),
-   [INTEGRATION.md](INTEGRATION.md), [DEPLOY.md](DEPLOY.md), and
-   [STATUS.md](../STATUS.md), including supported platforms and cluster limits.
+   [CONFIGURATION.md](../CONFIGURATION.md), [USAGE.md](../USAGE.md),
+   [INTEGRATION.md](../INTEGRATION.md), [DEPLOY.md](../DEPLOY.md), and
+   [STATUS.md](../../STATUS.md), including supported platforms and cluster limits.
 
 Proposed bounded metrics: artifact count and allocated bytes by
 classification; scan age/completeness; cleanup attempts/errors; oldest

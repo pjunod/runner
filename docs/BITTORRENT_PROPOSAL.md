@@ -1317,7 +1317,7 @@ unleased delegation if its target becomes held. `/api/v1/cluster` publishes the 
 for each node, while the ordinary status response describes the node serving
 that engine snapshot.
 
-[`REGRAB_LOOP_PLAN.md`](REGRAB_LOOP_PLAN.md) F1–F3 landed before this expansion.
+[`REGRAB_LOOP_PLAN.md`](archive/REGRAB_LOOP_PLAN.md) F1–F3 landed before this expansion.
 Observed ENOSPC/EDQUOT from existing writers and post-processing still latches
 the same immediate guard even when a mounted filesystem's forecast lies. The
 dormant torrent adapter does not yet report its `StorageFull` signal into that
@@ -2329,9 +2329,9 @@ metainfo/magnet/URL admission · durable descriptor before start · handle map �
 stats coalescing · readiness · pause/resume/delete · seed policy · download and
 upload limits · disk guard · watch directory · terminal history.
 
-**Prerequisites already met:** [`REGRAB_LOOP_PLAN.md`](REGRAB_LOOP_PLAN.md)
+**Prerequisites already met:** [`REGRAB_LOOP_PLAN.md`](archive/REGRAB_LOOP_PLAN.md)
 F1–F3 landed on 2026-07-31, and
-[`DEFECT_HISTORY_DELETE.md`](DEFECT_HISTORY_DELETE.md) is resolved with shared
+[`DEFECT_HISTORY_DELETE.md`](archive/DEFECT_HISTORY_DELETE.md) is resolved with shared
 JSONL tombstones. M2 may rely on the enforcing disk guard and terminal-history
 delete semantics; neither is still a reason to start production networking.
 The complete M0 matrix and independent review of the maintained engine are

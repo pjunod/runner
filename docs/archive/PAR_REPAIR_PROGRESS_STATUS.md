@@ -1,8 +1,10 @@
 # PAR repair status — design, build, and qualification
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [PAR_REPAIR_PROGRESS_PLAN.md](../PAR_REPAIR_PROGRESS_PLAN.md).
+
 **Updated:** 2026-10-06 · **Status:** CI failure fixed; targeted qualification passed
 
-Companion to [PAR_REPAIR_PROGRESS_PLAN.md](PAR_REPAIR_PROGRESS_PLAN.md), which
+Companion to [PAR_REPAIR_PROGRESS_PLAN.md](../PAR_REPAIR_PROGRESS_PLAN.md), which
 owns the implementation contract. The originating chat owns design; GPT-6.1
 Sol builds in its isolated clone. This page records evidence, not intentions
 presented as completed work.

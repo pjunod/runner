@@ -1,10 +1,12 @@
 # Startup runtime recovery — implementation and merge status
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [STARTUP_RECOVERY_BACKPRESSURE.md](../STARTUP_RECOVERY_BACKPRESSURE.md) and [STARTUP_VERIFICATION_PLAN.md](../STARTUP_VERIFICATION_PLAN.md).
+
 **Owner:** Codex (`codex/startup-runtime-recovery`) · **Updated:** 2026-11-01
 **State:** implementation and Astra corrections complete · **Live validation/merge status and owner:** [PR #262](https://github.com/pjunod/runner/pull/262)
 **Base:** `368b500` (fresh remote clone; includes held-job recovery updates)
 
-Companion to [STARTUP_VERIFICATION_PLAN.md](STARTUP_VERIFICATION_PLAN.md)
+Companion to [STARTUP_VERIFICATION_PLAN.md](../STARTUP_VERIFICATION_PLAN.md)
 (reviewed design) and [STARTUP_VERIFICATION_REVIEW.md](STARTUP_VERIFICATION_REVIEW.md)
 (review history). This is the implementation ledger. The linked PR body is the live status page: Codex updates its check results, remaining work and merge state without creating source-only commits that restart passing CI lanes.
 

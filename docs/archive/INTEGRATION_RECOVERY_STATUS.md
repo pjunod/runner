@@ -1,12 +1,14 @@
 # Integration recovery — custody, admission, and publication
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [PIPELINE_CONTRACT.md](../PIPELINE_CONTRACT.md) (custody and acknowledgement are gone) and [INTEGRATION.md](../INTEGRATION.md).
+
 **Status:** implemented; review, qualification and rollout evidence tracked in
 [PR #272](https://github.com/pjunod/runner/pull/272) ·
 **Written:** 2026-11-03 · **Updated:** 2026-11-04 (America/New_York) · **Branch:**
 `codex/baseline-integration-recovery`
 
 Companion to [publication performance](PUBLICATION_PERFORMANCE_PLAN.md) and
-[deployment](DEPLOY.md). This record owns the remaining integration failures
+[deployment](../DEPLOY.md). This record owns the remaining integration failures
 and the checks required before deploying the publication improvements.
 
 ## Failures — distinguish fixture ordering from application behavior
@@ -113,7 +115,7 @@ export. Terminal retirement requires a checked row matching durable source,
 control, status and stamp, its exact inspected revision, and the existing
 selected-Delivery guard. Whole-queue re-verification during authority projection
 replacement remains a separate optimization; this correction reuses no proof.
-See the [independent I/O audit](IO_EFFICIENCY_AUDIT.md) for remaining cost
+See the [independent I/O audit](../IO_EFFICIENCY_AUDIT.md) for remaining cost
 investigations; those follow-ups are outside this qualification fix.
 
 ## Custody — FINALDIR reports output without transferring authority

@@ -1,12 +1,14 @@
 # The re-grab loop — diagnosis and fix plan
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [PIPELINE_CONTRACT.md](../PIPELINE_CONTRACT.md) §2.2 (typed reasons and `blames_release` decide the re-grab).
+
 **Status:** nzbd F1–F3 complete; monarr and operator work remains ·
 **Diagnosed:** live on nuc3 2026-07-31 against build `0.2.0+unknown`
 (built 2026-07-29 18:49 UTC, includes `2453665`) · **Written:** 2026-07-31 ·
 **Updated:** 2026-08-05 · **Spans:** nzbd (§6) · monarr (§7) · the nuc3 deploy
 (§8)
 
-Companion to [ARCHITECTURE.md](ARCHITECTURE.md) (how post-processing and the
+Companion to [ARCHITECTURE.md](../ARCHITECTURE.md) (how post-processing and the
 owner loop are built) and sibling of
 [DEFECT_HISTORY_DELETE.md](DEFECT_HISTORY_DELETE.md) — this is *why the
 completed dir filled with a terabyte of duplicate downloads, and the fixes,

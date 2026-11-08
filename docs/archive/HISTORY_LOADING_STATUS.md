@@ -1,9 +1,11 @@
 # History loading implementation status
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [HISTORY_LOADING_PLAN.md](../HISTORY_LOADING_PLAN.md).
+
 **Status:** first release merged; M6 implemented and reviewed, final CI in PR #238 ·
 **Updated:** 2026-09-25
 
-The [reviewed plan](HISTORY_LOADING_PLAN.md) records the diagnosis, nuc3
+The [reviewed plan](../HISTORY_LOADING_PLAN.md) records the diagnosis, nuc3
 measurements, and recovery contracts. This page tracks delivery of its first
 release. Work uses an independent clone at
 `/private/tmp/nzbd-history-loading`, branch `codex/history-loading`, based on
@@ -38,7 +40,7 @@ not HTTP latency or post-fix production evidence. The nuc3 baseline remains
 
 - Performance fixes are always active. Dev settings can pause or enable
   synchronization immediately; readiness never blocks enablement.
-- M6 is implemented and reviewed in [HISTORY_INCREMENTAL.md](HISTORY_INCREMENTAL.md),
+- M6 is implemented and reviewed in [HISTORY_INCREMENTAL.md](../HISTORY_INCREMENTAL.md),
   which tracks its implementation, equivalence review, final tests, and merge.
 - Retain the original index during relocation. Rejecting a stale destination
   or missing active index protects cursor state; it is not a feature gate.

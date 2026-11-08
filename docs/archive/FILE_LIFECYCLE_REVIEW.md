@@ -1,5 +1,7 @@
 # File lifecycle review — adversarial findings and required corrections
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [FILE_LIFECYCLE_OPERATIONS.md](../FILE_LIFECYCLE_OPERATIONS.md).
+
 **Status:** agent review plus Opus follow-up; full scope retained;
 implementation unstarted ·
 **Reviewed:** 2026-09-25 · **Method:** three independent agent reviews,
@@ -117,9 +119,9 @@ The recovery then applies its old replacement decision and overwrites or
 removes the newly imported library copy.
 
 **Source evidence:** Curator's
-[`runImportTracked`](../../monarr/internal/app/acquisition/importers.go)
+`runImportTracked` (curator `internal/app/acquisition/importers.go`)
 locks by download ID, not library target. Episode placement in
-[`import.go`](../../monarr/internal/app/acquisition/import.go) can bypass
+`import.go` (curator `internal/app/acquisition/import.go`) can bypass
 ordinary non-upgrade rejection for manual imports, replace an existing
 destination, and remove superseded files. A reservation on the recovery ID
 does not serialize a different download for the same target.
@@ -147,7 +149,7 @@ the destination or classify it as an unresolved quality skip, violating the
 plan's promise to resume only unfinished work.
 
 **Source evidence:** Curator's
-[`placeContext`](../../monarr/internal/app/acquisition/import.go) returns
+`placeContext` (curator `internal/app/acquisition/import.go`) returns
 after rename without the required file/directory synchronization protocol.
 Episode import separately removes old files, upserts the new file, and
 updates episode links. An outbox added only at the end leaves those earlier
@@ -177,9 +179,9 @@ Curator stops selecting the payload for cleanup retries, recreating the
 unnoticed retained-file problem.
 
 **Source evidence:** Curator's native
-[`Client.Remove`](../../monarr/internal/adapters/nzbd/nzbd.go) treats any
+`Client.Remove` (curator `internal/adapters/nzbd/nzbd.go`) treats any
 successful HTTP response as completion. Its
-[`removePayload`](../../monarr/internal/app/acquisition/cleanup.go) then
+`removePayload` (curator `internal/app/acquisition/cleanup.go`) then
 calls `MarkPayloadRemoved` and logs reclaimed bytes. Updating only Runner's
 web/mobile callers would not fix this consumer.
 
@@ -207,7 +209,7 @@ documented rollback cannot start the service. A saved-config mirror can
 reintroduce the incompatible TOML even after editing the primary file.
 
 **Source evidence:** Runner's
-[`Config`](../crates/nzbd-config/src/lib.rs) uses
+[`Config`](../../crates/nzbd-config/src/lib.rs) uses
 `#[serde(deny_unknown_fields)]`. Unknown sections are rejected regardless of
 their `mode` value.
 
@@ -288,10 +290,10 @@ clock-shift fixtures; these tests have not yet been implemented.
 ### 5.3 Additional verified gap — Curator bypasses deletion refusal on disk
 
 Our earlier R5 correction was incomplete. Checking only
-[`Client.do` / `Remove`](../../monarr/internal/adapters/nzbd/nzbd.go) showed
+`Client.do` / `Remove` (curator `internal/adapters/nzbd/nzbd.go`) showed
 that `503` becomes an error, but did not establish end-to-end retry safety.
 Reading the full
-[`cleanup.go`](../../monarr/internal/app/acquisition/cleanup.go) now shows:
+`cleanup.go` (curator `internal/app/acquisition/cleanup.go`) now shows:
 
 ```text
 Runner returns pending/refused/error

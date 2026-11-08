@@ -12,14 +12,10 @@ throughput, direct-to-disk writing, and drop-in compatibility with the
 Sonarr/Radarr ecosystem and NZBGet's post-processing script protocol.
 Optionally runs as a **multi-node cluster** over a shared work volume.
 
-Follow [file lifecycle progress](docs/FILE_LIFECYCLE_STATUS.md) for the
-[ownership and recovery plan](docs/FILE_LIFECYCLE_PLAN.md) and its
-[design review](docs/FILE_LIFECYCLE_REVIEW.md).
 See [file lifecycle operations](docs/FILE_LIFECYCLE_OPERATIONS.md) for retention,
-recovery mounts, cancellation and backup/restore.
-The draft [Curator delivery protocol](docs/CURATOR_DELIVERY.md) describes the
-restart-safe ready manifest and independent acceptance receipt; it is not yet
-validated for deployment.
+recovery mounts, cancellation and backup/restore, and
+[INTEGRATION.md](docs/INTEGRATION.md) for the seam with curator and cinema
+(pipeline contract v2).
 
 ## Highlights
 
@@ -121,48 +117,20 @@ NZBGet configuration and prints a mapping report.
 
 ## Documentation
 
-[PAR repair build status](docs/PAR_REPAIR_PROGRESS_STATUS.md) tracks the storage,
-workspace retirement, repair, and qualification work specified by the
-[repair plan](docs/PAR_REPAIR_PROGRESS_PLAN.md).
+Every document is indexed in [docs/README.md](docs/README.md); the ones most
+people need:
 
 | Doc | What it covers |
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | Release binaries, Docker, Homebrew, building from source, musl static builds |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | The complete annotated `nzbd.toml` reference |
-| [docs/STARTUP_RECOVERY_BACKPRESSURE.md](docs/STARTUP_RECOVERY_BACKPRESSURE.md) | Slow recovery, zero-byte verification, false corruption holds, and journal admission backpressure |
-| [docs/URL_FETCH_RECOVERY.md](docs/URL_FETCH_RECOVERY.md) | Stuck URL acquisitions: lifecycle root cause, Fable review disposition, and engine-owned recovery |
-| [docs/DOWNLOAD_SPEED_ROOT_CAUSE_PLAN.md](docs/DOWNLOAD_SPEED_ROOT_CAUSE_PLAN.md) | Active download regression: measured inventory scans, proposed indexes, and validation gates for Fable review |
-| [docs/PUBLICATION_PERFORMANCE_PLAN.md](docs/PUBLICATION_PERFORMANCE_PLAN.md) | Slow rename/publication root causes, integrity-preserving fixes, and qualification before deployment |
-| [docs/INTEGRATION_RECOVERY_STATUS.md](docs/INTEGRATION_RECOVERY_STATUS.md) | Baseline integration repairs, script-output custody, and the deployment qualification record |
-| [docs/IO_EFFICIENCY_AUDIT.md](docs/IO_EFFICIENCY_AUDIT.md) | Independent I/O audit, fixed bottlenecks, and ranked follow-ups with integrity boundaries |
-| [docs/RENAME_PERFORMANCE_PLAN.md](docs/RENAME_PERFORMANCE_PLAN.md) | Reduce PAR naming reads with producer evidence while preserving verified commits |
 | [docs/USAGE.md](docs/USAGE.md) | CLI, web UI, connecting the *arr apps, RSS feeds + filter language, extension scripts, deobfuscation |
-| [docs/MOBILE.md](docs/MOBILE.md) | Building the iPhone/iPad/Android app, connecting it to runner, and its exact control/security boundaries |
-| [docs/MOBILE_QUEUE_PARITY_PLAN.md](docs/MOBILE_QUEUE_PARITY_PLAN.md) | Reviewed mobile torrent grouping and controls implementation plan |
-| [docs/MOBILE_QUEUE_PARITY_REVIEW.md](docs/MOBILE_QUEUE_PARITY_REVIEW.md) | Fable's source review and required corrections |
-| [docs/MOBILE_QUEUE_PARITY_STATUS.md](docs/MOBILE_QUEUE_PARITY_STATUS.md) | Implementation, review, validation, and delivery progress |
-| [docs/MOBILE_REVIEW.md](docs/MOBILE_REVIEW.md) | Independent review of the mobile app (2026-08): code, performance, UI, release readiness, and the Google TV / Apple TV gap |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | systemd, Docker Compose, Kubernetes, multi-node cluster deployment |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design: the whole system, phase by phase |
-| [docs/BITTORRENT_PROPOSAL.md](docs/BITTORRENT_PROPOSAL.md) | First-class BitTorrent backend: engine choice, queue/storage contracts, *arr compatibility, security, rollout, and review decisions |
-| [docs/BITTORRENT_M0_REPORT.md](docs/BITTORRENT_M0_REPORT.md) | BitTorrent engine spike: passing data-path evidence, measurements, and the API gaps blocking daemon integration |
-| [docs/BITTORRENT_GATE9_REVIEW.md](docs/BITTORRENT_GATE9_REVIEW.md) | Reviewer decision brief for the BitTorrent resource, dependency, license, and three constrained advisory exceptions |
-| [docs/BITTORRENT_RELEASE_REVIEW.md](docs/BITTORRENT_RELEASE_REVIEW.md) | Pre-release operations review: current no-go, public traffic, ports, paths, seeding, deletion, evidence, and sign-off conditions |
-| [docs/BITTORRENT_M1B_REPORT.md](docs/BITTORRENT_M1B_REPORT.md) | Dormant protocol-neutral queue/backend seam: schema 3, shared scheduling, coalesced progress, and the production-networking guard |
-| [docs/INTEGRATION.md](docs/INTEGRATION.md) | Every seam with monarr and plurx: what each does, where you watch it, and the command that proves it |
-| [docs/INTEGRATION_PLAN.md](docs/INTEGRATION_PLAN.md) | The event/cursor contract consumers build against, and how it was built |
-| [docs/DEFECT_HISTORY_DELETE.md](docs/DEFECT_HISTORY_DELETE.md) | Resolved defect: why history rows resurrected, why forget now means everywhere, and how portable tombstones converge |
-| [docs/STARTUP_RECOVERY_REVIEW.md](docs/STARTUP_RECOVERY_REVIEW.md) | Review of the 2026-09-25 startup delay: pending magnet retries held the API offline, plus fix and rollout checks |
-| [docs/STARTUP_VERIFICATION_STATUS.md](docs/STARTUP_VERIFICATION_STATUS.md) | Owner, implementation progress, validation and merge status for startup runtime recovery |
-| [docs/STARTUP_VERIFICATION_PLAN.md](docs/STARTUP_VERIFICATION_PLAN.md) | Startup incident evidence and reviewed runtime recovery contract |
-| [docs/STARTUP_VERIFICATION_REVIEW.md](docs/STARTUP_VERIFICATION_REVIEW.md) | Astra and Opus review findings and disposition |
-| [docs/HISTORY_LOADING_PLAN.md](docs/HISTORY_LOADING_PLAN.md) | History loading: measured root cause, implemented first release, operator controls, and remaining deployment validation |
-| [docs/HISTORY_LOADING_STATUS.md](docs/HISTORY_LOADING_STATUS.md) | History performance delivery status, review, final checks, and merge evidence |
-| [docs/HISTORY_INCREMENTAL.md](docs/HISTORY_INCREMENTAL.md) | Incremental history ingestion: delivery status, merge equivalence, recovery, and resource checks |
+| [docs/MOBILE.md](docs/MOBILE.md) | Building the iPhone/iPad/Android app, connecting it to runner, and its exact control/security boundaries |
+| [docs/INTEGRATION.md](docs/INTEGRATION.md) | The seam with curator and cinema: job API, events, history cursor, publications, disposal |
+| [docs/FILE_LIFECYCLE_OPERATIONS.md](docs/FILE_LIFECYCLE_OPERATIONS.md) | What happens to payload bytes: retention, parking, recovery |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design: the whole system, phase by phase, and the ADR summary |
 | [docs/CLUSTERING.md](docs/CLUSTERING.md) | Cluster design (ADR-13…16), failure matrix, operations |
-| [docs/CLUSTERING_COMPLETION_PLAN.md](docs/CLUSTERING_COMPLETION_PLAN.md) | Current plurx comparison, recommended authority changes, and the finite C3 implementation/CI plan |
-| [docs/CLUSTERING_STATUS.md](docs/CLUSTERING_STATUS.md) | Cluster completion progress, review, validation, and remaining external evidence |
-| [docs/TORRENT_QUEUE_STATUS.md](docs/TORRENT_QUEUE_STATUS.md) | Torrent queue lifecycle, review, validation, and merge progress |
 | [STATUS.md](STATUS.md) | What's done, what's next, with commit evidence |
 
 Deployable examples live under [`examples/`](examples/):

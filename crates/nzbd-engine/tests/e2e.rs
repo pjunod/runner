@@ -2258,7 +2258,7 @@ async fn public_resume_releases_allocation_and_identity_holds() {
         )
         .await
         .unwrap());
-    // An operator resume is always an exit (docs/HELD_JOBS_PLAN.md §4.6).
+    // An operator resume is always an exit (docs/archive/HELD_JOBS_PLAN.md §4.6).
     assert!(engine.resume_job(job).await.unwrap());
     assert!(!engine.export_ready(job).await.unwrap().unwrap().held());
     engine.shutdown().await;

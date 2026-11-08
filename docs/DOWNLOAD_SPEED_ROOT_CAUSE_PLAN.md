@@ -8,7 +8,7 @@ remains pending and production configuration is unchanged.
 `codex/download-inventory-performance`.
 
 Companion to [the I/O audit](IO_EFFICIENCY_AUDIT.md) and
-[publication performance](PUBLICATION_PERFORMANCE_PLAN.md). This plan addresses
+[publication performance](archive/PUBLICATION_PERFORMANCE_PLAN.md). This plan addresses
 slow active Usenet downloads on nuc3. Review the evidence and scope before
 implementing the milestones. If an optimization requires weakening durability,
 identity, generation, retention or deletion checks, revise this plan first.

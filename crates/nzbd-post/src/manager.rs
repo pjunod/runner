@@ -36,7 +36,7 @@ pub use nzbd_types::PP_DONE_PARAM;
 /// every *other* terminal failure's directory sitting in the category
 /// tree an importer watches, forever. Nothing ever removed them: ~523 GB
 /// of known-bad downloads in one field report
-/// (docs/REGRAB_LOOP_PLAN.md D2).
+/// (docs/archive/REGRAB_LOOP_PLAN.md D2).
 ///
 /// `Delete` is the default. The bytes are known-bad by definition, and
 /// the job's NZB is parked with its history entry, so `requeue` fetches

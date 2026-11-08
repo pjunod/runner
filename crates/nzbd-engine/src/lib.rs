@@ -723,7 +723,7 @@ impl Engine {
         };
 
         // Automatic hold recovery: one task, off the owner loop, for every
-        // policy that releases without a person (docs/HELD_JOBS_PLAN.md §4.5).
+        // policy that releases without a person (docs/archive/HELD_JOBS_PLAN.md §4.5).
         handle
             .tracker
             .spawn(hold_recovery::run(handle.clone(), handle.cancel.clone()));

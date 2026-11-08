@@ -5,7 +5,7 @@
 integration recovery candidate. Final qualification and rollout evidence is tracked
 in [PR #272](https://github.com/pjunod/runner/pull/272).
 
-Companion to [PUBLICATION_PERFORMANCE_PLAN.md](PUBLICATION_PERFORMANCE_PLAN.md)
+Companion to [PUBLICATION_PERFORMANCE_PLAN.md](archive/PUBLICATION_PERFORMANCE_PLAN.md)
 (the completed-folder root cause and implementation contract). This document
 preserves the independent audit of adjacent code. Use the fixed-work table to
 avoid rediscovering work already done, then choose follow-ups by measured cost.

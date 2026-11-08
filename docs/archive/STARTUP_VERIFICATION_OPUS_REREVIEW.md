@@ -1,8 +1,10 @@
 # Re-review: nzbd startup availability and runtime verification
 
+> **Archived 2026-11-08 (pipeline contract v2 M6).** Historical record; current: [STARTUP_RECOVERY_BACKPRESSURE.md](../STARTUP_RECOVERY_BACKPRESSURE.md) and [STARTUP_VERIFICATION_PLAN.md](../STARTUP_VERIFICATION_PLAN.md).
+
 **Status:** independent re-review preserved; disposition in the companion record · **Received:** 2026-11-01
 
-Companion to [STARTUP_VERIFICATION_PLAN.md](STARTUP_VERIFICATION_PLAN.md)
+Companion to [STARTUP_VERIFICATION_PLAN.md](../STARTUP_VERIFICATION_PLAN.md)
 (proposal) and [STARTUP_VERIFICATION_REVIEW.md](STARTUP_VERIFICATION_REVIEW.md)
 (findings and disposition). The user supplied this Opus re-review; its
 body is preserved verbatim. Source-level findings are not runtime test
