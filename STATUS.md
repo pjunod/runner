@@ -4,7 +4,7 @@
 
 **Merge only after deploy confirmation.** Paul confirms that every node runs
 curator M2 and runner **0.5.0 (M6a)** — not merely M1a/M3 — before this
-merges. **Status:** draft PR (#PR) on `claude/pipeline-v2-m6b-runner`
+merges. **Status:** draft PR [#297](https://github.com/pjunod/runner/pull/297) on `claude/pipeline-v2-m6b-runner`
 (runner 0.6.0), stacked on M6a (base `claude/pipeline-v2-m6a-runner`). Not
 reviewed, not merged, not deployed.
 
