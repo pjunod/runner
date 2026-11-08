@@ -2390,9 +2390,7 @@ async fn openapi() -> Response {
                 "summary": "Read-only reconciliation feed of publications (contract v2 §2.5): immutable rows in sequence order — job, transfer (requestToken), publicationPath, publicationGeneration, manifestDigest, readyAt, kind completed|salvage, and the manifest body (files, manifest). Curator reads it on the poll to catch a completed or publication_ready it missed",
                 "parameters": [
                     {"name": "after", "in": "query", "description": "Cursor: rows with sequence > N (nextCursor of the previous page)"},
-                    {"name": "limit", "in": "query", "description": "1..=100, default 50"},
-                    {"name": "includeAccepted", "in": "query", "deprecated": true,
-                     "description": "Accepted and ignored for one release: there is no acceptance, every row is returned"}
+                    {"name": "limit", "in": "query", "description": "1..=100, default 50"}
                 ] } },
             "/api/v1/deliveries/{id}/accept": { "post": { "summary": "Removed (pipeline contract v2 §2.5): answers 410 Gone", "deprecated": true } },
             "/api/v1/jobs": {
