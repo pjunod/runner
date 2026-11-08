@@ -416,10 +416,14 @@ impl Inventory {
         Ok(())
     }
 
-    /// The disposal gate (contract §2.6): `Some(terminal)` only when the
-    /// job has a terminal record, its event has been emitted and its salvage
-    /// obligation is no longer pending.
+    /// The disposal gate (contract §2.5–2.6): `Some(terminal)` only when the
+    /// job has a terminal record, its event has been emitted, its salvage
+    /// obligation is no longer pending and no publication move of the job is
+    /// still open (reconciliation has not yet finished or unwound it).
     pub fn disposal_allowed(&self, job: u32) -> Result<Option<JobTerminal>> {
+        if self.open_intent_for_job(job)? {
+            return Ok(None);
+        }
         Ok(self
             .terminal(job)?
             .filter(|t| t.emitted && t.salvage != SalvageState::Pending))

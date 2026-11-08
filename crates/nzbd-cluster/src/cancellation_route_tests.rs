@@ -375,7 +375,7 @@ async fn explicit_delete_waits_remote_join_before_owner_seal_and_physical_cleanu
     }
     assert!(
         control
-            .cluster_discovery_page(0, 10, true)
+            .cluster_discovery_page(0, 10)
             .await
             .unwrap()
             .0

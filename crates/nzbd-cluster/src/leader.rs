@@ -2925,7 +2925,7 @@ async fn ensure_cluster_delivery(
         .iter()
         .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
     let delivery:nzbd_state::artifacts::Delivery=serde_json::from_value(serde_json::json!({
-        "protocolVersion":1,"sequence":0,"status":"ready","deliveryId":id,"publicationGeneration":result_id,
+        "protocolVersion":1,"sequence":0,"deliveryId":id,"publicationGeneration":result_id,
         "artifactId":format!("cluster-publication:{result_id}"),"sourceArtifactId":source.as_ref().map(|source|source.artifact.as_str()).unwrap_or(""),
         "sourceGeneration":source.as_ref().map(|source|source.generation.as_str()).unwrap_or(""),"jobId":job.id.0,
         "runnerInstanceId":control.delivery_instance().await?,
@@ -2935,7 +2935,6 @@ async fn ensure_cluster_delivery(
         "failureCause":job.params.iter().find(|(key,_)|key=="Failure:Reason"||key=="Failure:Files").map(|(_,value)|value),
         "publicationPath":final_path.to_string_lossy(),"manifestDigest":format!("{:x}",Sha256::digest(canonical)),
         "files":files,"fileOutcomes":manifest.file_outcomes,"readyAt":accepted_at_ms/1000,
-        "acceptedAt":null,"consumerReceiptId":null,
         "runnerStages":{"nodeId":"unrecorded","clockDomain":"unrecorded","spans":sealed_job.stages.iter().take(128).collect::<Vec<_>>()},
         "lifecycleTiming":nzbd_engine::frozen_lifecycle_timing(&sealed_job),
         "sourceCleanup":{"status":"pending","error":null,"attempts":0,"nextRetryAt":null,"blockedSince":null,"warning":null}

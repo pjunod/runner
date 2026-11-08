@@ -1420,6 +1420,27 @@ fn salvage_failed_delivery(
     failure_cause: &str,
     archive_assessment: &EarlyArchiveAssessment,
 ) -> Result<Option<FailedSalvage>, String> {
+    // Contract §2.5: a salvage move a crash left open is finished or unwound
+    // first; one that committed is completed from its journal, never
+    // selected again from what is now the publication.
+    inventory
+        .reconcile_job_intents(job.id.0)
+        .map_err(|error| error.to_string())?;
+    if let Some(moved) = inventory
+        .committed_intent_publication(job.id.0)
+        .map_err(|error| error.to_string())?
+    {
+        return finish_salvage_receipt(
+            inventory,
+            job,
+            completed_root,
+            moved,
+            terminal_outcome,
+            failure_stage,
+            failure_cause,
+        )
+        .map(Some);
+    }
     let source = inventory
         .refresh_for_delivery(job.id.0)
         .map_err(|error| error.to_string())?;
@@ -1464,20 +1485,62 @@ fn salvage_failed_delivery(
     }
     std::fs::create_dir_all(completed_root).map_err(|error| error.to_string())?;
     let name = nzbd_engine::queue::sanitize_name(&job.name);
-    let target = completed_root.join(format!("{name}.runner-{}", source.generation));
+    let target = completed_root.join(format!(
+        "{name}.job-{}.runner-{}",
+        job.id.0, source.generation
+    ));
     let delivery_lifecycle = job.delivery_lifecycle;
-    let moved = if delivery_lifecycle {
-        inventory.publish_selected_for_delivery_checked(
+    let transfer = job
+        .params
+        .iter()
+        .find(|(key, _)| key == "monarr-transfer")
+        .map(|(_, value)| value.as_str());
+    let moved = inventory
+        .publish_selected_with_transfer(
             job.id.0,
             &target,
             selected,
             outcomes,
+            transfer,
+            delivery_lifecycle,
             &|| Ok(()),
         )
-    } else {
-        inventory.publish_selected_checked(job.id.0, &target, selected, outcomes, &|| Ok(()))
+        .map_err(|error| error.to_string())?;
+    finish_salvage_receipt(
+        inventory,
+        job,
+        completed_root,
+        moved,
+        terminal_outcome,
+        failure_stage,
+        failure_cause,
+    )
+    .map(Some)
+}
+
+/// The receipt half of a salvage publication: mark it completed and write
+/// its delivery row (idempotent for the same generation).
+fn finish_salvage_receipt(
+    inventory: &nzbd_state::artifacts::Inventory,
+    job: &Job,
+    completed_root: &Path,
+    moved: nzbd_state::artifacts::RelocationResult,
+    terminal_outcome: &str,
+    failure_stage: &str,
+    failure_cause: &str,
+) -> Result<FailedSalvage, String> {
+    let delivery_lifecycle = job.delivery_lifecycle;
+    if let Some(delivery) = inventory
+        .delivery_for_job(job.id.0)
+        .map_err(|error| error.to_string())?
+        .filter(|delivery| delivery.publication_generation == moved.generation)
+    {
+        return Ok(FailedSalvage {
+            delivery: Some(delivery),
+            published_path: moved.published_path,
+            generation: moved.generation,
+        });
     }
-    .map_err(|error| error.to_string())?;
     inventory
         .finish(
             job.id.0,
@@ -1510,11 +1573,11 @@ fn salvage_failed_delivery(
     } else {
         None
     };
-    Ok(Some(FailedSalvage {
+    Ok(FailedSalvage {
         delivery,
         published_path: moved.published_path,
         generation: moved.generation,
-    }))
+    })
 }
 
 struct FailedSalvage {
@@ -1665,15 +1728,24 @@ async fn scan_queue(
             // Contract §2.6: a failed row stays queued until its terminal's
             // salvage obligation has settled and its source is disposed —
             // salvage and disposal read it.
-            let terminal = {
+            let (terminal, open_intent) = {
                 let inventory = inventory.clone();
                 let id = j.id.0;
-                tokio::task::spawn_blocking(move || inventory.terminal(id))
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .flatten()
+                tokio::task::spawn_blocking(move || {
+                    (
+                        inventory.terminal(id).ok().flatten(),
+                        // A read error counts as open: the row waits.
+                        inventory.open_intent_for_job(id).unwrap_or(true),
+                    )
+                })
+                .await
+                .unwrap_or((None, true))
             };
+            // Contract §2.5: neither side of an open publication move may be
+            // retired or disposed until reconciliation finishes or unwinds it.
+            if open_intent {
+                continue;
+            }
             let settled = match &terminal {
                 None => true, // stamped before job_terminals existed
                 Some(t) if !t.emitted => false,
@@ -3785,6 +3857,18 @@ async fn process_job_ctx_from_inner(
         // after scripts have finished mutating the Runner-owned source.
         if job.lifecycle_eligible() {
             let inventory = engine.artifacts();
+            // Contract §2.5: a publication move left open by a crash or an
+            // I/O error is finished or unwound before deciding whether it
+            // committed — never selected from again.
+            let reconcile_inventory = inventory.clone();
+            crate::attempt::current()
+                .expect("processing control")
+                .blocking(move |_| {
+                    reconcile_inventory
+                        .reconcile_job_intents(job_id.0)
+                        .map_err(PostError::from)
+                })
+                .await?;
             let current = inventory
                 .for_job(job_id.0)
                 .map_err(|e| PostError::Subprocess(e.to_string()))?
@@ -3857,8 +3941,12 @@ async fn process_job_ctx_from_inner(
                 } else {
                     "private-payload"
                 };
-                let target =
-                    target_root.join(format!("{publication_name}.runner-{}", source.generation));
+                // Contract §1: `<name>.job-<id>.runner-<gen>` — two attempts
+                // at the same release can never collide.
+                let target = target_root.join(format!(
+                    "{publication_name}.job-{}.runner-{}",
+                    job_id.0, source.generation
+                ));
                 stages.enter(PostStage::Move).await;
                 if !(ctx.commit_ok)() {
                     return Err(PostError::Subprocess(
@@ -3898,27 +3986,25 @@ async fn process_job_ctx_from_inner(
                 let inventory_for_publish = inventory.clone();
                 let target_for_publish = target.clone();
                 let delivery_eligible = job.delivery_lifecycle;
+                let transfer = job
+                    .params
+                    .iter()
+                    .find(|(key, _)| key == "monarr-transfer")
+                    .map(|(_, value)| value.clone());
                 let published = crate::attempt::current()
                     .expect("processing control")
                     .blocking(move |control| {
-                        let publish = if delivery_eligible {
-                            inventory_for_publish.publish_selected_for_delivery_checked(
+                        inventory_for_publish
+                            .publish_selected_with_transfer(
                                 job_id.0,
                                 &target_for_publish,
                                 selected_files,
                                 file_outcomes,
+                                transfer.as_deref(),
+                                delivery_eligible,
                                 &|| control.checkpoint(),
                             )
-                        } else {
-                            inventory_for_publish.publish_selected_checked(
-                                job_id.0,
-                                &target_for_publish,
-                                selected_files,
-                                file_outcomes,
-                                &|| control.checkpoint(),
-                            )
-                        };
-                        publish.map_err(PostError::from)
+                            .map_err(PostError::from)
                     })
                     .await;
                 stages.finish().await;
@@ -8003,14 +8089,6 @@ mod decision_tests {
         let delivery = inventory
             .create_delivery(41, true, Some("transfer-41"))
             .unwrap();
-        inventory
-            .accept_delivery(
-                &delivery.delivery_id,
-                &delivery.publication_generation,
-                &delivery.manifest_digest,
-                "curator-receipt-41",
-            )
-            .unwrap();
         std::fs::remove_dir_all(&published).unwrap();
 
         assert_eq!(
@@ -8852,14 +8930,6 @@ mod decision_tests {
                 Some("health"),
                 Some("health threshold failed after one episode completed"),
                 true,
-            )
-            .unwrap();
-        inventory
-            .accept_delivery(
-                &delivery.delivery_id,
-                &delivery.publication_generation,
-                &delivery.manifest_digest,
-                "curator-receipt-42",
             )
             .unwrap();
         std::fs::remove_dir_all(&published).unwrap();

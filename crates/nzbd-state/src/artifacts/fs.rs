@@ -8,6 +8,50 @@ thread_local! {
     pub(super) static RENAME_FAILURE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
+/// Plan M3 (a) / IMPL §7.6 test support: per-inventory counts of the payload
+/// operations a publication performs — `rename` (one per payload file moved
+/// into a publication), `copy_bytes` (bytes streamed by a cross-volume copy),
+/// `hash_bytes` (bytes read only to compute a digest) and `manifest_write`.
+/// Keyed by the inventory's installation id rather than thread-local,
+/// because post-processing runs publication on a blocking worker thread.
+#[cfg(any(test, feature = "test-support"))]
+static FS_OPS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(String, &'static str), u64>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[inline]
+pub(crate) fn count_op(scope: &str, kind: &'static str, amount: u64) {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        *FS_OPS
+            .lock()
+            .unwrap()
+            .entry((scope.to_owned(), kind))
+            .or_default() += amount;
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    let _ = (scope, kind, amount);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn fs_ops_snapshot(scope: &str) -> std::collections::HashMap<&'static str, u64> {
+    FS_OPS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((owner, _), _)| owner == scope)
+        .map(|((_, kind), count)| (*kind, *count))
+        .collect()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn fs_ops_reset(scope: &str) {
+    FS_OPS
+        .lock()
+        .unwrap()
+        .retain(|(owner, _), _| owner != scope);
+}
+
 pub fn identity(meta: &fs::Metadata) -> Identity {
     #[cfg(unix)]
     {
