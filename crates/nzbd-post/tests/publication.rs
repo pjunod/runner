@@ -6,7 +6,7 @@ use nzbd_engine::{AddOpts, Engine, EngineConfig, EngineHandle, Tuning};
 use nzbd_post::manager::{process_job, spawn_post_manager, PostConfig, PpFinal};
 use nzbd_state::artifacts::{IntentState, RunnerManifest, TerminalStep, RUNNER_MANIFEST_NAME};
 use nzbd_state::history::HistoryDb;
-use nzbd_types::{FailureReason, JobId, JobStatus, SegmentState, TerminalOutcome};
+use nzbd_types::{JobId, JobStatus, SegmentState, TerminalOutcome};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -440,7 +440,10 @@ async fn crash_then_restart(stage: &'static str, manager_at_boot: bool) {
         run_once(&engine, &history, tmp.path(), job).await.is_err(),
         "{stage}: the attempt stopped"
     );
-    let moving = matches!(stage, "after_first_rename" | "after_last_rename");
+    let moving = matches!(
+        stage,
+        "after_rename_before_journal" | "after_first_rename" | "after_last_rename"
+    );
     if moving || stage == "after_manifest" {
         assert!(
             engine.artifacts().open_intent_for_job(job.0).unwrap(),
@@ -649,10 +652,7 @@ async fn crash_with_corrupted_source_unwinds() {
         "the moved file is back with the rest of the source"
     );
     assert!(source.join(SIBLING.0).exists(), "nothing was disposed");
-    // The job does not complete from a corrupted source: either the boot
-    // verification holds it for repair (the CRC no longer matches), or a
-    // publication attempt fails it `io` (unwound generation, see the state
-    // test crash_with_corrupted_source_unwinds).
+    // The job does not complete from a corrupted source.
     let cancel = CancellationToken::new();
     let tracker = TaskTracker::new();
     settle_or_hold(&engine, job).await;
@@ -674,11 +674,31 @@ async fn crash_with_corrupted_source_unwinds() {
             .is_none(),
         "nothing was delivered"
     );
-    if let Some(terminal) = engine.artifacts().terminal(job.0).unwrap() {
-        assert_eq!(terminal.outcome, TerminalOutcome::Failed, "{terminal:?}");
-        assert_eq!(terminal.reason, Some(FailureReason::Io), "{terminal:?}");
-        assert!(!terminal.blames_release);
-    }
+    // Review #283-6: deterministic. Boot verification proves the
+    // remaining file's ranges invalid and holds the job for repair: no
+    // terminal, and the hold names the repair. (A publication attempt on
+    // the unwound generation would fail `io`; the state test
+    // crash_with_corrupted_source_unwinds proves that refusal.)
+    assert!(
+        engine.artifacts().terminal(job.0).unwrap().is_none(),
+        "held for repair, not terminal"
+    );
+    let snapshot = engine.snapshot();
+    let summary = snapshot
+        .jobs
+        .iter()
+        .find(|summary| summary.id == job)
+        .expect("the job stays queued");
+    assert_eq!(summary.status_projected, "held", "{summary:?}");
+    let verification = summary.verification.as_ref().expect("verification");
+    assert_eq!(verification.state, "blocked", "{verification:?}");
+    assert!(
+        verification
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("repair")),
+        "{verification:?}"
+    );
     assert!(
         publications(tmp.path()).is_empty(),
         "no publication was made from the corrupted source"
@@ -687,6 +707,18 @@ async fn crash_with_corrupted_source_unwinds() {
     tracker.close();
     tracker.wait().await;
     engine.shutdown().await;
+}
+
+// Review #283-3: the first file is in the publication, the journal does
+// not record it.
+#[tokio::test]
+async fn crash_after_rename_before_journal_finishes_on_restart() {
+    crash_then_restart("after_rename_before_journal", false).await;
+}
+
+#[tokio::test]
+async fn crash_after_rename_before_journal_finishes_with_manager_at_boot() {
+    crash_then_restart("after_rename_before_journal", true).await;
 }
 
 // The daemon's order (`nzbd/src/main.rs`): the post manager starts right

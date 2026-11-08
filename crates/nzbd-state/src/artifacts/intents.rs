@@ -788,6 +788,9 @@ impl Inventory {
                 }
             }
             let moved = self.move_intent_file(&intent, &intent.files[index], checkpoint, scope)?;
+            // The file is in the publication; the journal does not say so
+            // yet (review #283-3: restart must locate it).
+            crash_point("after_rename_before_journal", scope)?;
             intent.files[index] = moved;
             {
                 let _guard = self.mutation_guard()?;
@@ -1142,10 +1145,19 @@ impl Inventory {
                 }
             }
         }
-        if intent.state == IntentState::Open {
+        // Open: decide finish or unwind from where every file is. Finishing
+        // (a restart that already decided to finish and stopped again):
+        // re-locate the files the journal does not record as moved — the
+        // process may have stopped between a rename and its journal update
+        // (review #283-3). Both passes are idempotent.
+        if matches!(intent.state, IntentState::Open | IntentState::Finishing) {
+            let reentry = intent.state == IntentState::Finishing;
             let mut evidence = Vec::new();
             let mut complete = true;
             for index in 0..intent.files.len() {
+                if reentry && intent.files[index].moved {
+                    continue;
+                }
                 checkpoint()?;
                 match self.locate_intent_file(&intent, &intent.files[index], checkpoint)? {
                     Found::Target(landed, sha256) => {
@@ -1170,7 +1182,12 @@ impl Inventory {
             } else {
                 IntentState::Unwinding
             };
-            intent.evidence = Some(evidence.join("; "));
+            let found = evidence.join("; ");
+            intent.evidence = Some(match intent.evidence.take().filter(|_| reentry) {
+                Some(earlier) if !found.is_empty() => format!("{earlier}; on re-entry: {found}"),
+                Some(earlier) => earlier,
+                None => found,
+            });
             tracing::warn!(
                 generation = %intent.generation,
                 decision = intent.state.as_str(),
@@ -1663,7 +1680,12 @@ mod tests {
     /// publication, no file in two places, and disposal refused until then.
     #[test]
     fn each_crash_point_restarts_to_one_publication() {
-        for stage in ["after_first_rename", "after_last_rename", "after_manifest"] {
+        for stage in [
+            "after_rename_before_journal",
+            "after_first_rename",
+            "after_last_rename",
+            "after_manifest",
+        ] {
             let base = tempfile::tempdir().unwrap();
             let (db, root) = fixture_in(base.path());
             let (source, selected, outcomes) = job(&db, &root, 62, SELECTED, SIBLINGS);
@@ -1708,6 +1730,52 @@ mod tests {
             db.retire_delivery_source(&delivery.delivery_id).unwrap();
             assert!(!source.exists(), "{stage}: disposed after commit");
         }
+    }
+
+    /// Review #283-3: a restart that decided to finish (`Finishing`) and
+    /// stopped again between a rename and its journal update re-locates the
+    /// unrecorded file on the next restart instead of retrying a move whose
+    /// source is gone.
+    #[test]
+    fn finishing_reentry_locates_a_rename_the_journal_missed() {
+        let base = tempfile::tempdir().unwrap();
+        let (db, root) = fixture_in(base.path());
+        let (source, selected, outcomes) = job(&db, &root, 70, SELECTED, SIBLINGS);
+        let completed = base.path().join("completed");
+        std::fs::create_dir(&completed).unwrap();
+        let target = completed.join("release.job-70.runner-g");
+        super::super::relocation::FAULTS
+            .with(|faults| faults.borrow_mut().insert("after_first_rename", libc::EIO));
+        assert!(db
+            .publish_selected_with_transfer(70, &target, selected, outcomes, None, true, &|| Ok(()))
+            .is_err());
+        let generation = db.for_job(70).unwrap().unwrap().generation;
+        db.close().unwrap();
+        // First restart: decides to finish, renames the next file, stops
+        // before journaling it.
+        let db = Inventory::open(&base.path().join("state")).unwrap();
+        super::super::relocation::FAULTS.with(|faults| {
+            faults
+                .borrow_mut()
+                .insert("after_rename_before_journal", libc::EIO)
+        });
+        assert!(db.reconcile_relocations().is_err(), "stopped mid-finish");
+        let intent = db.relocation_intent(&generation).unwrap().unwrap();
+        assert_eq!(intent.state, IntentState::Finishing);
+        let unrecorded = intent
+            .files
+            .iter()
+            .filter(|file| !file.moved && target.join(&file.dst).exists())
+            .count();
+        assert_eq!(unrecorded, 1, "one rename the journal does not record");
+        db.close().unwrap();
+        // Second restart: finishes.
+        let db = Inventory::open(&base.path().join("state")).unwrap();
+        db.reconcile_relocations().unwrap();
+        let intent = db.relocation_intent(&generation).unwrap().unwrap();
+        assert_eq!(intent.state, IntentState::Committed);
+        assert!(intent.evidence.as_deref().unwrap().contains("on re-entry"));
+        assert_one_publication(&target, &source);
     }
 
     /// Plan M3 (e): with the source half-moved and a remaining source file

@@ -132,6 +132,7 @@ impl Inventory {
             "copy_chunk"
                 | "before_commit"
                 | "after_first_rename"
+                | "after_rename_before_journal"
                 | "after_last_rename"
                 | "after_manifest"
                 | "after_delivery"
