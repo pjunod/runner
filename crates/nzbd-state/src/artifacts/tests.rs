@@ -376,7 +376,7 @@ fn selected_delivery_copies_only_payload_and_prunes_resolved_source_files() {
 }
 
 #[test]
-fn selected_delivery_retains_par_repair_set_without_keep() {
+fn selected_delivery_retains_published_par_repair_dependency_without_keep() {
     let (tmp, db, root) = fixture();
     let source = root.join("working-par-dependency");
     db.allocate_for_delivery(54, &root, &source, true, true)
@@ -421,10 +421,9 @@ fn selected_delivery_retains_par_repair_set_without_keep() {
         .unwrap();
     let cleanup = db.retire_delivery_source(&delivery.delivery_id).unwrap();
     assert_eq!(cleanup.source_cleanup.status, "blocked");
-    // Contract §2.5 (M3): the published episode was renamed into the
-    // publication — the PAR set it belongs to stays as the repair input, the
-    // episode itself is in one place only.
-    assert!(!source.join("episode.mkv").exists());
+    // A published repair input keeps its source name (linked, not renamed):
+    // the PAR set stays repairable after curator removes the publication.
+    assert!(source.join("episode.mkv").exists());
     assert!(target.join("episode.mkv").exists());
     assert!(source.join("set.par2").exists());
     let status = |path: &str| {
@@ -436,7 +435,7 @@ fn selected_delivery_retains_par_repair_set_without_keep() {
             .source_cleanup_status
             .clone()
     };
-    assert_eq!(status("episode.mkv"), "removed");
+    assert_eq!(status("episode.mkv"), "retained_repair_dependency");
     assert_eq!(status("set.par2"), "retained_repair_dependency");
     assert!(!db.get(&delivery.artifact_id).unwrap().keep_on_failure);
 }
@@ -3269,4 +3268,71 @@ fn external_output_observation_never_adopts_owned_associated_or_replaced_paths()
         std::fs::read(replaced.join("foreign.bin")).unwrap(),
         b"foreign bytes"
     );
+}
+
+/// Contract §2.6 (orchestrator addition to M3): a park whose destination
+/// root cannot be created is journaled as the move's first step — an
+/// operation on the retry ladder, visible with the artifact (Attention) and
+/// to the disposal gate's `disposal_retry_at` — and the same request
+/// succeeds once the root can be made.
+#[test]
+fn park_root_creation_failure_lands_on_the_operation_ladder() {
+    let (tmp, db, root) = fixture();
+    let source = root.join("failed-source");
+    db.allocate_for_delivery(88, &root, &source, true, true)
+        .unwrap();
+    std::fs::write(source.join("episode.mkv"), b"failed bytes").unwrap();
+    db.finish(88, &source, &root, "active").unwrap();
+    // The park root's parent is a regular file: create_dir_all fails.
+    let blocker = tmp.path().join("parked");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let target = blocker.join("failed").join("failed-source");
+    let error = db.relocate(88, &target).unwrap_err();
+    assert!(matches!(error, Error::Io(_)), "{error}");
+    let artifact = db.for_job(88).unwrap().unwrap();
+    let operations = db.pending_relocations(&artifact.id).unwrap();
+    assert_eq!(operations.len(), 1, "the failure is journaled");
+    let operation = &operations[0];
+    assert_eq!(operation.state, "retry");
+    assert_eq!(operation.attempts, 1);
+    assert!(operation.next_retry > now(), "on the ladder");
+    assert!(operation
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("could not be created")));
+    assert_eq!(
+        db.disposal_retry_at(88).unwrap(),
+        Some(operation.next_retry)
+    );
+    assert!(artifact
+        .error
+        .as_deref()
+        .is_some_and(|error| error.starts_with("destination root ")));
+    let attention = db
+        .list_page(&ListQuery {
+            limit: 50,
+            filter: ListFilter::Attention,
+            ..ListQuery::default()
+        })
+        .unwrap();
+    assert!(
+        attention
+            .rows
+            .iter()
+            .any(|row| row.artifact.id == artifact.id),
+        "visible under Attention"
+    );
+    assert!(source.join("episode.mkv").exists(), "nothing moved");
+    // A second failure climbs the ladder.
+    assert!(db.relocate(88, &target).is_err());
+    let again = db.pending_relocations(&artifact.id).unwrap();
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].attempts, 2);
+    // Once the root can be created, the same request parks the source.
+    std::fs::remove_file(&blocker).unwrap();
+    let moved = db.relocate(88, &target).unwrap();
+    assert_eq!(moved.published_path, target);
+    assert!(target.join("episode.mkv").exists());
+    assert!(db.pending_relocations(&artifact.id).unwrap().is_empty());
+    assert!(db.for_job(88).unwrap().unwrap().error.is_none());
 }

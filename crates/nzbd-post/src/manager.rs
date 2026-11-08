@@ -1847,24 +1847,15 @@ async fn scan_queue(
             // Contract §2.6: a failed row stays queued until its terminal's
             // salvage obligation has settled and its source is disposed —
             // salvage and disposal read it.
-            let (terminal, open_intent) = {
+            let terminal = {
                 let inventory = inventory.clone();
                 let id = j.id.0;
-                tokio::task::spawn_blocking(move || {
-                    (
-                        inventory.terminal(id).ok().flatten(),
-                        // A read error counts as open: the row waits.
-                        inventory.open_intent_for_job(id).unwrap_or(true),
-                    )
-                })
-                .await
-                .unwrap_or((None, true))
+                tokio::task::spawn_blocking(move || inventory.terminal(id))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .flatten()
             };
-            // Contract §2.5: neither side of an open publication move may be
-            // retired or disposed until reconciliation finishes or unwinds it.
-            if open_intent {
-                continue;
-            }
             let settled = match &terminal {
                 None => true, // stamped before job_terminals existed
                 Some(t) if !t.emitted => false,
@@ -1874,6 +1865,21 @@ async fn scan_queue(
                 Some(_) => finish_stamped_delivery(engine, j.id).await,
             };
             if !settled || gate.is_some() {
+                continue;
+            }
+            // Contract §2.5: the row is not retired while a publication move
+            // of the job is open — the salvage above is what finishes it.
+            let open_intent = {
+                let inventory = inventory.clone();
+                let id = j.id.0;
+                tokio::task::spawn_blocking(move || inventory.open_intent_for_job(id))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    // A read error counts as open: the row waits.
+                    .unwrap_or(true)
+            };
+            if open_intent {
                 continue;
             }
             if let Err(error) = reconcile_stamped_completion(engine, history, j.id).await {
@@ -7988,7 +7994,10 @@ mod decision_tests {
             .retire_delivery_source(&delivery.delivery_id)
             .unwrap();
         assert_ne!(cleanup.source_cleanup.status, "succeeded");
+        // A published repair input keeps its source name (contract §2.5 as
+        // built: linked, not renamed), so the set stays repairable.
         assert!(source.join("episode-01.mkv").exists());
+        assert!(salvage.published_path.join("episode-01.mkv").exists());
         assert!(source.join(".runner-file-2.part").exists());
         assert_eq!(
             std::fs::read(source.join(".runner-file-3.part")).unwrap(),
@@ -8389,7 +8398,7 @@ mod decision_tests {
                 .unwrap()
                 .generation;
             self.completed
-                .join(format!("Some.Release.runner-{generation}"))
+                .join(format!("Some.Release.job-41.runner-{generation}"))
         }
 
         /// The publication holds exactly the release-named media.

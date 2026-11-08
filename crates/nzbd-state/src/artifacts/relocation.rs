@@ -37,6 +37,11 @@ pub(super) struct Relocation {
     /// publication since M3; legacy journals have none.
     #[serde(default)]
     pub(super) intent: Option<String>,
+    /// Contract §2.6: the destination root could not be created. The move
+    /// has not started; this journal only carries the failure's retry ladder
+    /// (visible with the artifact) until the same request succeeds.
+    #[serde(default)]
+    pub(super) root_pending: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -263,7 +268,14 @@ impl Inventory {
             let Some(source) = self.for_job(job)? else {
                 return Ok(());
             };
-            let pending = self.pending_relocations(&source.id)?;
+            let mut pending = self.pending_relocations(&source.id)?;
+            // A root-pending journal moved nothing; the retried move itself
+            // supersedes it.
+            pending.retain(|op| {
+                serde_json::from_str::<Relocation>(&op.request)
+                    .map(|movement| !movement.root_pending)
+                    .unwrap_or(true)
+            });
             if pending.is_empty() {
                 return Ok(());
             }
@@ -987,6 +999,79 @@ impl Inventory {
         Ok(())
     }
 
+    /// Record a destination root that could not be created as a `relocate`
+    /// operation in `retry` (or `review` for an unsupported error) with the
+    /// ladder and the error, and note it on the source artifact.
+    #[allow(clippy::too_many_arguments)]
+    fn journal_root_failure(
+        &self,
+        key: &str,
+        source: &Artifact,
+        destination: &Path,
+        defer_source_retirement: bool,
+        publication_files: &Option<Vec<FileEntry>>,
+        file_outcomes: &[DeliveryFileOutcome],
+        prior_attempts: u32,
+        error: &std::io::Error,
+    ) -> Result<()> {
+        let unsupported = matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+        );
+        let attempts = prior_attempts.saturating_add(1);
+        let movement = Relocation {
+            source: source.clone(),
+            destination: destination.into(),
+            requested_destination: Some(destination.into()),
+            // Never read for a root-pending journal: the root does not exist.
+            destination_root: source.root_identity.clone(),
+            scratch: None,
+            registry: false,
+            publication: None,
+            publication_key: None,
+            cleanup_done: false,
+            cleanup: CleanupSchedule::default(),
+            defer_source_retirement,
+            publication_files: publication_files.clone(),
+            file_outcomes: file_outcomes.to_vec(),
+            source_cleanup_removed: Vec::new(),
+            source_cleanup_current: None,
+            intent: None,
+            root_pending: true,
+        };
+        let message = format!(
+            "destination root {} could not be created: {error}",
+            destination.parent().unwrap_or(destination).display()
+        );
+        let op = Operation {
+            id: key.into(),
+            artifact: source.id.clone(),
+            kind: "relocate".into(),
+            state: if unsupported { "review" } else { "retry" }.into(),
+            request: serde_json::to_string(&movement)?,
+            created_at: now(),
+            not_before: 0,
+            attempts,
+            next_retry: if unsupported {
+                0
+            } else {
+                now().saturating_add([30, 60, 120, 300][attempts.saturating_sub(1).min(3) as usize])
+            },
+            error: Some(message.clone()),
+        };
+        let _guard = self.mutation_guard()?;
+        let mut current = self.get(&source.id)?;
+        current.error = Some(message);
+        current.updated_at = now();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        save_operation(&tx, &op)?;
+        save_artifact(&tx, &current)?;
+        event(&tx, &source.id, "relocation_root_unavailable", key)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn relocate_checked_mode_inner(
         &self,
         job: u32,
@@ -1097,6 +1182,42 @@ impl Inventory {
                 published_path: source.path,
             });
         }
+        // A previous attempt of this same request that could not create its
+        // destination root is superseded by this one, which inherits its
+        // attempt count so the ladder keeps climbing.
+        let root_key = format!(
+            "move-root-{}-{}-{:x}",
+            source.id,
+            source.generation,
+            Sha256::digest(destination.as_os_str().as_encoded_bytes())
+        );
+        let prior_root_attempts = match self.operation(&root_key) {
+            Ok(mut prior) if !matches!(prior.state.as_str(), "succeeded" | "cancelled") => {
+                let attempts = prior.attempts;
+                prior.state = "cancelled".into();
+                prior.error = Some("superseded by a retry of the same move".into());
+                let _guard = self.mutation_guard()?;
+                let mut current = self.get(&source.id)?;
+                let mut db = self.db.lock().unwrap();
+                let tx = db.transaction()?;
+                save_operation(&tx, &prior)?;
+                if current
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with("destination root "))
+                {
+                    current.error = None;
+                    save_artifact(&tx, &current)?;
+                }
+                tx.commit()?;
+                drop(db);
+                source.error = current.error;
+                attempts
+            }
+            Ok(prior) => prior.attempts,
+            Err(Error::NotFound) => 0,
+            Err(error) => return Err(error),
+        };
         // The exact-generation namespace lease serializes claims. Revisions are not generations:
         // a review outcome cannot authorize a fresh scratch copy.
         let unresolved: i64 = self.db.lock().unwrap().query_row(
@@ -1128,7 +1249,23 @@ impl Inventory {
         let root = destination
             .parent()
             .ok_or_else(|| Error::Conflict("missing destination root".into()))?;
-        std::fs::create_dir_all(root)?;
+        if let Err(error) = std::fs::create_dir_all(root) {
+            // Contract §2.6: root creation is the move's first filesystem
+            // step, so its failure is journaled like any later one — on the
+            // operation's own retry ladder, visible with the artifact —
+            // instead of vanishing before an operation exists.
+            self.journal_root_failure(
+                &root_key,
+                &source,
+                destination,
+                defer_source_retirement,
+                &publication_files,
+                &file_outcomes,
+                prior_root_attempts,
+                &error,
+            )?;
+            return Err(error.into());
+        }
         let root_dir = fs::open_dir(root)?;
         if destination.try_exists()? {
             return Err(Error::Conflict("move destination already exists".into()));
@@ -1157,6 +1294,7 @@ impl Inventory {
             source_cleanup_removed: Vec::new(),
             source_cleanup_current: None,
             intent: None,
+            root_pending: false,
         };
         // Contract §2.5: a selected publication moves file by file under a
         // journaled intent, inserted with the operation, before any rename.
@@ -1166,6 +1304,7 @@ impl Inventory {
                     &key,
                     &source,
                     selected,
+                    &relocation.file_outcomes,
                     destination,
                     &relocation.destination_root,
                     transfer,
@@ -2804,7 +2943,9 @@ impl Inventory {
                 }
             }
             let mut movement: Relocation = serde_json::from_str(&op.request)?;
-            if movement.intent.is_some() {
+            if movement.intent.is_some() || movement.root_pending {
+                // Intents reconcile from their own journal; a root-pending
+                // journal holds no moved bytes and is retried by its request.
                 continue;
             }
             let source = {

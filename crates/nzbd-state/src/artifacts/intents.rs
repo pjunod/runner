@@ -92,6 +92,13 @@ pub struct IntentFile {
     #[serde(default)]
     pub dst_identity: Option<Identity>,
     pub moved: bool,
+    /// A published file that is also an input of a PAR set still needed to
+    /// repair the rest of the source (`repair_dependency`): it is linked
+    /// (same volume) or copied (cross volume) into the publication and its
+    /// source name stays, so the set remains repairable after curator
+    /// removes the publication.
+    #[serde(default)]
+    pub keep_source: bool,
 }
 
 /// One row of `relocation_intents`.
@@ -351,6 +358,7 @@ impl Inventory {
         operation: &str,
         source: &Artifact,
         selected: &[FileEntry],
+        outcomes: &[DeliveryFileOutcome],
         target_dir: &Path,
         destination_root: &Identity,
         transfer: Option<&str>,
@@ -380,6 +388,9 @@ impl Inventory {
                 }),
                 dst_identity: None,
                 moved: false,
+                keep_source: outcomes
+                    .iter()
+                    .any(|outcome| outcome.source_path == entry.path && outcome.repair_dependency),
             })
             .collect::<Vec<_>>();
         if files.is_empty() {
@@ -453,7 +464,7 @@ impl Inventory {
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         for artifact in artifacts {
-            self.reconcile_open_intents(None, Some(&artifact), None, &|| Ok(()))?;
+            self.reconcile_open_intents_in(None, Some(&artifact), None, &|| Ok(()), true)?;
         }
         Ok(())
     }
@@ -559,7 +570,7 @@ impl Inventory {
                 && intent
                     .files
                     .iter()
-                    .any(|file| file.src == source_path && file.moved)
+                    .any(|file| file.src == source_path && file.moved && !file.keep_source)
         }))
     }
 
@@ -636,8 +647,13 @@ impl Inventory {
                 }
             }
             checkpoint()?;
-            fs::rename_exclusive(&from, &to)?;
-            fs::count_op(&self.installation, "rename", 1);
+            if file.keep_source {
+                crate::fileops::link(&from, &to)?;
+                fs::count_op(&self.installation, "link", 1);
+            } else {
+                fs::rename_exclusive(&from, &to)?;
+                fs::count_op(&self.installation, "rename", 1);
+            }
             let landed = fs::open_at(&parent, Path::new(file_name(&file.dst)?), false)?;
             let landed_identity = fs::identity_for_file(&landed)?;
             if !moved_identity_matches(&file.identity, &landed_identity) {
@@ -894,6 +910,30 @@ impl Inventory {
         }
         let source_root = fs::open_dir(&intent.source_dir)?;
         let remaining = fs::manifest(&source_root, 100_000)?;
+        // A linked repair input changed only its ctime (the new name). Carry
+        // that controlled transition into the source snapshot retirement
+        // checks against; anything else about it must be unchanged.
+        for file in intent
+            .files
+            .iter()
+            .filter(|file| file.keep_source && !intent.cross_volume)
+        {
+            let observed = remaining
+                .iter()
+                .find(|entry| entry.path == file.src)
+                .filter(|entry| moved_identity_matches(&file.identity, &entry.identity))
+                .ok_or_else(|| {
+                    Error::Conflict(format!("linked repair input changed: {}", file.src))
+                })?;
+            if let Some(entry) = movement
+                .source
+                .files
+                .iter_mut()
+                .find(|entry| entry.path == file.src)
+            {
+                entry.identity = observed.identity.clone();
+            }
+        }
         let root = intent
             .target_dir
             .parent()
@@ -958,6 +998,21 @@ impl Inventory {
         snapshot: Option<&StartupReconciliation>,
         checkpoint: &dyn Fn() -> std::io::Result<()>,
     ) -> Result<()> {
+        self.reconcile_open_intents_in(root, artifact, snapshot, checkpoint, false)
+    }
+
+    /// `within_attempt`: the caller is the job's own post-processing or
+    /// salvage attempt, which already holds the source generation's use; it
+    /// takes the processing namespace lease (as the live move does) instead
+    /// of a reconciliation lease that the attempt's own use would refuse.
+    fn reconcile_open_intents_in(
+        &self,
+        root: Option<&Path>,
+        artifact: Option<&str>,
+        snapshot: Option<&StartupReconciliation>,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+        within_attempt: bool,
+    ) -> Result<()> {
         for intent in self.open_relocation_intents()? {
             if artifact.is_some_and(|artifact| artifact != intent.artifact) {
                 continue;
@@ -985,6 +1040,11 @@ impl Inventory {
             if artifact.is_none() && op.state == "retry" && op.next_retry > now() {
                 continue;
             }
+            // A refusal waits for a person or an explicit retry; the periodic
+            // sweep does not repeat it (startup and explicit retries do).
+            if artifact.is_none() && snapshot.is_none() && op.state == "review" {
+                continue;
+            }
             // An admitted deletion keeps its undo window; it is refused
             // while the intent is open, so this is only a pre-M3 admission.
             let deletion_pending: bool = self.db.lock().unwrap().query_row(
@@ -1007,7 +1067,13 @@ impl Inventory {
                 inventory: self,
                 id: intent.operation.clone(),
             };
-            let Some(_lease) = self.reserve_reconciliation(std::slice::from_ref(&source))? else {
+            let lease = if within_attempt {
+                self.reserve_processing_mutation(std::slice::from_ref(&source))?
+            } else {
+                self.reserve_reconciliation(std::slice::from_ref(&source))?
+            };
+            let Some(_lease) = lease else {
+                tracing::debug!(operation = %intent.operation, "publication intent source is busy; reconciling later");
                 continue;
             };
             // Re-read under the single flight: the live attempt may have
@@ -1222,6 +1288,12 @@ impl Inventory {
                         "cannot unwind {}: it is not the journaled file; retained for review",
                         file.dst
                     )));
+                }
+                if file.keep_source && open_optional(&source_root, &file.src)?.is_some() {
+                    // A second name of a repair input the source kept.
+                    fs::unlink(&parent, Path::new(name), false)?;
+                    fs::sync_directory(&parent)?;
+                    continue;
                 }
                 if let Some(source_parent) = parent_of(&file.src) {
                     crate::fileops::parents(&intent.source_dir, source_parent)?;
@@ -1697,6 +1769,89 @@ mod tests {
         db.retire_delivery_source(&delivery.delivery_id).unwrap();
         assert!(!source.exists());
         assert_one_publication_after_retire(&target);
+    }
+
+    /// A published file that is still an input of the source's PAR set is
+    /// linked, not renamed: after a crash it finishes as a link (both names,
+    /// one inode) and unwinds by dropping only the publication's name.
+    #[test]
+    fn repair_input_is_linked_and_survives_finish_and_unwind() {
+        for corrupt in [false, true] {
+            let base = tempfile::tempdir().unwrap();
+            let (db, root) = fixture_in(base.path());
+            let files: &[(&str, &[u8])] = &[("a.mkv", b"repair input"), ("b.mkv", b"plain")];
+            let (source, selected, mut outcomes) = job(&db, &root, 67, files, &[]);
+            outcomes
+                .iter_mut()
+                .find(|outcome| outcome.source_path == "a.mkv")
+                .unwrap()
+                .repair_dependency = true;
+            let completed = base.path().join("completed");
+            std::fs::create_dir(&completed).unwrap();
+            let target = completed.join("release.job-67.runner-g");
+            super::super::relocation::FAULTS
+                .with(|faults| faults.borrow_mut().insert("after_first_rename", libc::EIO));
+            assert!(db
+                .publish_selected_with_transfer(
+                    67,
+                    &target,
+                    selected,
+                    outcomes,
+                    None,
+                    true,
+                    &|| Ok(())
+                )
+                .is_err());
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(source.join("a.mkv")).unwrap().ino(),
+                std::fs::metadata(target.join("a.mkv")).unwrap().ino(),
+                "linked"
+            );
+            if corrupt {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::fs::write(source.join("b.mkv"), b"changed").unwrap();
+            }
+            db.close().unwrap();
+            let db = Inventory::open(&base.path().join("state")).unwrap();
+            db.reconcile_relocations().unwrap();
+            let generation = db.for_job(67).unwrap().unwrap().generation;
+            let intent = db.relocation_intent(&generation).unwrap().unwrap();
+            assert_eq!(
+                std::fs::read(source.join("a.mkv")).unwrap(),
+                b"repair input"
+            );
+            if corrupt {
+                assert_eq!(intent.state, IntentState::Unwound);
+                assert!(!target.exists());
+                continue;
+            }
+            assert_eq!(intent.state, IntentState::Committed);
+            assert_eq!(
+                std::fs::read(target.join("a.mkv")).unwrap(),
+                b"repair input"
+            );
+            assert_eq!(std::fs::read(target.join("b.mkv")).unwrap(), b"plain");
+            assert!(!source.join("b.mkv").exists());
+            let delivery = db.create_delivery(67, true, None).unwrap();
+            let cleanup = db.retire_delivery_source(&delivery.delivery_id).unwrap();
+            assert_eq!(
+                cleanup.source_cleanup.status, "blocked",
+                "the repair input stays"
+            );
+            assert!(source.join("a.mkv").exists());
+            let status = |path: &str| {
+                cleanup
+                    .file_outcomes
+                    .iter()
+                    .find(|outcome| outcome.source_path == path)
+                    .unwrap()
+                    .source_cleanup_status
+                    .clone()
+            };
+            assert_eq!(status("a.mkv"), "retained_repair_dependency");
+            assert_eq!(status("b.mkv"), "removed");
+        }
     }
 
     /// A cross-volume move reserves its bytes before anything is journaled:

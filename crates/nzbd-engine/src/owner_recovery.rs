@@ -445,7 +445,36 @@ impl Owner {
         }
     }
 
+    /// A boot verification waits for its payload root; if the job's terminal
+    /// is stamped meanwhile (the terminal replay of a crash after the history
+    /// write), the job no longer has a payload to prove and nothing would
+    /// ever run or clear that verification — and a job under verification
+    /// can be neither exported nor admitted. Drop such waiting verifications.
+    pub(super) fn drop_unneeded_verifications(&mut self) {
+        let stale = self
+            .state
+            .jobs
+            .iter()
+            .filter(|job| !super::transitions::needs_payload(job))
+            .filter(|job| {
+                self.verification
+                    .get(&job.id)
+                    .is_some_and(|state| !state.running)
+            })
+            .map(|job| job.id)
+            .collect::<Vec<_>>();
+        for job in stale {
+            self.verification.remove(&job);
+            if let Some(current) = self.state.job_mut(job) {
+                set_owner_param(&mut current.params, PENDING, None);
+                set_owner_param(&mut current.params, REASON, None);
+            }
+            self.dirty = true;
+        }
+    }
+
     pub(super) fn start_verifications(&mut self) {
+        self.drop_unneeded_verifications();
         if self.cancel.is_cancelled() || self.verification_roots.len() >= MAX_VERIFICATION_WORKERS {
             return;
         }
