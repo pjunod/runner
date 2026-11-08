@@ -313,7 +313,7 @@ generation while retaining prior custody. History and the canonical queue
 replacement complete before the owner releases operational fences. Replay
 requires the accepted control result and current authority checkpoint, and
 never adopts a replacement inode merely because a marker exists.
-See [startup verification status](STARTUP_VERIFICATION_STATUS.md).
+See [startup verification status](archive/STARTUP_VERIFICATION_STATUS.md).
 
 Shutdown stops intake, cancels workers, consumes their remaining results, and waits for actual worker termination before saving the final document and clearing the diagnostic marker. A failed drain or final save prevents a replacement backend from being started in the same process.
 
@@ -341,7 +341,7 @@ provide a trustworthy cluster-wide “last line.” A later completion has a new
 `completed_at`; the same key cannot be revived. Old binaries skip the tagged
 mutation as an unknown line, so a rolling cluster must finish upgrading before
 it relies on a new forget. See
-[DEFECT_HISTORY_DELETE.md](DEFECT_HISTORY_DELETE.md) for the defect and decision.
+[DEFECT_HISTORY_DELETE.md](archive/DEFECT_HISTORY_DELETE.md) for the defect and decision.
 
 **History loading and retention.** Native and compat listings read a local
 SQLite WAL snapshot; native page rows and total share one read transaction.
@@ -509,6 +509,7 @@ Native config is **TOML** (`nzbd.toml`): typed, serde-validated, sectioned (`[pa
 | 17 | **Web UI: one embedded no-build page with a hand-rolled keyed reconciler** (§12) | Svelte 5 + Vite SPA (a Node build chain in CI, permanently, for component structure we don't need at this size); vendoring preact+htm (13 KB of third-party JS in-tree to diff one `<table>` that ~150 lines diff fine). Trade-off accepted knowingly: no virtualized tables and no i18n scaffolding, revisit past ~500 rows or ~120 KB |
 | 18 | **Delete parks the regenerated NZB to history and is undoable; no `confirm()` anywhere** (§12) | Confirmation dialogs (interrupt before anything happens, then say nothing afterwards — the worst of both ends); bare instant delete (a misclick on a 60 GiB job costs a full re-download); two-step inline arming for everything (still two clicks, the thing being complained about). Arming is kept for the one action nothing can undo: deleting downloaded files |
 | 19 | **BitTorrent: one protocol-neutral queue/backend seam; immutable seed tree; readiness is durable state** ([proposal](BITTORRENT_PROPOSAL.md), [M0 report](BITTORRENT_M0_REPORT.md), [M1b report](BITTORRENT_M1B_REPORT.md)). **Amended:** the maintained twelve-patch rqbit v8.1.1 engine retains the accepted M0 boundaries, adds feature-gated loopback DHT test support, and announces as Runner with a tracker-compliant lifecycle. Single-node activation owns one session, durable admission/recovery, shared scheduling/bandwidth/quota/disk policy, native web/mobile surfaces, and a narrow qBittorrent Web API 2.8.1 projection. DHT-on may query a privacy-unknown magnet hash before list-only metadata validation; public metadata proceeds and private metadata is rejected before managed admission. Disabled mode opens no peer listener and refuses orphaned live torrent state. M6 cluster ownership still requires its own ADR; proxy use remains fail-closed for DHT and UDP trackers. | A second daemon (two queue authorities and lifecycle stores); pretending pieces/peers are NNTP articles/servers (dishonest state); pinning a release candidate or entering `libtorrent` FFI before an explicit engine decision. First release is deliberately v1 TCP/IPv4 and single-node. |
+| 20 | **Pipeline contract v2: one terminal fact per job, typed at the producer, environmental holds only, per-file journaled publication with no acknowledgement** ([ADR-20](adr/0020-pipeline-contract-v2.md), [contract](PIPELINE_CONTRACT.md)) | Patching the v1 seam (review holds, acknowledgement, four retry clocks and text-matched causes each fixed a symptom and left the next); a broker or new transport (SSE + REST + SQLite already carry it) |
 
 ## 16. Roadmap
 
