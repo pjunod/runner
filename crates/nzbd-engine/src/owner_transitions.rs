@@ -1216,7 +1216,7 @@ impl Owner {
     ) {
         let job = candidate.id;
         // An imported row may come from a 0.5.0 node (a hold as `paused`).
-        candidate.normalize_hold_status();
+        crate::normalize_stored_hold_status(&mut candidate, "imported job");
         if require_existing && self.state.job(job).is_none() {
             callback(self, Err(failure("replacement target no longer exists")));
             return;
@@ -1421,7 +1421,7 @@ impl Owner {
     ) {
         // Replicated rows may come from a 0.5.0 node (a hold as `paused`).
         for job in &mut jobs {
-            job.normalize_hold_status();
+            crate::normalize_stored_hold_status(job, "replicated authority");
         }
         if !self.post_admissions.is_empty()
             || !self.allocating_jobs.is_empty()

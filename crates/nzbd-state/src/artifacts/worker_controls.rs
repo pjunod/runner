@@ -492,7 +492,15 @@ impl Inventory {
                                     } else {
                                         checkpoint.job.status
                                     };
-                                    checkpoint.job.normalize_hold_status();
+                                    if checkpoint.job.normalize_hold_status()
+                                        == nzbd_types::HoldStatusChange::LostHold
+                                    {
+                                        tracing::warn!(
+                                            job,
+                                            control = ?checkpoint.job.control(),
+                                            "an adopted held job has no holding control; it is now paused"
+                                        );
+                                    }
                                     probe_params = local.probe_params.clone();
                                     local.context = context.clone();
                                     tx.execute(

@@ -1369,7 +1369,7 @@ impl Owner {
                     }
                 }
                 // A 0.5.0 snapshot stores a hold as `paused` + a held control.
-                j.normalize_hold_status();
+                crate::normalize_stored_hold_status(j, "queue snapshot");
                 drop_retired_params(j);
             }
             state.recompute_all_totals();
@@ -9886,19 +9886,25 @@ impl Owner {
         };
         // The status mirrors the hold record (M6b): every path that writes
         // a held control writes `Held`, every release leaves it.
-        debug_assert!(
-            self.state.jobs.iter().all(|j| {
+        // (A control of an unknown version on a running job is fenced like a
+        // hold but keeps its status; only `Paused`/`Held` must agree.)
+        #[cfg(debug_assertions)]
+        {
+            let agrees = |j: &Job| {
                 (j.status != JobStatus::Held || j.held())
                     && !(j.status == JobStatus::Paused && j.held())
-            }),
-            "status disagrees with hold record: {:?}",
-            self.state
-                .jobs
-                .iter()
-                .filter(|j| (j.status == JobStatus::Held) != j.held())
-                .map(|j| (j.id, j.status, j.control().map(|c| c.lifecycle)))
-                .collect::<Vec<_>>()
-        );
+            };
+            debug_assert!(
+                self.state.jobs.iter().all(agrees),
+                "status disagrees with hold record: {:?}",
+                self.state
+                    .jobs
+                    .iter()
+                    .filter(|j| !agrees(j))
+                    .map(|j| (j.id, j.status, j.control().map(|c| c.lifecycle)))
+                    .collect::<Vec<_>>()
+            );
+        }
         let projected = snap
             .jobs
             .iter()

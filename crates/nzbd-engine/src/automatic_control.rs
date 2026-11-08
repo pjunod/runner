@@ -62,11 +62,12 @@ fn read(job: &Job) -> Option<AutomaticControlTransition> {
     if marker.job != job.id || !marker.valid_identity() {
         return None;
     }
-    // A marker a 0.5.0 node stamped records a hold as `Paused` with its
-    // held control; the rows it is compared with load as `Held`. The
-    // identity hashes what was stamped, so the statuses are read as the
-    // projection after it is checked, not rewritten in the param. Markers
-    // live only until the cluster acknowledges them.
+    // Every marker records a hold as `Paused` with its held control (0.5.0
+    // stamps it so, and so does this build — see `stamp`); the rows it is
+    // compared with load as `Held`. The identity hashes what was stamped,
+    // so the statuses are read as the projection after it is checked, not
+    // rewritten in the param. Markers live only until the cluster
+    // acknowledges them.
     let held = |control: Option<&JobControl>| {
         control.is_some_and(|c| c.lifecycle == "held" || c.version != 1)
     };
@@ -108,13 +109,26 @@ pub(crate) fn stamp(
     let control = result
         .control()
         .ok_or("automatic transition has no result control")?;
+    // Stamped in the 0.5.0 form: `Held` as `Paused`, the held control beside
+    // it carrying the hold. The identity hashes the statuses, so a 0.5.0
+    // node (rolled back, or not yet upgraded) recomputes the same identity
+    // and can still read, apply or drop the marker; `read` restores `Held`
+    // from the control. Stamping `held` would leave a marker 0.5.0 sees as
+    // pending but cannot read — a job nothing can move (review #297 r2-1).
+    let stamped = |status: JobStatus| {
+        if status == JobStatus::Held {
+            JobStatus::Paused
+        } else {
+            status
+        }
+    };
     let mut marker = AutomaticControlTransition {
         identity: String::new(),
         job: result.id,
         base_control: before.control(),
-        base_status: before.status,
+        base_status: stamped(before.status),
         result_control: control,
-        result_status: result.status,
+        result_status: stamped(result.status),
         storage_instance_id: installation.into(),
         source: source.map(|source| SourceGeneration {
             artifact: source.id.clone(),
@@ -153,5 +167,94 @@ impl crate::EngineHandle {
             reply,
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(status: JobStatus) -> Job {
+        Job {
+            id: JobId(5),
+            kind: nzbd_types::JobKind::Nzb,
+            name: "job".into(),
+            dir_name: "job".into(),
+            name_provisional: false,
+            delivery_lifecycle: false,
+            queued_at_unix: 0,
+            original_name: String::new(),
+            category: None,
+            priority: 0,
+            dupe: nzbd_types::DupeInfo::default(),
+            params: Vec::new(),
+            files: Vec::new(),
+            totals: nzbd_types::JobTotals::default(),
+            status,
+            torrent: None,
+            stages: Vec::new(),
+        }
+    }
+
+    fn control(revision: &str, lifecycle: &str) -> JobControl {
+        JobControl {
+            version: 1,
+            revision: revision.into(),
+            lifecycle: lifecycle.into(),
+            cause: "capacity".into(),
+            stage: "download_write".into(),
+            retry_policy: "scheduled_retry".into(),
+            message: String::new(),
+            instance: "i".into(),
+            previous_status: Some(JobStatus::Downloading),
+            manual_pause: false,
+            retry_attempt: 1,
+            next_retry_at_unix: None,
+            blocked_since_unix: None,
+            released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
+        }
+    }
+
+    /// Review #297 r2-1: a marker this build stamps on a hold validates on a
+    /// 0.5.0 node (which hashes `paused`) and reads back as `Held` here.
+    #[test]
+    fn a_held_marker_is_stamped_in_the_050_form_and_reads_back_held() {
+        let mut before = job(JobStatus::Held);
+        before.set_control(&control("1", "held"));
+        let mut result = job(JobStatus::Held);
+        result.set_control(&control("2", "held"));
+        stamp(&before, &mut result, "installation", None).unwrap();
+        let (_, raw) = result
+            .params
+            .iter()
+            .find(|(key, _)| key == AUTOMATIC_CONTROL_PARAM)
+            .unwrap();
+        let wire: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(wire["baseStatus"], "paused");
+        assert_eq!(wire["resultStatus"], "paused");
+        // What a 0.5.0 node decodes: the stamped statuses, as written.
+        let as_050: AutomaticControlTransition = serde_json::from_str(raw).unwrap();
+        assert!(
+            as_050.valid_identity(),
+            "0.5.0 recomputes the same identity"
+        );
+        assert_eq!(as_050.result_status, JobStatus::Paused);
+        // This build: valid, current, and projected back to `Held`.
+        let marker = transition(&result).expect("the marker is current");
+        assert_eq!(marker.base_status, JobStatus::Held);
+        assert_eq!(marker.result_status, JobStatus::Held);
+        // A release is not a hold: its status is stamped as it is.
+        let mut released = job(JobStatus::Queued);
+        released.set_control(&control("3", "running"));
+        let mut released_before = result.clone();
+        released_before
+            .params
+            .retain(|(key, _)| key != AUTOMATIC_CONTROL_PARAM);
+        stamp(&released_before, &mut released, "installation", None).unwrap();
+        let marker = transition(&released).unwrap();
+        assert_eq!(marker.base_status, JobStatus::Held);
+        assert_eq!(marker.result_status, JobStatus::Queued);
     }
 }

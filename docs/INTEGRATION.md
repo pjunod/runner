@@ -197,7 +197,7 @@ never consulted to settle a terminal in normal operation.
 | Receipt field | Meaning |
 |---|---|
 | `protocolVersion`, `requestToken`, `jobId`, `generation`, `runnerInstanceId`, `submissionSha256` | identity of the admission |
-| `outcome` | the admission's outcome (the continuity-loss lookup) |
+| `outcome` | the admission's outcome (the continuity-loss lookup): the job's queue status while it is queued — `fetching` · `queued` · `downloading` · `paused` · `held` (since 0.6.0; a hold read `paused` before) · `post_queued` · `post_processing` · `completed` · `failed` — then `completed`, `failed` or `deleted` once it leaves the queue |
 | `terminalOutcome`, `failureStage`, `failureCause` | the terminal's history status string and failure detail |
 | `failureReason`, `fetchCause`, `blamesRelease`, `salvage` | the typed terminal (§2.2), from the `Failure:Reason` / `Failure:FetchCause` / `Failure:BlamesRelease` / `Failure:Salvage` params |
 | `publicationPath`, `sourceArtifactId`, `sourceGeneration`, `keepSourceOnFailure` | where the bytes went |

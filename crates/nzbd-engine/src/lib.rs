@@ -110,6 +110,27 @@ fn url_storage_error(error: nzbd_state::artifacts::Error) -> EngineError {
     }
 }
 
+/// [`nzbd_types::Job::normalize_hold_status`] for a row read from storage
+/// (the queue snapshot, an import, a replicated row): a `held` row that no
+/// longer has a holding control becomes `paused`, and that is logged with
+/// the control found — a damaged hold must not turn into a person's pause
+/// without a trace (contract §2.3). Returns what changed.
+pub fn normalize_stored_hold_status(
+    job: &mut nzbd_types::Job,
+    whence: &str,
+) -> nzbd_types::HoldStatusChange {
+    let change = job.normalize_hold_status();
+    if change == nzbd_types::HoldStatusChange::LostHold {
+        tracing::warn!(
+            job = job.id.0,
+            whence,
+            control = ?job.control(),
+            "a held job has no holding control; it is now paused and waits for a person"
+        );
+    }
+    change
+}
+
 /// Contract §2.3 — the environmental hold an errno names, or `None` when
 /// retrying the same call cannot help (a refused permission, a missing file:
 /// the job's terminal `failed/io`, §2.2).

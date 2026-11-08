@@ -551,6 +551,17 @@ pub struct StageSpan {
     pub ms: Option<u64>,
 }
 
+/// What [`Job::normalize_hold_status`] did to a row's status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldStatusChange {
+    Unchanged,
+    /// `paused` + a held control (a 0.5.0 row) became `held`.
+    Held,
+    /// `held` without a holding control became `paused`: the hold record
+    /// was lost or replaced. Callers reading stored rows log it.
+    LostHold,
+}
+
 /// Job param stamped by post-processing when it finishes (value = final
 /// PP status). Its presence means "never post-process this job again" —
 /// across restarts, leader failovers and lease reclaims.
@@ -1136,20 +1147,26 @@ impl Job {
     /// queue, a replicated cluster record, an imported or adopted job.
     ///
     /// A 0.5.0 row stores a hold as `paused` + a held control: that is
-    /// `Held`. A `held` status whose control no longer holds (a release
-    /// written by a 0.5.0 node that kept the status, or a lost control) is
-    /// stopped without a hold, which is `Paused` — a person resumes it.
-    /// Returns whether the status changed.
-    pub fn normalize_hold_status(&mut self) -> bool {
+    /// `Held` ([`HoldStatusChange::Held`], the expected upgrade path). A
+    /// `held` status whose control no longer holds — a lost or clobbered
+    /// control — is stopped without a hold, which is `Paused`, a person
+    /// resumes it ([`HoldStatusChange::LostHold`]). That second case hides
+    /// damage, so callers reading a row from storage log it.
+    ///
+    /// Only `Paused`/`Held` are rewritten. A worker control checkpoint can
+    /// leave `Paused` (its `manual_pause`) beside a control of a version this
+    /// build does not know (`version != 1`, which [`Job::held`] treats as a
+    /// hold); such a row turns `Held` on its next load. No 0.5.0 write
+    /// produces it.
+    pub fn normalize_hold_status(&mut self) -> HoldStatusChange {
         let held = self.held();
-        let status = match self.status {
-            JobStatus::Paused if held => JobStatus::Held,
-            JobStatus::Held if !held => JobStatus::Paused,
-            status => status,
+        let (status, change) = match self.status {
+            JobStatus::Paused if held => (JobStatus::Held, HoldStatusChange::Held),
+            JobStatus::Held if !held => (JobStatus::Paused, HoldStatusChange::LostHold),
+            status => (status, HoldStatusChange::Unchanged),
         };
-        let changed = status != self.status;
         self.status = status;
-        changed
+        change
     }
     pub fn set_control(&mut self, control: &JobControl) {
         self.params.retain(|(k, _)| k != CONTROL_PARAM);
@@ -1388,21 +1405,21 @@ mod tests {
             stages: Vec::new(),
         };
         // A person's pause is not a hold.
-        assert!(!job.normalize_hold_status());
+        assert_eq!(job.normalize_hold_status(), HoldStatusChange::Unchanged);
         assert_eq!(job.status, JobStatus::Paused);
         // 0.5.0 stored a hold as `paused` + a held control.
         job.set_control(&control("held"));
-        assert!(job.normalize_hold_status());
+        assert_eq!(job.normalize_hold_status(), HoldStatusChange::Held);
         assert_eq!(job.status, JobStatus::Held);
         assert_eq!(projected_status(&job), "held");
         // A `held` status whose control was released is a plain stop.
         job.set_control(&control("running"));
-        assert!(job.normalize_hold_status());
+        assert_eq!(job.normalize_hold_status(), HoldStatusChange::LostHold);
         assert_eq!(job.status, JobStatus::Paused);
         // Only a stopped status is rewritten.
         job.status = JobStatus::Queued;
         job.set_control(&control("held"));
-        assert!(!job.normalize_hold_status());
+        assert_eq!(job.normalize_hold_status(), HoldStatusChange::Unchanged);
         assert_eq!(job.status, JobStatus::Queued);
     }
 }

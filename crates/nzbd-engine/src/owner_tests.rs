@@ -3145,10 +3145,28 @@ async fn a_hold_is_held_and_a_pause_inside_it_is_remembered() {
     owner.state.jobs.push(pending_job(1));
     owner.state.jobs.push(pending_job(2));
     owner.state.jobs[1].status = JobStatus::Paused;
+    // The fixture's channel holds one event; this test counts them.
+    owner.events = tokio::sync::broadcast::channel(64).0;
+    let mut events = owner.events.subscribe();
     for job in [JobId(1), JobId(2)] {
         assert!(owner.hold_job(job, HoldCause::Capacity, "download_write", "ENOSPC"));
     }
     pump(&mut owner, &mut messages).await;
+    // One `held` status change per hold (contract §2.4).
+    let held_changes = |events: &mut tokio::sync::broadcast::Receiver<Event>| {
+        let mut seen = std::collections::HashMap::<JobId, usize>::new();
+        while let Ok(event) = events.try_recv() {
+            if let Event::JobStatusChanged { job, status, .. } = event {
+                if status == "held" {
+                    *seen.entry(job).or_default() += 1;
+                }
+            }
+        }
+        seen
+    };
+    let seen = held_changes(&mut events);
+    assert_eq!(seen.get(&JobId(1)), Some(&1), "{seen:?}");
+    assert_eq!(seen.get(&JobId(2)), Some(&1), "{seen:?}");
     for (index, manual) in [(0, false), (1, true)] {
         let job = &owner.state.jobs[index];
         assert_eq!(job.status, JobStatus::Held);
@@ -3164,6 +3182,10 @@ async fn a_hold_is_held_and_a_pause_inside_it_is_remembered() {
     assert!(paused.await.unwrap());
     assert_eq!(owner.state.jobs[0].status, JobStatus::Held);
     assert!(owner.state.jobs[0].control().unwrap().manual_pause);
+    assert!(
+        held_changes(&mut events).is_empty(),
+        "a pause inside a hold is not another status change"
+    );
     // The storage release keeps the remembered pause (`retry_hold_proven`
     // is the operator retry, which clears it; this is the capacity path).
     let (reply, released) = oneshot::channel();
