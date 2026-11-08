@@ -7564,7 +7564,10 @@ fn checkpoint_custody_batch_matches_individual_refresh_and_fresh_keep_changes() 
             serde_json::to_value(&expected).unwrap()
         );
         assert_eq!(receipts[0].keep_source_on_failure, keep);
-        assert_eq!(receipts[1].source_artifact_id.as_deref(), Some(artifact.id.as_str()));
+        assert_eq!(
+            receipts[1].source_artifact_id.as_deref(),
+            Some(artifact.id.as_str())
+        );
         assert_eq!(receipts[2].custody_state, "runner_owned");
         assert_eq!(receipts[3].custody_state, "runner_owned");
         assert_eq!(receipts[4].custody_state, "curator");
