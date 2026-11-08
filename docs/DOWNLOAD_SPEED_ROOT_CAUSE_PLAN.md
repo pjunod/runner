@@ -484,6 +484,14 @@ inside rollback-only trials took 1.4–2.2 ms before indexing and 4.4–4.9 ms a
 Those update timings exclude commit/fsync and are not nuc3 predictions. The
 added write cost is real and remains part of runtime qualification.
 
+The first CI run exposed a fixture race in
+[`acknowledged_worker_api_import_is_noop_for_late_preterminal_descriptor`](../crates/nzbd-engine/src/owner_tests.rs):
+it attempted publication immediately after asynchronous import acknowledgement,
+while source verification could still hold custody. The fixture now waits on
+the existing export-readiness helper before publication. Production custody
+checks are unchanged. The exact failing test and the affected owner subset are
+included in follow-up validation.
+
 Validation results and PR merge status are recorded with the PR. The remaining
 root-cause attribution and live comparison gates in §6 remain necessary before
 claiming the earlier 109 MiB/s rate has been restored.
