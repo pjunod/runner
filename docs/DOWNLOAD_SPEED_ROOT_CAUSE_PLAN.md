@@ -589,3 +589,58 @@ with the PR. Runtime acceptance still requires untraced sustained measurements
 on nuc3 with one active download, unchanged provider settings, and verified
 binary provenance. The target remains 109 MiB/s; a passing test suite alone
 does not establish that throughput.
+
+## 11. Follow-up — receipt custody refresh blocked the owner
+
+PR #290 merged as `0b7fa3b` and deployed the verified `ef5692d` source tree.
+A separate actual-file 20-second trace showed the intended flush reduction:
+payload writer syncs fell from 1,123 calls / 18.059 seconds to 100 calls /
+1.399 seconds; journal syncs fell from 1,123 / 12.526 seconds to 15 / 0.192
+seconds. Recovery-loaded untraced windows still measured only 11–13 MiB/s.
+These windows do not establish steady-state restoration to 109 MiB/s.
+
+Targeted owner probes isolated the remaining pauses. Most `grant_work` calls
+took less than 128 microseconds, but occasional writer births and completion
+handlers took 1–4 seconds. Queue document cloning consumed only 0.438 seconds
+in one 20-second sample, and owner ticks only 0.064 seconds. In the next
+20-second sample, `refresh_url_admission_custody` consumed 17.634 seconds;
+synchronizing receipt fields in memory took 0.002 seconds and lifecycle
+timing took 0.021 seconds. All 30 provider sockets were present, with empty
+receive buffers and several-second command gaps. The owner was repeatedly
+blocked in receipt refresh rather than servicing those connections.
+
+`persist_then` refreshes every URL receipt before enqueuing a structural
+snapshot. A pinned receipt calls `Inventory::get`, which reads and decodes
+the complete artifact JSON, including its file manifest, while holding the
+inventory connection mutex. Custody refresh uses only generation, state,
+ownership and Keep flags. The checkpoint path runs for writer birth, file
+publication intent and recovery progress, so queue and receipt history amplify
+the cost. The refresh behavior predates the batching change.
+
+A further syscall probe identified the dominant round trip: in a 20-second
+window, 1,318 custody refreshes consumed 1.284 seconds, of which 1,124 `fcntl`
+calls consumed 1.235 seconds. Page reads took only 0.001 seconds and futex waits
+0.010 seconds. Individual SQLite read transactions repeatedly acquire/release
+file locks through the GlusterFS volume. A projection alone cannot remove
+those per-query lock round trips.
+
+The follow-up reads all checkpoint receipt headers with one bound JSON-array
+query and one SQLite read statement/transaction, then applies the same custody
+rules to each receipt. Missing rows and per-row decoding failures leave only
+that receipt unchanged. Unpinned failed sources are pinned first using the
+existing generation/installation checks. The batch reads current values at
+one consistent point; it is not cached across checkpoints.
+
+Both batch and individual lookups use an indexed `json_remove(data,'$.files')`
+projection (guarded by `json_valid`, retaining malformed rows as raw data). The index carries the compact header beside the artifact
+ID, avoiding reads and decoding of the full manifest on this hot path. It
+returns an explicit custody-only value, retains the existing artifact metadata
+validation and generation comparison, and reads current values on every call.
+There is no cache timeout, delayed custody update, or change to the state/Keep
+rules. The rare unpinned failed-source lookup retains its existing behavior.
+
+Validation must cover existing-inventory reopen, index selection and avoidance
+of table-blob reads, equality with the current full-artifact custody fields,
+missing/stale generations, and updates to state/ownership/Keep metadata.
+After review, CI and deployment, repeat the owner-latency trace and sustained
+one-slot download measurements. The 109 MiB/s runtime gate remains open.
