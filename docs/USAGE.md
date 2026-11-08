@@ -43,6 +43,25 @@ stage*, then *held*. A paused lane latches amber with a ▶; click it to resume.
 Each paused lane gets its own badge naming the client that paused it, and
 both survive a restart. The mobile app has the same two toggles.
 
+**Storage.** The Storage panel beside the rate tiles has one row per
+filesystem Runner writes to, named for what it holds: **processing** (state,
+working, failed, intermediate, temporary and watch folders) or **completed**
+(the downloads directory, category destinations and torrent payloads). A
+filesystem holding both says **processing · completed**; hover the row for
+the exact roles, the path and used / total. The left half is capacity and
+free space. The right half graphs the last three minutes of writes (filled)
+and reads (line) at one point a second, with the current rates beside it and
+the busiest second in view printed at the graph's top-left. What the numbers
+cover depends on the filesystem, and the tooltip says which:
+
+- a local disk or a container bind mount of one is **device-wide**: every
+  program using that disk counts, not only Runner;
+- an NFS mount is **this machine's traffic** to the server; other clients of
+  the NAS are not visible from here;
+- SMB/CIFS, FUSE and overlay mounts expose no counters and read **I/O n/a**
+  instead of drawing a flat line. A gap in a graph is a second that was not
+  measured, never a claim of zero.
+
 **Adding downloads.** **+ add nzb** uploads one or more local NZB files.
 **+ add torrent** opens an inline form for a magnet link, remote `.torrent`
 URL, or local `.torrent` file, with category, priority, and add-paused options.

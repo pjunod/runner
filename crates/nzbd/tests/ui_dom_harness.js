@@ -437,10 +437,13 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
 // --- 8b. storage paths: capacity, warning levels, stable rows ------------
 {
   const GiB = 1024 ** 3;
+  const MiB = 1024 ** 2;
   const storage = T.storageModels({ storage: [
-    { label: "working", path: "/data/working", available_bytes: 25 * GiB, total_bytes: 100 * GiB },
-    { label: "downloads", path: "/data/downloads", available_bytes: 10 * GiB, total_bytes: 100 * GiB },
-    { label: "failed", path: "/data/failed", available_bytes: null, total_bytes: null },
+    { name: "processing", label: "state · working", path: "/data/working", available_bytes: 25 * GiB, total_bytes: 100 * GiB,
+      io: { source: "block", detail: "nvme0n1p2", read_bps: 2 * MiB, write_bps: 90 * MiB } },
+    { name: "completed", label: "downloads", path: "/data/downloads", available_bytes: 10 * GiB, total_bytes: 100 * GiB,
+      io: { source: "nfs", detail: "nas:/share", read_bps: null, write_bps: null } },
+    { label: "failed", path: "/data/failed", available_bytes: null, total_bytes: null, io: null },
   ] });
   eq(storage.length, 3, "every configured storage path gets a row");
   eq(storage[0].pct, "75%", "fullness is used capacity, not free capacity");
@@ -448,17 +451,77 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(storage[0].free, "25.0 GiB free", "remaining capacity is stated too");
   ok(storage[1].cls.includes("warn"), "a filesystem at 90% reads as a warning");
   eq(storage[2].pct, "measuring…", "the initial probe does not pretend zero usage");
+  eq(storage[0].label, "processing", "a row is named for what the filesystem is for");
+  ok(storage[0].tip.includes("(state · working)"), "the configured roles stay in the tooltip");
+  ok(storage[0].tip.includes("75.0 GiB used of 100 GiB"), "used and total capacity move into the tooltip");
+  eq(storage[2].label, "failed", "an older daemon without a name falls back to the role label");
+  eq(storage[0].ioA, "W 90.0 MiB/s", "the write rate is stated");
+  eq(storage[0].ioB, "R 2.0 MiB/s", "the read rate is stated");
+  ok(storage[0].ioTip.includes("nvme0n1p2") && storage[0].ioTip.includes("other program"),
+    "block-device I/O is named as device-wide");
+  ok(storage[1].ioQuiet && storage[1].ioA === "measuring…", "no rate until the second sample");
+  ok(storage[1].ioTip.includes("nas:/share") && storage[1].ioTip.includes("Other clients"),
+    "NFS I/O is named as this machine's traffic only");
+  eq(storage[2].ioA, "no I/O data", "a filesystem with no device identity says so");
+  {
+    const na = T.storageIoModel({ source: "unsupported", detail: "cifs", read_bps: null, write_bps: null });
+    ok(na.ioQuiet && na.ioA === "I/O n/a" && na.ioTip.includes("(cifs)"),
+      "a filesystem without counters names its type rather than drawing a flat line");
+    const stale = T.storageIoModel({ source: "stale", detail: "sda1", read_bps: null, write_bps: null });
+    eq(stale.ioA, "I/O stalled", "a stopped sampler is reported, not frozen");
+  }
 
   const list = node("div");
   T.reconcileRows(list, storage, fake);
   const first = list.children[0];
-  eq(first.children[0].children[0].textContent, "working", "the path role is visible");
-  eq(first.children[0].children[1].textContent, "/data/working", "the actual path is visible");
-  eq(first.children[1].children[0].style.width, "75.0%", "the bar shows the same fullness");
+  const cap = first.children[0], ioCell = first.children[1];
+  eq(cap.children[0].children[0].textContent, "processing", "the filesystem's name is visible");
+  eq(cap.children[0].children[1].textContent, "/data/working", "the actual path is visible");
+  eq(cap.children[1].children[0].children[0].style.width, "75.0%", "the bar shows the same fullness");
+  eq(cap.children[1].children[1].textContent, "25.0 GiB free", "free space sits beside the bar");
+  eq(ioCell.children[1].children[0].textContent, "W 90.0 MiB/s", "the write rate sits beside its graph");
+  eq(ioCell.children[1].children[1].textContent, "R 2.0 MiB/s", "the read rate sits under it");
   resetCounts();
   T.reconcileRows(list, storage, fake);
   eq(counts.text + counts.cls + counts.style + counts.prop, 0,
     "unchanged storage readings do not rewrite their rows");
+}
+
+// --- 8c. storage I/O history: gaps stay gaps, three minutes per row -----
+{
+  T.storageIo.clear();
+  T.storageIoLatest.clear();
+  const rows = [{ path: "/p" }];
+  const live = (r, w) => [{ path: "/p", io: { source: "block", detail: "sda1", read_bps: r, write_bps: w } }];
+  let t = 1_000_000;
+  T.noteStorageIo(live(1, 2), t);
+  T.sampleStorageIo(rows, true, t += 1000);
+  T.sampleStorageIo(rows, true, t += 1000);
+  eq(JSON.stringify(T.storageIo.get("storage:/p").w), "[2,2]",
+    "an unchanged rate (not re-sent by the stream) still advances the graph");
+  T.noteStorageIo([{ path: "/p", io: { source: "unsupported", detail: "cifs", read_bps: null, write_bps: null } }], t);
+  T.sampleStorageIo(rows, true, t += 1000);
+  T.noteStorageIo(live(3, 4), t);
+  T.sampleStorageIo(rows, true, t += 1000);
+  T.sampleStorageIo(rows, false, t += 3000);
+  T.sampleStorageIo(rows, false, t += 4000);
+  const h = T.storageIo.get("storage:/p");
+  eq(JSON.stringify(h.w), "[2,2,null,4,4,null]",
+    "unmeasured seconds and a dead stream without a recent poll are gaps, not zeros");
+  eq(JSON.stringify(T.storageRuns(h.w)), "[[0,1],[3,4]]", "each measured run is drawn on its own");
+  for (let i = 0; i < 400; i++) T.sampleStorageIo(rows, true, t += 1000);
+  eq(T.storageIo.get("storage:/p").w.length, 180, "history keeps the same three minutes as the rate tile");
+  T.sampleStorageIo([], true, t += 1000);
+  ok(!T.storageIo.has("storage:/p") && !T.storageIoLatest.has("storage:/p"),
+    "a filesystem that leaves the config drops its history");
+  // A tick's rows carry no io: the row reads the stream's latest instead.
+  T.noteStorageIo(live(5, 6), t);
+  const fromTick = T.storageModels({ storage: [{ name: "completed", path: "/p", available_bytes: 1, total_bytes: 2 }] });
+  eq(fromTick[0].ioA, "W 6 B/s", "a tick row shows the rate from the storage_io frame");
+  const fresh = T.storageModels({ storage: [{ name: "completed", path: "/new", available_bytes: 1, total_bytes: 2 }] });
+  eq(fresh[0].ioA, "measuring…", "a row with no sample yet is measuring, not missing");
+  T.storageIo.clear();
+  T.storageIoLatest.clear();
 }
 
 // The summary's progress blocks arrive under snake_case keys (their fields

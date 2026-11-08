@@ -243,6 +243,10 @@ pub struct ServerVolume {
 /// The enforcing disk guard's cached evidence for one filesystem.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StorageVolumeSnapshot {
+    /// What the dashboard calls this filesystem: `processing`, `completed`,
+    /// or both when one filesystem holds both.
+    pub name: String,
+    /// The configured roles on this filesystem, joined with ` · `.
     pub label: String,
     pub path: String,
     pub available_bytes: Option<u64>,
@@ -251,6 +255,23 @@ pub struct StorageVolumeSnapshot {
     /// capacity is conservative last-known data; None means no successful
     /// reading has ever been observed.
     pub current: bool,
+    /// Read/write throughput. `None` when the platform gives this
+    /// filesystem no device identity to sample by.
+    pub io: Option<StorageIoSnapshot>,
+}
+
+/// One filesystem's throughput from the storage I/O sampler.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StorageIoSnapshot {
+    /// `block` (device-wide counters, every program on that disk),
+    /// `nfs` (this machine's traffic to the server), `unsupported` (no
+    /// counters exist; `detail` names the filesystem type), or `stale`
+    /// (the sampler has stopped publishing; rates are withheld).
+    pub source: &'static str,
+    /// The device name, NFS export, or reason.
+    pub detail: String,
+    pub read_bps: Option<u64>,
+    pub write_bps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

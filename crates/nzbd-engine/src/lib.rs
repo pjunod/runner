@@ -15,6 +15,7 @@ mod admissions;
 pub mod automatic_control;
 pub mod backend;
 mod cluster_stop;
+pub mod disk_io;
 mod download_capacity;
 pub mod events;
 pub mod failover;
@@ -719,6 +720,16 @@ impl Engine {
                     }
                 }
             });
+        }
+
+        // Storage throughput for the dashboard: procfs only, on its own
+        // thread, following the capacity probe's filesystems.
+        if !cfg.disk_guard_roots.is_empty() {
+            crate::disk_io::spawn_sampler(
+                owner.disk_guard_handle(),
+                &owner.disk_io_handle(),
+                cancel.clone(),
+            );
         }
 
         tracker.spawn(owner.run(engine_rx));

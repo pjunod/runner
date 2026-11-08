@@ -1,5 +1,51 @@
 # nzbd — Project Status
 
+## Storage I/O in the overview — 2026-11-08
+
+**Status:** draft [#303](https://github.com/pjunod/runner/pull/303) (runner
+0.8.0). Next: the full fast lane once, then merge. Owner: Claude (Opus 5.5
+session). Not deployed — deploy is
+Paul's. The adversarial review was cut short at Paul's call to hurry and did
+not report; nothing from it is folded in.
+
+**Local gate (NZBD_REQUIRE_TOOLS=1, nothing skipped):** fmt; clippy
+`--workspace --all-targets -D warnings`; nzbd-engine `disk_io` 10 and
+`volumes` 21 (one, `inaccessible_path_is_unknown…`, fails only as root
+because root ignores permission bits — it fails identically on main and
+passes run as `nobody`); nzbd-api lib 92 (including the docs contract and
+the idle-stream `hb` test); engine e2e storage inventory; UI harnesses
+(1,024 DOM assertions, boot). Not run here: the full `make fast-check` and
+the rest of the workspace suite; run them once on the PR. A live daemon was
+checked in headless Chrome, light and dark, 1100 px and 400 px: the
+overview is 109 px tall, the same as 0.7.0.
+
+**Post-deploy checks:** on nuc3, the processing and completed rows show
+`block` or `nfs` rates (hover the graph for the source); a SMB or FUSE
+mount reads "I/O n/a". `curl -s :6789/api/v1/status | jq '.storage[].io'`
+shows the source per row.
+
+Paul approved option 2 of the mockups (split panel, rate-graph style).
+
+- **Engine.** `disk_io` samples once a second on its own thread, from procfs
+  only: `/proc/diskstats` for block devices (anonymous `st_dev` such as btrfs
+  falls back to the mount source), `/proc/self/mountstats` server bytes for
+  NFS, otherwise `unsupported` with the filesystem type. Rates older than
+  5 s are withheld as `stale`. Each storage row also gets a `name`
+  (processing / completed / both) from its roles; the role `label` is
+  unchanged because the disk guard and file lifecycle key on it.
+- **API.** `storage[].name` and `storage[].io {source, detail, read_bps,
+  write_bps}` on `/api/v1/status`. The tick omits `io` so its de-duplication
+  still holds on an idle queue; `/api/v1/events?storage_io=1` adds a
+  `storage_io` frame (1 Hz, only on change, not counted as stream activity).
+- **Web UI.** Each row: capacity on the left, three-minute write/read graph
+  and rates on the right. Used / total and roles moved to the tooltip.
+- **Fixed during the build:** the dev_t minor mask was wrong for majors above
+  4095 (caught by the test).
+
+**Decision made without Paul (review later):** I/O moved off the tick onto
+an opt-in frame, because per-second counters stopped an idle stream ever
+going quiet, including for the mobile app, which does not draw the graph.
+
 ## Split pause: downloads and post-processing pause independently — 2026-11-08
 
 **Status:** merged as [#302](https://github.com/pjunod/runner/pull/302) (runner 0.7.0,

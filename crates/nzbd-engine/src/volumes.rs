@@ -264,6 +264,57 @@ pub struct StorageVolumeReading {
     /// present, are conservative last-known data retained after a timeout or
     /// inaccessible path.
     pub current: bool,
+    /// What the configured paths on this filesystem are for, which is what
+    /// the dashboard names the row by.
+    pub kinds: StorageKinds,
+}
+
+/// What a filesystem holds, from the roles of the configured paths on it.
+///
+/// `label` keeps the exact roles (`state · working · failed`) because the
+/// disk guard, its log lines and the file-lifecycle code key on them. The
+/// dashboard instead names a filesystem by the one thing an operator cares
+/// about: is this where jobs are worked on, or where finished jobs land?
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageKinds {
+    pub processing: bool,
+    pub completed: bool,
+}
+
+impl StorageKinds {
+    /// Classify one role label as produced by `Config::storage_roots`.
+    /// Finished output (the downloads directory, category destinations and
+    /// torrent payloads) is "completed"; everything Runner works in on the
+    /// way there (state, working, failed, intermediate, temporary, watch
+    /// folders, torrent control) is "processing".
+    pub fn of_role(role: &str) -> Self {
+        let completed = role == "downloads"
+            || role == "torrent payloads"
+            || role.starts_with("category: ")
+            || role.starts_with("torrent category: ");
+        StorageKinds {
+            processing: !completed,
+            completed,
+        }
+    }
+
+    pub fn union(self, other: StorageKinds) -> StorageKinds {
+        StorageKinds {
+            processing: self.processing || other.processing,
+            completed: self.completed || other.completed,
+        }
+    }
+
+    /// The dashboard name, falling back to the role label when nothing has
+    /// been classified.
+    pub fn name(self, fallback: &str) -> String {
+        match (self.processing, self.completed) {
+            (true, true) => "processing · completed".to_owned(),
+            (true, false) => "processing".to_owned(),
+            (false, true) => "completed".to_owned(),
+            (false, false) => fallback.to_owned(),
+        }
+    }
 }
 
 struct StorageMember<'a> {
@@ -507,6 +558,7 @@ fn default_probe_spawner() -> ProbeSpawner {
 
 fn unknown_storage_volume(label: String, path: PathBuf) -> StorageVolumeReading {
     StorageVolumeReading {
+        kinds: StorageKinds::of_role(&label),
         label,
         path,
         available_bytes: None,
@@ -704,6 +756,12 @@ pub fn storage_volume_readings(roots: &[DiskGuardRoot]) -> Vec<StorageVolumeRead
                 total_bytes: space.map(|reading| reading.total),
                 device_id: group.device,
                 current: space.is_some(),
+                kinds: group
+                    .members
+                    .iter()
+                    .fold(StorageKinds::default(), |kinds, member| {
+                        kinds.union(StorageKinds::of_role(&member.root.label))
+                    }),
             }
         })
         .collect()
@@ -804,6 +862,7 @@ fn coalesce_storage_volumes(
             group.label.push_str(&reading.label);
             group.path = common_path_pair(&group.path, &reading.path);
             group.current &= reading.current;
+            group.kinds = group.kinds.union(reading.kinds);
             if let Some(available) = reading.available_bytes {
                 let should_replace = group
                     .available_bytes
@@ -937,6 +996,7 @@ mod tests {
                 available_bytes: Some(900),
                 total_bytes: Some(1000),
                 device_id: Some(1),
+                kinds: StorageKinds::default(),
                 current: true,
             },
             StorageVolumeReading {
@@ -945,6 +1005,7 @@ mod tests {
                 available_bytes: Some(100),
                 total_bytes: Some(1000),
                 device_id: Some(2),
+                kinds: StorageKinds::default(),
                 current: true,
             },
             StorageVolumeReading {
@@ -953,6 +1014,7 @@ mod tests {
                 available_bytes: Some(500),
                 total_bytes: Some(1000),
                 device_id: Some(3),
+                kinds: StorageKinds::default(),
                 current: true,
             },
         ]);
@@ -972,6 +1034,7 @@ mod tests {
             available_bytes: None,
             total_bytes: None,
             device_id: None,
+            kinds: StorageKinds::default(),
             current: false,
         }]);
         assert_eq!(reading.available_bytes, None);
@@ -1002,6 +1065,7 @@ mod tests {
                 available_bytes: Some(10),
                 total_bytes: Some(1000),
                 device_id: Some(1),
+                kinds: StorageKinds::default(),
                 current: false,
             },
             StorageVolumeReading {
@@ -1010,6 +1074,7 @@ mod tests {
                 available_bytes: Some(900),
                 total_bytes: Some(1000),
                 device_id: Some(2),
+                kinds: StorageKinds::default(),
                 current: true,
             },
         ]);
@@ -1027,6 +1092,7 @@ mod tests {
                 available_bytes: Some(900),
                 total_bytes: Some(1000),
                 device_id: Some(7),
+                kinds: StorageKinds::default(),
                 current: false,
             },
             StorageVolumeReading {
@@ -1035,6 +1101,7 @@ mod tests {
                 available_bytes: Some(10),
                 total_bytes: Some(1000),
                 device_id: Some(7),
+                kinds: StorageKinds::default(),
                 current: true,
             },
         ]));
@@ -1052,6 +1119,7 @@ mod tests {
             available_bytes: Some(10),
             total_bytes: Some(1000),
             device_id: Some(7),
+            kinds: StorageKinds::default(),
             current: true,
         };
         let unknown = StorageVolumeReading {
@@ -1060,6 +1128,7 @@ mod tests {
             available_bytes: None,
             total_bytes: None,
             device_id: Some(7),
+            kinds: StorageKinds::default(),
             current: false,
         };
         for readings in [
@@ -1096,6 +1165,7 @@ mod tests {
                     available_bytes: Some(500),
                     total_bytes: Some(1000),
                     device_id: None,
+                    kinds: StorageKinds::default(),
                     current: true,
                 })
             })
@@ -1231,6 +1301,7 @@ mod tests {
                     available_bytes: Some(1),
                     total_bytes: Some(2),
                     device_id: None,
+                    kinds: StorageKinds::default(),
                     current: true,
                 })
             },
@@ -1279,6 +1350,7 @@ mod tests {
                     available_bytes: Some(100),
                     total_bytes: Some(200),
                     device_id: None,
+                    kinds: StorageKinds::default(),
                     current: true,
                 })
             },
@@ -1399,6 +1471,7 @@ mod tests {
                 available_bytes: Some(500),
                 total_bytes: Some(1000),
                 device_id: None,
+                kinds: StorageKinds::default(),
                 current: true,
             })
         };
@@ -1426,6 +1499,7 @@ mod tests {
                     available_bytes: Some(600),
                     total_bytes: Some(1000),
                     device_id: None,
+                    kinds: StorageKinds::default(),
                     current: true,
                 })
             })

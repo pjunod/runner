@@ -2034,6 +2034,7 @@ async fn storage_inventory_publishes_when_the_enforcing_floor_is_disabled() {
             assert!(!snapshot.disk_low);
             assert!(snapshot.storage_volumes[0].current);
             assert_eq!(snapshot.storage_volumes[0].label, "downloads");
+            assert_eq!(snapshot.storage_volumes[0].name, "completed");
             break;
         }
         assert!(
@@ -2041,6 +2042,36 @@ async fn storage_inventory_publishes_when_the_enforcing_floor_is_disabled() {
             "storage inventory was not published with the floor disabled"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The I/O sampler follows the capacity probe's filesystems. On Linux
+    // every row gets a source within a few samples; a block device or NFS
+    // mount also gets rates once two samples exist.
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let snapshot = engine.snapshot();
+            let io = snapshot.storage_volumes[0].io.clone();
+            let done = match &io {
+                Some(io) if io.source == "unsupported" => {
+                    assert!(io.read_bps.is_none() && !io.detail.is_empty());
+                    true
+                }
+                Some(io) if io.source == "block" || io.source == "nfs" => {
+                    io.read_bps.is_some() && io.write_bps.is_some()
+                }
+                _ => false,
+            };
+            if done {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "storage I/O was not published: {io:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
     engine.shutdown().await;
 }

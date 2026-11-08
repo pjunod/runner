@@ -28,7 +28,9 @@ use crate::queue::{
 };
 use crate::rate::{RateLimiter, SpeedMeter};
 use crate::recovery::{DurableFileProof, ProvenRange, WRITER_PROTOCOL};
-use crate::snapshot::{JobSummary, QueueSnapshot, SharedSnapshot, StorageVolumeSnapshot};
+use crate::snapshot::{
+    JobSummary, QueueSnapshot, SharedSnapshot, StorageIoSnapshot, StorageVolumeSnapshot,
+};
 use crate::volumes::DiskGuardReading;
 use crate::writer::{spawn_writer_scoped, WriteCmd, WriterFact, WriterHandle, WriterScope};
 #[path = "owner_recovery.rs"]
@@ -1084,6 +1086,9 @@ pub(crate) struct Owner {
     /// 2026-07-26). An initially unknown reading never trips the guard; an
     /// incomplete later cycle cannot clear a hold that already exists.
     disk_guard: Arc<ArcSwap<DiskGuardReading>>,
+    /// Latest per-filesystem throughput from the storage I/O sampler.
+    /// Read-only here: the sampler thread owns the writes.
+    disk_io: Arc<ArcSwap<crate::disk_io::DiskIoReading>>,
     /// The exact reading used for the most recent admission decision.
     /// Snapshot publication must not reload `disk_guard`: the prober may
     /// publish a newer value between decision and status publication, which
@@ -1573,6 +1578,9 @@ impl Owner {
             last_save_ms: 0,
             background_save_pending: false,
             disk_guard: Arc::new(ArcSwap::from_pointee(DiskGuardReading::default())),
+            disk_io: Arc::new(ArcSwap::from_pointee(
+                crate::disk_io::DiskIoReading::default(),
+            )),
             evaluated_disk_guard: Arc::new(DiskGuardReading::default()),
             volumes: crate::volumes::VolumeBook::load(state_dir, journal_suffix),
             quota_probe_pending: false,
@@ -8528,6 +8536,10 @@ impl Owner {
 
     /// The prober task's write side, handed out at spawn (lib.rs) so the
     /// statvfs syscall lives on a blocking thread, never in this loop.
+    pub(crate) fn disk_io_handle(&self) -> Arc<ArcSwap<crate::disk_io::DiskIoReading>> {
+        self.disk_io.clone()
+    }
+
     pub(crate) fn disk_guard_handle(&self) -> Arc<ArcSwap<DiskGuardReading>> {
         self.disk_guard.clone()
     }
@@ -9808,6 +9820,8 @@ impl Owner {
             .collect();
         blocked_servers.sort_unstable();
         let disk_guard = &self.evaluated_disk_guard;
+        let disk_io = self.disk_io.load();
+        let disk_io_stale = disk_io.is_stale(std::time::Instant::now());
         let snap = QueueSnapshot {
             up_since_unix: self.up_since_unix,
             queue_authority: self.persist,
@@ -9857,11 +9871,24 @@ impl Owner {
                 .volumes
                 .iter()
                 .map(|volume| StorageVolumeSnapshot {
+                    name: volume.kinds.name(&volume.label),
                     label: volume.label.clone(),
                     path: volume.path.to_string_lossy().into_owned(),
                     available_bytes: volume.available_bytes,
                     total_bytes: volume.total_bytes,
                     current: volume.current,
+                    io: disk_io
+                        .for_device(volume.device_id)
+                        .map(|io| StorageIoSnapshot {
+                            source: if disk_io_stale {
+                                "stale"
+                            } else {
+                                io.source.kind()
+                            },
+                            detail: io.source.detail().to_owned(),
+                            read_bps: io.read_bps.filter(|_| !disk_io_stale),
+                            write_bps: io.write_bps.filter(|_| !disk_io_stale),
+                        }),
                 })
                 .collect(),
             enospc_observed: self.enospc_observed,
