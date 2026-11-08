@@ -135,6 +135,7 @@ impl Inventory {
                 | "after_last_rename"
                 | "after_manifest"
                 | "after_delivery"
+                | "move_file"
         ) {
             return Err(Error::Conflict(
                 "unsupported relocation test boundary".into(),
@@ -748,6 +749,7 @@ impl Inventory {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn relocate_selected_checked_mode(
         &self,
         job: u32,
@@ -1072,6 +1074,7 @@ impl Inventory {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn relocate_checked_mode_inner(
         &self,
         job: u32,

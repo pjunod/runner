@@ -1401,8 +1401,9 @@ mod tests {
             )
             .await
             .unwrap();
-        // The no-op `accept` reads no body; a missing row is still 404.
-        assert_eq!(unsupported.status(), StatusCode::NOT_FOUND);
+        // There is no acceptance (contract §2.5): `accept` is gone for
+        // every id and body.
+        assert_eq!(unsupported.status(), StatusCode::GONE);
 
         let missing = app
             .clone()
@@ -1424,7 +1425,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing.status(), StatusCode::GONE);
 
         let retry_missing = app
             .oneshot(

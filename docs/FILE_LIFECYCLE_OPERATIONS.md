@@ -1,6 +1,6 @@
 # File lifecycle operations
 
-**Status:** implementation under final preparation · **Updated:** 2026-11-01
+**Status:** implementation under final preparation · **Updated:** 2026-11-07 (pipeline contract v2 M3: per-file publication, no acceptance)
 
 Runner records payload ownership separately from History. Removing a History
 row does not abandon its files. Unknown folders are retained for review, and
@@ -68,10 +68,11 @@ opening a job never scans the Delivery collection to guess its receipt.
 Measured queue, fetch, download and processing steps remain separate for each
 machine and process session. A subtotal counts overlapping completed steps once,
 using recorded monotonic endpoints. The immutable publication snapshot measures
-queue, URL fetch, download and processing through READY. Consumer acceptance
-and handoff retry observations remain in the separate mutable receipt lane;
-Runner does not invent a handoff duration ending after the snapshot. The wire
-contract also accepts a future explicit `handoff` interval.
+queue, URL fetch, download and processing through READY. There is no consumer
+acceptance (pipeline contract v2 §2.5): curator owns a publication from the
+moment its `.runner-manifest.json` exists, and Runner does not invent a
+handoff duration ending after the snapshot. The wire contract also accepts a
+future explicit `handoff` interval.
 
 Evidence stays bounded at 128 major intervals. Omission counters are conservative
 lower bounds: **at least N omitted**, and any subtotal describes the **recorded
@@ -80,7 +81,7 @@ measurements survive late imports without being counted twice. StageSpan-based
 processing details lack historical per-span machine/session identity; their
 origin remains explicitly unrecorded, including after restart. Missing or interrupted measurements stay
 unknown. Processing details expand the major steps and are not added again.
-Publication/consumer acceptance and source-copy cleanup follow separately. Copy
+Publication and source-copy cleanup follow separately. Copy
 status, retry attempts and errors lead; exact references can be expanded. Retry
 source cleanup uses its existing independent action, and polling preserves its
 button and focus. Phone queue and History details show the same receipt and
@@ -126,8 +127,27 @@ consumers never cause expiry. A missing heartbeat is diagnostic only.
 - Queue retirement waits for writer-stop acknowledgements. Startup reconciles
   interrupted retirement before resuming writers.
 - Category moves and failed-file parking journal their source and destination.
-  Publication refuses an existing destination. Cross-volume moves verify copies
-  before exact-entry source cleanup. Incomplete scratch is retained for review.
+  A destination root that cannot be created (for example a park volume that is
+  not mounted) is journaled too: the move's operation waits on its retry
+  ladder with the error, visible under Files → **Attention**, and the same move
+  retries. Publication refuses an existing destination. Cross-volume whole-directory
+  moves verify copies before exact-entry source cleanup. Incomplete scratch is
+  retained for review.
+- A selected publication moves **file by file** under a journaled intent
+  (`relocation_intents`: generation, target, each file's identity, digest and
+  destination), written before the first rename; `.runner-manifest.json` is
+  written last. On restart each open intent is finished (every file found
+  unchanged in the target or the source) or unwound (moved files put back by
+  identity, the target removed, the job failed `io` and parked) — never both.
+  While an intent is open, deletion, disposal and queue retirement refuse
+  either side; the source shows under Files → **Attention** in state
+  `transitioning`. Same-volume files are renamed (no copy, one digest read at
+  most); cross-volume files are streamed once, hashing as they are written. A
+  published file that a retained PAR set still needs is linked instead, and
+  its source name is retained as `retained_repair_dependency`.
+  The processing directory then holds only unselected siblings, which Runner
+  disposes of once the delivery row exists. See
+  [INTEGRATION.md §2a](INTEGRATION.md#2a-publication-manifest-and-the-move-journal-pipeline-contract-v2-runner-040).
 - A fully journaled recovery publication can finish after a crash by checking
   directory identity, manifest, sizes and hashes. Incomplete staging is retained
   and exposed for explicit review; it is not erased by matching a scratch name.
@@ -135,8 +155,9 @@ consumers never cause expiry. A missing heartbeat is diagnostic only.
   quality/provenance, episode links and each file receipt commit together.
   Outbox delivery retries independently of the browser or original HTTP request.
 
-Do not manually erase SQLite journals, sidecars, rollback files or a directory
-with an active claim. A review state is a request to inspect the recorded paths
+Do not manually erase SQLite journals, sidecars, rollback files, a directory
+with an active claim, or a publication directory without its
+`.runner-manifest.json` (reconciliation owns it until it finishes or unwinds). A review state is a request to inspect the recorded paths
 and actual filesystem, not evidence that the files are disposable.
 
 ## 4. Backup and restore

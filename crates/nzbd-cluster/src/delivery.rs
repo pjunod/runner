@@ -2137,7 +2137,10 @@ mod tests {
             .is_none());
         assert_eq!(page["nextCursor"], final_record.delivery.sequence);
         assert_eq!(by_id["first"]["sequence"], committed.delivery.sequence);
-        assert_eq!(by_id["first"]["consumerReceiptId"], "consumer-receipt");
+        assert!(
+            by_id["first"].get("consumerReceiptId").is_none(),
+            "no acceptance on the feed"
+        );
         // Force an actual false actor commit after its snapshot fence fails.
         // A directory at the projection path also defeats concurrent election
         // projection rewrites until we repair it; no sleep-based race proof.

@@ -145,13 +145,26 @@ struct VerificationFailure {
     reason: String,
     checked_bytes: u64,
     review_required: bool,
+    /// The owner verified against an allocation snapshot that a committed
+    /// inventory transition (e.g. a publication move reconciled at startup)
+    /// has since replaced: reload the allocation and verify again.
+    stale_allocation: bool,
 }
 impl VerificationFailure {
+    fn stale(reason: impl ToString, checked_bytes: u64) -> Self {
+        Self {
+            reason: reason.to_string(),
+            checked_bytes,
+            review_required: false,
+            stale_allocation: true,
+        }
+    }
     fn unavailable(reason: impl ToString, checked_bytes: u64) -> Self {
         Self {
             reason: reason.to_string(),
             checked_bytes,
             review_required: false,
+            stale_allocation: false,
         }
     }
     fn conflict(reason: impl ToString, checked_bytes: u64) -> Self {
@@ -159,6 +172,7 @@ impl VerificationFailure {
             reason: reason.to_string(),
             checked_bytes,
             review_required: true,
+            stale_allocation: false,
         }
     }
 }
@@ -473,6 +487,20 @@ impl Owner {
         }
     }
 
+    /// Re-read the job's allocation and queue its verification again. Not a
+    /// retry ladder: it runs once per observed inventory transition.
+    fn reload_stale_allocation(&mut self, job: JobId) {
+        if let Some(state) = self.verification.get_mut(&job) {
+            state.running = false;
+            state.phase = "loading".into();
+            state.partial = None;
+        }
+        self.queue_payload_recovery(job);
+        self.dirty = true;
+        self.publish_now();
+        self.bump_epoch();
+    }
+
     pub(super) fn start_verifications(&mut self) {
         self.drop_unneeded_verifications();
         if self.cancel.is_cancelled() || self.verification_roots.len() >= MAX_VERIFICATION_WORKERS {
@@ -706,6 +734,10 @@ impl Owner {
         }
         let verified = match result.outcome {
             Ok(verified) => verified,
+            Err(failure) if failure.stale_allocation => {
+                self.reload_stale_allocation(job);
+                return;
+            }
             Err(failure) => {
                 self.block_verification(job, failure);
                 self.dirty = true;
@@ -720,16 +752,9 @@ impl Owner {
                 && cached.path == verified.allocation.path
                 && cached.root == verified.allocation.root
         }) {
-            self.block_verification(
-                job,
-                VerificationFailure::conflict(
-                    "allocation generation changed while verifying",
-                    verified.checked_bytes,
-                ),
-            );
-            self.dirty = true;
-            self.publish_now();
-            self.bump_epoch();
+            // The worker read the current allocation; the owner's cached
+            // snapshot is the stale one.
+            self.reload_stale_allocation(job);
             return;
         }
         if !verified.complete {
@@ -1094,7 +1119,7 @@ fn verify_job_batch(
         || current.path != allocation.path
         || current.root != allocation.root
     {
-        return Err(VerificationFailure::conflict(
+        return Err(VerificationFailure::stale(
             "allocation authority changed before verification",
             checked,
         ));

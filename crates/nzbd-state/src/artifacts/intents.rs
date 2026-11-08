@@ -353,6 +353,7 @@ fn update_intent(db: &Connection, intent: &RelocationIntent) -> Result<()> {
 
 impl Inventory {
     /// The move intent for a selected publication, before anything moves.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new_relocation_intent(
         &self,
         operation: &str,
@@ -735,6 +736,22 @@ impl Inventory {
         checkpoint: &dyn Fn() -> std::io::Result<()>,
         scope: Option<&Identity>,
     ) -> Result<RunnerManifest> {
+        {
+            // The destination root is the one the move journaled; a volume
+            // swapped underneath it (remount, replaced directory) is review.
+            let op = self.operation(&intent.operation)?;
+            let movement: Relocation = serde_json::from_str(&op.request)?;
+            let parent = intent
+                .target_dir
+                .parent()
+                .ok_or_else(|| Error::Conflict("publication has no parent".into()))?;
+            if !movement
+                .destination_root
+                .same_object(&fs::identity_for_file(&fs::open_dir(parent)?)?)
+            {
+                return Err(Error::Conflict("move destination root changed".into()));
+            }
+        }
         match fs::open_dir(&intent.target_dir) {
             Ok(_) => {}
             Err(Error::Io(error))
@@ -1522,12 +1539,11 @@ mod tests {
     /// the delivery.
     #[test]
     fn same_volume_publication_renames_selected_only() {
-        let base = tempfile::tempdir_in(
-            Path::new("/dev/shm")
-                .is_dir()
-                .then_some("/dev/shm")
-                .unwrap_or("/tmp"),
-        )
+        let base = tempfile::tempdir_in(if Path::new("/dev/shm").is_dir() {
+            "/dev/shm"
+        } else {
+            "/tmp"
+        })
         .unwrap();
         let (db, root) = fixture_in(base.path());
         let (source, selected, outcomes) = job(&db, &root, 61, SELECTED, SIBLINGS);

@@ -4612,8 +4612,13 @@ fn success_publication(
 /// still-owned publication (refusing if its digest changed) and retire the
 /// source. True once nothing is owed.
 async fn finish_stamped_delivery(engine: &EngineHandle, job: JobId) -> bool {
-    let Ok(Some(row)) = engine.export_job(job).await else {
-        return true;
+    let row = match engine.export_job(job).await {
+        Ok(Some(row)) => row,
+        // The row is gone: nothing is owed.
+        Ok(None) => return true,
+        // A transient owner state (verification or journal loading): the
+        // delivery may still be owed; never retire the row on a non-answer.
+        Err(_) => return false,
     };
     let param = |key: &str| {
         row.params
@@ -9071,6 +9076,7 @@ mod decision_tests {
                 true,
             )
             .unwrap();
+        assert_eq!(delivery.kind(), "salvage");
         std::fs::remove_dir_all(&published).unwrap();
 
         assert_eq!(
