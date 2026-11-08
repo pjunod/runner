@@ -354,7 +354,7 @@ impl PendingWrites {
             };
             if let Err(error) = result {
                 report
-                    .error(format!("write {}: {error}", part_path.display()))
+                    .io_error(&format!("write {}", part_path.display()), &error)
                     .await;
                 return false;
             }
@@ -366,7 +366,9 @@ impl PendingWrites {
         let identity = match file_identity(file).await {
             Ok(identity) => identity,
             Err(error) => {
-                report.error(error).await;
+                report
+                    .io_error(&format!("identity {}", part_path.display()), &error)
+                    .await;
                 return false;
             }
         };
@@ -1980,7 +1982,10 @@ mod tests {
         let facts = batch_facts(&mut events).await;
         task.await.unwrap();
         assert_eq!(facts.len(), 1);
-        assert!(matches!(&facts[0],WriterFact::Error{error} if error.contains("os error 28")));
+        assert!(
+            matches!(&facts[0], WriterFact::Error { error, cause: Some(nzbd_types::HoldCause::Capacity) } if error.contains("os error 28")),
+            "a failed shared sync on a full volume holds for capacity, not failed/io: {facts:?}"
+        );
         assert_eq!(
             std::fs::read(temp.path().join(".runner-file-2.part")).unwrap(),
             [1, 2, 3, 4]
@@ -2096,7 +2101,9 @@ mod tests {
         let (mut events, _, task) = queued_writer(temp.path(), commands, scope);
         let facts = batch_facts(&mut events).await;
         task.await.unwrap();
-        assert!(matches!(&facts[..], [WriterFact::Error {error}] if error.contains("identity")));
+        assert!(
+            matches!(&facts[..], [WriterFact::Error { error, cause: None }] if error.contains("identity"))
+        );
         assert_eq!(std::fs::read(part).unwrap(), b"foreign mutation");
         assert!(!temp.path().join("out").exists());
     }
