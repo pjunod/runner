@@ -208,13 +208,19 @@ try {
   .storage-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 5px; }
   .storage-head b { font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; }
   .storage-head span { color: var(--muted); font-size: 10.5px; }
-  .storage-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
-    grid-auto-rows: minmax(0, 1fr); flex: 1; gap: 8px 18px; }
-  .storage-row { display: flex; flex-direction: column; justify-content: center;
+  /* One row per filesystem: capacity on the left, the last three minutes
+     of read/write throughput on the right, so a path's fullness and its
+     load read on the same line. Two rows fit the height the overview
+     already had (the stats grid sets it). */
+  .storage-list { display: grid; grid-template-columns: minmax(0, 1fr);
+    grid-auto-rows: minmax(0, 1fr); flex: 1; gap: 4px; }
+  .storage-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     min-width: 0; --storage-color: var(--accent); }
   .storage-row.warn { --storage-color: var(--warn); }
   .storage-row.bad { --storage-color: var(--bad); }
-  .storage-top, .storage-bottom { display: flex; align-items: baseline; gap: 8px;
+  .storage-cap { display: flex; flex-direction: column; justify-content: center;
+    min-width: 0; padding-right: 12px; }
+  .storage-top { display: flex; align-items: baseline; gap: 8px; line-height: 1.3;
     min-width: 0; font-variant-numeric: tabular-nums; }
   .storage-label { flex: 0 1 auto; max-width: 55%; overflow: hidden; text-overflow: ellipsis;
     color: var(--ink2); font-size: 10.5px; font-weight: 650; text-transform: uppercase;
@@ -223,11 +229,26 @@ try {
     color: var(--muted); font: 10.5px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
     white-space: nowrap; }
   .storage-pct { flex: 0 0 auto; color: var(--storage-color); font-size: 11px; font-weight: 650; }
-  .storage-track { height: 5px; margin: 4px 0 3px; overflow: hidden;
+  .storage-capline { display: flex; align-items: center; gap: 8px; margin-top: 2px;
+    color: var(--muted); font-size: 10.5px; line-height: 1.2; font-variant-numeric: tabular-nums; }
+  .storage-track { flex: 1; height: 5px; overflow: hidden;
     background: var(--track); border-radius: 99px; }
   .storage-fill { height: 100%; width: 0; background: var(--storage-color);
     border-radius: inherit; transition: width .5s ease; }
-  .storage-bottom { justify-content: space-between; color: var(--muted); font-size: 10.5px; }
+  .storage-free { flex: 0 0 auto; white-space: nowrap; }
+  .storage-io { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px;
+    min-width: 0; padding-left: 12px; border-left: 1px solid var(--line); }
+  .storage-plot { position: relative; min-width: 0; }
+  .storage-plot canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .storage-rates { display: flex; flex-direction: column; justify-content: space-between;
+    min-width: 74px; color: var(--ink2); font-size: 10.5px; line-height: 1.2;
+    text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .storage-rates.quiet { justify-content: center; color: var(--muted); }
+  .storage-legend { margin-left: auto; white-space: nowrap; }
+  .storage-legend i { display: inline-block; width: 6px; height: 6px; border-radius: 2px;
+    margin: 0 3px 0 7px; vertical-align: 1px; }
+  .storage-legend .w { background: var(--accent); }
+  .storage-legend .r { background: var(--ink2); }
 
   .badges { display: flex; gap: 6px; flex-wrap: wrap; }
   .badge { font-size: 11px; font-weight: 600; border: 1px solid var(--line);
@@ -961,12 +982,10 @@ try {
   @media (max-width: 840px) {
     .overview { grid-template-columns: minmax(0, 1fr); }
     .stats, .overview.no-storage .stats { grid-template-columns: repeat(4, minmax(110px, 1fr)); }
-    .storage-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
   @media (max-width: 640px) {
     .wrap { padding: 12px 10px 34px; }
     .stats, .overview.no-storage .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .storage-list { grid-template-columns: minmax(0, 1fr); }
     th.num, td.num { display: none; }        /* size/health columns */
     th:nth-child(2), td:nth-child(2) { display: none; } /* status column */
     .st.st-inline { display: inline-block; margin-top: 3px; }
@@ -1113,7 +1132,8 @@ try {
     </div>
 
     <div class="storage-panel" id="storage-panel" hidden>
-      <div class="storage-head"><b>Storage</b><span>configured paths and filesystem capacity</span></div>
+      <div class="storage-head"><b>Storage</b><span>capacity · I/O, last 3 minutes</span>
+        <span class="storage-legend" title="Bytes per second written to and read from each filesystem."><i class="w"></i>write<i class="r"></i>read</span></div>
       <div class="storage-list" id="storage-list"></div>
     </div>
   </div>
@@ -3292,6 +3312,9 @@ function statusModels(s) {
 // Each reading is filesystem capacity, even when the configured leaf does
 // not exist yet (the daemon measures its nearest existing ancestor). That
 // makes a future category destination useful before its first job arrives.
+// A row is named for what the filesystem is for (`name`: processing or
+// completed); the exact configured roles stay in its tooltip.
+function storageKey(v, i) { return "storage:" + (v.path || i); }
 function storageModels(s) {
   return (s.storage || []).map((v, i) => {
     const hasReading = v.total_bytes != null && v.available_bytes != null &&
@@ -3303,55 +3326,84 @@ function storageModels(s) {
     const used = Math.max(0, total - available);
     const pct = total ? Math.max(0, Math.min(100, used * 100 / total)) : 0;
     const level = pct >= 95 ? " bad" : pct >= 85 ? " warn" : "";
+    const lastKnown = v.current === false && v.available_bytes != null;
+    const name = v.name || v.label || "path";
+    const roles = v.label && v.label !== name ? " (" + v.label + ")" : "";
     return {
-      key: "storage:" + (v.path || i), kind: "storage",
+      key: storageKey(v, i), kind: "storage",
       cls: "storage-row" + level,
-      label: (v.label || "path") +
-        (v.current === false && v.available_bytes != null ? " · last known" : ""),
+      label: name + (lastKnown ? " · last known" : ""),
       path: v.path || "—",
       pct: hasReading ? Math.round(pct) + "%" : "measuring…",
       fill: hasReading ? pct.toFixed(1) + "%" : "0%",
       used: hasReading ? fmtBytes(used) + " / " + fmtBytes(total) : "capacity unavailable",
       free: hasReading ? fmtBytes(available) + " free" : "",
-      tip: hasReading
-        ? (v.label || "path") +
-          (v.current === false && v.available_bytes != null ? " (last known)" : "") +
-          " on " + (v.path || "") + " — " +
-          fmtBytes(used) + " used of " + fmtBytes(total) +
-          " (" + Math.round(pct) + "%)"
-        : (v.label || "path") +
-          (v.current === false && v.available_bytes != null ? " (last known)" : "") +
-          " on " + (v.path || "") +
-          " — waiting for a capacity reading",
+      tip: name + roles + (lastKnown ? " (last known)" : "") + " on " + (v.path || "") +
+        (hasReading
+          ? " — " + fmtBytes(used) + " used of " + fmtBytes(total) + " (" + Math.round(pct) + "%)"
+          : " — waiting for a capacity reading"),
+      ...storageIoModel(v.io),
     };
   });
 }
 
+// What the I/O half of a row says. The server reports where its numbers
+// come from, and the row says it in words: device-wide counters include
+// every program on that disk, NFS counters are this machine's traffic only,
+// and a filesystem with no counters says so instead of drawing a flat line.
+function storageIoModel(io) {
+  const quiet = (text, tip) => ({ ioQuiet: true, ioA: text, ioB: "", ioTip: tip });
+  if (!io) return quiet("no I/O data",
+    "This platform gives the filesystem no device identity, so Runner cannot sample its I/O.");
+  if (io.source === "unsupported") return quiet("I/O n/a",
+    "No transfer counters exist for this filesystem (" + io.detail + "). Runner graphs block " +
+    "devices and NFS mounts; SMB, FUSE and overlay mounts expose none.");
+  if (io.source === "stale") return quiet("I/O stalled",
+    "The storage I/O sampler has not reported for more than 5 seconds.");
+  const tip = io.source === "nfs"
+    ? "This machine's traffic to " + io.detail + " over the last 3 minutes. " +
+      "Other clients of that server are not visible from here."
+    : "Device-wide reads and writes on " + io.detail + " over the last 3 minutes, " +
+      "including any other program using that disk.";
+  if (io.read_bps == null || io.write_bps == null) return quiet("measuring…", tip);
+  return { ioQuiet: false, ioA: "W " + fmtRate(io.write_bps), ioB: "R " + fmtRate(io.read_bps), ioTip: tip };
+}
+
 function buildStorageRow(d) {
   const row = d.create("div", "storage-row");
-  const top = d.append(row, d.create("div", "storage-top"));
+  const cap = d.append(row, d.create("div", "storage-cap"));
+  const top = d.append(cap, d.create("div", "storage-top"));
   const label = d.append(top, d.create("span", "storage-label"));
   const path = d.append(top, d.create("span", "storage-path"));
   const pct = d.append(top, d.create("span", "storage-pct"));
-  const track = d.append(row, d.create("div", "storage-track"));
+  const line = d.append(cap, d.create("div", "storage-capline"));
+  const track = d.append(line, d.create("div", "storage-track"));
   const fill = d.append(track, d.create("div", "storage-fill"));
-  const bottom = d.append(row, d.create("div", "storage-bottom"));
-  const used = d.append(bottom, d.create("span"));
-  const free = d.append(bottom, d.create("span"));
-  row.__c = { label, path, pct, fill, used, free };
+  const free = d.append(line, d.create("span", "storage-free"));
+  const ioCell = d.append(row, d.create("div", "storage-io"));
+  const plot = d.append(ioCell, d.create("div", "storage-plot"));
+  const canvas = d.append(plot, d.create("canvas"));
+  const rates = d.append(ioCell, d.create("div", "storage-rates"));
+  const rateA = d.append(rates, d.create("span"));
+  const rateB = d.append(rates, d.create("span"));
+  row.__c = { cap, label, path, pct, fill, free, ioCell, canvas, rates, rateA, rateB, key: null };
   return row;
 }
 function applyStorageRow(row, m, d) {
   d = d || dom;
   const c = row.__c, w = differ(row);
+  c.key = m.key;
   w("cls", m.cls, v => d.cls(row, v));
   w("label", m.label, v => d.text(c.label, v));
   w("path", m.path, v => d.text(c.path, v));
   w("pct", m.pct, v => d.text(c.pct, v));
   w("fill", m.fill, v => d.style(c.fill, "width", v));
-  w("used", m.used, v => d.text(c.used, v));
   w("free", m.free, v => d.text(c.free, v));
-  w("tip", m.tip, v => d.prop(row, "title", v));
+  w("tip", m.tip, v => d.prop(c.cap, "title", v));
+  w("ioQuiet", m.ioQuiet, v => d.cls(c.rates, "storage-rates" + (v ? " quiet" : "")));
+  w("ioA", m.ioA, v => d.text(c.rateA, v));
+  w("ioB", m.ioB, v => d.text(c.rateB, v));
+  w("ioTip", m.ioTip, v => d.prop(c.ioCell, "title", v));
 }
 KINDS.storage = { build: buildStorageRow, apply: applyStorageRow };
 
@@ -3431,6 +3483,109 @@ function drawSparkline() {
   ctx.strokeStyle = accent;
   ctx.lineWidth = Math.max(1, dpr);
   ctx.stroke();
+}
+
+// ---- storage I/O history: three minutes per filesystem -----------------
+// The same window and cadence as the rate sparkline, one ring per storage
+// row. A sample without rates (first reading, unsupported, stalled) is a
+// gap in the line, not a zero: the graph never claims an idle disk it did
+// not measure.
+const storageIo = new Map();
+let storageIoPushedAt = 0, storageIoDrawnAt = 0;
+function pushStorageIoSampled(storage) {
+  const now = Date.now();
+  if (now - storageIoPushedAt < 900) return;
+  storageIoPushedAt = now;
+  const seen = new Set();
+  (storage || []).forEach((v, i) => {
+    const key = storageKey(v, i);
+    seen.add(key);
+    let h = storageIo.get(key);
+    if (!h) storageIo.set(key, h = { r: [], w: [] });
+    const io = v.io;
+    const ok = !!io && io.read_bps != null && io.write_bps != null &&
+      io.source !== "stale" && io.source !== "unsupported";
+    h.r.push(ok ? Math.max(0, Number(io.read_bps) || 0) : null);
+    h.w.push(ok ? Math.max(0, Number(io.write_bps) || 0) : null);
+    if (h.r.length > SPARK_N) { h.r.shift(); h.w.shift(); }
+  });
+  for (const key of [...storageIo.keys()]) if (!seen.has(key)) storageIo.delete(key);
+}
+function drawStorageIo() {
+  const list = $("storage-list");
+  if (!list || document.hidden) return;
+  const now = Date.now();
+  if (now - storageIoDrawnAt < 900) return;
+  const rows = [...list.children].filter((row) =>
+    row.__c && row.__c.canvas && row.__c.canvas.getContext);
+  if (!rows.length) return;               // nothing drawable (e.g. a test DOM)
+  storageIoDrawnAt = now;
+  const css = getComputedStyle(document.documentElement);
+  const ink = {
+    accent: css.getPropertyValue("--accent").trim() || "#4a8fe0",
+    read: css.getPropertyValue("--ink2").trim() || "#b9b9b3",
+    muted: css.getPropertyValue("--muted").trim() || "#84847e",
+    grid: css.getPropertyValue("--line").trim() || "rgba(128,128,128,.15)",
+    font: css.getPropertyValue("--font-ui").trim() || "system-ui",
+  };
+  for (const row of rows) drawStorageGraph(row.__c.canvas, storageIo.get(row.__c.key), ink);
+}
+/// Contiguous runs of measured samples; each is drawn as its own shape so
+/// a gap stays a gap.
+function storageRuns(series) {
+  const out = [];
+  let run = null;
+  series.forEach((v, i) => {
+    if (v == null) { run = null; return; }
+    if (!run) out.push(run = []);
+    run.push(i);
+  });
+  return out.filter((r) => r.length > 1);
+}
+function drawStorageGraph(cv, h, ink) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round((cv.clientWidth || 140) * dpr));
+  const ht = Math.max(1, Math.round((cv.clientHeight || 28) * dpr));
+  if (cv.width !== w || cv.height !== ht) { cv.width = w; cv.height = ht; }
+  const ctx = cv.getContext("2d");
+  ctx.clearRect(0, 0, w, ht);
+  ctx.fillStyle = ink.grid;
+  for (let k = 1; k < 4; k++) ctx.fillRect(Math.round(w * k / 4), 0, Math.max(1, dpr * .5), ht);
+  if (!h || h.w.length < 2) return;
+  let peak = 1;
+  for (let i = 0; i < h.w.length; i++) peak = Math.max(peak, h.w[i] || 0, h.r[i] || 0);
+  const step = w / (SPARK_N - 1), off = SPARK_N - h.w.length;
+  const x = (i) => (i + off) * step;
+  const y = (v) => ht - 1 - (v / peak) * (ht - 2);
+  const lw = Math.max(1, dpr);
+  for (const run of storageRuns(h.w)) {
+    ctx.beginPath();
+    ctx.moveTo(x(run[0]), ht);
+    for (const i of run) ctx.lineTo(x(i), y(h.w[i]));
+    ctx.lineTo(x(run[run.length - 1]), ht);
+    ctx.closePath();
+    ctx.fillStyle = ink.accent;
+    ctx.globalAlpha = 0.22;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.beginPath();
+    run.forEach((i, k) => k ? ctx.lineTo(x(i), y(h.w[i])) : ctx.moveTo(x(i), y(h.w[i])));
+    ctx.strokeStyle = ink.accent;
+    ctx.lineWidth = lw;
+    ctx.stroke();
+  }
+  for (const run of storageRuns(h.r)) {
+    ctx.beginPath();
+    run.forEach((i, k) => k ? ctx.lineTo(x(i), y(h.r[i])) : ctx.moveTo(x(i), y(h.r[i])));
+    ctx.strokeStyle = ink.read;
+    ctx.lineWidth = lw * 1.3;
+    ctx.stroke();
+  }
+  // The scale: this row's busiest second in view.
+  ctx.font = (9 * dpr) + "px " + ink.font;
+  ctx.textBaseline = "top";
+  ctx.fillStyle = ink.muted;
+  ctx.fillText(fmtRate(peak), 0, dpr);
 }
 
 // ---- title ticker -------------------------------------------------------
@@ -3550,6 +3705,7 @@ function renderStatus() {
     $("active").value = s.max_active_downloads;
   reconcileRows($("srv-chips"), serverChipModels(s), dom);
   drawSparkline();
+  drawStorageIo();
   updateTitle();
 }
 // Scalar tiles get the same "only write when it changed" treatment as rows.
@@ -4151,6 +4307,7 @@ async function refreshStatus() {
   pollResult(true);
   store.status = await r.json();
   pushRateSampled(store.status.download_rate_bps);
+  pushStorageIoSampled(store.status.storage);
   renderStatus();
 }
 async function refreshQueue() {
@@ -5161,6 +5318,7 @@ function applyTick(d) {
   store.jobsLoaded = true;
   pending.reconcile(d.jobs);
   pushRateSampled(d.status.download_rate_bps);
+  pushStorageIoSampled(d.status.storage);
   renderStatus();
   if (activeTab === "queue") renderQueue();
 }
@@ -7002,7 +7160,7 @@ if (typeof __nzbd_test_enable !== "undefined") {
     readDisplay, displayMode, applyDisplay, DISPLAY_LAYOUTS, DISPLAY_PALETTES,
     rowModel, reconcileRows, applyRow, differ, KINDS, store,
     controlPendingLabel, controlPendingText, mergePendingJobs, acquisitionStatus, overlayPendingObservations, refreshPendingObservations,
-    histModel, fileModel, statusModels, storageModels, queueModels, detailModel,
+    histModel, fileModel, statusModels, storageModels, storageIoModel, pushStorageIoSampled, storageRuns, storageIo, queueModels, detailModel,
     statusName, statusLabel, healthColor, repairProgressText, fmtBytes, fmtRate, fmtEta, fmtDur, ppSummary,
     sectionOf, currentPostStage, pipelineModels, stageElapsedMs, SECTIONS, ORDERED,
     torrentPrimaryAction, torrentPhase, torrentStatus, seedPolicyText, seedStopText, seedLimitReached, toggleSection, collapsedSections,
