@@ -495,3 +495,47 @@ included in follow-up validation.
 Validation results and PR merge status are recorded with the PR. The remaining
 root-cause attribution and live comparison gates in §6 remain necessary before
 claiming the earlier 109 MiB/s rate has been restored.
+
+## 9. Follow-up — writer-birth waits caused repeated queue selection
+
+**Measured November 8:** PR #284 merged as `1f73dea`; its three indexes were
+also applied to nuc3 with explicit user approval in a 0.85-second transaction.
+Live query plans used the indexes, but short rate samples remained about
+15–34 MiB/s. The indexing defect was real; it was not the complete explanation
+for the reported throughput loss.
+
+A 30-second function profile after indexing recorded 35,451
+`ensure_allocation` calls across 322 `grant_work` calls, about 110 allocation
+checks per request. Some lease requests took 512–2,048 ms. A separate profile
+found most owner ticks took 4–16 ms, queue document clones took 32–128 ms,
+and background snapshot saves took 512–2,048 ms. These observations distinguish
+normal tick work from slow message/scheduling work; background save latency
+alone does not prove direct owner blocking.
+
+In [grant_work](../crates/nzbd-engine/src/owner.rs), an asynchronously starting
+writer has no published writer generation until its persistence completion is
+handled by the owner. The old loop used `continue` on that missing generation.
+It selected the unchanged Pending segment again, up to `max + jobs.len()` times,
+while the owner could not process the completion that would make it ready.
+Each pass also cloned the complete job in `ensure_allocation`, even when its
+allocation was already cached. Large queues magnify both selection and copying.
+
+The correction returns the current lease batch immediately on an unready
+writer. It preserves any earlier granted leases, yields the owner to process
+persistence completions, and leaves the active-download limit and durable
+writer-birth boundary intact. It does not expand selection to lower-priority
+jobs or start writers across the entire pending queue. Cached allocation checks
+borrow the job; only a genuinely scheduled allocation clones its descriptor.
+
+[Three scheduler regression tests](../crates/nzbd-engine/src/owner_tests.rs)
+use a real blocked persistence worker and a test-only selection counter. The
+66-job fixture failed before the fix with 67 selections rather than one, then
+passed after the correction. Cases cover normal and Post-fetch selection,
+no premature lease or extra writer birth, continued leasing after durable
+completion, and retaining an earlier lease when the next writer is unready.
+All 319 engine unit tests passed locally. The counter is absent from production
+builds. No NZB-fetch task logic is changed in this follow-up.
+
+The remaining acceptance gate is an active-download comparison on nuc3 after
+the reviewed scheduler correction is installed. Do not infer restoration to
+109 MiB/s from the deterministic selection-count improvement alone.

@@ -7808,3 +7808,104 @@ async fn newer_hold_replaces_the_first_cause() {
         "the deadline runs from the episode's start"
     );
 }
+
+async fn check_pending_writer_yields_owner_without_rescanning(post_fetch: bool) {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    install_control_test_server(&mut owner);
+    owner.state.max_active_downloads = 1;
+    owner.state.jobs = vec![pending_job(1), pending_job(2)];
+    for id in [JobId(1), JobId(2)] {
+        allocate_for_test(&mut owner, &mut messages, id, false).await;
+    }
+    owner.writer_for(JobId(2), FileId(20));
+    pump(&mut owner, &mut messages).await;
+    assert!(owner.writers.contains_key(&FileId(20)));
+    owner.state.jobs.extend((3..67).map(pending_job));
+    let release = block_control_test_io(&mut owner).await;
+    owner.writer_for(JobId(1), FileId(10));
+    assert!(owner.pending_writer_birth.contains_key(&FileId(10)));
+    assert!(!owner.writers.contains_key(&FileId(10)));
+    if post_fetch {
+        owner
+            .post_fetch_files
+            .insert(JobId(1), HashSet::from([FileId(10)]));
+    }
+    owner.work_selection_attempts = 0;
+    let leases = owner.grant_work(ServerId(1), 1);
+    let attempts = owner.work_selection_attempts;
+    let birth_still_pending = owner.pending_writer_birth.contains_key(&FileId(10));
+    let blocked_segment = owner.state.job(JobId(1)).unwrap().files[0].segments[0].state;
+    let second_segment = owner.state.job(JobId(2)).unwrap().files[0].segments[0].state;
+    let extra_births = owner
+        .pending_writer_birth
+        .keys()
+        .any(|file| *file != FileId(10));
+    release.send(()).unwrap();
+    pump(&mut owner, &mut messages).await;
+
+    assert!(leases.is_empty());
+    assert_eq!(
+        attempts, 1,
+        "unready writer must yield the owner, not rescan once per queued job"
+    );
+    assert!(matches!(blocked_segment, SegmentState::Pending));
+    assert!(
+        matches!(second_segment, SegmentState::Pending),
+        "active-download cap must remain in force"
+    );
+    assert!(birth_still_pending);
+    assert!(
+        !extra_births,
+        "a blocked head must not start writers across the whole queue"
+    );
+    assert!(owner.writers.contains_key(&FileId(10)));
+    let ready = owner.grant_work(ServerId(1), 1);
+    assert_eq!(
+        ready.len(),
+        1,
+        "durable birth completion must resume normal leasing"
+    );
+    assert_eq!(ready[0].r.job, JobId(1));
+}
+
+#[tokio::test]
+async fn pending_writer_birth_yields_owner_without_rescanning_queue() {
+    check_pending_writer_yields_owner_without_rescanning(false).await;
+}
+
+#[tokio::test]
+async fn pending_post_fetch_writer_yields_owner_without_rescanning_queue() {
+    check_pending_writer_yields_owner_without_rescanning(true).await;
+}
+
+#[tokio::test]
+async fn pending_next_writer_returns_already_granted_leases() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    install_control_test_server(&mut owner);
+    let mut job = pending_job(1);
+    let mut second = job.files[0].clone();
+    second.id = FileId(11);
+    second.filename = "next.bin".into();
+    job.files.push(second);
+    recompute_job_totals(&mut job);
+    owner.state.jobs = vec![job];
+    allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
+    owner.writer_for(JobId(1), FileId(10));
+    pump(&mut owner, &mut messages).await;
+    let release = block_control_test_io(&mut owner).await;
+    owner.work_selection_attempts = 0;
+    let leases = owner.grant_work(ServerId(1), 2);
+    let attempts = owner.work_selection_attempts;
+    let next_pending = owner.pending_writer_birth.contains_key(&FileId(11));
+    release.send(()).unwrap();
+    pump(&mut owner, &mut messages).await;
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].r.file, FileId(10));
+    assert_eq!(
+        attempts, 2,
+        "one ready lease then one blocked candidate must end the batch"
+    );
+    assert!(next_pending);
+}
