@@ -150,9 +150,24 @@ rewrite in `commit_intent` (`intents.rs`).
     failure is environmental (`inaccessible_path_is_unknown…` sets mode 000,
     which root ignores; untouched by this branch).
   - Clippy `-D warnings` on the five touched crates, all targets.
+- **CI gate 1 on #283** (`f492aa9`): the sealed cluster PP generation
+  copied the worker publication's `.runner-manifest.json` as payload, so its
+  file list never matched the journaled one ("selected PP publication changed
+  after its durable journal committed", retried every 150 ms) and no cluster
+  delivery appeared — the three `cluster_e2e` READY/remote-PP timeouts. The
+  manifest is now excluded from the sealed payload (`c74608a`). Two
+  `cluster_e2e` tests and one `nzbd` bin test asserted v1 behaviour M3
+  removes (contract §2.5: accept → 410 for every id, publications named
+  `<name>.job-<id>.runner-<gen>`) and were updated. Local: `cluster_e2e`
+  22/22 in 237 s; `nzbd` bin 27/27.
+- **Open (cluster mode):** the leader materializes the sealed generation into
+  its own publication directory and computes the `runner-manifest-v1`
+  digest for the cluster delivery row, but writes no `.runner-manifest.json`
+  there. Cluster publications therefore rely on the v1 delivery record during
+  the rollout (contract §6); a v2-only curator would not see them. Not built
+  in M3 (IMPL §7 is single-node); needs a decision before the v1 record goes.
 - **Not verified:** `cargo test --workspace` and clippy `--workspace` (the
-  gate's); `NZBD_REQUIRE_TOOLS=1`; `nzbd-cluster` integration tests
-  (`cluster_e2e`); a real NFS mount (no CI NFS fixture exists — (d) drives the
+  gate's); `NZBD_REQUIRE_TOOLS=1`; a real NFS mount (no CI NFS fixture exists — (d) drives the
   fallback through the EINVAL rename seam); deploy.
 - **Engine fix 2:** a boot verification that read an allocation the
   startup intent reconciliation had just replaced (the job's artifact moved
