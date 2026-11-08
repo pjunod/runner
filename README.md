@@ -129,6 +129,7 @@ workspace retirement, repair, and qualification work specified by the
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | Release binaries, Docker, Homebrew, building from source, musl static builds |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | The complete annotated `nzbd.toml` reference |
+| [docs/URL_FETCH_RECOVERY.md](docs/URL_FETCH_RECOVERY.md) | Stuck URL acquisitions: lifecycle root cause, Fable review disposition, and engine-owned recovery |
 | [docs/DOWNLOAD_SPEED_ROOT_CAUSE_PLAN.md](docs/DOWNLOAD_SPEED_ROOT_CAUSE_PLAN.md) | Active download regression: measured inventory scans, proposed indexes, and validation gates for Fable review |
 | [docs/PUBLICATION_PERFORMANCE_PLAN.md](docs/PUBLICATION_PERFORMANCE_PLAN.md) | Slow rename/publication root causes, integrity-preserving fixes, and qualification before deployment |
 | [docs/INTEGRATION_RECOVERY_STATUS.md](docs/INTEGRATION_RECOVERY_STATUS.md) | Baseline integration repairs, script-output custody, and the deployment qualification record |
