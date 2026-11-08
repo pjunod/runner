@@ -10,10 +10,10 @@ use crate::failover::AttemptOutcome;
 use crate::owner::{EngineMsg, Lease};
 use crate::rate::{RateLimiter, SpeedMeter};
 use crate::writer::WriteCmd;
-use nzbd_nntp::transport::{NntpConnection, TlsClientConfig, TransportError};
+use nzbd_nntp::transport::{NntpConnection, TerminatorScanner, TlsClientConfig, TransportError};
 use nzbd_nntp::Command;
 use nzbd_types::{ServerDef, ServerId};
-use nzbd_yenc::{Status, YencDecoder};
+use nzbd_yenc::{Status, YencDecoder, YencError};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, watch, Notify};
@@ -358,53 +358,82 @@ async fn handle_one(
     Ok(())
 }
 
+// Wire framing survives payload errors. The yEnc decoder may reject after
+// consuming the terminator and does not report a consumed offset on error.
+// Only this persistent transport scanner decides what belongs to this BODY.
+struct FramedBodyDecoder {
+    framing: TerminatorScanner,
+    decoder: YencDecoder,
+    failed: bool,
+}
+
+impl FramedBodyDecoder {
+    fn new() -> Self {
+        Self {
+            framing: TerminatorScanner::new(),
+            decoder: YencDecoder::new(),
+            failed: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8], out: &mut Vec<u8>) -> (usize, bool, Option<YencError>) {
+        let (consumed, done) = self.framing.feed(chunk);
+        let error = if self.failed {
+            None
+        } else {
+            match self.decoder.push(&chunk[..consumed], out) {
+                Ok((status, decoded))
+                    if decoded != consumed || (status == Status::Finished && !done) =>
+                {
+                    Some(YencError::Malformed(
+                        "payload and transport framing disagree",
+                    ))
+                }
+                Ok(_) => None,
+                Err(error) => Some(error),
+            }
+        };
+        self.failed |= error.is_some();
+        (consumed, done, error)
+    }
+}
+
 async fn stream_body(
     conn: &mut NntpConnection,
     lease: &Lease,
     ctx: &ConnCtx,
 ) -> Result<(), TransportError> {
-    let mut decoder = YencDecoder::new();
+    let mut body = FramedBodyDecoder::new();
     let mut out: Vec<u8> = Vec::with_capacity(768 * 1024);
 
     loop {
-        let chunk_len = {
+        let (consumed, done, error) = {
             let chunk = conn.body_chunk().await?;
             if chunk.is_empty() {
                 return Err(TransportError::Closed);
             }
-            match decoder.push(chunk, &mut out) {
-                Ok((Status::NeedMore, consumed)) => {
-                    debug_assert_eq!(consumed, chunk.len());
-                    consumed
-                }
-                Ok((Status::Finished, consumed)) => {
-                    conn.consume(consumed);
-                    ctx.meter
-                        .add_for(lease.r.job.0, ctx.server.id.0, consumed as u64);
-                    ctx.limiter.debit(consumed).await;
-                    break;
-                }
-                Err(e) => {
-                    // Broken article: drain to the terminator to stay in
-                    // protocol sync, then report an article-level failure.
-                    let len = chunk.len();
-                    conn.consume(len);
-                    ctx.meter
-                        .add_for(lease.r.job.0, ctx.server.id.0, len as u64);
-                    tracing::debug!(msgid = %lease.message_id, error = %e, "yEnc decode failed");
-                    conn.drain_body().await?;
-                    fail_leases(ctx, std::slice::from_ref(lease), AttemptOutcome::Other).await;
-                    return Ok(());
-                }
-            }
+            body.push(chunk, &mut out)
         };
-        conn.consume(chunk_len);
+        conn.consume(consumed);
         ctx.meter
-            .add_for(lease.r.job.0, ctx.server.id.0, chunk_len as u64);
-        ctx.limiter.debit(chunk_len).await;
+            .add_for(lease.r.job.0, ctx.server.id.0, consumed as u64);
+        ctx.limiter.debit(consumed).await;
+        if let Some(error) = error {
+            tracing::debug!(msgid = %lease.message_id, error = %error, "yEnc decode failed");
+        }
+        if done {
+            break;
+        }
+        // After a payload error, keep framing/discarding with the SAME
+        // scanner. Never consume the next pipelined response or wait for a
+        // second terminator when this chunk already ended the article.
+    }
+    if body.failed {
+        fail_leases(ctx, std::slice::from_ref(lease), AttemptOutcome::Other).await;
+        return Ok(());
     }
 
-    let Some(result) = decoder.take_result() else {
+    let Some(result) = body.decoder.take_result() else {
         fail_leases(ctx, std::slice::from_ref(lease), AttemptOutcome::Other).await;
         return Ok(());
     };
@@ -509,6 +538,227 @@ mod adaptive_tests {
             epoch_tx,
             budget_tx,
         )
+    }
+
+    #[tokio::test]
+    async fn bad_ypart_terminator_does_not_become_a_connection_timeout() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"200 test ready\r\n").await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut command = String::new();
+            socket.read_line(&mut command).await.unwrap();
+            assert!(command.starts_with("BODY "));
+            // One short write coalesces the malformed control line with the
+            // body terminator, matching the observed provider response.
+            socket.get_mut().write_all(b"222 body follows\r\n=ybegin part=1 line=128 size=4 name=bad.bin\r\n=ypart begin=0 end=4\r\n.\r\n").await.unwrap();
+            command.clear();
+            let _ = socket.read_line(&mut command).await;
+        });
+        let (engine_tx, mut engine_rx) = mpsc::channel(8);
+        let (ctx, _epoch, _budget) =
+            context(test_server(port), engine_tx, CancellationToken::new());
+        let (writer, mut written) = mpsc::channel(1);
+        let lease = Lease {
+            r: SegRef {
+                job: JobId(3),
+                file: FileId(4),
+                seg_number: 5,
+            },
+            message_id: "bad@example".into(),
+            generation: 7,
+            writer,
+        };
+        let (mut connection, _) =
+            NntpConnection::connect(&ctx.server, None, ctx.connect_timeout, ctx.read_timeout)
+                .await
+                .unwrap();
+        connection
+            .send(&Command::Body(&lease.message_id))
+            .await
+            .unwrap();
+        let result = handle_one(&mut connection, &lease, &ctx).await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            result.is_ok(),
+            "malformed body was fully terminated; must not wait for another terminator: {result:?}"
+        );
+        assert!(
+            matches!(engine_rx.try_recv(), Ok(EngineMsg::ScopedOutcome { generation: 7, message, .. }) if matches!(*message, EngineMsg::SegmentFailed { outcome: AttemptOutcome::Other, .. }))
+        );
+        assert!(engine_rx.try_recv().is_err(), "one article failure only");
+        assert!(
+            written.try_recv().is_err(),
+            "malformed payload must never reach the writer"
+        );
+    }
+
+    #[test]
+    fn body_framing_preserves_pipeline_bytes_at_every_split() {
+        let payload = [4, 23, 24, 4]; // Encodes leading and mid-line dots.
+        let post =
+            nzbd_nserv::build_post("framing", &[("good.bin", payload.to_vec())], payload.len());
+        let valid = post.files[0].articles[0].wire.as_ref().clone();
+        let cases = [
+            (valid.as_slice(), false),
+            (b"provider text stub\r\n.\r\n".as_slice(), true),
+            (b"=ybegin part=1 line=128 size=4 name=bad.bin\r\n=ypart begin=0 end=4\r\ntrailing midline dot.\r\n.\r\n".as_slice(), true),
+            (b"=ybegin line=128 name=bad.bin\r\nstray.\r\n.\r\n".as_slice(), true),
+            (b"=ybegin line=128 size=4 name=bad.bin\r\nABCD\r\n.\r\n".as_slice(), true),
+            (b"plain LF stub\n.\n".as_slice(), true),
+        ];
+        let following = b"222 next response\r\nfuture body bytes";
+        for (article, fails) in cases {
+            let wire = [article, following].concat();
+            for split in 0..=wire.len() {
+                let mut body = FramedBodyDecoder::new();
+                let mut out = Vec::new();
+                let mut consumed = 0;
+                let mut errors = 0;
+                let mut done = false;
+                for chunk in [&wire[..split], &wire[split..]] {
+                    let (used, ended, error) = body.push(chunk, &mut out);
+                    consumed += used;
+                    errors += usize::from(error.is_some());
+                    if ended {
+                        done = true;
+                        break;
+                    }
+                }
+                assert!(done, "split {split}");
+                assert_eq!(
+                    consumed,
+                    article.len(),
+                    "next response over-consumed at split {split}"
+                );
+                assert_eq!(&wire[consumed..], following);
+                assert_eq!(body.failed, fails, "split {split}");
+                assert_eq!(
+                    errors,
+                    usize::from(fails),
+                    "one decoder failure per article"
+                );
+                if !fails {
+                    assert_eq!(out, payload);
+                    let result = body.decoder.take_result().unwrap();
+                    assert_eq!(result.crc_ok, Some(true));
+                    assert!(result.len_ok);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn body_framing_drains_long_bad_lines_with_the_same_scanner() {
+        let mut article = vec![b'x'; 20_000];
+        article.extend_from_slice(b"trailing.\r\n.\r\n");
+        let next = b"222 untouched\r\n";
+        let wire = [article.as_slice(), next].concat();
+        // Include a chunk beginning at a mid-line dot: restarting a scanner
+        // there would mistake a data suffix for the article terminator.
+        for split in [
+            1,
+            8_192,
+            8_193,
+            20_008,
+            article.len() - 2,
+            article.len() - 1,
+            article.len(),
+        ] {
+            let mut body = FramedBodyDecoder::new();
+            let mut out = Vec::new();
+            let mut consumed = 0;
+            let mut errors = 0;
+            for chunk in [&wire[..split], &wire[split..]] {
+                let (used, done, error) = body.push(chunk, &mut out);
+                consumed += used;
+                errors += usize::from(error.is_some());
+                if done {
+                    break;
+                }
+            }
+            assert_eq!(consumed, article.len(), "split {split}");
+            assert_eq!(&wire[consumed..], next);
+            assert!(body.failed);
+            assert_eq!(errors, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_body_keeps_a_coalesced_valid_pipeline_reply() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let payload = [4, 23, 24, 4];
+        let post =
+            nzbd_nserv::build_post("pipeline", &[("good.bin", payload.to_vec())], payload.len());
+        let bad = b"=ybegin part=1 line=128 size=4 name=bad.bin\r\n=ypart begin=0 end=4\r\n.\r\n";
+        let response = [
+            b"222 first\r\n".as_slice(),
+            bad.as_slice(),
+            b"222 second\r\n".as_slice(),
+            post.files[0].articles[0].wire.as_slice(),
+        ]
+        .concat();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"200 test ready\r\n").await.unwrap();
+            let mut socket = BufReader::new(socket);
+            for _ in 0..2 {
+                let mut command = String::new();
+                socket.read_line(&mut command).await.unwrap();
+                assert!(command.starts_with("BODY "));
+            }
+            socket.get_mut().write_all(&response).await.unwrap();
+            let mut command = String::new();
+            let _ = socket.read_line(&mut command).await;
+        });
+        let (engine_tx, mut engine_rx) = mpsc::channel(8);
+        let (ctx, _epoch, _budget) =
+            context(test_server(port), engine_tx, CancellationToken::new());
+        let (writer, mut written) = mpsc::channel(4);
+        let lease = |seg_number| Lease {
+            r: SegRef {
+                job: JobId(3),
+                file: FileId(4),
+                seg_number,
+            },
+            message_id: format!("article-{seg_number}@example"),
+            generation: 7,
+            writer: writer.clone(),
+        };
+        let (mut connection, _) =
+            NntpConnection::connect(&ctx.server, None, ctx.connect_timeout, ctx.read_timeout)
+                .await
+                .unwrap();
+        let result = run_leases(&mut connection, &[lease(1), lease(2)], &ctx).await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            result.is_ok(),
+            "one bad article must not lose its valid pipeline successor"
+        );
+        assert!(
+            matches!(engine_rx.try_recv(),Ok(EngineMsg::ScopedOutcome { generation:7,message,.. }) if matches!(*message,EngineMsg::SegmentFailed { seg_number:1,outcome:AttemptOutcome::Other,.. }))
+        );
+        assert!(
+            matches!(engine_rx.try_recv(),Ok(EngineMsg::ScopedOutcome { generation:7,message,.. }) if matches!(*message,EngineMsg::FileMetadata { .. }))
+        );
+        assert!(
+            engine_rx.try_recv().is_err(),
+            "no connection failure or duplicate outcome"
+        );
+        assert!(
+            matches!(written.try_recv(),Ok(WriteCmd::Segment {seg_number:2,data,..}) if data==payload)
+        );
+        assert!(
+            written.try_recv().is_err(),
+            "bad bytes never reach the writer"
+        );
     }
 
     #[test]

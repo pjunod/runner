@@ -26,6 +26,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Convert snapshots to exact plain JSON for rollback. Stop the daemon first.
+    SnapshotPlain {
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Inventory ownership lock directory (defaults to state-dir).
+        #[arg(long)]
+        inventory_dir: Option<PathBuf>,
+        /// Highest queue document schema accepted by the rollback binary.
+        #[arg(long)]
+        max_schema: u32,
+    },
     /// Quarantine file operations after restoring a backup. Stop the daemon first.
     ArtifactsRestore {
         #[arg(long)]
@@ -128,6 +139,20 @@ fn main() -> anyhow_lite::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::SnapshotPlain {
+            state_dir,
+            inventory_dir,
+            max_schema,
+        } => {
+            let inventory_dir = inventory_dir.as_deref().unwrap_or(&state_dir);
+            let paths =
+                nzbd_state::materialize_plain_snapshots(&state_dir, inventory_dir, max_schema)
+                    .map_err(|error| anyhow_lite::Error::msg(error.to_string()))?;
+            for path in paths {
+                println!("Materialized exact JSON: {}", path.display());
+            }
+            Ok(())
+        }
         Command::ArtifactsBackup { state_dir, output } => {
             let inventory = nzbd_state::artifacts::Inventory::open(&state_dir)
                 .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;

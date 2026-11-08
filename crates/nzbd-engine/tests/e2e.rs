@@ -2442,12 +2442,21 @@ async fn legacy_identity_conflict_hold_converts_at_boot() {
 /// no click; a paused one stays with the operator.
 #[tokio::test]
 async fn stranded_storage_hold_recovers_after_restart_without_a_click() {
+    let disconnected = format!(
+        "write /processing/stranded/.runner-file-1.part: {}",
+        std::io::Error::from_raw_os_error(libc::ENOTCONN)
+    );
     for (cause, policy, message, manual) in [
-        ("io", "review", "write /processing/stranded/.runner-file-1.part: Transport endpoint is not connected (os error 107)", false),
-        ("io", "review", "write /processing/stranded/.runner-file-1.part: Transport endpoint is not connected (os error 107)", true),
+        ("io", "review", disconnected.as_str(), false),
+        ("io", "review", disconnected.as_str(), true),
         // A full disk written before storage holds carried a time: released
         // by the recovery pass once the probe admits writes.
-        ("capacity", "resume_same_job", "write x: No space left on device (os error 28)", false),
+        (
+            "capacity",
+            "resume_same_job",
+            "write x: No space left on device (os error 28)",
+            false,
+        ),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let engine = spawn_engine(tmp.path(), vec![]).await;
@@ -2498,13 +2507,22 @@ async fn stranded_storage_hold_recovers_after_restart_without_a_click() {
             usize::from(!manual)
         );
         let job = engine.export_ready(JobId(992)).await.unwrap().unwrap();
-        assert_eq!(job.held(), manual, "{cause}: a paused hold waits for the operator");
+        assert_eq!(
+            job.held(),
+            manual,
+            "{cause}: a paused hold waits for the operator"
+        );
         if manual {
             assert!(
                 engine.resume_job(JobId(992)).await.unwrap(),
                 "…whose retry always works"
             );
-            assert!(!engine.export_ready(JobId(992)).await.unwrap().unwrap().held());
+            assert!(!engine
+                .export_ready(JobId(992))
+                .await
+                .unwrap()
+                .unwrap()
+                .held());
         } else {
             assert_ne!(job.status, JobStatus::Paused);
         }

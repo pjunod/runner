@@ -69,7 +69,7 @@ async fn run_tool_owned(
         use std::os::unix::process::CommandExt;
         command.as_std_mut().process_group(0);
     }
-    let mut child = command
+    command
         .args(args)
         .current_dir(cwd)
         .env_clear()
@@ -80,8 +80,9 @@ async fn run_tool_owned(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    let mut child = crate::script::spawn_retrying_etxtbsy(&mut command)
+        .await
         .map_err(|e| PostError::ToolMissing(format!("{cmd}: {e}")))?;
 
     let group = child.id();
@@ -823,6 +824,36 @@ mod tests {
     // a loaded runner cannot turn a successful one-line fixture into the
     // timeout outcome the assertion is deliberately not testing.
     const SUBPROCESS_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// A tool whose executable is still open for writing fails `execve`
+    /// with `ETXTBSY`. That is a busy tool, not a missing one: reporting it
+    /// as `ToolMissing` hands a RAR to the 7-Zip fallback even when the
+    /// first extractor would have reported disk exhaustion. Hold the write
+    /// handle briefly, as a concurrent fork does, and require the run.
+    #[tokio::test]
+    async fn busy_tool_executable_is_retried_not_reported_missing() {
+        use std::io::Write;
+        let t = tempfile::tempdir().unwrap();
+        let tool = t.path().join("busy-tool");
+        let mut handle = std::fs::File::create(&tool).unwrap();
+        handle.write_all(b"#!/bin/sh\necho ran\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            drop(handle);
+        });
+        let out = run_tool(
+            tool.to_str().unwrap(),
+            &[],
+            t.path(),
+            SUBPROCESS_TEST_TIMEOUT,
+        )
+        .await
+        .expect("a briefly busy executable is spawned once it is released");
+        release.join().unwrap();
+        assert_eq!(out.code, 0);
+        assert_eq!(out.stdout.trim(), "ran");
+    }
 
     fn write_tool(path: &Path, body: &str) {
         std::fs::write(path, body).unwrap();

@@ -12,6 +12,7 @@ test-support = []
 nzbd-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+zstd = { workspace = true }
 thiserror = { workspace = true }
 rusqlite = { workspace = true }
 flate2 = { workspace = true }

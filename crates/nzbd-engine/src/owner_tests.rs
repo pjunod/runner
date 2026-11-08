@@ -3709,7 +3709,10 @@ fn rearm_reclassifies_by_errno_and_derives_policy() {
         hold(
             "io",
             "review",
-            "write /processing/x.part: Transport endpoint is not connected (os error 107)"
+            &format!(
+                "write /processing/x.part: {}",
+                std::io::Error::from_raw_os_error(libc::ENOTCONN)
+            )
         ),
         1000
     )
@@ -3756,7 +3759,10 @@ async fn adopting_authority_rearms_holds() {
         cause: "io".into(),
         stage: "download_write".into(),
         retry_policy: "review".into(),
-        message: "write x: Transport endpoint is not connected (os error 107)".into(),
+        message: format!(
+            "write x: {}",
+            std::io::Error::from_raw_os_error(libc::ENOTCONN)
+        ),
         instance: "i".into(),
         previous_status: Some(JobStatus::Downloading),
         manual_pause: false,
@@ -7659,6 +7665,68 @@ fn unpinned_failed_receipt_adopts_its_jobs_source_and_reports_disposal() {
     assert!(refresh_url_admission_custody(&mut receipt, &inventory));
     assert_eq!(receipt.custody_state, "deleted_by_runner");
     assert_eq!(receipt.source_cleanup_status.as_deref(), Some("removed"));
+}
+
+#[test]
+fn checkpoint_custody_batch_matches_individual_refresh_and_fresh_keep_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("processing");
+    std::fs::create_dir(&root).unwrap();
+    let inventory = nzbd_state::artifacts::Inventory::open(&tmp.path().join("state")).unwrap();
+    let source = root.join("batch-custody");
+    inventory
+        .allocate_for_delivery(2204, &root, &source, true, false)
+        .unwrap();
+    std::fs::write(source.join("partial.bin"), b"retained bytes").unwrap();
+    let artifact = inventory.finish(2204, &source, &root, "retained").unwrap();
+    let mut base = catalog_receipt("batch-pinned", 2204);
+    base.runner_instance_id = inventory.installation.clone();
+    base.outcome = "failed".into();
+    base.custody_state = "runner_owned".into();
+    base.source_artifact_id = Some(artifact.id.clone());
+    base.source_generation = Some(artifact.generation.clone());
+    let mut unpinned = base.clone();
+    unpinned.request_token = "batch-unpinned".into();
+    unpinned.source_artifact_id = None;
+    unpinned.source_generation = None;
+    let mut stale = base.clone();
+    stale.request_token = "batch-stale".into();
+    stale.source_generation = Some("different-generation".into());
+    let mut missing = base.clone();
+    missing.request_token = "batch-missing".into();
+    missing.source_artifact_id = Some("missing-artifact".into());
+    let mut consumer = base.clone();
+    consumer.request_token = "batch-consumer".into();
+    consumer.custody_state = "curator".into();
+    let mut foreign = unpinned.clone();
+    foreign.request_token = "batch-foreign".into();
+    foreign.runner_instance_id = "another-installation".into();
+    let mut receipts = vec![base, unpinned, stale, missing, consumer, foreign];
+    for keep in [true, false] {
+        assert!(inventory.set_keep_on_failure(2204, keep).unwrap());
+        let mut expected = receipts.clone();
+        let mut expected_changed = false;
+        for receipt in &mut expected {
+            expected_changed |= refresh_url_admission_custody(receipt, &inventory);
+        }
+        assert_eq!(
+            refresh_url_admission_custodies(&mut receipts, &inventory),
+            expected_changed
+        );
+        assert_eq!(
+            serde_json::to_value(&receipts).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(receipts[0].keep_source_on_failure, keep);
+        assert_eq!(
+            receipts[1].source_artifact_id.as_deref(),
+            Some(artifact.id.as_str())
+        );
+        assert_eq!(receipts[2].custody_state, "runner_owned");
+        assert_eq!(receipts[3].custody_state, "runner_owned");
+        assert_eq!(receipts[4].custody_state, "curator");
+        assert!(receipts[5].source_artifact_id.is_none());
+    }
 }
 
 #[test]

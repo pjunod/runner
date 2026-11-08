@@ -242,6 +242,36 @@ impl Artifact {
         ))
     }
 }
+/// Exact receipt-custody metadata from the current artifact row. This does
+/// not contain file manifests and cannot serve as payload or identity proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactCustody {
+    pub generation: String,
+    pub state: String,
+    pub owned: bool,
+    pub keep: bool,
+    pub keep_on_failure: bool,
+}
+
+impl ArtifactCustody {
+    fn from_header(raw: &str) -> Result<Self> {
+        let header: Artifact = serde_json::from_str(raw)?;
+        Ok(Self {
+            generation: header.generation,
+            state: header.state,
+            owned: header.owned,
+            keep: header.keep,
+            keep_on_failure: header.keep_on_failure,
+        })
+    }
+}
+
+// The expression must match in the index and SELECT. Invalid JSON remains
+// invalid instead of making one corrupt row prevent index creation on reopen.
+const RECEIPT_CUSTODY_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS artifacts_receipt_custody ON artifacts(id,CASE WHEN typeof(data)='text' AND json_valid(data) THEN json_remove(data,'$.files') ELSE data END)";
+const RECEIPT_CUSTODY_QUERY: &str = "SELECT CASE WHEN typeof(data)='text' AND json_valid(data) THEN json_remove(data,'$.files') ELSE data END FROM artifacts INDEXED BY artifacts_receipt_custody WHERE id=?1";
+const RECEIPT_CUSTODIES_QUERY: &str = "SELECT id,CASE WHEN typeof(data)='text' AND json_valid(data) THEN json_remove(data,'$.files') ELSE data END FROM artifacts INDEXED BY artifacts_receipt_custody WHERE id IN (SELECT value FROM json_each(?1))";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Operation {
     pub id: String,
@@ -707,6 +737,7 @@ impl Inventory {
           CREATE INDEX IF NOT EXISTS events_artifact ON events(artifact,seq);
           INSERT OR IGNORE INTO meta VALUES('schema','1');
           INSERT OR IGNORE INTO meta VALUES('installation',lower(hex(randomblob(16))));")?;
+        db.execute_batch(RECEIPT_CUSTODY_INDEX_SQL)?;
         let backlog_migrated: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM meta WHERE key='delivery_backlog_migration')",
             [],
@@ -916,6 +947,50 @@ impl Inventory {
     }
     pub fn get(&self, key: &str) -> Result<Artifact> {
         read(&self.db.lock().unwrap(), "artifacts", key)
+    }
+    /// Read fresh custody metadata using the transactionally maintained
+    /// covering expression index, without loading or decoding file manifests.
+    /// Validate the remaining full Artifact header so malformed fields and
+    /// legacy defaults keep their existing semantics. No custody is cached.
+    pub fn receipt_custody(&self, key: &str) -> Result<ArtifactCustody> {
+        let raw: Option<String> = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare_cached(RECEIPT_CUSTODY_QUERY)?;
+            statement.query_row([key], |row| row.get(0)).optional()?
+        };
+        ArtifactCustody::from_header(&raw.ok_or(Error::NotFound)?)
+    }
+    /// Read all requested custody headers in one consistent SQLite statement
+    /// and one database-lock round trip. Missing keys are absent; malformed
+    /// rows retain their own errors without hiding unrelated valid rows.
+    pub fn receipt_custodies(
+        &self,
+        keys: &[String],
+    ) -> Result<std::collections::HashMap<String, Result<ArtifactCustody>>> {
+        if keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let keys = serde_json::to_string(keys)?;
+        let rows = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare_cached(RECEIPT_CUSTODIES_QUERY)?;
+            let rows = statement.query_map([keys], |row| {
+                // A non-text corrupt header is a per-row error too. Failure
+                // to step the statement itself still fails the whole read.
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(key, raw)| {
+                (
+                    key,
+                    raw.map_err(Error::Sql)
+                        .and_then(|raw| ArtifactCustody::from_header(&raw)),
+                )
+            })
+            .collect())
     }
     pub fn for_job(&self, job: u32) -> Result<Option<Artifact>> {
         let db = self.db.lock().unwrap();

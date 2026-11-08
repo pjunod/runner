@@ -24,6 +24,9 @@ pub mod capacity;
 pub mod fileops;
 mod fsx;
 pub mod history;
+mod snapshot_codec;
+mod snapshot_encoder;
+pub use snapshot_encoder::{SnapshotEncoder, SnapshotEncoderStats};
 pub mod torrent_sources;
 #[cfg(windows)]
 mod windows_secret;
@@ -699,9 +702,25 @@ impl SnapshotStore {
                 doc.schema_version, QUEUE_SCHEMA_VERSION
             )));
         }
-        let bytes = serde_json::to_vec(doc)?;
+        let bytes = snapshot_codec::encode(serde_json::to_vec(doc)?)?;
+        self.commit_encoded(&bytes, guard)
+    }
+
+    /// Encode an owned document with a bounded, byte-equivalence cache. The
+    /// cache never substitutes for the complete atomic durability sequence.
+    pub fn save_cached_guarded(
+        &self,
+        doc: QueueSnapshotDoc,
+        encoder: &mut SnapshotEncoder,
+        guard: &dyn Fn() -> bool,
+    ) -> Result<u64, StateError> {
+        let bytes = encoder.encode(doc)?;
+        self.commit_encoded(&bytes, guard)
+    }
+
+    fn commit_encoded(&self, bytes: &[u8], guard: &dyn Fn() -> bool) -> Result<u64, StateError> {
         let mut f = fsx::create(&self.tmp)?;
-        fsx::write_whole(&mut f, &bytes, &self.tmp)?;
+        fsx::write_whole(&mut f, bytes, &self.tmp)?;
         fsx::sync_data(&f, &self.tmp)?;
         drop(f);
         if !guard() {
@@ -722,10 +741,24 @@ impl SnapshotStore {
             Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e),
         };
+        Self::decode(&bytes).map(Some)
+    }
+
+    /// Decode already-read snapshot bytes without creating directories or
+    /// changing the document. Migration callers retain the original bytes for
+    /// their fingerprint and backup, regardless of the filesystem encoding.
+    /// Decode the storage envelope without interpreting or reserializing its
+    /// JSON. This preserves exact bytes for offline inspection and conversion.
+    pub fn decode_json_bytes(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, StateError> {
+        snapshot_codec::decode(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<QueueSnapshotDoc, StateError> {
+        let bytes = snapshot_codec::decode(bytes)?;
         match serde_json::from_slice::<QueueSnapshotDoc>(&bytes) {
             Ok(doc) => {
                 validate_queue_schema_version(doc.schema_version)?;
-                Ok(Some(doc))
+                Ok(doc)
             }
             Err(typed_error) => {
                 if let Ok(header) = serde_json::from_slice::<QueueSnapshotHeader>(&bytes) {
@@ -735,6 +768,85 @@ impl SnapshotStore {
             }
         }
     }
+}
+
+/// Materialize exact JSON bytes for an older binary, without loading an engine,
+/// replaying/compacting journals, migrating schema, or opening SQLite. The
+/// existing inventory ownership lock excludes cooperating daemon processes.
+/// Converts the authoritative store and every existing worker store. All files
+/// are validated before the first replacement; interruption is safely resumable.
+pub fn materialize_plain_snapshots(
+    state_dir: &Path,
+    inventory_dir: &Path,
+    max_schema: u32,
+) -> Result<Vec<PathBuf>, StateError> {
+    let lock = fsx::open(&inventory_dir.join("artifacts.lock"))?;
+    lock.try_lock().map_err(|error| {
+        StateError::Corrupt(format!(
+            "stop the daemon before decoding snapshots: {error}"
+        ))
+    })?;
+    let mut paths = Vec::new();
+    let authoritative = state_dir.join("queue.json");
+    if fsx::exists(&authoritative)? {
+        paths.push(authoritative);
+    }
+    let workers = state_dir.join("workers");
+    match fsx::read_dir(&workers) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = fsx::ctx(entry, "read directory entry", &workers)?;
+                let kind = fsx::ctx(entry.file_type(), "read file type", &entry.path())?;
+                if kind.is_symlink() {
+                    return Err(StateError::Corrupt(
+                        "worker snapshot directory is a symlink".into(),
+                    ));
+                }
+                if kind.is_dir() {
+                    let path = entry.path().join("queue.json");
+                    if fsx::exists(&path)? {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+        Err(error) if error.is_not_found() => {}
+        Err(error) => return Err(error),
+    }
+    let read = |path: &Path| -> Result<(Vec<u8>, bool), StateError> {
+        let original = fsx::read(path)?;
+        let decoded = snapshot_codec::decode(&original)?;
+        let header: QueueSnapshotHeader = serde_json::from_slice(&decoded)
+            .map_err(|error| StateError::Corrupt(format!("{}: {error}", path.display())))?;
+        if header.schema_version > max_schema {
+            return Err(StateError::Corrupt(format!(
+                "{} has document schema {}; rollback binary supports at most {max_schema}",
+                path.display(),
+                header.schema_version
+            )));
+        }
+        let compressed = matches!(decoded, std::borrow::Cow::Owned(_));
+        Ok((decoded.into_owned(), compressed))
+    };
+    for path in &paths {
+        read(path)?;
+    }
+    let mut converted = Vec::new();
+    for path in paths {
+        let (bytes, compressed) = read(&path)?;
+        if !compressed {
+            continue;
+        }
+        let tmp = path.with_extension("json.codec-plain.tmp");
+        let mut file = fsx::create(&tmp)?;
+        fsx::write_whole(&mut file, &bytes, &tmp)?;
+        fsx::sync_data(&file, &tmp)?;
+        drop(file);
+        fsx::rename(&tmp, &path)?;
+        fsx::sync_dir(path.parent().unwrap())?;
+        converted.push(path);
+    }
+    Ok(converted)
 }
 
 fn validate_queue_schema_version(schema_version: u32) -> Result<(), StateError> {
@@ -1468,15 +1580,46 @@ mod tests {
             max_active_downloads: 1,
         };
         // 4 jobs × 100 files × 500 segments = 200k segments.
+        let raw = serde_json::to_vec(&doc).unwrap();
+        assert!(raw.len() > 10 << 20, "doc is production-sized");
         let bytes = store.save(&doc).unwrap();
-        assert!(bytes > 10 << 20, "doc is production-sized ({bytes} B)");
+        assert_eq!(
+            bytes,
+            std::fs::metadata(dir.path().join("queue.json"))
+                .unwrap()
+                .len()
+        );
+        assert!(
+            bytes < raw.len() as u64 / 2,
+            "large snapshots reduce filesystem traffic"
+        );
         let loaded = store.load().unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&doc).unwrap()
+        );
         assert_eq!(loaded.jobs.len(), 4);
         assert_eq!(loaded.jobs[3].files.len(), 100);
         assert_eq!(loaded.jobs[3].files[99].segments.len(), 500);
         assert_eq!(
             loaded.jobs[1].files[0].segments[0].message_id,
             doc.jobs[1].files[0].segments[0].message_id
+        );
+        let mut encoder = SnapshotEncoder::default();
+        let first = encoder.encode(doc.clone()).unwrap();
+        assert_eq!(
+            SnapshotStore::decode_json_bytes(&first).unwrap().as_ref(),
+            raw
+        );
+        let second = encoder.encode(doc).unwrap();
+        assert_eq!(
+            SnapshotStore::decode_json_bytes(&second).unwrap().as_ref(),
+            raw
+        );
+        assert_eq!(
+            encoder.stats().reused_jobs,
+            4,
+            "all production-shaped jobs reused by full equality"
         );
     }
 
@@ -1602,6 +1745,128 @@ mod tests {
         );
         assert_eq!(records[1].record, rec(2));
         assert_eq!(records[1].provenance, None);
+    }
+
+    fn large_snapshot_doc() -> QueueSnapshotDoc {
+        let mut job = minimal_job();
+        job.params
+            .push(("opaque".into(), "metadata".repeat(160_000)));
+        QueueSnapshotDoc {
+            jobs: vec![job],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn compressed_snapshot_keeps_fencing_and_failure_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        let mut doc = large_snapshot_doc();
+        store.save(&doc).unwrap();
+        let path = dir.path().join("queue.json");
+        let committed = std::fs::read(&path).unwrap();
+        assert!(committed.starts_with(b"NZBDQZ01"));
+        // A legacy JSON reader refuses this encoding; it cannot silently load
+        // an abandoned older file because there is only one authoritative path.
+        assert!(serde_json::from_slice::<QueueSnapshotDoc>(&committed).is_err());
+        doc.next_job_id = 123;
+        assert!(store.save_guarded(&doc, &|| false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+        std::fs::remove_file(dir.path().join("queue.json.tmp")).unwrap();
+        std::fs::create_dir(dir.path().join("queue.json.tmp")).unwrap();
+        assert!(store.save(&doc).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+        std::fs::remove_dir(dir.path().join("queue.json.tmp")).unwrap();
+        #[cfg(unix)]
+        {
+            crate::fsx::fail_next_dir_sync();
+            assert!(store
+                .save(&doc)
+                .unwrap_err()
+                .to_string()
+                .contains("fsync directory"));
+        }
+    }
+
+    #[test]
+    fn offline_plain_conversion_preserves_bytes_and_journals_and_excludes_live_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker = dir.path().join("workers/node-1");
+        std::fs::create_dir_all(&worker).unwrap();
+        let lock = File::create(dir.path().join("artifacts.lock")).unwrap();
+        lock.try_lock().unwrap();
+        let mut json = serde_json::to_value(large_snapshot_doc()).unwrap();
+        json["future_unknown_field"] = serde_json::json!({"preserve": [1, 2, 3]});
+        let mut raw = serde_json::to_vec_pretty(&json).unwrap();
+        raw.push(b'\n');
+        let encoded = snapshot_codec::encode(raw.clone()).unwrap();
+        let paths = [dir.path().join("queue.json"), worker.join("queue.json")];
+        for path in &paths {
+            std::fs::write(path, &encoded).unwrap();
+        }
+        let plain_worker = dir.path().join("workers/node-plain");
+        std::fs::create_dir_all(&plain_worker).unwrap();
+        std::fs::write(plain_worker.join("queue.json"), &raw).unwrap();
+        let v2_worker = dir.path().join("workers/node-v2");
+        std::fs::create_dir_all(&v2_worker).unwrap();
+        let mut v2 = b"NZBDQZ02".to_vec();
+        v2.extend_from_slice(&(raw.len() as u64).to_le_bytes());
+        v2.extend_from_slice(&crc32fast::hash(&raw).to_le_bytes());
+        v2.extend_from_slice(&2u32.to_le_bytes());
+        for part in [&raw[..raw.len() / 2], &raw[raw.len() / 2..]] {
+            v2.extend_from_slice(&snapshot_codec::encode_frame(part).unwrap());
+        }
+        std::fs::write(v2_worker.join("queue.json"), &v2).unwrap();
+        let journal = dir.path().join("segments.journal");
+        std::fs::write(&journal, b"retain every journal byte").unwrap();
+        // A bogus SQLite file also proves conversion never opens/migrates DBs.
+        std::fs::write(dir.path().join("artifacts.sqlite"), b"do not open").unwrap();
+        assert!(materialize_plain_snapshots(dir.path(), dir.path(), QUEUE_SCHEMA_VERSION).is_err());
+        drop(lock);
+        assert!(
+            materialize_plain_snapshots(dir.path(), dir.path(), QUEUE_SCHEMA_VERSION - 1).is_err()
+        );
+        for path in &paths {
+            assert_eq!(std::fs::read(path).unwrap(), encoded);
+        }
+        let mut corrupted = encoded.clone();
+        corrupted[16] ^= 1;
+        std::fs::write(&paths[1], &corrupted).unwrap();
+        assert!(materialize_plain_snapshots(dir.path(), dir.path(), QUEUE_SCHEMA_VERSION).is_err());
+        assert_eq!(
+            std::fs::read(&paths[0]).unwrap(),
+            encoded,
+            "validate every store before replacing the first"
+        );
+        std::fs::write(&paths[1], &encoded).unwrap();
+        let converted =
+            materialize_plain_snapshots(dir.path(), dir.path(), QUEUE_SCHEMA_VERSION).unwrap();
+        assert_eq!(converted.len(), 3);
+        for path in &paths {
+            assert_eq!(std::fs::read(path).unwrap(), raw);
+        }
+        assert_eq!(
+            std::fs::read(journal).unwrap(),
+            b"retain every journal byte"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("artifacts.sqlite")).unwrap(),
+            b"do not open"
+        );
+        assert!(
+            materialize_plain_snapshots(dir.path(), dir.path(), QUEUE_SCHEMA_VERSION)
+                .unwrap()
+                .is_empty()
+        );
+        // Simulate interruption after one store was already materialized.
+        std::fs::write(&paths[1], &encoded).unwrap();
+        assert_eq!(
+            materialize_plain_snapshots(dir.path(), dir.path(), QUEUE_SCHEMA_VERSION).unwrap(),
+            vec![paths[1].clone()]
+        );
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), raw);
+        assert_eq!(std::fs::read(plain_worker.join("queue.json")).unwrap(), raw);
+        assert_eq!(std::fs::read(v2_worker.join("queue.json")).unwrap(), raw);
     }
 
     #[test]

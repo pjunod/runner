@@ -100,6 +100,8 @@ async fn replicated_election_task(
             break;
         }
         if let Some(current) = token.take() {
+            #[cfg(test)]
+            tests::pause_before_renewal(&cfg.node).await;
             match control.renew(&current, cfg.takeover_after).await {
                 Ok(Some(renewed)) => {
                     seq = seq.saturating_add(1);
@@ -118,6 +120,21 @@ async fn replicated_election_task(
                 Ok(None) => {
                     tracing::warn!("replicated leader lease was rejected; demoting");
                     publish(&tx, projected_leader(&layout, None), false);
+                }
+                Err(error)
+                    if cancel.is_cancelled()
+                        && current.expires_at_unix_ms > crate::control::unix_ms_public() =>
+                {
+                    // Shutdown cancels this task and then stops the control
+                    // store before the engine's final checkpoint. A renewal
+                    // submitted after that stop fails because of it, which is
+                    // not lost office while the lease is inside its deadline.
+                    // Demoting here would fence the final checkpoint. Past the
+                    // deadline a successor may hold office, so that case and
+                    // a rejection (`Ok(None)`) still demote.
+                    tracing::debug!(%error, "leader renewal interrupted by shutdown");
+                    token = Some(current);
+                    break;
                 }
                 Err(error) => {
                     tracing::warn!(%error, "replicated leader renewal failed; demoting");
@@ -528,5 +545,104 @@ mod tests {
             .unwrap();
         assert!(!guard());
         drop(tx);
+    }
+
+    /// Test-only pause between the loop's cancellation check and the
+    /// renewal write, keyed by election node name. This is the window the
+    /// shutdown race needs: the check passed, then shutdown cancels and
+    /// stops the control store before the renewal is submitted.
+    pub(super) struct RenewalGate {
+        reached: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    static RENEWAL_GATES: std::sync::Mutex<Vec<(String, std::sync::Arc<RenewalGate>)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// Removes its gate on drop, so a failed test cannot leave one behind.
+    struct RegisteredGate(&'static str);
+
+    impl RegisteredGate {
+        fn new(node: &'static str, gate: std::sync::Arc<RenewalGate>) -> Self {
+            RENEWAL_GATES.lock().unwrap().push((node.into(), gate));
+            Self(node)
+        }
+    }
+
+    impl Drop for RegisteredGate {
+        fn drop(&mut self) {
+            if let Ok(mut gates) = RENEWAL_GATES.lock() {
+                gates.retain(|(name, _)| name != self.0);
+            }
+        }
+    }
+
+    pub(super) async fn pause_before_renewal(node: &str) {
+        let gate = RENEWAL_GATES
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(name, _)| name == node)
+            .map(|(_, gate)| gate.clone());
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Shutdown cancels the election, then stops the replicated control
+    /// store before the engine writes its final checkpoint. A renewal that
+    /// passed the cancellation check before shutdown began is submitted
+    /// after the store stopped and fails with "raft stopped". That error is
+    /// this node's own shutdown, not lost office: the lease is still valid
+    /// until its deadline, so the view must stay "me" and the final
+    /// checkpoint must not be fenced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn renewal_error_after_shutdown_cancel_does_not_demote() {
+        const NODE: &str = "renewal-interrupted-by-shutdown";
+        let temp = tempfile::tempdir().unwrap();
+        let control =
+            crate::control::coordinator_protocol_tests::test_store(&temp, "shutdown-renewal").await;
+        let layout = SharedLayout::new(&temp.path().join("shared"), NODE).unwrap();
+        let tracker = TaskTracker::new();
+        let cancel = CancellationToken::new();
+        let gate = std::sync::Arc::new(RenewalGate {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let _registered = RegisteredGate::new(NODE, gate.clone());
+        let mut view = spawn_replicated_election(
+            layout,
+            cfg(NODE, 0),
+            control.clone(),
+            "boot".into(),
+            cancel.clone(),
+            &tracker,
+        );
+        tokio::time::timeout(Duration::from_secs(10), view.wait_for(|v| v.is_me))
+            .await
+            .expect("single voter takes office")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), gate.reached.notified())
+            .await
+            .expect("first renewal reaches the gate");
+        let held = view.borrow().record.as_ref().map(|record| record.seq);
+        // Exactly ClusterRuntime::shutdown's order: cancel, then stop control.
+        cancel.cancel();
+        control.shutdown().await.unwrap();
+        gate.release.notify_one();
+        tracker.close();
+        tokio::time::timeout(Duration::from_secs(10), tracker.wait())
+            .await
+            .expect("election task exits after shutdown");
+        assert!(
+            view.borrow().is_me,
+            "shutdown's own control stop demoted the leader"
+        );
+        assert_eq!(
+            view.borrow().record.as_ref().map(|record| record.seq),
+            held,
+            "the gated renewal must fail against the stopped store, not commit"
+        );
     }
 }

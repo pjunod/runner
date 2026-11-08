@@ -3382,7 +3382,7 @@ mod out_of_space_tests {
         for no in [
             "Permission denied (os error 13)",
             "os error 57",
-            "(os error 50)",
+            "(os error 22)",
             "(os error 1107)",
             "a release named Transport endpoint is not connected",
             "finalize: complete checkpoint digest differs",
