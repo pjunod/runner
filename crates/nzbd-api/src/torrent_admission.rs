@@ -2419,6 +2419,33 @@ fn persist_descriptor(path: &Path, bytes: &[u8]) -> Result<(), nzbd_state::State
     result
 }
 
+/// Contract §2.2 for a permanent metadata failure: a source URL the item's
+/// host answered 4xx for is `fetch{gone}` (the release is gone); a local
+/// read/write/state failure is `io`; metainfo that cannot be what it claims
+/// (unparseable, wrong info-hash, invalid) is `identity`.
+fn native_metadata_failure(
+    error: &AdmissionError,
+) -> (nzbd_types::FailureReason, Option<nzbd_types::FetchCause>) {
+    use nzbd_torrent::TorrentError;
+    use nzbd_types::{FailureReason, FetchCause};
+    match error {
+        AdmissionError::Torrent(TorrentError::TorrentSourceHttpStatus { status, .. })
+            if (400..500).contains(status) =>
+        {
+            (FailureReason::Fetch, Some(FetchCause::Gone))
+        }
+        AdmissionError::Torrent(
+            TorrentError::TorrentSourceRequestFailed { .. }
+            | TorrentError::TorrentSourceTimeout { .. }
+            | TorrentError::TorrentSourceRetry { .. }
+            | TorrentError::TorrentSourceHttpStatus { .. }
+            | TorrentError::MagnetMetadataTimeout,
+        ) => (FailureReason::Fetch, Some(FetchCause::IndexerUnavailable)),
+        AdmissionError::Torrent(_) => (FailureReason::Identity, None),
+        _ => (FailureReason::Io, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3990,32 +4017,5 @@ mod tests {
         ))
         .is_input_error());
         assert!(AdmissionError::Encoding.is_input_error());
-    }
-}
-
-/// Contract §2.2 for a permanent metadata failure: a source URL the item's
-/// host answered 4xx for is `fetch{gone}` (the release is gone); a local
-/// read/write/state failure is `io`; metainfo that cannot be what it claims
-/// (unparseable, wrong info-hash, invalid) is `identity`.
-fn native_metadata_failure(
-    error: &AdmissionError,
-) -> (nzbd_types::FailureReason, Option<nzbd_types::FetchCause>) {
-    use nzbd_torrent::TorrentError;
-    use nzbd_types::{FailureReason, FetchCause};
-    match error {
-        AdmissionError::Torrent(TorrentError::TorrentSourceHttpStatus { status, .. })
-            if (400..500).contains(status) =>
-        {
-            (FailureReason::Fetch, Some(FetchCause::Gone))
-        }
-        AdmissionError::Torrent(
-            TorrentError::TorrentSourceRequestFailed { .. }
-            | TorrentError::TorrentSourceTimeout { .. }
-            | TorrentError::TorrentSourceRetry { .. }
-            | TorrentError::TorrentSourceHttpStatus { .. }
-            | TorrentError::MagnetMetadataTimeout,
-        ) => (FailureReason::Fetch, Some(FetchCause::IndexerUnavailable)),
-        AdmissionError::Torrent(_) => (FailureReason::Identity, None),
-        _ => (FailureReason::Io, None),
     }
 }

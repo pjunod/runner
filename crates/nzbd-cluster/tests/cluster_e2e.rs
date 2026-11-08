@@ -1387,6 +1387,129 @@ async fn single_node_cluster_restart_keeps_the_queue() {
     a2.kill().await;
 }
 
+/// Plan M1a (i), review #280-6: a worker's post-processing failure is one
+/// terminal, recorded by the leader — exactly one `job_terminals` row (on
+/// the leader; the executing worker records none), one history row and one
+/// `job_pp_finished` — and the PP lease is released. The failure's bytes are
+/// disposed through the cluster cleanup ledger, not by a second node; the
+/// non-executing nodes hold no terminal row to dispose from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn worker_pp_failure_is_one_leader_terminal() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    if !require_tool("7z") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let files = vec![(
+        "broken.zip",
+        b"PK\x03\x04 this is not a complete zip archive".to_vec(),
+    )];
+    let post = build_post("brokenpp", &files, 20_000);
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+    let node = |coordinator, priority, download, post_process| NodeOpts {
+        coordinator,
+        priority,
+        download,
+        max_download_jobs: if download { 2 } else { 0 },
+        post_process,
+        min_free_disk_bytes: 0,
+    };
+    // The authority runs post-processing too (the daemon's usual shape):
+    // only a node with a PP setup holds the shared history, and the leader
+    // must hold it to own the terminal.
+    let a = start_node(tmp.path(), "a", node(true, 0, false, true), ns.port(), 4).await;
+    let b = start_node(tmp.path(), "b", node(false, 5, true, false), ns.port(), 4).await;
+    let c = start_node(tmp.path(), "c", node(false, 9, false, true), ns.port(), 4).await;
+    wait_for("leader elected", 15, || {
+        get_json(&a.url, "/api/v1/cluster")["is_leader"].as_bool() == Some(true)
+    })
+    .await;
+    wait_for("all nodes registered", 15, || {
+        get_json(&a.url, "/api/v1/cluster")["nodes"]
+            .as_array()
+            .is_some_and(|n| n.len() == 3)
+    })
+    .await;
+    let mut events = a.runtime.engine.subscribe();
+    add_job(&a.url, "brokenpp", post.nzb.as_bytes()).await;
+    wait_for("worker PP failure recorded by the leader", 60, || {
+        a.runtime
+            .engine
+            .artifacts()
+            .terminal(1)
+            .unwrap()
+            .is_some_and(|terminal| terminal.emitted)
+    })
+    .await;
+    let terminal = a.runtime.engine.artifacts().terminal(1).unwrap().unwrap();
+    assert_eq!(terminal.outcome, nzbd_types::TerminalOutcome::Failed);
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Unpack));
+    assert!(terminal.blames_release);
+    assert!(terminal.markers_stamped);
+    let seq = terminal.history_seq.expect("history row");
+    for other in [&b, &c] {
+        assert!(
+            other
+                .runtime
+                .engine
+                .artifacts()
+                .terminal(1)
+                .unwrap()
+                .is_none(),
+            "{}: only the leader records the terminal",
+            other.url
+        );
+    }
+    // One history row for the job across every node's shared history log.
+    let rows = std::fs::read_dir(tmp.path().join(".nzbd-cluster/history"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".jsonl"))
+        .flat_map(|entry| {
+            std::fs::read_to_string(entry.path())
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<nzbd_state::HistoryEntry>(line).ok())
+                .filter(|row| row.name == "brokenpp")
+                .map(|row| (row.job, row.completed_at_unix, row.status))
+                .collect::<Vec<_>>()
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(rows.len(), 1, "exactly one history row: {rows:?}");
+    wait_for("failed row retired from the leader's queue", 30, || {
+        get_json(&a.url, "/api/v1/jobs")["jobs"]
+            .as_array()
+            .is_some_and(|jobs| jobs.is_empty())
+    })
+    .await;
+    assert!(
+        get_json(&a.url, "/api/v1/cluster")["leases"]
+            .as_array()
+            .is_none_or(|leases| leases.is_empty()),
+        "the PP lease is released"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let mut finished = 0;
+    while let Ok(event) = events.try_recv() {
+        if let nzbd_engine::Event::JobPpFinished {
+            job, history_seq, ..
+        } = event
+        {
+            if job.0 == 1 {
+                assert_eq!(history_seq, seq);
+                finished += 1;
+            }
+        }
+    }
+    assert_eq!(finished, 1, "exactly one job_pp_finished");
+    a.kill().await;
+    b.kill().await;
+    c.kill().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn pp_runs_on_idle_node_via_anti_affinity() {
     let _ = tracing_subscriber::fmt()

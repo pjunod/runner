@@ -3028,14 +3028,48 @@ async fn record_pp_history(
             .push((nzbd_types::PP_DONE_PARAM.into(), entry.status.clone()));
     }
     let publication = cluster_publication(&stamped, entry.final_dir.as_deref());
-    let terminal = nzbd_engine::terminal::terminal_from_stamped(&stamped, entry, publication)
-        .ok_or_else(|| "post-processing result carries no terminal stamp".to_string())?;
+    let salvage_publication = stamped
+        .params
+        .iter()
+        .any(|(key, _)| key == "Delivery:Id")
+        .then(|| publication.clone())
+        .flatten();
+    let mut terminal =
+        nzbd_engine::terminal::terminal_from_stamped(&stamped, entry, publication)
+            .ok_or_else(|| "post-processing result carries no terminal stamp".to_string())?;
+    let failed = terminal.outcome == nzbd_types::TerminalOutcome::Failed;
+    if failed {
+        // In cluster mode the executing worker has already salvaged (its
+        // result carries the salvage Delivery when anything verified) and
+        // the source copies are disposed through the cluster cleanup ledger
+        // (`sourceCopies`, one owner per copy); nothing is owed on the
+        // leader's own inventory.
+        terminal.salvage = if salvage_publication.is_some() {
+            nzbd_state::artifacts::SalvageState::Published
+        } else {
+            nzbd_state::artifacts::SalvageState::None
+        };
+    }
+    let job_id = job.id;
     match s
         .engine
         .record_terminal_in(terminal, Some(history.clone()))
         .await
     {
-        Ok(Some(_)) => Ok(()),
+        Ok(Some(row)) => {
+            // First recording only (a replay finds the disposal noted).
+            if failed && row.disposal.is_none() {
+                let inventory = s.engine.artifacts();
+                let _ = tokio::task::spawn_blocking(move || {
+                    inventory.record_disposal(job_id.0, "cluster source cleanup ledger")
+                })
+                .await;
+                if let Some(publication) = salvage_publication {
+                    s.engine.emit_publication_ready(job_id, publication);
+                }
+            }
+            Ok(())
+        }
         Ok(None) => Err("the terminal record is not durable yet".into()),
         Err(error) => Err(error.to_string()),
     }
