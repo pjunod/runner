@@ -25,17 +25,20 @@ pub struct ScriptHost {
 ///
 /// nzbd is squarely in the path of this: it runs operator scripts, and an
 /// operator who drops a new script into `scripts_dir` while a job is
-/// finishing is racing precisely this window. Retrying is the accepted
+/// finishing is racing precisely this window. Extractor and repair tools
+/// ([`crate::tools::run_tool`]) take the same path: a busy executable is
+/// not a missing one, and reporting it as missing would hand the archive
+/// to the fallback extractor. Retrying is the accepted
 /// mitigation (rust-lang/rust#114554); a handful of short waits covers
 /// the fork window without turning a genuinely missing interpreter into a
 /// long stall.
-async fn spawn_retrying_etxtbsy(
+pub(crate) async fn spawn_retrying_etxtbsy(
     cmd: &mut tokio::process::Command,
 ) -> std::io::Result<tokio::process::Child> {
     const WAITS_MS: [u64; 4] = [1, 5, 20, 50];
     for wait in WAITS_MS {
         match cmd.spawn() {
-            Err(e) if e.raw_os_error() == Some(26) => {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
                 tokio::time::sleep(Duration::from_millis(wait)).await;
             }
             other => return other,
