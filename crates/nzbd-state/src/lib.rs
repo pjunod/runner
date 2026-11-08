@@ -215,34 +215,51 @@ struct OpenJournal {
 
 pub struct JobJournals {
     jobs_dir: PathBuf,
-    /// Fencing suffix — the work-lease id, or "local" for single-node.
+    /// Stable work-lease identity, retained when a checkpoint rotates files.
+    fencing_suffix: String,
+    /// Unique inode incarnation within that fencing identity.
     suffix: String,
     open: std::collections::HashMap<u32, OpenJournal>,
     dirty: bool,
+}
+
+fn journal_incarnation(fencing_suffix: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "{fencing_suffix}.{}.{stamp:x}.{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 impl JobJournals {
     pub fn open(state_dir: &Path, suffix: &str) -> Result<JobJournals, StateError> {
         let jobs_dir = state_dir.join("jobs");
         fsx::create_dir_all(&jobs_dir)?;
+        let fencing_suffix = sanitize_suffix(suffix);
+        let suffix = journal_incarnation(&fencing_suffix);
         Ok(JobJournals {
             jobs_dir,
-            suffix: {
-                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-                let stamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos();
-                format!(
-                    "{}.{}.{stamp:x}.{}",
-                    sanitize_suffix(suffix),
-                    std::process::id(),
-                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                )
-            },
+            fencing_suffix,
+            suffix,
             open: Default::default(),
             dirty: false,
         })
+    }
+
+    /// After a complete covering checkpoint commits, retire this incarnation's
+    /// append descriptors without deleting any journal evidence. The next append
+    /// creates a fresh exclusive inode rather than extending a possibly torn
+    /// tail. Worker/delegated journals need this even when not compactable.
+    pub fn rotate_after_checkpoint(&mut self) -> Result<(), StateError> {
+        self.sync()?;
+        self.open.clear();
+        self.suffix = journal_incarnation(&self.fencing_suffix);
+        Ok(())
     }
 
     pub fn jobs_dir(&self) -> &Path {
@@ -1460,6 +1477,43 @@ mod tests {
         assert!(JobJournals::replay_job(dir.path(), JobId(1))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn journal_checkpoint_rotation_keeps_evidence_and_fencing_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut local = JobJournals::open(dir.path(), "lease.with.dots").unwrap();
+        let mut foreign = JobJournals::open(dir.path(), "foreign").unwrap();
+        local.append(&rec(0)).unwrap();
+        local.sync().unwrap();
+        let old = local.open.get(&1).unwrap().path.clone();
+        let evidence = std::fs::read(&old).unwrap();
+        foreign.append(&rec(1)).unwrap();
+        foreign.sync().unwrap();
+        for segment in 2..=4 {
+            local.rotate_after_checkpoint().unwrap();
+            local.append(&rec(segment)).unwrap();
+            local.sync().unwrap();
+            assert!(local
+                .open
+                .get(&1)
+                .unwrap()
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("journal.lease_with_dots."));
+        }
+        foreign.append(&rec(5)).unwrap();
+        foreign.sync().unwrap();
+        assert_eq!(std::fs::read(&old).unwrap(), evidence);
+        let mut segments = JobJournals::replay_job(dir.path(), JobId(1))
+            .unwrap()
+            .into_iter()
+            .map(|record| record.segment_number)
+            .collect::<Vec<_>>();
+        segments.sort_unstable();
+        assert_eq!(segments, (0..=5).collect::<Vec<_>>());
     }
 
     #[test]

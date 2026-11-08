@@ -223,8 +223,16 @@ impl Persistence {
                             match guard { Some(g) => target.save_guarded(&doc, &move || g()), None => target.save(&doc) }?;
                             // Only this lane appends local records. Foreign live
                             // journals remain untouched, including unknown jobs.
-                            for job in doc.jobs.iter().filter(|_|authoritative) {
+                            // Preserve the failed incarnation as evidence;
+                            // normal healthy checkpoints still compact locally.
+                            for job in doc.jobs.iter().filter(|_|authoritative && append_failure.is_none()) {
                                 if !delegated.contains(&job.id) { if let Err(error)=journal.compact_local(job.id) {tracing::warn!(job=job.id.0,%error,"snapshot durable; journal compaction deferred");} }
+                            }
+                            if append_failure.is_some() {
+                                // Worker saves and delegated rows intentionally
+                                // retain old files. Never reopen admission onto
+                                // a retained torn tail after the checkpoint.
+                                journal.rotate_after_checkpoint()?;
                             }
                             Ok(())
                         })();
@@ -888,6 +896,93 @@ mod tests {
             1
         );
         stop(&mut lane, dir.path()).await;
+    }
+
+    #[tokio::test]
+    async fn worker_checkpoint_recovery_rotates_past_torn_and_retains_foreign_journals() {
+        use std::io::Write;
+        for (authoritative, delegated) in [(false, false), (true, true), (true, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut journal = JobJournals::open(dir.path(), "local").unwrap();
+            journal.append(&record(JobId(1), 1)).unwrap();
+            journal.sync().unwrap();
+            let poisoned = std::fs::read_dir(dir.path().join("jobs/1"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&poisoned)
+                .unwrap()
+                .write_all(b"{torn")
+                .unwrap();
+            let retained = std::fs::read(&poisoned).unwrap();
+            let mut foreign = JobJournals::open(dir.path(), "foreign").unwrap();
+            foreign.append(&record(JobId(1), 10)).unwrap();
+            foreign.sync().unwrap();
+            // A real append failure establishes the lane's recovery fence. The
+            // poisoned job remains cached/open, and worker saves cannot compact it.
+            std::fs::write(dir.path().join("jobs/2"), b"not a directory").unwrap();
+            let (tx, mut rx) = mpsc::channel(32);
+            let mut lane = Persistence::start(
+                journal,
+                SnapshotStore::open(dir.path()).unwrap(),
+                SnapshotStore::open(&dir.path().join("worker")).unwrap(),
+                tx,
+            );
+            assert!(lane.send(Request::Append {
+                revision: 1,
+                record: record(JobId(2), 1),
+                provenance: None
+            }));
+            assert!(completion(&mut rx).await.result.is_err());
+            let mut state = QueueState::default();
+            assert_eq!(
+                state.admit_url(
+                    "retained".into(),
+                    "http://example.invalid/retained",
+                    None,
+                    0
+                ),
+                JobId(1)
+            );
+            assert!(lane.send(Request::Snapshot {
+                revision: 2,
+                doc: state.to_doc(),
+                delegated: if delegated {
+                    HashSet::from([JobId(1)])
+                } else {
+                    HashSet::new()
+                },
+                authoritative,
+                guard: None
+            }));
+            assert!(completion(&mut rx).await.result.is_ok());
+            assert!(lane.send(Request::Append {
+                revision: 3,
+                record: record(JobId(1), 3),
+                provenance: None
+            }));
+            assert!(completion(&mut rx).await.result.is_ok());
+            foreign.append(&record(JobId(1), 11)).unwrap();
+            foreign.sync().unwrap();
+            let replayed = JobJournals::replay_job(dir.path(), JobId(1)).unwrap();
+            assert_eq!(
+                replayed
+                    .iter()
+                    .map(|record| record.segment_number)
+                    .collect::<HashSet<_>>(),
+                HashSet::from([1, 3, 10, 11])
+            );
+            assert_eq!(
+                std::fs::read(&poisoned).unwrap(),
+                retained,
+                "old torn evidence must remain untouched"
+            );
+            stop(&mut lane, dir.path()).await;
+        }
     }
 
     #[tokio::test]
