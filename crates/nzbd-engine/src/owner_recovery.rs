@@ -459,17 +459,31 @@ impl Owner {
         }
     }
 
-    /// A boot verification waits for its payload root; if the job's terminal
-    /// is stamped meanwhile (the terminal replay of a crash after the history
-    /// write), the job no longer has a payload to prove and nothing would
-    /// ever run or clear that verification — and a job under verification
-    /// can be neither exported nor admitted. Drop such waiting verifications.
+    /// A boot verification waits for its payload root; if the job's
+    /// `completed` terminal is stamped meanwhile (the terminal replay of a
+    /// crash after the history write), its payload is the publication's and
+    /// nothing is left to prove — yet nothing would ever run or clear that
+    /// verification, and a job under verification can be neither exported
+    /// nor admitted. Drop exactly those waiting verifications.
+    ///
+    /// Only a successful, stamped completion qualifies: a failed job's
+    /// retained or partially deleted source (failed cleanup included) keeps
+    /// its verification, which fences export and admission until its `Done`
+    /// bits are proven or dropped.
     pub(super) fn drop_unneeded_verifications(&mut self) {
         let stale = self
             .state
             .jobs
             .iter()
-            .filter(|job| !super::transitions::needs_payload(job))
+            .filter(|job| {
+                job.status == JobStatus::Completed
+                    && job.torrent.is_none()
+                    && !super::transitions::failed_cleanup_only(job)
+                    && job
+                        .params
+                        .iter()
+                        .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+            })
             .filter(|job| {
                 self.verification
                     .get(&job.id)
