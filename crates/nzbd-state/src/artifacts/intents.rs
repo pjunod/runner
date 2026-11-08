@@ -1284,19 +1284,22 @@ impl Inventory {
                 };
                 let landed_identity = fs::identity_for_file(&landed)?;
                 if intent.cross_volume {
-                    // A copy: the original never left the source.
-                    if file
-                        .dst_identity
-                        .as_ref()
-                        .is_some_and(|recorded| recorded == &landed_identity)
-                        || open_optional(&source_root, &file.src)?.is_some()
-                    {
+                    // A copy: the original never left the source. Review
+                    // #283-2: the copy is removed only while the source
+                    // still holds the journaled original — otherwise the
+                    // copy may be the only one left.
+                    let original = match open_optional(&source_root, &file.src)? {
+                        Some(source) => fs::identity_for_file(&source)? == file.identity,
+                        None => false,
+                    };
+                    if original {
                         fs::unlink(&parent, Path::new(name), false)?;
                         fs::sync_directory(&parent)?;
                         continue;
                     }
                     return Err(Error::Conflict(format!(
-                        "cannot unwind {}: the source copy is gone; retained for review",
+                        "cannot unwind {}: the source no longer holds the journaled original; \
+                         the copy is retained for review",
                         file.dst
                     )));
                 }
@@ -1306,11 +1309,27 @@ impl Inventory {
                         file.dst
                     )));
                 }
-                if file.keep_source && open_optional(&source_root, &file.src)?.is_some() {
+                if file.keep_source {
                     // A second name of a repair input the source kept.
-                    fs::unlink(&parent, Path::new(name), false)?;
-                    fs::sync_directory(&parent)?;
-                    continue;
+                    // Review #283-2: only while the source name is the same
+                    // object; a lost source name gets the file back below.
+                    match open_optional(&source_root, &file.src)? {
+                        Some(source)
+                            if fs::identity_for_file(&source)?.same_object(&landed_identity) =>
+                        {
+                            fs::unlink(&parent, Path::new(name), false)?;
+                            fs::sync_directory(&parent)?;
+                            continue;
+                        }
+                        Some(_) => {
+                            return Err(Error::Conflict(format!(
+                                "cannot unwind {}: the source name holds a different file; \
+                                 retained for review",
+                                file.dst
+                            )));
+                        }
+                        None => {}
+                    }
                 }
                 if let Some(source_parent) = parent_of(&file.src) {
                     crate::fileops::parents(&intent.source_dir, source_parent)?;
@@ -1498,6 +1517,35 @@ mod tests {
 
     fn selected_bytes() -> u64 {
         SELECTED.iter().map(|(_, bytes)| bytes.len() as u64).sum()
+    }
+
+    /// A scratch directory on a different device from `base` (review
+    /// #283-13): tmpfs, the system temp dir, or the test binary's own
+    /// volume. Without one the test cannot prove its cross-volume shape;
+    /// under `NZBD_REQUIRE_TOOLS` (CI) that is a failure, not a skip.
+    fn second_volume(base: &Path, test: &str) -> Option<tempfile::TempDir> {
+        use std::os::unix::fs::MetadataExt;
+        let device = std::fs::metadata(base).unwrap().dev();
+        let candidates = [
+            Some(PathBuf::from("/dev/shm")),
+            Some(std::env::temp_dir()),
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(Path::to_path_buf)),
+        ];
+        for candidate in candidates.into_iter().flatten() {
+            if std::fs::metadata(&candidate).is_ok_and(|meta| meta.is_dir() && meta.dev() != device)
+            {
+                if let Ok(dir) = tempfile::tempdir_in(&candidate) {
+                    return Some(dir);
+                }
+            }
+        }
+        if std::env::var_os("NZBD_REQUIRE_TOOLS").is_some() {
+            panic!("{test}: no second device for the cross-volume fixture, and NZBD_REQUIRE_TOOLS is set");
+        }
+        eprintln!("{test}: no second device; skipped (set NZBD_REQUIRE_TOOLS to make this fatal)");
+        None
     }
 
     /// Every selected file in exactly one place, and that place is the
@@ -1752,27 +1800,21 @@ mod tests {
     /// source until the delivery retires them.
     #[test]
     fn cross_volume_publication_copies_once() {
-        let shm = Path::new("/dev/shm");
         let base = tempfile::tempdir().unwrap();
-        let target_base =
-            tempfile::tempdir_in(if shm.is_dir() { shm } else { base.path() }).unwrap();
+        let Some(target_base) = second_volume(base.path(), "cross_volume_publication_copies_once")
+        else {
+            return;
+        };
         let (db, root) = fixture_in(base.path());
         let (source, selected, outcomes) = job(&db, &root, 65, SELECTED, SIBLINGS);
         let completed = target_base.path().join("completed");
         std::fs::create_dir(&completed).unwrap();
-        use std::os::unix::fs::MetadataExt;
-        let cross =
-            std::fs::metadata(&root).unwrap().dev() != std::fs::metadata(&completed).unwrap().dev();
         let target = completed.join("release.job-65.runner-g");
         db.reset_fs_ops();
         db.publish_selected_with_transfer(65, &target, selected, outcomes, None, true, &|| Ok(()))
             .unwrap();
         let ops = db.fs_ops();
         assert_eq!(ops.get("rename").copied(), Some(SELECTED.len() as u64));
-        if !cross {
-            eprintln!("cross_volume_publication_copies_once: /dev/shm shares a device with the temp dir; asserted same-volume shape only");
-            return;
-        }
         assert_eq!(ops.get("copy_bytes").copied(), Some(selected_bytes()));
         assert_eq!(ops.get("hash_bytes").copied().unwrap_or(0), 0);
         for (path, bytes) in SELECTED {
@@ -1870,23 +1912,167 @@ mod tests {
         }
     }
 
+    /// Review #283-2: a cross-volume unwind removes a copy only while the
+    /// source still holds the journaled original. With the original gone
+    /// or replaced, the copy may be the only one: it is retained and the
+    /// operation goes to review.
+    #[test]
+    fn cross_volume_unwind_keeps_a_copy_whose_original_is_gone() {
+        for replaced in [false, true] {
+            let base = tempfile::tempdir().unwrap();
+            let Some(target_base) = second_volume(
+                base.path(),
+                "cross_volume_unwind_keeps_a_copy_whose_original_is_gone",
+            ) else {
+                return;
+            };
+            let (db, root) = fixture_in(base.path());
+            let (source, selected, outcomes) = job(&db, &root, 68, SELECTED, SIBLINGS);
+            let completed = target_base.path().join("completed");
+            std::fs::create_dir(&completed).unwrap();
+            let target = completed.join("release.job-68.runner-g");
+            super::super::relocation::FAULTS
+                .with(|faults| faults.borrow_mut().insert("after_first_rename", libc::EIO));
+            assert!(db
+                .publish_selected_with_transfer(
+                    68,
+                    &target,
+                    selected,
+                    outcomes,
+                    None,
+                    true,
+                    &|| Ok(())
+                )
+                .is_err());
+            let generation = db.for_job(68).unwrap().unwrap().generation;
+            let intent = db.relocation_intent(&generation).unwrap().unwrap();
+            assert!(intent.cross_volume);
+            let copied = intent.files.iter().find(|file| file.moved).unwrap().clone();
+            let remaining = intent
+                .files
+                .iter()
+                .find(|file| !file.moved)
+                .unwrap()
+                .clone();
+            let original = SELECTED
+                .iter()
+                .find(|(path, _)| *path == copied.src)
+                .unwrap()
+                .1;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // A changed remaining source forces the unwind.
+            std::fs::write(source.join(&remaining.src), b"corrupted bytes!!").unwrap();
+            std::fs::remove_file(source.join(&copied.src)).unwrap();
+            if replaced {
+                std::fs::write(source.join(&copied.src), b"a different file").unwrap();
+            }
+            db.close().unwrap();
+            let db = Inventory::open(&base.path().join("state")).unwrap();
+            db.reconcile_relocations().unwrap();
+            let intent = db.relocation_intent(&generation).unwrap().unwrap();
+            assert_eq!(intent.state, IntentState::Unwinding, "replaced={replaced}");
+            assert_eq!(
+                std::fs::read(target.join(&copied.dst)).unwrap(),
+                original,
+                "replaced={replaced}: the copy is retained"
+            );
+            let op = db.operation(&intent.operation).unwrap();
+            assert_eq!(op.state, "review", "replaced={replaced}");
+            assert!(
+                op.error
+                    .as_deref()
+                    .unwrap()
+                    .contains("no longer holds the journaled original"),
+                "{:?}",
+                op.error
+            );
+        }
+    }
+
+    /// Review #283-2: unwinding a linked repair input drops the
+    /// publication's name only while the source name is the same object. A
+    /// source name that now holds another file is a conflict (the
+    /// publication's name is the original's last); a lost source name gets
+    /// the file back.
+    #[test]
+    fn repair_input_unwind_checks_the_source_is_the_same_object() {
+        for replaced in [false, true] {
+            let base = tempfile::tempdir().unwrap();
+            let (db, root) = fixture_in(base.path());
+            let files: &[(&str, &[u8])] = &[("a.mkv", b"repair input"), ("b.mkv", b"plain")];
+            let (source, selected, mut outcomes) = job(&db, &root, 69, files, &[]);
+            outcomes
+                .iter_mut()
+                .find(|outcome| outcome.source_path == "a.mkv")
+                .unwrap()
+                .repair_dependency = true;
+            let completed = base.path().join("completed");
+            std::fs::create_dir(&completed).unwrap();
+            let target = completed.join("release.job-69.runner-g");
+            super::super::relocation::FAULTS
+                .with(|faults| faults.borrow_mut().insert("after_first_rename", libc::EIO));
+            assert!(db
+                .publish_selected_with_transfer(
+                    69,
+                    &target,
+                    selected,
+                    outcomes,
+                    None,
+                    true,
+                    &|| Ok(())
+                )
+                .is_err());
+            assert!(
+                target.join("a.mkv").exists(),
+                "the repair input is linked first"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::fs::write(source.join("b.mkv"), b"changed").unwrap();
+            std::fs::remove_file(source.join("a.mkv")).unwrap();
+            if replaced {
+                std::fs::write(source.join("a.mkv"), b"imposter").unwrap();
+            }
+            db.close().unwrap();
+            let db = Inventory::open(&base.path().join("state")).unwrap();
+            db.reconcile_relocations().unwrap();
+            let generation = db.for_job(69).unwrap().unwrap().generation;
+            let intent = db.relocation_intent(&generation).unwrap().unwrap();
+            if replaced {
+                assert_eq!(intent.state, IntentState::Unwinding);
+                assert_eq!(
+                    std::fs::read(target.join("a.mkv")).unwrap(),
+                    b"repair input",
+                    "the original's last name is retained"
+                );
+                assert_eq!(std::fs::read(source.join("a.mkv")).unwrap(), b"imposter");
+                assert_eq!(db.operation(&intent.operation).unwrap().state, "review");
+            } else {
+                assert_eq!(intent.state, IntentState::Unwound);
+                assert_eq!(
+                    std::fs::read(source.join("a.mkv")).unwrap(),
+                    b"repair input",
+                    "the lost source name gets the original back"
+                );
+                assert!(!target.exists());
+            }
+        }
+    }
+
     /// A cross-volume move reserves its bytes before anything is journaled:
     /// a refused reservation leaves no intent and the source untouched.
     #[test]
     fn cross_volume_capacity_refusal_journals_nothing() {
-        let shm = Path::new("/dev/shm");
         let base = tempfile::tempdir().unwrap();
-        let target_base =
-            tempfile::tempdir_in(if shm.is_dir() { shm } else { base.path() }).unwrap();
+        let Some(target_base) = second_volume(
+            base.path(),
+            "cross_volume_capacity_refusal_journals_nothing",
+        ) else {
+            return;
+        };
         let (db, root) = fixture_in(base.path());
         let (source, selected, outcomes) = job(&db, &root, 66, SELECTED, SIBLINGS);
         let completed = target_base.path().join("completed");
         std::fs::create_dir(&completed).unwrap();
-        use std::os::unix::fs::MetadataExt;
-        if std::fs::metadata(&root).unwrap().dev() == std::fs::metadata(&completed).unwrap().dev() {
-            eprintln!("cross_volume_capacity_refusal_journals_nothing: no second device; nothing to assert");
-            return;
-        }
         crate::capacity::FAIL_NEXT_RESERVATION.with(|fail| fail.set(true));
         let target = completed.join("release.job-66.runner-g");
         assert!(db
