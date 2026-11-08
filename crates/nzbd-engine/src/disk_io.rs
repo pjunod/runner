@@ -182,7 +182,10 @@ impl DiskIoSampler {
         let nfs = parse_mountstats(&text.mountstats);
         let mut volumes = Vec::with_capacity(devices.len());
         for &device_id in devices {
-            if volumes.iter().any(|io: &VolumeIo| io.device_id == device_id) {
+            if volumes
+                .iter()
+                .any(|io: &VolumeIo| io.device_id == device_id)
+            {
                 continue;
             }
             let (source, counters) = resolve(device_id, &mounts, &disks, &nfs, device_name);
@@ -192,7 +195,8 @@ impl DiskIoSampler {
                         .previous
                         .get(&device_id)
                         .and_then(|(at, prev_source, prev)| {
-                            (prev_source == &source).then(|| rate_between(*at, *prev, now, counters))
+                            (prev_source == &source)
+                                .then(|| rate_between(*at, *prev, now, counters))
                         })
                         .flatten();
                     self.previous
@@ -243,8 +247,8 @@ fn rate_between(
 
 /// Linux `dev_t` to (major, minor), matching glibc's `gnu_dev_major/minor`.
 pub fn split_dev(dev: u64) -> (u64, u64) {
-    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
-    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & 0xffff_f000);
+    let minor = (dev & 0xff) | ((dev >> 12) & 0xffff_ff00);
     (major, minor)
 }
 
@@ -373,9 +377,8 @@ fn resolve(
     let number = split_dev(device_id);
     let mounts = mounts.get(&number).map(Vec::as_slice).unwrap_or(&[]);
     if let Some(mount) = mounts.iter().find(|mount| mount.fstype.starts_with("nfs")) {
-        if let Some((export, counters)) = mounts
-            .iter()
-            .find_map(|mount| nfs.get(&mount.mount_point))
+        if let Some((export, counters)) =
+            mounts.iter().find_map(|mount| nfs.get(&mount.mount_point))
         {
             return (
                 IoSource::Nfs {
@@ -501,9 +504,9 @@ mod tests {
     fn dev(major: u64, minor: u64) -> u64 {
         // Inverse of split_dev (glibc makedev).
         ((major & 0xfff) << 8)
-            | ((major & !0xfff) << 32)
+            | ((major & 0xffff_f000) << 32)
             | (minor & 0xff)
-            | ((minor & !0xff) << 12)
+            | ((minor & 0xffff_ff00) << 12)
     }
 
     fn names(source: &str) -> Option<String> {
@@ -598,7 +601,11 @@ mod tests {
             &text((0, 0), (0, 0)),
             &names,
         );
-        let why: Vec<&str> = reading.volumes.iter().map(|io| io.source.detail()).collect();
+        let why: Vec<&str> = reading
+            .volumes
+            .iter()
+            .map(|io| io.source.detail())
+            .collect();
         assert_eq!(why, ["cifs", "nfs without mountstats", "no matching mount"]);
         assert!(reading
             .volumes
@@ -636,14 +643,22 @@ mod tests {
         let t0 = Instant::now();
         let id = dev(259, 2);
         sampler.sample_from(&[id], t0, &text((0, 0), (0, 0)), &names);
-        sampler.sample_from(&[], t0 + Duration::from_secs(1), &text((0, 0), (0, 0)), &names);
+        sampler.sample_from(
+            &[],
+            t0 + Duration::from_secs(1),
+            &text((0, 0), (0, 0)),
+            &names,
+        );
         let back = sampler.sample_from(
             &[id],
             t0 + Duration::from_secs(2),
             &text((100, 100), (0, 0)),
             &names,
         );
-        assert_eq!(back.volumes[0].read_bps, None, "no rate across a gap in the config");
+        assert_eq!(
+            back.volumes[0].read_bps, None,
+            "no rate across a gap in the config"
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ mod admissions;
 pub mod automatic_control;
 pub mod backend;
 mod cluster_stop;
+pub mod disk_io;
 mod download_capacity;
 pub mod events;
 pub mod failover;
@@ -27,7 +28,6 @@ pub mod snapshot;
 pub mod terminal;
 pub mod torrent_acquisitions;
 pub mod torrent_runtime;
-pub mod disk_io;
 pub mod volumes;
 
 mod imports;

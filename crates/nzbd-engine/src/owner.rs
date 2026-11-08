@@ -9877,8 +9877,9 @@ impl Owner {
                     available_bytes: volume.available_bytes,
                     total_bytes: volume.total_bytes,
                     current: volume.current,
-                    io: disk_io.for_device(volume.device_id).map(|io| {
-                        StorageIoSnapshot {
+                    io: disk_io
+                        .for_device(volume.device_id)
+                        .map(|io| StorageIoSnapshot {
                             source: if disk_io_stale {
                                 "stale"
                             } else {
@@ -9887,8 +9888,7 @@ impl Owner {
                             detail: io.source.detail().to_owned(),
                             read_bps: io.read_bps.filter(|_| !disk_io_stale),
                             write_bps: io.write_bps.filter(|_| !disk_io_stale),
-                        }
-                    }),
+                        }),
                 })
                 .collect(),
             enospc_observed: self.enospc_observed,
