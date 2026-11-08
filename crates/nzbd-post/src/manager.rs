@@ -792,6 +792,25 @@ async fn failure_followup(
             tracing::warn!(job = job.0, %error, "failed-source assessment did not complete; the source is retained");
         }
     }
+    // Forced (Retry now, `job_pp_finished`): the disposal operation's own
+    // ladder is brought forward, so a park that moved its bytes but did not
+    // commit is completed now rather than at its `next_retry`.
+    if force && terminal.salvage != nzbd_state::artifacts::SalvageState::Pending {
+        let inventory = engine.artifacts();
+        let in_flight = inventory.clone();
+        if tokio::task::spawn_blocking(move || in_flight.disposal_in_flight(job.0))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false)
+        {
+            if let Ok(Err(error)) =
+                tokio::task::spawn_blocking(move || inventory.retry_disposal_now(job.0)).await
+            {
+                tracing::warn!(job = job.0, %error, "failed-source disposal stays on its ladder");
+            }
+        }
+    }
     let done = if terminal.salvage == nzbd_state::artifacts::SalvageState::Pending {
         false
     } else {
@@ -1133,7 +1152,10 @@ async fn dispose_failed_source(
         .ok()
         .flatten()
         .is_some_and(|artifact| !artifact.terminal() && artifact.path.exists())
-        || source.exists();
+        || source.exists()
+        // A disposal operation that moved the bytes but did not commit
+        // still holds them; replaying it below records where they are.
+        || inventory.disposal_in_flight(job.0).unwrap_or(true);
     if !has_source {
         // A fetch failure, or an attempt that never wrote a byte.
         return record("no payload".into()).await;

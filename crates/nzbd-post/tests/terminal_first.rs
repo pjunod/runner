@@ -1114,3 +1114,144 @@ async fn absent_integrity_proof_is_unknown_not_cleanup_authority() {
     );
     engine.shutdown().await;
 }
+
+/// v2 of the deleted `retry_now_releases_a_due_failed_source_and_runs_manager_salvage`:
+/// a failed row whose disposal is waiting on its operation's durable
+/// `next_retry` stays put on the manager's own rescans, and an operator
+/// Retry now runs the follow-up immediately, past that deadline — salvage
+/// settled, then the park replays and is recorded once.
+#[tokio::test]
+async fn retry_now_runs_a_failed_source_follow_up_past_its_disposal_ladder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, source) = admitted_job(
+        &engine,
+        "retry-now",
+        &[(
+            "Movie.2020.mkv",
+            Some(b"\x1a\x45\xdf\xa3 unproven matroska".as_slice()),
+        )],
+        JobStatus::Failed,
+    )
+    .await;
+    let mut row = export(&engine, job_id).await.unwrap();
+    for file in &mut row.files {
+        file.crc32 = None; // unproven: nothing to salvage, the source is parked
+    }
+    engine.import_job(row, false, false).await.unwrap();
+    assert!(engine
+        .fail_job(
+            job_id,
+            FailureReason::Health,
+            None,
+            "health",
+            "below critical"
+        )
+        .await
+        .unwrap());
+    // The park's relocate operation hits an I/O error (EIO) before it
+    // commits, so it goes onto its own durable retry ladder.
+    let parked = tmp.path().join("parked");
+    let fault = engine
+        .artifacts()
+        .inject_relocation_test_fault(job_id.0, "before_commit", 5)
+        .unwrap();
+    let cfg = PostConfig {
+        failure_action: FailureAction::Delete,
+        failed_dir: Some(parked.clone()),
+        ..PostConfig::default()
+    };
+    let dest = tmp.path().join("dest");
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let retry_at = loop {
+        assert!(!nzbd_post::manager::follow_up_failure(&engine, &cfg, &dest, job_id).await);
+        if let Some(at) = engine.artifacts().disposal_retry_at(job_id.0).unwrap() {
+            break at;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the park fails onto its ladder: {:?}",
+            engine.artifacts().terminal(job_id.0).unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        retry_at > now() + 5,
+        "the ladder is in the future: {retry_at}"
+    );
+    let terminal = engine.artifacts().terminal(job_id.0).unwrap().unwrap();
+    assert_ne!(terminal.salvage, SalvageState::Pending, "salvage ran first");
+    assert!(terminal.disposal.is_none(), "{terminal:?}");
+
+    // The storage comes back. The manager's startup rescan honours the
+    // ladder: nothing is recorded before `next_retry`.
+    drop(fault);
+    let cancel = CancellationToken::new();
+    let tracker = TaskTracker::new();
+    let manager = spawn_post_manager(
+        engine.clone(),
+        cfg.clone(),
+        history,
+        dest.clone(),
+        None,
+        cancel.clone(),
+        &tracker,
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        engine
+            .artifacts()
+            .terminal(job_id.0)
+            .unwrap()
+            .unwrap()
+            .disposal
+            .is_none(),
+        "a rescan waits for the ladder"
+    );
+    assert_eq!(
+        engine.artifacts().disposal_retry_at(job_id.0).unwrap(),
+        Some(retry_at),
+        "the ladder is untouched by the rescan"
+    );
+
+    // Retry now runs the owed follow-up immediately.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match manager.retry_now(job_id).await {
+            Ok(()) => break,
+            // The owner may still be settling the re-imported row.
+            Err(nzbd_post::manager::RestartPostError::NotReady)
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            Err(error) => panic!("retry now: {error}"),
+        }
+    }
+    assert!(now() < retry_at, "ran ahead of the ladder");
+    let terminal = engine.artifacts().terminal(job_id.0).unwrap().unwrap();
+    let disposal = terminal.disposal.clone().unwrap();
+    assert!(disposal.starts_with("parked at"), "{disposal}");
+    assert!(parked.join("retry-now").join("Movie.2020.mkv").exists());
+    assert!(!source.join("Movie.2020.mkv").exists());
+    assert_eq!(
+        std::fs::read_dir(&parked).unwrap().count(),
+        1,
+        "one parked copy"
+    );
+    assert_eq!(
+        engine.artifacts().disposal_retry_at(job_id.0).unwrap(),
+        None,
+        "the ladder's operation settled"
+    );
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+    engine.shutdown().await;
+}
