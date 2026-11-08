@@ -1,5 +1,98 @@
 # nzbd — Project Status
 
+## Pipeline contract v2 M6a — one clock per job, errno not text, docs from the contract — 2026-11-08
+
+**Status:** draft PR (#PR) on `claude/pipeline-v2-m6a-runner` (runner 0.5.0),
+base `main` (M3 #283 merged in). Not reviewed, not merged, not deployed.
+Safe to merge right after M3: no wire field is removed and nothing persisted
+changes shape. Plan: `IMPL_RUNNER.md` §8 / `PIPELINE_REWRITE_PLAN.md` M6.
+M6b (wire removals, persisted `Held`) is stacked on this branch and merges
+only after deploy confirmation.
+
+- **Backoff clocks collapsed** to the hold ladder and the disposal ladder.
+  Holds: the owner's `HOLD_RETRY_DELAYS_SECONDS` only — the PP manager's
+  second scheduler (`schedule_recoverable_post_retry` /
+  `prepare_recoverable_post_retry`, `POST_RETRY_DELAYS_SECONDS`, its jitter)
+  and `QueueCommand::SchedulePostRetry` / `EngineHandle::schedule_post_retry`
+  are deleted; the owner already schedules every timed hold it writes and
+  re-arms an unscheduled one on load. Disposal: `Operation.next_retry`. The
+  `*PP:failed-cleanup-next-retry/blocked-since/last-error` params (no writer
+  since M1a) are dropped when the queue loads (`drop_retired_params`);
+  `failed_cleanup` on the job summary keeps the attempt count. The
+  verification backoff (`owner_recovery.rs`) is unchanged.
+- **Errno, not text.** `is_out_of_space` / `is_storage_unavailable` /
+  `io_hold_cause` are replaced by `errno_hold_cause`, `io_error_hold_cause`
+  (`raw_os_error()`, else the std kind, else the wrapped error),
+  `error_hold_cause` (walks `source()` to the io error or a SQLite
+  `DiskFull`/`SystemIoFailure` code) and `stderr_hold_cause` — the one text
+  rule, for subprocess output. Writer errors, payload resolution, allocation,
+  terminal write faults, `pp_verdict`, salvage (now `Result<_, PostError>`),
+  disposal and torrent io errors are typed. Still text, each named at its
+  call site: par2/unrar/7z output and `PostError::Subprocess`,
+  `EngineError::Lifecycle` messages, a torrent backend's error string, a
+  persisted operation error, and the pre-v2 `io` hold message (goes in M6b).
+- **cfg(test) twins deleted** where a test-only wrapper carried the doc
+  comment of the production path: `Owner::reschedule_hold`,
+  `Inventory::reconcile_deleted_artifacts`, `reconcile_transforms(_root)`,
+  `ControlStore::commit_url_outbox`, `tls::server_config`. `spawn_writer`
+  stays as test support and says so.
+- **Docs.** `docs/INTEGRATION.md` rewritten from the contract with every
+  literal read from `event_json` and the handlers (deprecated fields marked
+  "removed in M6b"); 29 superseded plans and finished status/review records
+  moved to `docs/archive/` with one-line pointers; `docs/README.md` indexes
+  every file; ADR-20 (`docs/adr/0020-pipeline-contract-v2.md`, row in
+  `ARCHITECTURE.md` §15).
+- **Accept tests.** `nzbd-api` `integration_doc_names_every_sse_event` (doc
+  event tables == `event_json` names and the SSE handler's frame literals;
+  a new `Event` variant does not compile until listed);
+  `crates/nzbd/tests/docs_index.rs` (index lists every doc; every relative
+  link in `docs/` and `README.md` resolves).
+- **Found doing it:** the web job detail read `post_timing`, `url_fetch` and
+  `failed_cleanup` under camelCase keys the API never sends, so none of the
+  three lines ever rendered; fixed, asserted in the UI DOM harness. An
+  extractor's full-disk report during salvage settled the obligation empty;
+  it is now a `StorageFull` io error and the obligation waits for space.
+
+**Deleted (non-test, approx.):** PP retry scheduler ~95 lines,
+`SchedulePostRetry` command/handle ~70, failed-cleanup progress fields and
+param list ~15, text classifiers ~30, cfg(test) wrappers ~35. Whole-branch
+non-test diff under `crates/`: +901 / −614 (includes the new classifier,
+its tests in `lib.rs`, and the 198-line doc test).
+
+**Behaviour change to review:** an `io::Error` whose *message* names a full
+or dropped volume but whose errno does not (e.g. `io::Error::other("… (os
+error 5)")`) is now a terminal `failed/io` (parked, no blame) instead of a
+hold. Real errno-bearing errors classify exactly as before.
+
+**Fast lane run:** `cargo clippy -p nzbd-post -p nzbd-engine -p nzbd-api
+-p nzbd-cluster -p nzbd-state -p nzbd --all-targets --features
+nzbd-state/test-support -- -D warnings` clean; `cargo test -p nzbd-engine
+--lib` 336/337 (the failure is `volumes::…inaccessible_path…`, a mode-000
+directory check that cannot fail as root in this sandbox; file untouched);
+`cargo test -p nzbd-post --lib` 120/120; `nzbd-post` `failure_regressions`
+6/6, `terminal_first` 15/15, `pp_pipeline` capacity hold 1/1; `nzbd-engine`
+e2e enospc/stranded/post-hold 3/3; `nzbd-state --lib` transforms /
+writer_naming / relocation_failure / artifacts tests 123 passed; `nzbd-api
+--lib` torrent_admission 25/25 and the doc test; `nzbd` `docs_index` 2/2
+and `tls` 6/6; `nzbd-cluster --lib delivery` 3/3. Full suite not run (the
+orchestrator's merge gate).
+
+**Not verified:** the UI DOM harness assertion (`crates/nzbd/tests/ui_dom.rs`
+needs the full `nzbd` test build; left to the gate); behaviour on macOS
+(`EREMOTEIO` is Linux-only and gated); anchors inside doc links (the link
+test checks paths only).
+
+**Decisions for Paul:** versions — M6a 0.5.0, M6b 0.6.0.
+`FILE_LIFECYCLE_OPERATIONS.md` stays live (it is the operations reference
+M3 updated), while `FILE_LIFECYCLE_PLAN/REVIEW/STATUS` are archived. The
+BitTorrent reports stay in place because the release-review script reads
+them. Out-of-repo links in the archived file-lifecycle docs (to a sibling
+`monarr` checkout) became code spans.
+
+**Post-deploy checks:** none new — no wire or schema change. A held job's
+`control.next_retry_at_unix` still advances 30 s → 1 m → 2 m → 5 m
+(`curl -s $NZBD/api/v1/jobs | jq '.jobs[] | select(.status_projected=="held") | .control | {cause, retry_attempt, next_retry_at_unix}'`).
+
 ## Pipeline contract v2 M3 — journaled per-file publication, one hash, no ack — 2026-11-07
 
 **Status:** draft PR [#283](https://github.com/pjunod/runner/pull/283) on
