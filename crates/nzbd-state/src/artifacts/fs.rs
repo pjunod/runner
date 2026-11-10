@@ -4,7 +4,11 @@ use std::fs::{self, File};
 use std::path::{Component, Path};
 
 #[cfg(test)]
+type UnlinkHook = Box<dyn FnOnce(&File, &Path)>;
+
+#[cfg(test)]
 thread_local! {
+    pub(crate) static BEFORE_UNLINK: std::cell::RefCell<Option<UnlinkHook>> = const { std::cell::RefCell::new(None) };
     pub(super) static RENAME_FAILURE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
@@ -358,6 +362,10 @@ mod unix {
         result
     }
     pub fn unlink(parent: &File, path: &Path, directory: bool) -> Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_UNLINK.with(|hook| hook.borrow_mut().take()) {
+            hook(parent, path);
+        }
         let n = name(path)?;
         let rc = unsafe {
             libc::unlinkat(
@@ -660,18 +668,30 @@ pub fn available_bytes(_: &File) -> Result<u64> {
 /// Atomic publication must never replace an unrelated empty directory.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn rename_exclusive(from: &Path, to: &Path) -> Result<()> {
-    rename_exclusive_impl(from, to, false)
+    rename_exclusive_impl(from, to, false, None)
+}
+
+/// Transfer an existing source-name guard into the rename, keeping the inode
+/// pinned until a verified target-name handle can replace it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn rename_exclusive_from_open(from: &Path, to: &Path, guard: File) -> Result<()> {
+    rename_exclusive_impl(from, to, false, Some(guard))
 }
 
 /// Compatibility for callers without an owning content journal. Native rename
 /// remains metadata-only; the link fallback verifies content once at each edge.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn rename_exclusive_verified(from: &Path, to: &Path) -> Result<()> {
-    rename_exclusive_impl(from, to, true)
+    rename_exclusive_impl(from, to, true, None)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn rename_exclusive_impl(from: &Path, to: &Path, verify_content: bool) -> Result<()> {
+fn rename_exclusive_impl(
+    from: &Path,
+    to: &Path,
+    verify_content: bool,
+    guard: Option<File>,
+) -> Result<()> {
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
@@ -750,6 +770,11 @@ fn rename_exclusive_impl(from: &Path, to: &Path, verify_content: bool) -> Result
         let name = Path::new(from.file_name().unwrap());
         let input = open_at(&source, name, false)?;
         let original = identity(&input.metadata()?);
+        if let Some(guard) = &guard {
+            if !rename_identity_matches(&identity(&guard.metadata()?), &original) {
+                return Err(Error::Conflict("guarded rename source was replaced".into()));
+            }
+        }
         if !input.metadata()?.is_file() {
             return Err(error.into());
         }
@@ -787,6 +812,13 @@ fn rename_exclusive_impl(from: &Path, to: &Path, verify_content: bool) -> Result
                     .into(),
             ));
         }
+        // NFS can silly-rename an open old name and remove it asynchronously
+        // on close, changing the target inode's ctime after we return. Keep
+        // the verified target handle, but close every old-name handle before
+        // unlink so the publication identity observes the final mutation.
+        drop(current);
+        drop(input);
+        drop(guard);
         unlink(&source, name, false)?;
         if let Some(expected) = original_digest {
             let final_file = open_at(&target, Path::new(to.file_name().unwrap()), false)?;
@@ -844,9 +876,61 @@ pub fn rename_exclusive(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn assert_name_not_open_for_test(path: &Path) {
+    let expected = path.canonicalize().unwrap();
+    for entry in std::fs::read_dir("/proc/self/fd").unwrap().flatten() {
+        let observed = std::fs::read_link(entry.path()).ok();
+        assert_ne!(
+            observed.as_deref(),
+            Some(expected.as_path()),
+            "old-name handle would defer NFS unlink"
+        );
+    }
+}
+
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod exclusive_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exclusive_fallback_closes_old_name_before_unlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("source");
+        let to = tmp.path().join("target");
+        for verified in [false, true] {
+            fs::write(&from, b"preserved payload").unwrap();
+            let old_name = from.clone();
+            BEFORE_UNLINK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |_, _| {
+                    assert_name_not_open_for_test(&old_name)
+                }));
+            });
+            RENAME_FAILURE.with(|value| value.set(Some(libc::EOPNOTSUPP)));
+            rename_exclusive_impl(&from, &to, verified, Some(File::open(&from).unwrap())).unwrap();
+            assert_eq!(fs::read(&to).unwrap(), b"preserved payload");
+            assert!(!from.exists());
+            fs::remove_file(&to).unwrap();
+        }
+    }
+
+    #[test]
+    fn guarded_fallback_rejects_replaced_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("source");
+        let retained = tmp.path().join("retained");
+        let to = tmp.path().join("target");
+        fs::write(&from, b"original").unwrap();
+        let guard = File::open(&from).unwrap();
+        fs::rename(&from, &retained).unwrap();
+        fs::write(&from, b"replaced").unwrap();
+        RENAME_FAILURE.with(|value| value.set(Some(libc::EOPNOTSUPP)));
+        assert!(rename_exclusive_from_open(&from, &to, guard).is_err());
+        assert_eq!(fs::read(&from).unwrap(), b"replaced");
+        assert_eq!(fs::read(&retained).unwrap(), b"original");
+        assert!(!to.exists());
+    }
 
     #[test]
     fn unsupported_file_rename_and_crash_replay_preserve_identity() {

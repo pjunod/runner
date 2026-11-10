@@ -269,6 +269,10 @@ pub fn copy_publish_checked(
         {
             return Err(Error::Conflict("copy publication identity changed".into()));
         }
+        // Closing private-name handles before unlink prevents deferred NFS
+        // sillyrename cleanup from changing the published inode after readback.
+        drop(temporary);
+        drop(output);
         // The source is retained. Verify the final name after our last
         // namespace mutation so link/unlink ctime changes do not cause scans.
         fs::unlink(&parent, Path::new(&tmp_name), false)?;
@@ -352,6 +356,27 @@ pub fn writer(path: &Path, create: bool) -> Result<File> {
 #[cfg(test)]
 mod copy_budget_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn copy_publication_closes_private_name_before_unlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        std::fs::write(&source, b"source and publication both survive").unwrap();
+        let parent = tmp.path().to_path_buf();
+        fs::BEFORE_UNLINK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_, name| {
+                assert!(name.to_string_lossy().starts_with(".runner-publish-"));
+                fs::assert_name_not_open_for_test(&parent.join(name));
+            }));
+        });
+        copy_publish_checked(&source, &target, &|| Ok(())).unwrap();
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            std::fs::read(&target).unwrap()
+        );
+    }
 
     #[test]
     fn final_readback_rejects_replaced_ancestor_even_when_old_descriptor_is_intact() {
