@@ -170,12 +170,22 @@ Second review pass (2026-11-11, on `paths.workspace_dir` and the fixes above):
 | 1 | moved workspace root re-stamped only the row; journal kept old identity → reconcile could orphan an in-flight workspace | journal scratch + attempt dirs re-stamped in the same tx |
 | 2 | path rewrite counted `instr` matches → re-stamp every start | counts/touches only changed values |
 | 3 | crash between commit and sidecar → stale sidecar forever | re-stamp driven by recorded/live root mismatch; stale own sidecar repaired |
-| 4 | finalize/post ENOSPC with a job that cannot retry held intake until manual resume | partial or job-dir probe when not runnable; post jobs retry under the latch |
+| 4 | finalize/post ENOSPC with a job that cannot retry held intake until manual resume | partial or job-dir probe when not runnable; a runnable job retries itself (post-side holds were never gated by the latch) |
 | 5 | probe walked above an unmounted root → false Cleared/Gone | bounded at the guarded root, recorded device required; missing root holds |
 | 6 | probe truncated to a stale size | live-writer files skipped; release to current size |
 | 7 | restart drain set outside the slot lock | drain derived from the slot under its lock; DELETE always clears |
 | 8 | remover emptied same-device bind mounts; deep-move temp names collided after crash | mount id (statx) scope; unique temp names, collision retry |
 | 9 | admission stat `Short` looped on terminal jobs (no-op verification) | `verification_inert` jobs owe no admission stat |
+
+Third review pass (2026-11-11, on the latch probe and the remover):
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | device recorded once; an NFS/autofs remount (new `st_dev`) held until operator resume | parent-filesystem device recorded too; root missing or on the parent's device holds, any other device rebinds and probes |
+| 2 | grouped roots recorded as their common path (`/` for two bind mounts) → device never matched | each member root recorded with the group's device; every-root probe uses one member per device |
+| 3 | post jobs in `space_retry_jobs` were a no-op (only the download-side storage release reads it) | removed; post-side holds were never gated by the latch |
+| 4 | release `set_len(max(current, len))` could regrow a file truncated mid-probe | `set_len(current)` |
+| 5 | remover fell back to device-only scope silently without statx mount id | one warning with the reason |
 
 ### State and hold exits
 
