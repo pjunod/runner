@@ -190,8 +190,8 @@ pub struct Artifact {
     pub created_at: i64,
     pub updated_at: i64,
     pub retention_seconds: u64,
+    /// Wall-clock expiry (W3): due when `deadline <= now`, across restarts.
     pub deadline: Option<i64>,
-    pub eligible_seconds: u64,
     #[serde(default)]
     pub files: Vec<FileEntry>,
     pub error: Option<String>,
@@ -242,13 +242,11 @@ impl Artifact {
             && self.hold.is_none()
             && self.retention_seconds > 0
     }
-    pub fn earliest_expiry(&self, now: i64) -> Option<i64> {
+    pub fn earliest_expiry(&self) -> Option<i64> {
         if !self.eligible() {
             return None;
         }
-        Some(self.deadline?.max(
-            now.saturating_add(self.retention_seconds.saturating_sub(self.eligible_seconds) as i64),
-        ))
+        self.deadline
     }
 }
 /// Exact receipt-custody metadata from the current artifact row. This does
@@ -449,7 +447,6 @@ pub struct Inventory {
     // publication checkpoint.
     publication_active: Mutex<std::collections::HashSet<String>>,
     relocation_active: Mutex<std::collections::HashSet<String>>,
-    clocks: Mutex<std::collections::HashMap<String, (u64, Instant)>>,
     reconcile_cursor: Mutex<String>,
     empty_failed_cursor: Mutex<String>,
     // One task runner at a time: the maintenance tick and an API kick can
@@ -921,7 +918,6 @@ impl Inventory {
             mutation: Mutex::new(()),
             publication_active: Mutex::new(std::collections::HashSet::new()),
             relocation_active: Mutex::new(std::collections::HashSet::new()),
-            clocks: Mutex::new(std::collections::HashMap::new()),
             reconcile_cursor: Mutex::new(String::new()),
             empty_failed_cursor: Mutex::new(String::new()),
             tasks: Mutex::new(()),
@@ -1408,7 +1404,6 @@ impl Inventory {
             updated_at: now(),
             retention_seconds: 0,
             deadline: None,
-            eligible_seconds: 0,
             files: Vec::new(),
             error: None,
             inspected_at: None,
@@ -1910,7 +1905,6 @@ impl Inventory {
         if state == "parked_failed" && a.owned {
             a.retention_seconds = u64::from(self.settings()?.failed_retention_days) * 86400;
             a.deadline = Some(now().saturating_add(a.retention_seconds as i64));
-            a.eligible_seconds = 0;
         }
         let _coordinator = self.mutation_guard()?;
         self.check_payload_capture(&original)?;
@@ -2016,7 +2010,6 @@ impl Inventory {
             updated_at: now(),
             retention_seconds: 0,
             deadline: None,
-            eligible_seconds: 0,
             files: Vec::new(),
             error: None,
             inspected_at: None,
@@ -2176,7 +2169,6 @@ impl Inventory {
             }
             a.retention_seconds = seconds;
         }
-        a.eligible_seconds = 0;
         a.deadline = Some(now().saturating_add(a.retention_seconds as i64));
         a.revision += 1;
         a.updated_at = now();
@@ -2557,7 +2549,6 @@ impl Inventory {
         }
         let mut a = self.get(key)?;
         a.hold = None;
-        a.eligible_seconds = 0;
         a.deadline = Some(now().saturating_add(a.retention_seconds as i64));
         a.revision += 1;
         save_artifact(&self.db.lock().unwrap(), &a)?;
@@ -2858,11 +2849,7 @@ impl Inventory {
         }
         if op.attempts == 0
             && ((a.revision != revision && !explicit_cancellation)
-                || (automatic
-                    && (!self.settings()?.enabled
-                        || !a.eligible()
-                        || a.eligible_seconds < a.retention_seconds
-                        || !a.deadline.is_some_and(|d| d <= now()))))
+                || (automatic && (!a.eligible() || !a.deadline.is_some_and(|d| d <= now()))))
         {
             op.state = "cancelled".into();
             op.error = Some("deletion authorization changed; a fresh request is required".into());
@@ -3023,8 +3010,8 @@ impl Inventory {
         Ok(())
     }
 
-    /// Count only daemon monotonic uptime observed while eligible. Reset the
-    /// checkpoint before the transaction: a failed commit loses time safely.
+    /// Failed-payload expiry is a wall-clock deadline (W3): it survives
+    /// restarts and does not wait on daemon uptime or an opt-in toggle.
     pub fn tick(&self) -> Result<()> {
         self.tick_with_history(None)
     }
@@ -3034,56 +3021,21 @@ impl Inventory {
     /// in the inventory journal, independent of history retention.
     pub fn tick_with_history(&self, history: Option<&crate::history::HistoryDb>) -> Result<()> {
         self.drain_writer_naming();
-        let enabled = self.settings()?.enabled;
-        let mut due = Vec::new();
-        {
-            let _guard = self.mutation_guard()?;
-            let mut db = self.db.lock().unwrap();
-            let tx = db.transaction()?;
-            let raws = {
-                let mut stmt =
-                    tx.prepare("SELECT data FROM artifacts WHERE state IN ('parked_failed','recovery_imported')")?;
-                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()?
-            };
-            let mut active_clocks = std::collections::HashSet::new();
-            for raw in raws {
-                let mut a: Artifact = serde_json::from_str(&raw)?;
-                active_clocks.insert(a.id.clone());
-                if enabled && a.eligible() {
-                    let elapsed = {
-                        let mut clocks = self.clocks.lock().unwrap();
-                        let point = clocks
-                            .entry(a.id.clone())
-                            .or_insert((a.revision, Instant::now()));
-                        let elapsed = if point.0 == a.revision {
-                            point.1.elapsed().as_secs()
-                        } else {
-                            0
-                        };
-                        *point = (a.revision, Instant::now());
-                        elapsed
-                    };
-                    a.eligible_seconds = a
-                        .eligible_seconds
-                        .saturating_add(elapsed)
-                        .min(a.retention_seconds);
-                    save_artifact(&tx, &a)?;
-                    if a.eligible_seconds >= a.retention_seconds
-                        && a.deadline.is_some_and(|d| d <= now())
-                    {
-                        due.push((a.id.clone(), a.revision));
-                    }
-                } else {
-                    self.clocks.lock().unwrap().remove(&a.id);
+        let due = {
+            let db = self.db.lock().unwrap();
+            let mut stmt = db.prepare(
+                "SELECT data FROM artifacts WHERE state IN ('parked_failed','recovery_imported')",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut due = Vec::new();
+            for raw in rows {
+                let a: Artifact = serde_json::from_str(&raw?)?;
+                if a.eligible() && a.deadline.is_some_and(|d| d <= now()) {
+                    due.push((a.id, a.revision));
                 }
             }
-            self.clocks
-                .lock()
-                .unwrap()
-                .retain(|key, _| active_clocks.contains(key));
-            tx.commit()?;
-        }
+            due
+        };
         for (key, revision) in due {
             if let Err(e) = self.request_delete_authorized(
                 &key,
@@ -3236,7 +3188,6 @@ impl Inventory {
             updated_at: now(),
             retention_seconds: 86400,
             deadline: None,
-            eligible_seconds: 0,
             files: fs::manifest(&dir, 100_000)?,
             error: None,
             inspected_at: Some(now()),
@@ -3285,7 +3236,6 @@ impl Inventory {
             let mut a: Artifact = serde_json::from_str(&raw)?;
             a.hold = Some("restored backup: review required".into());
             a.keep = true;
-            a.eligible_seconds = 0;
             a.deadline = None;
             a.revision += 1;
             save_artifact(&tx, &a)?;

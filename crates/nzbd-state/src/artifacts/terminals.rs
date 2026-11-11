@@ -513,6 +513,103 @@ impl Inventory {
         .map(Some)
     }
 
+    /// W3 (Paul, 2026-11-11): a curator-admitted failure the job does not
+    /// keep follows `failure_action` once its salvage settles; under
+    /// `delete` it is never parked. Sources an older build parked under the
+    /// replaced park-always rule are due now, through the ordinary retention
+    /// path (`tick`). Returns how many became due.
+    pub fn expire_parked_curator_failures(&self) -> Result<usize> {
+        let _guard = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let raws = {
+            let mut statement = tx.prepare(
+                "SELECT a.data FROM artifacts a JOIN job_terminals t ON t.job=a.job WHERE a.state='parked_failed' AND t.outcome='failed' AND t.keep_on_failure=0 AND t.transfer IS NOT NULL AND t.salvage<>'pending'",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let at = now();
+        let mut due = 0;
+        for raw in raws {
+            let mut artifact: Artifact = serde_json::from_str(&raw)?;
+            if artifact.keep
+                || artifact.keep_on_failure
+                || artifact.deadline.is_some_and(|deadline| deadline <= at)
+            {
+                continue;
+            }
+            artifact.deadline = Some(at);
+            artifact.revision += 1;
+            artifact.updated_at = at;
+            save_artifact(&tx, &artifact)?;
+            event(
+                &tx,
+                &artifact.id,
+                "retention",
+                "curator-admitted failure follows failure_action",
+            )?;
+            due += 1;
+        }
+        tx.commit()?;
+        Ok(due)
+    }
+
+    /// W8: re-snapshot a failed source's file inventory once, for an
+    /// advisory assessment that found it drifted (a PAR repair rewrote a
+    /// part, a file vanished). Allowed for the owned, live source only.
+    pub fn refresh_failed_source(&self, job: u32) -> Result<Artifact> {
+        let Some(mut source) = self.job_source(job)? else {
+            return Err(Error::NotFound);
+        };
+        if !source.owned || source.terminal() || source.hold.is_some() {
+            return Err(Error::Conflict(
+                "failed source is not an owned live generation".into(),
+            ));
+        }
+        let original = source.clone();
+        let dir = self.verify(&source)?;
+        source.files = fs::manifest(&dir, 100_000)?;
+        source.inspected_at = Some(now());
+        source.revision += 1;
+        source.updated_at = now();
+        let _coordinator = self.mutation_guard()?;
+        self.check_payload_capture(&original)?;
+        save_artifact(&self.db.lock().unwrap(), &source)?;
+        Ok(source)
+    }
+
+    /// W8: a kept failure's bytes stay where they are. Recording that is a
+    /// state change, not a re-capture of the directory: a drifted or
+    /// partly missing source must not keep the follow-up looping.
+    pub fn retain_kept_failure(&self, job: u32, path: &Path) -> Result<bool> {
+        let _guard = self.mutation_guard()?;
+        let Some(mut artifact) = self.for_job(job)? else {
+            return Ok(false);
+        };
+        if artifact.path != path || !artifact.owned {
+            return Ok(false);
+        }
+        if artifact.state == "retained" {
+            return Ok(true);
+        }
+        if !matches!(
+            artifact.state.as_str(),
+            "active" | "transitioning" | "retiring"
+        ) {
+            return Ok(false);
+        }
+        artifact.state = "retained".into();
+        artifact.revision += 1;
+        artifact.updated_at = now();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        save_artifact(&tx, &artifact)?;
+        event(&tx, &artifact.id, "finalized", "retained")?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Record the disposal of a failed source; disposal is then done.
     pub fn record_disposal(&self, job: u32, note: &str) -> Result<()> {
         let db = self.db.lock().unwrap();

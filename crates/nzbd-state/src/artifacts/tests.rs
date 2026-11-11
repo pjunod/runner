@@ -1880,42 +1880,81 @@ fn symlink_payload_entry_cannot_escape_the_owned_directory() {
     assert!(outside.join("movie.mkv").exists());
 }
 #[test]
-fn wall_clock_alone_never_expires_a_payload_and_keep_resets_elapsed_time() {
-    let (_tmp, db, root) = fixture();
-    let mut a = parked(&db, &root);
-    db.set_settings(&Settings {
-        enabled: true,
-        ..Settings::default()
-    })
-    .unwrap();
-    a.deadline = Some(1);
+fn parked_failure_expires_on_its_wall_clock_deadline_across_restarts_without_opt_in() {
+    // R4 / W3: expiry is the deadline alone — no uptime clock, no
+    // automation toggle — and it holds across a restart.
+    let (tmp, db, root) = fixture();
+    let path = root.join("job");
+    db.allocate_for_delivery(1, &root, &path, true, false)
+        .unwrap();
+    std::fs::write(path.join("episode.mkv"), b"original media").unwrap();
+    let mut a = db.finish(1, &path, &root, "parked_failed").unwrap();
+    assert!(!db.settings().unwrap().enabled);
     a.retention_seconds = 100;
-    a.eligible_seconds = 0;
+    a.deadline = Some(now() + 3600);
     save_artifact(&db.db.lock().unwrap(), &a).unwrap();
     db.tick().unwrap();
-    assert!(a.path.exists());
-    db.clocks.lock().unwrap().insert(
-        a.id.clone(),
-        (a.revision, Instant::now() - Duration::from_secs(50)),
-    );
-    db.tick().unwrap();
-    let a = db.get(&a.id).unwrap();
-    assert_eq!(a.eligible_seconds, 50);
+    db.run_due_deletes().unwrap();
+    assert!(a.path.exists(), "not yet due");
+    a.deadline = Some(now() - 1);
+    save_artifact(&db.db.lock().unwrap(), &a).unwrap();
+    db.close().unwrap();
+    drop(db);
+    let db = Inventory::open(&tmp.path().join("state")).unwrap();
     let kept = db.retention(&a.id, a.revision, true, None).unwrap();
+    db.tick().unwrap();
+    assert!(a.path.exists(), "Keep holds an expired payload");
     let release_started = now();
     let released = db.retention(&a.id, kept.revision, false, None).unwrap();
     let release_finished = now();
-    db.clocks.lock().unwrap().insert(
-        a.id.clone(),
-        (a.revision, Instant::now() - Duration::from_secs(500)),
+    assert!(
+        (release_started + 100..=release_finished + 100).contains(&released.deadline.unwrap()),
+        "releasing Keep starts a fresh period"
+    );
+    let mut due = db.get(&a.id).unwrap();
+    due.deadline = Some(now() - 1);
+    save_artifact(&db.db.lock().unwrap(), &due).unwrap();
+    db.tick().unwrap();
+    db.run_due_deletes().unwrap();
+    assert!(!a.path.exists(), "expired at its wall-clock deadline");
+}
+/// W3 upgrade: a curator-admitted failure an older build parked under
+/// park-always (2713, 2770, …) follows `failure_action = delete` once its
+/// salvage has settled — due now, deleted by the ordinary retention path.
+/// A kept failure and a job curator did not admit stay parked.
+#[test]
+fn parked_curator_failures_expire_under_delete_policy() {
+    use super::terminals::tests::failed;
+    let (_tmp, db, root) = fixture();
+    let mut paths = Vec::new();
+    for (job, transfer, keep) in [(1, true, false), (2, true, true), (3, false, false)] {
+        let path = root.join(format!("job-{job}"));
+        db.allocate_for_delivery(job, &root, &path, true, false)
+            .unwrap();
+        std::fs::write(path.join("episode.mkv"), b"original media").unwrap();
+        db.finish(job, &path, &root, "parked_failed").unwrap();
+        let mut terminal = failed(job, SalvageState::None);
+        terminal.keep_on_failure = keep;
+        if !transfer {
+            terminal.transfer = None;
+        }
+        db.record_terminal(&terminal).unwrap();
+        paths.push(path);
+    }
+    assert_eq!(db.expire_parked_curator_failures().unwrap(), 1);
+    assert_eq!(
+        db.expire_parked_curator_failures().unwrap(),
+        0,
+        "idempotent"
     );
     db.tick().unwrap();
-    assert_eq!(
-        db.get(&a.id).unwrap().eligible_seconds,
-        0,
-        "old checkpoint cannot count held time"
+    db.run_due_deletes().unwrap();
+    assert!(!paths[0].exists(), "curator-admitted failure deleted");
+    assert!(paths[1].exists(), "keep_on_failure stays");
+    assert!(
+        paths[2].exists(),
+        "a job curator did not admit keeps its retention"
     );
-    assert!((release_started + 100..=release_finished + 100).contains(&released.deadline.unwrap()));
 }
 #[test]
 fn restore_quarantines_pending_deletion_and_retention() {
@@ -1928,7 +1967,6 @@ fn restore_quarantines_pending_deletion_and_retention() {
     let restored = db.get(&a.id).unwrap();
     assert!(restored.keep);
     assert!(restored.hold.is_some());
-    assert_eq!(restored.eligible_seconds, 0);
     assert!(a.path.exists());
 }
 #[test]
@@ -2072,7 +2110,6 @@ fn retention_preview_is_atomic_and_never_shortens_elapsed_eligibility() {
     let apply_finished = now();
     let a = db.get(&a.id).unwrap();
     assert_eq!(a.retention_seconds, 86400);
-    assert_eq!(a.eligible_seconds, 0);
     assert!((apply_started + 86400..=apply_finished + 86400).contains(&a.deadline.unwrap()));
 }
 #[test]
@@ -2276,7 +2313,7 @@ fn lifecycle_scale_one_million_tombstones() {
 }
 
 #[test]
-fn queued_expiry_is_invalidated_by_a_fresh_policy_or_disabled_automation() {
+fn queued_expiry_is_invalidated_by_a_fresh_policy_not_by_the_automation_toggle() {
     for disable in [false, true] {
         let (_tmp, db, root) = fixture();
         let path = root.join("job");
@@ -2290,17 +2327,20 @@ fn queued_expiry_is_invalidated_by_a_fresh_policy_or_disabled_automation() {
         })
         .unwrap();
         a.deadline = Some(now() - 1);
-        a.eligible_seconds = a.retention_seconds;
         save_artifact(&db.db.lock().unwrap(), &a).unwrap();
         let op = db
             .request_delete_authorized(&a.id, a.revision, "expiry", 0, true)
             .unwrap();
         if disable {
+            // W3: the automation toggle is not expiry authority; a due
+            // expiry proceeds with it off.
             db.set_settings(&Settings::default()).unwrap();
-        } else {
-            db.retention(&a.id, a.revision, false, Some(86400 * 30))
-                .unwrap();
+            assert_eq!(db.execute_delete(&op.id).unwrap().state, "succeeded");
+            assert!(!a.path.join("episode.mkv").exists());
+            continue;
         }
+        db.retention(&a.id, a.revision, false, Some(86400 * 30))
+            .unwrap();
         assert_eq!(db.execute_delete(&op.id).unwrap().state, "cancelled");
         assert!(a.path.join("episode.mkv").exists());
     }

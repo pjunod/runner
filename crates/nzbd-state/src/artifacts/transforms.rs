@@ -318,7 +318,6 @@ impl Inventory {
         scratch.state = "allocating".into();
         scratch.keep = false;
         scratch.retention_seconds = 0;
-        scratch.eligible_seconds = 0;
         scratch.deadline = None;
         scratch.owned = true;
         scratch.hold = Some("transform workspace".into());

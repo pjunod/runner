@@ -212,7 +212,6 @@ async fn list(State(st): State<ApiState>, Query(p): Query<Page>) -> Response {
     };
     work(move || {
         let page = db.list_page(&query)?;
-        let now = nzbd_state::artifacts::now();
         let entries: Vec<_> = page
             .rows
             .into_iter()
@@ -221,7 +220,7 @@ async fn list(State(st): State<ApiState>, Query(p): Query<Page>) -> Response {
                     "files": row.files,
                     "bytes": row.bytes,
                     "measured": row.measured,
-                    "earliest_expiry": row.artifact.earliest_expiry(now),
+                    "earliest_expiry": row.artifact.earliest_expiry(),
                     "artifact": row.artifact,
                 })
             })

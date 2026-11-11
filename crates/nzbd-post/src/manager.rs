@@ -1003,6 +1003,9 @@ pub async fn dispose_remote_failure(
         .map(|assessment| assessment.disposition);
     let action = if nzbd_engine::terminal::keeps_failed_source(job) {
         FailureAction::None
+    } else if nzbd_types::transfer_of(&job.params).is_some() {
+        // W3: a curator-admitted failure follows `failure_action`.
+        cfg.failure_action
     } else if reason.is_some_and(|reason| reason.park_always()) {
         // Contract §2.2 park-always: the copy stays under runner custody
         // where it is; the cluster ledger retains it (`artifacts::cluster`).
@@ -1318,11 +1321,14 @@ async fn dispose_failed_source(
             .and_then(|source| source.failure_assessment)
             .is_some_and(|assessment| assessment.disposition == "unusable")
     };
-    let action = if action == FailureAction::Delete && !assessed_unusable {
-        FailureAction::Park
-    } else {
-        action
-    };
+    // A curator-admitted failure's salvage already took whatever verified
+    // payload it held; the assessment gate is for jobs nobody re-grabs.
+    let action =
+        if action == FailureAction::Delete && !assessed_unusable && terminal.transfer.is_none() {
+            FailureAction::Park
+        } else {
+            action
+        };
     let mut failure_cfg = cfg.clone();
     failure_cfg.failure_action = action;
     if gate.as_ref().is_some_and(|claim| !claim(job)) {
@@ -1378,23 +1384,36 @@ async fn dispose_failed_source(
         } else {
             "retained"
         };
-        if let Err(error) = inventory.finish(job.0, path, path.parent().unwrap_or(dest_dir), state)
-        {
-            tracing::warn!(job = job.0, %error, "failed-source inventory record remains pending");
+        // A kept failure is recorded where it is, without re-capturing a
+        // directory that may have drifted (W8, 2710/2535).
+        let kept_in_place =
+            state == "retained" && matches!(inventory.retain_kept_failure(job.0, path), Ok(true));
+        let recorded = kept_in_place
+            || inventory
+                .finish(job.0, path, path.parent().unwrap_or(dest_dir), state)
+                .inspect_err(|error| {
+                    tracing::warn!(job = job.0, %error, "failed-source inventory record remains pending");
+                })
+                .is_ok();
+        if !recorded {
             return false;
         }
     }
     record(disposition.note).await
 }
 
-/// Contract §2.6 precedence: the job's keep-on-failure, then the
-/// park-always reasons, then `[post] failure_action`.
+/// Contract §2.6 precedence: the job's keep-on-failure; then, for a
+/// curator-admitted job, `[post] failure_action` as configured (its salvage
+/// has settled, curator has re-grabbed — Paul, 2026-11-11, W3); for any
+/// other job the park-always reasons, then `failure_action`.
 fn disposal_action(
     cfg: &PostConfig,
     terminal: &nzbd_state::artifacts::JobTerminal,
 ) -> FailureAction {
     if terminal.keep_on_failure {
         FailureAction::None
+    } else if terminal.transfer.is_some() {
+        cfg.failure_action
     } else if terminal.reason.is_some_and(|reason| reason.park_always()) {
         FailureAction::Park
     } else {
@@ -1913,7 +1932,11 @@ async fn scan_queue(
             .map(|job| job.id)
             .collect::<std::collections::HashSet<_>>();
         let lookup = inventory.clone();
+        let expire_parked = cfg.failure_action == FailureAction::Delete && gate.is_none();
         let owed = tokio::task::spawn_blocking(move || {
+            if expire_parked {
+                lookup.expire_parked_curator_failures()?;
+            }
             let mut owed = lookup.pending_salvage()?;
             owed.extend(lookup.pending_disposal()?);
             Ok::<_, nzbd_state::artifacts::Error>(owed)
@@ -4923,14 +4946,63 @@ async fn record_failure_assessment(
     assessed: Option<&std::collections::HashMap<String, FileAssessment>>,
 ) -> Result<(), PostError> {
     let inventory = engine.artifacts();
-    let Some(source) = inventory.job_source(job.id.0)? else {
+    let Some(mut source) = inventory.job_source(job.id.0)? else {
         return Ok(());
     };
+    // W8: the assessment is advisory. A missing source root has nothing to
+    // assess (disposal records it gone); an inventory that drifted is
+    // re-snapshotted once; whatever still fails settles as `unknown` —
+    // retained, never retried forever.
+    if matches!(
+        std::fs::symlink_metadata(&source.path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ) {
+        return Ok(());
+    }
     let mut diagnostics = match assessed {
         Some(diagnostics) => diagnostics.clone(),
-        None => {
-            publication_diagnostics(job, &source, consumed, verified, terminal_unusable, probed)?
-        }
+        None => match publication_diagnostics(
+            job,
+            &source,
+            consumed,
+            verified,
+            terminal_unusable,
+            probed,
+        ) {
+            Ok(diagnostics) => diagnostics,
+            Err(first) => {
+                let retried = inventory
+                    .refresh_failed_source(job.id.0)
+                    .map_err(PostError::from)
+                    .and_then(|refreshed| {
+                        source = refreshed;
+                        publication_diagnostics(
+                            job,
+                            &source,
+                            consumed,
+                            verified,
+                            terminal_unusable,
+                            probed,
+                        )
+                    });
+                match retried {
+                    Ok(diagnostics) => diagnostics,
+                    Err(error) => {
+                        tracing::info!(job = job.id.0, %first, %error,
+                            "failed-source assessment settles unassessed; the source is kept");
+                        let mut reason = format!("kept, unassessed: {error}");
+                        reason.truncate(2000);
+                        inventory.set_failure_assessment(
+                            &source.id,
+                            &source.generation,
+                            "unknown",
+                            &reason,
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
+        },
     };
     for path in password_required {
         diagnostics.insert(

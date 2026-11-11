@@ -2843,7 +2843,6 @@ mod tests {
             artifact.state = "parked_failed".into();
             artifact.deadline = Some(now() - 1);
             artifact.retention_seconds = 1;
-            artifact.eligible_seconds = 1;
             save_artifact(&f.inventory.db.lock().unwrap(), &artifact).unwrap();
         }
         let operation = f
