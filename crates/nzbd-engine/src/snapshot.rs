@@ -301,6 +301,10 @@ pub struct QueueSnapshot {
     /// initial fail-safe measurement, or incomplete evidence after a prior
     /// hold.
     pub disk_low: bool,
+    /// W5a: jobs whose own finalize retry is the evidence an out-of-space
+    /// failure needs; hold recovery may release them while `disk_low`.
+    #[serde(skip)]
+    pub space_retry_jobs: std::collections::HashSet<JobId>,
     /// Lowest measured free space across every configured write root. None
     /// means the enforcing probe has no usable reading or is disabled.
     #[serde(default)]

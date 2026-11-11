@@ -928,12 +928,19 @@ pub(crate) enum EngineMsg {
         whence: String,
         /// The directory whose write failed, when the reporter knows it.
         dir: Option<PathBuf>,
+        /// The job whose post-processing write failed: that job's own retry
+        /// is the evidence that clears it (W5a).
+        job: Option<JobId>,
     },
-    /// W5a: a probe write+fsync round finished (`observed` is the ENOSPC
-    /// count when it started; a newer failure voids a success).
+    /// W5a: a probe round finished: per failure, the ENOSPC count it was
+    /// planned under (a newer report of the same failure voids a success)
+    /// and what it found.
     SpaceProbed {
-        observed: u64,
-        result: Result<(), String>,
+        results: Vec<(
+            crate::space_probe::SpaceOp,
+            u64,
+            crate::space_probe::ProbeResult,
+        )>,
     },
 }
 
@@ -1189,9 +1196,13 @@ pub(crate) struct Owner {
     enospc_latched: bool,
     enospc_observed: u64,
     enospc_where: Option<String>,
-    /// W5a: directories a write reported ENOSPC in, probed before the latch
-    /// clears; empty means every guarded root.
-    enospc_dirs: std::collections::BTreeSet<PathBuf>,
+    /// W5a: every write that reported ENOSPC, by the operation that failed.
+    /// The latch clears when each has evidence from its own operation
+    /// (`space_probe`), never from a write somewhere else.
+    enospc_failures:
+        std::collections::BTreeMap<crate::space_probe::SpaceOp, crate::space_probe::SpaceFailure>,
+    /// Probe filesystem (a fake in tests).
+    space_probe_fs: Arc<dyn crate::space_probe::ProbeFs>,
     space_probe_inflight: bool,
     space_probe_after: Instant,
     space_probe_failures: u32,
@@ -1672,7 +1683,8 @@ impl Owner {
             enospc_latched: false,
             enospc_observed: 0,
             enospc_where: None,
-            enospc_dirs: std::collections::BTreeSet::new(),
+            enospc_failures: std::collections::BTreeMap::new(),
+            space_probe_fs: Arc::new(crate::space_probe::RealFs),
             space_probe_inflight: false,
             space_probe_after: Instant::now(),
             space_probe_failures: 0,
@@ -2124,8 +2136,15 @@ impl Owner {
                 final_path,
                 combined_crc,
             } => self.on_writer_finalized(job, file, ok, final_path, combined_crc),
-            EngineMsg::OutOfSpace { whence, dir } => self.observe_out_of_space_in(&whence, dir),
-            EngineMsg::SpaceProbed { observed, result } => self.on_space_probed(observed, result),
+            EngineMsg::OutOfSpace { whence, dir, job } => match job {
+                Some(job) => self.observe_space_failure(
+                    &whence,
+                    crate::space_probe::SpaceOp::Post { job },
+                    dir,
+                ),
+                None => self.observe_out_of_space_in(&whence, dir),
+            },
+            EngineMsg::SpaceProbed { results } => self.on_space_probed(results),
             EngineMsg::WriterIdentityMismatch { job, file, error } => {
                 self.on_writer_identity_mismatch(job, file, &error)
             }
@@ -2140,21 +2159,36 @@ impl Owner {
                 // waits for space, a dropped mount retries on its own, and
                 // anything else (a digest or size mismatch) is the job's
                 // terminal failure rather than a re-check forever.
-                if crate::out_of_space(cause.as_ref()) {
-                    // The job's own directory is where the write failed.
-                    let dir = self
-                        .artifacts
-                        .for_job(job.0)
-                        .ok()
-                        .flatten()
-                        .map(|artifact| artifact.path);
-                    self.observe_out_of_space_in(&error, dir);
-                }
                 let stage = if error.starts_with("finalize") {
                     "finalize"
                 } else {
                     "download_write"
                 };
+                if crate::out_of_space(cause.as_ref()) {
+                    // W5a: the evidence that clears this is the same file's
+                    // write (an allocation on its partial) or, for a file
+                    // whose bytes are all written, its own finalize retry.
+                    let part = self
+                        .artifacts
+                        .for_job(job.0)
+                        .ok()
+                        .flatten()
+                        .map(|artifact| {
+                            artifact.path.join(format!(".runner-file-{}.part", file.0))
+                        });
+                    let written = self.state.job(job).is_some_and(|record| {
+                        record
+                            .files
+                            .iter()
+                            .any(|entry| entry.id == file && entry.is_terminal())
+                    });
+                    let op = if stage == "finalize" || written {
+                        crate::space_probe::SpaceOp::Finalize { job, file }
+                    } else {
+                        crate::space_probe::SpaceOp::Write { job, file }
+                    };
+                    self.observe_space_failure(&error, op, part);
+                }
                 match cause {
                     Some(cause) => {
                         self.hold_job(job, cause, stage, &error);
@@ -6334,6 +6368,8 @@ impl Owner {
                 server,
                 identity,
             } => {
+                // W5a: the same file's write landed.
+                self.space_op_succeeded(&crate::space_probe::SpaceOp::Write { job, file });
                 let reference = SegRef {
                     job,
                     file,
@@ -6649,6 +6685,8 @@ impl Owner {
         file_size: u64,
         server: ServerId,
     ) {
+        // W5a: the same file's write landed.
+        self.space_op_succeeded(&crate::space_probe::SpaceOp::Write { job, file });
         self.volumes
             .add(server, len as u64, unix_now(), self.tuning.quota_start_day);
         let r = SegRef {
@@ -7611,35 +7649,49 @@ impl Owner {
         let Some(f) = self.state.file_mut(job, file) else {
             return;
         };
-        f.finalized = true;
-        if ok {
-            f.crc32 = combined_crc;
-        }
         let filename = f.filename.clone();
         if !ok {
-            // The bytes did not land. Record it against the job so that
-            // check_job_complete cannot call this a success — see the field's
-            // comment for why health is incapable of catching it.
+            // The bytes did not land. The file is NOT finalized: its partial
+            // may be the only copy of the payload, and the startup sweep
+            // removes partials of finalized files. The failure is recorded
+            // durably as the job's `failed/io` terminal (parked, blameless,
+            // salvage keeps the partial) — the same path as a writer error
+            // that retrying cannot fix — so it survives a restart instead of
+            // living only in memory.
             tracing::error!(job = job.0, file = file.0, %filename,
                 "finalize failed; the job cannot be reported as successful");
-            self.write_failures
-                .entry(job)
-                .or_insert_with(|| format!("could not write {filename} to disk"));
+            self.emit(Event::FileFinished {
+                job,
+                file,
+                filename: filename.clone(),
+                ok: false,
+            });
+            self.fail_job_terminal(
+                job,
+                nzbd_types::FailureReason::Io,
+                None,
+                "finalize",
+                &format!("could not write {filename} to disk"),
+            );
+            return;
         }
+        f.finalized = true;
+        f.crc32 = combined_crc;
+        // W5a: this file's own write and publication landed.
+        self.space_op_succeeded(&crate::space_probe::SpaceOp::Write { job, file });
+        self.space_op_succeeded(&crate::space_probe::SpaceOp::Finalize { job, file });
         tracing::info!(job = job.0, file = file.0, %filename, ok, path = ?final_path, "file finished");
         // A completed file may be the recovery index that knows what this
         // whole job actually is. Only worth asking when the job still has
         // no real name.
-        if ok {
-            if let Some(path) = final_path.clone() {
-                self.maybe_learn_name_from(job, path);
-            }
+        if let Some(path) = final_path.clone() {
+            self.maybe_learn_name_from(job, path);
         }
         self.emit(Event::FileFinished {
             job,
             file,
             filename,
-            ok,
+            ok: true,
         });
         self.dirty = true;
         self.check_job_complete(job);
@@ -8783,19 +8835,36 @@ impl Owner {
     /// downloading at wire speed while writers, finalize and PP were all
     /// being told there was no space — 725 GB burned in a day. A failed
     /// write is not a forecast, so it does not go through the threshold:
-    /// it latches the guard directly and only a successful probe
-    /// write+fsync where the write failed (or an operator resume) clears it.
-    pub(crate) fn observe_out_of_space(&mut self, whence: &str) {
-        self.observe_out_of_space_in(whence, None);
+    /// it latches the guard directly and only evidence from the operation
+    /// that failed (`space_probe`) or an operator resume clears it.
+    /// An unattributed report (torrent backend, a bare report): only a
+    /// directory probe can answer it.
+    pub(crate) fn observe_out_of_space_in(&mut self, whence: &str, dir: Option<PathBuf>) {
+        let dir = dir.unwrap_or_default();
+        self.observe_space_failure(
+            whence,
+            crate::space_probe::SpaceOp::Directory(dir.clone()),
+            (!dir.as_os_str().is_empty()).then_some(dir),
+        );
     }
 
-    pub(crate) fn observe_out_of_space_in(&mut self, whence: &str, dir: Option<PathBuf>) {
-        if let Some(dir) = dir.filter(|dir| !dir.as_os_str().is_empty()) {
-            self.enospc_dirs.insert(dir);
-        }
-        self.space_probe_failures = 0;
-        self.space_probe_after = Instant::now() + Duration::from_secs(30);
+    /// Record what failed; the latch holds until each recorded failure has
+    /// evidence from its own operation.
+    pub(crate) fn observe_space_failure(
+        &mut self,
+        whence: &str,
+        op: crate::space_probe::SpaceOp,
+        path: Option<PathBuf>,
+    ) {
         self.enospc_observed += 1;
+        self.enospc_failures.insert(
+            op,
+            crate::space_probe::SpaceFailure {
+                path,
+                observed: self.enospc_observed,
+            },
+        );
+        self.space_probe_after = Instant::now() + Duration::from_secs(30);
         self.enospc_where = Some(whence.to_string());
         if !self.enospc_latched {
             self.enospc_latched = true;
@@ -8819,7 +8888,7 @@ impl Owner {
     pub(crate) fn clear_enospc_latch(&mut self) {
         if self.enospc_latched {
             self.enospc_latched = false;
-            self.enospc_dirs.clear();
+            self.enospc_failures.clear();
             self.space_probe_failures = 0;
             // Drop only the previous latch-derived hold before reevaluating.
             // A current below-floor reading immediately restores disk_low;
@@ -8878,61 +8947,171 @@ impl Owner {
         }
     }
 
-    /// W5a: while latched, try real writes where the failure happened, on
-    /// a backoff (30 s doubling to 10 min). Off the owner thread.
+    /// W5a: while latched, gather evidence for each recorded failure on a
+    /// backoff (30 s doubling to 10 min), off the owner thread. Failures
+    /// whose operation no longer exists are dropped here; finalize and
+    /// post-processing failures wait for their own retries.
     fn maybe_probe_space(&mut self) {
+        use crate::space_probe::{Planned, SpaceOp, Target};
         if !self.enospc_latched
             || self.space_probe_inflight
             || Instant::now() < self.space_probe_after
         {
             return;
         }
-        let mut dirs: Vec<PathBuf> = self.enospc_dirs.iter().cloned().collect();
-        if dirs.is_empty() {
-            dirs = self
-                .evaluated_disk_guard
-                .volumes
-                .iter()
-                .map(|volume| volume.path.clone())
-                .collect();
-            dirs.push(self.dest_dir.clone());
-            dirs.sort();
-            dirs.dedup();
+        let gone = self
+            .enospc_failures
+            .keys()
+            .filter(|op| match op {
+                SpaceOp::Write { job, .. }
+                | SpaceOp::Finalize { job, .. }
+                | SpaceOp::Post { job } => !self.state.job(*job).is_some_and(|record| {
+                    !matches!(
+                        record.status,
+                        JobStatus::Failed | JobStatus::Completed | JobStatus::Deleted
+                    )
+                }),
+                SpaceOp::Terminal | SpaceOp::Directory(_) => false,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for op in gone {
+            tracing::info!(
+                ?op,
+                "out-of-space failure dropped: its operation no longer exists"
+            );
+            self.enospc_failures.remove(&op);
+        }
+        if self.settle_space_latch() {
+            return;
+        }
+        let mut roots: Vec<PathBuf> = self
+            .evaluated_disk_guard
+            .volumes
+            .iter()
+            .map(|volume| volume.path.clone())
+            .collect();
+        roots.push(self.dest_dir.clone());
+        roots.sort();
+        roots.dedup();
+        let plan = self
+            .enospc_failures
+            .iter()
+            .filter_map(|(op, failure)| {
+                let target = match op {
+                    SpaceOp::Write { .. } => Target::File(failure.path.clone()?),
+                    SpaceOp::Directory(dir) if dir.as_os_str().is_empty() => {
+                        Target::Dirs(roots.clone())
+                    }
+                    SpaceOp::Directory(dir) => Target::Dirs(vec![dir.clone()]),
+                    // Their own retries are the evidence.
+                    SpaceOp::Finalize { .. } | SpaceOp::Terminal | SpaceOp::Post { .. } => {
+                        return None
+                    }
+                };
+                Some(Planned {
+                    op: op.clone(),
+                    observed: failure.observed,
+                    target,
+                })
+            })
+            .collect::<Vec<_>>();
+        if plan.is_empty() {
+            return;
         }
         self.space_probe_inflight = true;
-        let observed = self.enospc_observed;
         let tx = self.engine_tx.clone();
+        let fs = self.space_probe_fs.clone();
         self.tracker.spawn_blocking(move || {
-            let result = crate::space_probe::probe(&dirs);
-            let _ = tx.blocking_send(EngineMsg::SpaceProbed { observed, result });
+            let results = crate::space_probe::run(&plan, fs.as_ref());
+            let _ = tx.blocking_send(EngineMsg::SpaceProbed { results });
         });
     }
 
-    pub(crate) fn on_space_probed(&mut self, observed: u64, result: Result<(), String>) {
+    pub(crate) fn on_space_probed(
+        &mut self,
+        results: Vec<(
+            crate::space_probe::SpaceOp,
+            u64,
+            crate::space_probe::ProbeResult,
+        )>,
+    ) {
+        use crate::space_probe::ProbeResult;
         self.space_probe_inflight = false;
-        match result {
-            Ok(()) if self.enospc_latched && observed == self.enospc_observed => {
-                tracing::info!(
-                    observed = self.enospc_observed,
-                    dirs = ?self.enospc_dirs,
-                    "out-of-space latch cleared — probe writes succeeded where the write failed"
-                );
-                self.enospc_latched = false;
-                self.enospc_dirs.clear();
-                self.space_probe_failures = 0;
-                self.update_disk_guard();
-                self.publish_now();
-            }
-            Ok(()) => {}
-            Err(error) => {
-                self.space_probe_failures = self.space_probe_failures.saturating_add(1);
-                let backoff = 30u64
-                    .saturating_mul(1 << self.space_probe_failures.min(5))
-                    .min(600);
-                self.space_probe_after = Instant::now() + Duration::from_secs(backoff);
-                tracing::debug!(%error, backoff, "out-of-space latch holds; probe write failed");
+        let mut held = false;
+        for (op, observed, result) in results {
+            let current = self
+                .enospc_failures
+                .get(&op)
+                .is_some_and(|failure| failure.observed == observed);
+            match result {
+                ProbeResult::Cleared if current => {
+                    tracing::info!(?op, "out-of-space failure cleared by an allocation on the operation that failed");
+                    self.enospc_failures.remove(&op);
+                    self.space_probe_failures = 0;
+                }
+                ProbeResult::Gone if current => {
+                    tracing::info!(
+                        ?op,
+                        "out-of-space failure dropped: the object that failed is gone"
+                    );
+                    self.enospc_failures.remove(&op);
+                }
+                ProbeResult::Holds(error) => {
+                    held = true;
+                    tracing::debug!(?op, %error, "out-of-space latch holds; probe allocation failed");
+                }
+                // A newer report of the same failure voids this answer.
+                ProbeResult::Cleared | ProbeResult::Gone => {}
             }
         }
+        if held {
+            self.space_probe_failures = self.space_probe_failures.saturating_add(1);
+            let backoff = 30u64
+                .saturating_mul(1 << self.space_probe_failures.min(5))
+                .min(600);
+            self.space_probe_after = Instant::now() + Duration::from_secs(backoff);
+        }
+        self.settle_space_latch();
+    }
+
+    /// The operation behind `op` succeeded (its own write, finalize, terminal
+    /// replay or post retry): that failure has its evidence.
+    pub(crate) fn space_op_succeeded(&mut self, op: &crate::space_probe::SpaceOp) {
+        if self.enospc_failures.remove(op).is_some() {
+            tracing::info!(
+                ?op,
+                "out-of-space failure cleared: the operation that failed succeeded"
+            );
+            self.settle_space_latch();
+        }
+    }
+
+    /// Clear the latch once no recorded failure remains. True when cleared.
+    fn settle_space_latch(&mut self) -> bool {
+        if !self.enospc_latched || !self.enospc_failures.is_empty() {
+            return false;
+        }
+        tracing::info!(
+            observed = self.enospc_observed,
+            "out-of-space latch cleared — every failed write has evidence from its own operation"
+        );
+        self.enospc_latched = false;
+        self.update_disk_guard();
+        self.publish_now();
+        true
+    }
+
+    /// Jobs whose own retry is the evidence a finalize failure needs: hold
+    /// recovery may release them while the latch holds (they fetch nothing).
+    pub(crate) fn space_retry_jobs(&self) -> HashSet<JobId> {
+        self.enospc_failures
+            .keys()
+            .filter_map(|op| match op {
+                crate::space_probe::SpaceOp::Finalize { job, .. } => Some(*job),
+                _ => None,
+            })
+            .collect()
     }
 
     fn pause_incomplete_torrents_for_storage(&mut self) {
@@ -10173,6 +10352,7 @@ impl Owner {
             post_paused: self.state.post_paused,
             quota_reached: self.quota_reached,
             disk_low: self.disk_low,
+            space_retry_jobs: self.space_retry_jobs(),
             disk_guard_free_bytes: disk_guard.available_bytes,
             disk_guard_label: disk_guard.limiting_label.clone(),
             disk_guard_path: disk_guard

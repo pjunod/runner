@@ -7,6 +7,10 @@ mod cluster_keep;
 pub use cluster::{remove_cluster_generation_copy, ClusterArtifactCopy, ClusterCopyCleanup};
 pub use cluster_keep::{ClusterFailureKeepStatus, ClusterFailureKeepTarget};
 pub(crate) mod fs;
+
+/// Name prefix of the engine's out-of-space directory probe files (W5a):
+/// excluded from every payload manifest.
+pub const SPACE_PROBE_PREFIX: &str = ".nzbd-space-probe-";
 mod policy;
 mod publication;
 pub use policy::{RetentionChange, RetentionPreview};

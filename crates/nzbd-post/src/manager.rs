@@ -2341,7 +2341,11 @@ fn spawn_job(
                     // truth about the volume and must stop intake too, not
                     // just fail this job.
                     if nzbd_engine::out_of_space(storage_hold_cause(&e).as_ref()) {
-                        engine.report_out_of_space(format!("post-processing job {}: {e}", job.0));
+                        engine.report_out_of_space_for(
+                            job,
+                            format!("post-processing job {}: {e}", job.0),
+                            None,
+                        );
                     }
                     tracing::error!(job = job.0, error = %e, "post-processing crashed");
                 }

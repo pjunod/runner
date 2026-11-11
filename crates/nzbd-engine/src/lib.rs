@@ -1947,7 +1947,13 @@ impl EngineHandle {
                 .ok_or_else(|| "the allocation hold could not be released".to_string()));
         }
         if cause.is_storage() && !control.post_side() {
-            if by == RetryBy::Recovery && self.snapshot().disk_low {
+            // W5a: a finalize that ran out of space is retried by its own
+            // job while the latch holds — that retry is the evidence.
+            let snapshot = self.snapshot();
+            if by == RetryBy::Recovery
+                && snapshot.disk_low
+                && !snapshot.space_retry_jobs.contains(&job)
+            {
                 return Ok(Err("waiting for free space".into()));
             }
             return self
@@ -3003,15 +3009,34 @@ impl EngineHandle {
         let _ = self.cmd_tx.try_send(EngineMsg::OutOfSpace {
             whence: whence.into(),
             dir: None,
+            job: None,
         });
     }
 
-    /// [`Self::report_out_of_space`] with the path whose write failed: the
-    /// latch clears only after probe writes succeed in that directory (W5a).
+    /// [`Self::report_out_of_space`] with the path whose write failed, for an
+    /// unattributed write: the latch clears only after probe writes succeed
+    /// in that directory (W5a).
     pub fn report_out_of_space_at(&self, whence: impl Into<String>, path: &std::path::Path) {
         let _ = self.cmd_tx.try_send(EngineMsg::OutOfSpace {
             whence: whence.into(),
             dir: Some(crate::space_probe::dir_of(path)),
+            job: None,
+        });
+    }
+
+    /// A post-processing write for `job` ran out of space. That job's own
+    /// retry is the evidence that clears it (W5a): the failure clears when
+    /// the job's terminal lands or the job leaves the queue.
+    pub fn report_out_of_space_for(
+        &self,
+        job: JobId,
+        whence: impl Into<String>,
+        path: Option<&std::path::Path>,
+    ) {
+        let _ = self.cmd_tx.try_send(EngineMsg::OutOfSpace {
+            whence: whence.into(),
+            dir: path.map(crate::space_probe::dir_of),
+            job: Some(job),
         });
     }
 

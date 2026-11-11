@@ -205,7 +205,7 @@ impl Owner {
     /// latches out-of-space, so downloads stop filling it.
     pub(super) fn terminal_store_fault(&mut self, whence: &str, fault: &StoreFault) {
         if crate::out_of_space(fault.cause.as_ref()) {
-            self.observe_out_of_space(whence);
+            self.observe_space_failure(whence, crate::space_probe::SpaceOp::Terminal, None);
         }
     }
 
@@ -221,7 +221,11 @@ impl Owner {
         self.release_terminal(job);
         tracing::error!(job = job.0, %error, "terminal record is not durable; holding the job until storage answers");
         if crate::out_of_space(error.cause.as_ref()) {
-            self.observe_out_of_space("terminal record");
+            self.observe_space_failure(
+                "terminal record",
+                crate::space_probe::SpaceOp::Terminal,
+                None,
+            );
         }
         if self.state.job(job).is_some() {
             self.hold_job(
@@ -367,7 +371,13 @@ impl Owner {
             move |owner, result| {
                 owner.release_terminal(job);
                 match result {
-                    Ok(Ok(row)) => callback(owner, Some(row)),
+                    Ok(Ok(row)) => {
+                        // W5a: the terminal store took a write, and this
+                        // job's post-processing reached its end.
+                        owner.space_op_succeeded(&crate::space_probe::SpaceOp::Terminal);
+                        owner.space_op_succeeded(&crate::space_probe::SpaceOp::Post { job });
+                        callback(owner, Some(row))
+                    }
                     Ok(Err(fault)) => {
                         owner.terminal_store_fault("terminal emitted flag", &fault);
                         tracing::warn!(job = job.0, error = %fault.message, "terminal emitted; its emitted flag will be replayed");
@@ -403,6 +413,14 @@ impl Owner {
                     tracing::warn!(error = %fault.message, "terminal replay could not read job_terminals")
                 }
                 Ok(Ok(rows)) => {
+                    // W5a: nothing left to replay means a recorded terminal
+                    // store failure has no operation left to retry.
+                    if rows.is_empty()
+                        && owner.terminals_in_flight.is_empty()
+                        && owner.deferred_terminals.is_empty()
+                    {
+                        owner.space_op_succeeded(&crate::space_probe::SpaceOp::Terminal);
+                    }
                     for row in rows {
                         let job = JobId(row.job);
                         if owner.terminals_in_flight.contains(&job) {

@@ -218,10 +218,16 @@ fn needs_payload(job: &Job) -> bool {
         && job.status != JobStatus::Deleted
 }
 
-/// Remove `.runner-file-<id>.part` files in a job directory whose file is
-/// not one a writer can still resume. Best effort: a failure leaves the
-/// file for the job's own lifecycle (closed-scope cleanup or disposal).
-pub(super) fn sweep_stale_parts(dir: &std::path::Path, resumable: &HashSet<u32>) -> usize {
+/// Remove `.runner-file-<id>.part` names left behind by a finalize that
+/// published the file (link, then unlink of the partial) but was killed
+/// before the unlink. A partial is removed only when its file is finalized
+/// and the published name is the *same object* (device + inode), so the
+/// removal drops a second name and never the only copy of the payload.
+/// Every other partial — unfinalized, unknown to the job, or a different
+/// object than the publication — stays for the job's own lifecycle
+/// (resume, salvage, closed-scope cleanup or disposal).
+pub(super) fn sweep_stale_parts(dir: &std::path::Path, finalized: &HashMap<u32, String>) -> usize {
+    use std::os::unix::fs::MetadataExt;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -236,16 +242,32 @@ pub(super) fn sweep_stale_parts(dir: &std::path::Path, resumable: &HashSet<u32>)
         else {
             continue;
         };
-        if resumable.contains(&id) || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+        let Some(published) = finalized.get(&id) else {
+            continue;
+        };
+        if !crate::recovery::safe_name(published) {
+            continue;
+        }
+        let (Ok(part), Ok(publication)) = (
+            std::fs::symlink_metadata(entry.path()),
+            std::fs::symlink_metadata(dir.join(published)),
+        ) else {
+            continue;
+        };
+        if !part.is_file()
+            || !publication.is_file()
+            || part.dev() != publication.dev()
+            || part.ino() != publication.ino()
+        {
             continue;
         }
         match std::fs::remove_file(entry.path()) {
             Ok(()) => {
                 removed += 1;
-                tracing::info!(path = %entry.path().display(), "removed a partial file no writer will resume");
+                tracing::info!(path = %entry.path().display(), "removed the leftover partial name of a published file");
             }
             Err(error) => {
-                tracing::warn!(path = %entry.path().display(), %error, "stale partial file remains");
+                tracing::warn!(path = %entry.path().display(), %error, "leftover partial name remains");
             }
         }
     }
@@ -1817,8 +1839,8 @@ impl Owner {
         let worker_root = root.clone();
         let default_root = self.dest_dir.clone();
         let snapshot = self.startup_snapshot.clone();
-        // W9: a `.runner-file-<id>.part` no writer will resume — its file is
-        // finalized or no longer part of the job — is removed at startup.
+        // W9: a `.runner-file-<id>.part` that is a second name of its
+        // finalized file's publication is removed at startup.
         let parts = self
             .state
             .jobs
@@ -1831,9 +1853,24 @@ impl Owner {
                         allocation.path.clone(),
                         job.files
                             .iter()
-                            .filter(|file| !file.finalized)
-                            .map(|file| file.id.0)
-                            .collect::<HashSet<u32>>(),
+                            .filter(|file| file.finalized)
+                            .map(|file| {
+                                let key = format!("*File:proof:{}", file.id.0);
+                                let published = job
+                                    .params
+                                    .iter()
+                                    .find(|(name, _)| name == &key)
+                                    .and_then(|(_, raw)| {
+                                        serde_json::from_str::<crate::recovery::DurableFileProof>(
+                                            raw,
+                                        )
+                                        .ok()
+                                    })
+                                    .and_then(|proof| proof.publication_name)
+                                    .unwrap_or_else(|| file.filename.clone());
+                                (file.id.0, published)
+                            })
+                            .collect::<HashMap<u32, String>>(),
                     )
                 })
             })
@@ -1859,9 +1896,11 @@ impl Owner {
         self.background_then(format!("reconcile-{}", root.display()), move || {
             if worker_root == default_root { prepare_unenrolled_payload_root(&inventory, &worker_root)?; }
             inventory.reconcile_startup_root_snapshot(&worker_root, &live, &snapshot).map_err(failure)?;
-            for (dir, resumable) in &parts {
-                sweep_stale_parts(dir, resumable);
+            for (dir, finalized) in &parts {
+                sweep_stale_parts(dir, finalized);
             }
+            // W5a: directory probe files a killed run left behind.
+            crate::space_probe::sweep_probe_files(&worker_root);
             Ok(())
         }, move |owner, result| {
             let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -2171,26 +2210,43 @@ impl Owner {
 #[cfg(test)]
 mod stale_part_tests {
     use super::*;
-    /// W9: only a resumable file's partial survives the startup sweep.
+    /// Finding 1: the sweep removes only a partial that is a second name of
+    /// its finalized file's publication. A finalized file whose publication
+    /// is missing or a different object keeps its partial (it may be the only
+    /// copy), and so do unfinalized and unknown files.
     #[test]
-    fn startup_sweep_keeps_only_resumable_partials() {
+    fn startup_sweep_removes_only_a_second_name_of_the_publication() {
         let dir = tempfile::tempdir().unwrap();
-        for name in [
-            ".runner-file-1.part",
-            ".runner-file-2.part",
-            ".runner-file-x.part",
-            "episode.mkv",
-        ] {
-            std::fs::write(dir.path().join(name), b"x").unwrap();
-        }
-        std::fs::create_dir(dir.path().join(".runner-file-3.part")).unwrap();
-        let resumable = [1u32].into_iter().collect();
-        assert_eq!(sweep_stale_parts(dir.path(), &resumable), 1);
-        assert!(dir.path().join(".runner-file-1.part").exists());
-        assert!(!dir.path().join(".runner-file-2.part").exists());
-        assert!(dir.path().join(".runner-file-x.part").exists());
-        assert!(dir.path().join(".runner-file-3.part").exists());
-        assert!(dir.path().join("episode.mkv").exists());
+        let d = dir.path();
+        // 1: finalized, published, killed before unlink → same object.
+        std::fs::write(d.join("one.mkv"), b"x").unwrap();
+        std::fs::hard_link(d.join("one.mkv"), d.join(".runner-file-1.part")).unwrap();
+        // 2: "finalized" but the rename never happened → only copy.
+        std::fs::write(d.join(".runner-file-2.part"), b"only").unwrap();
+        // 3: finalized, publication exists but is a different object.
+        std::fs::write(d.join("three.mkv"), b"y").unwrap();
+        std::fs::write(d.join(".runner-file-3.part"), b"z").unwrap();
+        // 4: not finalized (not in the map) → resumable.
+        std::fs::write(d.join("four.mkv"), b"w").unwrap();
+        std::fs::hard_link(d.join("four.mkv"), d.join(".runner-file-4.part")).unwrap();
+        std::fs::write(d.join(".runner-file-x.part"), b"x").unwrap();
+        let finalized: HashMap<u32, String> = [
+            (1, "one.mkv".to_string()),
+            (2, "two.mkv".to_string()),
+            (3, "three.mkv".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(sweep_stale_parts(d, &finalized), 1);
+        assert!(!d.join(".runner-file-1.part").exists());
+        assert!(d.join("one.mkv").exists());
+        assert_eq!(
+            std::fs::read(d.join(".runner-file-2.part")).unwrap(),
+            b"only"
+        );
+        assert!(d.join(".runner-file-3.part").exists());
+        assert!(d.join(".runner-file-4.part").exists());
+        assert!(d.join(".runner-file-x.part").exists());
     }
 }
 

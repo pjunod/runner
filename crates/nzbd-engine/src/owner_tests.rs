@@ -4620,24 +4620,54 @@ fn statvfs_never_clears_an_observed_write_latch() {
     }
 }
 
-/// R3 / W5a: a fake volume where statvfs says free but writes fail: the
-/// latch holds through high readings and failed probes, ignores a probe that
-/// started before a newer ENOSPC, and clears on the first successful probe
-/// write+fsync in the directory that failed.
+/// A Gluster distribute volume in miniature: new files land on the brick
+/// with room and succeed; the file that failed lives on the full brick.
+struct SplitBrickFs {
+    full: std::sync::Mutex<bool>,
+    failing_file: PathBuf,
+}
+impl crate::space_probe::ProbeFs for SplitBrickFs {
+    fn probe_file(&self, path: &std::path::Path) -> crate::space_probe::ProbeResult {
+        if path == self.failing_file && *self.full.lock().unwrap() {
+            crate::space_probe::ProbeResult::Holds("No space left on device (os error 28)".into())
+        } else {
+            crate::space_probe::ProbeResult::Cleared
+        }
+    }
+    fn probe_dir(&self, _: &std::path::Path) -> crate::space_probe::ProbeResult {
+        crate::space_probe::ProbeResult::Cleared
+    }
+}
+
+/// R3 / W5a (finding 3): statvfs says free and new files succeed, but the
+/// partial whose write failed sits on the full brick. The latch holds through
+/// high readings and through new-file success, ignores a probe planned
+/// before a newer report of the same failure, and clears only when an
+/// allocation on that same file succeeds.
 #[tokio::test]
-async fn write_latch_clears_only_on_a_successful_probe_where_the_write_failed() {
+async fn write_latch_clears_only_on_evidence_from_the_failed_file() {
+    use crate::space_probe::{Planned, ProbeFs, ProbeResult, SpaceOp, Target};
     let tuning = Tuning {
         min_free_disk_bytes: 100,
         ..Tuning::default()
     };
     let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(tuning);
     pump(&mut owner, &mut messages).await;
-    let failing = tmp.path().join("dest");
-    owner.observe_out_of_space_in(
+    owner.state.jobs.push(pending_job(2));
+    let part = tmp.path().join("dest/job/.runner-file-20.part");
+    let fs = SplitBrickFs {
+        full: std::sync::Mutex::new(true),
+        failing_file: part.clone(),
+    };
+    let op = SpaceOp::Write {
+        job: JobId(2),
+        file: FileId(20),
+    };
+    owner.observe_space_failure(
         "write x.part: No space left on device",
-        Some(failing.clone()),
+        op.clone(),
+        Some(part.clone()),
     );
-    assert!(owner.enospc_dirs.contains(&failing));
     owner.disk_guard.store(Arc::new(DiskGuardReading {
         available_bytes: Some(132_000_000_000),
         all_roots_known: true,
@@ -4650,27 +4680,56 @@ async fn write_latch_clears_only_on_a_successful_probe_where_the_write_failed() 
             "statvfs is not evidence"
         );
     }
-    let observed = owner.enospc_observed;
-    owner.on_space_probed(
-        observed,
-        Err("No space left on device (os error 28)".into()),
+    let plan = |owner: &Owner| {
+        vec![Planned {
+            op: op.clone(),
+            observed: owner.enospc_failures[&op].observed,
+            target: Target::File(part.clone()),
+        }]
+    };
+    // New files would succeed (probe_dir), but the failing file still fails.
+    assert_eq!(
+        fs.probe_dir(tmp.path()),
+        ProbeResult::Cleared,
+        "the fake places new files on the brick with room"
     );
-    assert!(owner.enospc_latched);
+    owner.on_space_probed(crate::space_probe::run(&plan(&owner), &fs));
+    assert!(owner.enospc_latched, "new-file success is not evidence");
     assert!(
         owner.space_probe_after > Instant::now(),
         "a failed probe backs off"
     );
-    owner.observe_out_of_space("another write failed");
-    owner.on_space_probed(observed, Ok(()));
-    assert!(
-        owner.enospc_latched,
-        "a probe older than the newest ENOSPC proves nothing"
-    );
-    crate::space_probe::probe(&owner.enospc_dirs.iter().cloned().collect::<Vec<_>>()).unwrap();
-    owner.on_space_probed(owner.enospc_observed, Ok(()));
+    // A probe planned before a newer report of the same failure proves nothing.
+    let stale = plan(&owner);
+    owner.observe_space_failure("write again", op.clone(), Some(part.clone()));
+    *fs.full.lock().unwrap() = false;
+    owner.on_space_probed(crate::space_probe::run(&stale, &fs));
+    assert!(owner.enospc_latched);
+    owner.on_space_probed(crate::space_probe::run(&plan(&owner), &fs));
     assert!(!owner.enospc_latched);
     assert!(!owner.disk_low, "the forecast is above the floor");
-    assert!(owner.enospc_dirs.is_empty());
+    assert!(owner.enospc_failures.is_empty());
+
+    // The writer's own next write to that file is evidence too.
+    owner.observe_space_failure("write", op.clone(), Some(part.clone()));
+    assert!(owner.enospc_latched);
+    owner.space_op_succeeded(&op);
+    assert!(!owner.enospc_latched);
+
+    // A finalize failure waits for its own job's retry, which hold recovery
+    // may run while the latch holds; a job that is gone drops its failure.
+    let finalize = SpaceOp::Finalize {
+        job: JobId(2),
+        file: FileId(20),
+    };
+    owner.observe_space_failure("finalize", finalize.clone(), Some(part.clone()));
+    assert!(owner.space_retry_jobs().contains(&JobId(2)));
+    owner.space_probe_after = Instant::now();
+    owner.maybe_probe_space();
+    assert!(owner.enospc_latched, "a live job's finalize retry decides");
+    owner.state.jobs.retain(|job| job.id != JobId(2));
+    owner.maybe_probe_space();
+    assert!(!owner.enospc_latched, "nothing is left to retry");
 }
 
 #[tokio::test]
@@ -7986,6 +8045,39 @@ async fn write_failure_is_io_not_health() {
         .iter()
         .any(|(key, value)| key == nzbd_types::PP_DONE_PARAM && value == "FAILURE/IO"));
     assert!(!owner.post_admissions.contains_key(&JobId(7)));
+}
+
+/// Finding 1: a finalize the writer reports as failed never marks the file
+/// finalized (its partial may be the only copy, and the startup sweep only
+/// touches partials of finalized files); the failure is the job's durable
+/// `failed/io` terminal, not an in-memory note a restart forgets.
+#[tokio::test]
+async fn failed_finalize_is_durable_and_never_marks_the_file_finalized() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    let mut job = pending_job(17);
+    job.files[0].segments[0].state = SegmentState::Done {
+        offset: 0,
+        len: 100,
+        crc: 1,
+    };
+    recompute_job_totals(&mut job);
+    let file = job.files[0].id;
+    owner.state.jobs.push(job);
+    owner.on_msg(EngineMsg::WriterFinalized {
+        job: JobId(17),
+        file,
+        ok: false,
+        final_path: None,
+        combined_crc: None,
+    });
+    let terminal = settle_terminal(&mut owner, &mut messages, 17).await;
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Io));
+    assert!(!terminal.blames_release);
+    let job = owner.state.job(JobId(17)).unwrap();
+    assert_eq!(job.status, JobStatus::Failed);
+    assert!(!job.files[0].finalized);
+    assert!(!owner.write_failures.contains_key(&JobId(17)));
 }
 
 /// Contract §2.1 / plan M1 (d): articles below critical health are the
