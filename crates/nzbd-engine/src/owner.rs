@@ -9290,10 +9290,15 @@ impl Owner {
         Vec<(FileId, String, nzbd_state::artifacts::Identity, u64)>,
     )> {
         let record = self.state.job(job)?;
-        if record
-            .params
-            .iter()
-            .any(|(key, _)| key == "*Recovery:download-retired")
+        // A short stat queues a verification and refuses this admission; a
+        // job verification cannot act on (terminal: PP done, cleanup-only,
+        // torrent) would get no ticket and be refused again on every retry.
+        // Its payload is what it is; post-processing works from that.
+        if recovery_worker::verification_inert(record)
+            || record
+                .params
+                .iter()
+                .any(|(key, _)| key == "*Recovery:download-retired")
         {
             return None;
         }

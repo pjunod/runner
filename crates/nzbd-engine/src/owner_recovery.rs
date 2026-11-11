@@ -402,13 +402,7 @@ impl Owner {
         let Some(current) = self.state.job(job) else {
             return;
         };
-        if current.torrent.is_some()
-            || super::transitions::failed_cleanup_only(current)
-            || current
-                .params
-                .iter()
-                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
-        {
+        if verification_inert(current) {
             // A terminal job downloads nothing more: there is nothing to prove.
             return;
         }
@@ -1699,6 +1693,19 @@ pub(super) enum AdmissionStat {
 
 /// The files of a job whose recorded ranges a proof vouches for, as
 /// `(file, publication name, proof object, highest proven end)`.
+/// Verification can do nothing for this job: a torrent, a failed job kept
+/// only for cleanup, or one whose post-processing already ended downloads
+/// nothing more, so `queue_verification` makes no ticket for it.
+/// Anything that would wait on a verification of such a job must not.
+pub(super) fn verification_inert(job: &Job) -> bool {
+    job.torrent.is_some()
+        || super::transitions::failed_cleanup_only(job)
+        || job
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+}
+
 pub(super) fn proven_files(job: &Job) -> Vec<(nzbd_types::FileId, String, Identity, u64)> {
     job.files
         .iter()

@@ -9078,6 +9078,45 @@ fn restart_job(
     job
 }
 
+/// Finding 9 (no-wedge review): the admission stat's `Short` answer queues
+/// a verification and refuses the admission. For a job verification cannot
+/// act on (post-processing done, as on a failed download kept for its
+/// follow-up) that refusal would repeat on every retry, so the stat is not
+/// owed at all; an ordinary job still owes it.
+#[tokio::test]
+async fn a_terminal_job_owes_no_admission_stat() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("dest")).unwrap();
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    pump(&mut owner, &mut messages).await;
+    let mut job = restart_job(&mut owner, 7, 4, 2, Some(""), false);
+    job.status = JobStatus::Failed;
+    owner.state.jobs = vec![job];
+    assert!(
+        owner.pp_admission_stat_needed(JobId(7)).is_some(),
+        "an ordinary job is stat-checked"
+    );
+    owner
+        .state
+        .job_mut(JobId(7))
+        .unwrap()
+        .params
+        .push((nzbd_types::PP_DONE_PARAM.into(), "FAILURE".into()));
+    // The file is now short of its proof: a stat would say Short, and the
+    // verification it queues is a no-op for this job.
+    let dir = owner.allocation_cache[&JobId(7)].path.clone();
+    let part = dir.join(".runner-file-70.part");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&part)
+        .unwrap()
+        .set_len(1)
+        .unwrap();
+    owner.queue_verification(JobId(7));
+    assert!(!owner.verification.contains_key(&JobId(7)));
+    assert!(owner.pp_admission_stat_needed(JobId(7)).is_none());
+}
+
 /// Persist the queue and stop the owner the way a killed process does:
 /// no shutdown path, only the inventory's process lock released.
 async fn stop_like_kill(mut owner: Owner, mut messages: mpsc::Receiver<EngineMsg>, persist: bool) {
