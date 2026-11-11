@@ -1382,6 +1382,94 @@ mod tests {
         assert_eq!(inventory.workspace_dir(), new);
     }
 
+    /// An in-flight workspace (open journal, one attempt) whose root is
+    /// copy-moved: the journal's copy of the scratch and its attempt are
+    /// re-stamped with the row, so startup reconcile leaves it to its
+    /// transform and the transform resumes. A value naming the old root
+    /// unquoted mid-string is neither rewritten nor counted, so a later start
+    /// re-stamps nothing; a crash between the commit and the sidecar write
+    /// (stale sidecar back in place) is finished by the next start.
+    #[test]
+    fn in_flight_workspace_survives_a_copy_moved_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("processing");
+        std::fs::create_dir(&root).unwrap();
+        let state = temp.path().join("state");
+        let inventory = Inventory::open(&state).unwrap();
+        inventory
+            .allocate_for_delivery(12, &root, &root.join("job"), false, false)
+            .unwrap();
+        std::fs::write(root.join("job/original"), b"original").unwrap();
+        let mut workspace = inventory.workspace(12, "par_repair", "abc").unwrap();
+        let attempt = inventory.begin_workspace_attempt(&mut workspace).unwrap();
+        std::fs::write(attempt.join("partial"), b"half").unwrap();
+        let old = state.join("transform-workspaces");
+        let note = format!("repair failed under {}/abc, retrying", old.display());
+        inventory
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO events(artifact,at,kind,detail) VALUES('note',0,'note',?1)",
+                [&note],
+            )
+            .unwrap();
+        let sidecar = state
+            .join("artifact-identities")
+            .join(&workspace.scratch.id)
+            .join(format!("{}.json", workspace.scratch.generation));
+        inventory.close().unwrap();
+        drop(inventory);
+        let new = temp.path().join("scratch-volume/.workspaces");
+        copy_tree(&old, &new);
+        std::fs::remove_dir_all(&old).unwrap();
+        let stale_sidecar = std::fs::read(&sidecar).unwrap();
+
+        let inventory = Inventory::open(&state).unwrap();
+        assert!(inventory.configure_workspace_dir(&new).unwrap() > 0);
+        inventory.close().unwrap();
+        drop(inventory);
+        // Crash after the commit, before the sidecar write.
+        std::fs::write(&sidecar, &stale_sidecar).unwrap();
+
+        let inventory = Inventory::open(&state).unwrap();
+        let before = inventory.get(&workspace.scratch.id).unwrap();
+        assert_eq!(
+            inventory.configure_workspace_dir(&new).unwrap(),
+            0,
+            "the unquoted mention is not a change"
+        );
+        let scratch = inventory.get(&workspace.scratch.id).unwrap();
+        assert_eq!(
+            scratch.revision, before.revision,
+            "nothing re-stamped twice"
+        );
+        let detail: String = inventory
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT detail FROM events WHERE artifact='note'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(detail, note);
+        inventory.verify(&scratch).unwrap();
+        assert!(inventory.is_transform_scratch(&scratch).unwrap());
+        inventory.reconcile_startup(&[12]).unwrap();
+        let scratch = inventory.get(&workspace.scratch.id).unwrap();
+        assert_eq!(scratch.state, "active", "not reclassified as an orphan");
+        assert!(scratch.job.is_none() && scratch.hold.as_deref() == Some("transform workspace"));
+        let mut resumed = inventory.workspace(12, "par_repair", "abc").unwrap();
+        assert_eq!(resumed.operation_id, workspace.operation_id);
+        assert!(resumed.scratch.path.starts_with(&new));
+        let next = inventory.begin_workspace_attempt(&mut resumed).unwrap();
+        assert_eq!(
+            std::fs::read(new.join(&workspace.operation_id).join("attempt-1/partial")).unwrap(),
+            b"half"
+        );
+        assert!(next.starts_with(&new));
+    }
+
     fn source(workspace: &Workspace) -> SourceGeneration {
         SourceGeneration {
             artifact: workspace.source.id.clone(),

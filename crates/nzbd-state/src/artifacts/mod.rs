@@ -1762,44 +1762,65 @@ impl Inventory {
     /// Use `dir` for transform workspaces (`paths.workspace_dir`). Rows
     /// recorded under the default root (`<state_dir>/transform-workspaces`)
     /// while `dir` is elsewhere — the operator moved the directory — are
-    /// rewritten to the same relative path under `dir` in every table, and a
-    /// moved row whose directory now exists there is re-stamped with its
-    /// current identity and manifest (Runner's private scratch: the move is
-    /// the operator's, not evidence against the payload). While the old root
-    /// still holds workspaces (not moved), nothing is rewritten: they finish
-    /// where they are. Idempotent: a second run finds nothing under the old
-    /// root. Returns the number of rewritten values.
+    /// rewritten to the same relative path under `dir` in every table. While
+    /// the old root still holds workspaces (not moved), nothing is rewritten:
+    /// they finish where they are. Then every workspace recorded under `dir`
+    /// whose recorded root is not the live root object (the root was moved
+    /// or copied there) is re-stamped — the artifact row, the transform
+    /// journal's own copy of the scratch and its attempt directories, and the
+    /// identity sidecar (Runner's private scratch: the move is the
+    /// operator's, not evidence against the payload). That re-stamp is
+    /// driven by the mismatch, not by this run's rewrite, so a crash between
+    /// the commit and the sidecar writes is finished by the next start.
+    /// Idempotent: a second run changes nothing. Returns the number of
+    /// rewritten values.
     pub fn configure_workspace_dir(&self, dir: &Path) -> Result<usize> {
         fs::absolute(dir)?;
         let old = default_workspace_dir(&self.state_dir);
         *self.workspace_dir.write().unwrap() = dir.to_path_buf();
-        if dir == old {
-            return Ok(0);
+        let new_text = dir
+            .to_str()
+            .ok_or_else(|| Error::Conflict("non-UTF-8 workspace path".into()))?
+            .to_owned();
+        let mut rewritten = 0;
+        if dir != old {
+            if dir.starts_with(&old) || old.starts_with(dir) {
+                return Err(Error::Conflict(format!(
+                    "paths.workspace_dir {} must not be nested with the default {}",
+                    dir.display(),
+                    old.display()
+                )));
+            }
+            // Not moved (the old root still holds workspaces): the recorded
+            // absolute paths stay valid where they are, and only new
+            // workspaces go to `dir`. Rewriting them now would point them at
+            // nothing.
+            if std::fs::read_dir(&old).is_ok_and(|mut entries| entries.next().is_some()) {
+                tracing::warn!(old = %old.display(), new = %dir.display(),
+                    "workspace_dir changed but the default workspace root still holds workspaces; \
+                     existing ones finish where they are");
+            } else {
+                let old_text = old
+                    .to_str()
+                    .ok_or_else(|| Error::Conflict("non-UTF-8 workspace path".into()))?
+                    .to_owned();
+                rewritten = self.rewrite_workspace_paths(&old_text, &new_text)?;
+            }
         }
-        if dir.starts_with(&old) || old.starts_with(dir) {
-            return Err(Error::Conflict(format!(
-                "paths.workspace_dir {} must not be nested with the default {}",
-                dir.display(),
-                old.display()
-            )));
+        let restamped = self.restamp_moved_workspaces(dir, &new_text)?;
+        if rewritten > 0 || restamped > 0 {
+            tracing::info!(from = %old.display(), to = %dir.display(), rewritten, restamped,
+                "transform workspace paths migrated");
         }
-        // Not moved (the old root still holds workspaces): the recorded
-        // absolute paths stay valid where they are, and only new workspaces
-        // go to `dir`. Rewriting them now would point them at nothing.
-        if std::fs::read_dir(&old).is_ok_and(|mut entries| entries.next().is_some()) {
-            tracing::warn!(old = %old.display(), new = %dir.display(),
-                "workspace_dir changed but the default workspace root still holds workspaces; \
-                 existing ones finish where they are");
-            return Ok(0);
-        }
-        let (old_text, new_text) = (
-            old.to_str()
-                .ok_or_else(|| Error::Conflict("non-UTF-8 workspace path".into()))?
-                .to_owned(),
-            dir.to_str()
-                .ok_or_else(|| Error::Conflict("non-UTF-8 workspace path".into()))?
-                .to_owned(),
-        );
+        Ok(rewritten)
+    }
+
+    /// Rewrite every recorded path under `old_text` to `new_text` in every
+    /// table: a whole value that is the root or under it, and every JSON
+    /// string that is, at any nesting depth. Counts only values that changed
+    /// (a value mentioning the old path unquoted mid-string, such as error
+    /// text, matches `instr` forever but is never rewritten or counted).
+    fn rewrite_workspace_paths(&self, old_text: &str, new_text: &str) -> Result<usize> {
         let _guard = self.mutation_guard()?;
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
@@ -1823,9 +1844,7 @@ impl Inventory {
                 if !(kind.eq_ignore_ascii_case("TEXT") || kind.is_empty()) {
                     continue;
                 }
-                // A whole value that is the root or under it, and every JSON
-                // string that is, at any nesting depth (a request is JSON
-                // inside JSON, so its quotes arrive escaped).
+                // A request is JSON inside JSON, so its quotes arrive escaped.
                 let mut expression = format!("\"{column}\"");
                 let mut binds: Vec<String> = Vec::new();
                 for quote in ["\"", "\\\"", "\\\\\\\""] {
@@ -1845,63 +1864,152 @@ impl Inventory {
                         );
                     }
                 }
-                let sql = format!(
-                    "UPDATE \"{table}\" SET \"{column}\" = CASE \
+                let value = format!(
+                    "CASE \
                      WHEN \"{column}\" = ?1 THEN ?2 \
                      WHEN substr(\"{column}\",1,length(?1)+1) = ?1||'/' THEN ?2||substr(\"{column}\",length(?1)+1) \
-                     ELSE {expression} END \
-                     WHERE typeof(\"{column}\")='text' AND instr(\"{column}\",?1) > 0"
+                     ELSE {expression} END"
+                );
+                let sql = format!(
+                    "UPDATE \"{table}\" SET \"{column}\" = {value} \
+                     WHERE typeof(\"{column}\")='text' AND instr(\"{column}\",?1) > 0 \
+                     AND ({value}) IS NOT \"{column}\""
                 );
                 let mut values: Vec<&dyn rusqlite::ToSql> = vec![&old_text, &new_text];
                 values.extend(binds.iter().map(|value| value as &dyn rusqlite::ToSql));
                 rewritten += tx.execute(&sql, values.as_slice())?;
             }
         }
-        // Re-stamp moved workspace rows that exist at the new root.
-        let moved = {
+        tx.commit()?;
+        Ok(rewritten)
+    }
+
+    /// Re-stamp workspaces recorded under `dir` whose recorded root is not
+    /// the live root object, in one transaction: the artifact row (root and
+    /// scratch identity, manifest) and every transform journal naming that
+    /// scratch (its copy of the scratch and its attempt directories), so
+    /// startup reconcile still recognises the workspace as a transform's
+    /// and a resume verifies. Then repair any of this installation's
+    /// sidecars still recording a different root for a row that matches
+    /// disk. A missing root re-stamps nothing. Returns the rows re-stamped.
+    fn restamp_moved_workspaces(&self, dir: &Path, dir_text: &str) -> Result<usize> {
+        let Ok(root) = fs::open_dir(dir) else {
+            return Ok(0);
+        };
+        let live_root = fs::identity_for_file(&root)?;
+        let live_scratch = |path: &Path| -> Option<(File, Identity)> {
+            let file = fs::open_dir(path).ok()?;
+            let identity = fs::identity_for_file(&file).ok()?;
+            Some((file, identity))
+        };
+        let _guard = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let rows = {
             let mut statement = tx.prepare("SELECT data FROM artifacts WHERE json_extract(data,'$.root')=?1 AND state NOT IN ('deleted','source_gone')")?;
-            let rows = statement.query_map([&new_text], |row| row.get::<_, String>(0))?;
+            let rows = statement.query_map([dir_text], |row| row.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        let mut restamped = Vec::new();
-        if rewritten > 0 {
-            if let Ok(root) = fs::open_dir(dir) {
-                let root_identity = fs::identity_for_file(&root)?;
-                for raw in moved {
-                    let mut a: Artifact = serde_json::from_str(&raw)?;
-                    a.root_identity = root_identity.clone();
-                    if let Ok(scratch) = fs::open_dir(&a.path) {
-                        a.identity = Some(fs::identity_for_file(&scratch)?);
-                        if let Ok(files) = fs::manifest(&scratch, 100_000) {
-                            a.files = files;
+        let mut current = std::collections::HashMap::new();
+        let mut restamped = 0usize;
+        for raw in rows {
+            let mut a: Artifact = serde_json::from_str(&raw)?;
+            if !a.root_identity.same_object(&live_root) {
+                a.root_identity = live_root.clone();
+                if let Some((scratch, identity)) = live_scratch(&a.path) {
+                    if a.identity.is_some() {
+                        a.identity = Some(identity);
+                    }
+                    if let Ok(files) = fs::manifest(&scratch, 100_000) {
+                        a.files = files;
+                    }
+                }
+                a.revision += 1;
+                a.updated_at = now();
+                save_artifact(&tx, &a)?;
+                event(
+                    &tx,
+                    &a.id,
+                    "workspace_moved",
+                    &format!("workspace root moved to {dir_text}"),
+                )?;
+                restamped += 1;
+            }
+            current.insert(a.id.clone(), a);
+        }
+        let operations = {
+            let mut statement = tx.prepare("SELECT data FROM operations WHERE json_extract(data,'$.kind') IN ('extract','par_repair') AND json_extract(json_extract(data,'$.request'),'$.scratch.root')=?1")?;
+            let rows = statement.query_map([dir_text], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in operations {
+            let mut op: Operation = serde_json::from_str(&raw)?;
+            let mut workspace: Workspace = serde_json::from_str(&op.request)?;
+            if workspace.scratch.root_identity.same_object(&live_root) {
+                continue;
+            }
+            workspace.scratch.root_identity = live_root.clone();
+            if let Some((scratch, identity)) = live_scratch(&workspace.scratch.path) {
+                if workspace.scratch.identity.is_some() {
+                    // Same value as the row's, so the journal and the row
+                    // agree exactly (`is_transform_scratch`).
+                    let row = current
+                        .get(&workspace.scratch.id)
+                        .filter(|row| row.generation == workspace.scratch.generation)
+                        .and_then(|row| row.identity.clone())
+                        .filter(|row| row.same_object(&identity));
+                    workspace.scratch.identity = Some(row.unwrap_or(identity));
+                }
+                for attempt in &mut workspace.attempts {
+                    if attempt.identity.is_some() {
+                        if let Ok(directory) = fs::open_relative(&scratch, &attempt.directory) {
+                            attempt.identity = Some(fs::identity_for_file(&directory)?);
                         }
                     }
-                    a.revision += 1;
-                    a.updated_at = now();
-                    save_artifact(&tx, &a)?;
-                    event(
-                        &tx,
-                        &a.id,
-                        "workspace_moved",
-                        &format!("workspace root moved to {new_text}"),
-                    )?;
-                    restamped.push(a);
                 }
             }
+            op.request = serde_json::to_string(&workspace)?;
+            save_operation(&tx, &op)?;
         }
         tx.commit()?;
         drop(db);
         drop(_guard);
-        for a in &restamped {
-            if a.owned && a.identity.is_some() {
+        for a in current.values() {
+            if a.owned && a.identity.is_some() && self.sidecar_records_other_root(a)? {
                 self.sidecar(a)?;
             }
         }
-        if rewritten > 0 {
-            tracing::info!(from = %old.display(), to = %dir.display(), rewritten,
-                restamped = restamped.len(), "transform workspace paths migrated");
+        Ok(restamped)
+    }
+
+    /// This installation's sidecar for `a` exists but records a different
+    /// root (path or object) than the row, while the row's root is the live
+    /// one: left behind by a root move whose re-stamp committed but whose
+    /// sidecar write did not. A foreign or unreadable sidecar is not ours to
+    /// rewrite.
+    fn sidecar_records_other_root(&self, a: &Artifact) -> Result<bool> {
+        let marker = self
+            .state_dir
+            .join("artifact-identities")
+            .join(&a.id)
+            .join(format!("{}.json", a.generation));
+        let Ok(bytes) = std::fs::read(marker) else {
+            return Ok(false);
+        };
+        let Ok(data) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Ok(false);
+        };
+        if data["installation"] != self.installation
+            || data["artifact"] != a.id
+            || data["generation"] != a.generation
+        {
+            return Ok(false);
         }
-        Ok(rewritten)
+        let recorded_root: Option<Identity> =
+            serde_json::from_value(data["root_identity"].clone()).ok();
+        Ok(data["root"] != a.root.to_string_lossy().as_ref()
+            || data["path"] != a.path.to_string_lossy().as_ref()
+            || !recorded_root.is_some_and(|root| root.same_object(&a.root_identity)))
     }
 
     fn verify(&self, a: &Artifact) -> Result<File> {
