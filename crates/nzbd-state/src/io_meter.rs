@@ -284,8 +284,16 @@ mod tests {
             .spawn()
             .unwrap();
         let mut meter = ProcessMeter::new(child.id(), Some(device));
-        // An exited child that has not been reaped still has its counters.
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Wait for exit the way run_tool does, without reaping: no timing
+        // assumption, so a loaded machine cannot race the samples.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !exited_unreaped(child.id()) {
+            assert!(std::time::Instant::now() < deadline, "dd did not exit");
+            meter.sample();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // An exited child that has not been reaped still has its counters;
+        // a repeat sample charges nothing new.
         meter.sample();
         meter.sample();
         child.wait().unwrap();
