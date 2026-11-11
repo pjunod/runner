@@ -1,5 +1,58 @@
 # nzbd — Project Status
 
+## No wedges: runner side of the pipeline rewrite plan — 2026-11-11 (0.9.0)
+
+**Status:** built, awaiting adversarial review. Branch `claude/no-wedge`
+(pushed; no PR yet). Owner: Claude (Opus 5.5 session). Next: adversarial
+review → fold in findings → full CI once → PR → merge. Not deployed.
+Rebased on main after #305 (0.8.1).
+
+Every stuck state named in the 2026-11-11 brief now has an automatic exit
+through the normal paths; nothing below needs a one-off script on upgrade.
+
+- **W1 ctime.** Published files compare by object + size + mtime
+  (`Identity::same_publication`) at intent commit and digest reuse.
+- **W7 / job 2709.** `prepare_delivery`, `commit_prepared_delivery` and
+  `finish()` build a committed per-file publication from its journal (new
+  `relocation_intents.manifest` column) and never re-read the publication.
+  2709 gets its delivery row on the next follow-up.
+- **W2 stale salvage.** `settle_salvage(none)` refused while a move is open;
+  the intent-commit transaction reopens `settled_none`; the salvage is
+  delivered from the journal even with the queue row retired
+  (`finish_committed_salvage`). Old rows reopen at open.
+- **W4 closed scope.** After a successful (or non-kept failed) delivery the
+  source tree is removed by root identity; nothing is retained for review.
+  Deliveries blocked on retained review files or "source changed outside
+  selected publication cleanup" retry once at open and complete.
+- **W3 retention / policy.** Expiry is wall-clock only (uptime clock and the
+  automation toggle removed). Curator-admitted, non-kept failures follow
+  `failure_action` once salvage settles (park-always replaced, Paul's call);
+  2713/2770/2811/2812/2856/2885 become due on the first rescan under
+  `delete` and are deleted by the retention tick. keep_on_failure is kept
+  indefinitely.
+- **W8 assessment loops (2710/2535).** Assessment is advisory: missing root
+  → nothing to assess; drift → one re-snapshot; then settles `unknown`.
+  Kept failures are recorded in place without re-capturing the directory.
+- **W9 (partial).** A startup orphan is a parked failure with the TTL;
+  legacy "review: allocation has no recovered job" rows convert at startup.
+  *Not built:* ambiguous `par_restore` → discard workspace and re-run;
+  `.runner-file-*.part` sweep (a GFID orphan on a brick is not visible to
+  runner — infra).
+- **W5a latch.** Write-observed ENOSPC clears only after probe writes
+  (8 × 1 MiB, fsynced) succeed in the failing directory, or operator resume;
+  statvfs never clears it.
+- **W5b no -shm.** Both DBs `locking_mode=EXCLUSIVE` before first access;
+  HistoryDb's second (reader) connection removed; `Inventory::close`
+  releases its connection for in-process reloads.
+- **W10 restart.** `POST /api/v1/restart` takes `Idempotency-Key` and
+  `?not_after=`; the UI sends both. *Not built:* PP drain/checkpoint on
+  restart.
+- **Subtitles.** A job's subtitles anywhere in the tree are published with
+  its video at their relative path (season packs pair by stem or folder;
+  ambiguous ones go alongside).
+- **Startup verification (items 1–2 of 7).** Writer proofs trusted on any
+  filesystem; fully proven files are not opened. Items 3–7 not built.
+
 ## Storage I/O on every filesystem; mobile graphs and versions — 2026-11-11
 
 **Status:** branch `fix/storage-io-mobile` (runner 0.8.1, mobile 1.1.8).

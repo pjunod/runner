@@ -9,9 +9,10 @@ failed or pending deletion preserves the retry record. See the
 
 ## 1. Enable and inspect
 
-Settings → Dev → **Enable file lifecycle automation** controls automatic failed
-payload expiry. Enablement always accepts the operator's choice; readiness
-information is advisory. Manual inspection, Keep and recovery remain available.
+Settings → Dev → **Enable file lifecycle automation** controls periodic
+discovery scans. Failed-payload expiry is not behind it (0.9.0): a parked
+failure expires at its deadline either way. Enablement always accepts the
+operator's choice; readiness information is advisory. Manual inspection, Keep and recovery remain available.
 A specific destructive action still requires verified ownership and no active
 writer, recovery claim or Keep hold.
 
@@ -27,9 +28,12 @@ fresh **Grab** in Curator, or retry the retained source. Removing such a queue
 entry does not offer an Undo that would reuse its consumer request token.
 Ordinary parked jobs retain their existing Undo/requeue behavior.
 
-New owned failures use seven days by default. Expiry requires both its wall
-clock deadline and seven days of observed eligible daemon uptime. Downtime and
-holds extend retention. Zero days means indefinitely. Removing Keep or applying
+New owned failures use seven days by default. Expiry is the wall-clock
+deadline alone: it is the same across restarts and downtime, and Keep or a
+hold suspends it. Zero days means indefinitely. An owned allocation whose job
+is not in the recovered queue at startup is a parked failure with the same
+retention (it was a review hold before 0.9.0); importing the job reclaims
+it. Removing Keep or applying
 a changed policy starts a fresh period. Existing unknown folders never acquire
 retroactive expiry merely because automation is enabled.
 

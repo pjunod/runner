@@ -212,6 +212,14 @@ quota_start_day = 1          # day of month the monthly quota resets
 root, not only `paths.dest_dir`. A zero value disables the hold but keeps the
 same cached inventory visible in native status.
 
+The free-space reading is a forecast. A write that actually fails with
+ENOSPC/EDQUOT latches the hold regardless of it, and the latch clears only
+when probe writes (eight 1 MiB files, each fsynced, then removed) succeed in
+the directory that failed — retried every 30 s, doubling to 10 minutes — or
+when the operator resumes the queue. A free-space reading never clears it:
+on a Gluster distribute volume statvfs sums the bricks and reports space
+while one brick is full.
+
 `max_active_downloads` decides how many jobs are worked on at the same
 time. At `1` — the default, and what nzbd has always done — the top job
 takes every connection until it has no segments left to hand out. Raising
@@ -369,17 +377,31 @@ password_hold_deadline_secs = 604800   # the same, for an archive waiting on
 after its terminal is recorded and after any salvage (the usable part of a
 failed job, published as a `kind: "salvage"` delivery) is settled. Precedence:
 
-1. `keep_on_failure` on the job — the files stay where they are.
-2. Reasons `publish`, `io`, `identity` and `hold_expired` are **always
-   parked**, whatever `failure_action` says. These failures are Runner's or the
-   environment's, not the release's, so the bytes are kept for recovery
-   (contract §2.6 default, "park-always").
-3. Everything else — `health`, `par`, `unpack`, `script`, `fetch` — follows
-   `failure_action`.
+1. `keep_on_failure` on the job — the files stay where they are, kept
+   indefinitely (no retention clock) and never re-assessed in a loop: a
+   failed assessment settles as `unknown` and the source stays.
+2. A job Curator admitted (it carries `monarr-transfer`) follows
+   `failure_action` for **every** reason once its salvage has settled —
+   Curator has already re-grabbed it, and any verified payload went out as
+   the salvage delivery. With the default `delete` the source is removed;
+   with `park` it moves to `failed_dir` and expires after
+   `failed_retention_days`. (0.9.0: this replaces "park-always" for
+   `publish`, `io`, `identity` and `hold_expired`; sources an older build
+   parked that way are expired by the normal retention path on upgrade.)
+3. Any other job: reasons `publish`, `io`, `identity` and `hold_expired`
+   are parked whatever `failure_action` says (nobody will re-grab them, so
+   the bytes are the only copy), and a source not assessed `unusable` is
+   parked rather than deleted. Everything else follows `failure_action`.
 
-Before 0.3.0, a job admitted by Curator (`monarr-delivery=1`) forced `delete`
-regardless of the setting. That override is gone; `failure_action` and the
-park-always list above are the whole rule.
+Parked failures expire at their wall-clock deadline (`failed_retention_days`,
+default 7) whether or not file-lifecycle automation is enabled and across
+restarts; Keep holds them. A job's source directory is a closed scope: once
+its delivery is a success (or a failure it does not keep), whatever the
+publication did not take — PAR sets, samples, `.exe`, consumed or obfuscated
+archive pieces, files a repair rewrote — is removed with the directory, and
+nothing is held for review. A job's subtitles (`srt`, `ass`, `ssa`, `sub`,
+`idx`, `sup`, `vtt`, anywhere in the tree — `Subs/2_English.srt` included)
+are published with its video at their relative path.
 
 **Holds always end.** A hold is environmental only — the job's own content
 never holds it — and is retried automatically on the hold ladder. Each hold

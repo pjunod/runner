@@ -1,6 +1,15 @@
 # Startup verification — root cause and proposed runtime recovery
 
-**Status:** proposed; implementation has not started · **Written:** 2026-11-01
+**Status (2026-11-11, 0.9.0):** partly superseded by Paul's rule — only the
+file being written at restart may need anything; a range the writer's
+durable proof covers (write → `sync_data` → `fstat` → proof) is never
+re-read, on any filesystem. Shipped on `claude/no-wedge`: the filesystem
+allowlist in `recovery::metadata_trustworthy` is gone (fuse.glusterfs and
+NFS proofs are trusted), and `verify_job_batch` does not open a file its
+proof fully covers. Not yet built: no verification tickets for proven jobs
+(§3.1/§3.4/§4 are overridden by that rule), lazy proof check at writer spawn,
+proof stamping for legacy Done ranges without reads, non-gating root
+reconciliation, phase timings. · **Written:** 2026-11-01
 · **Incident:** `nuc3`, 2026-11-01 · **Review:** revised after
 [Opus's third review](archive/STARTUP_VERIFICATION_OPUS_THIRD_REVIEW.md); these
 amendments supersede the previously approved draft and were approved by

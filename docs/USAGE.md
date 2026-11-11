@@ -531,9 +531,12 @@ The per-job pipeline and its knobs are described in
   deleted from disk (`delete`), mirroring NZBGet's HealthCheck.
 - **Every failure has a reason.** History and `job_pp_finished` name one of
   `health`, `fetch`, `par`, `unpack`, `script`, `publish`, `io`, `identity`
-  or `hold_expired`. The last four are Runner's or the environment's fault,
-  not the release's, so they are **always parked** in `failed_dir` whatever
-  `failure_action` says; a job with keep-on-failure is left in place. A
+  or `hold_expired`. A job Curator admitted follows `failure_action`
+  (default `delete`) for every reason once its salvage settles — Curator
+  has re-grabbed it. For any other job the last four (Runner's or the
+  environment's fault, not the release's) are parked in `failed_dir`
+  whatever `failure_action` says. A job with keep-on-failure is left in
+  place. A
   failed job whose bytes still hold something usable (one bad episode in a
   season pack, a repairable PAR set) has that part published as a salvage
   delivery before the rest is disposed of.
