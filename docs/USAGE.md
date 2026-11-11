@@ -45,8 +45,9 @@ both survive a restart. The mobile app has the same two toggles.
 
 **Storage.** The Storage panel beside the rate tiles has one row per
 filesystem Runner writes to, named for what it holds: **processing** (state,
-working, failed, intermediate, temporary and watch folders) or **completed**
-(the downloads directory, category destinations and torrent payloads). A
+working, failed, intermediate, temporary and watch folders, and torrent
+payloads, which download and seed in place) or **completed** (the downloads
+directory and category destinations). A
 filesystem holding both says **processing · completed**; hover the row for
 the exact roles, the path and used / total. The left half is capacity and
 free space. The right half graphs the last three minutes of writes (filled)
@@ -58,9 +59,12 @@ cover depends on the filesystem, and the tooltip says which:
   program using that disk counts, not only Runner;
 - an NFS mount is **this machine's traffic** to the server; other clients of
   the NAS are not visible from here;
-- SMB/CIFS, FUSE and overlay mounts expose no counters and read **I/O n/a**
-  instead of drawing a flat line. A gap in a graph is a second that was not
-  measured, never a claim of zero.
+- a GlusterFS or other FUSE mount, an SMB share or an overlay has no kernel
+  counters, so the graph shows **Runner's own** reads and writes there:
+  article writes, par2 and unpacking, the copy to the completed folder, and
+  torrent transfer. Other programs using that filesystem are not included.
+
+A gap in a graph is a second that was not measured, never a claim of zero.
 
 **Adding downloads.** **+ add nzb** uploads one or more local NZB files.
 **+ add torrent** opens an inline form for a magnet link, remote `.torrent`

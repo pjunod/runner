@@ -283,15 +283,13 @@ pub struct StorageKinds {
 
 impl StorageKinds {
     /// Classify one role label as produced by `Config::storage_roots`.
-    /// Finished output (the downloads directory, category destinations and
-    /// torrent payloads) is "completed"; everything Runner works in on the
-    /// way there (state, working, failed, intermediate, temporary, watch
-    /// folders, torrent control) is "processing".
+    /// Finished output (the downloads directory and category destinations)
+    /// is "completed"; everything Runner works in on the way there (state,
+    /// working, failed, intermediate, temporary, watch folders, torrent
+    /// control, and torrent payloads, which download and seed in place) is
+    /// "processing".
     pub fn of_role(role: &str) -> Self {
-        let completed = role == "downloads"
-            || role == "torrent payloads"
-            || role.starts_with("category: ")
-            || role.starts_with("torrent category: ");
+        let completed = role == "downloads" || role.starts_with("category: ");
         StorageKinds {
             processing: !completed,
             completed,
@@ -1567,6 +1565,35 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn roles_name_a_filesystem_processing_or_completed() {
+        let name = |roles: &[&str]| {
+            roles
+                .iter()
+                .fold(StorageKinds::default(), |kinds, role| {
+                    kinds.union(StorageKinds::of_role(role))
+                })
+                .name("fallback")
+        };
+        assert_eq!(name(&["downloads"]), "completed");
+        assert_eq!(name(&["category: tv"]), "completed");
+        // The live nuc3 layout: torrents download and seed in place on the
+        // processing volume, so that volume is processing, not both.
+        assert_eq!(
+            name(&[
+                "working",
+                "torrent payloads",
+                "state",
+                "failed",
+                "torrent control"
+            ]),
+            "processing"
+        );
+        assert_eq!(name(&["torrent category: tv"]), "processing");
+        assert_eq!(name(&["working", "downloads"]), "processing · completed");
+        assert_eq!(name(&[]), "fallback");
+    }
+
     #[test]
     fn configured_roots_on_one_filesystem_are_one_failure_domain() {
         let tmp = tempfile::tempdir().unwrap();

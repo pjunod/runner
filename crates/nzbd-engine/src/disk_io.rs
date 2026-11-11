@@ -14,10 +14,12 @@
 //!   bytes this machine actually sent to and received from the server for
 //!   that mount, which is the traffic Runner's host puts on the NAS. Other
 //!   clients of the same NAS are invisible from here.
-//! * anything else (SMB/CIFS, FUSE, overlay without a backing device, or a
-//!   platform without procfs) is reported as unsupported with the
-//!   filesystem type, so the dashboard can say why there is no graph rather
-//!   than draw a flat line.
+//! * anything else (GlusterFS and other FUSE mounts, SMB/CIFS, overlay
+//!   without a backing device, or a platform without procfs) has no kernel
+//!   counters, so it reports what Runner itself moved there, from
+//!   `nzbd_state::io_meter`: article writes, par2 and unpack tools, the
+//!   copy to the completed folder, and torrent transfer. Other programs
+//!   using that filesystem are not visible, and the source says so.
 //!
 //! Only procfs is read. Nothing here touches the storage itself, so a wedged
 //! network mount cannot stall a sample; the sampler still runs on its own
@@ -46,9 +48,10 @@ pub enum IoSource {
     /// `/proc/self/mountstats`; `export` is the mount source, e.g.
     /// `nas:/share`.
     Nfs { export: String },
-    /// No counters exist for this filesystem; `why` names its type or the
-    /// platform.
-    Unsupported { why: String },
+    /// The kernel keeps no counters for this filesystem; the numbers are
+    /// Runner's own I/O there. `fstype` names the filesystem type (or the
+    /// reason, e.g. a platform without procfs).
+    Runner { fstype: String },
 }
 
 impl IoSource {
@@ -57,7 +60,7 @@ impl IoSource {
         match self {
             IoSource::Block { .. } => "block",
             IoSource::Nfs { .. } => "nfs",
-            IoSource::Unsupported { .. } => "unsupported",
+            IoSource::Runner { .. } => "runner",
         }
     }
 
@@ -65,7 +68,7 @@ impl IoSource {
         match self {
             IoSource::Block { device } => device,
             IoSource::Nfs { export } => export,
-            IoSource::Unsupported { why } => why,
+            IoSource::Runner { fstype } => fstype,
         }
     }
 }
@@ -149,23 +152,12 @@ pub struct DiskIoSampler {
 impl DiskIoSampler {
     /// Sample the live system.
     pub fn sample(&mut self, devices: &[u64], now: Instant) -> DiskIoReading {
-        match ProcText::read() {
-            Some(text) => self.sample_from(devices, now, &text, &canonical_device_name),
-            None => DiskIoReading {
-                at: now,
-                volumes: devices
-                    .iter()
-                    .map(|&device_id| VolumeIo {
-                        device_id,
-                        source: IoSource::Unsupported {
-                            why: unsupported_platform().to_owned(),
-                        },
-                        read_bps: None,
-                        write_bps: None,
-                    })
-                    .collect(),
-            },
-        }
+        let text = ProcText::read().unwrap_or_else(|| ProcText {
+            mountinfo: String::new(),
+            diskstats: String::new(),
+            mountstats: String::new(),
+        });
+        self.sample_from(devices, now, &text, &canonical_device_name, &runner_totals)
     }
 
     /// Sample from the given procfs text. `device_name` resolves a mount
@@ -176,6 +168,7 @@ impl DiskIoSampler {
         now: Instant,
         text: &ProcText,
         device_name: &dyn Fn(&str) -> Option<String>,
+        runner: &dyn Fn(u64) -> IoCounters,
     ) -> DiskIoReading {
         let mounts = parse_mountinfo(&text.mountinfo);
         let disks = parse_diskstats(&text.diskstats);
@@ -188,26 +181,21 @@ impl DiskIoSampler {
             {
                 continue;
             }
-            let (source, counters) = resolve(device_id, &mounts, &disks, &nfs, device_name);
-            let (read_bps, write_bps) = match counters {
-                Some(counters) => {
-                    let rate = self
-                        .previous
-                        .get(&device_id)
-                        .and_then(|(at, prev_source, prev)| {
-                            (prev_source == &source)
-                                .then(|| rate_between(*at, *prev, now, counters))
-                        })
-                        .flatten();
-                    self.previous
-                        .insert(device_id, (now, source.clone(), counters));
-                    rate.map_or((None, None), |(r, w)| (Some(r), Some(w)))
-                }
-                None => {
-                    self.previous.remove(&device_id);
-                    (None, None)
-                }
+            // No kernel counters: fall back to what Runner moved there.
+            let (source, counters) = match resolve(device_id, &mounts, &disks, &nfs, device_name) {
+                (source, Some(counters)) => (source, counters),
+                (source, None) => (source, runner(device_id)),
             };
+            let rate = self
+                .previous
+                .get(&device_id)
+                .and_then(|(at, prev_source, prev)| {
+                    (prev_source == &source).then(|| rate_between(*at, *prev, now, counters))
+                })
+                .flatten();
+            self.previous
+                .insert(device_id, (now, source.clone(), counters));
+            let (read_bps, write_bps) = rate.map_or((None, None), |(r, w)| (Some(r), Some(w)));
             volumes.push(VolumeIo {
                 device_id,
                 source,
@@ -220,11 +208,19 @@ impl DiskIoSampler {
     }
 }
 
-fn unsupported_platform() -> &'static str {
+fn runner_totals(device: u64) -> IoCounters {
+    let totals = nzbd_state::io_meter::totals(device);
+    IoCounters {
+        read_bytes: totals.read_bytes,
+        write_bytes: totals.write_bytes,
+    }
+}
+
+fn no_kernel_counters() -> &'static str {
     if cfg!(target_os = "linux") {
-        "procfs unreadable"
+        "no matching mount"
     } else {
-        "not available on this platform"
+        "no kernel counters on this platform"
     }
 }
 
@@ -388,8 +384,8 @@ fn resolve(
             );
         }
         return (
-            IoSource::Unsupported {
-                why: format!("{} without mountstats", mount.fstype),
+            IoSource::Runner {
+                fstype: format!("{} without mountstats", mount.fstype),
             },
             None,
         );
@@ -414,11 +410,11 @@ fn resolve(
             }
         }
     }
-    let why = mounts
+    let fstype = mounts
         .first()
         .map(|mount| mount.fstype.clone())
-        .unwrap_or_else(|| "no matching mount".to_owned());
-    (IoSource::Unsupported { why }, None)
+        .unwrap_or_else(|| no_kernel_counters().to_owned());
+    (IoSource::Runner { fstype }, None)
 }
 
 /// `/dev/mapper/vg-data` → `dm-0`; `/dev/sdb1` → `sdb1`.
@@ -509,6 +505,10 @@ mod tests {
             | ((minor & 0xffff_ff00) << 12)
     }
 
+    fn no_runner(_: u64) -> IoCounters {
+        IoCounters::default()
+    }
+
     fn names(source: &str) -> Option<String> {
         match source {
             "/dev/mapper/vg-data" => Some("dm-0".to_owned()),
@@ -528,7 +528,13 @@ mod tests {
     fn first_sample_names_the_source_and_reports_no_rate_yet() {
         let mut sampler = DiskIoSampler::default();
         let now = Instant::now();
-        let reading = sampler.sample_from(&[dev(259, 2)], now, &text((0, 0), (0, 0)), &names);
+        let reading = sampler.sample_from(
+            &[dev(259, 2)],
+            now,
+            &text((0, 0), (0, 0)),
+            &names,
+            &no_runner,
+        );
         let io = reading.for_device(Some(dev(259, 2))).unwrap();
         assert_eq!(
             io.source,
@@ -544,13 +550,14 @@ mod tests {
         let mut sampler = DiskIoSampler::default();
         let t0 = Instant::now();
         let id = dev(259, 2);
-        sampler.sample_from(&[id], t0, &text((1_000, 2_000), (0, 0)), &names);
+        sampler.sample_from(&[id], t0, &text((1_000, 2_000), (0, 0)), &names, &no_runner);
         // 2048 sectors read and 4096 written over two seconds.
         let reading = sampler.sample_from(
             &[id],
             t0 + Duration::from_secs(2),
             &text((3_048, 6_096), (0, 0)),
             &names,
+            &no_runner,
         );
         let io = reading.for_device(Some(id)).unwrap();
         assert_eq!(io.read_bps, Some(2048 * 512 / 2));
@@ -562,12 +569,19 @@ mod tests {
         let mut sampler = DiskIoSampler::default();
         let t0 = Instant::now();
         let id = dev(0, 52);
-        sampler.sample_from(&[id], t0, &text((0, 0), (10_000, 20_000)), &names);
+        sampler.sample_from(
+            &[id],
+            t0,
+            &text((0, 0), (10_000, 20_000)),
+            &names,
+            &no_runner,
+        );
         let reading = sampler.sample_from(
             &[id],
             t0 + Duration::from_secs(1),
             &text((0, 0), (10_500, 21_000)),
             &names,
+            &no_runner,
         );
         let io = reading.for_device(Some(id)).unwrap();
         assert_eq!(
@@ -582,8 +596,13 @@ mod tests {
     #[test]
     fn an_anonymous_device_falls_back_to_the_mount_source() {
         let mut sampler = DiskIoSampler::default();
-        let reading =
-            sampler.sample_from(&[dev(0, 60)], Instant::now(), &text((0, 0), (0, 0)), &names);
+        let reading = sampler.sample_from(
+            &[dev(0, 60)],
+            Instant::now(),
+            &text((0, 0), (0, 0)),
+            &names,
+            &no_runner,
+        );
         assert_eq!(
             reading.volumes[0].source,
             IoSource::Block {
@@ -593,24 +612,43 @@ mod tests {
     }
 
     #[test]
-    fn filesystems_without_counters_say_what_they_are() {
+    fn filesystems_without_kernel_counters_report_runners_own_io() {
         let mut sampler = DiskIoSampler::default();
-        let reading = sampler.sample_from(
-            &[dev(0, 61), dev(0, 62), dev(0, 99)],
-            Instant::now(),
-            &text((0, 0), (0, 0)),
-            &names,
-        );
-        let why: Vec<&str> = reading
+        let t0 = Instant::now();
+        let ids = [dev(0, 61), dev(0, 62), dev(0, 99)];
+        let first = |_: u64| IoCounters {
+            read_bytes: 1_000,
+            write_bytes: 5_000,
+        };
+        let reading = sampler.sample_from(&ids, t0, &text((0, 0), (0, 0)), &names, &first);
+        let fstypes: Vec<&str> = reading
             .volumes
             .iter()
             .map(|io| io.source.detail())
             .collect();
-        assert_eq!(why, ["cifs", "nfs without mountstats", "no matching mount"]);
+        assert_eq!(
+            fstypes,
+            ["cifs", "nfs without mountstats", "no matching mount"]
+        );
         assert!(reading
             .volumes
             .iter()
-            .all(|io| io.source.kind() == "unsupported" && io.read_bps.is_none()));
+            .all(|io| io.source.kind() == "runner" && io.read_bps.is_none()));
+        let later = |_: u64| IoCounters {
+            read_bytes: 3_000,
+            write_bytes: 9_000,
+        };
+        let reading = sampler.sample_from(
+            &ids,
+            t0 + Duration::from_secs(2),
+            &text((0, 0), (0, 0)),
+            &names,
+            &later,
+        );
+        assert!(reading
+            .volumes
+            .iter()
+            .all(|io| io.read_bps == Some(1_000) && io.write_bps == Some(2_000)));
     }
 
     #[test]
@@ -618,12 +656,13 @@ mod tests {
         let mut sampler = DiskIoSampler::default();
         let t0 = Instant::now();
         let id = dev(259, 2);
-        sampler.sample_from(&[id], t0, &text((5_000, 5_000), (0, 0)), &names);
+        sampler.sample_from(&[id], t0, &text((5_000, 5_000), (0, 0)), &names, &no_runner);
         let reset = sampler.sample_from(
             &[id],
             t0 + Duration::from_secs(1),
             &text((10, 10), (0, 0)),
             &names,
+            &no_runner,
         );
         assert_eq!(reset.volumes[0].read_bps, None);
         // The next sample measures from the reset value.
@@ -632,6 +671,7 @@ mod tests {
             t0 + Duration::from_secs(2),
             &text((12, 14), (0, 0)),
             &names,
+            &no_runner,
         );
         assert_eq!(after.volumes[0].read_bps, Some(1024));
         assert_eq!(after.volumes[0].write_bps, Some(2048));
@@ -642,18 +682,20 @@ mod tests {
         let mut sampler = DiskIoSampler::default();
         let t0 = Instant::now();
         let id = dev(259, 2);
-        sampler.sample_from(&[id], t0, &text((0, 0), (0, 0)), &names);
+        sampler.sample_from(&[id], t0, &text((0, 0), (0, 0)), &names, &no_runner);
         sampler.sample_from(
             &[],
             t0 + Duration::from_secs(1),
             &text((0, 0), (0, 0)),
             &names,
+            &no_runner,
         );
         let back = sampler.sample_from(
             &[id],
             t0 + Duration::from_secs(2),
             &text((100, 100), (0, 0)),
             &names,
+            &no_runner,
         );
         assert_eq!(
             back.volumes[0].read_bps, None,
