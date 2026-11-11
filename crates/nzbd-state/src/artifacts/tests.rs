@@ -495,7 +495,7 @@ fn pre_upgrade_artifacts_cannot_run_queued_automatic_deletion() {
 }
 
 #[test]
-fn pre_upgrade_explicit_delete_is_frozen_but_new_delete_remains_available() {
+fn pre_upgrade_explicit_delete_resumes_under_closed_scope() {
     let (tmp, db, root) = fixture();
     let legacy = parked(&db, &root);
     let pending = db
@@ -522,17 +522,13 @@ fn pre_upgrade_explicit_delete_is_frozen_but_new_delete_remains_available() {
         .unwrap();
     db.close().unwrap();
 
+    // No-wedge (closed scope): the migration still freezes it, and the
+    // open's automatic exit resumes it — an owned payload is Runner's own.
     let migrated = Inventory::open(&tmp.path().join("state")).unwrap();
+    assert_eq!(migrated.operation(&pending.id).unwrap().state, "retry");
     let old = migrated.execute_delete(&pending.id).unwrap();
-    assert_eq!(old.state, "review");
-    assert!(legacy.path.exists());
-    let reviewed = migrated
-        .request_delete(&legacy.id, legacy.revision, "new-reviewed-delete", 0)
-        .unwrap();
-    assert_eq!(
-        migrated.execute_delete(&reviewed.id).unwrap().state,
-        "succeeded"
-    );
+    assert_eq!(old.state, "succeeded");
+    assert!(!legacy.path.exists());
 }
 
 #[test]
@@ -2388,9 +2384,12 @@ fn startup_orphaned_active_allocation_preserves_binding_until_explicit_successor
     let a = db.allocate(42, &root, &root.join("orphan")).unwrap();
     std::fs::write(a.path.join("media.mkv"), b"keep").unwrap();
     db.reconcile_startup(&[]).unwrap();
+    // No-wedge (closed scope): an owned orphan parks with the failed TTL
+    // whenever it was allocated; the binding survives for a successor.
     let orphan = db.get(&a.id).unwrap();
-    assert_eq!(orphan.state, "retained");
-    assert!(orphan.keep && orphan.hold.is_some());
+    assert_eq!(orphan.state, "parked_failed");
+    assert!(!orphan.keep && orphan.hold.is_none());
+    assert!(orphan.earliest_expiry().is_some());
     assert_eq!(db.for_job(42).unwrap().unwrap().id, a.id);
     assert!(db.inspect(&a.id).is_ok());
     assert!(db
@@ -3788,4 +3787,183 @@ fn v1_acceptance_columns_are_dropped_on_open() {
         })
         .unwrap();
     assert_eq!(kept, 1);
+}
+
+// No-wedge task 2: every review/retained hold takes its registered exit.
+
+fn held(db: &Inventory, root: &Path, job: u32, hold: &str) -> Artifact {
+    let path = root.join(format!("held-{job}"));
+    db.allocate(job, root, &path).unwrap();
+    std::fs::write(path.join("payload.bin"), b"payload bytes").unwrap();
+    let mut a = db.finish(job, &path, root, "retained").unwrap();
+    a.hold = Some(hold.into());
+    a.updated_at = now() - 2 * exits::HOLD_EXIT_SECONDS;
+    save_artifact(&db.db.lock().unwrap(), &a).unwrap();
+    a
+}
+
+#[test]
+fn cancelled_recovery_holds_exit_and_only_the_copy_is_disposed() {
+    let (_tmp, db, root) = fixture();
+    let source = held(&db, &root, 1, "review: cancelled recovery");
+    let staging = held(&db, &root, 2, "review: cancelled recovery staging");
+    let report = db.exit_wedged_states(0, false).unwrap();
+    assert_eq!((report.released, report.parked), (1, 1));
+    let source = db.get(&source.id).unwrap();
+    assert!(source.hold.is_none());
+    assert_eq!(source.state, "retained", "the original keeps its lifecycle");
+    let copy = db.get(&staging.id).unwrap();
+    assert_eq!(copy.state, "parked_failed");
+    assert!(copy.earliest_expiry().is_some_and(|due| due <= now()));
+    db.tick().unwrap();
+    db.run_due_deletes().unwrap();
+    assert!(!staging.path.exists(), "the copy is disposed");
+    assert!(source.path.exists(), "the original is never removed");
+    // Idempotent: nothing left to convert.
+    assert_eq!(db.exit_wedged_states(0, true).unwrap().total(), 0);
+}
+
+#[test]
+fn unowned_content_is_never_touched_and_its_delete_is_cancelled() {
+    let (_tmp, db, root) = fixture();
+    let adopted = held(&db, &root, 1, "review: files changed; adoption required");
+    let discovered = held(&db, &root, 2, "review");
+    let mut unheld = db.get(&discovered.id).unwrap();
+    unheld.hold = None;
+    save_artifact(&db.db.lock().unwrap(), &unheld).unwrap();
+    let op = db
+        .request_delete(&discovered.id, unheld.revision, "old-delete", 0)
+        .unwrap();
+    for (a, hold) in [
+        (&adopted, "review: files changed; adoption required"),
+        (&discovered, "review"),
+    ] {
+        let mut a = db.get(&a.id).unwrap();
+        a.owned = false;
+        a.hold = Some(hold.into());
+        save_artifact(&db.db.lock().unwrap(), &a).unwrap();
+    }
+    {
+        let db = db.db.lock().unwrap();
+        db.execute(
+            "UPDATE operations SET state='review',data=json_set(data,'$.state','review','$.error','deletion generation changed') WHERE id=?1",
+            [&op.id],
+        )
+        .unwrap();
+    }
+    db.exit_wedged_states(0, true).unwrap();
+    for a in [&adopted, &discovered] {
+        let after = db.get(&a.id).unwrap();
+        assert!(after.hold.is_some() && !after.owned && after.state == "retained");
+        assert!(a.path.exists());
+    }
+    assert_eq!(db.operation(&op.id).unwrap().state, "cancelled");
+}
+
+#[test]
+fn refused_disposal_resnapshots_the_closed_scope_and_retries() {
+    let (_tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    let op = db.request_delete(&a.id, a.revision, "dispose", 0).unwrap();
+    // Something inside the job's own directory that is not in the manifest.
+    std::fs::write(a.path.join("late.part"), b"written after the snapshot").unwrap();
+    assert_eq!(db.execute_delete(&op.id).unwrap().state, "review");
+    let mut refused = db.get(&a.id).unwrap();
+    assert_eq!(refused.hold.as_deref(), Some("review"));
+    refused.updated_at = now() - 2 * exits::HOLD_EXIT_SECONDS;
+    save_artifact(&db.db.lock().unwrap(), &refused).unwrap();
+    // The tick's grace has passed: re-snapshot and retry.
+    let report = db
+        .exit_wedged_states(exits::HOLD_EXIT_SECONDS, true)
+        .unwrap();
+    assert_eq!(report.retried, 1);
+    assert_eq!(db.operation(&op.id).unwrap().state, "retry");
+    assert!(db.get(&a.id).unwrap().hold.is_none());
+    assert_eq!(db.execute_delete(&op.id).unwrap().state, "succeeded");
+    assert!(!a.path.exists());
+}
+
+#[test]
+fn a_fresh_hold_waits_for_the_grace_and_a_restart_releases_quiescence() {
+    let (tmp, db, root) = fixture();
+    let a = held(&db, &root, 1, "review: subprocess quiescence unconfirmed");
+    let mut fresh = db.get(&a.id).unwrap();
+    fresh.updated_at = now();
+    save_artifact(&db.db.lock().unwrap(), &fresh).unwrap();
+    assert_eq!(
+        db.exit_wedged_states(exits::HOLD_EXIT_SECONDS, true)
+            .unwrap()
+            .total(),
+        0,
+        "the flow that set it gets HOLD_EXIT_SECONDS first"
+    );
+    db.close().unwrap();
+    drop(db);
+    // No subprocess outlives the process: the open releases it.
+    let db = Inventory::open(&tmp.path().join("state")).unwrap();
+    assert!(db.get(&a.id).unwrap().hold.is_none());
+}
+
+#[test]
+fn an_interrupted_writer_retirement_is_reclassified() {
+    let (_tmp, db, root) = fixture();
+    let gone = held(&db, &root, 1, "review: interrupted writer retirement");
+    let replaced = held(&db, &root, 2, "review: interrupted writer retirement");
+    let intact = held(&db, &root, 3, "review: interrupted writer retirement");
+    std::fs::remove_dir_all(&gone.path).unwrap();
+    std::fs::remove_dir_all(&replaced.path).unwrap();
+    std::fs::create_dir(&replaced.path).unwrap();
+    std::fs::write(replaced.path.join("someone-else"), b"x").unwrap();
+    db.exit_wedged_states(0, true).unwrap();
+    assert_eq!(db.get(&gone.id).unwrap().state, "source_gone");
+    let other = db.get(&replaced.id).unwrap();
+    assert!(!other.owned && other.hold.as_deref() == Some("review"));
+    assert!(replaced.path.join("someone-else").exists(), "never deleted");
+    let parked = db.get(&intact.id).unwrap();
+    assert_eq!(parked.state, "parked_failed");
+    assert!(parked.hold.is_none() && parked.earliest_expiry().is_some());
+}
+
+#[test]
+fn materialization_predecessors_and_orphans_park_with_the_failed_ttl() {
+    let (_tmp, db, root) = fixture();
+    let mut rows = Vec::new();
+    for (job, hold) in [
+        (1, "review: superseded by accepted generation"),
+        (2, "review: allocation has no recovered job"),
+        (3, "review: previous external job generation"),
+        (4, "review: superseded private processing source"),
+    ] {
+        let a = held(&db, &root, job, hold);
+        let mut pinned = db.get(&a.id).unwrap();
+        pinned.keep = true; // the pin the flow set with the hold
+        save_artifact(&db.db.lock().unwrap(), &pinned).unwrap();
+        rows.push(a);
+    }
+    let report = db.exit_wedged_states(0, false).unwrap();
+    assert_eq!(report.parked, 4);
+    for a in rows {
+        let after = db.get(&a.id).unwrap();
+        assert_eq!(after.state, "parked_failed", "{:?}", a.hold);
+        assert!(!after.keep && after.hold.is_none());
+        assert!(
+            after.deadline.is_some_and(|due| due > now()),
+            "TTL, not now"
+        );
+        assert!(a.path.exists());
+    }
+}
+
+#[test]
+fn pre_upgrade_automatic_delete_in_review_resumes_on_the_tick() {
+    let (_tmp, db, root) = fixture();
+    let legacy = parked(&db, &root);
+    let op = db
+        .request_delete_authorized(&legacy.id, legacy.revision, "legacy-retention", 0, true)
+        .unwrap();
+    assert_eq!(db.execute_delete(&op.id).unwrap().state, "review");
+    let report = db.exit_wedged_states(0, false).unwrap();
+    assert_eq!(report.retried, 1);
+    assert_eq!(db.operation(&op.id).unwrap().state, "retry");
+    assert!(db.get(&legacy.id).unwrap().automatic_cleanup_eligible);
 }

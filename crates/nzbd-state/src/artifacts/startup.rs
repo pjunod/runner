@@ -411,18 +411,22 @@ impl Inventory {
                 previous_hold: artifact.hold.clone(),
                 classified_revision: original.revision + 1,
             });
-            if !live
-                && artifact.state == "retained"
-                && artifact.owned
-                && artifact.automatic_cleanup_eligible
-                && !artifact.keep
-                && artifact.hold.is_none()
-            {
+            if !live && artifact.state == "retained" && artifact.owned {
                 // W9: an owned allocation whose job is gone is a failed
                 // source with the failed-payload TTL, not a review state.
                 // The durable binding stays, so an import/adoption that
                 // arrives later reclaims it (`reclaim_recovered_orphan`).
+                // No-wedge: closed scope — an owned allocation is Runner's
+                // own download whenever it was made, so pre-eligibility rows
+                // park too; a person's Keep still retains it, and a hold it
+                // already had keeps its own registered exit.
+                let hold = artifact.hold.take();
                 Self::park_orphan(&mut artifact, self.settings()?.failed_retention_days);
+                artifact.automatic_cleanup_eligible = true;
+                artifact.hold = hold;
+            } else if !live && artifact.owned {
+                // Not retained (an interrupted writer retirement): its own
+                // hold's registered exit reclassifies it.
             } else if !live {
                 // Imports/adoptions may arrive while this payload worker is
                 // running. Retain the durable binding so a later owner can
@@ -495,17 +499,18 @@ impl Inventory {
             let mut artifact: Artifact = serde_json::from_str(&raw)?;
             let operation: Operation = serde_json::from_str(&op)?;
             let receipt: OrphanReceipt = serde_json::from_str(&operation.request)?;
-            if !artifact.owned
-                || !artifact.automatic_cleanup_eligible
-                || receipt.previous_keep
-                || receipt.previous_hold.is_some()
-                || receipt.generation != artifact.generation
-                || artifact.revision != receipt.classified_revision
-            {
+            if !artifact.owned || receipt.generation != artifact.generation {
                 continue;
             }
-            artifact.keep = false;
+            // No-wedge: closed scope. Keep is what it was before the
+            // classification pinned it (a later person's change wins), and a
+            // hold it had before keeps its own registered exit.
+            if artifact.revision == receipt.classified_revision {
+                artifact.keep = receipt.previous_keep;
+            }
             Self::park_orphan(&mut artifact, retention_days);
+            artifact.automatic_cleanup_eligible = true;
+            artifact.hold = receipt.previous_hold.clone();
             artifact.revision += 1;
             artifact.updated_at = now();
             save_artifact(&tx, &artifact)?;

@@ -11,6 +11,7 @@ mod policy;
 mod publication;
 pub use policy::{RetentionChange, RetentionPreview};
 mod delivery;
+pub mod exits;
 mod materialization;
 pub use materialization::{
     external_generation_identity, ExternalGeneration, ExternalGenerationFile,
@@ -929,6 +930,11 @@ impl Inventory {
             tasks: Mutex::new(()),
         };
         inventory.abandon_reviewed_transforms()?;
+        // No-wedge: upgrade and restart conversion of review/retained rows
+        // (database-only exits; the tick runs the rest).
+        if let Err(error) = inventory.exit_wedged_states(0, false) {
+            tracing::warn!(%error, "automatic exits at open deferred to the tick");
+        }
         Ok(inventory)
     }
     fn mutation_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
@@ -3066,6 +3072,9 @@ impl Inventory {
         self.reconcile_workspace_retirements_with_history(history)?;
         self.run_workspace_retirements()?;
         self.reconcile_recoveries()?;
+        if let Err(error) = self.exit_wedged_states(exits::HOLD_EXIT_SECONDS, true) {
+            tracing::warn!(%error, "automatic exits for review/retained states deferred");
+        }
         self.schedule_discovery()?;
         self.run_tasks()?;
         self.reconcile_missing()?;
