@@ -3261,7 +3261,18 @@ impl Inventory {
         };
         for raw in raws {
             let mut a: Artifact = serde_json::from_str(&raw)?;
-            a.hold = Some("restored backup: review required".into());
+            // Finding 8: record the Keep the row had, so releasing the
+            // quarantine restores it instead of leaving Keep on everything.
+            // A row already quarantined keeps its first record.
+            if a.hold.as_deref() != Some(exits::RESTORE_HOLD) {
+                event(
+                    &tx,
+                    &a.id,
+                    "restore_quarantine",
+                    if a.keep { "keep=true" } else { "keep=false" },
+                )?;
+            }
+            a.hold = Some(exits::RESTORE_HOLD.into());
             a.keep = true;
             a.deadline = None;
             a.revision += 1;

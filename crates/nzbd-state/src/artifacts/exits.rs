@@ -211,7 +211,7 @@ pub const HOLD_EXITS: &[HoldExit] = &[
     h("review: previous external job generation", PARK_PIN, Exit::Timer("owned: parked with the failed TTL; unowned: adoption")),
     h("review: managed seed metainfo mismatch", PARK_TTL, Exit::Timer("seed directory (closed scope) parked with the failed TTL")),
     h("review retained source", PARK_TTL, Exit::Timer("parked with the failed TTL")),
-    h("restored backup: review required", HoldAction::Release, Exit::Policy("released; the Keep a restore sets stays until a person clears it")),
+    h("restored backup: review required", HoldAction::Release, Exit::Timer("released; the row gets back the Keep it had before the restore")),
 ];
 
 /// The registered exit for a hold string.
@@ -700,9 +700,17 @@ impl Inventory {
                 if current.revision != a.revision || current.hold.as_deref() != Some(&hold) {
                     return Ok(());
                 }
-                park(&mut current, if immediate { 0 } else { ttl }, clear_keep);
                 let mut db = self.db.lock().unwrap();
                 let tx = db.transaction()?;
+                // Finding 10: clear only the Keep the pin set; an operator's
+                // explicit Keep (or the Keep a row had before) stays.
+                let keep = if clear_keep {
+                    keep_after_forced(&tx, &current.id)?
+                } else {
+                    current.keep
+                };
+                park(&mut current, if immediate { 0 } else { ttl }, false);
+                current.keep = keep;
                 save_artifact(&tx, &current)?;
                 event(
                     &tx,
@@ -748,6 +756,11 @@ impl Inventory {
         current.updated_at = now();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
+        if hold == RESTORE_HOLD {
+            // Finding 8: the restore forced Keep on every row; releasing its
+            // hold gives back the Keep the row had (or an operator gave it).
+            current.keep = keep_after_forced(&tx, &current.id)?;
+        }
         save_artifact(&tx, &current)?;
         event(
             &tx,
@@ -871,6 +884,33 @@ enum RecoveryExit {
 
 /// Park an owned row as a failed source: due after `ttl` seconds (now for a
 /// redundant copy). Keep / keep_on_failure still retain it (policy).
+/// The hold a restored backup puts on every live row.
+pub(crate) const RESTORE_HOLD: &str = "restored backup: review required";
+
+/// The Keep a row has once a hold that forced Keep on it is lifted: what
+/// the row had when a restore quarantined it, or the operator's latest
+/// explicit retention choice (Keep, adoption) — otherwise no Keep. A row
+/// quarantined before this was recorded (upgrade) keeps Keep only when an
+/// explicit operator Keep event exists.
+pub(crate) fn keep_after_forced(db: &rusqlite::Connection, artifact: &str) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+    let latest: Option<(String, String)> = db
+        .query_row(
+            "SELECT kind,detail FROM events WHERE artifact=?1 AND kind IN ('restore_quarantine','retention','adopted') ORDER BY at DESC, rowid DESC LIMIT 1",
+            [artifact],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(match latest {
+        Some((kind, detail)) => match kind.as_str() {
+            "restore_quarantine" => detail == "keep=true",
+            "retention" => detail == "Keep",
+            _ => true, // adopted: kept indefinitely
+        },
+        None => false,
+    })
+}
+
 fn park(a: &mut Artifact, ttl: i64, clear_keep: bool) {
     a.hold = None;
     if clear_keep {

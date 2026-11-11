@@ -4003,3 +4003,92 @@ fn pre_upgrade_automatic_delete_in_review_resumes_on_the_tick() {
     assert_eq!(db.operation(&op.id).unwrap().state, "retry");
     assert!(db.get(&legacy.id).unwrap().automatic_cleanup_eligible);
 }
+
+/// Finding 8: releasing a restore quarantine gives each row back the Keep it
+/// had — the forced Keep does not block delivery cleanup forever — while an
+/// operator's Keep survives; an already-quarantined (upgrade) row loses the
+/// forced Keep unless an explicit operator Keep event exists.
+#[test]
+fn releasing_a_restore_quarantine_restores_the_previous_keep() {
+    let (_tmp, db, root) = fixture();
+    let plain = held(&db, &root, 1, "x");
+    let kept = held(&db, &root, 2, "x");
+    let upgraded = held(&db, &root, 3, "x");
+    let upgraded_kept = held(&db, &root, 4, "x");
+    for a in [&plain, &kept, &upgraded, &upgraded_kept] {
+        let mut row = db.get(&a.id).unwrap();
+        row.hold = None;
+        save_artifact(&db.db.lock().unwrap(), &row).unwrap();
+    }
+    let row = db.get(&kept.id).unwrap();
+    db.retention(&kept.id, row.revision, true, None).unwrap();
+    let row = db.get(&upgraded_kept.id).unwrap();
+    db.retention(&upgraded_kept.id, row.revision, true, None)
+        .unwrap();
+    db.quarantine_restore().unwrap();
+    // Rows quarantined by a build that recorded nothing.
+    db.db
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM events WHERE kind='restore_quarantine' AND artifact IN (?1,?2)",
+            rusqlite::params![upgraded.id, upgraded_kept.id],
+        )
+        .unwrap();
+    for a in [&plain, &kept, &upgraded, &upgraded_kept] {
+        let mut row = db.get(&a.id).unwrap();
+        assert!(row.keep);
+        row.updated_at = now() - 2 * exits::HOLD_EXIT_SECONDS;
+        save_artifact(&db.db.lock().unwrap(), &row).unwrap();
+    }
+    db.exit_wedged_states(exits::HOLD_EXIT_SECONDS, true)
+        .unwrap();
+    for (a, keep) in [
+        (&plain, false),
+        (&kept, true),
+        (&upgraded, false),
+        (&upgraded_kept, true),
+    ] {
+        let row = db.get(&a.id).unwrap();
+        assert!(row.hold.is_none(), "{}", a.id);
+        assert_eq!(row.keep, keep, "{}", a.id);
+    }
+}
+
+/// Finding 10: parking a pinned hold clears only the pin's Keep; an
+/// operator's explicit Keep stays.
+#[test]
+fn parking_a_pinned_hold_keeps_an_operator_keep() {
+    let (_tmp, db, root) = fixture();
+    let pinned = held(
+        &db,
+        &root,
+        1,
+        "review: superseded private processing source",
+    );
+    let operator = held(&db, &root, 2, "x");
+    let mut row = db.get(&operator.id).unwrap();
+    row.hold = None;
+    save_artifact(&db.db.lock().unwrap(), &row).unwrap();
+    let row = db.get(&operator.id).unwrap();
+    db.retention(&operator.id, row.revision, true, None)
+        .unwrap();
+    for (a, hold) in [
+        (&pinned, "review: superseded private processing source"),
+        (&operator, "review: superseded private processing source"),
+    ] {
+        let mut row = db.get(&a.id).unwrap();
+        row.hold = Some(hold.into());
+        row.keep = true;
+        row.updated_at = now() - 2 * exits::HOLD_EXIT_SECONDS;
+        save_artifact(&db.db.lock().unwrap(), &row).unwrap();
+    }
+    db.exit_wedged_states(exits::HOLD_EXIT_SECONDS, true)
+        .unwrap();
+    let pinned = db.get(&pinned.id).unwrap();
+    assert_eq!(pinned.state, "parked_failed");
+    assert!(!pinned.keep, "the pin's Keep is cleared");
+    let operator = db.get(&operator.id).unwrap();
+    assert_eq!(operator.state, "parked_failed");
+    assert!(operator.keep, "the operator's Keep stays");
+}
