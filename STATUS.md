@@ -133,6 +133,16 @@ through the normal paths; nothing below needs a one-off script on upgrade.
   deleted at once (review asked to delete Runner-placed files; that would
   delete the only copy — conflict for Paul); a silent recovery consumer's
   quiescence is taken as given after the failed TTL.
+- **`paths.workspace_dir` (nuc4 layout).** Transform workspaces follow
+  `paths.workspace_dir` (default `<state dir>/transform-workspaces`, so
+  nothing changes unless set; also a storage root, so discovery excludes it
+  and the disk guard watches it). After the operator moves the directory,
+  startup rewrites every recorded path under the old default in every
+  table (JSON at any nesting depth included) and re-stamps the moved
+  workspaces; idempotent, and skipped while the old root still holds
+  workspaces. Recommended: `queue_dir` (state) local, `main_dir`,
+  `workspace_dir` and `dest_dir` on the processing volume (same device →
+  publish by rename). Documented in CONFIGURATION.md and DEPLOY.md.
 - **Not done:** full suite not run (fast lane on the PR).
 
 ### Review fixes (Fable, 2026-11-11)

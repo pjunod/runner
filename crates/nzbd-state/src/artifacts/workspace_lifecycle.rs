@@ -1264,6 +1264,124 @@ mod tests {
         inventory.finish_workspace(&workspace).unwrap();
         (temp, inventory, workspace)
     }
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    /// `paths.workspace_dir`: unset, workspaces live under the state
+    /// directory; set, under the configured directory.
+    #[test]
+    fn workspaces_default_under_state_and_follow_the_configured_dir() {
+        let (temp, inventory, workspace) = fixture();
+        let default = temp.path().join("state/transform-workspaces");
+        assert_eq!(inventory.workspace_dir(), default);
+        assert!(workspace.scratch.path.starts_with(&default));
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("processing");
+        std::fs::create_dir(&root).unwrap();
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        let configured = root.join(".workspaces");
+        assert_eq!(inventory.configure_workspace_dir(&configured).unwrap(), 0);
+        inventory
+            .allocate_for_delivery(12, &root, &root.join("job"), false, false)
+            .unwrap();
+        let workspace = inventory.workspace(12, "par_repair", "abc").unwrap();
+        assert!(
+            workspace.scratch.path.starts_with(&configured),
+            "{:?}",
+            workspace.scratch.path
+        );
+        assert!(!temp.path().join("state/transform-workspaces").exists());
+        assert!(
+            inventory
+                .configure_workspace_dir(&temp.path().join("state/transform-workspaces/inner"))
+                .is_err(),
+            "nested with the default is refused"
+        );
+    }
+
+    /// Rows recorded under the default root keep working after the operator
+    /// moves the directory (here: copied, so every inode changes) and sets
+    /// `paths.workspace_dir`: every recorded path is rewritten, the moved
+    /// scratch verifies at its new place, and a second run changes nothing.
+    #[test]
+    fn moved_workspace_rows_are_migrated_once() {
+        let (temp, inventory, workspace) = fixture();
+        let old = temp.path().join("state/transform-workspaces");
+        let new = temp.path().join("processing/.workspaces");
+        let old_text = old.to_str().unwrap().to_owned();
+        inventory.close().unwrap();
+        drop(inventory);
+        copy_tree(&old, &new);
+        // Not moved yet (the old root still holds it): nothing is rewritten.
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        assert_eq!(inventory.configure_workspace_dir(&new).unwrap(), 0);
+        assert!(inventory
+            .get(&workspace.scratch.id)
+            .unwrap()
+            .path
+            .starts_with(&old));
+        inventory.close().unwrap();
+        drop(inventory);
+        std::fs::remove_dir_all(&old).unwrap();
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        assert!(inventory.configure_workspace_dir(&new).unwrap() > 0);
+        let scratch = inventory.get(&workspace.scratch.id).unwrap();
+        assert!(scratch.path.starts_with(&new), "{:?}", scratch.path);
+        assert_eq!(scratch.root, new);
+        inventory.verify(&scratch).unwrap();
+        let leftover: i64 = {
+            let db = inventory.db.lock().unwrap();
+            let tables: Vec<String> = db
+                .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect();
+            tables
+                .iter()
+                .map(|table| {
+                    let columns: Vec<String> = db
+                        .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+                        .unwrap()
+                        .query_map([], |row| row.get(1))
+                        .unwrap()
+                        .map(|row| row.unwrap())
+                        .collect();
+                    columns
+                        .iter()
+                        .map(|column| {
+                            db.query_row(
+                                &format!("SELECT count(*) FROM \"{table}\" WHERE typeof(\"{column}\")='text' AND instr(\"{column}\",?1)>0"),
+                                [&old_text],
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .unwrap()
+                        })
+                        .sum::<i64>()
+                })
+                .sum()
+        };
+        assert_eq!(leftover, 0, "no recorded path still names the old root");
+        assert_eq!(
+            inventory.configure_workspace_dir(&new).unwrap(),
+            0,
+            "idempotent"
+        );
+        assert_eq!(inventory.workspace_dir(), new);
+    }
+
     fn source(workspace: &Workspace) -> SourceGeneration {
         SourceGeneration {
             artifact: workspace.source.id.clone(),

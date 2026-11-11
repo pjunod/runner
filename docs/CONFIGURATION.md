@@ -18,9 +18,49 @@ main_dir = "~/downloads"            # default Usenet processing root + state
 dest_dir = "~/downloads/complete"   # finished downloads (per-category overrides below)
 # inter_dir = "~/downloads/inter"   # processing override; absent/empty uses main_dir
 # nzb_watch_dir = "~/downloads/nzb" # drop .nzb files here to auto-queue them
-# queue_dir = "~/downloads/queue"   # journal + queue snapshots (default: <main_dir>/queue)
+# queue_dir = "~/downloads/queue"   # the state directory (default: <main_dir>/queue)
+# workspace_dir = "~/downloads/.workspaces" # PAR repair / extraction scratch
+#                                   # (default: <state dir>/transform-workspaces)
 # temp_dir = "/tmp/nzbd"            # scratch space
 ```
+
+**The state directory** (`queue_dir`, default `<main_dir>/queue`) holds
+everything that is not payload: `queue.json` and its snapshots, the per-job
+journals, `artifacts.sqlite` (file lifecycle), the history index
+(`history.sqlite`, unless `[history] index_dir` moves it), the history
+journal, parked NZBs (`nzbs/`), torrent session state and the identity
+sidecars. It is small and fsync-heavy: a local disk is the right place.
+
+**`workspace_dir`** is where post-processing builds a PAR repair or an
+extraction before the result is moved into the job's processing directory.
+It holds payload-sized data while a transform runs, and its output reaches
+processing by `rename` only when both are on the same filesystem — on
+different volumes every result is copied. Unset, it stays under the state
+directory (nothing changes for existing installs). Put it on the processing
+volume when the state directory is a small local disk. Moving it later is
+supported: stop nzbd, move the directory, set `workspace_dir`, start; at
+startup every recorded workspace path under the old default
+(`<state dir>/transform-workspaces`) is rewritten to the new directory and
+the moved workspaces are re-stamped (a no-op on every later start). If the
+old directory still holds workspaces (not moved), nothing is rewritten:
+those finish where they are and only new workspaces use `workspace_dir`. It
+must not be nested inside the default location (or contain it).
+
+**Recommended layout with a small local state disk** (state local, payload on
+one processing volume):
+
+```toml
+[paths]
+queue_dir     = "/srv/nzbd/state"          # local disk: state only
+main_dir      = "/processing"              # processing volume
+workspace_dir = "/processing/.workspaces"  # same volume as main_dir
+dest_dir      = "/processing/completed"    # same volume: publish = rename
+```
+
+`dest_dir` on the same filesystem as the job's processing directory
+publishes by same-volume rename (decided by device number; no bytes are
+copied). On a GlusterFS FUSE mount every path of the volume shares one
+device, so `/processing/completed` qualifies.
 
 The watch dir is polled by the daemon; a dropped `.nzb` is queued and the
 file removed. In cluster mode only the current leader watches it.

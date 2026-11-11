@@ -372,6 +372,11 @@ pub struct Paths {
     pub temp_dir: Option<PathBuf>,
     pub torrent_dir: Option<PathBuf>,
     pub torrent_watch_dir: Option<PathBuf>,
+    /// Transform workspaces (PAR repair / extraction scratch). Unset: under
+    /// the state directory. Put it on the processing volume (beside
+    /// `main_dir`) when the state directory is a small local disk, so a
+    /// workspace's output reaches processing by rename, not by copy.
+    pub workspace_dir: Option<PathBuf>,
 }
 
 impl Default for Paths {
@@ -385,6 +390,7 @@ impl Default for Paths {
             temp_dir: None,
             torrent_dir: None,
             torrent_watch_dir: None,
+            workspace_dir: None,
         }
     }
 }
@@ -631,6 +637,22 @@ impl Config {
         expand_home(&self.paths.dest_dir)
     }
 
+    /// Transform workspace root: `paths.workspace_dir`, else
+    /// `<state_dir>/transform-workspaces`.
+    pub fn workspace_dir(&self) -> PathBuf {
+        self.configured_workspace_dir()
+            .unwrap_or_else(|| self.state_dir().join("transform-workspaces"))
+    }
+
+    /// `paths.workspace_dir` when set (expanded); `None` keeps the default.
+    pub fn configured_workspace_dir(&self) -> Option<PathBuf> {
+        self.paths
+            .workspace_dir
+            .as_ref()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| expand_home(p))
+    }
+
     /// Usenet processing root: nonempty InterDir, otherwise MainDir.
     pub fn download_dir(&self) -> PathBuf {
         self.paths
@@ -691,6 +713,9 @@ impl Config {
             }
         };
         push("state".into(), self.state_dir());
+        if let Some(path) = self.configured_workspace_dir() {
+            push("workspaces".into(), path);
+        }
         if self.cluster.enabled {
             if let Some(path) = &self.cluster.shared_dir {
                 push(
@@ -2141,6 +2166,33 @@ Server2.Connections=0
             def.state_dir(),
             PathBuf::from(&home).join("downloads/queue")
         );
+    }
+
+    #[test]
+    fn workspace_dir_defaults_under_state_and_follows_the_setting() {
+        let mut cfg = Config::default();
+        cfg.paths.queue_dir = Some(PathBuf::from("/srv/nzbd/state"));
+        assert_eq!(cfg.configured_workspace_dir(), None);
+        assert_eq!(
+            cfg.workspace_dir(),
+            PathBuf::from("/srv/nzbd/state/transform-workspaces")
+        );
+        assert!(!cfg
+            .storage_roots()
+            .iter()
+            .any(|root| root.label.contains("workspaces")));
+        let parsed: Config = toml::from_str(
+            "[paths]\nmain_dir = \"/processing\"\nqueue_dir = \"/srv/nzbd/state\"\nworkspace_dir = \"/processing/.workspaces\"\ndest_dir = \"/processing/completed\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.workspace_dir(),
+            PathBuf::from("/processing/.workspaces")
+        );
+        assert!(parsed
+            .storage_roots()
+            .iter()
+            .any(|root| root.path == std::path::Path::new("/processing/.workspaces")));
     }
 
     #[test]

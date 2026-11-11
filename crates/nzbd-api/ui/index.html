@@ -6486,6 +6486,7 @@ const SETTINGS_SECTIONS = [
     ["paths.nzb_watch_dir", "watch dir for dropped .nzb (optional)", "text?"],
     ["paths.torrent_dir", "torrent payload dir (optional)", "text?"],
     ["paths.torrent_watch_dir", "watch dir for dropped .torrent (optional)", "text?"],
+    ["paths.workspace_dir", "transform workspace dir (optional; default under the state dir; put it on the processing volume)", "text?"],
   ]},
   { key: "servers", title: "News servers", desc: "Tier 0 is tried first; higher tiers are backups. Fill servers only see missing articles. Connection counts apply immediately when lowered; raising one above what the daemon started with needs a restart.", array: true },
   { key: "queue", title: "Speed & queue", desc: "Speed limit and simultaneous downloads apply immediately on save; the rest needs a restart.", fields: [

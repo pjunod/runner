@@ -564,6 +564,7 @@ fn guard_test_owner_with_backend(
         &tmp.path().join("state"),
         None,
         None,
+        None,
         tmp.path().join("dest"),
         Vec::new(),
         None,
@@ -1470,6 +1471,7 @@ fn control_test_owner_at(
     let (backend, adapter) = crate::backend::backend_channel(1, 1);
     let owner = Owner::recover(
         &base.join("state"),
+        None,
         None,
         None,
         base.join("dest"),

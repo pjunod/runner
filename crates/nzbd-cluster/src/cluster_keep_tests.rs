@@ -39,6 +39,7 @@ impl Node {
             pp_weight: 1,
             disk_guard_roots: vec![],
             torrent_payload_roots: vec![],
+            workspace_dir: None,
         };
         drop(raft);
         drop(control);

@@ -84,6 +84,8 @@ pub struct ClusterConfig {
     /// enforcing low-disk guard.
     pub disk_guard_roots: Vec<nzbd_engine::volumes::DiskGuardRoot>,
     pub torrent_payload_roots: Vec<PathBuf>,
+    /// Transform workspace root (`paths.workspace_dir`); `None` = default.
+    pub workspace_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +261,7 @@ impl ClusterRuntime {
             download_enabled: false,
             state_dir: layout.state_dir(),
             artifact_dir: Some(cfg.control_dir.join("file-lifecycle")),
+            workspace_dir: cfg.workspace_dir.clone(),
             expected_installation_id,
             dest_dir: dest_dir.clone(),
             torrent_payload_roots: cfg.torrent_payload_roots.clone(),

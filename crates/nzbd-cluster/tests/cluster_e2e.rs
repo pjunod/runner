@@ -219,6 +219,7 @@ async fn start_node_with_control(
             path: shared.join("complete"),
         }],
         torrent_payload_roots: Vec::new(),
+        workspace_dir: None,
     };
     let tuning = Tuning {
         retry_interval: Duration::from_millis(400),

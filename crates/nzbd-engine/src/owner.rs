@@ -1311,6 +1311,7 @@ impl Owner {
     pub(crate) fn recover(
         state_dir: &Path,
         artifact_dir: Option<&Path>,
+        workspace_dir: Option<&Path>,
         expected_installation_id: Option<&str>,
         dest_dir: PathBuf,
         torrent_payload_roots: Vec<PathBuf>,
@@ -1342,6 +1343,13 @@ impl Owner {
             )
             .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?,
         );
+        // `paths.workspace_dir`, and the migration of rows recorded under the
+        // default root, before anything reads a workspace path.
+        if let Some(dir) = workspace_dir {
+            artifacts
+                .configure_workspace_dir(dir)
+                .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+        }
         // Capture the metadata boundary before runtime Inventory handles can
         // admit allocations or journals while payload workers are delayed.
         let startup_snapshot = Arc::new(

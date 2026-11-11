@@ -302,7 +302,7 @@ impl Inventory {
         }
         let dir = self.verify(&source)?;
         source.files = fs::manifest(&dir, 100_000)?;
-        let workspace_root = self.state_dir.join("transform-workspaces");
+        let workspace_root = self.workspace_dir();
         std::fs::create_dir_all(&workspace_root)?;
         let workspace_dir = fs::open_dir(&workspace_root)?;
         let path = workspace_root.join(&key);

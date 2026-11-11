@@ -423,6 +423,7 @@ fn cluster_runtime_config(
         pp_weight: c.pp_weight.max(1),
         disk_guard_roots: disk_guard_roots(cfg),
         torrent_payload_roots: torrent_payload_roots(cfg),
+        workspace_dir: cfg.configured_workspace_dir(),
     };
     Ok((runtime, shared_dir))
 }
@@ -1252,6 +1253,7 @@ fn run(
     engine_cfg.torrent_payload_roots = torrent_payload_roots(&cfg);
     engine_cfg.max_active_downloads = cfg.max_active_downloads();
     engine_cfg.expected_installation_id = expected_identity;
+    engine_cfg.workspace_dir = cfg.configured_workspace_dir();
 
     // Keep a shutdown handle outside the startup future: any later failure
     // (torrent restore, watch roots, router setup) must drain the accepted

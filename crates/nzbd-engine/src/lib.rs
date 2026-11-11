@@ -500,6 +500,9 @@ pub struct EngineConfig {
     pub state_dir: PathBuf,
     /// Node-local lifecycle database, separate from cluster journals.
     pub artifact_dir: Option<PathBuf>,
+    /// Transform workspace root (`paths.workspace_dir`); `None` keeps the
+    /// default `<artifact/state dir>/transform-workspaces`.
+    pub workspace_dir: Option<PathBuf>,
     /// Independently enrolled inventory identity; never create a new store on mismatch.
     pub expected_installation_id: Option<String>,
     /// Completed jobs are written to `<dest_dir>/<job name>/`.
@@ -544,6 +547,7 @@ impl EngineConfig {
             download_enabled: true,
             state_dir,
             artifact_dir: None,
+            workspace_dir: None,
             expected_installation_id: None,
             disk_guard_roots: vec![DiskGuardRoot {
                 label: "downloads".into(),
@@ -626,6 +630,7 @@ impl Engine {
         let owner = Owner::recover(
             &cfg.state_dir,
             cfg.artifact_dir.as_deref(),
+            cfg.workspace_dir.as_deref(),
             cfg.expected_installation_id.as_deref(),
             cfg.dest_dir.clone(),
             cfg.torrent_payload_roots.clone(),
