@@ -1197,9 +1197,8 @@ pub(crate) struct Owner {
     enospc_observed: u64,
     enospc_where: Option<String>,
     /// Finding 7: jobs whose proven files passed the post-processing
-    /// admission stat, by job epoch; and the ones being stat'ed now.
+    /// admission stat, by job epoch.
     pp_stat_passed: HashMap<JobId, u64>,
-    pp_stat_inflight: HashSet<JobId>,
     /// W5a: every write that reported ENOSPC, by the operation that failed.
     /// The latch clears when each has evidence from its own operation
     /// (`space_probe`), never from a write somewhere else.
@@ -1688,7 +1687,6 @@ impl Owner {
             enospc_observed: 0,
             enospc_where: None,
             pp_stat_passed: HashMap::new(),
-            pp_stat_inflight: HashSet::new(),
             enospc_failures: std::collections::BTreeMap::new(),
             space_probe_fs: Arc::new(crate::space_probe::RealFs),
             space_probe_inflight: false,
@@ -2729,8 +2727,42 @@ impl Owner {
                 // (off this loop) before post-processing reads it: a replaced,
                 // missing or truncated file goes to verification, which
                 // reopens its missing ranges for download.
-                if !self.pp_admission_stat_passed(job) {
-                    let _ = reply.send(None);
+                if let Some((epoch, dir, files)) = self.pp_admission_stat_needed(job) {
+                    self.background_then(
+                        format!("pp-stat-{}", job.0),
+                        move || Ok(recovery_worker::stat_proven_files(&dir, &files)),
+                        move |owner, result| {
+                            match result {
+                                Ok(recovery_worker::AdmissionStat::Fits) => {
+                                    owner.pp_stat_passed.insert(job, epoch);
+                                    // The admission re-runs every check
+                                    // against the queue as it is now.
+                                    owner.on_command(QueueCommand::BeginPostAdmission {
+                                        job,
+                                        reply,
+                                    });
+                                }
+                                Ok(recovery_worker::AdmissionStat::Short(why)) => {
+                                    tracing::warn!(job = job.0, %why,
+                                        "proven payload no longer fits its proof; verifying before post-processing");
+                                    owner.queue_verification(job);
+                                    let _ = reply.send(None);
+                                    owner.publish_now();
+                                    owner.bump_epoch();
+                                }
+                                Ok(recovery_worker::AdmissionStat::Unavailable(why)) => {
+                                    tracing::warn!(job = job.0, %why,
+                                        "payload stat unavailable; post-processing admission retries");
+                                    let _ = reply.send(None);
+                                }
+                                Err(error) => {
+                                    tracing::warn!(job = job.0, %error,
+                                        "payload stat failed; post-processing admission retries");
+                                    let _ = reply.send(None);
+                                }
+                            }
+                        },
+                    );
                     return;
                 }
                 if self.state.job(job).is_some_and(|job| {
@@ -2759,6 +2791,7 @@ impl Owner {
                     self.writers.remove(&file);
                 }
                 self.post_admissions.insert(job, generation);
+                self.pp_stat_passed.remove(&job);
                 let cancellation = self.cancel.child_token();
                 self.post_cancellations.insert(job, cancellation.clone());
                 if let Some(record) = self.state.job_mut(job) {
@@ -9121,61 +9154,34 @@ impl Owner {
         true
     }
 
-    /// Finding 7: true once this job's proven files were stat'ed for the
-    /// current epoch and fit their proofs. Otherwise starts the stat (off the
-    /// owner loop) and answers false; the admission is asked again when it
-    /// answers (the epoch bump re-runs the post manager's scan).
-    fn pp_admission_stat_passed(&mut self, job: JobId) -> bool {
-        let Some(record) = self.state.job(job) else {
-            return false;
-        };
+    /// Finding 7: the stat post-processing admission still owes this job
+    /// for its current epoch — `(epoch, directory, proven files)` — or None
+    /// when it passed, has nothing to check, or was checked at an earlier
+    /// admission (its download retired into post-processing custody).
+    #[allow(clippy::type_complexity)]
+    fn pp_admission_stat_needed(
+        &mut self,
+        job: JobId,
+    ) -> Option<(
+        u64,
+        PathBuf,
+        Vec<(FileId, String, nzbd_state::artifacts::Identity, u64)>,
+    )> {
+        let record = self.state.job(job)?;
         if record
             .params
             .iter()
             .any(|(key, _)| key == "*Recovery:download-retired")
         {
-            return true; // checked at its first admission; transforms own it since
+            return None;
         }
         let files = recovery_worker::proven_files(record);
+        if files.is_empty() {
+            return None;
+        }
+        let dir = self.allocation_cache.get(&job).map(|a| a.path.clone())?;
         let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
-        if files.is_empty() || self.pp_stat_passed.get(&job) == Some(&epoch) {
-            return true;
-        }
-        let Some(dir) = self.allocation_cache.get(&job).map(|a| a.path.clone()) else {
-            return true; // no allocation: verification already decided above
-        };
-        if !self.pp_stat_inflight.insert(job) {
-            return false;
-        }
-        self.background_then(
-            format!("pp-stat-{}", job.0),
-            move || Ok(recovery_worker::stat_proven_files(&dir, &files)),
-            move |owner, result| {
-                owner.pp_stat_inflight.remove(&job);
-                if owner.job_epochs.get(&job) != Some(&epoch) {
-                    return;
-                }
-                match result {
-                    Ok(recovery_worker::AdmissionStat::Fits) => {
-                        owner.pp_stat_passed.insert(job, epoch);
-                    }
-                    Ok(recovery_worker::AdmissionStat::Short(why)) => {
-                        tracing::warn!(job = job.0, %why,
-                            "proven payload no longer fits its proof; verifying before post-processing");
-                        owner.queue_verification(job);
-                    }
-                    Ok(recovery_worker::AdmissionStat::Unavailable(why)) => {
-                        tracing::warn!(job = job.0, %why, "payload stat unavailable; post-processing admission retries");
-                    }
-                    Err(error) => {
-                        tracing::warn!(job = job.0, %error, "payload stat failed; post-processing admission retries");
-                    }
-                }
-                owner.publish_now();
-                owner.bump_epoch();
-            },
-        );
-        false
+        (self.pp_stat_passed.get(&job) != Some(&epoch)).then_some((epoch, dir, files))
     }
 
     /// Jobs whose own retry is the evidence a finalize failure needs: hold
