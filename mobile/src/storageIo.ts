@@ -23,10 +23,12 @@ export interface StorageIoState {
   latest: Record<string, StorageIo | null | undefined>;
   /** When `latest` was last fed, for judging freshness without a stream. */
   notedAt: number;
+  /** When the clock last took a sample; seconds it missed become gaps. */
+  sampledAt: number;
   history: Record<string, StorageIoSeries>;
 }
 
-export const emptyStorageIo: StorageIoState = { latest: {}, notedAt: 0, history: {} };
+export const emptyStorageIo: StorageIoState = { latest: {}, notedAt: 0, sampledAt: 0, history: {} };
 
 export function storageKey(storage: Pick<StoragePath, 'path'>, index: number): string {
   return `storage:${storage.path || index}`;
@@ -58,6 +60,12 @@ export function sampleStorageIo(
   now: number,
 ): StorageIoState {
   const fresh = live || now - state.notedAt < 6_500;
+  // A suspended app or a stalled JS thread skips ticks; those seconds were
+  // not measured, so they are gaps and the time axis stays three minutes.
+  const missed = state.sampledAt > 0
+    ? Math.min(STORAGE_IO_WINDOW, Math.max(0, Math.floor((now - state.sampledAt) / 1_000) - 1))
+    : 0;
+  const gaps: null[] = new Array(missed).fill(null);
   const history: Record<string, StorageIoSeries> = {};
   const latest: StorageIoState['latest'] = {};
   rows.forEach((row, index) => {
@@ -67,11 +75,41 @@ export function sampleStorageIo(
     const ok = fresh && measurable(io);
     const previous = state.history[key] ?? { read: [], write: [] };
     history[key] = {
-      read: [...previous.read, ok ? Math.max(0, io.read_bps) : null].slice(-STORAGE_IO_WINDOW),
-      write: [...previous.write, ok ? Math.max(0, io.write_bps) : null].slice(-STORAGE_IO_WINDOW),
+      read: [...previous.read, ...gaps, ok ? Math.max(0, io.read_bps) : null].slice(-STORAGE_IO_WINDOW),
+      write: [...previous.write, ...gaps, ok ? Math.max(0, io.write_bps) : null].slice(-STORAGE_IO_WINDOW),
     };
   });
-  return { latest, notedAt: state.notedAt, history };
+  return { latest, notedAt: state.notedAt, sampledAt: now, history };
+}
+
+/**
+ * The history lives outside React state so its once-a-second update
+ * re-renders only the Storage block that subscribes to it, not the whole
+ * dashboard and queue list.
+ */
+export interface StorageIoStore {
+  get: () => StorageIoState;
+  subscribe: (listener: () => void) => () => void;
+  note: (rows: readonly Pick<StoragePath, 'path' | 'io'>[] | undefined, now: number) => void;
+  sample: (rows: readonly Pick<StoragePath, 'path'>[], live: boolean, now: number) => void;
+}
+
+export function createStorageIoStore(initial: StorageIoState = emptyStorageIo): StorageIoStore {
+  let state = initial;
+  const listeners = new Set<() => void>();
+  const set = (next: StorageIoState) => {
+    state = next;
+    listeners.forEach((listener) => listener());
+  };
+  return {
+    get: () => state,
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+    note: (rows, now) => set(noteStorageIo(state, rows, now)),
+    sample: (rows, live, now) => set(sampleStorageIo(state, rows, live, now)),
+  };
 }
 
 export interface StorageIoBar {
@@ -130,6 +168,7 @@ export function storageIoText(io: StorageIo | null | undefined): StorageIoText {
   const quiet = (text: string, describe: string): StorageIoText => ({ quiet: true, write: text, read: '', describe });
   if (io === undefined) return quiet('measuring…', 'Waiting for the first I/O sample.');
   if (io === null) return quiet('no I/O data', 'Runner cannot identify this filesystem, so it cannot sample its I/O.');
+  // 0.8.0 daemons report "unsupported" where 0.8.1 graphs Runner's own I/O.
   if (io.source === 'unsupported') return quiet('I/O n/a', `${io.detail} keeps no I/O counters.`);
   if (io.source === 'stale') return quiet('I/O stalled', 'The I/O sampler has not reported for more than 5 seconds.');
   const describe = io.source === 'nfs'

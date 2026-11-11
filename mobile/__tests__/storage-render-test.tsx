@@ -2,7 +2,7 @@ import React from 'react';
 import { Text } from 'react-native';
 import { DashboardScreen } from '../src/screens/DashboardScreen';
 import { useNzbd } from '../src/hooks/useNzbd';
-import { emptyStorageIo, noteStorageIo, sampleStorageIo } from '../src/storageIo';
+import { createStorageIoStore, emptyStorageIo, noteStorageIo, sampleStorageIo } from '../src/storageIo';
 const { act, create } = require('react-test-renderer');
 
 jest.mock('expo/fetch', () => ({ fetch: jest.fn() }));
@@ -39,7 +39,7 @@ test('both storage rows graph their I/O and say what it covers; both pause lanes
   for (let t = 2_000; t < 12_000; t += 1_000) io = sampleStorageIo(io, storage, true, t);
   const status = { download_rate_bps: 100, remaining_bytes: 1000, jobs_downloading: 0, jobs_queued: 0, storage,
     blocked_servers: [], servers: [], quota_reached: false, disk_low: false, download_paused: false, post_paused: true };
-  (useNzbd as jest.Mock).mockImplementation(() => ({ snapshot: { jobs: [], status }, storageIo: io, connectionState: 'live', busyKey: null, queueAction: jest.fn() }));
+  (useNzbd as jest.Mock).mockImplementation(() => ({ snapshot: { jobs: [], status }, storageIo: createStorageIoStore(io), connectionState: 'live', busyKey: null, queueAction: jest.fn() }));
   await act(async () => { tree = create(<DashboardScreen {...props} />); });
 
   const shown = text();
@@ -72,7 +72,7 @@ test('both storage rows graph their I/O and say what it covers; both pause lanes
 test('a row with no sample yet says measuring, not missing', async () => {
   const status = { download_rate_bps: 0, remaining_bytes: 0, jobs_downloading: 0, jobs_queued: 0, storage: [storage[0]],
     blocked_servers: [], servers: [], quota_reached: false, disk_low: false };
-  (useNzbd as jest.Mock).mockImplementation(() => ({ snapshot: { jobs: [], status }, storageIo: emptyStorageIo, connectionState: 'live', busyKey: null, queueAction: jest.fn() }));
+  (useNzbd as jest.Mock).mockImplementation(() => ({ snapshot: { jobs: [], status }, storageIo: createStorageIoStore(), connectionState: 'live', busyKey: null, queueAction: jest.fn() }));
   await act(async () => { tree = create(<DashboardScreen {...props} />); });
   expect(text()).toContain('measuring…');
 });

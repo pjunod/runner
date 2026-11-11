@@ -1,5 +1,6 @@
 import {
   STORAGE_IO_BARS,
+  createStorageIoStore,
   emptyStorageIo,
   noteStorageIo,
   sampleStorageIo,
@@ -24,7 +25,9 @@ describe('storage I/O history', () => {
     state = noteStorageIo(state, [{ path: '/p', io: live(3, 4) }], t);
     state = sampleStorageIo(state, rows, false, (t += 3_000));
     state = sampleStorageIo(state, rows, false, (t += 4_000));
-    expect(state.history['storage:/p'].write).toEqual([2, 2, null, 4, null]);
+    // stale -> gap; 3 s later: two missed seconds, then a fresh poll's 4;
+    // 4 s later: three missed seconds, then nothing fresh -> gap.
+    expect(state.history['storage:/p'].write).toEqual([2, 2, null, null, null, 4, null, null, null, null]);
 
     for (let i = 0; i < 400; i++) state = sampleStorageIo(state, rows, true, (t += 1_000));
     expect(state.history['storage:/p'].write).toHaveLength(180);
@@ -32,6 +35,29 @@ describe('storage I/O history', () => {
     state = sampleStorageIo(state, [], true, (t += 1_000));
     expect(state.history).toEqual({});
     expect(state.latest).toEqual({});
+  });
+
+  it('seconds the clock missed (app suspended) become gaps, so the axis stays three minutes', () => {
+    const rows = [{ path: '/p' }];
+    let state = noteStorageIo(emptyStorageIo, [{ path: '/p', io: live(1, 2) }], 0);
+    state = sampleStorageIo(state, rows, true, 1_000);
+    state = sampleStorageIo(state, rows, true, 5_000);
+    expect(state.history['storage:/p'].write).toEqual([2, null, null, null, 2]);
+    state = sampleStorageIo(state, rows, true, 10_000_000);
+    expect(state.history['storage:/p'].write).toHaveLength(180);
+    expect(state.history['storage:/p'].write.filter((v) => v !== null)).toEqual([2]);
+  });
+
+  it('the store notifies subscribers on every sample', () => {
+    const store = createStorageIoStore();
+    const seen: number[] = [];
+    const stop = store.subscribe(() => seen.push(store.get().sampledAt));
+    store.note([{ path: '/p', io: live(1, 2) }], 0);
+    store.sample([{ path: '/p' }], true, 1_000);
+    stop();
+    store.sample([{ path: '/p' }], true, 2_000);
+    expect(seen).toEqual([0, 1_000]);
+    expect(store.get().history['storage:/p'].write).toEqual([2, 2]);
   });
 
   it('a tick row without io does not erase the rate a storage_io frame gave', () => {

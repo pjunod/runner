@@ -1,6 +1,6 @@
 import * as DocumentPicker from 'expo-document-picker';
 import { File } from 'expo-file-system';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
   Alert,
   Modal,
@@ -58,7 +58,10 @@ import { LogsView } from './LogsView';
 import { holdAction } from '../holdAction';
 import { holdDeadlineText, holdHeadline } from '../holdPresentation';
 import { QUEUE_LANES, QueueLane, laneNotice, lanePaused, laneToggleAction, laneToggleLabel, pausedIndicator } from '../queueLanes';
-import { StorageIoState, storageIoBars, storageIoText, storageKey } from '../storageIo';
+import { StorageIoState, StorageIoStore, createStorageIoStore, storageIoBars, storageIoText, storageKey } from '../storageIo';
+
+/** For a hook (or test double) that supplies no I/O store. */
+const noStorageIo = createStorageIoStore();
 
 type AppSection = 'queue' | 'history' | 'logs';
 
@@ -309,7 +312,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
 
       {activeSection === 'queue' && status ? (
         <View style={styles.overviewDock}>
-          <Overview status={status} storageIo={storageIo} styles={styles} wide={wide} />
+          <Overview status={status} storageIo={storageIo ?? noStorageIo} styles={styles} wide={wide} />
         </View>
       ) : null}
 
@@ -437,12 +440,12 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
 
 function Overview({
   status,
-  storageIo,
+  storageIo: storageIoStore,
   styles,
   wide,
 }: {
   status: StatusDto;
-  storageIo: StorageIoState;
+  storageIo: StorageIoStore;
   styles: ReturnType<typeof makeStyles>;
   wide: boolean;
 }) {
@@ -452,6 +455,8 @@ function Overview({
     : status.download_rate_bps > 0
       ? formatDuration(status.remaining_bytes / status.download_rate_bps)
       : '—';
+  // Subscribed here so the once-a-second graph update re-renders only this block.
+  const storageIo = useSyncExternalStore(storageIoStore.subscribe, storageIoStore.get);
   const volumes = status.storage ?? [];
   const critical = criticalStorage(volumes);
   const criticalUsage = critical ? storageUsage(critical) : null;
@@ -577,6 +582,7 @@ function StorageVolume({
         critical && styles.storageRowCritical,
       ]}
     >
+      <View style={styles.storageCap}>
       <View style={styles.storageTop}>
         <Text numberOfLines={1} style={styles.storageLabel}>
           {storageEvidenceLabel(storage)}
@@ -611,7 +617,8 @@ function StorageVolume({
       <Text numberOfLines={1} style={styles.storageCapacity}>
         {capacity}
       </Text>
-      <StorageIoGraph io={io} series={ioSeries} styles={styles} />
+      </View>
+      <StorageIoGraph io={io} series={ioSeries} styles={styles} wide={wide} />
     </View>
   );
 }
@@ -621,17 +628,19 @@ function StorageIoGraph({
   io,
   series,
   styles,
+  wide,
 }: {
   io: StorageIoState['latest'][string];
   series: StorageIoState['history'][string] | undefined;
   styles: ReturnType<typeof makeStyles>;
+  wide: boolean;
 }) {
   const text = storageIoText(io);
   const { bars, peak } = storageIoBars(series);
   return (
     <View
       accessibilityLabel={`I/O, last 3 minutes. ${text.quiet ? text.write : `${text.write}, ${text.read}`}. ${text.describe}`}
-      style={styles.storageIo}
+      style={[styles.storageIo, wide ? styles.storageIoBelow : styles.storageIoBeside]}
     >
       <View style={styles.storageIoPlot}>
         {peak !== null ? (
@@ -1453,7 +1462,10 @@ export const makeStyles = (theme: Theme) =>
       borderColor: 'transparent',
       backgroundColor: theme.panelAlt,
     },
-    storageRowPhone: { width: '100%' },
+    // On a phone the graph sits beside capacity, as on the web, so the
+    // pinned overview does not grow; wide cards have room for it below.
+    storageRowPhone: { width: '100%', flexDirection: 'row', alignItems: 'stretch', gap: 8 },
+    storageCap: { flex: 1, minWidth: 0 },
     storageRowWide: { minWidth: 150, flexBasis: 170, flexGrow: 1 },
     storageRowCritical: { borderColor: theme.accent },
     storageTop: { flexDirection: 'row', alignItems: 'center', gap: 5 },
@@ -1497,7 +1509,15 @@ export const makeStyles = (theme: Theme) =>
     storageLegendWrite: { backgroundColor: theme.accent },
     storageLegendRead: { backgroundColor: theme.textMuted },
     storageLegendText: { color: theme.textMuted, fontSize: 7 },
-    storageIo: { flexDirection: 'row', alignItems: 'stretch', gap: 6, marginTop: 4, height: 24 },
+    storageIo: { flexDirection: 'row', alignItems: 'stretch', gap: 6 },
+    storageIoBelow: { marginTop: 4, height: 24 },
+    storageIoBeside: {
+      flex: 1,
+      minWidth: 0,
+      paddingLeft: 8,
+      borderLeftWidth: StyleSheet.hairlineWidth,
+      borderLeftColor: theme.border,
+    },
     storageIoPlot: {
       flex: 1,
       minWidth: 0,
@@ -1509,7 +1529,15 @@ export const makeStyles = (theme: Theme) =>
     storageIoColumn: { flex: 1, height: '100%', justifyContent: 'flex-end' },
     storageIoWrite: { backgroundColor: theme.accent, opacity: 0.55 },
     storageIoRead: { position: 'absolute', left: 0, right: 0, height: 1.5, backgroundColor: theme.textMuted },
-    storageIoScale: { position: 'absolute', top: 0, left: 0, color: theme.textMuted, fontSize: 7 },
+    storageIoScale: {
+      position: 'absolute',
+      top: 0,
+      left: 0,
+      paddingRight: 2,
+      color: theme.textMuted,
+      backgroundColor: theme.panelAlt,
+      fontSize: 7,
+    },
     storageIoRates: { width: 66, justifyContent: 'space-between' },
     storageIoRatesQuiet: { justifyContent: 'center' },
     storageIoRate: { color: theme.textMuted, fontSize: 8, textAlign: 'right', fontVariant: ['tabular-nums'] },
