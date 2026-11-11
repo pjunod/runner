@@ -388,6 +388,103 @@ mod unix {
     /// there (each level holds a descriptor).
     const MAX_HELD_DEPTH: usize = 48;
 
+    /// Which mount a directory is on: its device, plus the kernel's mount
+    /// id where available (statx `STATX_MNT_ID`, Linux 5.8+). A bind mount
+    /// of the same filesystem shares the device and differs only here.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct MountScope {
+        device: u64,
+        mount: Option<u64>,
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// Inodes the tests present as a different mount of the same device
+        /// (a bind mount needs privileges a test may not have).
+        pub(super) static FAKE_BIND_MOUNTS: std::cell::RefCell<Vec<u64>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// The mount id of `name` in `dir` (not followed), or of `dir` itself
+    /// when `name` is empty. None where statx or the field is unavailable.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn mount_id_at(dir: &File, name: &CStr) -> Option<u64> {
+        let mut buf = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        let flags = libc::AT_SYMLINK_NOFOLLOW
+            | if name.to_bytes().is_empty() {
+                libc::AT_EMPTY_PATH
+            } else {
+                0
+            };
+        // SAFETY: name is NUL terminated; buf is written on success only.
+        let rc = unsafe {
+            libc::statx(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                flags,
+                libc::STATX_MNT_ID | libc::STATX_INO,
+                buf.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let stat = unsafe { buf.assume_init() };
+        if stat.stx_mask & libc::STATX_MNT_ID == 0 {
+            return None;
+        }
+        #[cfg(test)]
+        if FAKE_BIND_MOUNTS.with(|fake| fake.borrow().contains(&stat.stx_ino)) {
+            return Some(stat.stx_mnt_id ^ (1 << 62));
+        }
+        Some(stat.stx_mnt_id)
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    fn mount_id_at(_: &File, _: &CStr) -> Option<u64> {
+        None
+    }
+
+    impl MountScope {
+        fn of(root: &File) -> Result<Self> {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Self {
+                device: root.metadata()?.dev(),
+                mount: mount_id_at(root, c""),
+            })
+        }
+        /// `name` in `dir` (a directory with device `device`) is on this
+        /// mount. With a root mount id known, an entry whose id cannot be
+        /// read is treated as another mount: never descended into.
+        fn contains(&self, device: u64, dir: &File, name: &CStr) -> bool {
+            device == self.device
+                && self
+                    .mount
+                    .is_none_or(|mount| mount_id_at(dir, name) == Some(mount))
+        }
+    }
+
+    /// A fresh name for a subtree moved up to the root: unique across runs
+    /// and processes (pid 1 in every container restart), so a crash mid
+    /// removal never leaves a name a later move collides with.
+    fn deep_name(deep: &mut u64) -> Result<CString> {
+        use std::hash::{BuildHasher, Hasher};
+        *deep += 1;
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(*deep);
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        );
+        CString::new(format!(
+            "{DEEP_PREFIX}{}-{deep}-{:016x}",
+            std::process::id(),
+            hasher.finish()
+        ))
+        .map_err(|_| Error::Conflict("NUL in name".into()))
+    }
+
     /// Every name in `dir`, raw (no UTF-8 requirement, no count limit).
     fn all_names(dir: &File) -> Result<Vec<CString>> {
         let fd = unsafe { libc::dup(dir.as_raw_fd()) };
@@ -492,12 +589,14 @@ mod unix {
     /// non-directory (regular file, symlink, fifo, socket, device) is
     /// unlinked by name, never followed; directories on the root's device are
     /// emptied and removed bottom-up; a directory on another device (a
-    /// mount) is left with its ancestors. No name is refused for its bytes,
-    /// its depth or the number of entries — closed-scope cleanup must not
-    /// block on names a manifest cannot describe.
+    /// mount) is left with its ancestors — and so is a directory on another
+    /// mount of the same device (a bind mount), told apart by mount id.
+    /// No name is refused for its bytes, its depth or the number of entries
+    /// — closed-scope cleanup must not block on names a manifest cannot
+    /// describe. Subtrees moved up for depth carry unique names, and any a
+    /// crashed run left at the root are emptied like the rest.
     pub fn remove_tree_contents(root: &File) -> Result<TreeRemoval> {
-        use std::os::unix::fs::MetadataExt;
-        let device = root.metadata()?.dev();
+        let device = MountScope::of(root)?;
         let mut report = TreeRemoval::default();
         let mut deep = 0u64;
         empty_dir(root, root, device, 0, &mut deep, &mut report)?;
@@ -525,7 +624,7 @@ mod unix {
     fn empty_dir(
         root: &File,
         dir: &File,
-        device: u64,
+        device: MountScope,
         depth: usize,
         deep: &mut u64,
         report: &mut TreeRemoval,
@@ -543,7 +642,7 @@ mod unix {
         root: &File,
         dir: &File,
         name: &CStr,
-        device: u64,
+        device: MountScope,
         depth: usize,
         deep: &mut u64,
         report: &mut TreeRemoval,
@@ -559,26 +658,33 @@ mod unix {
             report.removed += 1;
             return Ok(true);
         }
-        if stat.st_dev as u64 != device {
+        if !device.contains(stat.st_dev as u64, dir, name) {
             report.foreign_mounts += 1;
             return Ok(false);
         }
         if depth >= MAX_HELD_DEPTH {
-            *deep += 1;
-            let target = CString::new(format!("{DEEP_PREFIX}{}-{deep}", std::process::id()))
-                .map_err(|_| Error::Conflict("NUL in name".into()))?;
-            let rc = unsafe {
-                libc::renameat(
-                    dir.as_raw_fd(),
-                    name.as_ptr(),
-                    root.as_raw_fd(),
-                    target.as_ptr(),
-                )
-            };
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error().into());
+            let mut attempts = 0;
+            loop {
+                let target = deep_name(deep)?;
+                let rc = unsafe {
+                    libc::renameat(
+                        dir.as_raw_fd(),
+                        name.as_ptr(),
+                        root.as_raw_fd(),
+                        target.as_ptr(),
+                    )
+                };
+                if rc == 0 {
+                    return Ok(true);
+                }
+                let error = std::io::Error::last_os_error();
+                attempts += 1;
+                if attempts >= 8
+                    || !matches!(error.raw_os_error(), Some(libc::EEXIST | libc::ENOTEMPTY))
+                {
+                    return Err(error.into());
+                }
             }
-            return Ok(true);
         }
         let child = match open_dir_at(dir, name) {
             Ok(child) => child,
@@ -591,7 +697,7 @@ mod unix {
             }
             Err(error) => return Err(error.into()),
         };
-        if child.metadata()?.dev() != device {
+        if !device.contains(child.metadata()?.dev(), &child, c"") {
             report.foreign_mounts += 1;
             return Ok(false);
         }
@@ -1331,6 +1437,95 @@ mod remove_tree_tests {
         assert!(manifest(&file, 1_000).is_err());
         let report = remove_tree_contents(&file).unwrap();
         assert_eq!(report.removed, 151);
+        assert!(empty(&dir));
+    }
+
+    /// Finding 8: a directory that is another mount of the same device (a
+    /// bind mount: same st_dev) is neither entered nor emptied; it and its
+    /// ancestors stay. Exercised with a real bind mount where this process
+    /// may mount, and always with an inode presented as another mount.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn a_bind_mount_on_the_same_device_is_never_emptied() {
+        use std::os::unix::fs::MetadataExt;
+        // Presented as another mount.
+        let (_outside, dir, file) = root();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join("sub/bound")).unwrap();
+        std::fs::write(tree.join("sub/bound/keep.mkv"), b"payload").unwrap();
+        std::fs::write(tree.join("sub/other.bin"), b"x").unwrap();
+        let inode = std::fs::metadata(tree.join("sub/bound")).unwrap().ino();
+        super::unix::FAKE_BIND_MOUNTS.with(|fake| fake.borrow_mut().push(inode));
+        let report = remove_tree_contents(&file).unwrap();
+        super::unix::FAKE_BIND_MOUNTS.with(|fake| fake.borrow_mut().clear());
+        assert_eq!(report.foreign_mounts, 1);
+        assert_eq!(
+            std::fs::read(tree.join("sub/bound/keep.mkv")).unwrap(),
+            b"payload"
+        );
+        assert!(!tree.join("sub/other.bin").exists());
+
+        // A real bind mount, where permitted.
+        let (outside, dir, file) = root();
+        let tree = dir.path().join("tree");
+        std::fs::write(outside.path().join("keep.mkv"), b"payload").unwrap();
+        std::fs::create_dir(tree.join("bound")).unwrap();
+        let source = std::ffi::CString::new(outside.path().as_os_str().as_bytes()).unwrap();
+        let target = std::ffi::CString::new(tree.join("bound").as_os_str().as_bytes()).unwrap();
+        // SAFETY: plain mount(2) on NUL-terminated paths.
+        let mounted = unsafe {
+            libc::mount(
+                source.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        } == 0;
+        struct Unmount(std::ffi::CString);
+        impl Drop for Unmount {
+            fn drop(&mut self) {
+                unsafe { libc::umount2(self.0.as_ptr(), libc::MNT_DETACH) };
+            }
+        }
+        if mounted {
+            let _unmount = Unmount(target.clone());
+            assert_eq!(
+                std::fs::metadata(tree.join("bound")).unwrap().dev(),
+                std::fs::metadata(&tree).unwrap().dev(),
+                "same device: only the mount id tells them apart"
+            );
+            let report = remove_tree_contents(&file).unwrap();
+            assert_eq!(report.foreign_mounts, 1);
+            assert_eq!(
+                std::fs::read(outside.path().join("keep.mkv")).unwrap(),
+                b"payload"
+            );
+        }
+    }
+
+    /// Finding 8: a crash mid deep-tree removal leaves a moved subtree at
+    /// the root under the old `<pid>-<n>` naming (pid 1 in a container
+    /// restarts n at 1 too). The next removal neither collides with it nor
+    /// leaves it.
+    #[test]
+    fn a_crashed_deep_removal_is_resumed_without_collisions() {
+        let (_outside, dir, file) = root();
+        let tree = dir.path().join("tree");
+        let leftover = tree.join(format!(".nzbd-remove-deep-{}-1", std::process::id()));
+        let mut path = leftover.clone();
+        for level in 0..60 {
+            path = path.join(format!("l{level}"));
+        }
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("leaf"), b"x").unwrap();
+        let mut path = tree.join("fresh");
+        for level in 0..120 {
+            path = path.join(format!("d{level}"));
+        }
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("leaf"), b"x").unwrap();
+        remove_tree_contents(&file).unwrap();
         assert!(empty(&dir));
     }
 

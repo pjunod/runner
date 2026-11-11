@@ -590,6 +590,15 @@ pub struct RestartWait {
 }
 
 static RESTART_PENDING: std::sync::Mutex<Option<RestartPending>> = std::sync::Mutex::new(None);
+
+/// The repair/extract drain is exactly "a restart is pending". Called with
+/// the `RESTART_PENDING` guard held, so no request, expiry or cancel can
+/// interleave between changing the slot and the flag (a re-request racing
+/// an expiry once left the drain on with nothing pending, and repair and
+/// extraction never started again).
+fn sync_restart_drain(pending: &Option<RestartPending>) {
+    nzbd_engine::set_restart_drain(pending.is_some());
+}
 static RESTART_EXPIRED: std::sync::Mutex<Option<RestartPending>> = std::sync::Mutex::new(None);
 
 /// The backend currently serving (each in-process reload builds a new
@@ -606,9 +615,7 @@ fn register_backend(engine: &EngineHandle, setup: &Arc<SetupHandle>) {
     // reload (or expired); either way its drain ends here, even if the task
     // that polled it did not survive the reload.
     poll_pending_restart(unix_now_secs());
-    if RESTART_PENDING.lock().unwrap().is_none() {
-        nzbd_engine::set_restart_drain(false);
-    }
+    sync_restart_drain(&RESTART_PENDING.lock().unwrap());
 }
 
 /// Post-processing a restart would throw away: a running PAR repair or
@@ -3141,6 +3148,7 @@ fn poll_pending_restart(now: i64) -> RestartStep {
             .as_ref()
             .map(|(engine, _)| restart_blockers(&engine.snapshot()))
     });
+    sync_restart_drain(&pending);
     drop(pending);
     if step == RestartStep::Restart {
         if let Some((_, setup)) = backend {
@@ -3149,9 +3157,6 @@ fn poll_pending_restart(now: i64) -> RestartStep {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             setup.reload.notify_one();
         }
-    }
-    if step != RestartStep::Wait {
-        nzbd_engine::set_restart_drain(false);
     }
     step
 }
@@ -3288,6 +3293,33 @@ mod restart_admission_tests {
             Ok(Some(RestartOutcome::Executed))
         );
     }
+
+    /// Finding 7: the drain is the pending slot. An expiry clears it, a
+    /// re-request after the expiry sets it again (no stale `false` from the
+    /// expired poll can land after it), and DELETE clears it even when
+    /// nothing is pending.
+    #[tokio::test]
+    async fn the_drain_follows_the_pending_slot() {
+        // The only test touching the process-wide slot and drain.
+        let request = |not_after| {
+            let mut pending = RESTART_PENDING.lock().unwrap();
+            *pending = pend("k-drain", Some(not_after));
+            sync_restart_drain(&pending);
+        };
+        request(200);
+        assert!(nzbd_engine::restart_drain());
+        assert_eq!(poll_pending_restart(201), RestartStep::Expired);
+        assert!(!nzbd_engine::restart_drain(), "expired: nothing pending");
+        request(400);
+        assert!(nzbd_engine::restart_drain(), "the re-request drains again");
+        let _ = delete_restart().await;
+        assert!(RESTART_PENDING.lock().unwrap().is_none());
+        assert!(!nzbd_engine::restart_drain());
+        // A drain left on with nothing pending: DELETE still ends it.
+        nzbd_engine::set_restart_drain(true);
+        let _ = delete_restart().await;
+        assert!(!nzbd_engine::restart_drain());
+    }
 }
 
 async fn post_restart(
@@ -3350,9 +3382,9 @@ async fn post_restart(
                 keys: all_keys,
                 generation,
             });
+            sync_restart_drain(&pending);
             spawn
         };
-        nzbd_engine::set_restart_drain(true);
         tracing::info!(waiting = ?waiting, not_after = query.not_after,
             "restart deferred until post-processing reaches a resumable boundary");
         if spawn {
@@ -3368,15 +3400,14 @@ async fn post_restart(
         return Json(json!({ "ok": true, "restarting": "deferred", "waiting_for": waiting }))
             .into_response();
     }
-    let mut all_keys = RESTART_PENDING
-        .lock()
-        .unwrap()
-        .take()
-        .map(|p| p.keys)
-        .unwrap_or_default();
+    let mut all_keys = {
+        let mut pending = RESTART_PENDING.lock().unwrap();
+        let taken = pending.take();
+        sync_restart_drain(&pending);
+        taken.map(|p| p.keys).unwrap_or_default()
+    };
     all_keys.extend(keys);
     set_restart_outcome(&all_keys, RestartOutcome::Executed);
-    nzbd_engine::set_restart_drain(false);
     tracing::info!(
         key,
         not_after = query.not_after,
@@ -3390,11 +3421,16 @@ async fn post_restart(
 
 /// W10: cancel a deferred restart. Repair and extraction resume admission.
 async fn delete_restart() -> Response {
-    let cancelled = RESTART_PENDING.lock().unwrap().take();
+    let cancelled = {
+        let mut pending = RESTART_PENDING.lock().unwrap();
+        let taken = pending.take();
+        // Always: a drain left on with nothing pending ends here too.
+        sync_restart_drain(&pending);
+        taken
+    };
     match cancelled {
         Some(pending) => {
             set_restart_outcome(&pending.keys, RestartOutcome::Cancelled);
-            nzbd_engine::set_restart_drain(false);
             tracing::info!("deferred restart cancelled");
             Json(json!({ "ok": true, "cancelled": true })).into_response()
         }
