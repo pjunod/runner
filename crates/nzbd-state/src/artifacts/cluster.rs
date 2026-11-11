@@ -343,10 +343,12 @@ impl Inventory {
                 error: operation.error,
             });
         }
-        // Contract §2.2: publish/io/identity/hold_expired failures always
-        // keep their bytes, whatever `failure_action` says — every raw copy
-        // of such a job is retained under runner custody for recovery.
+        // Contract §2.2: publish/io/identity/hold_expired failures of a job
+        // curator did not admit keep their bytes. A curator-admitted job
+        // follows `failure_action` once salvage settles (W3, as single-node
+        // disposal does), so its raw copies get no park-always exemption.
         if !copy.selected
+            && !artifact.delivery_lifecycle
             && !artifact.terminal()
             && nzbd_types::FailureReason::ALL
                 .into_iter()

@@ -1316,8 +1316,14 @@ impl Owner {
         // made-up `history_seq`.
         let history = match history {
             Some(history) => history,
+            // Per node (W5b): cluster nodes share `state_dir`, and an
+            // EXCLUSIVE SQLite store has exactly one owner.
             None => Arc::new(nzbd_state::history::HistoryDb::open(
-                &state_dir.join("engine-history.sqlite"),
+                &state_dir.join(if journal_suffix.is_empty() {
+                    "engine-history.sqlite".to_owned()
+                } else {
+                    format!("engine-history.{journal_suffix}.sqlite")
+                }),
                 None,
             )?),
         };

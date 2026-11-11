@@ -2777,7 +2777,8 @@ async fn worker_restart_regrant_preserves_retry_deadline_and_private_generation(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn terminal_unusable_cluster_completion_parks_raw_copies_and_drains_sealed_generations() {
+async fn terminal_unusable_cluster_completion_follows_failure_action_and_drains_sealed_generations()
+{
     terminal_empty_cluster_fixture(false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -2993,10 +2994,12 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
     wait_for("exact terminal source disposition acknowledged",30,||{
         let (code,body)=http(&authority.url,"GET",&format!("/api/v1/deliveries/{id}"),b"");
         if cleanup_started.elapsed().as_secs()>12&&!cleanup_debug.replace(true){eprintln!("private copy disposition code={code} {body}; authority source={:?}; worker source={:?}",authority.runtime.engine.artifacts().for_job(entry.job.0).ok().flatten().map(|a|(a.id,a.generation,a.path,a.state,a.error)),worker.runtime.engine.artifacts().for_job(entry.job.0).ok().flatten().map(|a|(a.id,a.generation,a.path,a.state,a.error)));}
-        // Contract v2 §2.2: an empty/junk-only completion is `failed/publish`,
-        // which always keeps its bytes — the raw copies are retained whether
-        // or not Keep is set (v1 deleted them unless Keep was set).
-        code==200&&serde_json::from_str::<serde_json::Value>(&body).is_ok_and(|row|row["cleanupOnly"]==true&&row["sourceCleanup"]["status"]=="blocked")
+        // Contract v2 §2.2 (0.9.0): an empty/junk-only completion is
+        // `failed/publish`. Kept, its raw copies are retained; a curator-
+        // admitted job without Keep follows `failure_action` (delete) like
+        // single-node disposal, so every copy is removed.
+        let expected = if keep { "blocked" } else { "succeeded" };
+        code==200&&serde_json::from_str::<serde_json::Value>(&body).is_ok_and(|row|row["cleanupOnly"]==true&&row["sourceCleanup"]["status"]==expected)
     }).await;
     let raw = authority
         .runtime
@@ -3005,16 +3008,17 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
         .for_job(entry.job.0)
         .unwrap()
         .unwrap();
-    assert!(
+    assert_eq!(
         raw.path.exists(),
-        "a publish failure's raw custody is retained (park-always): path={} state={} keep={} detail={}",
+        keep,
+        "a kept publish failure's raw custody is retained, an unkept one deleted: path={} state={} keep={} detail={}",
         raw.path.display(),
         raw.state,
         raw.keep_on_failure,
         get_json(&authority.url, &format!("/api/v1/deliveries/{id}"))
     );
     assert_eq!(raw.keep_on_failure, keep);
-    assert_ne!(raw.state, "deleted");
+    assert_eq!(raw.state == "deleted", !keep);
     let remaining = manifest_paths(&tmp.path().join(".nzbd-cluster/generations"));
     let remaining_files = remaining
         .iter()
@@ -3035,12 +3039,18 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
     );
     assert_eq!(admission["outcome"], "failed");
     assert_eq!(admission["terminalOutcome"], entry.status);
-    // Park-always (v2): runner keeps custody of a publish failure's bytes.
     assert_eq!(
         admission["custodyState"],
-        if keep { "kept_by_user" } else { "runner_owned" }
+        if keep {
+            "kept_by_user"
+        } else {
+            "deleted_by_runner"
+        }
     );
-    assert_eq!(admission["sourceCleanupStatus"], "retained");
+    assert_eq!(
+        admission["sourceCleanupStatus"],
+        if keep { "retained" } else { "removed" }
+    );
     assert_eq!(admission["keepSourceOnFailure"], keep);
     assert!(admission["publicationPath"].is_null());
     let discovery = get_json(
