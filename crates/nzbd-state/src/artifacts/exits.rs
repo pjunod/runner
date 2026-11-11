@@ -200,7 +200,7 @@ pub const HOLD_EXITS: &[HoldExit] = &[
     h("review: unselected source files remain after receipt cleanup", HoldAction::Release, Exit::Timer("released; the source follows its TTL")),
     h("review: relocation staging", PARK_TTL, Exit::Event("its relocate operation ends; left over after that, parked with the failed TTL")),
     h("review: abandoned relocation staging", DISPOSE_COPY, Exit::Timer("copy disposed; abandon verified the original source")),
-    h("review: interrupted move", HoldAction::AbandonMove, Exit::Timer("move abandoned (unwind, or close without deleting); the job fails io and parks the source")),
+    h("review: interrupted move", HoldAction::AbandonMove, Exit::Timer("move abandoned (unwind; else Runner-placed duplicates removed and an only-copy residue parked with the failed TTL); the job fails io and parks the source")),
     h("review: workspace cleanup", HoldAction::RetryDelete, Exit::Timer("scratch re-snapshotted (closed scope) and its retirement retried")),
     h("review: subprocess quiescence unconfirmed", HoldAction::Release, Exit::Timer("released at the next open (no subprocess outlives the process) or after HOLD_EXIT_SECONDS")),
     h("review: interrupted transform", HoldAction::Release, Exit::Timer("released; post-processing re-runs the transform (W9)")),

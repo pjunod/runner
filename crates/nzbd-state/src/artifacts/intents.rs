@@ -245,6 +245,15 @@ fn file_name(path: &str) -> Result<&std::ffi::OsStr> {
 }
 
 /// Same object, same size, same modification time: what survives a rename.
+/// Whether `landed` is the file this journal entry placed: its recorded
+/// publication identity, or (a rename) the journaled source object itself.
+fn runner_placed(file: &IntentFile, landed: &Identity) -> bool {
+    file.dst_identity
+        .as_ref()
+        .is_some_and(|placed| placed.same_publication(landed))
+        || moved_identity_matches(&file.identity, landed)
+}
+
 fn moved_identity_matches(recorded: &Identity, observed: &Identity) -> bool {
     recorded.same_publication(observed)
 }
@@ -1241,9 +1250,15 @@ impl Inventory {
             Ok(()) => Ok(()),
             Err(Error::Conflict(why)) => {
                 let source_root = fs::open_dir(&intent.source_dir)?;
-                if intent.target_dir.symlink_metadata().is_ok() {
+                // Finding 11: what Runner placed (proven by the journal's
+                // identities) and the source still holds is removed; what is
+                // the only copy is owned and parked with the failed TTL, so
+                // it exits on retention instead of staying unowned forever;
+                // anything not proven Runner's stays unowned.
+                if self.clear_intent_residue(&intent, &source_root)? {
                     if let Some(parent) = intent.target_dir.parent() {
-                        self.discover_unlocked(parent, &intent.target_dir)?;
+                        let found = self.discover_unlocked(parent, &intent.target_dir)?;
+                        self.own_proven_residue(&intent, found)?;
                     }
                 }
                 intent.evidence = Some(format!(
@@ -1255,6 +1270,131 @@ impl Inventory {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// After a refused unwind: remove each target file Runner placed (its
+    /// identity is the journal's) whose content the source still holds (the
+    /// source name is the same object, or a cross-volume copy's original is
+    /// intact), then empty directories bottom-up and the target directory if
+    /// empty. Never removes an only copy. True when the target still exists.
+    fn clear_intent_residue(&self, intent: &RelocationIntent, source_root: &File) -> Result<bool> {
+        let target_root = match fs::open_dir(&intent.target_dir) {
+            Ok(root) => root,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false)
+            }
+            Err(error) => return Err(error),
+        };
+        for file in &intent.files {
+            let Some(landed) = open_optional(&target_root, &file.dst)? else {
+                continue;
+            };
+            let landed = fs::identity_for_file(&landed)?;
+            if !runner_placed(file, &landed) {
+                continue;
+            }
+            let duplicate = match open_optional(source_root, &file.src)? {
+                Some(source) => {
+                    let source = fs::identity_for_file(&source)?;
+                    if intent.cross_volume {
+                        source == file.identity
+                    } else {
+                        source.same_object(&landed)
+                    }
+                }
+                None => false,
+            };
+            if duplicate {
+                let parent = relative_dir(&target_root, parent_of(&file.dst))?;
+                fs::unlink(&parent, Path::new(file_name(&file.dst)?), false)?;
+            }
+        }
+        if fs::open_at(&target_root, Path::new(RUNNER_MANIFEST_PART), false).is_ok() {
+            fs::unlink(&target_root, Path::new(RUNNER_MANIFEST_PART), false)?;
+        }
+        let mut left = fs::manifest(&target_root, 100_000)?;
+        if left.iter().any(|entry| !entry.identity.directory) {
+            return Ok(true);
+        }
+        left.sort_by_key(|entry| std::cmp::Reverse(entry.path.matches('/').count()));
+        for entry in &left {
+            let path = Path::new(&entry.path);
+            let parent = relative_dir(
+                &target_root,
+                path.parent().filter(|p| !p.as_os_str().is_empty()),
+            )?;
+            fs::unlink(
+                &parent,
+                Path::new(path.file_name().unwrap_or_default()),
+                true,
+            )?;
+        }
+        drop(target_root);
+        if let Some(parent) = intent.target_dir.parent() {
+            let parent_root = fs::open_dir(parent)?;
+            let name = intent
+                .target_dir
+                .file_name()
+                .ok_or_else(|| Error::Conflict("publication directory has no name".into()))?;
+            fs::unlink(&parent_root, Path::new(name), true)?;
+        }
+        Ok(false)
+    }
+
+    /// The residue of a refused unwind, when every file in it is one Runner
+    /// placed (journal identity): Runner's own payload, its only copy — owned
+    /// and parked with the failed TTL (Keep-on-failure of the job still
+    /// retains it). Otherwise the discovered record stays unowned.
+    fn own_proven_residue(&self, intent: &RelocationIntent, found: Artifact) -> Result<()> {
+        if found.owned || found.state != "unknown" {
+            return Ok(());
+        }
+        let dir = fs::open_dir(&intent.target_dir)?;
+        let files = fs::manifest(&dir, 100_000)?;
+        let proven = files
+            .iter()
+            .filter(|entry| !entry.identity.directory)
+            .all(|entry| {
+                intent
+                    .files
+                    .iter()
+                    .any(|file| file.dst == entry.path && runner_placed(file, &entry.identity))
+            });
+        if !proven {
+            return Ok(());
+        }
+        let ttl = i64::from(self.settings()?.failed_retention_days) * 86400;
+        let keep_on_failure = self
+            .get(&intent.artifact)
+            .map(|source| source.keep_on_failure)
+            .unwrap_or(false);
+        let _guard = self.mutation_guard()?;
+        let mut a = self.get(&found.id)?;
+        if a.revision != found.revision {
+            return Ok(());
+        }
+        a.owned = true;
+        a.files = files;
+        a.hold = None;
+        a.keep = false;
+        a.keep_on_failure = keep_on_failure;
+        a.state = "parked_failed".into();
+        a.automatic_cleanup_eligible = true;
+        a.retention_seconds = ttl.max(1) as u64;
+        a.deadline = Some(now().saturating_add(ttl.max(0)));
+        a.revision += 1;
+        a.updated_at = now();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        save_artifact(&tx, &a)?;
+        event(
+            &tx,
+            &a.id,
+            "publication_residue",
+            "files Runner placed and could not put back; parked with the failed TTL",
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Close an intent nothing in the inventory owns any more: no file is
@@ -2539,15 +2679,21 @@ mod tests {
         assert_eq!(
             std::fs::read(target.join("a.mkv")).unwrap(),
             b"repair input",
-            "nothing is deleted"
+            "the only copy is never deleted"
         );
-        assert!(
-            db.list(0, 1000)
-                .unwrap()
-                .iter()
-                .any(|item| item.path == target),
-            "the publication directory is registered for review"
-        );
+        // Finding 11: every file left is one Runner placed (journal
+        // identity), so the residue is Runner's own: owned and parked with
+        // the failed TTL, not unowned content forever.
+        let residue = db
+            .list(0, 1000)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.path == target)
+            .expect("the publication directory is registered");
+        let residue = db.get(&residue.id).unwrap();
+        assert!(residue.owned, "{residue:?}");
+        assert_eq!(residue.state, "parked_failed");
+        assert!(residue.hold.is_none() && !residue.keep && residue.deadline.is_some());
         assert_eq!(db.operation(&op.id).unwrap().state, "cancelled");
         assert!(!db.open_intent_for_job(78).unwrap());
     }
