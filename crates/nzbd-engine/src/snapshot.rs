@@ -349,6 +349,9 @@ pub struct QueueSnapshot {
     pub session_downloaded_bytes: u64,
     /// Bytes still to fetch across active jobs (non-paused files).
     pub remaining_bytes: u64,
+    /// Restart phase timings since process start (no-wedge item 7).
+    #[serde(default)]
+    pub startup: crate::startup_phases::StartupPhases,
     pub jobs: Vec<JobSummary>,
 }
 

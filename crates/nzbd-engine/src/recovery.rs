@@ -10,6 +10,58 @@ use std::{
 
 pub(crate) const WRITER_PROTOCOL: u32 = 1;
 
+/// Test-only counting probe: payload file opens and bytes read by the
+/// verification, resolution and writer paths, scoped to a watched
+/// directory so parallel tests never see each other's I/O.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default, Debug)]
+    pub(crate) struct Counts {
+        pub opens: AtomicU64,
+        pub bytes: AtomicU64,
+    }
+    impl Counts {
+        pub fn opens(&self) -> u64 {
+            self.opens.load(Ordering::SeqCst)
+        }
+        pub fn bytes(&self) -> u64 {
+            self.bytes.load(Ordering::SeqCst)
+        }
+    }
+    type Watches = Mutex<Vec<(PathBuf, Arc<Counts>)>>;
+    static WATCHES: Watches = Mutex::new(Vec::new());
+
+    pub(crate) fn watch(dir: &Path) -> Arc<Counts> {
+        let counts = Arc::new(Counts::default());
+        WATCHES
+            .lock()
+            .unwrap()
+            .push((dir.to_path_buf(), counts.clone()));
+        counts
+    }
+    fn each(path: &Path, f: impl Fn(&Counts)) {
+        for (dir, counts) in WATCHES.lock().unwrap().iter() {
+            if path.starts_with(dir) {
+                f(counts);
+            }
+        }
+    }
+    pub(crate) fn opened(path: &Path) {
+        each(path, |counts| {
+            counts.opens.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+    pub(crate) fn read(path: &Path, bytes: u64) {
+        each(path, |counts| {
+            counts.bytes.fetch_add(bytes, Ordering::SeqCst);
+        });
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub(crate) struct ProvenRange {
     pub seg_number: u32,
@@ -137,6 +189,8 @@ pub(crate) fn validate_range(
     crc: u32,
     expected: Option<&Identity>,
 ) -> ValidationOutcome {
+    #[cfg(test)]
+    probe::opened(path);
     let mut file = match nzbd_state::fileops::open(path) {
         Ok(file) => file,
         Err(error) => return open_outcome(error),
@@ -166,6 +220,8 @@ pub(crate) fn validate_range(
             return ValidationOutcome::Unavailable(error.to_string());
         }
         digest.update(&data[..amount]);
+        #[cfg(test)]
+        probe::read(path, amount as u64);
         remaining -= amount as u64;
     }
     let after = match capture_identity(&file) {
@@ -233,6 +289,8 @@ pub(crate) fn resolve_payload(
             }
             Ok(_) => {}
         }
+        #[cfg(test)]
+        probe::opened(&path);
         let opened =
             nzbd_state::fileops::open(&path).map_err(|error| ResolveError::unavailable(&error))?;
         let identity = nzbd_state::fileops::identity(&opened)

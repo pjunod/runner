@@ -37,6 +37,7 @@ mod owner;
 mod pool;
 mod recovery;
 mod space_probe;
+pub mod startup_phases;
 mod url_dispatch;
 mod writer;
 
@@ -549,6 +550,8 @@ impl Engine {
     /// Recover state, spawn the owner task and one connection task per
     /// configured connection, and return the handle.
     pub async fn spawn(cfg: EngineConfig) -> Result<EngineHandle, EngineError> {
+        // The boot clock starts at the latest here (`nzbd run` starts it first).
+        let _ = startup_phases::boot_instant();
         let shared = new_shared_snapshot();
         let (events, _) = broadcast::channel(512);
         let (epoch_tx, epoch_rx) = watch::channel(0u64);

@@ -292,6 +292,8 @@ async fn ensure_open(
         if expected.is_none() {
             tokio::fs::create_dir_all(dir).await?;
         }
+        #[cfg(test)]
+        recovery::probe::opened(part);
         let descriptor =
             nzbd_state::fileops::writer(part, expected.is_none()).map_err(std::io::Error::other)?;
         let identity = recovery::capture_identity(&descriptor).map_err(std::io::Error::other)?;
@@ -426,34 +428,50 @@ async fn writer_task(
     // filesystems the kernel keeps no counters for. Taken from the open
     // file on the first write (the directory may not exist yet here).
     let mut device: Option<u64> = None;
+    // No-wedge item 4: the lazy identity check of a restart happens here,
+    // at the first open of the one file being written. Whatever it finds
+    // holds only this job, with its evidence retained: a failed stat (EIO,
+    // ENOTCONN, ...) is never proof that bytes are gone, and a replaced
+    // inode is a hold an operator (or the hold ladder) resolves, never a
+    // terminal failure or a demotion of `Done` ranges.
     let resolved = match recovery::resolve_payload(&dir, file_id, &final_name) {
         Ok(payload) => payload,
         Err(error) => {
-            match error {
-                recovery::ResolveError::Unavailable { message, cause } => {
-                    report
-                        .send(WriterFact::Error {
-                            error: format!("write admission / payload resolution: {message}"),
-                            cause,
-                        })
-                        .await;
-                }
-                recovery::ResolveError::IdentityConflict => {
-                    report
-                        .error("write admission / payload resolution: identity conflict")
-                        .await;
-                }
-            }
+            let (message, cause) = match error {
+                recovery::ResolveError::Unavailable { message, cause } => (message, cause),
+                recovery::ResolveError::IdentityConflict => (
+                    "conflicting payload aliases; evidence retained".into(),
+                    None,
+                ),
+            };
+            report
+                .send(WriterFact::Error {
+                    error: format!("write admission / payload resolution: {message}"),
+                    cause: Some(cause.unwrap_or(nzbd_types::HoldCause::StorageUnavailable)),
+                })
+                .await;
             return;
         }
     };
     if let Some(payload) = &resolved {
+        // The same object, not the same size/mtime: a write the previous run
+        // made but never acknowledged (a kill between write and sync, or
+        // between sync and the owner's journal) legitimately grows or touches
+        // the file. Its ranges are still Pending and are simply rewritten;
+        // every acknowledged range was fsynced before it was recorded.
         if scope
             .expected_identity
             .as_ref()
-            .is_some_and(|saved| *saved != payload.identity)
+            .is_some_and(|saved| !saved.same_object(&payload.identity))
         {
-            report.error("writer identity conflict at admission").await;
+            report
+                .send(WriterFact::Error {
+                    error: "write admission: payload file identity changed (replaced inode); \
+                            evidence retained"
+                        .into(),
+                    cause: Some(nzbd_types::HoldCause::StorageUnavailable),
+                })
+                .await;
             return;
         }
         if !payload.published && payload.path != part_path {
@@ -477,6 +495,8 @@ async fn writer_task(
     let mut expected = scope.expected_identity;
     if expected.is_some() {
         if let Some(payload) = &resolved {
+            #[cfg(test)]
+            recovery::probe::opened(&payload.path);
             let opened = match nzbd_state::fileops::open(&payload.path) {
                 Ok(opened) => opened,
                 Err(error) => {

@@ -132,12 +132,23 @@ fn copy_commit_error(error: &nzbd_state::StateError) -> nzbd_state::StateError {
     }
 }
 
+/// Test hook: the persistence lane dies after appending a record of this job
+/// and before the journal sync (scoped by job id; tests use unique ids).
+#[cfg(test)]
+pub(super) static JOURNAL_KILL_AFTER_APPEND: std::sync::Mutex<Option<JobId>> =
+    std::sync::Mutex::new(None);
+
 fn commit_append_batch(
     journal: &mut impl JournalCommit,
     batch: Vec<JournalAppend>,
 ) -> Vec<(u64, Result<(), nzbd_state::StateError>)> {
     let mut results = Vec::with_capacity(batch.len());
     let mut append_error = None;
+    #[cfg(test)]
+    let batch_jobs = batch
+        .iter()
+        .map(|append| append.record.job)
+        .collect::<Vec<_>>();
     for append in batch {
         // A failed append may leave a torn tail. Do not append more records
         // behind it and then incorrectly acknowledge them as replayable.
@@ -151,6 +162,17 @@ fn commit_append_batch(
             }
         }
         results.push((append.revision, result));
+    }
+    #[cfg(test)]
+    let armed = *JOURNAL_KILL_AFTER_APPEND
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    #[cfg(test)]
+    if let Some(job) = armed {
+        if results.iter().any(|(_, result)| result.is_ok()) && batch_jobs.contains(&job) {
+            // A process killed between the append and its sync.
+            panic!("simulated kill -9 after journal append, before sync");
+        }
     }
     // No continuation can observe success before the shared durability point.
     if results.iter().any(|(_, result)| result.is_ok()) {

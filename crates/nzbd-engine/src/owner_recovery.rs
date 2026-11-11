@@ -606,6 +606,7 @@ impl Owner {
             state.phase = "checking".into();
             state.reason = None;
             let cancellation = state.cancel.clone();
+            let stamp_legacy = self.boot_jobs.contains(&job);
             let inventory = self.artifacts.clone();
             let root = allocation.root.clone();
             self.verification_roots.insert(root.clone());
@@ -624,6 +625,7 @@ impl Owner {
                             generation,
                             partial,
                             true,
+                            stamp_legacy,
                         )
                     }))
                     .unwrap_or_else(|_| {
@@ -1116,9 +1118,13 @@ fn verify_job(
     cancel: &CancellationToken,
     ticket: u64,
 ) -> Result<VerifiedJob, VerificationFailure> {
-    verify_job_batch(job, allocation, inventory, cancel, ticket, None, false)
+    verify_job_batch(
+        job, allocation, inventory, cancel, ticket, None, false, false,
+    )
 }
 
+// One verification pass's inputs; each is a distinct fence or policy.
+#[allow(clippy::too_many_arguments)]
 fn verify_job_batch(
     job: &Job,
     allocation: Artifact,
@@ -1127,6 +1133,7 @@ fn verify_job_batch(
     ticket: u64,
     partial: Option<VerifiedJob>,
     bounded: bool,
+    stamp_legacy: bool,
 ) -> Result<VerifiedJob, VerificationFailure> {
     let mut checked = partial.as_ref().map_or(0, |partial| partial.checked_bytes);
     let batch_started = std::time::Instant::now();
@@ -1252,8 +1259,15 @@ fn verify_job_batch(
         let file_generation = parameter(job, &format!("*File:generation:{}", file.id.0))
             .map(str::to_owned)
             .unwrap_or_else(|| format!("verification-{ticket}-{}", file.id.0));
-        let proof = parameter(job, &format!("*File:proof:{}", file.id.0))
-            .and_then(|raw| serde_json::from_str::<DurableFileProof>(raw).ok());
+        let proof_param = parameter(job, &format!("*File:proof:{}", file.id.0));
+        // No-wedge item 5 (Paul, 2026-11-11; overrides
+        // STARTUP_VERIFICATION_PLAN §3.1/§3.4/§4): a legacy `Done` range —
+        // no writer proof of any kind, on a job this installation's own
+        // snapshot carried at boot — is stamped at first open from the
+        // file's stat, without reading it. PAR verification in
+        // post-processing is the backstop for its bytes.
+        let stamp = stamp_legacy && proof_param.is_none();
+        let proof = proof_param.and_then(|raw| serde_json::from_str::<DurableFileProof>(raw).ok());
         let publication = parameter(job, &format!("*File:publication:{}", file.id.0))
             .or_else(|| {
                 proof
@@ -1378,7 +1392,24 @@ fn verify_job_batch(
                 batch_ranges += 1;
                 continue;
             }
+            if stamp {
+                // A successful stat is the only evidence taken: a range past
+                // the end of the file is absent, every other one is stamped.
+                if range
+                    .end()
+                    .is_some_and(|end| end <= resolved.identity.bytes)
+                {
+                    valid.push(range.clone());
+                } else {
+                    verified.invalid.push((file.id, range.seg_number));
+                }
+                accepted.insert(range.seg_number);
+                batch_ranges += 1;
+                continue;
+            }
             if descriptor.is_none() {
+                #[cfg(test)]
+                recovery::probe::opened(&resolved.path);
                 descriptor = Some(
                     nzbd_state::fileops::open(&resolved.path)
                         .map_err(|error| VerificationFailure::unavailable(error, checked))?,
@@ -1407,6 +1438,8 @@ fn verify_job_batch(
                 cursor,
                 budget,
             );
+            #[cfg(test)]
+            recovery::probe::read(&resolved.path, bytes);
             checked = checked.saturating_add(bytes);
             batch_bytes = batch_bytes.saturating_add(bytes);
             if !complete {
@@ -1473,6 +1506,8 @@ fn verify_job_batch(
         let final_path = verified.allocation.path.join(publication);
         let published = match std::fs::symlink_metadata(&final_path) {
             Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                #[cfg(test)]
+                recovery::probe::opened(&final_path);
                 let target = nzbd_state::fileops::open(&final_path)
                     .map_err(|error| VerificationFailure::unavailable(error, checked))?;
                 let target_identity = recovery::capture_identity(&target)
@@ -1600,6 +1635,158 @@ fn legacy_rar_order_hold(control: &nzbd_types::JobControl) -> bool {
         && control.stage == "rar_rename"
         && control.message
             == "subprocess failed: RAR set lacks checked order/membership evidence; filenames preserved"
+}
+
+/// What a file's recorded `Done` ranges rest on, decided from metadata
+/// alone (no payload is opened).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FileEvidence {
+    /// No `Done` range, or a writer proof of this allocation generation
+    /// covers every one: the writer acknowledged each range only after its
+    /// write, `sync_data` and `fstat` succeeded.
+    Covered,
+    /// `Done` ranges with no proof of any kind (a pre-proof build).
+    Legacy,
+    /// A proof exists but does not bind or cover the recorded ranges.
+    Unproven,
+}
+
+pub(super) fn file_evidence(
+    job: &Job,
+    file: &nzbd_types::FileEntry,
+    allocation_generation: &str,
+    installation: &str,
+) -> FileEvidence {
+    let done = ranges(file);
+    if done.is_empty() {
+        return FileEvidence::Covered;
+    }
+    // A job admitted to post-processing keeps its download proof as the
+    // publication proof; it is the same writer evidence.
+    let raw = parameter(job, &format!("*File:proof:{}", file.id.0))
+        .or_else(|| parameter(job, &format!("*File:publication-proof:{}", file.id.0)));
+    let Some(raw) = raw else {
+        return FileEvidence::Legacy;
+    };
+    let Ok(proof) = serde_json::from_str::<DurableFileProof>(raw) else {
+        return FileEvidence::Unproven;
+    };
+    let generation = parameter(job, &format!("*File:generation:{}", file.id.0)).unwrap_or("");
+    if proof.covers(
+        generation,
+        allocation_generation,
+        installation,
+        &proof.identity,
+        &done,
+    ) {
+        FileEvidence::Covered
+    } else {
+        FileEvidence::Unproven
+    }
+}
+
+impl Owner {
+    /// Whether every recorded range of the job rests on evidence that needs
+    /// no verification pass before its writer or post-processing admission.
+    /// A legacy range of a boot job counts: it is stamped at first open.
+    pub(super) fn payload_evidence_sufficient(&self, job: &Job) -> bool {
+        if !job.files.iter().any(|file| file.has_any_done()) {
+            return true;
+        }
+        let Some(allocation) = self.allocation_cache.get(&job.id) else {
+            return false;
+        };
+        job.files.iter().all(|file| {
+            match file_evidence(
+                job,
+                file,
+                &allocation.generation,
+                &self.artifacts.installation,
+            ) {
+                FileEvidence::Covered => true,
+                FileEvidence::Legacy | FileEvidence::Unproven => false,
+            }
+        })
+    }
+
+    /// Startup classification (no-wedge item 3): only a job that genuinely
+    /// needs a check before it can move gets a verification ticket. Proven
+    /// jobs, paused jobs and legacy boot jobs get none; their check, if any,
+    /// happens lazily at writer spawn or post-processing admission.
+    pub(super) fn startup_ticket_needed(&self, job: &Job) -> bool {
+        if self.startup_intent_jobs.contains(&job.id)
+            || job
+                .params
+                .iter()
+                .any(|(key, _)| key == "*Recovery:publication-repair")
+        {
+            return true;
+        }
+        // Pre-v2 holds that only a verification pass releases.
+        if job.held()
+            && job.control().is_some_and(|control| {
+                legacy_coverage_hold(&control) || legacy_rar_order_hold(&control)
+            })
+        {
+            return true;
+        }
+        if job.status == JobStatus::Paused {
+            return false;
+        }
+        let Some(allocation) = self.allocation_cache.get(&job.id) else {
+            // Completion evidence without an allocation needs recovery
+            // before any writer may resolve a path for it.
+            return job.files.iter().any(|file| file.has_any_done());
+        };
+        let boot = self.boot_jobs.contains(&job.id);
+        job.files.iter().any(|file| {
+            match file_evidence(
+                job,
+                file,
+                &allocation.generation,
+                &self.artifacts.installation,
+            ) {
+                FileEvidence::Covered => false,
+                FileEvidence::Legacy => !boot,
+                FileEvidence::Unproven => true,
+            }
+        })
+    }
+
+    /// Release a startup "loading" ticket the classification found
+    /// unnecessary, and do what verification's acceptance would have done.
+    pub(super) fn release_startup_ticket(&mut self, job: JobId) {
+        if self
+            .verification
+            .get(&job)
+            .is_none_or(|state| state.running || state.phase != "loading")
+        {
+            return;
+        }
+        self.verification.remove(&job);
+        if let Some(current) = self.state.job_mut(job) {
+            set_owner_param(&mut current.params, PENDING, None);
+            set_owner_param(&mut current.params, REASON, None);
+        }
+        self.dirty = true;
+        if self.state.job(job).is_some_and(|job| {
+            !job.held() && matches!(job.status, JobStatus::Queued | JobStatus::Downloading)
+        }) {
+            let finalize = self
+                .state
+                .job(job)
+                .unwrap()
+                .files
+                .iter()
+                .filter(|file| file.is_terminal() && file.has_any_done() && !file.finalized)
+                .map(|file| file.id)
+                .collect::<Vec<_>>();
+            for file in finalize {
+                self.send_finalize(job, file);
+            }
+            self.check_job_complete(job);
+        }
+    }
 }
 
 fn accepted_hold_rewrite(job: &mut Job, post_retry_validated: bool, needs_download: bool) {
@@ -1752,6 +1939,7 @@ mod tests {
             11,
             None,
             true,
+            false,
         )
         .unwrap();
         assert!(!first.complete);
@@ -1770,6 +1958,7 @@ mod tests {
                 11,
                 Some(result),
                 true,
+                false,
             )
             .unwrap();
         }
@@ -1804,13 +1993,23 @@ mod tests {
             11,
             None,
             true,
+            false,
         )
         .unwrap();
         assert!(!first.complete);
         assert_eq!(first.checked_bytes, BATCH_BYTES);
         assert_eq!(first.partial_range.as_ref().unwrap().read, BATCH_BYTES);
-        let second =
-            verify_job_batch(&job, allocation, &inventory, &cancel, 11, Some(first), true).unwrap();
+        let second = verify_job_batch(
+            &job,
+            allocation,
+            &inventory,
+            &cancel,
+            11,
+            Some(first),
+            true,
+            false,
+        )
+        .unwrap();
         assert!(second.complete);
         assert_eq!(second.checked_bytes, bytes.len() as u64);
         assert!(second.invalid.is_empty());
@@ -1839,13 +2038,22 @@ mod tests {
             11,
             None,
             true,
+            false,
         )
         .unwrap();
         std::fs::rename(&path, path.with_extension("old")).unwrap();
         std::fs::write(&path, &bytes).unwrap();
-        let failure =
-            verify_job_batch(&job, allocation, &inventory, &cancel, 11, Some(first), true)
-                .unwrap_err();
+        let failure = verify_job_batch(
+            &job,
+            allocation,
+            &inventory,
+            &cancel,
+            11,
+            Some(first),
+            true,
+            false,
+        )
+        .unwrap_err();
         assert!(failure.review_required);
         assert!(failure.reason.contains("identity"));
     }

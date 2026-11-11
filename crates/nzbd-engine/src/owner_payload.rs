@@ -59,6 +59,70 @@ impl Owner {
         self.start_payload_work();
     }
 
+    /// Run one blocking job on its own thread, outside the bounded payload
+    /// lane, and continue on the owner. Startup root reconciliation uses it
+    /// so a slow root never delays lease-time work on the same root. The
+    /// tracker owns the join, so shutdown still waits for the syscall.
+    pub(super) fn background_then<T: Send + 'static>(
+        &mut self,
+        name: String,
+        action: impl FnOnce() -> Result<T, nzbd_state::StateError> + Send + 'static,
+        continuation: impl FnOnce(&mut Owner, Result<T, nzbd_state::StateError>) + Send + 'static,
+    ) {
+        let revision = fresh_epoch();
+        self.io_callbacks.insert(
+            revision,
+            Box::new(move |owner, result| {
+                let result = result.and_then(|value| {
+                    value.downcast::<T>().map(|value| *value).map_err(|_| {
+                        nzbd_state::StateError::Corrupt("background response type mismatch".into())
+                    })
+                });
+                continuation(owner, result);
+            }),
+        );
+        let (reply, result) = oneshot::channel();
+        let worker = std::thread::Builder::new().name(name).spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                action().map(|value| Box::new(value) as Box<dyn std::any::Any + Send>)
+            }))
+            .unwrap_or_else(|_| {
+                Err(nzbd_state::StateError::Corrupt(
+                    "background worker panicked".into(),
+                ))
+            });
+            let _ = reply.send(result);
+        });
+        match worker {
+            Ok(worker) => {
+                let engine = self.engine_tx.clone();
+                self.tracker.spawn(async move {
+                    let result = result.await.unwrap_or_else(|_| {
+                        Err(nzbd_state::StateError::Corrupt(
+                            "background worker returned no result".into(),
+                        ))
+                    });
+                    let result = if worker.join().is_err() {
+                        Err(nzbd_state::StateError::Corrupt(
+                            "background worker failed while stopping".into(),
+                        ))
+                    } else {
+                        result
+                    };
+                    let _ = engine
+                        .send(EngineMsg::BackgroundFinished { revision, result })
+                        .await;
+                });
+            }
+            Err(error) => self.io_finished(
+                revision,
+                Err(nzbd_state::StateError::Corrupt(format!(
+                    "start background worker: {error}"
+                ))),
+            ),
+        }
+    }
+
     pub(super) fn start_payload_work(&mut self) {
         if self.cancel.is_cancelled() {
             return;

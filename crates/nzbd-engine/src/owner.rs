@@ -812,6 +812,11 @@ pub(crate) enum EngineMsg {
         revision: u64,
         result: IoResult,
     },
+    /// A background (off-lane) blocking job finished; see `background_then`.
+    BackgroundFinished {
+        revision: u64,
+        result: IoResult,
+    },
     WritersStopped {
         job: JobId,
         generation: u64,
@@ -955,6 +960,17 @@ pub(crate) struct Owner {
     startup_roots_loading: bool,
     startup_roots_ready: bool,
     startup_roots_retry_at: Instant,
+    /// Jobs this installation's own snapshot carried at boot. A legacy
+    /// `Done` range of one of these (no writer proof at all) is stamped at
+    /// first open without being read; imported and adopted rows are not.
+    boot_jobs: HashSet<JobId>,
+    /// Jobs with an open lifecycle intent (relocation, transform custody,
+    /// a non-active allocation). Only these wait for their root's startup
+    /// reconciliation; live active allocations lease immediately.
+    startup_intent_jobs: HashSet<JobId>,
+    startup_phases: crate::startup_phases::StartupPhases,
+    /// While set, `publish_now` is deferred to the end of a batch.
+    publish_batched: bool,
     verification: HashMap<JobId, VerificationState>,
     verification_roots: HashSet<PathBuf>,
     allocation_cache: HashMap<JobId, nzbd_state::artifacts::Artifact>,
@@ -966,6 +982,9 @@ pub(crate) struct Owner {
     pending_writer_birth: HashMap<FileId, u64>,
     #[cfg(test)]
     work_selection_attempts: usize,
+    /// Test hook handed to every writer this owner spawns.
+    #[cfg(test)]
+    writer_sync_hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
     allocating_jobs: HashSet<JobId>,
     pending_journal_loads: HashMap<JobId, (u64, usize)>,
     pending_control_commits: HashSet<JobId>,
@@ -1481,6 +1500,12 @@ impl Owner {
                 .reserved_file_id()
                 .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?,
         );
+        let boot_jobs = state
+            .jobs
+            .iter()
+            .filter(|job| job.torrent.is_none())
+            .map(|job| job.id)
+            .collect::<HashSet<_>>();
         let initial_disk_hold = tuning.min_free_disk_bytes > 0;
         let initial_quota_hold = tuning.daily_quota_bytes > 0 || tuning.monthly_quota_bytes > 0;
         let mut owner = Owner {
@@ -1507,6 +1532,10 @@ impl Owner {
             startup_roots_loading: false,
             startup_roots_ready: false,
             startup_roots_retry_at: Instant::now(),
+            boot_jobs,
+            startup_intent_jobs: HashSet::new(),
+            startup_phases: crate::startup_phases::StartupPhases::default(),
+            publish_batched: false,
             verification: HashMap::new(),
             verification_roots: HashSet::new(),
             allocation_cache,
@@ -1518,6 +1547,8 @@ impl Owner {
             pending_writer_birth: HashMap::new(),
             #[cfg(test)]
             work_selection_attempts: 0,
+            #[cfg(test)]
+            writer_sync_hook: None,
             allocating_jobs: HashSet::new(),
             pending_journal_loads: HashMap::new(),
             pending_control_commits: HashSet::new(),
@@ -1633,6 +1664,7 @@ impl Owner {
             rotate: 0,
             guard_tick: 0,
         };
+        owner.startup_phases.owner_ready_ms = Some(crate::startup_phases::since_boot_ms());
         owner.schedule_startup_reconciliation();
         Ok(owner)
     }
@@ -1874,6 +1906,12 @@ impl Owner {
                 revision,
                 result,
             } => self.payload_finished(root, revision, result),
+            EngineMsg::BackgroundFinished { revision, result } => {
+                self.io_finished(revision, result);
+                self.retry_payload_recoveries();
+                self.start_verifications();
+                self.bump_epoch();
+            }
             EngineMsg::ScopedNameInspected {
                 job,
                 generation,
@@ -2608,6 +2646,25 @@ impl Owner {
                 if !allowed {
                     let _ = reply.send(None);
                     return;
+                }
+                // No-wedge item 4: a job startup released untouched is checked
+                // here, from metadata, before post-processing reads it. A range
+                // no writer proof covers gets this job's ticket (a legacy one
+                // is stamped without a read); PAR verification is the backstop.
+                // A job admitted before (its download retired into PP custody)
+                // was checked then; transforms own its shape since.
+                if self.state.job(job).is_some_and(|record| {
+                    !record
+                        .params
+                        .iter()
+                        .any(|(key, _)| key == "*Recovery:download-retired")
+                        && !self.payload_evidence_sufficient(record)
+                }) {
+                    self.queue_verification(job);
+                    if self.verification.contains_key(&job) {
+                        let _ = reply.send(None);
+                        return;
+                    }
                 }
                 if self.state.job(job).is_some_and(|job| {
                     job.files.iter().any(|file| {
@@ -6163,6 +6220,7 @@ impl Owner {
                 }
                 if self.retiring_writers.contains_key(&r.job)
                     || self.allocating_jobs.contains(&r.job)
+                    || self.verification.contains_key(&r.job)
                 {
                     // Writer retirement owns its own completion/wake-up. It is
                     // transient, not an allocation needing operator review.
@@ -6219,6 +6277,11 @@ impl Owner {
                 writer,
                 generation,
             });
+        }
+        if !leases.is_empty() && self.startup_phases.first_lease_ms.is_none() {
+            let ms = crate::startup_phases::since_boot_ms();
+            self.startup_phases.first_lease_ms = Some(ms);
+            tracing::info!(ms, "first article lease since boot");
         }
         leases
     }
@@ -7946,6 +8009,22 @@ impl Owner {
                 "writer retirement in progress".into(),
             ));
         }
+        // Completion evidence with no allocation is recovery's, never a
+        // fresh allocation's: a job startup released untouched
+        // (paused, then resumed) takes its recovery pass here, lazily.
+        let needs_recovery = !self.allocated_jobs.contains(&job)
+            && !self.allocating_jobs.contains(&job)
+            && self
+                .state
+                .job(job)
+                .is_some_and(|record| record.files.iter().any(|file| file.has_any_done()))
+            && !self.allocation_cache.contains_key(&job);
+        if needs_recovery {
+            self.queue_verification(job);
+            return Err(nzbd_state::artifacts::Error::Conflict(
+                "payload recovery pending".into(),
+            ));
+        }
         let record = self
             .state
             .job(job)
@@ -8188,7 +8267,7 @@ impl Owner {
                 #[cfg(test)]
                 naming_test_hook: None,
                 #[cfg(test)]
-                sync_test_hook: None,
+                sync_test_hook: owner.writer_sync_hook.clone(),
             };
             let writer = spawn_writer_scoped(
                 &owner.tracker,
@@ -9618,6 +9697,10 @@ impl Owner {
     }
 
     fn publish_now(&mut self) {
+        if self.publish_batched {
+            // A batch (startup ticketing) publishes once when it ends.
+            return;
+        }
         self.repair_progress.retain(|id, _| {
             self.state.job(*id).is_some_and(|job| {
                 !job.held()
@@ -10074,6 +10157,10 @@ impl Owner {
             download_rate_bps: rate.saturating_add(torrent_rate),
             session_downloaded_bytes: self.meter.total(),
             remaining_bytes,
+            startup: crate::startup_phases::StartupPhases {
+                listener_ms: crate::startup_phases::listener_ms(),
+                ..self.startup_phases.clone()
+            },
             jobs,
         };
         // The status mirrors the hold record (M6b): every path that writes
