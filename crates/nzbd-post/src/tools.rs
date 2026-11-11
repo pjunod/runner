@@ -134,26 +134,42 @@ async fn run_tool_owned(
         _ = cancellation.cancelled() => None,
         result = tokio::time::timeout(timeout, async {
         let waited = async {
+            let mut tick = tokio::time::interval(Duration::from_millis(100));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Poll for exit with WNOWAIT instead of racing wait(), which
+            // would reap the child before its last bytes are read. Where
+            // that cannot be observed, sample until wait() returns instead;
+            // only the final interval's bytes are lost then.
             #[cfg(target_os = "linux")]
             if let Some(pid) = group {
-                // Poll for exit with WNOWAIT instead of racing wait(),
-                // which would reap the child before its last bytes are read.
-                let mut tick = tokio::time::interval(Duration::from_millis(100));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tick.tick().await;
-                    let exited = nzbd_state::io_meter::exited_unreaped(pid);
-                    if let Some(meter) = meter.as_mut() {
-                        meter.sample();
-                    }
-                    if exited {
-                        break;
+                    match nzbd_state::io_meter::exited_unreaped(pid) {
+                        Ok(exited) => {
+                            if let Some(meter) = meter.as_mut() {
+                                meter.sample();
+                            }
+                            if exited {
+                                return child.wait().await;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(%error, "tool exit not observable without reaping; sampling until wait()");
+                            break;
+                        }
                     }
                 }
             }
-            #[cfg(not(target_os = "linux"))]
-            let _ = meter.take();
-            child.wait().await
+            loop {
+                tokio::select! {
+                    status = child.wait() => break status,
+                    _ = tick.tick() => {
+                        if let Some(meter) = meter.as_mut() {
+                            meter.sample();
+                        }
+                    }
+                }
+            }
         };
         let (o, e, status) = tokio::join!(read_capped(out), read_err, waited);
         (o, e, status)

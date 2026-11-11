@@ -159,21 +159,31 @@ pub fn process_io(_pid: u32) -> Option<Totals> {
     None
 }
 
-/// True once our child `pid` has exited, without reaping it, so its
-/// `/proc/<pid>/io` can still be read for a final sample. Also true when
-/// the pid is no longer ours to wait for, so a caller never waits forever.
+/// Whether our child `pid` has exited, observed without reaping it so its
+/// `/proc/<pid>/io` can still be read for a final sample. An error means
+/// this cannot be observed here; the caller must fall back to an ordinary
+/// wait rather than assume the child is gone (that would stop sampling a
+/// tool that is still running).
 #[cfg(target_os = "linux")]
-pub fn exited_unreaped(pid: u32) -> bool {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-        )
-    };
-    rc != 0 || unsafe { info.si_pid() } != 0
+pub fn exited_unreaped(pid: u32) -> std::io::Result<bool> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if rc == 0 {
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 pub fn parse_proc_io(text: &str) -> Option<Totals> {
@@ -273,43 +283,73 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_child_process_is_charged_to_its_directory() {
+    fn a_running_child_is_charged_as_it_works() {
+        use std::io::Write;
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("in.bin"), vec![7u8; 256 * 1024]).unwrap();
         let device = u64::MAX - 9;
         let before = totals(device);
-        let mut child = std::process::Command::new("dd")
-            .args(["if=in.bin", "of=out.bin", "bs=65536", "status=none"])
+        // tee copies its stdin to out.bin and stays alive until stdin
+        // closes, so the samples below never race its exit.
+        let mut child = std::process::Command::new("tee")
+            .arg("out.bin")
             .current_dir(tmp.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let mut meter = ProcessMeter::new(child.id(), Some(device));
-        // Wait for exit the way run_tool does, without reaping: no timing
-        // assumption, so a loaded machine cannot race the samples.
+        let pid = child.id();
+        let mut meter = ProcessMeter::new(pid, Some(device));
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(&vec![5u8; 256 * 1024]).unwrap();
+        stdin.flush().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !exited_unreaped(child.id()) {
-            assert!(std::time::Instant::now() < deadline, "dd did not exit");
+        loop {
             meter.sample();
+            let seen = totals(device);
+            if seen.read_bytes - before.read_bytes >= 256 * 1024
+                && seen.write_bytes - before.write_bytes >= 256 * 1024
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tee's I/O never reached the meter: {:?} (proc io {:?})",
+                seen,
+                process_io(pid)
+            );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        // An exited child that has not been reaped still has its counters;
-        // a repeat sample charges nothing new.
+        let charged = totals(device);
         meter.sample();
-        meter.sample();
+        assert_eq!(
+            totals(device),
+            charged,
+            "a repeat sample charges nothing new"
+        );
+        drop(stdin);
         child.wait().unwrap();
-        meter.sample();
-        let after = totals(device);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exited_child_is_seen_before_it_is_reaped() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match exited_unreaped(pid) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => panic!("waitid(WNOWAIT) is unavailable here: {error}"),
+            }
+            assert!(std::time::Instant::now() < deadline, "true did not exit");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert!(
-            after.read_bytes - before.read_bytes >= 256 * 1024,
-            "{after:?}"
+            process_io(pid).is_some(),
+            "an exited, unreaped child's counters stay readable"
         );
-        assert!(
-            after.write_bytes - before.write_bytes >= 256 * 1024,
-            "{after:?}"
-        );
-        assert!(
-            after.read_bytes - before.read_bytes < 512 * 1024,
-            "repeat samples charge only what is new: {after:?}"
-        );
+        child.wait().unwrap();
+        assert!(process_io(pid).is_none() || pid == std::process::id());
     }
 }
