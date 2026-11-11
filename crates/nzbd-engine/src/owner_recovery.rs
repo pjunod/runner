@@ -1346,9 +1346,9 @@ fn verify_job_batch(
                     .map(|(_, number)| *number),
             )
             .collect();
-        let mut read_payload = false;
-        let mut descriptor = nzbd_state::fileops::open(&resolved.path)
-            .map_err(|error| VerificationFailure::unavailable(error, checked))?;
+        // A range the writer's durable proof covers is not re-read, and a
+        // file whose every range it covers is not even opened.
+        let mut descriptor: Option<std::fs::File> = None;
         for range in &done {
             if accepted.contains(&range.seg_number) {
                 continue;
@@ -1368,7 +1368,12 @@ fn verify_job_batch(
                 batch_ranges += 1;
                 continue;
             }
-            read_payload = true;
+            if descriptor.is_none() {
+                descriptor = Some(
+                    nzbd_state::fileops::open(&resolved.path)
+                        .map_err(|error| VerificationFailure::unavailable(error, checked))?,
+                );
+            }
             let cursor = verified.partial_range.get_or_insert_with(|| PartialRange {
                 file: file.id,
                 range: range.clone(),
@@ -1386,8 +1391,12 @@ fn verify_job_batch(
             } else {
                 u64::MAX
             };
-            let (outcome, bytes, complete) =
-                read_piece(&mut descriptor, &resolved.identity, cursor, budget);
+            let (outcome, bytes, complete) = read_piece(
+                descriptor.as_mut().expect("opened above"),
+                &resolved.identity,
+                cursor,
+                budget,
+            );
             checked = checked.saturating_add(bytes);
             batch_bytes = batch_bytes.saturating_add(bytes);
             if !complete {
@@ -1424,28 +1433,33 @@ fn verify_job_batch(
             .iter()
             .all(|range| accepted.contains(&range.seg_number));
         // Stamp legacy verification only after a sync of the same opened object;
-        // validate current identity both before and after that sync.
-        let before = recovery::capture_identity(&descriptor)
-            .map_err(|error| VerificationFailure::unavailable(error, checked))?;
-        if before != resolved.identity {
-            return Err(VerificationFailure::conflict(
-                "file changed before verification checkpoint",
-                checked,
-            ));
-        }
-        if read_payload {
+        // validate current identity both before and after that sync. A file
+        // proven entirely by its durable writer proof was never opened: its
+        // resolved identity is the one the proof matched.
+        let identity = if let Some(descriptor) = &descriptor {
+            let before = recovery::capture_identity(descriptor)
+                .map_err(|error| VerificationFailure::unavailable(error, checked))?;
+            if before != resolved.identity {
+                return Err(VerificationFailure::conflict(
+                    "file changed before verification checkpoint",
+                    checked,
+                ));
+            }
             descriptor
                 .sync_data()
                 .map_err(|error| VerificationFailure::unavailable(error, checked))?;
-        }
-        let identity = recovery::capture_identity(&descriptor)
-            .map_err(|error| VerificationFailure::unavailable(error, checked))?;
-        if identity != before {
-            return Err(VerificationFailure::conflict(
-                "file changed during verification checkpoint",
-                checked,
-            ));
-        }
+            let identity = recovery::capture_identity(descriptor)
+                .map_err(|error| VerificationFailure::unavailable(error, checked))?;
+            if identity != before {
+                return Err(VerificationFailure::conflict(
+                    "file changed during verification checkpoint",
+                    checked,
+                ));
+            }
+            identity
+        } else {
+            resolved.identity.clone()
+        };
         let final_path = verified.allocation.path.join(publication);
         let published = match std::fs::symlink_metadata(&final_path) {
             Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
