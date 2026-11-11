@@ -2,9 +2,10 @@
 
 ## No wedges: runner side of the pipeline rewrite plan — 2026-11-11 (0.9.0)
 
-**Status:** built, awaiting adversarial review. Branch `claude/no-wedge`
-(pushed; no PR yet). Owner: Claude (Opus 5.5 session). Next: adversarial
-review → fold in findings → full CI once → PR → merge. Not deployed.
+**Status:** built (startup items 1–7 plus no-wedge tasks 1–3), awaiting
+adversarial review. Branch `claude/no-wedge` (pushed; no PR yet). Owner:
+Claude (Opus 5.5 session). Next: adversarial review → fold in findings →
+full CI once → PR → merge. Not deployed.
 Rebased on main after #305 (0.8.1).
 
 Every stuck state named in the 2026-11-11 brief now has an automatic exit
@@ -77,14 +78,139 @@ through the normal paths; nothing below needs a one-off script on upgrade.
   ~0.65 s (debug) with 0 payload bytes read and no paused-job opens; kill -9
   at before_sync / after_sync / after journal append → only unacknowledged
   segments re-fetched, final CRC correct; replaced inode holds only its job.
-- **Review/retained states still without an automatic exit** (operator or
-  explicit-action states, left for a follow-up): unowned/adopted payloads
-  (`review`, "files changed; adoption required"), cancelled recovery and
-  recovery staging holds, interrupted move/relocation staging holds,
-  workspace cleanup / subprocess-quiescence holds, interrupted writer
-  retirement, delete operations in `review` (generation changed,
-  pre-upgrade non-eligible, cancellation receipt changed), and
-  materialization `retained` predecessors.
+- **Identity mismatch at writer spawn (task 1).** A replaced inode,
+  conflicting aliases or ranges incoherent with the recorded object no
+  longer hold the job: that one file's Done ranges and proof are discarded,
+  the next writer removes the file's names in the job's own directory and
+  re-downloads it. After 3 resets of the same file the job ends
+  `failed/identity` (which blames the release under contract §2.2 — Paul to
+  confirm that is wanted for a filesystem that keeps swapping inodes). An
+  existing hold for one of these refusals retries at once on load.
+- **Every review/retained state has an exit (task 2).** `artifacts::exits`
+  registers each state and hold with its exit, and
+  `Inventory::exit_wedged_states` carries them out: at open (database-only,
+  no grace — upgrade and restart conversion) and on each maintenance tick
+  (all exits, after `HOLD_EXIT_SECONDS` = 1 h, so the flow that set a hold
+  gets its own follow-up first). Copies whose original is retained are
+  disposed; anything that may hold payload bytes is parked with the failed
+  TTL (Keep / keep_on_failure still retain it); locks on healthy rows are
+  released; refused disposals re-snapshot the closed scope and retry;
+  relocations in review are abandoned (original verified and kept, target
+  closed without deleting). Unowned/adopted content is never touched.
+  Every exit is idempotent.
+- **Registry test (task 3).** `exits::tests` scans every crate's production
+  sources for state and hold strings the code writes and fails if one has no
+  registered exit; another fails if anything but unowned content needs an
+  operator; job statuses and hold causes are exhaustive matches. The table
+  below is printed by `cargo test -p nzbd-state --lib exits::tests::exit_table
+  -- --nocapture`.
+- **Decisions made without Paul (review later):** startup orphans park
+  whatever their eligibility flag (closed scope); a restored backup's
+  hold is released but the Keep the restore set stays (a person clears it);
+  an interrupted move whose target cannot be put back leaves the target as
+  discovered (unowned) content in the library, never deleted.
+- **Not done:** the cluster copy ledger records `retained` when a copy's
+  delete op was in review; whether it re-asks once that op takes its exit
+  is not verified. Recovery handoffs waiting on a consumer (`published`,
+  `claimed`) have no TTL. Full suite not run (fast lane on the PR).
+
+### State and hold exits
+
+| Scope | State / hold | Exit |
+|---|---|---|
+| job | `queued` | event: a download slot leases it |
+| job | `downloading` | event: all articles done or failed → post-processing or failed/health |
+| job | `paused` | policy: stopped by a person (or seed policy); the person resumes it |
+| job | `held` | timer: hold cause retry policy; the hold deadline ends it failed/hold_expired |
+| job | `fetching` | event: URL fetch succeeds or fails failed/fetch |
+| job | `post_queued` | event: a post-processing slot admits it |
+| job | `post_processing` | event: the stage finishes; the job ends completed or failed/<reason> |
+| job | `completed` | terminal |
+| job | `failed` | terminal |
+| job | `deleted` | terminal |
+| job hold cause | `engine_unavailable` | timer: retry ladder; deadline → failed/hold_expired |
+| job hold cause | `storage_unavailable` | timer: retry ladder; deadline → failed/hold_expired |
+| job hold cause | `capacity` | timer: resumes when the resource returns; deadline → failed/hold_expired |
+| job hold cause | `quota` | timer: resumes when the resource returns; deadline → failed/hold_expired |
+| job hold cause | `allocation` | timer: resumes when the resource returns; deadline → failed/hold_expired |
+| job hold cause | `mount_unavailable` | timer: mount re-checked every pass; deadline → failed/hold_expired |
+| job hold cause | `missing_tool` | timer: retry ladder; deadline → failed/hold_expired |
+| job hold cause | `password_required` | timer: retry ladder; deadline → failed/hold_expired |
+| artifact | `allocating` | event: allocation commit; startup classifies an interrupted one (missing → source_gone, present → unowned adoption) |
+| artifact | `active` | event: the job finishes: delivery, failure policy, or retirement |
+| artifact | `active_unverified` | event: queue admission verifies it (→ active) or it stays an unowned adoption candidate |
+| artifact | `transitioning` | event: relocation/intent finishes or unwinds (intent reconciliation, then the review-op exit) |
+| artifact | `retiring` | event: writer stop; startup reclassifies an interrupted one |
+| artifact | `completed` | event: delivery cleanup removes the closed-scope source |
+| artifact | `retained` | timer: its hold's exit (HOLD_EXITS); an unheld retained owned orphan is parked with the failed TTL |
+| artifact | `unknown` | operator (unowned only): discovered content Runner did not create; never deleted automatically |
+| artifact | `parked_failed` | timer: failed-retention TTL → retention deletion (Keep / keep_on_failure: policy) |
+| artifact | `recovery_staged` | event: consumer import receipt; a cancelled/failed recovery's copy is disposed |
+| artifact | `recovery_imported` | timer: retention TTL → deletion |
+| artifact | `deleting` | event: the delete operation finishes or retries |
+| artifact | `delete_failed` | timer: delete retry ladder; a conflict re-snapshots the closed scope and retries |
+| artifact | `deleted` | terminal |
+| artifact | `source_gone` | terminal |
+| operation | `queued` | timer: not_before / next_retry, then runs |
+| operation | `running` | event: the worker finishes; startup resumes an interrupted one |
+| operation | `retry` | timer: next_retry ladder |
+| operation | `review` | timer: exit_wedged_states: delete → retry or cancel; relocate → abandon (unwind) or close; transforms abandoned (W9); restored-backup → cancel |
+| operation | `retained` | event: startup-orphan receipt row; closes when the orphan is reclaimed or disposed |
+| operation | `preview` | event: retention preview: applied or superseded by the next preview |
+| operation | `succeeded` | terminal |
+| operation | `cancelled` | terminal |
+| operation | `failed` | terminal |
+| operation | `pending` | event: its worker claims it |
+| operation | `stopping` | event: worker stop acknowledgement |
+| operation | `transferred` | terminal |
+| recovery | `staging` | event: publication finishes or fails; reconcile_recoveries resumes it |
+| recovery | `publishing` | event: publication finishes or fails; reconcile_recoveries resumes it |
+| recovery | `published` | event: consumer claim/import receipt or cancellation |
+| recovery | `claimed` | event: consumer import receipt or cancellation |
+| recovery | `cancel_pending` | event: worker quiescence acknowledgement; unclaimed ones cancel on reconcile |
+| recovery | `imported` | timer: receipt-scoped source prune (automatic after HOLD_EXIT_SECONDS), then the source's TTL |
+| recovery | `partial` | timer: receipt-scoped source prune (automatic after HOLD_EXIT_SECONDS), then the source's TTL |
+| recovery | `review` | timer: restored backup: cancelled by exit_wedged_states; its staged copy is disposed |
+| recovery | `pruned` | terminal |
+| intent | `open` | event: restart reconciliation decides finish or unwind |
+| intent | `finishing` | event: finish completes; a refusal goes to the review-op exit |
+| intent | `unwinding` | event: unwind completes; a refusal goes to the review-op exit (close, never delete) |
+| intent | `committed` | terminal |
+| intent | `unwound` | terminal |
+| delivery cleanup | `pending` | event: the delivery's source cleanup runs |
+| delivery cleanup | `running` | event: cleanup worker; startup turns an interrupted one into retry |
+| delivery cleanup | `retry` | timer: cleanup_next_retry_at |
+| delivery cleanup | `blocked` | timer: policy change wakes it; otherwise retried after HOLD_EXIT_SECONDS |
+| delivery cleanup | `succeeded` | terminal |
+| delivery cleanup | `done` | terminal |
+| delivery cleanup | `removed` | terminal |
+| url admission | `runner_owned` | event: the admitted job's own lifecycle |
+| daemon | `starting` | event: startup completes or the process exits |
+| artifact hold | `waiting for writer stop` | event: writer stop; startup reclassifies an interrupted retirement |
+| artifact hold | `transform workspace` | event: transform finishes; workspace retirement disposes the scratch |
+| artifact hold | `recovery:<id>` | event: recovery finishes; a failed/cancelled one releases, an imported one is receipt-pruned after HOLD_EXIT_SECONDS |
+| artifact hold | `awaiting complete import receipt` | event: consumer import receipt; a cancelled/failed recovery's copy is disposed |
+| artifact hold | `review` | timer: unowned: adoption (operator); owned: refused disposal re-snapshotted and retried, otherwise released |
+| artifact hold | `review: files changed; adoption required` | operator (unowned only): adopted content changed; never deleted automatically |
+| artifact hold | `review: preexisting accepted output` | operator (unowned only): output Runner did not create |
+| artifact hold | `review: cancelled recovery` | timer: released; the source keeps its bytes and lifecycle |
+| artifact hold | `review: cancelled recovery staging` | timer: copy disposed; the recovery source holds the original |
+| artifact hold | `review: unselected source files remain` | timer: released; the source follows its TTL |
+| artifact hold | `review: unselected source files remain after receipt cleanup` | timer: released; the source follows its TTL |
+| artifact hold | `review: relocation staging` | event: its relocate operation ends; left over after that, parked with the failed TTL |
+| artifact hold | `review: abandoned relocation staging` | timer: copy disposed; abandon verified the original source |
+| artifact hold | `review: interrupted move` | timer: move abandoned (unwind, or close without deleting); the job fails io and parks the source |
+| artifact hold | `review: workspace cleanup` | timer: scratch re-snapshotted (closed scope) and its retirement retried |
+| artifact hold | `review: subprocess quiescence unconfirmed` | timer: released at the next open (no subprocess outlives the process) or after HOLD_EXIT_SECONDS |
+| artifact hold | `review: interrupted transform` | timer: released; post-processing re-runs the transform (W9) |
+| artifact hold | `review: interrupted writer retirement` | timer: gone → source_gone; replaced → unowned adoption; present → released |
+| artifact hold | `review: allocation has no recovered job` | timer: owned: parked with the failed TTL (W9); unowned: adoption |
+| artifact hold | `review: superseded by accepted generation` | timer: materialization predecessor parked with the failed TTL |
+| artifact hold | `review: superseded private processing source` | timer: parked with the failed TTL |
+| artifact hold | `review: previous external job generation` | timer: owned: parked with the failed TTL; unowned: adoption |
+| artifact hold | `review: managed seed metainfo mismatch` | timer: seed directory (closed scope) parked with the failed TTL |
+| artifact hold | `review retained source` | timer: parked with the failed TTL |
+| artifact hold | `restored backup: review required` | policy: released; the Keep a restore sets stays until a person clears it |
 
 ## Storage I/O on every filesystem; mobile graphs and versions — 2026-11-11
 
