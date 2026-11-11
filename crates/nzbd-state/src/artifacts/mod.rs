@@ -906,7 +906,7 @@ impl Inventory {
         }
         fs::sync_directory(&fs::open_dir(state_dir)?)?;
         let worker_session = id(&db)?;
-        Ok(Self {
+        let inventory = Self {
             writer_naming: Mutex::new(std::collections::VecDeque::new()),
             naming_leases: Mutex::new(std::collections::HashMap::new()),
             retired_naming: Mutex::new(Vec::new()),
@@ -927,7 +927,9 @@ impl Inventory {
             reconcile_cursor: Mutex::new(String::new()),
             empty_failed_cursor: Mutex::new(String::new()),
             tasks: Mutex::new(()),
-        })
+        };
+        inventory.abandon_reviewed_transforms()?;
+        Ok(inventory)
     }
     fn mutation_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
         let guard = self.mutation.lock().unwrap();

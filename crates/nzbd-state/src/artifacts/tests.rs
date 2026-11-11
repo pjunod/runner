@@ -1430,7 +1430,8 @@ fn legacy_four_field_restore_journal_is_fenced_without_startup_failure() {
         assert!(db.reconcile_transforms_root_snapshot(&root, None).is_ok());
     }
     let fenced = db.operation("legacy-restore-four-tuple").unwrap();
-    assert_eq!(fenced.state, "review");
+    // W9: abandoned without replay; post-processing re-runs the transform.
+    assert_eq!(fenced.state, "cancelled");
     assert!(fenced
         .error
         .as_deref()
@@ -1955,6 +1956,42 @@ fn parked_curator_failures_expire_under_delete_policy() {
         paths[2].exists(),
         "a job curator did not admit keeps its retention"
     );
+}
+/// W9 upgrade: a transform an older build parked in `review`, with the
+/// "review: interrupted transform" Keep hold on its source, is abandoned
+/// at open so post-processing re-runs it; idempotent.
+#[test]
+fn reviewed_transforms_are_abandoned_on_open() {
+    let (tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    let mut held = db.get(&a.id).unwrap();
+    held.hold = Some("review: interrupted transform".into());
+    held.keep = true;
+    save_artifact(&db.db.lock().unwrap(), &held).unwrap();
+    let op = Operation {
+        id: "par-restore-reviewed".into(),
+        artifact: a.id.clone(),
+        kind: "par_restore".into(),
+        state: "review".into(),
+        request: "[]".into(),
+        created_at: now(),
+        not_before: 0,
+        attempts: 1,
+        next_retry: 0,
+        error: Some("interrupted restore has ambiguous identities".into()),
+    };
+    save_operation(&db.db.lock().unwrap(), &op).unwrap();
+    db.close().unwrap();
+    drop(db);
+    for _ in 0..2 {
+        let db = Inventory::open(&tmp.path().join("state")).unwrap();
+        let after = db.operation(&op.id).unwrap();
+        assert_eq!(after.state, "cancelled");
+        assert!(after.error.unwrap().contains("ambiguous identities"));
+        let source = db.get(&a.id).unwrap();
+        assert!(source.hold.is_none() && !source.keep);
+        db.close().unwrap();
+    }
 }
 #[test]
 fn restore_quarantines_pending_deletion_and_retention() {

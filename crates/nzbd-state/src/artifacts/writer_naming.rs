@@ -788,7 +788,8 @@ mod tests {
                 .reconcile_transforms_root_snapshot(&root, None)
                 .unwrap();
         }
-        assert_eq!(inventory.operation(&op.id).unwrap().state, "review");
+        // W9: abandoned, never replayed over the mutated bytes.
+        assert_eq!(inventory.operation(&op.id).unwrap().state, "cancelled");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(
                 &inventory.operation(&op.id).unwrap().request
@@ -913,7 +914,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(state, "review");
+        // W9: an ambiguous replay is abandoned (PP re-runs it), never held.
+        assert_eq!(state, "cancelled");
     }
     #[test]
     fn restart_after_tentative_rename_uses_legacy_strict_digest_replay_not_cached_expectation() {

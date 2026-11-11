@@ -218,6 +218,40 @@ fn needs_payload(job: &Job) -> bool {
         && job.status != JobStatus::Deleted
 }
 
+/// Remove `.runner-file-<id>.part` files in a job directory whose file is
+/// not one a writer can still resume. Best effort: a failure leaves the
+/// file for the job's own lifecycle (closed-scope cleanup or disposal).
+pub(super) fn sweep_stale_parts(dir: &std::path::Path, resumable: &HashSet<u32>) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".runner-file-"))
+            .and_then(|rest| rest.strip_suffix(".part"))
+            .and_then(|id| id.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if resumable.contains(&id) || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => {
+                removed += 1;
+                tracing::info!(path = %entry.path().display(), "removed a partial file no writer will resume");
+            }
+            Err(error) => {
+                tracing::warn!(path = %entry.path().display(), %error, "stale partial file remains");
+            }
+        }
+    }
+    removed
+}
+
 pub(super) fn failed_cleanup_only(job: &Job) -> bool {
     job.params
         .iter()
@@ -1695,9 +1729,34 @@ impl Owner {
         let worker_root = root.clone();
         let default_root = self.dest_dir.clone();
         let snapshot = self.startup_snapshot.clone();
+        // W9: a `.runner-file-<id>.part` no writer will resume — its file is
+        // finalized or no longer part of the job — is removed at startup.
+        let parts = self
+            .state
+            .jobs
+            .iter()
+            .filter(|job| needs_payload(job))
+            .filter_map(|job| {
+                let allocation = self.allocation_cache.get(&job.id)?;
+                (allocation.root == root).then(|| {
+                    (
+                        allocation.path.clone(),
+                        job.files
+                            .iter()
+                            .filter(|file| !file.finalized)
+                            .map(|file| file.id.0)
+                            .collect::<HashSet<u32>>(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
         self.payload_then(root.clone(), move || {
             if worker_root == default_root { prepare_unenrolled_payload_root(&inventory, &worker_root)?; }
-            inventory.reconcile_startup_root_snapshot(&worker_root, &live, &snapshot).map_err(failure)
+            inventory.reconcile_startup_root_snapshot(&worker_root, &live, &snapshot).map_err(failure)?;
+            for (dir, resumable) in &parts {
+                sweep_stale_parts(dir, resumable);
+            }
+            Ok(())
         }, move |owner, result| {
             let state = owner.startup_reconciliation.get_mut(&root).unwrap();
             state.running = false;
@@ -1987,6 +2046,32 @@ impl Owner {
         for job in jobs {
             self.queue_payload_recovery(job);
         }
+    }
+}
+
+#[cfg(test)]
+mod stale_part_tests {
+    use super::*;
+    /// W9: only a resumable file's partial survives the startup sweep.
+    #[test]
+    fn startup_sweep_keeps_only_resumable_partials() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            ".runner-file-1.part",
+            ".runner-file-2.part",
+            ".runner-file-x.part",
+            "episode.mkv",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        std::fs::create_dir(dir.path().join(".runner-file-3.part")).unwrap();
+        let resumable = [1u32].into_iter().collect();
+        assert_eq!(sweep_stale_parts(dir.path(), &resumable), 1);
+        assert!(dir.path().join(".runner-file-1.part").exists());
+        assert!(!dir.path().join(".runner-file-2.part").exists());
+        assert!(dir.path().join(".runner-file-x.part").exists());
+        assert!(dir.path().join(".runner-file-3.part").exists());
+        assert!(dir.path().join("episode.mkv").exists());
     }
 }
 
