@@ -380,10 +380,364 @@ mod unix {
         parent.sync_all()?;
         Ok(())
     }
+
+    /// Prefix of a too-deep directory moved up to the root by
+    /// [`remove_tree_contents`] so its fds stay bounded.
+    const DEEP_PREFIX: &str = ".nzbd-remove-deep-";
+    /// Depth after which a subtree is moved up to the root and removed from
+    /// there (each level holds a descriptor).
+    const MAX_HELD_DEPTH: usize = 48;
+
+    /// Which mount a directory is on: its device, plus the kernel's mount
+    /// id where available (statx `STATX_MNT_ID`, Linux 5.8+). A bind mount
+    /// of the same filesystem shares the device and differs only here.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct MountScope {
+        device: u64,
+        mount: Option<u64>,
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// Inodes the tests present as a different mount of the same device
+        /// (a bind mount needs privileges a test may not have).
+        pub(super) static FAKE_BIND_MOUNTS: std::cell::RefCell<Vec<u64>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// The mount id of `name` in `dir` (not followed), or of `dir` itself
+    /// when `name` is empty. None where statx or the field is unavailable.
+    fn mount_id_at(dir: &File, name: &CStr) -> Option<u64> {
+        mount_id_or_reason(dir, name).ok()
+    }
+
+    /// [`mount_id_at`], with why the id is unavailable.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn mount_id_or_reason(dir: &File, name: &CStr) -> std::result::Result<u64, String> {
+        let mut buf = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        let flags = libc::AT_SYMLINK_NOFOLLOW
+            | if name.to_bytes().is_empty() {
+                libc::AT_EMPTY_PATH
+            } else {
+                0
+            };
+        // SAFETY: name is NUL terminated; buf is written on success only.
+        let rc = unsafe {
+            libc::statx(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                flags,
+                libc::STATX_MNT_ID | libc::STATX_INO,
+                buf.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(format!("statx failed: {}", std::io::Error::last_os_error()));
+        }
+        let stat = unsafe { buf.assume_init() };
+        if stat.stx_mask & libc::STATX_MNT_ID == 0 {
+            return Err("statx did not report STATX_MNT_ID (kernel older than 5.8?)".into());
+        }
+        #[cfg(test)]
+        if FAKE_BIND_MOUNTS.with(|fake| fake.borrow().contains(&stat.stx_ino)) {
+            return Ok(stat.stx_mnt_id ^ (1 << 62));
+        }
+        Ok(stat.stx_mnt_id)
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    fn mount_id_or_reason(_: &File, _: &CStr) -> std::result::Result<u64, String> {
+        Err("statx mount id is not available on this target".into())
+    }
+
+    /// The remover's scope falls back to the device alone (bind mounts of
+    /// the same filesystem are then indistinguishable): say so, once.
+    fn warn_device_only_scope(reason: &str) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                reason,
+                "tree remover: mount id unavailable; scoping removals by device only \
+                 (a bind mount of the same filesystem inside a removed tree is not detected)"
+            );
+        });
+    }
+
+    impl MountScope {
+        fn of(root: &File) -> Result<Self> {
+            use std::os::unix::fs::MetadataExt;
+            let mount = match mount_id_or_reason(root, c"") {
+                Ok(mount) => Some(mount),
+                Err(reason) => {
+                    warn_device_only_scope(&reason);
+                    None
+                }
+            };
+            Ok(Self {
+                device: root.metadata()?.dev(),
+                mount,
+            })
+        }
+        /// `name` in `dir` (a directory with device `device`) is on this
+        /// mount. With a root mount id known, an entry whose id cannot be
+        /// read is treated as another mount: never descended into.
+        fn contains(&self, device: u64, dir: &File, name: &CStr) -> bool {
+            device == self.device
+                && self
+                    .mount
+                    .is_none_or(|mount| mount_id_at(dir, name) == Some(mount))
+        }
+    }
+
+    /// A fresh name for a subtree moved up to the root: unique across runs
+    /// and processes (pid 1 in every container restart), so a crash mid
+    /// removal never leaves a name a later move collides with.
+    fn deep_name(deep: &mut u64) -> Result<CString> {
+        use std::hash::{BuildHasher, Hasher};
+        *deep += 1;
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(*deep);
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        );
+        CString::new(format!(
+            "{DEEP_PREFIX}{}-{deep}-{:016x}",
+            std::process::id(),
+            hasher.finish()
+        ))
+        .map_err(|_| Error::Conflict("NUL in name".into()))
+    }
+
+    /// Every name in `dir`, raw (no UTF-8 requirement, no count limit).
+    fn all_names(dir: &File) -> Result<Vec<CString>> {
+        let fd = unsafe { libc::dup(dir.as_raw_fd()) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(std::io::Error::last_os_error().into());
+        }
+        unsafe {
+            libc::rewinddir(stream);
+        }
+        let mut out = Vec::new();
+        let result = loop {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+            unsafe {
+                *libc::__error() = 0;
+            }
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                let err = std::io::Error::last_os_error();
+                break if err.raw_os_error() == Some(0) {
+                    Ok(out)
+                } else {
+                    Err(err.into())
+                };
+            }
+            let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if bytes.to_bytes() != b"." && bytes.to_bytes() != b".." {
+                out.push(bytes.to_owned());
+            }
+        };
+        unsafe {
+            libc::closedir(stream);
+        }
+        result
+    }
+
+    fn lstat_at(dir: &File, name: &CStr) -> std::io::Result<libc::stat> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: name is NUL terminated; stat is written on success only.
+        let rc = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { stat.assume_init() })
+    }
+
+    fn unlink_name(dir: &File, name: &CStr, directory: bool) -> std::io::Result<()> {
+        let rc = unsafe {
+            libc::unlinkat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                if directory { libc::AT_REMOVEDIR } else { 0 },
+            )
+        };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn open_dir_at(dir: &File, name: &CStr) -> std::io::Result<File> {
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECTORY;
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// What [`remove_tree_contents`] did.
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub struct TreeRemoval {
+        /// Names unlinked (files, links, special files, directories).
+        pub removed: usize,
+        /// Directories on another device (a mount inside the tree): not
+        /// entered and not removed, nor are their ancestors.
+        pub foreign_mounts: usize,
+    }
+
+    /// Remove everything under `root` (not `root` itself) by raw name: each
+    /// name is examined with `fstatat(AT_SYMLINK_NOFOLLOW)`; every
+    /// non-directory (regular file, symlink, fifo, socket, device) is
+    /// unlinked by name, never followed; directories on the root's device are
+    /// emptied and removed bottom-up; a directory on another device (a
+    /// mount) is left with its ancestors — and so is a directory on another
+    /// mount of the same device (a bind mount), told apart by mount id.
+    /// No name is refused for its bytes, its depth or the number of entries
+    /// — closed-scope cleanup must not block on names a manifest cannot
+    /// describe. Subtrees moved up for depth carry unique names, and any a
+    /// crashed run left at the root are emptied like the rest.
+    pub fn remove_tree_contents(root: &File) -> Result<TreeRemoval> {
+        let device = MountScope::of(root)?;
+        let mut report = TreeRemoval::default();
+        let mut deep = 0u64;
+        empty_dir(root, root, device, 0, &mut deep, &mut report)?;
+        // Subtrees moved up for depth; each pass empties what it moved.
+        loop {
+            let moved = all_names(root)?
+                .into_iter()
+                .filter(|name| name.to_bytes().starts_with(DEEP_PREFIX.as_bytes()))
+                .collect::<Vec<_>>();
+            if moved.is_empty() {
+                break;
+            }
+            let before = report.removed;
+            for name in moved {
+                remove_entry_named(root, root, &name, device, 0, &mut deep, &mut report)?;
+            }
+            if report.removed == before {
+                break; // only foreign mounts remain under the moved names
+            }
+        }
+        root.sync_all()?;
+        Ok(report)
+    }
+
+    fn empty_dir(
+        root: &File,
+        dir: &File,
+        device: MountScope,
+        depth: usize,
+        deep: &mut u64,
+        report: &mut TreeRemoval,
+    ) -> Result<bool> {
+        let mut complete = true;
+        for name in all_names(dir)? {
+            complete &= remove_entry_named(root, dir, &name, device, depth, deep, report)?;
+        }
+        Ok(complete)
+    }
+
+    /// Remove one name; false when a foreign mount below it keeps it.
+    #[allow(clippy::unnecessary_cast)] // st_dev width varies across Unix targets
+    fn remove_entry_named(
+        root: &File,
+        dir: &File,
+        name: &CStr,
+        device: MountScope,
+        depth: usize,
+        deep: &mut u64,
+        report: &mut TreeRemoval,
+    ) -> Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let stat = match lstat_at(dir, name) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            unlink_name(dir, name, false)?;
+            report.removed += 1;
+            return Ok(true);
+        }
+        if !device.contains(stat.st_dev as u64, dir, name) {
+            report.foreign_mounts += 1;
+            return Ok(false);
+        }
+        if depth >= MAX_HELD_DEPTH {
+            let mut attempts = 0;
+            loop {
+                let target = deep_name(deep)?;
+                let rc = unsafe {
+                    libc::renameat(
+                        dir.as_raw_fd(),
+                        name.as_ptr(),
+                        root.as_raw_fd(),
+                        target.as_ptr(),
+                    )
+                };
+                if rc == 0 {
+                    return Ok(true);
+                }
+                let error = std::io::Error::last_os_error();
+                attempts += 1;
+                if attempts >= 8
+                    || !matches!(error.raw_os_error(), Some(libc::EEXIST | libc::ENOTEMPTY))
+                {
+                    return Err(error.into());
+                }
+            }
+        }
+        let child = match open_dir_at(dir, name) {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            // Swapped for a non-directory since the lstat: unlink that name.
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+                unlink_name(dir, name, false)?;
+                report.removed += 1;
+                return Ok(true);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !device.contains(child.metadata()?.dev(), &child, c"") {
+            report.foreign_mounts += 1;
+            return Ok(false);
+        }
+        if !empty_dir(root, &child, device, depth + 1, deep, report)? {
+            return Ok(false);
+        }
+        drop(child);
+        unlink_name(dir, name, true)?;
+        report.removed += 1;
+        Ok(true)
+    }
 }
 
 #[cfg(unix)]
-pub use unix::{create_file_exclusive_at, names, open_at, open_dir, unlink};
+pub use unix::{create_file_exclusive_at, names, open_at, open_dir, remove_tree_contents, unlink};
 
 // Windows retains ordinary queue/PP operation and cached inspection. Checked
 // destructive ownership remains unavailable until a handle-relative unlink
@@ -489,6 +843,16 @@ pub fn names(_: &File) -> Result<Vec<std::ffi::OsString>> {
 pub fn unlink(_: &File, _: &Path, _: bool) -> Result<()> {
     Err(Error::Conflict("descriptor deletion unavailable".into()))
 }
+#[cfg(not(unix))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TreeRemoval {
+    pub removed: usize,
+    pub foreign_mounts: usize,
+}
+#[cfg(not(unix))]
+pub fn remove_tree_contents(_: &File) -> Result<TreeRemoval> {
+    Err(Error::Conflict("descriptor deletion unavailable".into()))
+}
 
 pub fn sync_directory(dir: &File) -> Result<()> {
     #[cfg(unix)]
@@ -524,6 +888,13 @@ pub fn manifest(dir: &File, limit: usize) -> Result<Vec<FileEntry>> {
             ));
         }
         for n in names(dir)? {
+            // A space probe's scratch file is never payload (W5a); a killed
+            // run's leftover is swept at startup.
+            if n.as_encoded_bytes()
+                .starts_with(crate::artifacts::SPACE_PROBE_PREFIX.as_bytes())
+            {
+                continue;
+            }
             if out.len() >= limit {
                 return Err(Error::Conflict(
                     "file inventory limit reached; no changes made".into(),
@@ -1015,5 +1386,184 @@ mod exclusive_tests {
         assert!(rename_exclusive(&from, &to).is_err());
         assert!(from.is_dir());
         assert!(!to.exists());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod remove_tree_tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    fn root() -> (tempfile::TempDir, tempfile::TempDir, File) {
+        let outside = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("tree")).unwrap();
+        let file = open_dir(&dir.path().join("tree")).unwrap();
+        (outside, dir, file)
+    }
+
+    fn empty(dir: &tempfile::TempDir) -> bool {
+        std::fs::read_dir(dir.path().join("tree"))
+            .unwrap()
+            .next()
+            .is_none()
+    }
+
+    /// Finding 4: symlinks (to files and directories, dangling or looping)
+    /// are unlinked by name and never followed; their targets survive.
+    #[test]
+    fn symlinks_are_unlinked_never_followed() {
+        let (outside, dir, file) = root();
+        let tree = dir.path().join("tree");
+        std::fs::write(outside.path().join("keep.bin"), b"payload").unwrap();
+        std::fs::create_dir(outside.path().join("keepdir")).unwrap();
+        std::fs::write(outside.path().join("keepdir/inner"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("keep.bin"), tree.join("to-file")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("keepdir"), tree.join("to-dir")).unwrap();
+        std::os::unix::fs::symlink(tree.join("loop"), tree.join("loop")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/x", tree.join("dangling")).unwrap();
+        assert!(manifest(&file, 100).is_err(), "the manifest refuses these");
+        let report = remove_tree_contents(&file).unwrap();
+        assert_eq!(report.removed, 4);
+        assert!(empty(&dir));
+        assert_eq!(
+            std::fs::read(outside.path().join("keep.bin")).unwrap(),
+            b"payload"
+        );
+        assert!(outside.path().join("keepdir/inner").exists());
+    }
+
+    #[test]
+    fn special_files_and_non_utf8_names_are_removed() {
+        let (_outside, dir, file) = root();
+        let tree = dir.path().join("tree");
+        let fifo = std::ffi::CString::new(tree.join("pipe").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let odd = tree.join(std::ffi::OsStr::from_bytes(b"bad-\xff-name"));
+        std::fs::create_dir(&odd).unwrap();
+        std::fs::write(odd.join(std::ffi::OsStr::from_bytes(b"\xfe.mkv")), b"x").unwrap();
+        let socket = std::os::unix::net::UnixListener::bind(tree.join("sock")).unwrap();
+        assert!(manifest(&file, 100).is_err());
+        remove_tree_contents(&file).unwrap();
+        drop(socket);
+        assert!(empty(&dir));
+    }
+
+    /// Deeper than the manifest's 64 and than the held-descriptor bound.
+    #[test]
+    fn deep_trees_are_removed_bottom_up() {
+        let (_outside, dir, file) = root();
+        let mut path = dir.path().join("tree");
+        for level in 0..150 {
+            path = path.join(format!("d{level}"));
+        }
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("leaf.bin"), b"x").unwrap();
+        assert!(manifest(&file, 1_000).is_err());
+        let report = remove_tree_contents(&file).unwrap();
+        assert_eq!(report.removed, 151);
+        assert!(empty(&dir));
+    }
+
+    /// Finding 8: a directory that is another mount of the same device (a
+    /// bind mount: same st_dev) is neither entered nor emptied; it and its
+    /// ancestors stay. Exercised with a real bind mount where this process
+    /// may mount, and always with an inode presented as another mount.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn a_bind_mount_on_the_same_device_is_never_emptied() {
+        use std::os::unix::fs::MetadataExt;
+        // Presented as another mount.
+        let (_outside, dir, file) = root();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join("sub/bound")).unwrap();
+        std::fs::write(tree.join("sub/bound/keep.mkv"), b"payload").unwrap();
+        std::fs::write(tree.join("sub/other.bin"), b"x").unwrap();
+        let inode = std::fs::metadata(tree.join("sub/bound")).unwrap().ino();
+        super::unix::FAKE_BIND_MOUNTS.with(|fake| fake.borrow_mut().push(inode));
+        let report = remove_tree_contents(&file).unwrap();
+        super::unix::FAKE_BIND_MOUNTS.with(|fake| fake.borrow_mut().clear());
+        assert_eq!(report.foreign_mounts, 1);
+        assert_eq!(
+            std::fs::read(tree.join("sub/bound/keep.mkv")).unwrap(),
+            b"payload"
+        );
+        assert!(!tree.join("sub/other.bin").exists());
+
+        // A real bind mount, where permitted.
+        let (outside, dir, file) = root();
+        let tree = dir.path().join("tree");
+        std::fs::write(outside.path().join("keep.mkv"), b"payload").unwrap();
+        std::fs::create_dir(tree.join("bound")).unwrap();
+        let source = std::ffi::CString::new(outside.path().as_os_str().as_bytes()).unwrap();
+        let target = std::ffi::CString::new(tree.join("bound").as_os_str().as_bytes()).unwrap();
+        // SAFETY: plain mount(2) on NUL-terminated paths.
+        let mounted = unsafe {
+            libc::mount(
+                source.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        } == 0;
+        struct Unmount(std::ffi::CString);
+        impl Drop for Unmount {
+            fn drop(&mut self) {
+                unsafe { libc::umount2(self.0.as_ptr(), libc::MNT_DETACH) };
+            }
+        }
+        if mounted {
+            let _unmount = Unmount(target.clone());
+            assert_eq!(
+                std::fs::metadata(tree.join("bound")).unwrap().dev(),
+                std::fs::metadata(&tree).unwrap().dev(),
+                "same device: only the mount id tells them apart"
+            );
+            let report = remove_tree_contents(&file).unwrap();
+            assert_eq!(report.foreign_mounts, 1);
+            assert_eq!(
+                std::fs::read(outside.path().join("keep.mkv")).unwrap(),
+                b"payload"
+            );
+        }
+    }
+
+    /// Finding 8: a crash mid deep-tree removal leaves a moved subtree at
+    /// the root under the old `<pid>-<n>` naming (pid 1 in a container
+    /// restarts n at 1 too). The next removal neither collides with it nor
+    /// leaves it.
+    #[test]
+    fn a_crashed_deep_removal_is_resumed_without_collisions() {
+        let (_outside, dir, file) = root();
+        let tree = dir.path().join("tree");
+        let leftover = tree.join(format!(".nzbd-remove-deep-{}-1", std::process::id()));
+        let mut path = leftover.clone();
+        for level in 0..60 {
+            path = path.join(format!("l{level}"));
+        }
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("leaf"), b"x").unwrap();
+        let mut path = tree.join("fresh");
+        for level in 0..120 {
+            path = path.join(format!("d{level}"));
+        }
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("leaf"), b"x").unwrap();
+        remove_tree_contents(&file).unwrap();
+        assert!(empty(&dir));
+    }
+
+    #[test]
+    fn more_entries_than_a_manifest_allows() {
+        let (_outside, dir, file) = root();
+        let tree = dir.path().join("tree");
+        for index in 0..100_005 {
+            File::create(tree.join(format!("{index}"))).unwrap();
+        }
+        assert!(manifest(&file, 1_000_000).is_err());
+        let report = remove_tree_contents(&file).unwrap();
+        assert_eq!(report.removed, 100_005);
+        assert!(empty(&dir));
     }
 }

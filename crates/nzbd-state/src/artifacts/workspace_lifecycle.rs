@@ -1264,6 +1264,212 @@ mod tests {
         inventory.finish_workspace(&workspace).unwrap();
         (temp, inventory, workspace)
     }
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    /// `paths.workspace_dir`: unset, workspaces live under the state
+    /// directory; set, under the configured directory.
+    #[test]
+    fn workspaces_default_under_state_and_follow_the_configured_dir() {
+        let (temp, inventory, workspace) = fixture();
+        let default = temp.path().join("state/transform-workspaces");
+        assert_eq!(inventory.workspace_dir(), default);
+        assert!(workspace.scratch.path.starts_with(&default));
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("processing");
+        std::fs::create_dir(&root).unwrap();
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        let configured = root.join(".workspaces");
+        assert_eq!(inventory.configure_workspace_dir(&configured).unwrap(), 0);
+        inventory
+            .allocate_for_delivery(12, &root, &root.join("job"), false, false)
+            .unwrap();
+        let workspace = inventory.workspace(12, "par_repair", "abc").unwrap();
+        assert!(
+            workspace.scratch.path.starts_with(&configured),
+            "{:?}",
+            workspace.scratch.path
+        );
+        assert!(!temp.path().join("state/transform-workspaces").exists());
+        assert!(
+            inventory
+                .configure_workspace_dir(&temp.path().join("state/transform-workspaces/inner"))
+                .is_err(),
+            "nested with the default is refused"
+        );
+    }
+
+    /// Rows recorded under the default root keep working after the operator
+    /// moves the directory (here: copied, so every inode changes) and sets
+    /// `paths.workspace_dir`: every recorded path is rewritten, the moved
+    /// scratch verifies at its new place, and a second run changes nothing.
+    #[test]
+    fn moved_workspace_rows_are_migrated_once() {
+        let (temp, inventory, workspace) = fixture();
+        let old = temp.path().join("state/transform-workspaces");
+        let new = temp.path().join("processing/.workspaces");
+        let old_text = old.to_str().unwrap().to_owned();
+        inventory.close().unwrap();
+        drop(inventory);
+        copy_tree(&old, &new);
+        // Not moved yet (the old root still holds it): nothing is rewritten.
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        assert_eq!(inventory.configure_workspace_dir(&new).unwrap(), 0);
+        assert!(inventory
+            .get(&workspace.scratch.id)
+            .unwrap()
+            .path
+            .starts_with(&old));
+        inventory.close().unwrap();
+        drop(inventory);
+        std::fs::remove_dir_all(&old).unwrap();
+        let inventory = Inventory::open(&temp.path().join("state")).unwrap();
+        assert!(inventory.configure_workspace_dir(&new).unwrap() > 0);
+        let scratch = inventory.get(&workspace.scratch.id).unwrap();
+        assert!(scratch.path.starts_with(&new), "{:?}", scratch.path);
+        assert_eq!(scratch.root, new);
+        inventory.verify(&scratch).unwrap();
+        let leftover: i64 = {
+            let db = inventory.db.lock().unwrap();
+            let tables: Vec<String> = db
+                .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect();
+            tables
+                .iter()
+                .map(|table| {
+                    let columns: Vec<String> = db
+                        .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+                        .unwrap()
+                        .query_map([], |row| row.get(1))
+                        .unwrap()
+                        .map(|row| row.unwrap())
+                        .collect();
+                    columns
+                        .iter()
+                        .map(|column| {
+                            db.query_row(
+                                &format!("SELECT count(*) FROM \"{table}\" WHERE typeof(\"{column}\")='text' AND instr(\"{column}\",?1)>0"),
+                                [&old_text],
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .unwrap()
+                        })
+                        .sum::<i64>()
+                })
+                .sum()
+        };
+        assert_eq!(leftover, 0, "no recorded path still names the old root");
+        assert_eq!(
+            inventory.configure_workspace_dir(&new).unwrap(),
+            0,
+            "idempotent"
+        );
+        assert_eq!(inventory.workspace_dir(), new);
+    }
+
+    /// An in-flight workspace (open journal, one attempt) whose root is
+    /// copy-moved: the journal's copy of the scratch and its attempt are
+    /// re-stamped with the row, so startup reconcile leaves it to its
+    /// transform and the transform resumes. A value naming the old root
+    /// unquoted mid-string is neither rewritten nor counted, so a later start
+    /// re-stamps nothing; a crash between the commit and the sidecar write
+    /// (stale sidecar back in place) is finished by the next start.
+    #[test]
+    fn in_flight_workspace_survives_a_copy_moved_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("processing");
+        std::fs::create_dir(&root).unwrap();
+        let state = temp.path().join("state");
+        let inventory = Inventory::open(&state).unwrap();
+        inventory
+            .allocate_for_delivery(12, &root, &root.join("job"), false, false)
+            .unwrap();
+        std::fs::write(root.join("job/original"), b"original").unwrap();
+        let mut workspace = inventory.workspace(12, "par_repair", "abc").unwrap();
+        let attempt = inventory.begin_workspace_attempt(&mut workspace).unwrap();
+        std::fs::write(attempt.join("partial"), b"half").unwrap();
+        let old = state.join("transform-workspaces");
+        let note = format!("repair failed under {}/abc, retrying", old.display());
+        inventory
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO events(artifact,at,kind,detail) VALUES('note',0,'note',?1)",
+                [&note],
+            )
+            .unwrap();
+        let sidecar = state
+            .join("artifact-identities")
+            .join(&workspace.scratch.id)
+            .join(format!("{}.json", workspace.scratch.generation));
+        inventory.close().unwrap();
+        drop(inventory);
+        let new = temp.path().join("scratch-volume/.workspaces");
+        copy_tree(&old, &new);
+        std::fs::remove_dir_all(&old).unwrap();
+        let stale_sidecar = std::fs::read(&sidecar).unwrap();
+
+        let inventory = Inventory::open(&state).unwrap();
+        assert!(inventory.configure_workspace_dir(&new).unwrap() > 0);
+        inventory.close().unwrap();
+        drop(inventory);
+        // Crash after the commit, before the sidecar write.
+        std::fs::write(&sidecar, &stale_sidecar).unwrap();
+
+        let inventory = Inventory::open(&state).unwrap();
+        let before = inventory.get(&workspace.scratch.id).unwrap();
+        assert_eq!(
+            inventory.configure_workspace_dir(&new).unwrap(),
+            0,
+            "the unquoted mention is not a change"
+        );
+        let scratch = inventory.get(&workspace.scratch.id).unwrap();
+        assert_eq!(
+            scratch.revision, before.revision,
+            "nothing re-stamped twice"
+        );
+        let detail: String = inventory
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT detail FROM events WHERE artifact='note'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(detail, note);
+        inventory.verify(&scratch).unwrap();
+        assert!(inventory.is_transform_scratch(&scratch).unwrap());
+        inventory.reconcile_startup(&[12]).unwrap();
+        let scratch = inventory.get(&workspace.scratch.id).unwrap();
+        assert_eq!(scratch.state, "active", "not reclassified as an orphan");
+        assert!(scratch.job.is_none() && scratch.hold.as_deref() == Some("transform workspace"));
+        let mut resumed = inventory.workspace(12, "par_repair", "abc").unwrap();
+        assert_eq!(resumed.operation_id, workspace.operation_id);
+        assert!(resumed.scratch.path.starts_with(&new));
+        let next = inventory.begin_workspace_attempt(&mut resumed).unwrap();
+        assert_eq!(
+            std::fs::read(new.join(&workspace.operation_id).join("attempt-1/partial")).unwrap(),
+            b"half"
+        );
+        assert!(next.starts_with(&new));
+    }
+
     fn source(workspace: &Workspace) -> SourceGeneration {
         SourceGeneration {
             artifact: workspace.source.id.clone(),

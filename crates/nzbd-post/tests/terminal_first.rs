@@ -331,12 +331,12 @@ async fn enospc_hold_expires_to_failed() {
     );
     let terminal = engine.artifacts().terminal(job_id.0).unwrap().unwrap();
     let disposal = terminal.disposal.unwrap();
-    // The verified episode was salvaged; what remains of the source is
-    // retained (hold_expired parks — never deleted, whatever
-    // failure_action says).
+    // The verified episode was salvaged; a curator-admitted job follows
+    // `failure_action` once salvage settles (W3, replacing park-always), so
+    // what remains of the source is retired with the salvage delivery.
     assert_eq!(terminal.salvage, SalvageState::Published);
-    assert_eq!(disposal, "salvage published; source retained");
-    assert!(source.exists());
+    assert_eq!(disposal, "salvage published; source retired");
+    assert!(!source.exists());
     engine.shutdown().await;
 }
 
@@ -1199,10 +1199,13 @@ async fn absent_integrity_proof_is_unknown_not_cleanup_authority() {
     )
     .await;
     // Drop the proof: the bytes arrived, but no file CRC vouches for them.
+    // The rule is for jobs nobody re-grabs: a curator-admitted failure
+    // follows `failure_action` (W3), so this job is not curator's.
     let mut row = export(&engine, job_id).await.unwrap();
     for file in &mut row.files {
         file.crc32 = None;
     }
+    row.params.retain(|(key, _)| key != "monarr-transfer");
     engine.import_job(row, false, false).await.unwrap();
     assert!(engine
         .fail_job(
@@ -1237,6 +1240,89 @@ async fn absent_integrity_proof_is_unknown_not_cleanup_authority() {
         kept.exists() || source.join("Movie.2020.mkv").exists(),
         "unproven payload is retained: {disposal}"
     );
+    engine.shutdown().await;
+}
+
+/// R4 / W8 (jobs 2710, 2535): a keep-on-failure job whose source drifted
+/// after its inventory snapshot (a file vanished, another was rewritten)
+/// settles to a final kept state within a bounded number of follow-ups
+/// instead of re-assessing every scan. The kept bytes are not touched.
+#[tokio::test]
+async fn kept_failure_with_a_drifted_source_settles_and_stops() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, _history) = spawn(tmp.path(), Tuning::default()).await;
+    let (job_id, source) = admitted_job(
+        &engine,
+        "kept-drift",
+        &[
+            (
+                "Movie.2020.mkv",
+                Some(b"\x1a\x45\xdf\xa3 unproven matroska".as_slice()),
+            ),
+            ("notes.bin", Some(b"opaque sibling".as_slice())),
+            ("part.r00", Some(b"rewritten later".as_slice())),
+        ],
+        JobStatus::Failed,
+    )
+    .await;
+    let mut row = export(&engine, job_id).await.unwrap();
+    for file in &mut row.files {
+        file.crc32 = None;
+    }
+    row.params.push((
+        nzbd_engine::terminal::KEEP_ON_FAILURE_PARAM.into(),
+        "1".into(),
+    ));
+    engine.import_job(row, false, false).await.unwrap();
+    assert!(engine
+        .fail_job(job_id, FailureReason::Unpack, None, "unpack", "bad archive")
+        .await
+        .unwrap());
+    // Drift after the snapshot, while the owner is still verifying the
+    // re-imported row: one sibling gone, one rewritten. A terminal job's
+    // verification must not hold its follow-up forever over a missing file.
+
+    std::fs::remove_file(source.join("notes.bin")).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(source.join("part.r00"), b"rewritten by a repair, longer").unwrap();
+    let cfg = PostConfig {
+        failure_action: FailureAction::Delete,
+        failed_dir: Some(tmp.path().join("parked")),
+        ..PostConfig::default()
+    };
+    let dest = tmp.path().join("dest");
+    let mut attempts = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !nzbd_post::manager::follow_up_failure(&engine, &cfg, &dest, job_id).await {
+        attempts += 1;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the kept failure settles: {:?} {:?}",
+            engine.artifacts().terminal(job_id.0).unwrap(),
+            engine.artifacts().for_job(job_id.0).unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let terminal = engine.artifacts().terminal(job_id.0).unwrap().unwrap();
+    assert!(terminal.keep_on_failure);
+    assert_eq!(
+        terminal.disposal.as_deref(),
+        Some("kept"),
+        "after {attempts} retries"
+    );
+    assert!(source.join("Movie.2020.mkv").exists(), "kept bytes stay");
+    assert!(source.join("part.r00").exists());
+    let assessed = engine
+        .artifacts()
+        .job_source(job_id.0)
+        .unwrap()
+        .unwrap()
+        .failure_assessment
+        .expect("the advisory assessment settled after one re-snapshot");
+    assert!(!assessed.reason.is_empty());
+    // Settled: the next follow-up is a no-op, not another assessment.
+    assert!(nzbd_post::manager::follow_up_failure(&engine, &cfg, &dest, job_id).await);
+    assert!(engine.artifacts().pending_disposal().unwrap().is_empty());
     engine.shutdown().await;
 }
 
@@ -1276,7 +1362,7 @@ async fn failed_park_losing_admission_after_move_is_fenced_and_retried() {
         .unwrap());
     let parked = tmp.path().join("parked");
     let cfg = PostConfig {
-        failure_action: FailureAction::Delete,
+        failure_action: FailureAction::Park,
         failed_dir: Some(parked.clone()),
         ..PostConfig::default()
     };
@@ -1371,7 +1457,7 @@ async fn retry_now_runs_a_failed_source_follow_up_past_its_disposal_ladder() {
         .inject_relocation_test_fault(job_id.0, "before_commit", 5)
         .unwrap();
     let cfg = PostConfig {
-        failure_action: FailureAction::Delete,
+        failure_action: FailureAction::Park,
         failed_dir: Some(parked.clone()),
         ..PostConfig::default()
     };

@@ -6486,6 +6486,7 @@ const SETTINGS_SECTIONS = [
     ["paths.nzb_watch_dir", "watch dir for dropped .nzb (optional)", "text?"],
     ["paths.torrent_dir", "torrent payload dir (optional)", "text?"],
     ["paths.torrent_watch_dir", "watch dir for dropped .torrent (optional)", "text?"],
+    ["paths.workspace_dir", "transform workspace dir (optional; default under the state dir; put it on the processing volume)", "text?"],
   ]},
   { key: "servers", title: "News servers", desc: "Tier 0 is tried first; higher tiers are backups. Fill servers only see missing articles. Connection counts apply immediately when lowered; raising one above what the daemon started with needs a restart.", array: true },
   { key: "queue", title: "Speed & queue", desc: "Speed limit and simultaneous downloads apply immediately on save; the rest needs a restart.", fields: [
@@ -6927,7 +6928,22 @@ $("btn-restart").onclick = async () => {
   const msg = $("cfg-msg");
   msg.className = ""; msg.textContent = "restarting…";
   $("btn-restart").disabled = true;
-  try { await jfetch("/api/v1/restart", { method: "POST" }); } catch { /* listener bouncing */ }
+  // A restart that times out here must not run later when re-sent or
+  // delivered late: one key per click, and a two-minute validity window.
+  const notAfter = Math.floor(Date.now() / 1000) + 120;
+  const key = `ui-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    const r = await jfetch(`/api/v1/restart?not_after=${notAfter}`, { method: "POST", headers: { "Idempotency-Key": key } });
+    const body = await r.json().catch(() => ({}));
+    if (body.restarting === "deferred") {
+      // Running PAR repair / extraction would be lost: the restart runs once
+      // they finish (status.restart_pending), never cancelling them silently.
+      const what = (body.waiting_for || []).map(w => `${w.name} (${w.stage})`).join(", ");
+      msg.textContent = `restart waits for post-processing to finish: ${what}`;
+      $("btn-restart").disabled = false;
+      return;
+    }
+  } catch { /* listener bouncing */ }
   for (let i = 0; i < 60; i++) {
     await new Promise(res => setTimeout(res, 500));
     try { const status = await jfetch("/api/v1/status"); if (status.ok && i > 1) break; } catch { /* loading or unavailable */ }

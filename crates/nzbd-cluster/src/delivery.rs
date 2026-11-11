@@ -1360,6 +1360,7 @@ mod tests {
             pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
+            workspace_dir: None,
         };
         drop(raft);
         drop(api);
@@ -1556,6 +1557,7 @@ mod tests {
             pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
+            workspace_dir: None,
         };
         drop(raft);
         drop(api);

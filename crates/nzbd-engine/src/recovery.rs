@@ -10,6 +10,58 @@ use std::{
 
 pub(crate) const WRITER_PROTOCOL: u32 = 1;
 
+/// Test-only counting probe: payload file opens and bytes read by the
+/// verification, resolution and writer paths, scoped to a watched
+/// directory so parallel tests never see each other's I/O.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default, Debug)]
+    pub(crate) struct Counts {
+        pub opens: AtomicU64,
+        pub bytes: AtomicU64,
+    }
+    impl Counts {
+        pub fn opens(&self) -> u64 {
+            self.opens.load(Ordering::SeqCst)
+        }
+        pub fn bytes(&self) -> u64 {
+            self.bytes.load(Ordering::SeqCst)
+        }
+    }
+    type Watches = Mutex<Vec<(PathBuf, Arc<Counts>)>>;
+    static WATCHES: Watches = Mutex::new(Vec::new());
+
+    pub(crate) fn watch(dir: &Path) -> Arc<Counts> {
+        let counts = Arc::new(Counts::default());
+        WATCHES
+            .lock()
+            .unwrap()
+            .push((dir.to_path_buf(), counts.clone()));
+        counts
+    }
+    fn each(path: &Path, f: impl Fn(&Counts)) {
+        for (dir, counts) in WATCHES.lock().unwrap().iter() {
+            if path.starts_with(dir) {
+                f(counts);
+            }
+        }
+    }
+    pub(crate) fn opened(path: &Path) {
+        each(path, |counts| {
+            counts.opens.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+    pub(crate) fn read(path: &Path, bytes: u64) {
+        each(path, |counts| {
+            counts.bytes.fetch_add(bytes, Ordering::SeqCst);
+        });
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub(crate) struct ProvenRange {
     pub seg_number: u32,
@@ -72,10 +124,12 @@ impl DurableFileProof {
     }
 }
 
-/// Protocol 1 relies on local filesystem descriptor identity and sync semantics.
-/// Network/FUSE mounts need deployment-specific identity and flush qualification;
-/// until then, their proofs retain provenance but recovery reads their ranges.
-/// This is evidence admission, with no operator feature-enable switch.
+/// A writer proof is recorded only after the range's write, `sync_data` and
+/// `fstat` succeeded (writer.rs `PendingWrites::flush`), so a proven range
+/// needs no re-read on any filesystem — Gluster/FUSE and NFS included: a
+/// successful sync is the same durability claim there. What the proof still
+/// requires is a mount identity this build can parse (platform + filesystem
+/// kind), so the object it names is the object found (Paul, 2026-11-11).
 pub(crate) fn metadata_trustworthy(identity: &Identity) -> bool {
     let mut parts = identity.mount_id.lines();
     if !matches!(parts.next(), Some("linux" | "macos")) {
@@ -84,13 +138,7 @@ pub(crate) fn metadata_trustworthy(identity: &Identity) -> bool {
     let Some((length, kind)) = parts.next().and_then(|part| part.split_once(':')) else {
         return false;
     };
-    if length.parse::<usize>().ok() != Some(kind.len()) {
-        return false;
-    }
-    matches!(
-        kind,
-        "ext2" | "ext3" | "ext4" | "xfs" | "btrfs" | "zfs" | "apfs" | "hfs" | "tmpfs" | "overlay"
-    )
+    !kind.is_empty() && length.parse::<usize>().ok() == Some(kind.len())
 }
 
 pub(crate) fn coherent_ranges(ranges: &[ProvenRange], bytes: u64) -> bool {
@@ -141,6 +189,8 @@ pub(crate) fn validate_range(
     crc: u32,
     expected: Option<&Identity>,
 ) -> ValidationOutcome {
+    #[cfg(test)]
+    probe::opened(path);
     let mut file = match nzbd_state::fileops::open(path) {
         Ok(file) => file,
         Err(error) => return open_outcome(error),
@@ -170,6 +220,8 @@ pub(crate) fn validate_range(
             return ValidationOutcome::Unavailable(error.to_string());
         }
         digest.update(&data[..amount]);
+        #[cfg(test)]
+        probe::read(path, amount as u64);
         remaining -= amount as u64;
     }
     let after = match capture_identity(&file) {
@@ -237,6 +289,8 @@ pub(crate) fn resolve_payload(
             }
             Ok(_) => {}
         }
+        #[cfg(test)]
+        probe::opened(&path);
         let opened =
             nzbd_state::fileops::open(&path).map_err(|error| ResolveError::unavailable(&error))?;
         let identity = nzbd_state::fileops::identity(&opened)
@@ -353,7 +407,7 @@ mod tests {
 mod metadata_admission_tests {
     use super::*;
     #[test]
-    fn unqualified_network_and_unknown_identity_require_range_reads() {
+    fn any_parsed_mount_identity_is_trusted_unknown_identity_is_not() {
         let identity = |mount_id: &str| Identity {
             device: 1,
             inode: 2,
@@ -363,14 +417,11 @@ mod metadata_admission_tests {
             changed: "c".into(),
             directory: false,
         };
-        for mount in [
-            "",
-            "linux\n14:fuse.glusterfs",
-            "linux\n4:nfs4",
-            "linux\n3:ext4",
-            "unknown\n4:ext4",
-        ] {
+        for mount in ["", "linux\n3:ext4", "unknown\n4:ext4", "linux\n0:"] {
             assert!(!metadata_trustworthy(&identity(mount)), "{mount}");
+        }
+        for mount in ["linux\n14:fuse.glusterfs\n4:/dev", "linux\n4:nfs4\n3:nas"] {
+            assert!(metadata_trustworthy(&identity(mount)), "{mount}");
         }
         assert!(metadata_trustworthy(&identity(
             "linux\n4:ext4\n9:/dev/data"

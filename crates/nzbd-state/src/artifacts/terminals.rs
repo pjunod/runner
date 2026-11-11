@@ -251,6 +251,37 @@ fn set_artifact_salvage(tx: &Connection, job: u32, salvage: SalvageState) -> Res
 /// only; `job_terminals` stays the authority). The source is picked by role,
 /// not recency: a publication (state `transferred`, or any artifact a delivery
 /// row names as its published one) belongs to Curator and is never marked.
+/// W2: a failed terminal whose salvage settled `none` while a publication
+/// of the job was still unresolved, and whose move later committed, owes
+/// that publication as salvage. Reopen the obligation so the salvage path
+/// finishes it from the journal. Runs in the intent-commit transaction and,
+/// for rows an older build left, once per open. Idempotent: once the
+/// delivery row exists (or the publication is gone) nothing matches.
+pub(super) fn reopen_salvage_for_committed_publications(
+    tx: &Connection,
+    job: Option<u32>,
+) -> Result<usize> {
+    let jobs = {
+        let mut statement = tx.prepare(
+            "SELECT t.job FROM job_terminals t WHERE t.outcome='failed' AND t.salvage='settled_none' AND (?1 IS NULL OR t.job=?1) AND EXISTS (SELECT 1 FROM relocation_intents i JOIN artifacts a ON a.id=i.artifact WHERE i.job=t.job AND i.state='committed' AND json_extract(a.data,'$.generation')=i.generation AND a.path=i.target_dir AND a.state IN ('active','completed') AND json_extract(a.data,'$.owned')=1 AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.artifact=i.artifact AND d.generation=i.generation))",
+        )?;
+        let rows = statement.query_map([job], |row| row.get::<_, u32>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for job in &jobs {
+        tx.execute(
+            "UPDATE job_terminals SET salvage='pending',salvage_error=NULL,updated_at=?2 WHERE job=?1",
+            rusqlite::params![job, now()],
+        )?;
+        set_artifact_salvage(tx, *job, SalvageState::Pending)?;
+        tracing::info!(
+            job,
+            "committed publication reopens a settled salvage obligation"
+        );
+    }
+    Ok(jobs.len())
+}
+
 fn set_artifact_failure_reason(tx: &Connection, job: u32, reason: FailureReason) -> Result<usize> {
     Ok(tx.execute(
         "UPDATE artifacts SET data=json_set(data,'$.failure_reason',?2) WHERE id=(SELECT id FROM artifacts WHERE job=?1 AND json_extract(data,'$.state')<>'transferred' AND id NOT IN (SELECT artifact FROM deliveries) ORDER BY updated_at DESC LIMIT 1)",
@@ -401,10 +432,27 @@ impl Inventory {
     /// Settle the salvage obligation (contract §2.2): `published` once the
     /// salvage publication is announced, `settled_none` when nothing was
     /// usable. Settling an obligation that is not pending is a no-op.
+    ///
+    /// `settled_none` is refused while a publication move of the job is
+    /// open: reconciliation may still commit it, and a committed
+    /// publication is a salvage publication (W2).
     pub fn settle_salvage(&self, job: u32, outcome: &SalvageOutcome) -> Result<()> {
         let _guard = self.mutation_guard()?;
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
+        if matches!(outcome, SalvageOutcome::None { .. }) {
+            let open: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM relocation_intents WHERE job=?1 AND state IN ('open','finishing','unwinding'))",
+                [job],
+                |row| row.get(0),
+            )?;
+            if open {
+                return Err(Error::Conflict(
+                    "a publication move of this job is still open; salvage settles once it resolves"
+                        .into(),
+                ));
+            }
+        }
         let (state, error) = match outcome {
             SalvageOutcome::Published(_) => (SalvageState::Published, None),
             SalvageOutcome::None { error } => (SalvageState::SettledNone, error.clone()),
@@ -418,6 +466,117 @@ impl Inventory {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Complete a failed job's salvage from a committed publication journal,
+    /// without the queue row (it may already be retired) and without reading
+    /// the publication: the delivery row is built from the journal and the
+    /// terminal. `None` when the job owes no such salvage.
+    pub fn finish_committed_salvage(&self, job: u32) -> Result<Option<super::Delivery>> {
+        let Some(terminal) = self.terminal(job)? else {
+            return Ok(None);
+        };
+        if terminal.outcome != TerminalOutcome::Failed || terminal.salvage != SalvageState::Pending
+        {
+            return Ok(None);
+        }
+        let Some(moved) = self.committed_intent_publication(job)? else {
+            return Ok(None);
+        };
+        if let Some(delivery) = self
+            .delivery_for_job(job)?
+            .filter(|delivery| delivery.publication_generation == moved.generation)
+        {
+            return Ok(Some(delivery));
+        }
+        let artifact = self.get(&moved.artifact_id)?;
+        if !artifact.delivery_lifecycle {
+            return Ok(None);
+        }
+        let root = moved
+            .published_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| artifact.root.clone());
+        self.finish(job, &moved.published_path, &root, "completed")?;
+        let prepared = self.prepare_delivery(job, true)?;
+        self.commit_prepared_delivery(
+            prepared,
+            terminal.transfer.as_deref(),
+            terminal.status(),
+            Some(terminal.stage.as_deref().unwrap_or_default()),
+            Some(terminal.message.as_deref().unwrap_or_default()),
+            terminal.keep_on_failure,
+            None,
+            None,
+        )
+        .map(Some)
+    }
+
+    /// W3 (Paul, 2026-11-11): a curator-admitted failure the job does not
+    /// keep follows `failure_action` once its salvage settles; under
+    /// `delete` it is never parked. Sources an older build parked under the
+    /// replaced park-always rule are due now, through the ordinary retention
+    /// path (`tick`). Returns how many became due.
+    pub fn expire_parked_curator_failures(&self) -> Result<usize> {
+        let _guard = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let raws = {
+            let mut statement = tx.prepare(
+                "SELECT a.data FROM artifacts a JOIN job_terminals t ON t.job=a.job WHERE a.state='parked_failed' AND t.outcome='failed' AND t.keep_on_failure=0 AND t.transfer IS NOT NULL AND t.salvage<>'pending'",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let at = now();
+        let mut due = 0;
+        for raw in raws {
+            let mut artifact: Artifact = serde_json::from_str(&raw)?;
+            if artifact.keep
+                || artifact.keep_on_failure
+                || artifact.deadline.is_some_and(|deadline| deadline <= at)
+            {
+                continue;
+            }
+            artifact.deadline = Some(at);
+            artifact.revision += 1;
+            artifact.updated_at = at;
+            save_artifact(&tx, &artifact)?;
+            event(
+                &tx,
+                &artifact.id,
+                "retention",
+                "curator-admitted failure follows failure_action",
+            )?;
+            due += 1;
+        }
+        tx.commit()?;
+        Ok(due)
+    }
+
+    /// W8: re-snapshot a failed source's file inventory once, for an
+    /// advisory assessment that found it drifted (a PAR repair rewrote a
+    /// part, a file vanished). Allowed for the owned, live source only.
+    pub fn refresh_failed_source(&self, job: u32) -> Result<Artifact> {
+        let Some(mut source) = self.job_source(job)? else {
+            return Err(Error::NotFound);
+        };
+        if !source.owned || source.terminal() || source.hold.is_some() {
+            return Err(Error::Conflict(
+                "failed source is not an owned live generation".into(),
+            ));
+        }
+        let original = source.clone();
+        let dir = self.verify(&source)?;
+        source.files = fs::manifest(&dir, 100_000)?;
+        source.inspected_at = Some(now());
+        source.revision += 1;
+        source.updated_at = now();
+        let _coordinator = self.mutation_guard()?;
+        self.check_payload_capture(&original)?;
+        save_artifact(&self.db.lock().unwrap(), &source)?;
+        Ok(source)
     }
 
     /// Record the disposal of a failed source; disposal is then done.
@@ -556,7 +715,7 @@ static TERMINAL_INSERT_FAILURES: std::sync::LazyLock<Mutex<std::collections::Has
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn entry(job: u32) -> crate::HistoryEntry {

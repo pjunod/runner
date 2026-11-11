@@ -550,6 +550,98 @@ pub struct StatusDto {
     pub servers: Vec<nzbd_engine::ServerVolume>,
     /// Cached capacity readings for the paths this process relies on.
     pub storage: Vec<StoragePathDto>,
+    /// W10: a restart waiting for post-processing to reach a resumable
+    /// boundary (PAR repair and extraction restart from scratch, so they
+    /// finish first). Absent when no restart is waiting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_pending: Option<RestartPending>,
+    /// W10: the last deferred restart that passed its `not_after` before
+    /// post-processing drained, so it did not run. Cleared by the next
+    /// restart request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_expired: Option<RestartPending>,
+    /// Restart phase timings since process start: listener bound, first
+    /// article lease, classification, per-root background reconciliation.
+    pub startup: nzbd_engine::startup_phases::StartupPhases,
+}
+
+/// A deferred restart: when it was asked for and what it waits on.
+#[derive(Clone, Debug, Serialize)]
+pub struct RestartPending {
+    pub requested_at_unix: i64,
+    /// The request's `not_after`: past it, the restart expires unrun.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_after_unix: Option<i64>,
+    pub waiting_for: Vec<RestartWait>,
+    /// Idempotency keys of the requests this restart answers.
+    #[serde(skip)]
+    keys: Vec<String>,
+    /// Backend generation the request was made under: a reload since then
+    /// already restarted.
+    #[serde(skip)]
+    generation: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RestartWait {
+    pub job: u32,
+    pub name: String,
+    pub stage: &'static str,
+}
+
+static RESTART_PENDING: std::sync::Mutex<Option<RestartPending>> = std::sync::Mutex::new(None);
+
+/// The repair/extract drain is exactly "a restart is pending". Called with
+/// the `RESTART_PENDING` guard held, so no request, expiry or cancel can
+/// interleave between changing the slot and the flag (a re-request racing
+/// an expiry once left the drain on with nothing pending, and repair and
+/// extraction never started again).
+fn sync_restart_drain(pending: &Option<RestartPending>) {
+    nzbd_engine::set_restart_drain(pending.is_some());
+}
+static RESTART_EXPIRED: std::sync::Mutex<Option<RestartPending>> = std::sync::Mutex::new(None);
+
+/// The backend currently serving (each in-process reload builds a new
+/// engine and setup handle): a deferred restart polls and restarts *this*
+/// one, never the one it was asked under.
+///
+/// It holds only what the poller reads — the published queue snapshot and
+/// the config-only setup handle — never an [`EngineHandle`]. The handle owns
+/// the backend's `artifacts.sqlite` inventory and history store, both opened
+/// `locking_mode=EXCLUSIVE` behind directory locks: a process-wide clone of
+/// it outlived the backend's teardown, and the reload's fresh instance could
+/// then never acquire them (it is registered here only *after* opening them),
+/// so every in-process restart stayed `backend_loading` forever.
+static CURRENT_BACKEND: std::sync::Mutex<Option<(nzbd_engine::SharedSnapshot, Arc<SetupHandle>)>> =
+    std::sync::Mutex::new(None);
+static BACKEND_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn register_backend(engine: &EngineHandle, setup: &Arc<SetupHandle>) {
+    *CURRENT_BACKEND.lock().unwrap() = Some((engine.shared_snapshot(), setup.clone()));
+    BACKEND_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    // A restart deferred under the previous backend is settled by this
+    // reload (or expired); either way its drain ends here, even if the task
+    // that polled it did not survive the reload.
+    poll_pending_restart(unix_now_secs());
+    sync_restart_drain(&RESTART_PENDING.lock().unwrap());
+}
+
+/// Post-processing a restart would throw away: a running PAR repair or
+/// extraction (both restart from the beginning after a reload).
+fn restart_blockers(snap: &QueueSnapshot) -> Vec<RestartWait> {
+    snap.jobs
+        .iter()
+        .filter_map(|job| match job.status {
+            JobStatus::Post {
+                stage: stage @ (nzbd_types::PostStage::ParRepair | nzbd_types::PostStage::Unpack),
+            } => Some(RestartWait {
+                job: job.id.0,
+                name: job.name.clone(),
+                stage: stage.as_str(),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 pub fn status_dto(snap: &QueueSnapshot) -> StatusDto {
@@ -626,6 +718,9 @@ fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -
         }),
         servers: snap.server_volumes.clone(),
         storage,
+        restart_pending: RESTART_PENDING.lock().unwrap().clone(),
+        restart_expired: RESTART_EXPIRED.lock().unwrap().clone(),
+        startup: snap.startup.clone(),
     }
 }
 
@@ -2962,14 +3057,393 @@ async fn put_config(
 
 /// Restart the daemon: tear down and re-run with the config on disk.
 /// The listener bounces for a moment; the UI polls /healthz.
-async fn post_restart(State(st): State<ApiState>) -> Response {
+#[derive(Deserialize, Default)]
+struct RestartQuery {
+    /// Unix seconds after which this request must not run (W10): a restart
+    /// that timed out on the client and is re-sent, or delivered late, is
+    /// refused instead of cancelling work started since.
+    not_after: Option<i64>,
+    /// Restart now even if PAR repair or extraction is running (W10).
+    #[serde(default)]
+    force: bool,
+}
+
+/// What became of a restart request, by idempotency key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestartOutcome {
+    /// Deferred, waiting for post-processing to drain.
+    Pending,
+    Executed,
+    /// Passed its `not_after` before it could run.
+    Expired,
+    Cancelled,
+}
+
+/// Idempotency keys of restart requests and what became of them. Kept
+/// across in-process backend reloads (the API state is rebuilt by each).
+static RESTART_OUTCOMES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::VecDeque<(String, RestartOutcome)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn set_restart_outcome(keys: &[String], outcome: RestartOutcome) {
+    let mut outcomes = RESTART_OUTCOMES.lock().unwrap();
+    for key in keys {
+        match outcomes.iter_mut().find(|(seen, _)| seen == key) {
+            Some(entry) => entry.1 = outcome,
+            None => outcomes.push_back((key.clone(), outcome)),
+        }
+    }
+    while outcomes.len() > 64 {
+        outcomes.pop_front();
+    }
+}
+
+/// W10: `Idempotency-Key` (header) makes a re-sent restart answer with what
+/// became of the first one; `not_after` refuses a stale one. Both optional
+/// for existing callers. `Ok(None)` is a new request (recorded `pending`).
+fn restart_admission(
+    key: Option<&str>,
+    not_after: Option<i64>,
+    now: i64,
+) -> Result<Option<RestartOutcome>, &'static str> {
+    let key = key.filter(|key| !key.is_empty());
+    if let Some(key) = key {
+        if let Some((_, outcome)) = RESTART_OUTCOMES
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(seen, _)| seen == key)
+        {
+            return Ok(Some(*outcome));
+        }
+    }
+    if not_after.is_some_and(|deadline| now > deadline) {
+        return Err("restart request expired (not_after has passed); send a new one");
+    }
+    if let Some(key) = key {
+        set_restart_outcome(&[key.to_owned()], RestartOutcome::Pending);
+    }
+    Ok(None)
+}
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// What one poll of a deferred restart decided.
+#[derive(Debug, PartialEq, Eq)]
+enum RestartStep {
+    /// Nothing pending (cancelled or already settled).
+    Done,
+    Wait,
+    Expired,
+    /// A reload happened since the request: it already restarted.
+    AlreadyReloaded,
+    /// Post-processing drained: restart now.
+    Restart,
+}
+
+/// One poll: settle the pending restart against the current backend.
+fn poll_pending_restart(now: i64) -> RestartStep {
+    let mut pending = RESTART_PENDING.lock().unwrap();
+    let generation = BACKEND_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    let backend = CURRENT_BACKEND.lock().unwrap().clone();
+    let step = settle_restart(&mut pending, now, generation, || {
+        backend
+            .as_ref()
+            .map(|(snapshot, _)| restart_blockers(&snapshot.load_full()))
+    });
+    sync_restart_drain(&pending);
+    drop(pending);
+    if step == RestartStep::Restart {
+        if let Some((_, setup)) = backend {
+            setup
+                .applied
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            setup.reload.notify_one();
+        }
+    }
+    step
+}
+
+/// [`poll_pending_restart`] on a given slot: `blockers` reads the current
+/// backend (None when no backend is registered yet).
+fn settle_restart(
+    pending: &mut Option<RestartPending>,
+    now: i64,
+    generation: u64,
+    blockers: impl FnOnce() -> Option<Vec<RestartWait>>,
+) -> RestartStep {
+    let Some(current) = pending.as_mut() else {
+        return RestartStep::Done;
+    };
+    let step = if current
+        .not_after_unix
+        .is_some_and(|deadline| now > deadline)
+    {
+        RestartStep::Expired
+    } else if generation != current.generation {
+        RestartStep::AlreadyReloaded
+    } else {
+        match blockers() {
+            Some(waiting) if waiting.is_empty() => RestartStep::Restart,
+            Some(waiting) => {
+                current.waiting_for = waiting;
+                RestartStep::Wait
+            }
+            None => RestartStep::Wait,
+        }
+    };
+    match step {
+        RestartStep::Wait | RestartStep::Done => {}
+        RestartStep::Expired => {
+            let expired = pending.take().unwrap();
+            tracing::warn!(not_after = ?expired.not_after_unix,
+                "deferred restart expired before post-processing drained; not restarting");
+            set_restart_outcome(&expired.keys, RestartOutcome::Expired);
+            *RESTART_EXPIRED.lock().unwrap() = Some(expired);
+        }
+        RestartStep::AlreadyReloaded => {
+            let done = pending.take().unwrap();
+            tracing::info!("deferred restart satisfied by a reload that already happened");
+            set_restart_outcome(&done.keys, RestartOutcome::Executed);
+        }
+        RestartStep::Restart => {
+            let done = pending.take().unwrap();
+            set_restart_outcome(&done.keys, RestartOutcome::Executed);
+            tracing::info!("post-processing reached a resumable boundary; restarting");
+        }
+    }
+    step
+}
+
+#[cfg(test)]
+mod restart_admission_tests {
+    use super::*;
+    /// R5 / W10: a stale restart is refused; a re-sent one answers with
+    /// what became of the first.
+    #[test]
+    fn stale_restart_is_refused_and_a_resend_answers_its_outcome() {
+        assert!(restart_admission(None, Some(99), 100).is_err());
+        assert_eq!(restart_admission(None, Some(100), 100), Ok(None));
+        assert_eq!(restart_admission(None, None, 100), Ok(None));
+        let key = "restart-test-key-r5";
+        assert_eq!(restart_admission(Some(key), Some(200), 100), Ok(None));
+        assert_eq!(
+            restart_admission(Some(key), Some(200), 150),
+            Ok(Some(RestartOutcome::Pending)),
+            "a deferral is pending, not executed"
+        );
+        set_restart_outcome(&[key.to_owned()], RestartOutcome::Executed);
+        assert_eq!(
+            restart_admission(Some(key), Some(200), 201),
+            Ok(Some(RestartOutcome::Executed))
+        );
+    }
+
+    fn pend(key: &str, not_after: Option<i64>) -> Option<RestartPending> {
+        set_restart_outcome(&[key.to_owned()], RestartOutcome::Pending);
+        Some(RestartPending {
+            requested_at_unix: 100,
+            not_after_unix: not_after,
+            waiting_for: vec![],
+            keys: vec![key.to_owned()],
+            generation: 7,
+        })
+    }
+
+    fn wait() -> Option<Vec<RestartWait>> {
+        Some(vec![RestartWait {
+            job: 1,
+            name: "x".into(),
+            stage: "par_repair",
+        }])
+    }
+
+    /// Finding 6: a deferred restart expires at its `not_after` (reported,
+    /// never fired late), a reload since the request settles it, and a
+    /// re-sent key reports which of those happened.
+    #[test]
+    fn a_deferred_restart_expires_at_not_after_and_a_reload_settles_it() {
+        let mut slot = pend("k-expire", Some(200));
+        assert_eq!(settle_restart(&mut slot, 150, 7, wait), RestartStep::Wait);
+        assert!(slot.is_some());
+        assert_eq!(
+            settle_restart(&mut slot, 201, 7, wait),
+            RestartStep::Expired
+        );
+        assert!(slot.is_none());
+        assert_eq!(
+            restart_admission(Some("k-expire"), Some(300), 250),
+            Ok(Some(RestartOutcome::Expired))
+        );
+        let mut slot = pend("k-reload", None);
+        assert_eq!(
+            settle_restart(&mut slot, 150, 8, wait),
+            RestartStep::AlreadyReloaded
+        );
+        assert_eq!(
+            restart_admission(Some("k-reload"), None, 150),
+            Ok(Some(RestartOutcome::Executed))
+        );
+        assert_eq!(settle_restart(&mut slot, 150, 8, wait), RestartStep::Done);
+        // The blockers are read from the backend on every poll.
+        let mut slot = pend("k-drained", None);
+        assert_eq!(
+            settle_restart(&mut slot, 150, 7, || Some(vec![])),
+            RestartStep::Restart
+        );
+        assert_eq!(
+            restart_admission(Some("k-drained"), None, 150),
+            Ok(Some(RestartOutcome::Executed))
+        );
+    }
+
+    /// Finding 7: the drain is the pending slot. An expiry clears it, a
+    /// re-request after the expiry sets it again (no stale `false` from the
+    /// expired poll can land after it), and DELETE clears it even when
+    /// nothing is pending.
+    #[tokio::test]
+    async fn the_drain_follows_the_pending_slot() {
+        // The only test touching the process-wide slot and drain.
+        let request = |not_after| {
+            let mut pending = RESTART_PENDING.lock().unwrap();
+            *pending = pend("k-drain", Some(not_after));
+            sync_restart_drain(&pending);
+        };
+        request(200);
+        assert!(nzbd_engine::restart_drain());
+        assert_eq!(poll_pending_restart(201), RestartStep::Expired);
+        assert!(!nzbd_engine::restart_drain(), "expired: nothing pending");
+        request(400);
+        assert!(nzbd_engine::restart_drain(), "the re-request drains again");
+        let _ = delete_restart().await;
+        assert!(RESTART_PENDING.lock().unwrap().is_none());
+        assert!(!nzbd_engine::restart_drain());
+        // A drain left on with nothing pending: DELETE still ends it.
+        nzbd_engine::set_restart_drain(true);
+        let _ = delete_restart().await;
+        assert!(!nzbd_engine::restart_drain());
+    }
+}
+
+async fn post_restart(
+    State(st): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<RestartQuery>,
+) -> Response {
     let Some(h) = &st.setup else {
         return error(StatusCode::NOT_FOUND, "no config handle");
     };
-    tracing::info!("restart requested from the settings UI");
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|key| !key.is_empty());
+    let now = unix_now_secs();
+    match restart_admission(key, query.not_after, now) {
+        Err(reason) => return error(StatusCode::CONFLICT, reason),
+        Ok(Some(outcome)) => {
+            tracing::info!(
+                key,
+                ?outcome,
+                "restart re-sent for an idempotency key already seen"
+            );
+            let answer = match outcome {
+                RestartOutcome::Pending => {
+                    json!({ "ok": true, "restarting": "deferred", "duplicate": true })
+                }
+                RestartOutcome::Executed => {
+                    json!({ "ok": true, "restarting": false, "duplicate": true })
+                }
+                RestartOutcome::Expired => {
+                    json!({ "ok": false, "restarting": false, "duplicate": true, "expired": true })
+                }
+                RestartOutcome::Cancelled => {
+                    json!({ "ok": false, "restarting": false, "duplicate": true, "cancelled": true })
+                }
+            };
+            return Json(answer).into_response();
+        }
+        Ok(None) => {}
+    }
+    RESTART_EXPIRED.lock().unwrap().take();
+    let keys = key.map(|key| vec![key.to_owned()]).unwrap_or_default();
+    // W10: never cancel hours of PAR repair or extraction silently. Unless
+    // the operator forces it, the restart waits for them (visible in
+    // /api/v1/status as `restart_pending`): no new repair or extraction
+    // starts meanwhile (the drain), and past `not_after` it expires.
+    let waiting = restart_blockers(&st.engine.snapshot());
+    if !query.force && !waiting.is_empty() {
+        let generation = BACKEND_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+        let spawn = {
+            let mut pending = RESTART_PENDING.lock().unwrap();
+            let spawn = pending.is_none();
+            let mut all_keys = pending.take().map(|p| p.keys).unwrap_or_default();
+            all_keys.extend(keys);
+            *pending = Some(RestartPending {
+                requested_at_unix: now,
+                not_after_unix: query.not_after,
+                waiting_for: waiting.clone(),
+                keys: all_keys,
+                generation,
+            });
+            sync_restart_drain(&pending);
+            spawn
+        };
+        tracing::info!(waiting = ?waiting, not_after = query.not_after,
+            "restart deferred until post-processing reaches a resumable boundary");
+        if spawn {
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    if poll_pending_restart(unix_now_secs()) != RestartStep::Wait {
+                        return;
+                    }
+                }
+            });
+        }
+        return Json(json!({ "ok": true, "restarting": "deferred", "waiting_for": waiting }))
+            .into_response();
+    }
+    let mut all_keys = {
+        let mut pending = RESTART_PENDING.lock().unwrap();
+        let taken = pending.take();
+        sync_restart_drain(&pending);
+        taken.map(|p| p.keys).unwrap_or_default()
+    };
+    all_keys.extend(keys);
+    set_restart_outcome(&all_keys, RestartOutcome::Executed);
+    tracing::info!(
+        key,
+        not_after = query.not_after,
+        force = query.force,
+        "restart requested from the settings UI"
+    );
     h.applied.store(true, std::sync::atomic::Ordering::Relaxed);
     h.reload.notify_one();
     Json(json!({ "ok": true, "restarting": true })).into_response()
+}
+
+/// W10: cancel a deferred restart. Repair and extraction resume admission.
+async fn delete_restart() -> Response {
+    let cancelled = {
+        let mut pending = RESTART_PENDING.lock().unwrap();
+        let taken = pending.take();
+        // Always: a drain left on with nothing pending ends here too.
+        sync_restart_drain(&pending);
+        taken
+    };
+    match cancelled {
+        Some(pending) => {
+            set_restart_outcome(&pending.keys, RestartOutcome::Cancelled);
+            tracing::info!("deferred restart cancelled");
+            Json(json!({ "ok": true, "cancelled": true })).into_response()
+        }
+        None => Json(json!({ "ok": true, "cancelled": false })).into_response(),
+    }
 }
 
 /// Observed compat clients (Sonarr/Radarr polling us) — the UI's
@@ -3193,6 +3667,7 @@ async fn history_action(
 /// already builds its router inside one.
 pub fn router_with(state: ApiState) -> Router {
     if let Some(setup) = &state.setup {
+        register_backend(&state.engine, setup);
         let roots = setup
             .current
             .lock()
@@ -3273,7 +3748,7 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/setup", get(get_setup).post(post_setup))
         .route("/api/v1/config", get(get_config).put(put_config))
-        .route("/api/v1/restart", post(post_restart))
+        .route("/api/v1/restart", post(post_restart).delete(delete_restart))
         .route("/healthz", get(healthz))
         .route("/", get(ui_index))
         .route("/manifest.webmanifest", get(pwa_manifest))
@@ -3566,6 +4041,42 @@ mod tests {
             params: vec![],
             stages: vec![],
         }
+    }
+
+    /// W10: only a running PAR repair or extraction defers a restart.
+    #[test]
+    fn restart_waits_only_for_par_repair_and_extraction() {
+        use nzbd_types::PostStage;
+        let snapshot = QueueSnapshot {
+            jobs: vec![
+                summary(
+                    1,
+                    JobStatus::Post {
+                        stage: PostStage::ParRepair,
+                    },
+                ),
+                summary(
+                    2,
+                    JobStatus::Post {
+                        stage: PostStage::Unpack,
+                    },
+                ),
+                summary(
+                    3,
+                    JobStatus::Post {
+                        stage: PostStage::ParVerify,
+                    },
+                ),
+                summary(4, JobStatus::Downloading),
+            ],
+            ..Default::default()
+        };
+        let waiting = super::restart_blockers(&snapshot);
+        assert_eq!(
+            waiting.iter().map(|w| (w.job, w.stage)).collect::<Vec<_>>(),
+            vec![(1, "par_repair"), (2, "unpack")]
+        );
+        assert!(super::restart_blockers(&QueueSnapshot::default()).is_empty());
     }
 
     #[test]

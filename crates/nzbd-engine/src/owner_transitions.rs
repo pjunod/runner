@@ -218,6 +218,62 @@ fn needs_payload(job: &Job) -> bool {
         && job.status != JobStatus::Deleted
 }
 
+/// Remove `.runner-file-<id>.part` names left behind by a finalize that
+/// published the file (link, then unlink of the partial) but was killed
+/// before the unlink. A partial is removed only when its file is finalized
+/// and the published name is the *same object* (device + inode), so the
+/// removal drops a second name and never the only copy of the payload.
+/// Every other partial — unfinalized, unknown to the job, or a different
+/// object than the publication — stays for the job's own lifecycle
+/// (resume, salvage, closed-scope cleanup or disposal).
+pub(super) fn sweep_stale_parts(dir: &std::path::Path, finalized: &HashMap<u32, String>) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".runner-file-"))
+            .and_then(|rest| rest.strip_suffix(".part"))
+            .and_then(|id| id.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(published) = finalized.get(&id) else {
+            continue;
+        };
+        if !crate::recovery::safe_name(published) {
+            continue;
+        }
+        let (Ok(part), Ok(publication)) = (
+            std::fs::symlink_metadata(entry.path()),
+            std::fs::symlink_metadata(dir.join(published)),
+        ) else {
+            continue;
+        };
+        if !part.is_file()
+            || !publication.is_file()
+            || part.dev() != publication.dev()
+            || part.ino() != publication.ino()
+        {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => {
+                removed += 1;
+                tracing::info!(path = %entry.path().display(), "removed the leftover partial name of a published file");
+            }
+            Err(error) => {
+                tracing::warn!(path = %entry.path().display(), %error, "leftover partial name remains");
+            }
+        }
+    }
+    removed
+}
+
 pub(super) fn failed_cleanup_only(job: &Job) -> bool {
     job.params
         .iter()
@@ -556,6 +612,7 @@ impl Owner {
         callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
     ) {
         let job = request.job.id;
+        self.boot_jobs.remove(&job);
         if !self.persist
             || self.cancel.is_cancelled()
             || self.allocating_jobs.contains(&job)
@@ -1215,6 +1272,9 @@ impl Owner {
         callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
     ) {
         let job = candidate.id;
+        // An imported row's ranges were not written by this boot's
+        // snapshot: they are verified, never stamped (no-wedge item 5).
+        self.boot_jobs.remove(&job);
         // An imported row may come from a 0.5.0 node (a hold as `paused`).
         crate::normalize_stored_hold_status(&mut candidate, "imported job");
         if require_existing && self.state.job(job).is_none() {
@@ -1419,6 +1479,8 @@ impl Owner {
         adopted_speed: Option<(u64, Option<u64>)>,
         callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
     ) {
+        // Replicated rows are verified, never stamped (no-wedge item 5).
+        self.boot_jobs.clear();
         // Replicated rows may come from a 0.5.0 node (a hold as `paused`).
         for job in &mut jobs {
             crate::normalize_stored_hold_status(job, "replicated authority");
@@ -1620,9 +1682,17 @@ impl Owner {
         });
     }
 
-    /// Enumerate lifecycle roots on the state lane, then reconcile each root
-    /// ahead of its allocation and verification workers. Orphan-only roots are
-    /// included so interrupted lifecycle operations cannot be skipped forever.
+    /// Enumerate lifecycle roots and open lifecycle intents on the state
+    /// lane (metadata only), classify every recovered job, then reconcile
+    /// each root in the background.
+    ///
+    /// No-wedge (Paul, 2026-11-11): the only file that may need anything at
+    /// a restart is the one being written; resume or re-fetch it and keep
+    /// moving. Until classification lands every job holds a "loading"
+    /// ticket (one SQLite pass). Then a job keeps its ticket only for
+    /// unproven ranges, an identity conflict or an open lifecycle intent;
+    /// every other job — proven, paused, legacy — is released untouched and
+    /// checked lazily at writer spawn or post-processing admission.
     pub(super) fn schedule_startup_reconciliation(&mut self) {
         if self.startup_roots_loading
             || self.startup_roots_ready
@@ -1639,22 +1709,51 @@ impl Owner {
             .filter(|job| needs_payload(job))
             .map(|job| job.id)
             .collect::<Vec<_>>();
-        for job in jobs {
-            self.queue_verification(job);
-            if let Some(state) = self.verification.get_mut(&job) {
+        // One snapshot publication for the whole queue, not one per job.
+        self.publish_batched = true;
+        for job in &jobs {
+            self.queue_verification(*job);
+            if let Some(state) = self.verification.get_mut(job) {
                 state.phase = "loading".into();
             }
         }
+        self.publish_batched = false;
+        self.publish_now();
         let snapshot = self.startup_snapshot.clone();
-        self.io_then(move || Ok::<_, nzbd_state::StateError>(snapshot.roots().to_vec()), move |owner, result| {
+        let inventory = self.artifacts.clone();
+        let candidates = jobs.iter().map(|job| job.0).collect::<Vec<_>>();
+        self.io_then(move || {
+            let roots = snapshot.roots().to_vec();
+            let mut intents = inventory
+                .open_relocation_intents()
+                .map_err(failure)?
+                .into_iter()
+                .map(|intent| intent.job)
+                .collect::<HashSet<u32>>();
+            for job in candidates {
+                if inventory.has_transform_custody(job).map_err(failure)? {
+                    intents.insert(job);
+                }
+            }
+            Ok::<_, nzbd_state::StateError>((roots, intents))
+        }, move |owner, result| {
             owner.startup_roots_loading = false;
             match result {
-                Ok(mut roots) => {
+                Ok((mut roots, intents)) => {
                     roots.push(owner.dest_dir.clone());
                     roots.extend(owner.allocation_cache.values().map(|allocation| allocation.root.clone()));
                     roots.sort();
                     roots.dedup();
+                    owner.startup_intent_jobs = intents.into_iter().map(JobId).collect();
+                    // A retiring, retained or still-allocating allocation is
+                    // an open lifecycle intent of its own.
+                    owner.startup_intent_jobs.extend(
+                        owner.allocation_cache.iter()
+                            .filter(|(_, allocation)| allocation.state != "active")
+                            .map(|(job, _)| *job),
+                    );
                     owner.startup_roots_ready = true;
+                    owner.classify_startup_jobs();
                     for root in roots { owner.reconcile_payload_root(root); }
                 }
                 Err(error) => {
@@ -1666,6 +1765,51 @@ impl Owner {
                 }
             }
         });
+    }
+
+    /// Release every startup ticket the job does not need; hand the rest
+    /// to recovery now (a live active allocation does not wait for its
+    /// root's reconciliation).
+    fn classify_startup_jobs(&mut self) {
+        let mut released = 0u32;
+        let mut ticketed = Vec::new();
+        self.publish_batched = true;
+        let jobs = self
+            .state
+            .jobs
+            .iter()
+            .filter(|job| {
+                self.verification
+                    .get(&job.id)
+                    .is_some_and(|state| !state.running && state.phase == "loading")
+            })
+            .map(|job| (job.id, self.startup_ticket_needed(job)))
+            .collect::<Vec<_>>();
+        for (job, needed) in jobs {
+            if needed {
+                ticketed.push(job);
+            } else {
+                self.release_startup_ticket(job);
+                released += 1;
+            }
+        }
+        self.publish_batched = false;
+        self.startup_phases.classified_ms = Some(crate::startup_phases::since_boot_ms());
+        self.startup_phases.startup_tickets = ticketed.len() as u32;
+        self.startup_phases.startup_untouched = released;
+        tracing::info!(
+            released,
+            ticketed = ticketed.len(),
+            intents = self.startup_intent_jobs.len(),
+            "startup classification: proven and paused jobs released without verification"
+        );
+        for job in ticketed {
+            if !self.pending_control_commits.contains(&job) {
+                self.queue_payload_recovery(job);
+            }
+        }
+        self.publish_now();
+        self.bump_epoch();
     }
 
     fn reconcile_payload_root(&mut self, root: PathBuf) {
@@ -1695,10 +1839,76 @@ impl Owner {
         let worker_root = root.clone();
         let default_root = self.dest_dir.clone();
         let snapshot = self.startup_snapshot.clone();
-        self.payload_then(root.clone(), move || {
+        // W9: a `.runner-file-<id>.part` that is a second name of its
+        // finalized file's publication is removed at startup.
+        let parts = self
+            .state
+            .jobs
+            .iter()
+            .filter(|job| needs_payload(job))
+            .filter_map(|job| {
+                let allocation = self.allocation_cache.get(&job.id)?;
+                (allocation.root == root).then(|| {
+                    (
+                        allocation.path.clone(),
+                        job.files
+                            .iter()
+                            .filter(|file| file.finalized)
+                            .map(|file| {
+                                let key = format!("*File:proof:{}", file.id.0);
+                                let published = job
+                                    .params
+                                    .iter()
+                                    .find(|(name, _)| name == &key)
+                                    .and_then(|(_, raw)| {
+                                        serde_json::from_str::<crate::recovery::DurableFileProof>(
+                                            raw,
+                                        )
+                                        .ok()
+                                    })
+                                    .and_then(|proof| proof.publication_name)
+                                    .unwrap_or_else(|| file.filename.clone());
+                                (file.id.0, published)
+                            })
+                            .collect::<HashMap<u32, String>>(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        // No-wedge item 6: reconciliation runs off the payload lane, so a slow
+        // (FUSE/NFS) root never queues the lease-time allocation revalidation
+        // of its live active jobs behind it. It touches only allocations that
+        // are not live and active; jobs with open intents wait for it.
+        let started_ms = crate::startup_phases::since_boot_ms();
+        let started = Instant::now();
+        let label = root.display().to_string();
+        self.startup_phases
+            .roots
+            .retain(|entry| entry.root != label);
+        self.startup_phases
+            .roots
+            .push(crate::startup_phases::RootReconciliation {
+                root: label.clone(),
+                started_ms,
+                duration_ms: None,
+                ok: None,
+            });
+        self.background_then(format!("reconcile-{}", root.display()), move || {
             if worker_root == default_root { prepare_unenrolled_payload_root(&inventory, &worker_root)?; }
-            inventory.reconcile_startup_root_snapshot(&worker_root, &live, &snapshot).map_err(failure)
+            inventory.reconcile_startup_root_snapshot(&worker_root, &live, &snapshot).map_err(failure)?;
+            for (dir, finalized) in &parts {
+                sweep_stale_parts(dir, finalized);
+            }
+            // W5a: directory probe files a killed run left behind.
+            crate::space_probe::sweep_probe_files(&worker_root);
+            Ok(())
         }, move |owner, result| {
+            let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if let Some(entry) = owner.startup_phases.roots.iter_mut().find(|entry| entry.root == label) {
+                entry.duration_ms = Some(elapsed);
+                entry.ok = Some(result.is_ok());
+            }
+            tracing::info!(root=%root.display(), ms = elapsed, ok = result.is_ok(), "startup root reconciliation finished");
             let state = owner.startup_reconciliation.get_mut(&root).unwrap();
             state.running = false;
             state.ready = result.is_ok();
@@ -1807,10 +2017,17 @@ impl Owner {
                         .map(|allocation| allocation.root.clone())
                         .unwrap_or_else(|| fallback_root.clone())
                 };
-                if !owner
-                    .startup_reconciliation
-                    .get(&root)
-                    .is_some_and(|state| state.ready)
+                // Only an open lifecycle intent (or an allocation that is not
+                // live and active) waits for its root's reconciliation.
+                let gated = owner.startup_intent_jobs.contains(&job)
+                    || allocation
+                        .as_ref()
+                        .is_none_or(|allocation| allocation.state != "active");
+                if gated
+                    && !owner
+                        .startup_reconciliation
+                        .get(&root)
+                        .is_some_and(|state| state.ready)
                 {
                     owner.allocating_jobs.remove(&job);
                     if !owner.startup_reconciliation.contains_key(&root) {
@@ -1987,6 +2204,49 @@ impl Owner {
         for job in jobs {
             self.queue_payload_recovery(job);
         }
+    }
+}
+
+#[cfg(test)]
+mod stale_part_tests {
+    use super::*;
+    /// Finding 1: the sweep removes only a partial that is a second name of
+    /// its finalized file's publication. A finalized file whose publication
+    /// is missing or a different object keeps its partial (it may be the only
+    /// copy), and so do unfinalized and unknown files.
+    #[test]
+    fn startup_sweep_removes_only_a_second_name_of_the_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        // 1: finalized, published, killed before unlink → same object.
+        std::fs::write(d.join("one.mkv"), b"x").unwrap();
+        std::fs::hard_link(d.join("one.mkv"), d.join(".runner-file-1.part")).unwrap();
+        // 2: "finalized" but the rename never happened → only copy.
+        std::fs::write(d.join(".runner-file-2.part"), b"only").unwrap();
+        // 3: finalized, publication exists but is a different object.
+        std::fs::write(d.join("three.mkv"), b"y").unwrap();
+        std::fs::write(d.join(".runner-file-3.part"), b"z").unwrap();
+        // 4: not finalized (not in the map) → resumable.
+        std::fs::write(d.join("four.mkv"), b"w").unwrap();
+        std::fs::hard_link(d.join("four.mkv"), d.join(".runner-file-4.part")).unwrap();
+        std::fs::write(d.join(".runner-file-x.part"), b"x").unwrap();
+        let finalized: HashMap<u32, String> = [
+            (1, "one.mkv".to_string()),
+            (2, "two.mkv".to_string()),
+            (3, "three.mkv".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(sweep_stale_parts(d, &finalized), 1);
+        assert!(!d.join(".runner-file-1.part").exists());
+        assert!(d.join("one.mkv").exists());
+        assert_eq!(
+            std::fs::read(d.join(".runner-file-2.part")).unwrap(),
+            b"only"
+        );
+        assert!(d.join(".runner-file-3.part").exists());
+        assert!(d.join(".runner-file-4.part").exists());
+        assert!(d.join(".runner-file-x.part").exists());
     }
 }
 

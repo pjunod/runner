@@ -855,7 +855,6 @@ impl Inventory {
         let mut a = self.get(&r.artifact)?;
         if complete {
             a.hold = None;
-            a.eligible_seconds = 0;
             a.deadline = Some(now().saturating_add(a.retention_seconds as i64));
             // Unselected media is never implicitly authorized for expiry.
             if a.files.iter().filter(|f| !f.identity.directory).count() != r.files.len() {
@@ -870,7 +869,6 @@ impl Inventory {
             staged.state = "recovery_imported".into();
             staged.hold = None;
             staged.deadline = Some(now() + 86400);
-            staged.eligible_seconds = 0;
             staged.revision += 1;
             save_artifact(&tx, &staged)?;
         }

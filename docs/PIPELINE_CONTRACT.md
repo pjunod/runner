@@ -153,10 +153,10 @@ Rules, each with its reason:
 | `par` | `par_verify`/`par_repair` | repair impossible or budget exhausted (PP) | yes | yes | `failure_action`, after salvage settles |
 | `unpack` | `unpack` | extractor failed on the bytes, not the disk (PP) | yes | yes | `failure_action`, after salvage settles |
 | `script` | `script` | post script non-zero (PP) | no | yes | `failure_action` |
-| `publish` | `move`/`publication_verify` | nothing passes selection: unknown kind, missing proof, empty (PP) | no | yes if anything verified | **`park`, always** |
-| `io` | any | write failure, digest/size mismatch, missing file, refused permission (owner or PP) | no | yes | **`park`, always** |
-| `identity` | any | the evidence disagrees with itself — conflicting yEnc metadata, foreign journal bytes (owner or PP) | yes | no | **`park`, always** |
-| `hold_expired` | the hold's stage | an environmental hold (§2.3) passed its deadline (hold recovery) | no | yes | `park` |
+| `publish` | `move`/`publication_verify` | nothing passes selection: unknown kind, missing proof, empty (PP) | no | yes if anything verified | `failure_action` after salvage settles (curator-admitted); else `park` |
+| `io` | any | write failure, digest/size mismatch, missing file, refused permission (owner or PP) | no | yes | `failure_action` after salvage settles (curator-admitted); else `park` |
+| `identity` | any | the evidence disagrees with itself — conflicting yEnc metadata, foreign journal bytes (owner or PP) | yes | no | `failure_action` (curator-admitted); else `park` |
+| `hold_expired` | the hold's stage | an environmental hold (§2.3) passed its deadline (hold recovery) | no | yes | `failure_action` after salvage settles (curator-admitted); else `park` |
 | `cancelled` | — | operator delete / curator cancel; `outcome: cancelled`, **emitted by runner's delete path as a real terminal** (curator never infers it from `job_deleted`, which carries no transfer) | no | — | runner's delete semantics |
 
 **A post-processing failure is terminal.** `HoldCause::PostFailure`,
@@ -170,16 +170,19 @@ never whether the failure is reported.** On nuc3, 24 of the last 29 `DELETED`
 history rows carry a `held` control — jobs that were deleted while held; a
 review hold's only exit.
 
-**`publish`, `io` and `identity` always park, whatever `failure_action` says.**
-These are the failures where the bytes are, by construction, intact or
-uncertain and the *policy* or the *environment* failed (19 of those 24 held
-rows were "no verified media … eligible for publication" on cleanly extracted
-releases). Deleting them on a default `failure_action = delete` would turn a
-reporting fix into a data-loss regression. Parked sources follow the normal
-`failed_retention_days` clock, show their reason and expiry in Files, and
-explicit Keep extends them through retention. *(Decision for Paul to look
-over: park-always for these three reasons, versus honouring
-`failure_action`. Both reviewers recommend park.)*
+**A curator-admitted failure follows `failure_action` for every reason**
+*(Paul, 2026-11-11 — decided; replaces park-always)*. Once its salvage has
+settled, any verified payload has gone out as the salvage publication and
+curator has re-grabbed the release, so parking the rest only fills
+`/processing/failed` with bytes nobody recovers (2713, 2770, 2811, 2812,
+2856, 2885 were parked with their once-committed publication while curator
+had already replaced them). Under the default `delete` the source is
+removed; under `park` it expires after `failed_retention_days` on its
+wall-clock deadline. A job curator did not admit keeps park-always for
+`publish`, `io`, `identity` and `hold_expired`: nobody re-grabs it, so the
+bytes are the only copy. `keep_on_failure` always keeps, indefinitely
+(there is no keep TTL), and its advisory assessment settles instead of
+retrying.
 
 **`blames_release` decides the blocklist**, not the mere fact of failure. A
 local permission fault, a full disk or a selection-policy miss must not
@@ -223,7 +226,7 @@ missing_tool · engine_unavailable · password_required`.
   not share a clock) and `deadline_unix` for display.
 - has a **deadline** — `[post] hold_deadline_secs` (default `86400`;
   `password_hold_deadline_secs` default `604800`) — after which **runner** ends the job
-  `failed/hold_expired` with the hold's message, bytes parked. Curator never
+  `failed/hold_expired` with the hold's message, bytes disposed per §2.2. Curator never
   authors `hold_expired` (§3.2): during a partition runner may recover the
   hold and complete the job, and a curator-side guess would then contradict
   the real outcome.
@@ -276,6 +279,16 @@ diffing ticks to discover transitions.
   open. A crash after the first rename, after the last rename, after the
   manifest, and before the history/delivery writes each leave exactly one
   usable outcome after restart.
+- **Runner never re-reads a publication it has made visible** *(0.9.0)*.
+  The committed move journal — files, digests, landed identities and the
+  manifest itself (`relocation_intents.manifest`) — is the authority the
+  delivery row is built from, so a curator that imports before runner
+  writes the row (job 2709) cannot leave it "changed before delivery
+  receipt". A file's identity is object + size + mtime with the journaled
+  digest, never ctime (NFS silly-rename removal and link/unlink move ctime).
+  A failed terminal cannot settle salvage `none` while a publication move of
+  the job is open; a move that commits later reopens the obligation and
+  the salvage is delivered from the journal, without the queue row.
 - The **manifest** is `.runner-manifest.json`: `{generation, job, transfer,
   created_at, cross_volume, files:[{path, bytes, sha256}], digest}`,
   mirrored in the history row params (`Delivery:Path/Generation/ManifestDigest`
@@ -318,11 +331,18 @@ diffing ticks to discover transitions.
 
 After the terminal event, runner disposes the processing source per
 `[post] failure_action` (`delete` default, `park`, `none`), overridden by the
-job's `keep_on_failure` and by the park-always reasons (§2.2), **and only
+job's `keep_on_failure` and, for a job curator did not admit, by the
+park-always reasons (§2.2), **and only
 once any salvage obligation for the job has settled** (`publication_ready`
 emitted, or `salvage: none` recorded). The lifecycle override that forces
 `Delete` regardless of config (`manager.rs:1054, 4404`) is removed: the
 config means what it says.
+
+**A job's source directory is a closed scope** *(0.9.0)*: every file in it
+came from the job's own download. Once its delivery is a success, or a
+failure the job does not keep, the source is removed as a tree by root
+identity — nothing the publication did not take is classified or held for
+review. A keep-on-failure delivery retains its unresolved files.
 
 Disposal is **owned by the artifact record and gated by the terminal
 record, not the queue row**: the terminal record (§2.1) names the markers

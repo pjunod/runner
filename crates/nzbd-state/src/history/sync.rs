@@ -746,9 +746,25 @@ pub(super) fn prepare_index(
     if fsx::exists(&tmp)? {
         fsx::remove_file(&tmp)?;
     }
+    // W5b / finding 9: an ordinary READ_ONLY open of a WAL database maps a
+    // `-shm` file (which a network filesystem cannot share). Open it like
+    // `Inventory::validate_expected`: read-write so byte-range EXCLUSIVE
+    // locking is possible (in-memory WAL index, no -shm) and no checkpoint
+    // on close so it is left as found. Not `query_only`: SQLite refuses
+    // `VACUUM INTO` under it, and the only statement run here writes the
+    // copy, never this file.
     let source_conn =
-        Connection::open_with_flags(&source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        Connection::open_with_flags(&source, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(sql_error)?;
+    source_conn
+        .set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .map_err(sql_error)?;
+    source_conn
+        .pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .map_err(sql_error)?;
     source_conn
         .execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()])
         .map_err(sql_error)?;
@@ -1041,18 +1057,19 @@ mod tests {
     }
 
     #[test]
-    fn readers_do_not_wait_for_the_reconciliation_gate_or_writer_connection() {
+    fn readers_do_not_wait_for_the_reconciliation_gate() {
+        // W5b: reads share the one EXCLUSIVE connection, so they serialize
+        // behind a bounded replay batch, never behind the reconciliation
+        // gate that spans a whole refresh.
         let t = tempfile::tempdir().unwrap();
         let db = Arc::new(local(t.path(), t.path()));
         db.record(&entry(1, 100)).unwrap();
         let gate = db.sync.gate.lock().unwrap();
-        let writer = db.conn.lock().unwrap();
         let (send, recv) = std::sync::mpsc::channel();
         let other = db.clone();
         let task =
             std::thread::spawn(move || send.send(other.read_page(20, 0, None).unwrap().1).unwrap());
         let result = recv.recv_timeout(Duration::from_secs(2));
-        drop(writer);
         drop(gate);
         task.join().unwrap();
         assert_eq!(result.unwrap(), 1);
@@ -1135,8 +1152,9 @@ mod tests {
             .unwrap();
         db.mark_seen(&[crate::JobId(1)], Some("consumer"), 201)
             .unwrap();
-        assert_eq!(db.list_filtered(1, true).unwrap()[0].seen_count, 0);
         drop(writer);
+        // Reads share the writer connection (W5b): look once it is free.
+        assert_eq!(db.list_filtered(1, true).unwrap()[0].seen_count, 0);
         db.flush_seen().unwrap();
         let row = db.list_filtered(1, true).unwrap().remove(0);
         assert_eq!(row.seen_count, 2);
@@ -1177,29 +1195,23 @@ mod tests {
     }
 
     #[test]
-    fn migration_reads_committed_wal_instead_of_copying_only_main_file() {
+    fn migration_copies_committed_state_and_neither_index_has_shm() {
         let t = tempfile::tempdir().unwrap();
         let state = t.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
         let db =
             HistoryDb::open(&state.join("history.sqlite"), Some(&state.join("history"))).unwrap();
         db.record(&entry(1, 100)).unwrap();
-        let pinned = Connection::open(state.join("history.sqlite")).unwrap();
-        pinned
-            .execute_batch("BEGIN; SELECT * FROM history;")
-            .unwrap();
         let seq = db.record_seq(&entry(2, 200)).unwrap();
+        // W5b: an EXCLUSIVE-mode index has no `-shm`, ever.
+        assert!(!state.join("history.sqlite-shm").exists());
         drop(db);
-        assert!(
-            std::fs::metadata(state.join("history.sqlite-wal"))
-                .unwrap()
-                .len()
-                > 0
-        );
         let migrated = local(&state, &t.path().join("local"));
         assert_eq!(migrated.count_filtered(true).unwrap(), 2);
         assert_eq!(migrated.list_filtered(1, true).unwrap()[0].seq, seq);
-        drop(pinned);
+        assert!(!t.path().join("local/history.sqlite-shm").exists());
+        // Finding 9: reading the old index for the copy maps no `-shm` either.
+        assert!(!state.join("history.sqlite-shm").exists());
     }
 
     #[test]
@@ -1278,7 +1290,7 @@ mod tests {
     fn query_plan_uses_history_ordering_index() {
         let t = tempfile::tempdir().unwrap();
         let db = local(t.path(), t.path());
-        let c = db.reader.lock().unwrap();
+        let c = db.conn.lock().unwrap();
         let mut q=c.prepare("EXPLAIN QUERY PLAN SELECT * FROM history ORDER BY completed_at DESC,id DESC LIMIT 20 OFFSET 500").unwrap();
         let plan = q
             .query_map([], |r| r.get::<_, String>(3))

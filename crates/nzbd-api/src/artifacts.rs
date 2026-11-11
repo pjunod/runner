@@ -212,7 +212,6 @@ async fn list(State(st): State<ApiState>, Query(p): Query<Page>) -> Response {
     };
     work(move || {
         let page = db.list_page(&query)?;
-        let now = nzbd_state::artifacts::now();
         let entries: Vec<_> = page
             .rows
             .into_iter()
@@ -221,7 +220,7 @@ async fn list(State(st): State<ApiState>, Query(p): Query<Page>) -> Response {
                     "files": row.files,
                     "bytes": row.bytes,
                     "measured": row.measured,
-                    "earliest_expiry": row.artifact.earliest_expiry(now),
+                    "earliest_expiry": row.artifact.earliest_expiry(),
                     "artifact": row.artifact,
                 })
             })
@@ -714,6 +713,11 @@ mod tests {
         let scratch = cfg.state_dir().join("transform-workspaces/private");
         std::fs::create_dir_all(&scratch).unwrap();
         std::fs::write(scratch.join("data"), b"private repair bytes").unwrap();
+        // A configured workspace dir on the processing volume is internal too.
+        cfg.paths.workspace_dir = Some(cfg.paths.main_dir.join(".workspaces"));
+        let configured = cfg.workspace_dir().join("private");
+        std::fs::create_dir_all(&configured).unwrap();
+        std::fs::write(configured.join("data"), b"private repair bytes").unwrap();
         for directory in [
             cfg.dest_dir(),
             cfg.paths.main_dir.join("failed"),

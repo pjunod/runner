@@ -301,6 +301,11 @@ pub struct QueueSnapshot {
     /// initial fail-safe measurement, or incomplete evidence after a prior
     /// hold.
     pub disk_low: bool,
+    /// W5a: jobs whose own finalize retry is the evidence an out-of-space
+    /// failure needs; hold recovery may release their (download-side)
+    /// storage hold while `disk_low`. Post-side holds are never gated.
+    #[serde(skip)]
+    pub space_retry_jobs: std::collections::HashSet<JobId>,
     /// Lowest measured free space across every configured write root. None
     /// means the enforcing probe has no usable reading or is disabled.
     #[serde(default)]
@@ -349,6 +354,9 @@ pub struct QueueSnapshot {
     pub session_downloaded_bytes: u64,
     /// Bytes still to fetch across active jobs (non-paused files).
     pub remaining_bytes: u64,
+    /// Restart phase timings since process start (no-wedge item 7).
+    #[serde(default)]
+    pub startup: crate::startup_phases::StartupPhases,
     pub jobs: Vec<JobSummary>,
 }
 

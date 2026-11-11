@@ -495,7 +495,7 @@ fn pre_upgrade_artifacts_cannot_run_queued_automatic_deletion() {
 }
 
 #[test]
-fn pre_upgrade_explicit_delete_is_frozen_but_new_delete_remains_available() {
+fn pre_upgrade_explicit_delete_resumes_under_closed_scope() {
     let (tmp, db, root) = fixture();
     let legacy = parked(&db, &root);
     let pending = db
@@ -522,17 +522,13 @@ fn pre_upgrade_explicit_delete_is_frozen_but_new_delete_remains_available() {
         .unwrap();
     db.close().unwrap();
 
+    // No-wedge (closed scope): the migration still freezes it, and the
+    // open's automatic exit resumes it — an owned payload is Runner's own.
     let migrated = Inventory::open(&tmp.path().join("state")).unwrap();
+    assert_eq!(migrated.operation(&pending.id).unwrap().state, "retry");
     let old = migrated.execute_delete(&pending.id).unwrap();
-    assert_eq!(old.state, "review");
-    assert!(legacy.path.exists());
-    let reviewed = migrated
-        .request_delete(&legacy.id, legacy.revision, "new-reviewed-delete", 0)
-        .unwrap();
-    assert_eq!(
-        migrated.execute_delete(&reviewed.id).unwrap().state,
-        "succeeded"
-    );
+    assert_eq!(old.state, "succeeded");
+    assert!(!legacy.path.exists());
 }
 
 #[test]
@@ -682,11 +678,11 @@ fn selected_delivery_copies_only_payload_and_prunes_resolved_source_files() {
         .unwrap();
     assert_eq!(replayed.len(), 4);
     let delivery = db.create_delivery(49, true, Some("t-49-test")).unwrap();
+    // Closed scope (W4): after a successful delivery nothing in the source
+    // is retained for review; the tree goes whole.
     let cleanup = db.retire_delivery_source(&delivery.delivery_id).unwrap();
-    assert_eq!(cleanup.source_cleanup.status, "blocked");
-    assert!(!source.join("Season 1/ep01.mkv").exists());
-    assert!(!source.join("readme.txt").exists());
-    assert!(source.join("unresolved.rar").exists());
+    assert_eq!(cleanup.source_cleanup.status, "succeeded");
+    assert!(!source.exists());
     let status = |path: &str| {
         cleanup
             .file_outcomes
@@ -699,12 +695,11 @@ fn selected_delivery_copies_only_payload_and_prunes_resolved_source_files() {
     assert_eq!(status("Season 1/ep01.mkv"), "removed");
     assert_eq!(status("readme.txt"), "removed");
     assert_eq!(status("consumed.rar"), "removed");
-    assert_eq!(status("unresolved.rar"), "retained");
-    assert!(!source.join("consumed.rar").exists());
+    assert_eq!(status("unresolved.rar"), "removed");
 }
 
 #[test]
-fn selected_delivery_retains_published_par_repair_dependency_without_keep() {
+fn selected_delivery_retires_published_par_repair_dependency_after_success() {
     let (tmp, db, root) = fixture();
     let source = root.join("working-par-dependency");
     db.allocate_for_delivery(54, &root, &source, true, true)
@@ -747,13 +742,14 @@ fn selected_delivery_retains_published_par_repair_dependency_without_keep() {
     let delivery = db
         .create_delivery(54, true, Some("repair-dependency-token"))
         .unwrap();
+    // A published repair input is linked, not renamed, so the PAR set stays
+    // repairable while the job can still need it. Once the delivery is a
+    // success that need is over (closed scope, W4): the source goes whole
+    // and the publication keeps its own name.
     let cleanup = db.retire_delivery_source(&delivery.delivery_id).unwrap();
-    assert_eq!(cleanup.source_cleanup.status, "blocked");
-    // A published repair input keeps its source name (linked, not renamed):
-    // the PAR set stays repairable after curator removes the publication.
-    assert!(source.join("episode.mkv").exists());
+    assert_eq!(cleanup.source_cleanup.status, "succeeded");
+    assert!(!source.exists());
     assert!(target.join("episode.mkv").exists());
-    assert!(source.join("set.par2").exists());
     let status = |path: &str| {
         cleanup
             .file_outcomes
@@ -763,8 +759,8 @@ fn selected_delivery_retains_published_par_repair_dependency_without_keep() {
             .source_cleanup_status
             .clone()
     };
-    assert_eq!(status("episode.mkv"), "retained_repair_dependency");
-    assert_eq!(status("set.par2"), "retained_repair_dependency");
+    assert_eq!(status("episode.mkv"), "removed");
+    assert_eq!(status("set.par2"), "removed");
     assert!(!db.get(&delivery.artifact_id).unwrap().keep_on_failure);
 }
 
@@ -1225,7 +1221,7 @@ fn keep_off_does_not_requeue_conflicted_failed_delete() {
 }
 
 #[test]
-fn clearing_keep_retries_partial_delivery_cleanup_without_deleting_recoverable_inputs() {
+fn clearing_keep_retries_partial_delivery_cleanup_as_a_closed_scope() {
     let (tmp, db, root) = fixture();
     let source = root.join("keep-partial-source");
     db.allocate_for_delivery(61, &root, &source, true, true)
@@ -1306,10 +1302,11 @@ fn clearing_keep_retries_partial_delivery_cleanup_without_deleting_recoverable_i
     assert!(db.set_keep_on_failure(61, false).unwrap());
     let scheduled = db.delivery(&delivery.delivery_id).unwrap();
     assert_eq!(scheduled.source_cleanup.status, "retry");
+    // Without Keep the failure follows the closed-scope rule: what the
+    // publication did not take is removed with the source.
     let refreshed = db.retire_delivery_source(&delivery.delivery_id).unwrap();
-    assert_eq!(refreshed.source_cleanup.status, "blocked");
-    assert!(!source.join("sample.txt").exists());
-    assert!(source.join("complete.rar").exists());
+    assert_eq!(refreshed.source_cleanup.status, "succeeded");
+    assert!(!source.exists());
     assert!(target.join("episode.mkv").exists());
 }
 
@@ -1429,7 +1426,8 @@ fn legacy_four_field_restore_journal_is_fenced_without_startup_failure() {
         assert!(db.reconcile_transforms_root_snapshot(&root, None).is_ok());
     }
     let fenced = db.operation("legacy-restore-four-tuple").unwrap();
-    assert_eq!(fenced.state, "review");
+    // W9: abandoned without replay; post-processing re-runs the transform.
+    assert_eq!(fenced.state, "cancelled");
     assert!(fenced
         .error
         .as_deref()
@@ -1879,42 +1877,117 @@ fn symlink_payload_entry_cannot_escape_the_owned_directory() {
     assert!(outside.join("movie.mkv").exists());
 }
 #[test]
-fn wall_clock_alone_never_expires_a_payload_and_keep_resets_elapsed_time() {
-    let (_tmp, db, root) = fixture();
-    let mut a = parked(&db, &root);
-    db.set_settings(&Settings {
-        enabled: true,
-        ..Settings::default()
-    })
-    .unwrap();
-    a.deadline = Some(1);
+fn parked_failure_expires_on_its_wall_clock_deadline_across_restarts_without_opt_in() {
+    // R4 / W3: expiry is the deadline alone — no uptime clock, no
+    // automation toggle — and it holds across a restart.
+    let (tmp, db, root) = fixture();
+    let path = root.join("job");
+    db.allocate_for_delivery(1, &root, &path, true, false)
+        .unwrap();
+    std::fs::write(path.join("episode.mkv"), b"original media").unwrap();
+    let mut a = db.finish(1, &path, &root, "parked_failed").unwrap();
+    assert!(!db.settings().unwrap().enabled);
     a.retention_seconds = 100;
-    a.eligible_seconds = 0;
+    a.deadline = Some(now() + 3600);
     save_artifact(&db.db.lock().unwrap(), &a).unwrap();
     db.tick().unwrap();
-    assert!(a.path.exists());
-    db.clocks.lock().unwrap().insert(
-        a.id.clone(),
-        (a.revision, Instant::now() - Duration::from_secs(50)),
-    );
-    db.tick().unwrap();
-    let a = db.get(&a.id).unwrap();
-    assert_eq!(a.eligible_seconds, 50);
+    db.run_due_deletes().unwrap();
+    assert!(a.path.exists(), "not yet due");
+    a.deadline = Some(now() - 1);
+    save_artifact(&db.db.lock().unwrap(), &a).unwrap();
+    db.close().unwrap();
+    drop(db);
+    let db = Inventory::open(&tmp.path().join("state")).unwrap();
     let kept = db.retention(&a.id, a.revision, true, None).unwrap();
+    db.tick().unwrap();
+    assert!(a.path.exists(), "Keep holds an expired payload");
     let release_started = now();
     let released = db.retention(&a.id, kept.revision, false, None).unwrap();
     let release_finished = now();
-    db.clocks.lock().unwrap().insert(
-        a.id.clone(),
-        (a.revision, Instant::now() - Duration::from_secs(500)),
+    assert!(
+        (release_started + 100..=release_finished + 100).contains(&released.deadline.unwrap()),
+        "releasing Keep starts a fresh period"
+    );
+    let mut due = db.get(&a.id).unwrap();
+    due.deadline = Some(now() - 1);
+    save_artifact(&db.db.lock().unwrap(), &due).unwrap();
+    db.tick().unwrap();
+    db.run_due_deletes().unwrap();
+    assert!(!a.path.exists(), "expired at its wall-clock deadline");
+}
+/// W3 upgrade: a curator-admitted failure an older build parked under
+/// park-always (2713, 2770, …) follows `failure_action = delete` once its
+/// salvage has settled — due now, deleted by the ordinary retention path.
+/// A kept failure and a job curator did not admit stay parked.
+#[test]
+fn parked_curator_failures_expire_under_delete_policy() {
+    use super::terminals::tests::failed;
+    let (_tmp, db, root) = fixture();
+    let mut paths = Vec::new();
+    for (job, transfer, keep) in [(1, true, false), (2, true, true), (3, false, false)] {
+        let path = root.join(format!("job-{job}"));
+        db.allocate_for_delivery(job, &root, &path, true, false)
+            .unwrap();
+        std::fs::write(path.join("episode.mkv"), b"original media").unwrap();
+        db.finish(job, &path, &root, "parked_failed").unwrap();
+        let mut terminal = failed(job, SalvageState::None);
+        terminal.keep_on_failure = keep;
+        if !transfer {
+            terminal.transfer = None;
+        }
+        db.record_terminal(&terminal).unwrap();
+        paths.push(path);
+    }
+    assert_eq!(db.expire_parked_curator_failures().unwrap(), 1);
+    assert_eq!(
+        db.expire_parked_curator_failures().unwrap(),
+        0,
+        "idempotent"
     );
     db.tick().unwrap();
-    assert_eq!(
-        db.get(&a.id).unwrap().eligible_seconds,
-        0,
-        "old checkpoint cannot count held time"
+    db.run_due_deletes().unwrap();
+    assert!(!paths[0].exists(), "curator-admitted failure deleted");
+    assert!(paths[1].exists(), "keep_on_failure stays");
+    assert!(
+        paths[2].exists(),
+        "a job curator did not admit keeps its retention"
     );
-    assert!((release_started + 100..=release_finished + 100).contains(&released.deadline.unwrap()));
+}
+/// W9 upgrade: a transform an older build parked in `review`, with the
+/// "review: interrupted transform" Keep hold on its source, is abandoned
+/// at open so post-processing re-runs it; idempotent.
+#[test]
+fn reviewed_transforms_are_abandoned_on_open() {
+    let (tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    let mut held = db.get(&a.id).unwrap();
+    held.hold = Some("review: interrupted transform".into());
+    held.keep = true;
+    save_artifact(&db.db.lock().unwrap(), &held).unwrap();
+    let op = Operation {
+        id: "par-restore-reviewed".into(),
+        artifact: a.id.clone(),
+        kind: "par_restore".into(),
+        state: "review".into(),
+        request: "[]".into(),
+        created_at: now(),
+        not_before: 0,
+        attempts: 1,
+        next_retry: 0,
+        error: Some("interrupted restore has ambiguous identities".into()),
+    };
+    save_operation(&db.db.lock().unwrap(), &op).unwrap();
+    db.close().unwrap();
+    drop(db);
+    for _ in 0..2 {
+        let db = Inventory::open(&tmp.path().join("state")).unwrap();
+        let after = db.operation(&op.id).unwrap();
+        assert_eq!(after.state, "cancelled");
+        assert!(after.error.unwrap().contains("ambiguous identities"));
+        let source = db.get(&a.id).unwrap();
+        assert!(source.hold.is_none() && !source.keep);
+        db.close().unwrap();
+    }
 }
 #[test]
 fn restore_quarantines_pending_deletion_and_retention() {
@@ -1927,7 +2000,6 @@ fn restore_quarantines_pending_deletion_and_retention() {
     let restored = db.get(&a.id).unwrap();
     assert!(restored.keep);
     assert!(restored.hold.is_some());
-    assert_eq!(restored.eligible_seconds, 0);
     assert!(a.path.exists());
 }
 #[test]
@@ -2071,7 +2143,6 @@ fn retention_preview_is_atomic_and_never_shortens_elapsed_eligibility() {
     let apply_finished = now();
     let a = db.get(&a.id).unwrap();
     assert_eq!(a.retention_seconds, 86400);
-    assert_eq!(a.eligible_seconds, 0);
     assert!((apply_started + 86400..=apply_finished + 86400).contains(&a.deadline.unwrap()));
 }
 #[test]
@@ -2275,7 +2346,7 @@ fn lifecycle_scale_one_million_tombstones() {
 }
 
 #[test]
-fn queued_expiry_is_invalidated_by_a_fresh_policy_or_disabled_automation() {
+fn queued_expiry_is_invalidated_by_a_fresh_policy_not_by_the_automation_toggle() {
     for disable in [false, true] {
         let (_tmp, db, root) = fixture();
         let path = root.join("job");
@@ -2289,17 +2360,20 @@ fn queued_expiry_is_invalidated_by_a_fresh_policy_or_disabled_automation() {
         })
         .unwrap();
         a.deadline = Some(now() - 1);
-        a.eligible_seconds = a.retention_seconds;
         save_artifact(&db.db.lock().unwrap(), &a).unwrap();
         let op = db
             .request_delete_authorized(&a.id, a.revision, "expiry", 0, true)
             .unwrap();
         if disable {
+            // W3: the automation toggle is not expiry authority; a due
+            // expiry proceeds with it off.
             db.set_settings(&Settings::default()).unwrap();
-        } else {
-            db.retention(&a.id, a.revision, false, Some(86400 * 30))
-                .unwrap();
+            assert_eq!(db.execute_delete(&op.id).unwrap().state, "succeeded");
+            assert!(!a.path.join("episode.mkv").exists());
+            continue;
         }
+        db.retention(&a.id, a.revision, false, Some(86400 * 30))
+            .unwrap();
         assert_eq!(db.execute_delete(&op.id).unwrap().state, "cancelled");
         assert!(a.path.join("episode.mkv").exists());
     }
@@ -2310,9 +2384,12 @@ fn startup_orphaned_active_allocation_preserves_binding_until_explicit_successor
     let a = db.allocate(42, &root, &root.join("orphan")).unwrap();
     std::fs::write(a.path.join("media.mkv"), b"keep").unwrap();
     db.reconcile_startup(&[]).unwrap();
+    // No-wedge (closed scope): an owned orphan parks with the failed TTL
+    // whenever it was allocated; the binding survives for a successor.
     let orphan = db.get(&a.id).unwrap();
-    assert_eq!(orphan.state, "retained");
-    assert!(orphan.keep && orphan.hold.is_some());
+    assert_eq!(orphan.state, "parked_failed");
+    assert!(!orphan.keep && orphan.hold.is_none());
+    assert!(orphan.earliest_expiry().is_some());
     assert_eq!(db.for_job(42).unwrap().unwrap().id, a.id);
     assert!(db.inspect(&a.id).is_ok());
     assert!(db
@@ -2740,7 +2817,7 @@ fn compact_keeps_the_size_of_a_cleared_payload() {
 
 #[test]
 fn a_closed_inventory_leaves_queued_tasks_for_the_next_boot() {
-    let (_tmp, db, root) = fixture();
+    let (tmp, db, root) = fixture();
     let op = db
         .submit_task(
             "scan",
@@ -2751,7 +2828,9 @@ fn a_closed_inventory_leaves_queued_tasks_for_the_next_boot() {
         .unwrap();
     db.close().unwrap();
     db.run_tasks().unwrap();
-    assert_eq!(db.operation(&op.id).unwrap().state, "queued");
+    drop(db);
+    let next = Inventory::open(&tmp.path().join("state")).unwrap();
+    assert_eq!(next.operation(&op.id).unwrap().state, "queued");
 }
 
 #[test]
@@ -3708,4 +3787,351 @@ fn v1_acceptance_columns_are_dropped_on_open() {
         })
         .unwrap();
     assert_eq!(kept, 1);
+}
+
+// No-wedge task 2: every review/retained hold takes its registered exit.
+
+fn held(db: &Inventory, root: &Path, job: u32, hold: &str) -> Artifact {
+    let path = root.join(format!("held-{job}"));
+    db.allocate(job, root, &path).unwrap();
+    std::fs::write(path.join("payload.bin"), b"payload bytes").unwrap();
+    let mut a = db.finish(job, &path, root, "retained").unwrap();
+    a.hold = Some(hold.into());
+    a.updated_at = now() - 2 * exits::HOLD_EXIT_SECONDS;
+    save_artifact(&db.db.lock().unwrap(), &a).unwrap();
+    a
+}
+
+#[test]
+fn cancelled_recovery_holds_exit_and_only_the_copy_is_disposed() {
+    let (_tmp, db, root) = fixture();
+    let source = held(&db, &root, 1, "review: cancelled recovery");
+    let staging = held(&db, &root, 2, "review: cancelled recovery staging");
+    let report = db.exit_wedged_states(0, false).unwrap();
+    assert_eq!((report.released, report.parked), (1, 1));
+    let source = db.get(&source.id).unwrap();
+    assert!(source.hold.is_none());
+    assert_eq!(source.state, "retained", "the original keeps its lifecycle");
+    let copy = db.get(&staging.id).unwrap();
+    assert_eq!(copy.state, "parked_failed");
+    assert!(copy.earliest_expiry().is_some_and(|due| due <= now()));
+    db.tick().unwrap();
+    db.run_due_deletes().unwrap();
+    assert!(!staging.path.exists(), "the copy is disposed");
+    assert!(source.path.exists(), "the original is never removed");
+    // Idempotent: nothing left to convert.
+    assert_eq!(db.exit_wedged_states(0, true).unwrap().total(), 0);
+}
+
+#[test]
+fn unowned_content_is_never_touched_and_its_delete_is_cancelled() {
+    let (_tmp, db, root) = fixture();
+    let adopted = held(&db, &root, 1, "review: files changed; adoption required");
+    let discovered = held(&db, &root, 2, "review");
+    let mut unheld = db.get(&discovered.id).unwrap();
+    unheld.hold = None;
+    save_artifact(&db.db.lock().unwrap(), &unheld).unwrap();
+    let op = db
+        .request_delete(&discovered.id, unheld.revision, "old-delete", 0)
+        .unwrap();
+    for (a, hold) in [
+        (&adopted, "review: files changed; adoption required"),
+        (&discovered, "review"),
+    ] {
+        let mut a = db.get(&a.id).unwrap();
+        a.owned = false;
+        a.hold = Some(hold.into());
+        save_artifact(&db.db.lock().unwrap(), &a).unwrap();
+    }
+    {
+        let db = db.db.lock().unwrap();
+        db.execute(
+            "UPDATE operations SET state='review',data=json_set(data,'$.state','review','$.error','deletion generation changed') WHERE id=?1",
+            [&op.id],
+        )
+        .unwrap();
+    }
+    db.exit_wedged_states(0, true).unwrap();
+    for a in [&adopted, &discovered] {
+        let after = db.get(&a.id).unwrap();
+        assert!(after.hold.is_some() && !after.owned && after.state == "retained");
+        assert!(a.path.exists());
+    }
+    assert_eq!(db.operation(&op.id).unwrap().state, "cancelled");
+}
+
+#[test]
+fn refused_disposal_resnapshots_the_closed_scope_and_retries() {
+    let (_tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    let op = db.request_delete(&a.id, a.revision, "dispose", 0).unwrap();
+    // Something inside the job's own directory that is not in the manifest.
+    std::fs::write(a.path.join("late.part"), b"written after the snapshot").unwrap();
+    assert_eq!(db.execute_delete(&op.id).unwrap().state, "review");
+    let mut refused = db.get(&a.id).unwrap();
+    assert_eq!(refused.hold.as_deref(), Some("review"));
+    refused.updated_at = now() - 2 * exits::HOLD_EXIT_SECONDS;
+    save_artifact(&db.db.lock().unwrap(), &refused).unwrap();
+    // The tick's grace has passed: re-snapshot and retry.
+    let report = db
+        .exit_wedged_states(exits::HOLD_EXIT_SECONDS, true)
+        .unwrap();
+    assert_eq!(report.retried, 1);
+    assert_eq!(db.operation(&op.id).unwrap().state, "retry");
+    assert!(db.get(&a.id).unwrap().hold.is_none());
+    assert_eq!(db.execute_delete(&op.id).unwrap().state, "succeeded");
+    assert!(!a.path.exists());
+}
+
+/// Finding 4: names the manifest refuses (a symlink out of the tree, a fifo)
+/// no longer block the re-snapshot: the closed scope is emptied by raw name
+/// (the link's target survives) and the disposal completes.
+#[cfg(unix)]
+#[test]
+fn refused_names_in_a_closed_scope_do_not_block_its_disposal() {
+    let (tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    let op = db.request_delete(&a.id, a.revision, "dispose", 0).unwrap();
+    let outside = tmp.path().join("outside.bin");
+    std::fs::write(&outside, b"not runner's").unwrap();
+    std::os::unix::fs::symlink(&outside, a.path.join("link")).unwrap();
+    let fifo = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(
+        a.path.join("pipe").as_os_str(),
+    ))
+    .unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let _ = db.execute_delete(&op.id);
+    let mut refused = db.get(&a.id).unwrap();
+    refused.hold = Some("review".into());
+    refused.state = "delete_failed".into();
+    refused.updated_at = now() - 2 * exits::HOLD_EXIT_SECONDS;
+    refused.revision += 1;
+    save_artifact(&db.db.lock().unwrap(), &refused).unwrap();
+    let mut stuck = db.operation(&op.id).unwrap();
+    stuck.state = "review".into();
+    save_operation(&db.db.lock().unwrap(), &stuck).unwrap();
+    let report = db
+        .exit_wedged_states(exits::HOLD_EXIT_SECONDS, true)
+        .unwrap();
+    assert_eq!(report.retried, 1);
+    assert_eq!(db.execute_delete(&op.id).unwrap().state, "succeeded");
+    assert!(!a.path.exists());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"not runner's");
+}
+
+#[test]
+fn a_fresh_hold_waits_for_the_grace_and_a_restart_releases_quiescence() {
+    let (tmp, db, root) = fixture();
+    let a = held(&db, &root, 1, "review: subprocess quiescence unconfirmed");
+    let mut fresh = db.get(&a.id).unwrap();
+    fresh.updated_at = now();
+    save_artifact(&db.db.lock().unwrap(), &fresh).unwrap();
+    assert_eq!(
+        db.exit_wedged_states(exits::HOLD_EXIT_SECONDS, true)
+            .unwrap()
+            .total(),
+        0,
+        "the flow that set it gets HOLD_EXIT_SECONDS first"
+    );
+    db.close().unwrap();
+    drop(db);
+    // No subprocess outlives the process: the open releases it.
+    let db = Inventory::open(&tmp.path().join("state")).unwrap();
+    assert!(db.get(&a.id).unwrap().hold.is_none());
+}
+
+#[test]
+fn an_interrupted_writer_retirement_is_reclassified() {
+    let (_tmp, db, root) = fixture();
+    let gone = held(&db, &root, 1, "review: interrupted writer retirement");
+    let replaced = held(&db, &root, 2, "review: interrupted writer retirement");
+    let intact = held(&db, &root, 3, "review: interrupted writer retirement");
+    std::fs::remove_dir_all(&gone.path).unwrap();
+    std::fs::remove_dir_all(&replaced.path).unwrap();
+    std::fs::create_dir(&replaced.path).unwrap();
+    std::fs::write(replaced.path.join("someone-else"), b"x").unwrap();
+    db.exit_wedged_states(0, true).unwrap();
+    assert_eq!(db.get(&gone.id).unwrap().state, "source_gone");
+    let other = db.get(&replaced.id).unwrap();
+    assert!(!other.owned && other.hold.as_deref() == Some("review"));
+    assert!(replaced.path.join("someone-else").exists(), "never deleted");
+    let parked = db.get(&intact.id).unwrap();
+    assert_eq!(parked.state, "parked_failed");
+    assert!(parked.hold.is_none() && parked.earliest_expiry().is_some());
+}
+
+#[test]
+fn materialization_predecessors_and_orphans_park_with_the_failed_ttl() {
+    let (_tmp, db, root) = fixture();
+    let mut rows = Vec::new();
+    for (job, hold) in [
+        (1, "review: superseded by accepted generation"),
+        (2, "review: allocation has no recovered job"),
+        (3, "review: previous external job generation"),
+        (4, "review: superseded private processing source"),
+    ] {
+        let a = held(&db, &root, job, hold);
+        let mut pinned = db.get(&a.id).unwrap();
+        pinned.keep = true; // the pin the flow set with the hold
+        save_artifact(&db.db.lock().unwrap(), &pinned).unwrap();
+        rows.push(a);
+    }
+    let report = db.exit_wedged_states(0, false).unwrap();
+    assert_eq!(report.parked, 4);
+    for a in rows {
+        let after = db.get(&a.id).unwrap();
+        assert_eq!(after.state, "parked_failed", "{:?}", a.hold);
+        assert!(!after.keep && after.hold.is_none());
+        assert!(
+            after.deadline.is_some_and(|due| due > now()),
+            "TTL, not now"
+        );
+        assert!(a.path.exists());
+    }
+}
+
+#[test]
+fn pre_upgrade_automatic_delete_in_review_resumes_on_the_tick() {
+    let (_tmp, db, root) = fixture();
+    let legacy = parked(&db, &root);
+    let op = db
+        .request_delete_authorized(&legacy.id, legacy.revision, "legacy-retention", 0, true)
+        .unwrap();
+    assert_eq!(db.execute_delete(&op.id).unwrap().state, "review");
+    let report = db.exit_wedged_states(0, false).unwrap();
+    assert_eq!(report.retried, 1);
+    assert_eq!(db.operation(&op.id).unwrap().state, "retry");
+    assert!(db.get(&legacy.id).unwrap().automatic_cleanup_eligible);
+}
+
+/// Finding 8: releasing a restore quarantine gives each row back the Keep it
+/// had — the forced Keep does not block delivery cleanup forever — while an
+/// operator's Keep survives; an already-quarantined (upgrade) row loses the
+/// forced Keep unless an explicit operator Keep event exists.
+#[test]
+fn releasing_a_restore_quarantine_restores_the_previous_keep() {
+    let (_tmp, db, root) = fixture();
+    let plain = held(&db, &root, 1, "x");
+    let kept = held(&db, &root, 2, "x");
+    let upgraded = held(&db, &root, 3, "x");
+    let upgraded_kept = held(&db, &root, 4, "x");
+    for a in [&plain, &kept, &upgraded, &upgraded_kept] {
+        let mut row = db.get(&a.id).unwrap();
+        row.hold = None;
+        save_artifact(&db.db.lock().unwrap(), &row).unwrap();
+    }
+    let row = db.get(&kept.id).unwrap();
+    db.retention(&kept.id, row.revision, true, None).unwrap();
+    let row = db.get(&upgraded_kept.id).unwrap();
+    db.retention(&upgraded_kept.id, row.revision, true, None)
+        .unwrap();
+    db.quarantine_restore().unwrap();
+    // Rows quarantined by a build that recorded nothing.
+    db.db
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM events WHERE kind='restore_quarantine' AND artifact IN (?1,?2)",
+            rusqlite::params![upgraded.id, upgraded_kept.id],
+        )
+        .unwrap();
+    for a in [&plain, &kept, &upgraded, &upgraded_kept] {
+        let mut row = db.get(&a.id).unwrap();
+        assert!(row.keep);
+        row.updated_at = now() - 2 * exits::HOLD_EXIT_SECONDS;
+        save_artifact(&db.db.lock().unwrap(), &row).unwrap();
+    }
+    db.exit_wedged_states(exits::HOLD_EXIT_SECONDS, true)
+        .unwrap();
+    for (a, keep) in [
+        (&plain, false),
+        (&kept, true),
+        (&upgraded, false),
+        (&upgraded_kept, true),
+    ] {
+        let row = db.get(&a.id).unwrap();
+        assert!(row.hold.is_none(), "{}", a.id);
+        assert_eq!(row.keep, keep, "{}", a.id);
+    }
+}
+
+/// Finding 10: parking a pinned hold clears only the pin's Keep; an
+/// operator's explicit Keep stays.
+#[test]
+fn parking_a_pinned_hold_keeps_an_operator_keep() {
+    let (_tmp, db, root) = fixture();
+    let pinned = held(
+        &db,
+        &root,
+        1,
+        "review: superseded private processing source",
+    );
+    let operator = held(&db, &root, 2, "x");
+    let mut row = db.get(&operator.id).unwrap();
+    row.hold = None;
+    save_artifact(&db.db.lock().unwrap(), &row).unwrap();
+    let row = db.get(&operator.id).unwrap();
+    db.retention(&operator.id, row.revision, true, None)
+        .unwrap();
+    for (a, hold) in [
+        (&pinned, "review: superseded private processing source"),
+        (&operator, "review: superseded private processing source"),
+    ] {
+        let mut row = db.get(&a.id).unwrap();
+        row.hold = Some(hold.into());
+        row.keep = true;
+        row.updated_at = now() - 2 * exits::HOLD_EXIT_SECONDS;
+        save_artifact(&db.db.lock().unwrap(), &row).unwrap();
+    }
+    db.exit_wedged_states(exits::HOLD_EXIT_SECONDS, true)
+        .unwrap();
+    let pinned = db.get(&pinned.id).unwrap();
+    assert_eq!(pinned.state, "parked_failed");
+    assert!(!pinned.keep, "the pin's Keep is cleared");
+    let operator = db.get(&operator.id).unwrap();
+    assert_eq!(operator.state, "parked_failed");
+    assert!(operator.keep, "the operator's Keep stays");
+}
+
+/// Finding 12: a recovery handoff waiting on a consumer that never claims
+/// (`published`) or stops heartbeating its claim (`claimed`) for
+/// failed_retention_days is cancelled through the existing path; a fresh
+/// one is untouched.
+#[test]
+fn silent_recovery_handoffs_are_cancelled_after_the_failed_ttl() {
+    let (tmp, db, root) = fixture();
+    let mut ids = Vec::new();
+    for job in 1..=3u32 {
+        let path = root.join(format!("job-{job}"));
+        db.allocate(job, &root, &path).unwrap();
+        std::fs::write(path.join("episode.mkv"), b"media").unwrap();
+        let a = db.finish(job, &path, &root, "parked_failed").unwrap();
+        let r = db
+            .stage_recovery(
+                &a.id,
+                a.revision,
+                &format!("handoff-{job}"),
+                &["episode.mkv".into()],
+                &tmp.path().join(format!("recovery-{job}")),
+            )
+            .unwrap();
+        ids.push(r);
+    }
+    db.claim_recovery(&ids[1].id, "curator", "import", &ids[1].manifest_digest)
+        .unwrap();
+    let ttl = i64::from(db.settings().unwrap().failed_retention_days) * 86400;
+    for r in &ids[..2] {
+        let mut stale = db.recovery(&r.id).unwrap();
+        stale.updated_at = now() - ttl - 60;
+        super::recovery::save(&db.db.lock().unwrap(), &stale).unwrap();
+    }
+    let report = db.exit_wedged_states(0, true).unwrap();
+    assert_eq!(report.recoveries, 2, "{report:?}");
+    assert_eq!(db.recovery(&ids[0].id).unwrap().state, "cancelled");
+    assert_eq!(db.recovery(&ids[1].id).unwrap().state, "cancelled");
+    assert_ne!(db.recovery(&ids[2].id).unwrap().state, "cancelled");
+    // A late claim from the silent consumer is refused.
+    assert!(db
+        .claim_recovery(&ids[1].id, "curator", "import", &ids[1].manifest_digest)
+        .is_err());
 }

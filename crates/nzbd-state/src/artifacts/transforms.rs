@@ -302,7 +302,7 @@ impl Inventory {
         }
         let dir = self.verify(&source)?;
         source.files = fs::manifest(&dir, 100_000)?;
-        let workspace_root = self.state_dir.join("transform-workspaces");
+        let workspace_root = self.workspace_dir();
         std::fs::create_dir_all(&workspace_root)?;
         let workspace_dir = fs::open_dir(&workspace_root)?;
         let path = workspace_root.join(&key);
@@ -318,7 +318,6 @@ impl Inventory {
         scratch.state = "allocating".into();
         scratch.keep = false;
         scratch.retention_seconds = 0;
-        scratch.eligible_seconds = 0;
         scratch.deadline = None;
         scratch.owned = true;
         scratch.hold = Some("transform workspace".into());
@@ -1712,6 +1711,48 @@ impl Inventory {
 impl Inventory {
     /// Reconcile one root's journaled mappings before new queue or PP
     /// operations start (startup runs it for every reconciliation root).
+    /// W9 upgrade: transforms an older build parked in `review` (and the
+    /// "review: interrupted transform" Keep hold it put on their source) are
+    /// abandoned the way this build abandons them. Idempotent.
+    pub(super) fn abandon_reviewed_transforms(&self) -> Result<usize> {
+        let _guard = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let raws = {
+            let mut statement = tx.prepare("SELECT data FROM operations WHERE state='review' AND json_extract(data,'$.kind') IN ('par_restore','par_repair','extract')")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in &raws {
+            let mut op: Operation = serde_json::from_str(raw)?;
+            op.state = "cancelled".into();
+            op.error = Some(format!(
+                "abandoned on upgrade: {}; post-processing re-runs the transform",
+                op.error.as_deref().unwrap_or("review")
+            ));
+            save_operation(&tx, &op)?;
+            let raw: Option<String> = tx
+                .query_row(
+                    "SELECT data FROM artifacts WHERE id=?1",
+                    [&op.artifact],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(raw) = raw {
+                let mut source: Artifact = serde_json::from_str(&raw)?;
+                if source.hold.as_deref() == Some("review: interrupted transform") {
+                    source.hold = None;
+                    source.keep = false;
+                    source.revision += 1;
+                    source.updated_at = now();
+                    save_artifact(&tx, &source)?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(raws.len())
+    }
+
     pub(super) fn reconcile_transforms_root_snapshot(
         &self,
         root: &Path,
@@ -1781,8 +1822,13 @@ impl Inventory {
                     // ctime-changing rename transition. Preserve the files
                     // and require explicit review instead of failing startup
                     // or inventing authority from today's bytes.
-                    op.state = "review".into();
-                    op.error = Some("legacy restore journal lacks rename content proof".into());
+                    // W9: no proof means no replay; the transform is
+                    // abandoned and post-processing re-runs it from source.
+                    op.state = "cancelled".into();
+                    op.error = Some(
+                        "abandoned: legacy restore journal lacks rename content proof; post-processing re-runs the transform"
+                            .into(),
+                    );
                     let _coordinator = self.mutation_guard()?;
                     save_operation(&self.db.lock().unwrap(), &op)?;
                     continue;
@@ -1992,15 +2038,18 @@ impl Inventory {
                     op.next_retry = now().saturating_add(delay);
                     save_operation(&self.db.lock().unwrap(), &op)?;
                 } else {
-                    op.state = "review".into();
-                    let mut source = self.get(&op.artifact)?;
-                    source.hold = Some("review: interrupted transform".into());
-                    source.keep = true;
-                    let mut db = self.db.lock().unwrap();
-                    let tx = db.transaction()?;
-                    save_artifact(&tx, &source)?;
-                    save_operation(&tx, &op)?;
-                    tx.commit()?;
+                    // W9: an interrupted transform whose replay is ambiguous
+                    // ("interrupted restore has ambiguous identities", an
+                    // input that changed) is abandoned, not held for review.
+                    // Its workspace belongs to the job; post-processing
+                    // re-runs the transform from the source (PAR verify sees
+                    // what is missing), or the job fails `par`/`io` and its
+                    // source is disposed by policy.
+                    op.state = "cancelled".into();
+                    op.error = Some(format!(
+                        "abandoned: {error}; post-processing re-runs the transform"
+                    ));
+                    save_operation(&self.db.lock().unwrap(), &op)?;
                 }
             }
         }

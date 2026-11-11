@@ -36,6 +36,8 @@ pub use lifecycle::frozen_lifecycle_timing;
 mod owner;
 mod pool;
 mod recovery;
+mod space_probe;
+pub mod startup_phases;
 mod url_dispatch;
 mod writer;
 
@@ -109,6 +111,24 @@ fn url_storage_error(error: nzbd_state::artifacts::Error) -> EngineError {
         nzbd_state::artifacts::Error::NotFound => EngineError::OwnershipLost,
         other => EngineError::Lifecycle(other.to_string()),
     }
+}
+
+/// W10 drain: set while a restart waits for post-processing to reach a
+/// resumable boundary. No new PAR repair or extraction starts while it is
+/// set (a job holds at that stage boundary), so the running ones drain and
+/// the restart cannot wait behind a backlog. Process-wide: it survives an
+/// in-process reload, and the API clears it when the restart runs, expires
+/// or is cancelled.
+static RESTART_DRAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a pending restart is draining repair/extraction admission.
+pub fn restart_drain() -> bool {
+    RESTART_DRAIN.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Start or end the restart drain (the API's restart deferral owns it).
+pub fn set_restart_drain(on: bool) {
+    RESTART_DRAIN.store(on, std::sync::atomic::Ordering::Release);
 }
 
 /// [`nzbd_types::Job::normalize_hold_status`] for a row read from storage
@@ -480,6 +500,9 @@ pub struct EngineConfig {
     pub state_dir: PathBuf,
     /// Node-local lifecycle database, separate from cluster journals.
     pub artifact_dir: Option<PathBuf>,
+    /// Transform workspace root (`paths.workspace_dir`); `None` keeps the
+    /// default `<artifact/state dir>/transform-workspaces`.
+    pub workspace_dir: Option<PathBuf>,
     /// Independently enrolled inventory identity; never create a new store on mismatch.
     pub expected_installation_id: Option<String>,
     /// Completed jobs are written to `<dest_dir>/<job name>/`.
@@ -524,6 +547,7 @@ impl EngineConfig {
             download_enabled: true,
             state_dir,
             artifact_dir: None,
+            workspace_dir: None,
             expected_installation_id: None,
             disk_guard_roots: vec![DiskGuardRoot {
                 label: "downloads".into(),
@@ -548,6 +572,8 @@ impl Engine {
     /// Recover state, spawn the owner task and one connection task per
     /// configured connection, and return the handle.
     pub async fn spawn(cfg: EngineConfig) -> Result<EngineHandle, EngineError> {
+        // The boot clock starts at the latest here (`nzbd run` starts it first).
+        let _ = startup_phases::boot_instant();
         let shared = new_shared_snapshot();
         let (events, _) = broadcast::channel(512);
         let (epoch_tx, epoch_rx) = watch::channel(0u64);
@@ -604,6 +630,7 @@ impl Engine {
         let owner = Owner::recover(
             &cfg.state_dir,
             cfg.artifact_dir.as_deref(),
+            cfg.workspace_dir.as_deref(),
             cfg.expected_installation_id.as_deref(),
             cfg.dest_dir.clone(),
             cfg.torrent_payload_roots.clone(),
@@ -1943,7 +1970,13 @@ impl EngineHandle {
                 .ok_or_else(|| "the allocation hold could not be released".to_string()));
         }
         if cause.is_storage() && !control.post_side() {
-            if by == RetryBy::Recovery && self.snapshot().disk_low {
+            // W5a: a finalize that ran out of space is retried by its own
+            // job while the latch holds — that retry is the evidence.
+            let snapshot = self.snapshot();
+            if by == RetryBy::Recovery
+                && snapshot.disk_low
+                && !snapshot.space_retry_jobs.contains(&job)
+            {
                 return Ok(Err("waiting for free space".into()));
             }
             return self
@@ -2998,6 +3031,35 @@ impl EngineHandle {
     pub fn report_out_of_space(&self, whence: impl Into<String>) {
         let _ = self.cmd_tx.try_send(EngineMsg::OutOfSpace {
             whence: whence.into(),
+            dir: None,
+            job: None,
+        });
+    }
+
+    /// [`Self::report_out_of_space`] with the path whose write failed, for an
+    /// unattributed write: the latch clears only after probe writes succeed
+    /// in that directory (W5a).
+    pub fn report_out_of_space_at(&self, whence: impl Into<String>, path: &std::path::Path) {
+        let _ = self.cmd_tx.try_send(EngineMsg::OutOfSpace {
+            whence: whence.into(),
+            dir: Some(crate::space_probe::dir_of(path)),
+            job: None,
+        });
+    }
+
+    /// A post-processing write for `job` ran out of space. That job's own
+    /// retry is the evidence that clears it (W5a): the failure clears when
+    /// the job's terminal lands or the job leaves the queue.
+    pub fn report_out_of_space_for(
+        &self,
+        job: JobId,
+        whence: impl Into<String>,
+        path: Option<&std::path::Path>,
+    ) {
+        let _ = self.cmd_tx.try_send(EngineMsg::OutOfSpace {
+            whence: whence.into(),
+            dir: path.map(crate::space_probe::dir_of),
+            job: Some(job),
         });
     }
 

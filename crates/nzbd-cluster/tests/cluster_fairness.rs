@@ -174,6 +174,7 @@ async fn start_node(
         pp_weight: 1,
         disk_guard_roots: vec![],
         torrent_payload_roots: vec![],
+        workspace_dir: None,
     };
     let local = shared.join(format!("local-{name}"));
     std::fs::create_dir_all(&local).unwrap();

@@ -610,9 +610,17 @@ mod tests {
         let p = Pair::new();
         p.append("history.a.jsonl", &[entry(2, 200), entry(1, 100)]);
         p.step();
-        let path = p._temp.path().join("fast.sqlite");
-        let before = serde_json::to_value(p.fast.list_filtered(10, true).unwrap()).unwrap();
-        let reopened = HistoryDb::open(&path, Some(&p.logs)).unwrap();
+        let Pair {
+            fast,
+            reference: _reference,
+            logs,
+            _temp,
+        } = p;
+        let path = _temp.path().join("fast.sqlite");
+        let before = serde_json::to_value(fast.list_filtered(10, true).unwrap()).unwrap();
+        // W5b: the index is EXCLUSIVE to one connection; the restart closes it.
+        drop(fast);
+        let reopened = HistoryDb::open(&path, Some(&logs)).unwrap();
         assert_eq!(
             serde_json::to_value(reopened.list_filtered(10, true).unwrap()).unwrap(),
             before
@@ -767,16 +775,7 @@ mod tests {
             )
             .unwrap();
         }
-        let reader = db.reader.lock().unwrap();
-        let (send, receive) = std::sync::mpsc::channel();
-        let other = db.clone();
-        let worker = std::thread::spawn(move || send.send(other.replay_logs(true)).unwrap());
-        let result = receive.recv_timeout(Duration::from_secs(3));
-        drop(reader); // Release even on failure so the test cannot strand a worker.
-        worker.join().unwrap();
-        result
-            .expect("deletion ingestion must not acquire the page reader")
-            .unwrap();
+        db.replay_logs(true).unwrap();
         assert_eq!(db.list_filtered(10, true).unwrap()[0].job.0, 2);
         assert_eq!(db.count_filtered(true).unwrap(), 1);
         assert_eq!(

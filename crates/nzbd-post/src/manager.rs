@@ -806,9 +806,39 @@ async fn failure_followup_settle(
         }
     };
     let Some(row) = row else {
-        // The queue row is gone (an operator delete, which owns its bytes):
-        // nothing remains for runner to salvage or dispose.
+        // The queue row is gone. A committed publication of the job is still
+        // owed as salvage (W2) and needs no row: its journal and terminal
+        // build the delivery. Otherwise (an operator delete, which owns its
+        // bytes) nothing remains for runner to salvage or dispose.
         let inventory = engine.artifacts();
+        let journaled = inventory.clone();
+        match tokio::task::spawn_blocking(move || journaled.finish_committed_salvage(job.0)).await {
+            Ok(Ok(Some(delivery))) => {
+                let publication = nzbd_types::Publication {
+                    path: delivery.publication_path.clone(),
+                    generation: delivery.publication_generation.clone(),
+                    manifest_digest: delivery.manifest_digest.clone(),
+                    files: u32::try_from(delivery.files.len()).unwrap_or(u32::MAX),
+                    cross_volume: inventory.delivery_cross_volume(&delivery),
+                };
+                let settled = inventory.clone();
+                let outcome = nzbd_state::artifacts::SalvageOutcome::Published(publication.clone());
+                if matches!(
+                    tokio::task::spawn_blocking(move || settled.settle_salvage(job.0, &outcome))
+                        .await,
+                    Ok(Ok(()))
+                ) {
+                    engine.emit_publication_ready(job, publication);
+                }
+                return Settle::Pending;
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(job = job.0, %error, "committed salvage publication remains pending");
+                return Settle::Pending;
+            }
+            Err(_) => return Settle::Pending,
+        }
         let _ = tokio::task::spawn_blocking(move || {
             inventory.settle_salvage(
                 job.0,
@@ -973,6 +1003,9 @@ pub async fn dispose_remote_failure(
         .map(|assessment| assessment.disposition);
     let action = if nzbd_engine::terminal::keeps_failed_source(job) {
         FailureAction::None
+    } else if nzbd_types::transfer_of(&job.params).is_some() {
+        // W3: a curator-admitted failure follows `failure_action`.
+        cfg.failure_action
     } else if reason.is_some_and(|reason| reason.park_always()) {
         // Contract §2.2 park-always: the copy stays under runner custody
         // where it is; the cluster ledger retains it (`artifacts::cluster`).
@@ -1288,11 +1321,14 @@ async fn dispose_failed_source(
             .and_then(|source| source.failure_assessment)
             .is_some_and(|assessment| assessment.disposition == "unusable")
     };
-    let action = if action == FailureAction::Delete && !assessed_unusable {
-        FailureAction::Park
-    } else {
-        action
-    };
+    // A curator-admitted failure's salvage already took whatever verified
+    // payload it held; the assessment gate is for jobs nobody re-grabs.
+    let action =
+        if action == FailureAction::Delete && !assessed_unusable && terminal.transfer.is_none() {
+            FailureAction::Park
+        } else {
+            action
+        };
     let mut failure_cfg = cfg.clone();
     failure_cfg.failure_action = action;
     if gate.as_ref().is_some_and(|claim| !claim(job)) {
@@ -1333,10 +1369,13 @@ async fn dispose_failed_source(
         })
     else {
         if observed.out_of_space {
-            engine.report_out_of_space(format!(
-                "failed-file disposition for job {}: {}",
-                job.0, observed.note
-            ));
+            engine.report_out_of_space_at(
+                format!(
+                    "failed-file disposition for job {}: {}",
+                    job.0, observed.note
+                ),
+                &source,
+            );
         }
         tracing::warn!(job = job.0, outcome = %observed.note,
             "failed-source disposition is incomplete; its operation retries on its own ladder");
@@ -1348,23 +1387,31 @@ async fn dispose_failed_source(
         } else {
             "retained"
         };
-        if let Err(error) = inventory.finish(job.0, path, path.parent().unwrap_or(dest_dir), state)
-        {
-            tracing::warn!(job = job.0, %error, "failed-source inventory record remains pending");
+        let recorded = inventory
+            .finish(job.0, path, path.parent().unwrap_or(dest_dir), state)
+            .inspect_err(|error| {
+                tracing::warn!(job = job.0, %error, "failed-source inventory record remains pending");
+            })
+            .is_ok();
+        if !recorded {
             return false;
         }
     }
     record(disposition.note).await
 }
 
-/// Contract §2.6 precedence: the job's keep-on-failure, then the
-/// park-always reasons, then `[post] failure_action`.
+/// Contract §2.6 precedence: the job's keep-on-failure; then, for a
+/// curator-admitted job, `[post] failure_action` as configured (its salvage
+/// has settled, curator has re-grabbed — Paul, 2026-11-11, W3); for any
+/// other job the park-always reasons, then `failure_action`.
 fn disposal_action(
     cfg: &PostConfig,
     terminal: &nzbd_state::artifacts::JobTerminal,
 ) -> FailureAction {
     if terminal.keep_on_failure {
         FailureAction::None
+    } else if terminal.transfer.is_some() {
+        cfg.failure_action
     } else if terminal.reason.is_some_and(|reason| reason.park_always()) {
         FailureAction::Park
     } else {
@@ -1883,7 +1930,11 @@ async fn scan_queue(
             .map(|job| job.id)
             .collect::<std::collections::HashSet<_>>();
         let lookup = inventory.clone();
+        let expire_parked = cfg.failure_action == FailureAction::Delete && gate.is_none();
         let owed = tokio::task::spawn_blocking(move || {
+            if expire_parked {
+                lookup.expire_parked_curator_failures()?;
+            }
             let mut owed = lookup.pending_salvage()?;
             owed.extend(lookup.pending_disposal()?);
             Ok::<_, nzbd_state::artifacts::Error>(owed)
@@ -2290,7 +2341,11 @@ fn spawn_job(
                     // truth about the volume and must stop intake too, not
                     // just fail this job.
                     if nzbd_engine::out_of_space(storage_hold_cause(&e).as_ref()) {
-                        engine.report_out_of_space(format!("post-processing job {}: {e}", job.0));
+                        engine.report_out_of_space_for(
+                            job,
+                            format!("post-processing job {}: {e}", job.0),
+                            None,
+                        );
                     }
                     tracing::error!(job = job.0, error = %e, "post-processing crashed");
                 }
@@ -2540,6 +2595,40 @@ mod post_pause_tests {
             }
         );
         assert_eq!(row.stages.len(), 2);
+        engine.shutdown().await;
+    }
+
+    /// Finding 6: while a restart is pending, no new repair or extraction
+    /// starts (other stages still do), so the restart is not held behind a
+    /// backlog; the drain ending releases the boundary.
+    #[tokio::test]
+    async fn a_pending_restart_drains_repair_and_extraction_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, _root, _history) = post_ready(&temp).await;
+        let cfg = plain_cfg();
+        let cancel = CancellationToken::new();
+        let mut stages = Stages::new(&engine, JobId(41), "job".into(), &cfg, cancel.clone());
+        nzbd_engine::set_restart_drain(true);
+        stages.enter(PostStage::ParVerify).await.unwrap();
+        let next = stages.enter(PostStage::ParRepair);
+        tokio::pin!(next);
+        let held = tokio::time::timeout(Duration::from_millis(300), &mut next)
+            .await
+            .is_err();
+        nzbd_engine::set_restart_drain(false);
+        assert!(held, "repair must not start while a restart is pending");
+        let row = engine.export_job(JobId(41)).await.unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            JobStatus::Post {
+                stage: PostStage::ParVerify
+            },
+            "a held job is no restart blocker"
+        );
+        tokio::time::timeout(Duration::from_secs(5), &mut next)
+            .await
+            .expect("the drain ending releases the boundary")
+            .unwrap();
         engine.shutdown().await;
     }
 
@@ -2924,6 +3013,30 @@ impl<'a> Stages<'a> {
                 )));
             }
             tracing::info!(job = self.job.0, next = ?stage, "post-processing resumed");
+        }
+        // W10: a pending restart drains repair and extraction — neither
+        // starts while it waits, so the running ones finish and the restart
+        // is not held behind a backlog. Other stages run on.
+        if matches!(stage, PostStage::ParRepair | PostStage::Unpack) && nzbd_engine::restart_drain()
+        {
+            if self.current.is_some() {
+                let ms = self.close();
+                self.engine.close_post_stage(self.job, now(), ms).await;
+            }
+            tracing::info!(job = self.job.0, next = ?stage,
+                "a restart is pending; holding before repair/extraction");
+            while nzbd_engine::restart_drain() {
+                tokio::select! {
+                    _ = self.cancel.cancelled() => {
+                        return Err(PostError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "processing attempt cancelled while a restart was pending",
+                        )));
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                }
+            }
+            tracing::info!(job = self.job.0, next = ?stage, "restart drain ended; continuing");
         }
         let prev_ms = self.close();
         // Status, timeline and event in that order. The first two are one
@@ -4893,14 +5006,63 @@ async fn record_failure_assessment(
     assessed: Option<&std::collections::HashMap<String, FileAssessment>>,
 ) -> Result<(), PostError> {
     let inventory = engine.artifacts();
-    let Some(source) = inventory.job_source(job.id.0)? else {
+    let Some(mut source) = inventory.job_source(job.id.0)? else {
         return Ok(());
     };
+    // W8: the assessment is advisory. A missing source root has nothing to
+    // assess (disposal records it gone); an inventory that drifted is
+    // re-snapshotted once; whatever still fails settles as `unknown` —
+    // retained, never retried forever.
+    if matches!(
+        std::fs::symlink_metadata(&source.path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ) {
+        return Ok(());
+    }
     let mut diagnostics = match assessed {
         Some(diagnostics) => diagnostics.clone(),
-        None => {
-            publication_diagnostics(job, &source, consumed, verified, terminal_unusable, probed)?
-        }
+        None => match publication_diagnostics(
+            job,
+            &source,
+            consumed,
+            verified,
+            terminal_unusable,
+            probed,
+        ) {
+            Ok(diagnostics) => diagnostics,
+            Err(first) => {
+                let retried = inventory
+                    .refresh_failed_source(job.id.0)
+                    .map_err(PostError::from)
+                    .and_then(|refreshed| {
+                        source = refreshed;
+                        publication_diagnostics(
+                            job,
+                            &source,
+                            consumed,
+                            verified,
+                            terminal_unusable,
+                            probed,
+                        )
+                    });
+                match retried {
+                    Ok(diagnostics) => diagnostics,
+                    Err(error) => {
+                        tracing::info!(job = job.id.0, %first, %error,
+                            "failed-source assessment settles unassessed; the source is kept");
+                        let mut reason = format!("kept, unassessed: {error}");
+                        reason.truncate(2000);
+                        inventory.set_failure_assessment(
+                            &source.id,
+                            &source.generation,
+                            "unknown",
+                            &reason,
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
+        },
     };
     for path in password_required {
         diagnostics.insert(
@@ -5247,6 +5409,33 @@ fn select_delivery_payload(
             ));
         }
     }
+    // Subtitles travel with the video they belong to (Paul, 2026-11-11):
+    // the published videos, as (parent, stem), for associating them.
+    let published_videos: Vec<(String, String)> = files
+        .iter()
+        .filter_map(|entry| {
+            let path = Path::new(&entry.path);
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
+            ((payload_kind(&extension) && payload_classification(&extension) == "video"
+                || !payload_kind(&extension) && probed.contains(&entry.path))
+                && verified_payload_paths.contains(&entry.path)
+                && !is_sample_or_proof(path, &stem))
+            .then(|| {
+                (
+                    path.parent()
+                        .unwrap_or(Path::new(""))
+                        .to_string_lossy()
+                        .to_ascii_lowercase(),
+                    stem,
+                )
+            })
+        })
+        .collect();
     let mut classifications = Vec::with_capacity(files.len());
 
     for entry in &files {
@@ -5288,6 +5477,17 @@ fn select_delivery_payload(
                     Some("no completed NZB/CRC or verified transform evidence identifies this payload"),
                 )),
             }
+        } else if !excluded && is_subtitle_extension(&extension) && !published_videos.is_empty() {
+            // A job's subtitles are never garbage when its video went out:
+            // publish every one, keeping its relative path (a `Subs/`
+            // folder, `2_English.srt`) so curator sees the folder context.
+            selected.push((*entry).clone());
+            selected_paths.insert(entry.path.as_str());
+            classifications.push((
+                "sidecar",
+                "published",
+                Some(subtitle_association(path, &published_videos)),
+            ));
         } else if !excluded && (is_sidecar_extension(&extension) || is_cover_name(&lower)) {
             let parent = path
                 .parent()
@@ -6338,10 +6538,66 @@ fn verified_direct_payload_paths_excluding(
     Ok(verified)
 }
 
+/// Subtitle formats; a subtitle is published with its job's video.
+fn is_subtitle_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "srt" | "ass" | "ssa" | "sub" | "idx" | "sup" | "vtt"
+    )
+}
+
+/// Which published video a subtitle belongs to, as its outcome reason. One
+/// video: all of the job's subtitles are its. Several (a season pack): the
+/// subtitle's stem starts with a video's stem, or a folder on its path is
+/// named after one (`Subs/<video stem>/2_English.srt`); otherwise it is
+/// published alongside and curator places it.
+fn subtitle_association(path: &Path, videos: &[(String, String)]) -> &'static str {
+    if videos.len() == 1 {
+        return "subtitle of the job's only published video";
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if videos
+        .iter()
+        .any(|(_, video)| stem == *video || stem.starts_with(&format!("{video}.")))
+    {
+        return "subtitle paired with a published video by name";
+    }
+    let folders = path
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .filter_map(|component| component.as_os_str().to_str())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if videos
+        .iter()
+        .any(|(_, video)| folders.iter().any(|folder| folder == video))
+    {
+        return "subtitle paired with a published video by its folder";
+    }
+    "subtitle published alongside the job's videos; no single video claims it"
+}
+
 fn is_sidecar_extension(extension: &str) -> bool {
     matches!(
         extension,
-        "srt" | "ass" | "ssa" | "sub" | "idx" | "nfo" | "jpg" | "jpeg" | "png" | "webp" | "tbn"
+        "srt"
+            | "ass"
+            | "ssa"
+            | "sub"
+            | "idx"
+            | "sup"
+            | "vtt"
+            | "nfo"
+            | "jpg"
+            | "jpeg"
+            | "png"
+            | "webp"
+            | "tbn"
     )
 }
 fn payload_kind(extension: &str) -> bool {
@@ -7418,6 +7674,103 @@ mod decision_tests {
             outcome("Season 1/ep02-sample.mkv").outcome,
             "excluded_source_cleanup"
         );
+    }
+
+    fn select_with_verified(
+        paths: &[&str],
+        verified: &[&str],
+    ) -> (
+        std::collections::HashSet<String>,
+        Vec<nzbd_state::artifacts::DeliveryFileOutcome>,
+    ) {
+        let entries = paths
+            .iter()
+            .map(|path| payload_entry(path))
+            .collect::<Vec<_>>();
+        let verified = verified.iter().map(|path| path.to_string()).collect();
+        let (selected, outcomes) = select_delivery_payload(
+            &entries,
+            &Default::default(),
+            &verified,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+        (
+            selected.into_iter().map(|entry| entry.path).collect(),
+            outcomes,
+        )
+    }
+
+    /// Subtitles in a `Subs/` folder and numbered-language names belong to
+    /// the job's only video and are published with their relative paths.
+    #[test]
+    fn subtitles_in_a_subs_folder_travel_with_the_only_video() {
+        let (selected, outcomes) = select_with_verified(
+            &[
+                "Show.S01E01.mkv",
+                "Subs/2_English.srt",
+                "Subs/English.srt",
+                "Subs/3_French.sup",
+                "Show.S01E01.vtt",
+                "readme.txt",
+            ],
+            &["Show.S01E01.mkv"],
+        );
+        for path in [
+            "Show.S01E01.mkv",
+            "Subs/2_English.srt",
+            "Subs/English.srt",
+            "Subs/3_French.sup",
+            "Show.S01E01.vtt",
+        ] {
+            assert!(selected.contains(path), "{path} must be published");
+        }
+        let subs = outcomes
+            .iter()
+            .find(|outcome| outcome.source_path == "Subs/2_English.srt")
+            .unwrap();
+        assert_eq!(subs.outcome, "published");
+        assert_eq!(subs.publication_path.as_deref(), Some("Subs/2_English.srt"));
+        assert!(!selected.contains("readme.txt"));
+    }
+
+    /// A season pack: subtitles pair by stem prefix or by a folder named
+    /// after the video; an ambiguous one is still published alongside.
+    #[test]
+    fn season_pack_subtitles_pair_by_folder_or_stem_and_are_never_dropped() {
+        let (selected, outcomes) = select_with_verified(
+            &[
+                "Show.S01E01.mkv",
+                "Show.S01E02.mkv",
+                "Subs/Show.S01E01/2_English.srt",
+                "Subs/Show.S01E02/2_English.srt",
+                "Show.S01E02.en.srt",
+                "Subs/English.srt",
+            ],
+            &["Show.S01E01.mkv", "Show.S01E02.mkv"],
+        );
+        let reason = |path: &str| {
+            let outcome = outcomes
+                .iter()
+                .find(|outcome| outcome.source_path == path)
+                .unwrap();
+            assert_eq!(outcome.outcome, "published", "{path}");
+            assert!(selected.contains(path), "{path}");
+            outcome.reason.clone().unwrap()
+        };
+        assert!(reason("Subs/Show.S01E01/2_English.srt").contains("folder"));
+        assert!(reason("Subs/Show.S01E02/2_English.srt").contains("folder"));
+        assert!(reason("Show.S01E02.en.srt").contains("by name"));
+        assert!(reason("Subs/English.srt").contains("alongside"));
+    }
+
+    /// Without a published video a subtitle keeps the sidecar rule.
+    #[test]
+    fn subtitles_without_a_published_video_follow_the_sidecar_rule() {
+        let (selected, _) =
+            select_with_verified(&["Subs/English.srt", "Album/a.flac"], &["Album/a.flac"]);
+        assert!(!selected.contains("Subs/English.srt"));
     }
 
     #[test]
@@ -10712,8 +11065,13 @@ mod decision_tests {
         );
         let delivery = inventory.delivery_for_job(41).unwrap().unwrap();
         // R3 (contract §2.2): a verified file with no recognised extension
-        // is media by its bytes (Matroska EBML here) and publishes.
-        assert_eq!(delivery.files.len(), 4);
+        // is media by its bytes (Matroska EBML here) and publishes; the
+        // job's subtitle travels with that video.
+        assert_eq!(delivery.files.len(), 5);
+        assert!(delivery
+            .files
+            .iter()
+            .any(|entry| entry.path == "unmatched.srt"));
         assert!(delivery
             .files
             .iter()

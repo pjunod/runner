@@ -7,10 +7,15 @@ mod cluster_keep;
 pub use cluster::{remove_cluster_generation_copy, ClusterArtifactCopy, ClusterCopyCleanup};
 pub use cluster_keep::{ClusterFailureKeepStatus, ClusterFailureKeepTarget};
 pub(crate) mod fs;
+
+/// Name prefix of the engine's out-of-space directory probe files (W5a):
+/// excluded from every payload manifest.
+pub const SPACE_PROBE_PREFIX: &str = ".nzbd-space-probe-";
 mod policy;
 mod publication;
 pub use policy::{RetentionChange, RetentionPreview};
 mod delivery;
+pub mod exits;
 mod materialization;
 pub use materialization::{
     external_generation_identity, ExternalGeneration, ExternalGenerationFile,
@@ -126,6 +131,15 @@ impl Identity {
             && self.directory == other.directory
     }
 }
+impl Identity {
+    /// Contract §2.5 / principle 5: a published file's identity is its
+    /// object, size and modification time (plus the journaled digest the
+    /// caller carries). Never ctime: link/unlink, NFS silly-rename removal
+    /// and chmod move ctime without touching the bytes.
+    pub fn same_publication(&self, other: &Self) -> bool {
+        self.same_object(other) && self.bytes == other.bytes && self.modified == other.modified
+    }
+}
 impl PartialEq for Identity {
     fn eq(&self, other: &Self) -> bool {
         self.same_object(other)
@@ -181,8 +195,8 @@ pub struct Artifact {
     pub created_at: i64,
     pub updated_at: i64,
     pub retention_seconds: u64,
+    /// Wall-clock expiry (W3): due when `deadline <= now`, across restarts.
     pub deadline: Option<i64>,
-    pub eligible_seconds: u64,
     #[serde(default)]
     pub files: Vec<FileEntry>,
     pub error: Option<String>,
@@ -233,13 +247,11 @@ impl Artifact {
             && self.hold.is_none()
             && self.retention_seconds > 0
     }
-    pub fn earliest_expiry(&self, now: i64) -> Option<i64> {
+    pub fn earliest_expiry(&self) -> Option<i64> {
         if !self.eligible() {
             return None;
         }
-        Some(self.deadline?.max(
-            now.saturating_add(self.retention_seconds.saturating_sub(self.eligible_seconds) as i64),
-        ))
+        self.deadline
     }
 }
 /// Exact receipt-custody metadata from the current artifact row. This does
@@ -432,6 +444,9 @@ pub struct Inventory {
     worker_session: String,
     closed: std::sync::atomic::AtomicBool,
     state_dir: PathBuf,
+    /// Root of transform workspaces (`paths.workspace_dir`); defaults to
+    /// `<state_dir>/transform-workspaces`.
+    workspace_dir: std::sync::RwLock<PathBuf>,
     pub installation: String,
     // Serialized mutation coordinator. Reads never wait for filesystem work.
     mutation: Mutex<()>,
@@ -440,7 +455,6 @@ pub struct Inventory {
     // publication checkpoint.
     publication_active: Mutex<std::collections::HashSet<String>>,
     relocation_active: Mutex<std::collections::HashSet<String>>,
-    clocks: Mutex<std::collections::HashMap<String, (u64, Instant)>>,
     reconcile_cursor: Mutex<String>,
     empty_failed_cursor: Mutex<String>,
     // One task runner at a time: the maintenance tick and an API kick can
@@ -514,6 +528,11 @@ fn save_operation(db: &Connection, op: &Operation) -> Result<()> {
     )?;
     Ok(())
 }
+/// The transform workspace root when `paths.workspace_dir` is not set.
+pub fn default_workspace_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("transform-workspaces")
+}
+
 fn event(db: &Connection, artifact: &str, kind: &str, detail: &str) -> Result<()> {
     db.execute(
         "INSERT INTO events(artifact,at,kind,detail) VALUES(?1,?2,?3,?4)",
@@ -691,6 +710,12 @@ impl Inventory {
             Connection::open(state_dir.join("artifacts.sqlite"))?
         };
         db.busy_timeout(Duration::from_secs(5))?;
+        // W5b: EXCLUSIVE before the first access, so WAL never creates or
+        // maps `-shm` (unsupported on network filesystems; a truncated one
+        // crash-looped nzbd with SIGBUS). The inventory is one connection
+        // behind `artifacts.lock`; the CLI's backup/restore open it the same
+        // way and refuse while the daemon holds it.
+        db.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
         if let Some(expected) = expected {
             let actual: String = db.query_row(
                 "SELECT value FROM meta WHERE key='installation'",
@@ -804,6 +829,41 @@ impl Inventory {
                 )?;
             }
         }
+        // 0.9.0: the committed manifest lives in the move journal so a
+        // delivery row never re-reads a publication its consumer may have
+        // taken (contract §2.5). Additive and idempotent.
+        let has_intent_manifest: bool = db.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('relocation_intents') WHERE name='manifest'",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n != 0),
+        )?;
+        if !has_intent_manifest {
+            db.execute(
+                "ALTER TABLE relocation_intents ADD COLUMN manifest TEXT",
+                [],
+            )?;
+        }
+        {
+            let tx = db.transaction()?;
+            terminals::reopen_salvage_for_committed_publications(&tx, None)?;
+            // 0.9.0 closed scope (W4): a source cleanup an older build
+            // blocked on retained review files or per-file identity drift is
+            // retried once under the new rule. Once per store.
+            let migrated: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='closed_scope_cleanup_migration')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !migrated {
+                tx.execute("UPDATE operations SET data=json_set(data,'$.request',(json_set(json_extract(data,'$.request'),'$.cleanup.state','retry','$.cleanup.next_retry',0,'$.cleanup.error',NULL) || '')) WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.cleanup.state')='blocked'", [])?;
+                tx.execute("UPDATE deliveries SET cleanup_status='retry',cleanup_error=NULL,cleanup_next_retry_at=0,cleanup_blocked_since=NULL WHERE cleanup_status='blocked'", [])?;
+                tx.execute(
+                    "INSERT INTO meta(key,value) VALUES('closed_scope_cleanup_migration','1')",
+                    [],
+                )?;
+            }
+            tx.commit()?;
+        }
         // A `running` cleanup belongs to a worker from the previous process.
         // The inventory lock was acquired above, so no live worker can race
         // this one-time boot recovery.
@@ -859,7 +919,7 @@ impl Inventory {
         }
         fs::sync_directory(&fs::open_dir(state_dir)?)?;
         let worker_session = id(&db)?;
-        Ok(Self {
+        let inventory = Self {
             writer_naming: Mutex::new(std::collections::VecDeque::new()),
             naming_leases: Mutex::new(std::collections::HashMap::new()),
             retired_naming: Mutex::new(Vec::new()),
@@ -873,15 +933,22 @@ impl Inventory {
             worker_session,
             closed: std::sync::atomic::AtomicBool::new(false),
             state_dir: state_dir.into(),
+            workspace_dir: std::sync::RwLock::new(default_workspace_dir(state_dir)),
             installation,
             mutation: Mutex::new(()),
             publication_active: Mutex::new(std::collections::HashSet::new()),
             relocation_active: Mutex::new(std::collections::HashSet::new()),
-            clocks: Mutex::new(std::collections::HashMap::new()),
             reconcile_cursor: Mutex::new(String::new()),
             empty_failed_cursor: Mutex::new(String::new()),
             tasks: Mutex::new(()),
-        })
+        };
+        inventory.abandon_reviewed_transforms()?;
+        // No-wedge: upgrade and restart conversion of review/retained rows
+        // (database-only exits; the tick runs the rest).
+        if let Err(error) = inventory.exit_wedged_states(0, false) {
+            tracing::warn!(%error, "automatic exits at open deferred to the tick");
+        }
+        Ok(inventory)
     }
     fn mutation_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
         let guard = self.mutation.lock().unwrap();
@@ -909,7 +976,8 @@ impl Inventory {
         })
     }
     /// Called only after the engine's writers and maintenance tasks finish.
-    /// Old API handles retain read access but cannot mutate a restarted daemon.
+    /// Old API handles can no longer read or mutate a restarted daemon's
+    /// store: the connection (and its EXCLUSIVE lock) is released.
     pub fn close(&self) -> Result<()> {
         let first_close = {
             let _guard = self.mutation.lock().unwrap();
@@ -918,6 +986,11 @@ impl Inventory {
         self.invalidate_all_writer_naming();
         self.drain_writer_naming();
         if first_close {
+            // W5b: the store's EXCLUSIVE lock goes with its connection, so a
+            // replacement backend in this process can open it. A stale
+            // handle's reads now fail instead of answering from a store
+            // another owner is writing.
+            *self.db.lock().unwrap() = Connection::open_in_memory()?;
             self._process_lock.unlock()?;
         }
         Ok(())
@@ -1364,7 +1437,6 @@ impl Inventory {
             updated_at: now(),
             retention_seconds: 0,
             deadline: None,
-            eligible_seconds: 0,
             files: Vec::new(),
             error: None,
             inspected_at: None,
@@ -1682,6 +1754,264 @@ impl Inventory {
         }
         Ok(root)
     }
+    /// Where transform workspaces are created.
+    pub fn workspace_dir(&self) -> PathBuf {
+        self.workspace_dir.read().unwrap().clone()
+    }
+
+    /// Use `dir` for transform workspaces (`paths.workspace_dir`). Rows
+    /// recorded under the default root (`<state_dir>/transform-workspaces`)
+    /// while `dir` is elsewhere — the operator moved the directory — are
+    /// rewritten to the same relative path under `dir` in every table. While
+    /// the old root still holds workspaces (not moved), nothing is rewritten:
+    /// they finish where they are. Then every workspace recorded under `dir`
+    /// whose recorded root is not the live root object (the root was moved
+    /// or copied there) is re-stamped — the artifact row, the transform
+    /// journal's own copy of the scratch and its attempt directories, and the
+    /// identity sidecar (Runner's private scratch: the move is the
+    /// operator's, not evidence against the payload). That re-stamp is
+    /// driven by the mismatch, not by this run's rewrite, so a crash between
+    /// the commit and the sidecar writes is finished by the next start.
+    /// Idempotent: a second run changes nothing. Returns the number of
+    /// rewritten values.
+    pub fn configure_workspace_dir(&self, dir: &Path) -> Result<usize> {
+        fs::absolute(dir)?;
+        let old = default_workspace_dir(&self.state_dir);
+        *self.workspace_dir.write().unwrap() = dir.to_path_buf();
+        let new_text = dir
+            .to_str()
+            .ok_or_else(|| Error::Conflict("non-UTF-8 workspace path".into()))?
+            .to_owned();
+        let mut rewritten = 0;
+        if dir != old {
+            if dir.starts_with(&old) || old.starts_with(dir) {
+                return Err(Error::Conflict(format!(
+                    "paths.workspace_dir {} must not be nested with the default {}",
+                    dir.display(),
+                    old.display()
+                )));
+            }
+            // Not moved (the old root still holds workspaces): the recorded
+            // absolute paths stay valid where they are, and only new
+            // workspaces go to `dir`. Rewriting them now would point them at
+            // nothing.
+            if std::fs::read_dir(&old).is_ok_and(|mut entries| entries.next().is_some()) {
+                tracing::warn!(old = %old.display(), new = %dir.display(),
+                    "workspace_dir changed but the default workspace root still holds workspaces; \
+                     existing ones finish where they are");
+            } else {
+                let old_text = old
+                    .to_str()
+                    .ok_or_else(|| Error::Conflict("non-UTF-8 workspace path".into()))?
+                    .to_owned();
+                rewritten = self.rewrite_workspace_paths(&old_text, &new_text)?;
+            }
+        }
+        let restamped = self.restamp_moved_workspaces(dir, &new_text)?;
+        if rewritten > 0 || restamped > 0 {
+            tracing::info!(from = %old.display(), to = %dir.display(), rewritten, restamped,
+                "transform workspace paths migrated");
+        }
+        Ok(rewritten)
+    }
+
+    /// Rewrite every recorded path under `old_text` to `new_text` in every
+    /// table: a whole value that is the root or under it, and every JSON
+    /// string that is, at any nesting depth. Counts only values that changed
+    /// (a value mentioning the old path unquoted mid-string, such as error
+    /// text, matches `instr` forever but is never rewritten or counted).
+    fn rewrite_workspace_paths(&self, old_text: &str, new_text: &str) -> Result<usize> {
+        let _guard = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let tables = {
+            let mut statement = tx.prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut rewritten = 0usize;
+        for table in tables {
+            let columns = {
+                let mut statement = tx.prepare(&format!("PRAGMA table_info(\"{table}\")"))?;
+                let rows = statement.query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for (column, kind) in columns {
+                if !(kind.eq_ignore_ascii_case("TEXT") || kind.is_empty()) {
+                    continue;
+                }
+                // A request is JSON inside JSON, so its quotes arrive escaped.
+                let mut expression = format!("\"{column}\"");
+                let mut binds: Vec<String> = Vec::new();
+                for quote in ["\"", "\\\"", "\\\\\\\""] {
+                    for (from, to) in [
+                        (format!("{quote}{old_text}/"), format!("{quote}{new_text}/")),
+                        (
+                            format!("{quote}{old_text}{quote}"),
+                            format!("{quote}{new_text}{quote}"),
+                        ),
+                    ] {
+                        binds.push(from);
+                        binds.push(to);
+                        expression = format!(
+                            "replace({expression},?{},?{})",
+                            binds.len() + 1,
+                            binds.len() + 2
+                        );
+                    }
+                }
+                let value = format!(
+                    "CASE \
+                     WHEN \"{column}\" = ?1 THEN ?2 \
+                     WHEN substr(\"{column}\",1,length(?1)+1) = ?1||'/' THEN ?2||substr(\"{column}\",length(?1)+1) \
+                     ELSE {expression} END"
+                );
+                let sql = format!(
+                    "UPDATE \"{table}\" SET \"{column}\" = {value} \
+                     WHERE typeof(\"{column}\")='text' AND instr(\"{column}\",?1) > 0 \
+                     AND ({value}) IS NOT \"{column}\""
+                );
+                let mut values: Vec<&dyn rusqlite::ToSql> = vec![&old_text, &new_text];
+                values.extend(binds.iter().map(|value| value as &dyn rusqlite::ToSql));
+                rewritten += tx.execute(&sql, values.as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(rewritten)
+    }
+
+    /// Re-stamp workspaces recorded under `dir` whose recorded root is not
+    /// the live root object, in one transaction: the artifact row (root and
+    /// scratch identity, manifest) and every transform journal naming that
+    /// scratch (its copy of the scratch and its attempt directories), so
+    /// startup reconcile still recognises the workspace as a transform's
+    /// and a resume verifies. Then repair any of this installation's
+    /// sidecars still recording a different root for a row that matches
+    /// disk. A missing root re-stamps nothing. Returns the rows re-stamped.
+    fn restamp_moved_workspaces(&self, dir: &Path, dir_text: &str) -> Result<usize> {
+        let Ok(root) = fs::open_dir(dir) else {
+            return Ok(0);
+        };
+        let live_root = fs::identity_for_file(&root)?;
+        let live_scratch = |path: &Path| -> Option<(File, Identity)> {
+            let file = fs::open_dir(path).ok()?;
+            let identity = fs::identity_for_file(&file).ok()?;
+            Some((file, identity))
+        };
+        let _guard = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let rows = {
+            let mut statement = tx.prepare("SELECT data FROM artifacts WHERE json_extract(data,'$.root')=?1 AND state NOT IN ('deleted','source_gone')")?;
+            let rows = statement.query_map([dir_text], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut current = std::collections::HashMap::new();
+        let mut restamped = 0usize;
+        for raw in rows {
+            let mut a: Artifact = serde_json::from_str(&raw)?;
+            if !a.root_identity.same_object(&live_root) {
+                a.root_identity = live_root.clone();
+                if let Some((scratch, identity)) = live_scratch(&a.path) {
+                    if a.identity.is_some() {
+                        a.identity = Some(identity);
+                    }
+                    if let Ok(files) = fs::manifest(&scratch, 100_000) {
+                        a.files = files;
+                    }
+                }
+                a.revision += 1;
+                a.updated_at = now();
+                save_artifact(&tx, &a)?;
+                event(
+                    &tx,
+                    &a.id,
+                    "workspace_moved",
+                    &format!("workspace root moved to {dir_text}"),
+                )?;
+                restamped += 1;
+            }
+            current.insert(a.id.clone(), a);
+        }
+        let operations = {
+            let mut statement = tx.prepare("SELECT data FROM operations WHERE json_extract(data,'$.kind') IN ('extract','par_repair') AND json_extract(json_extract(data,'$.request'),'$.scratch.root')=?1")?;
+            let rows = statement.query_map([dir_text], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in operations {
+            let mut op: Operation = serde_json::from_str(&raw)?;
+            let mut workspace: Workspace = serde_json::from_str(&op.request)?;
+            if workspace.scratch.root_identity.same_object(&live_root) {
+                continue;
+            }
+            workspace.scratch.root_identity = live_root.clone();
+            if let Some((scratch, identity)) = live_scratch(&workspace.scratch.path) {
+                if workspace.scratch.identity.is_some() {
+                    // Same value as the row's, so the journal and the row
+                    // agree exactly (`is_transform_scratch`).
+                    let row = current
+                        .get(&workspace.scratch.id)
+                        .filter(|row| row.generation == workspace.scratch.generation)
+                        .and_then(|row| row.identity.clone())
+                        .filter(|row| row.same_object(&identity));
+                    workspace.scratch.identity = Some(row.unwrap_or(identity));
+                }
+                for attempt in &mut workspace.attempts {
+                    if attempt.identity.is_some() {
+                        if let Ok(directory) = fs::open_relative(&scratch, &attempt.directory) {
+                            attempt.identity = Some(fs::identity_for_file(&directory)?);
+                        }
+                    }
+                }
+            }
+            op.request = serde_json::to_string(&workspace)?;
+            save_operation(&tx, &op)?;
+        }
+        tx.commit()?;
+        drop(db);
+        drop(_guard);
+        for a in current.values() {
+            if a.owned && a.identity.is_some() && self.sidecar_records_other_root(a)? {
+                self.sidecar(a)?;
+            }
+        }
+        Ok(restamped)
+    }
+
+    /// This installation's sidecar for `a` exists but records a different
+    /// root (path or object) than the row, while the row's root is the live
+    /// one: left behind by a root move whose re-stamp committed but whose
+    /// sidecar write did not. A foreign or unreadable sidecar is not ours to
+    /// rewrite.
+    fn sidecar_records_other_root(&self, a: &Artifact) -> Result<bool> {
+        let marker = self
+            .state_dir
+            .join("artifact-identities")
+            .join(&a.id)
+            .join(format!("{}.json", a.generation));
+        let Ok(bytes) = std::fs::read(marker) else {
+            return Ok(false);
+        };
+        let Ok(data) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Ok(false);
+        };
+        if data["installation"] != self.installation
+            || data["artifact"] != a.id
+            || data["generation"] != a.generation
+        {
+            return Ok(false);
+        }
+        let recorded_root: Option<Identity> =
+            serde_json::from_value(data["root_identity"].clone()).ok();
+        Ok(data["root"] != a.root.to_string_lossy().as_ref()
+            || data["path"] != a.path.to_string_lossy().as_ref()
+            || !recorded_root.is_some_and(|root| root.same_object(&a.root_identity)))
+    }
+
     fn verify(&self, a: &Artifact) -> Result<File> {
         self.verify_root(a)?;
         let file = fs::open_dir(&a.path)?;
@@ -1788,6 +2118,31 @@ impl Inventory {
         {
             return Ok(a);
         }
+        // Contract §2.5: a committed per-file publication is finalized from
+        // its journal. It is visible, so its consumer may already have
+        // taken files out of it; re-reading it would only find that.
+        if matches!(state, "active" | "completed")
+            && matches!(a.state.as_str(), "active" | "completed")
+            && a.owned
+            && a.path == path
+            && a.root == root
+            && self.committed_publication_intent(&a)?.is_some()
+        {
+            if a.state == state {
+                return Ok(a);
+            }
+            a.state = state.into();
+            a.revision += 1;
+            a.updated_at = now();
+            let _coordinator = self.mutation_guard()?;
+            self.check_payload_capture(&original)?;
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
+            save_artifact(&tx, &a)?;
+            event(&tx, &a.id, "finalized", state)?;
+            tx.commit()?;
+            return Ok(a);
+        }
         if a.path == path && a.state == state {
             let dir = self.verify(&a)?;
             if a.state == "active" {
@@ -1841,7 +2196,6 @@ impl Inventory {
         if state == "parked_failed" && a.owned {
             a.retention_seconds = u64::from(self.settings()?.failed_retention_days) * 86400;
             a.deadline = Some(now().saturating_add(a.retention_seconds as i64));
-            a.eligible_seconds = 0;
         }
         let _coordinator = self.mutation_guard()?;
         self.check_payload_capture(&original)?;
@@ -1947,7 +2301,6 @@ impl Inventory {
             updated_at: now(),
             retention_seconds: 0,
             deadline: None,
-            eligible_seconds: 0,
             files: Vec::new(),
             error: None,
             inspected_at: None,
@@ -2107,7 +2460,6 @@ impl Inventory {
             }
             a.retention_seconds = seconds;
         }
-        a.eligible_seconds = 0;
         a.deadline = Some(now().saturating_add(a.retention_seconds as i64));
         a.revision += 1;
         a.updated_at = now();
@@ -2488,7 +2840,6 @@ impl Inventory {
         }
         let mut a = self.get(key)?;
         a.hold = None;
-        a.eligible_seconds = 0;
         a.deadline = Some(now().saturating_add(a.retention_seconds as i64));
         a.revision += 1;
         save_artifact(&self.db.lock().unwrap(), &a)?;
@@ -2789,11 +3140,7 @@ impl Inventory {
         }
         if op.attempts == 0
             && ((a.revision != revision && !explicit_cancellation)
-                || (automatic
-                    && (!self.settings()?.enabled
-                        || !a.eligible()
-                        || a.eligible_seconds < a.retention_seconds
-                        || !a.deadline.is_some_and(|d| d <= now()))))
+                || (automatic && (!a.eligible() || !a.deadline.is_some_and(|d| d <= now()))))
         {
             op.state = "cancelled".into();
             op.error = Some("deletion authorization changed; a fresh request is required".into());
@@ -2954,8 +3301,8 @@ impl Inventory {
         Ok(())
     }
 
-    /// Count only daemon monotonic uptime observed while eligible. Reset the
-    /// checkpoint before the transaction: a failed commit loses time safely.
+    /// Failed-payload expiry is a wall-clock deadline (W3): it survives
+    /// restarts and does not wait on daemon uptime or an opt-in toggle.
     pub fn tick(&self) -> Result<()> {
         self.tick_with_history(None)
     }
@@ -2965,56 +3312,21 @@ impl Inventory {
     /// in the inventory journal, independent of history retention.
     pub fn tick_with_history(&self, history: Option<&crate::history::HistoryDb>) -> Result<()> {
         self.drain_writer_naming();
-        let enabled = self.settings()?.enabled;
-        let mut due = Vec::new();
-        {
-            let _guard = self.mutation_guard()?;
-            let mut db = self.db.lock().unwrap();
-            let tx = db.transaction()?;
-            let raws = {
-                let mut stmt =
-                    tx.prepare("SELECT data FROM artifacts WHERE state IN ('parked_failed','recovery_imported')")?;
-                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()?
-            };
-            let mut active_clocks = std::collections::HashSet::new();
-            for raw in raws {
-                let mut a: Artifact = serde_json::from_str(&raw)?;
-                active_clocks.insert(a.id.clone());
-                if enabled && a.eligible() {
-                    let elapsed = {
-                        let mut clocks = self.clocks.lock().unwrap();
-                        let point = clocks
-                            .entry(a.id.clone())
-                            .or_insert((a.revision, Instant::now()));
-                        let elapsed = if point.0 == a.revision {
-                            point.1.elapsed().as_secs()
-                        } else {
-                            0
-                        };
-                        *point = (a.revision, Instant::now());
-                        elapsed
-                    };
-                    a.eligible_seconds = a
-                        .eligible_seconds
-                        .saturating_add(elapsed)
-                        .min(a.retention_seconds);
-                    save_artifact(&tx, &a)?;
-                    if a.eligible_seconds >= a.retention_seconds
-                        && a.deadline.is_some_and(|d| d <= now())
-                    {
-                        due.push((a.id.clone(), a.revision));
-                    }
-                } else {
-                    self.clocks.lock().unwrap().remove(&a.id);
+        let due = {
+            let db = self.db.lock().unwrap();
+            let mut stmt = db.prepare(
+                "SELECT data FROM artifacts WHERE state IN ('parked_failed','recovery_imported')",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut due = Vec::new();
+            for raw in rows {
+                let a: Artifact = serde_json::from_str(&raw?)?;
+                if a.eligible() && a.deadline.is_some_and(|d| d <= now()) {
+                    due.push((a.id, a.revision));
                 }
             }
-            self.clocks
-                .lock()
-                .unwrap()
-                .retain(|key, _| active_clocks.contains(key));
-            tx.commit()?;
-        }
+            due
+        };
         for (key, revision) in due {
             if let Err(e) = self.request_delete_authorized(
                 &key,
@@ -3031,6 +3343,9 @@ impl Inventory {
         self.reconcile_workspace_retirements_with_history(history)?;
         self.run_workspace_retirements()?;
         self.reconcile_recoveries()?;
+        if let Err(error) = self.exit_wedged_states(exits::HOLD_EXIT_SECONDS, true) {
+            tracing::warn!(%error, "automatic exits for review/retained states deferred");
+        }
         self.schedule_discovery()?;
         self.run_tasks()?;
         self.reconcile_missing()?;
@@ -3167,7 +3482,6 @@ impl Inventory {
             updated_at: now(),
             retention_seconds: 86400,
             deadline: None,
-            eligible_seconds: 0,
             files: fs::manifest(&dir, 100_000)?,
             error: None,
             inspected_at: Some(now()),
@@ -3214,9 +3528,19 @@ impl Inventory {
         };
         for raw in raws {
             let mut a: Artifact = serde_json::from_str(&raw)?;
-            a.hold = Some("restored backup: review required".into());
+            // Finding 8: record the Keep the row had, so releasing the
+            // quarantine restores it instead of leaving Keep on everything.
+            // A row already quarantined keeps its first record.
+            if a.hold.as_deref() != Some(exits::RESTORE_HOLD) {
+                event(
+                    &tx,
+                    &a.id,
+                    "restore_quarantine",
+                    if a.keep { "keep=true" } else { "keep=false" },
+                )?;
+            }
+            a.hold = Some(exits::RESTORE_HOLD.into());
             a.keep = true;
-            a.eligible_seconds = 0;
             a.deadline = None;
             a.revision += 1;
             save_artifact(&tx, &a)?;
@@ -3267,6 +3591,38 @@ mod identity_preflight_tests {
                 (entry.file_name(), std::fs::read(entry.path()).unwrap())
             })
             .collect()
+    }
+
+    /// R3 / W5b: neither state database ever has a `-shm`; a truncated one
+    /// left by an older build (the nuc3 SIGBUS) is never mapped.
+    #[test]
+    fn state_databases_run_without_shm_even_over_a_truncated_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inventory = Inventory::open(tmp.path()).unwrap();
+        inventory
+            .configure_scan(serde_json::json!({"roots": []}))
+            .unwrap();
+        assert!(!tmp.path().join("artifacts.sqlite-shm").exists());
+        inventory.close().unwrap();
+        drop(inventory);
+        std::fs::write(tmp.path().join("artifacts.sqlite-shm"), b"abc").unwrap();
+        let history_path = tmp.path().join("history.sqlite");
+        let history = crate::history::HistoryDb::open(&history_path, None).unwrap();
+        drop(history);
+        std::fs::write(tmp.path().join("history.sqlite-shm"), b"abc").unwrap();
+        let inventory = Inventory::open(tmp.path()).unwrap();
+        inventory
+            .configure_scan(serde_json::json!({"roots": []}))
+            .unwrap();
+        let history = crate::history::HistoryDb::open(&history_path, None).unwrap();
+        assert_eq!(history.count_filtered(true).unwrap(), 0);
+        for shm in ["artifacts.sqlite-shm", "history.sqlite-shm"] {
+            assert_eq!(
+                std::fs::read(tmp.path().join(shm)).unwrap(),
+                b"abc",
+                "{shm} untouched"
+            );
+        }
     }
 
     #[test]

@@ -67,6 +67,14 @@ use tokio_util::sync::CancellationToken;
 /// Refuse a new control request once this bound is reached rather than growing
 /// owner memory without limit while no adapter is attached.
 const MAX_PENDING_BACKEND_COMMANDS: usize = 64;
+/// No-wedge task 1: how many times one file may be discarded and
+/// re-downloaded after an identity mismatch before the job fails
+/// `identity`.
+pub(crate) const IDENTITY_RESET_LIMIT: u32 = 3;
+/// Job param: identity resets taken so far for a file (`<prefix><file>`).
+pub(crate) const IDENTITY_RESETS_PREFIX: &str = "*File:identity-resets:";
+/// Job param: the next writer for this file must start from an empty file.
+pub(crate) const IDENTITY_DISCARD_PREFIX: &str = "*File:identity-discard:";
 
 // Only an unenrolled configured root may be initialized. A missing enrolled
 // mount remains unavailable; creating a replacement directory cannot prove it.
@@ -812,6 +820,11 @@ pub(crate) enum EngineMsg {
         revision: u64,
         result: IoResult,
     },
+    /// A background (off-lane) blocking job finished; see `background_then`.
+    BackgroundFinished {
+        revision: u64,
+        result: IoResult,
+    },
     WritersStopped {
         job: JobId,
         generation: u64,
@@ -901,11 +914,29 @@ pub(crate) enum EngineMsg {
         /// ([`crate::io_error_hold_cause`]); `None` is a terminal `failed/io`.
         cause: Option<nzbd_types::HoldCause>,
     },
+    /// The writer found the file on disk is not the object its proof names
+    /// (no-wedge task 1). Nothing was written.
+    WriterIdentityMismatch {
+        job: JobId,
+        file: FileId,
+        error: String,
+    },
     /// A real write ran out of space (ENOSPC/EDQUOT). Reported from
     /// wherever it happened — writer, finalize, post-processing — and
     /// latches the disk guard immediately.
     OutOfSpace {
         whence: String,
+        /// The directory whose write failed, when the reporter knows it.
+        dir: Option<PathBuf>,
+        /// The job whose post-processing write failed: that job's own retry
+        /// is the evidence that clears it (W5a).
+        job: Option<JobId>,
+    },
+    /// W5a: a probe round finished: per failure, the ENOSPC count it was
+    /// planned under (a newer report of the same failure voids a success),
+    /// what it found, and the guarded roots it found remounted.
+    SpaceProbed {
+        results: Vec<crate::space_probe::Probed>,
     },
 }
 
@@ -947,6 +978,17 @@ pub(crate) struct Owner {
     startup_roots_loading: bool,
     startup_roots_ready: bool,
     startup_roots_retry_at: Instant,
+    /// Jobs this installation's own snapshot carried at boot. A legacy
+    /// `Done` range of one of these (no writer proof at all) is stamped at
+    /// first open without being read; imported and adopted rows are not.
+    boot_jobs: HashSet<JobId>,
+    /// Jobs with an open lifecycle intent (relocation, transform custody,
+    /// a non-active allocation). Only these wait for their root's startup
+    /// reconciliation; live active allocations lease immediately.
+    startup_intent_jobs: HashSet<JobId>,
+    startup_phases: crate::startup_phases::StartupPhases,
+    /// While set, `publish_now` is deferred to the end of a batch.
+    publish_batched: bool,
     verification: HashMap<JobId, VerificationState>,
     verification_roots: HashSet<PathBuf>,
     allocation_cache: HashMap<JobId, nzbd_state::artifacts::Artifact>,
@@ -958,6 +1000,9 @@ pub(crate) struct Owner {
     pending_writer_birth: HashMap<FileId, u64>,
     #[cfg(test)]
     work_selection_attempts: usize,
+    /// Test hook handed to every writer this owner spawns.
+    #[cfg(test)]
+    writer_sync_hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
     allocating_jobs: HashSet<JobId>,
     pending_journal_loads: HashMap<JobId, (u64, usize)>,
     pending_control_commits: HashSet<JobId>,
@@ -1147,6 +1192,19 @@ pub(crate) struct Owner {
     enospc_latched: bool,
     enospc_observed: u64,
     enospc_where: Option<String>,
+    /// Finding 7: jobs whose proven files passed the post-processing
+    /// admission stat, by job epoch.
+    pp_stat_passed: HashMap<JobId, u64>,
+    /// W5a: every write that reported ENOSPC, by the operation that failed.
+    /// The latch clears when each has evidence from its own operation
+    /// (`space_probe`), never from a write somewhere else.
+    enospc_failures:
+        std::collections::BTreeMap<crate::space_probe::SpaceOp, crate::space_probe::SpaceFailure>,
+    /// Probe filesystem (a fake in tests).
+    space_probe_fs: Arc<dyn crate::space_probe::ProbeFs>,
+    space_probe_inflight: bool,
+    space_probe_after: Instant,
+    space_probe_failures: u32,
     guard_tick: u32,
     /// Round-robin cursor over the active set, advanced per granted
     /// lease. See `SelectionCtx::rotate`.
@@ -1172,21 +1230,16 @@ pub(crate) fn torrent_payload_device(
         .or_else(|| holding("torrent payloads"))
 }
 
+/// statvfs is a forecast that can hold intake; it is never evidence that a
+/// write-observed ENOSPC recovered (W5a: Gluster DHT sums its bricks). The
+/// latch is cleared only by a successful probe write or the operator.
 fn disk_guard_decision(
     was_held: bool,
-    mut write_latched: bool,
+    write_latched: bool,
     reading: &DiskGuardReading,
     floor: u64,
 ) -> (bool, bool) {
     let free = reading.available_bytes;
-    let clear_at = floor.saturating_mul(2);
-    if write_latched
-        && clear_at > 0
-        && reading.all_roots_known
-        && free.is_some_and(|available| available >= clear_at)
-    {
-        write_latched = false;
-    }
     let below_floor = floor > 0 && free.is_some_and(|available| available < floor);
     // Once held, an incomplete cycle is not recovery evidence. Retain the
     // hold until every configured root was measured and the minimum is above
@@ -1254,6 +1307,7 @@ impl Owner {
     pub(crate) fn recover(
         state_dir: &Path,
         artifact_dir: Option<&Path>,
+        workspace_dir: Option<&Path>,
         expected_installation_id: Option<&str>,
         dest_dir: PathBuf,
         torrent_payload_roots: Vec<PathBuf>,
@@ -1285,6 +1339,13 @@ impl Owner {
             )
             .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?,
         );
+        // `paths.workspace_dir`, and the migration of rows recorded under the
+        // default root, before anything reads a workspace path.
+        if let Some(dir) = workspace_dir {
+            artifacts
+                .configure_workspace_dir(dir)
+                .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+        }
         // Capture the metadata boundary before runtime Inventory handles can
         // admit allocations or journals while payload workers are delayed.
         let startup_snapshot = Arc::new(
@@ -1307,8 +1368,14 @@ impl Owner {
         // made-up `history_seq`.
         let history = match history {
             Some(history) => history,
+            // Per node (W5b): cluster nodes share `state_dir`, and an
+            // EXCLUSIVE SQLite store has exactly one owner.
             None => Arc::new(nzbd_state::history::HistoryDb::open(
-                &state_dir.join("engine-history.sqlite"),
+                &state_dir.join(if journal_suffix.is_empty() {
+                    "engine-history.sqlite".to_owned()
+                } else {
+                    format!("engine-history.{journal_suffix}.sqlite")
+                }),
                 None,
             )?),
         };
@@ -1466,6 +1533,12 @@ impl Owner {
                 .reserved_file_id()
                 .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?,
         );
+        let boot_jobs = state
+            .jobs
+            .iter()
+            .filter(|job| job.torrent.is_none())
+            .map(|job| job.id)
+            .collect::<HashSet<_>>();
         let initial_disk_hold = tuning.min_free_disk_bytes > 0;
         let initial_quota_hold = tuning.daily_quota_bytes > 0 || tuning.monthly_quota_bytes > 0;
         let mut owner = Owner {
@@ -1492,6 +1565,10 @@ impl Owner {
             startup_roots_loading: false,
             startup_roots_ready: false,
             startup_roots_retry_at: Instant::now(),
+            boot_jobs,
+            startup_intent_jobs: HashSet::new(),
+            startup_phases: crate::startup_phases::StartupPhases::default(),
+            publish_batched: false,
             verification: HashMap::new(),
             verification_roots: HashSet::new(),
             allocation_cache,
@@ -1503,6 +1580,8 @@ impl Owner {
             pending_writer_birth: HashMap::new(),
             #[cfg(test)]
             work_selection_attempts: 0,
+            #[cfg(test)]
+            writer_sync_hook: None,
             allocating_jobs: HashSet::new(),
             pending_journal_loads: HashMap::new(),
             pending_control_commits: HashSet::new(),
@@ -1611,9 +1690,16 @@ impl Owner {
             enospc_latched: false,
             enospc_observed: 0,
             enospc_where: None,
+            pp_stat_passed: HashMap::new(),
+            enospc_failures: std::collections::BTreeMap::new(),
+            space_probe_fs: Arc::new(crate::space_probe::RealFs),
+            space_probe_inflight: false,
+            space_probe_after: Instant::now(),
+            space_probe_failures: 0,
             rotate: 0,
             guard_tick: 0,
         };
+        owner.startup_phases.owner_ready_ms = Some(crate::startup_phases::since_boot_ms());
         owner.schedule_startup_reconciliation();
         Ok(owner)
     }
@@ -1855,6 +1941,12 @@ impl Owner {
                 revision,
                 result,
             } => self.payload_finished(root, revision, result),
+            EngineMsg::BackgroundFinished { revision, result } => {
+                self.io_finished(revision, result);
+                self.retry_payload_recoveries();
+                self.start_verifications();
+                self.bump_epoch();
+            }
             EngineMsg::ScopedNameInspected {
                 job,
                 generation,
@@ -2052,7 +2144,18 @@ impl Owner {
                 final_path,
                 combined_crc,
             } => self.on_writer_finalized(job, file, ok, final_path, combined_crc),
-            EngineMsg::OutOfSpace { whence } => self.observe_out_of_space(&whence),
+            EngineMsg::OutOfSpace { whence, dir, job } => match job {
+                Some(job) => self.observe_space_failure(
+                    &whence,
+                    crate::space_probe::SpaceOp::Post { job },
+                    dir,
+                ),
+                None => self.observe_out_of_space_in(&whence, dir),
+            },
+            EngineMsg::SpaceProbed { results } => self.on_space_probed(results),
+            EngineMsg::WriterIdentityMismatch { job, file, error } => {
+                self.on_writer_identity_mismatch(job, file, &error)
+            }
             EngineMsg::WriterError {
                 job,
                 file,
@@ -2064,14 +2167,36 @@ impl Owner {
                 // waits for space, a dropped mount retries on its own, and
                 // anything else (a digest or size mismatch) is the job's
                 // terminal failure rather than a re-check forever.
-                if crate::out_of_space(cause.as_ref()) {
-                    self.observe_out_of_space(&error);
-                }
                 let stage = if error.starts_with("finalize") {
                     "finalize"
                 } else {
                     "download_write"
                 };
+                if crate::out_of_space(cause.as_ref()) {
+                    // W5a: the evidence that clears this is the same file's
+                    // write (an allocation on its partial) or, for a file
+                    // whose bytes are all written, its own finalize retry.
+                    let part = self
+                        .artifacts
+                        .for_job(job.0)
+                        .ok()
+                        .flatten()
+                        .map(|artifact| {
+                            artifact.path.join(format!(".runner-file-{}.part", file.0))
+                        });
+                    let written = self.state.job(job).is_some_and(|record| {
+                        record
+                            .files
+                            .iter()
+                            .any(|entry| entry.id == file && entry.is_terminal())
+                    });
+                    let op = if stage == "finalize" || written {
+                        crate::space_probe::SpaceOp::Finalize { job, file }
+                    } else {
+                        crate::space_probe::SpaceOp::Write { job, file }
+                    };
+                    self.observe_space_failure(&error, op, part);
+                }
                 match cause {
                     Some(cause) => {
                         self.hold_job(job, cause, stage, &error);
@@ -2582,6 +2707,68 @@ impl Owner {
                     let _ = reply.send(None);
                     return;
                 }
+                // No-wedge item 4: a job startup released untouched is checked
+                // here, from metadata, before post-processing reads it. A range
+                // no writer proof covers gets this job's ticket (a legacy one
+                // is stamped without a read); PAR verification is the backstop.
+                // A job admitted before (its download retired into PP custody)
+                // was checked then; transforms own its shape since.
+                if self.state.job(job).is_some_and(|record| {
+                    !record
+                        .params
+                        .iter()
+                        .any(|(key, _)| key == "*Recovery:download-retired")
+                        && !self.payload_evidence_sufficient(record)
+                }) {
+                    self.queue_verification(job);
+                    if self.verification.contains_key(&job) {
+                        let _ = reply.send(None);
+                        return;
+                    }
+                }
+                // Finding 7: a proof says which object holds the ranges, not
+                // that the object still holds them. One stat per proven file
+                // (off this loop) before post-processing reads it: a replaced,
+                // missing or truncated file goes to verification, which
+                // reopens its missing ranges for download.
+                if let Some((epoch, dir, files)) = self.pp_admission_stat_needed(job) {
+                    self.background_then(
+                        format!("pp-stat-{}", job.0),
+                        move || Ok(recovery_worker::stat_proven_files(&dir, &files)),
+                        move |owner, result| {
+                            match result {
+                                Ok(recovery_worker::AdmissionStat::Fits) => {
+                                    owner.pp_stat_passed.insert(job, epoch);
+                                    // The admission re-runs every check
+                                    // against the queue as it is now.
+                                    owner.on_command(QueueCommand::BeginPostAdmission {
+                                        job,
+                                        reply,
+                                    });
+                                }
+                                Ok(recovery_worker::AdmissionStat::Short(why)) => {
+                                    tracing::warn!(job = job.0, %why,
+                                        "proven payload no longer fits its proof; verifying before post-processing");
+                                    owner.queue_verification(job);
+                                    let _ = reply.send(None);
+                                    owner.publish_now();
+                                    owner.bump_epoch();
+                                }
+                                Ok(recovery_worker::AdmissionStat::Unavailable(why)) => {
+                                    tracing::warn!(job = job.0, %why,
+                                        "payload stat unavailable; post-processing admission retries");
+                                    let _ = reply.send(None);
+                                }
+                                Err(error) => {
+                                    tracing::warn!(job = job.0, %error,
+                                        "payload stat failed; post-processing admission retries");
+                                    let _ = reply.send(None);
+                                }
+                            }
+                        },
+                    );
+                    return;
+                }
                 if self.state.job(job).is_some_and(|job| {
                     job.files.iter().any(|file| {
                         self.writers
@@ -2608,6 +2795,7 @@ impl Owner {
                     self.writers.remove(&file);
                 }
                 self.post_admissions.insert(job, generation);
+                self.pp_stat_passed.remove(&job);
                 let cancellation = self.cancel.child_token();
                 self.post_cancellations.insert(job, cancellation.clone());
                 if let Some(record) = self.state.job_mut(job) {
@@ -6136,6 +6324,7 @@ impl Owner {
                 }
                 if self.retiring_writers.contains_key(&r.job)
                     || self.allocating_jobs.contains(&r.job)
+                    || self.verification.contains_key(&r.job)
                 {
                     // Writer retirement owns its own completion/wake-up. It is
                     // transient, not an allocation needing operator review.
@@ -6193,6 +6382,11 @@ impl Owner {
                 generation,
             });
         }
+        if !leases.is_empty() && self.startup_phases.first_lease_ms.is_none() {
+            let ms = crate::startup_phases::since_boot_ms();
+            self.startup_phases.first_lease_ms = Some(ms);
+            tracing::info!(ms, "first article lease since boot");
+        }
         leases
     }
 
@@ -6226,6 +6420,8 @@ impl Owner {
                 server,
                 identity,
             } => {
+                // W5a: the same file's write landed.
+                self.space_op_succeeded(&crate::space_probe::SpaceOp::Write { job, file });
                 let reference = SegRef {
                     job,
                     file,
@@ -6433,6 +6629,13 @@ impl Owner {
                     cause,
                 });
             }
+            WriterFact::IdentityMismatch { error } => {
+                if let Some(writer) = self.writers.remove(&file) {
+                    self.retire_writer_handle(job, writer);
+                }
+                self.writer_epochs.remove(&file);
+                self.on_msg(EngineMsg::WriterIdentityMismatch { job, file, error });
+            }
             WriterFact::Rejected {
                 seg_number,
                 server,
@@ -6452,6 +6655,80 @@ impl Owner {
         }
     }
 
+    /// No-wedge task 1. The writer found that the file on disk is not the
+    /// object its proof names. The recorded ranges are therefore not on
+    /// disk: discard this one file's Done ranges and proof and re-download
+    /// it from an empty file (the next writer removes whatever sits at its
+    /// names; the job directory is Runner's closed scope). Other files and
+    /// other jobs are untouched. After [`IDENTITY_RESET_LIMIT`] resets of the
+    /// same file the job ends `failed/io` (the storage's fault, never the
+    /// release's; salvage allowed) and follows its terminal policy, so a
+    /// filesystem that keeps swapping the object cannot loop.
+    fn on_writer_identity_mismatch(&mut self, job: JobId, file: FileId, error: &str) {
+        let resets_key = format!("{IDENTITY_RESETS_PREFIX}{}", file.0);
+        let Some(record) = self.state.job_mut(job) else {
+            return;
+        };
+        if record
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+        {
+            return;
+        }
+        let resets = record
+            .params
+            .iter()
+            .find(|(key, _)| key == &resets_key)
+            .and_then(|(_, value)| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        if resets >= IDENTITY_RESET_LIMIT {
+            tracing::warn!(job = job.0, file = file.0, %error, resets, "writer identity mismatch recurred; failing job");
+            // A filesystem that keeps replacing the object is the storage's
+            // fault, not the release's: `failed/io` (blameless, parked,
+            // salvage allowed), with the cause named in the message.
+            self.fail_job_terminal(
+                job,
+                nzbd_types::FailureReason::Io,
+                None,
+                "download_write",
+                &format!("identity: {error}; recurred after {resets} re-downloads of the file"),
+            );
+            return;
+        }
+        tracing::warn!(job = job.0, file = file.0, %error, attempt = resets + 1, "writer identity mismatch; re-downloading the file");
+        set_owner_param(
+            &mut record.params,
+            &resets_key,
+            Some((resets + 1).to_string()),
+        );
+        set_owner_param(
+            &mut record.params,
+            &format!("{IDENTITY_DISCARD_PREFIX}{}", file.0),
+            Some("1".into()),
+        );
+        set_owner_param(&mut record.params, &format!("*File:proof:{}", file.0), None);
+        if let Some(entry) = record.files.iter_mut().find(|entry| entry.id == file) {
+            for segment in &mut entry.segments {
+                if matches!(
+                    segment.state,
+                    SegmentState::Done { .. } | SegmentState::Leased { .. }
+                ) {
+                    segment.state = SegmentState::Pending;
+                }
+            }
+            entry.finalized = false;
+            entry.crc32 = None;
+        }
+        recompute_job_totals(record);
+        self.file_sizes.remove(&file);
+        self.finalize_sent.remove(&file);
+        self.attempts.retain(|reference, _| reference.file != file);
+        self.dirty = true;
+        self.publish_now();
+        self.bump_epoch();
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn on_segment_written(
         &mut self,
@@ -6464,6 +6741,8 @@ impl Owner {
         file_size: u64,
         server: ServerId,
     ) {
+        // W5a: the same file's write landed.
+        self.space_op_succeeded(&crate::space_probe::SpaceOp::Write { job, file });
         self.volumes
             .add(server, len as u64, unix_now(), self.tuning.quota_start_day);
         let r = SegRef {
@@ -6481,6 +6760,15 @@ impl Owner {
             return; // duplicate (e.g. recovery overlap)
         }
         seg.state = SegmentState::Done { offset, len, crc };
+        if let Some(record) = self.state.job_mut(job) {
+            // The writer that took this write started from an empty file:
+            // the discard it was asked for is done.
+            set_owner_param(
+                &mut record.params,
+                &format!("{IDENTITY_DISCARD_PREFIX}{}", file.0),
+                None,
+            );
+        }
         self.append_journal(
             JournalRecord {
                 job,
@@ -7417,35 +7705,49 @@ impl Owner {
         let Some(f) = self.state.file_mut(job, file) else {
             return;
         };
-        f.finalized = true;
-        if ok {
-            f.crc32 = combined_crc;
-        }
         let filename = f.filename.clone();
         if !ok {
-            // The bytes did not land. Record it against the job so that
-            // check_job_complete cannot call this a success — see the field's
-            // comment for why health is incapable of catching it.
+            // The bytes did not land. The file is NOT finalized: its partial
+            // may be the only copy of the payload, and the startup sweep
+            // removes partials of finalized files. The failure is recorded
+            // durably as the job's `failed/io` terminal (parked, blameless,
+            // salvage keeps the partial) — the same path as a writer error
+            // that retrying cannot fix — so it survives a restart instead of
+            // living only in memory.
             tracing::error!(job = job.0, file = file.0, %filename,
                 "finalize failed; the job cannot be reported as successful");
-            self.write_failures
-                .entry(job)
-                .or_insert_with(|| format!("could not write {filename} to disk"));
+            self.emit(Event::FileFinished {
+                job,
+                file,
+                filename: filename.clone(),
+                ok: false,
+            });
+            self.fail_job_terminal(
+                job,
+                nzbd_types::FailureReason::Io,
+                None,
+                "finalize",
+                &format!("could not write {filename} to disk"),
+            );
+            return;
         }
+        f.finalized = true;
+        f.crc32 = combined_crc;
+        // W5a: this file's own write and publication landed.
+        self.space_op_succeeded(&crate::space_probe::SpaceOp::Write { job, file });
+        self.space_op_succeeded(&crate::space_probe::SpaceOp::Finalize { job, file });
         tracing::info!(job = job.0, file = file.0, %filename, ok, path = ?final_path, "file finished");
         // A completed file may be the recovery index that knows what this
         // whole job actually is. Only worth asking when the job still has
         // no real name.
-        if ok {
-            if let Some(path) = final_path.clone() {
-                self.maybe_learn_name_from(job, path);
-            }
+        if let Some(path) = final_path.clone() {
+            self.maybe_learn_name_from(job, path);
         }
         self.emit(Event::FileFinished {
             job,
             file,
             filename,
-            ok,
+            ok: true,
         });
         self.dirty = true;
         self.check_job_complete(job);
@@ -7919,6 +8221,22 @@ impl Owner {
                 "writer retirement in progress".into(),
             ));
         }
+        // Completion evidence with no allocation is recovery's, never a
+        // fresh allocation's: a job startup released untouched
+        // (paused, then resumed) takes its recovery pass here, lazily.
+        let needs_recovery = !self.allocated_jobs.contains(&job)
+            && !self.allocating_jobs.contains(&job)
+            && self
+                .state
+                .job(job)
+                .is_some_and(|record| record.files.iter().any(|file| file.has_any_done()))
+            && !self.allocation_cache.contains_key(&job);
+        if needs_recovery {
+            self.queue_verification(job);
+            return Err(nzbd_state::artifacts::Error::Conflict(
+                "payload recovery pending".into(),
+            ));
+        }
         let record = self
             .state
             .job(job)
@@ -8108,6 +8426,8 @@ impl Owner {
             return closed();
         }
         let expected_identity = proof.as_ref().map(|proof| proof.identity.clone());
+        let discard_key = format!("{IDENTITY_DISCARD_PREFIX}{}", file.0);
+        let discard_existing = record.params.iter().any(|(key, _)| key == &discard_key);
         let filename = record
             .params
             .iter()
@@ -8157,11 +8477,12 @@ impl Owner {
                 proven,
                 expected_identity,
                 collect_naming,
+                discard_existing,
                 naming_inventory: collect_naming.then(|| owner.artifacts.clone()),
                 #[cfg(test)]
                 naming_test_hook: None,
                 #[cfg(test)]
-                sync_test_hook: None,
+                sync_test_hook: owner.writer_sync_hook.clone(),
             };
             let writer = spawn_writer_scoped(
                 &owner.tracker,
@@ -8570,10 +8891,38 @@ impl Owner {
     /// downloading at wire speed while writers, finalize and PP were all
     /// being told there was no space — 725 GB burned in a day. A failed
     /// write is not a forecast, so it does not go through the threshold:
-    /// it latches the guard directly and only a statvfs reading of twice
-    /// the floor (or an operator resume) clears it.
-    pub(crate) fn observe_out_of_space(&mut self, whence: &str) {
+    /// it latches the guard directly and only evidence from the operation
+    /// that failed (`space_probe`) or an operator resume clears it.
+    /// An unattributed report (torrent backend, a bare report): only a
+    /// directory probe can answer it.
+    pub(crate) fn observe_out_of_space_in(&mut self, whence: &str, dir: Option<PathBuf>) {
+        let dir = dir.unwrap_or_default();
+        self.observe_space_failure(
+            whence,
+            crate::space_probe::SpaceOp::Directory(dir.clone()),
+            (!dir.as_os_str().is_empty()).then_some(dir),
+        );
+    }
+
+    /// Record what failed; the latch holds until each recorded failure has
+    /// evidence from its own operation.
+    pub(crate) fn observe_space_failure(
+        &mut self,
+        whence: &str,
+        op: crate::space_probe::SpaceOp,
+        path: Option<PathBuf>,
+    ) {
         self.enospc_observed += 1;
+        let volumes = self.guarded_volumes();
+        self.enospc_failures.insert(
+            op,
+            crate::space_probe::SpaceFailure {
+                path,
+                observed: self.enospc_observed,
+                volumes,
+            },
+        );
+        self.space_probe_after = Instant::now() + Duration::from_secs(30);
         self.enospc_where = Some(whence.to_string());
         if !self.enospc_latched {
             self.enospc_latched = true;
@@ -8597,6 +8946,8 @@ impl Owner {
     pub(crate) fn clear_enospc_latch(&mut self) {
         if self.enospc_latched {
             self.enospc_latched = false;
+            self.enospc_failures.clear();
+            self.space_probe_failures = 0;
             // Drop only the previous latch-derived hold before reevaluating.
             // A current below-floor reading immediately restores disk_low;
             // an unknown reading does not defeat the explicit override.
@@ -8626,14 +8977,11 @@ impl Owner {
             self.tuning.min_free_disk_bytes,
         );
         self.evaluated_disk_guard = reading.clone();
-        if was_latched && !self.enospc_latched {
-            tracing::info!(
-                free = free.unwrap_or_default(),
-                clear_at = self.tuning.min_free_disk_bytes.saturating_mul(2),
-                limiting_path = ?reading.limiting_path,
-                "out-of-space latch cleared — every volume reports twice the floor free"
-            );
-        }
+        debug_assert!(
+            !was_latched || self.enospc_latched,
+            "statvfs never clears the latch"
+        );
+        self.maybe_probe_space();
         if self.disk_low != was {
             if self.disk_low {
                 self.pause_incomplete_torrents_for_storage();
@@ -8655,6 +9003,343 @@ impl Owner {
             }
             self.publish_guard_change(was, self.disk_low);
         }
+    }
+
+    /// W5a: while latched, gather evidence for each recorded failure on a
+    /// backoff (30 s doubling to 10 min), off the owner thread. Failures
+    /// whose operation no longer exists are dropped here; see
+    /// [`Self::space_probe_plan`] for what each remaining one waits on.
+    fn maybe_probe_space(&mut self) {
+        use crate::space_probe::SpaceOp;
+        if !self.enospc_latched
+            || self.space_probe_inflight
+            || Instant::now() < self.space_probe_after
+        {
+            return;
+        }
+        let gone = self
+            .enospc_failures
+            .keys()
+            .filter(|op| match op {
+                SpaceOp::Write { job, .. }
+                | SpaceOp::Finalize { job, .. }
+                | SpaceOp::Post { job } => !self.state.job(*job).is_some_and(|record| {
+                    !matches!(
+                        record.status,
+                        JobStatus::Failed | JobStatus::Completed | JobStatus::Deleted
+                    )
+                }),
+                SpaceOp::Terminal | SpaceOp::Directory(_) => false,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for op in gone {
+            tracing::info!(
+                ?op,
+                "out-of-space failure dropped: its operation no longer exists"
+            );
+            self.enospc_failures.remove(&op);
+        }
+        if self.settle_space_latch() {
+            return;
+        }
+        let plan = self.space_probe_plan();
+        if plan.is_empty() {
+            return;
+        }
+        self.space_probe_inflight = true;
+        let tx = self.engine_tx.clone();
+        let fs = self.space_probe_fs.clone();
+        self.tracker.spawn_blocking(move || {
+            let results = crate::space_probe::run(&plan, fs.as_ref());
+            let _ = tx.blocking_send(EngineMsg::SpaceProbed { results });
+        });
+    }
+
+    /// The guarded volumes as the disk guard last measured them — each
+    /// configured member root with its filesystem's device and its parent's
+    /// (never a group's common path, which for two bind mounts of one
+    /// filesystem is another filesystem) — plus the completed directory;
+    /// recorded with each failure.
+    fn guarded_volumes(&self) -> Vec<crate::space_probe::GuardedVolume> {
+        use crate::space_probe::GuardedVolume;
+        let mut volumes: Vec<GuardedVolume> = self
+            .evaluated_disk_guard
+            .volumes
+            .iter()
+            .flat_map(|volume| {
+                let members: Vec<GuardedVolume> = if volume.members.is_empty() {
+                    vec![GuardedVolume {
+                        root: volume.path.clone(),
+                        device: volume.device_id,
+                        parent_device: None,
+                    }]
+                } else {
+                    volume
+                        .members
+                        .iter()
+                        .map(|member| GuardedVolume {
+                            root: member.path.clone(),
+                            device: volume.device_id,
+                            parent_device: member.parent_device_id,
+                        })
+                        .collect()
+                };
+                members
+            })
+            .collect();
+        if !volumes
+            .iter()
+            .any(|volume| self.dest_dir.starts_with(&volume.root))
+        {
+            volumes.push(GuardedVolume {
+                root: self.dest_dir.clone(),
+                device: None,
+                parent_device: None,
+            });
+        }
+        volumes.sort();
+        volumes.dedup();
+        volumes
+    }
+
+    /// A writer for `file` (or a retiring one of `job`) has not stopped: its
+    /// own next write is the evidence, and an allocation probe racing it
+    /// could cut bytes it appends. Writers exist only while data for the
+    /// file is in flight, so that write comes.
+    fn space_writer_live(&self, job: JobId, file: FileId) -> bool {
+        self.writers
+            .get(&file)
+            .is_some_and(|writer| !*writer.stopped.borrow())
+            || self
+                .retiring_writers
+                .get(&job)
+                .is_some_and(|writers| writers.iter().any(|writer| !*writer.stopped.borrow()))
+    }
+
+    /// The job's own retry will run: it is not stopped by a person, not
+    /// held for review, and (for post-processing) the lane is not paused.
+    fn space_retry_runnable(&self, op: &crate::space_probe::SpaceOp) -> bool {
+        use crate::space_probe::SpaceOp;
+        let (SpaceOp::Finalize { job, .. } | SpaceOp::Post { job }) = op else {
+            return false;
+        };
+        let Some(record) = self.state.job(*job) else {
+            return false;
+        };
+        if matches!(op, SpaceOp::Post { .. }) && self.state.post_paused {
+            return false;
+        }
+        match record.status {
+            JobStatus::Paused | JobStatus::Failed | JobStatus::Completed | JobStatus::Deleted => {
+                false
+            }
+            JobStatus::Held => record
+                .control()
+                .is_some_and(|control| !control.manual_pause && control.retry_policy != "review"),
+            _ => true,
+        }
+    }
+
+    /// What each recorded failure is probed with:
+    ///
+    /// * Write — an allocation on the partial that failed, unless its writer
+    ///   is live (its next write decides); with no recorded partial, a
+    ///   directory probe in the job's directory.
+    /// * Finalize / Post — the job's own retry while it can run (hold
+    ///   recovery releases it under the latch). When it cannot (paused,
+    ///   operator-held, post-processing paused), the partial itself
+    ///   (finalize) or the job's directory, so intake never waits on a
+    ///   person who has not been asked.
+    /// * Terminal — its own replay.
+    /// * Directory — probe files there (every guarded root when empty).
+    ///
+    /// No guarded root containing a target: the target only. Every probe
+    /// is bounded by the root and device recorded with the failure.
+    pub(crate) fn space_probe_plan(&self) -> Vec<crate::space_probe::Planned> {
+        use crate::space_probe::{Planned, SpaceOp, Target};
+        let job_dir = |job: JobId, failure: &crate::space_probe::SpaceFailure| -> Target {
+            let dir = failure
+                .path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .or_else(|| self.allocation_cache.get(&job).map(|a| a.path.clone()));
+            match dir {
+                Some(dir) => Target::Dirs(vec![(dir.clone(), failure.bound(&dir))]),
+                None => Target::Dirs(failure.probe_roots()),
+            }
+        };
+        self.enospc_failures
+            .iter()
+            .filter_map(|(op, failure)| {
+                let target = match op {
+                    SpaceOp::Write { job, file } => {
+                        if self.space_writer_live(*job, *file) {
+                            return None;
+                        }
+                        match &failure.path {
+                            Some(path) => Target::File(path.clone(), failure.bound(path)),
+                            None => job_dir(*job, failure),
+                        }
+                    }
+                    SpaceOp::Finalize { job, file } => {
+                        if self.space_retry_runnable(op) || self.space_writer_live(*job, *file) {
+                            return None;
+                        }
+                        match &failure.path {
+                            Some(path) => Target::File(path.clone(), failure.bound(path)),
+                            None => job_dir(*job, failure),
+                        }
+                    }
+                    SpaceOp::Post { job } => {
+                        if self.space_retry_runnable(op) {
+                            return None;
+                        }
+                        job_dir(*job, failure)
+                    }
+                    SpaceOp::Directory(dir) if dir.as_os_str().is_empty() => {
+                        Target::Dirs(failure.probe_roots())
+                    }
+                    SpaceOp::Directory(dir) => {
+                        Target::Dirs(vec![(dir.clone(), failure.bound(dir))])
+                    }
+                    SpaceOp::Terminal => return None,
+                };
+                Some(Planned {
+                    op: op.clone(),
+                    observed: failure.observed,
+                    target,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn on_space_probed(&mut self, results: Vec<crate::space_probe::Probed>) {
+        use crate::space_probe::ProbeResult;
+        self.space_probe_inflight = false;
+        let mut held = false;
+        for (op, observed, result, rebound) in results {
+            if let Some(failure) = self.enospc_failures.get_mut(&op) {
+                if !rebound.is_empty() {
+                    tracing::info!(
+                        ?op,
+                        ?rebound,
+                        "guarded volume mounted again on a new device; rebound"
+                    );
+                    failure.rebind(&rebound);
+                }
+            }
+            let current = self
+                .enospc_failures
+                .get(&op)
+                .is_some_and(|failure| failure.observed == observed);
+            match result {
+                ProbeResult::Cleared if current => {
+                    tracing::info!(?op, "out-of-space failure cleared by an allocation on the operation that failed");
+                    self.enospc_failures.remove(&op);
+                    self.space_probe_failures = 0;
+                }
+                ProbeResult::Gone if current => {
+                    tracing::info!(
+                        ?op,
+                        "out-of-space failure dropped: the object that failed is gone"
+                    );
+                    self.enospc_failures.remove(&op);
+                }
+                ProbeResult::Holds(error) => {
+                    held = true;
+                    tracing::debug!(?op, %error, "out-of-space latch holds; probe allocation failed");
+                }
+                // A newer report of the same failure voids this answer.
+                ProbeResult::Cleared | ProbeResult::Gone => {}
+            }
+        }
+        if held {
+            self.space_probe_failures = self.space_probe_failures.saturating_add(1);
+            let backoff = 30u64
+                .saturating_mul(1 << self.space_probe_failures.min(5))
+                .min(600);
+            self.space_probe_after = Instant::now() + Duration::from_secs(backoff);
+        }
+        self.settle_space_latch();
+    }
+
+    /// The operation behind `op` succeeded (its own write, finalize, terminal
+    /// replay or post retry): that failure has its evidence.
+    pub(crate) fn space_op_succeeded(&mut self, op: &crate::space_probe::SpaceOp) {
+        if self.enospc_failures.remove(op).is_some() {
+            tracing::info!(
+                ?op,
+                "out-of-space failure cleared: the operation that failed succeeded"
+            );
+            self.settle_space_latch();
+        }
+    }
+
+    /// Clear the latch once no recorded failure remains. True when cleared.
+    fn settle_space_latch(&mut self) -> bool {
+        if !self.enospc_latched || !self.enospc_failures.is_empty() {
+            return false;
+        }
+        tracing::info!(
+            observed = self.enospc_observed,
+            "out-of-space latch cleared — every failed write has evidence from its own operation"
+        );
+        self.enospc_latched = false;
+        self.update_disk_guard();
+        self.publish_now();
+        true
+    }
+
+    /// Finding 7: the stat post-processing admission still owes this job
+    /// for its current epoch — `(epoch, directory, proven files)` — or None
+    /// when it passed, has nothing to check, or was checked at an earlier
+    /// admission (its download retired into post-processing custody).
+    #[allow(clippy::type_complexity)]
+    fn pp_admission_stat_needed(
+        &mut self,
+        job: JobId,
+    ) -> Option<(
+        u64,
+        PathBuf,
+        Vec<(FileId, String, nzbd_state::artifacts::Identity, u64)>,
+    )> {
+        let record = self.state.job(job)?;
+        // A short stat queues a verification and refuses this admission; a
+        // job verification cannot act on (terminal: PP done, cleanup-only,
+        // torrent) would get no ticket and be refused again on every retry.
+        // Its payload is what it is; post-processing works from that.
+        if recovery_worker::verification_inert(record)
+            || record
+                .params
+                .iter()
+                .any(|(key, _)| key == "*Recovery:download-retired")
+        {
+            return None;
+        }
+        let files = recovery_worker::proven_files(record);
+        if files.is_empty() {
+            return None;
+        }
+        let dir = self.allocation_cache.get(&job).map(|a| a.path.clone())?;
+        let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+        (self.pp_stat_passed.get(&job) != Some(&epoch)).then_some((epoch, dir, files))
+    }
+
+    /// Jobs whose own retry is the evidence a finalize failure needs: hold
+    /// recovery may release their download-side storage hold while the
+    /// latch holds (a finalize fetches nothing). Post-processing failures
+    /// are not listed: a post-side hold is released through the custody
+    /// check, which `disk_low` never gates, so its retry already runs.
+    pub(crate) fn space_retry_jobs(&self) -> HashSet<JobId> {
+        self.enospc_failures
+            .keys()
+            .filter_map(|op| match op {
+                crate::space_probe::SpaceOp::Finalize { job, .. } => Some(*job),
+                _ => None,
+            })
+            .collect()
     }
 
     fn pause_incomplete_torrents_for_storage(&mut self) {
@@ -9277,7 +9962,8 @@ impl Owner {
                         .first()
                         .map(|root| format!("torrent payload write under {}", root.display()))
                         .unwrap_or_else(|| "torrent payload write".to_owned());
-                    self.observe_out_of_space(&whence);
+                    let dir = self.torrent_payload_roots.first().cloned();
+                    self.observe_out_of_space_in(&whence, dir);
                 }
             }
         }
@@ -9525,6 +10211,10 @@ impl Owner {
     }
 
     fn publish_now(&mut self) {
+        if self.publish_batched {
+            // A batch (startup ticketing) publishes once when it ends.
+            return;
+        }
         self.repair_progress.retain(|id, _| {
             self.state.job(*id).is_some_and(|job| {
                 !job.held()
@@ -9890,6 +10580,7 @@ impl Owner {
             post_paused: self.state.post_paused,
             quota_reached: self.quota_reached,
             disk_low: self.disk_low,
+            space_retry_jobs: self.space_retry_jobs(),
             disk_guard_free_bytes: disk_guard.available_bytes,
             disk_guard_label: disk_guard.limiting_label.clone(),
             disk_guard_path: disk_guard
@@ -9981,6 +10672,10 @@ impl Owner {
             download_rate_bps: rate.saturating_add(torrent_rate),
             session_downloaded_bytes: self.meter.total(),
             remaining_bytes,
+            startup: crate::startup_phases::StartupPhases {
+                listener_ms: crate::startup_phases::listener_ms(),
+                ..self.startup_phases.clone()
+            },
             jobs,
         };
         // The status mirrors the hold record (M6b): every path that writes
@@ -10415,7 +11110,19 @@ pub(crate) fn rearmed_hold(
     }
     let policy = cause.policy();
     let unscheduled = policy.timed() && control.next_retry_at_unix.is_none();
-    if control.cause == cause.as_str() && control.retry_policy == policy.as_str() && !unscheduled {
+    // No-wedge task 1: a writer identity mismatch used to hold the job on
+    // storage until the deadline. It now discards the file and re-downloads,
+    // so the existing hold retries at once and takes that exit.
+    let identity_wedge =
+        writer_identity_hold(&control) && control.next_retry_at_unix.is_some_and(|at| at > now);
+    if identity_wedge {
+        control.next_retry_at_unix = Some(now);
+    }
+    if control.cause == cause.as_str()
+        && control.retry_policy == policy.as_str()
+        && !unscheduled
+        && !identity_wedge
+    {
         return None;
     }
     control.revision = control
@@ -10432,6 +11139,20 @@ pub(crate) fn rearmed_hold(
         None
     };
     Some(control)
+}
+
+/// A hold an earlier build wrote for a writer identity mismatch (the three
+/// refusals that are now [`EngineMsg::WriterIdentityMismatch`]).
+pub(crate) fn writer_identity_hold(control: &nzbd_types::JobControl) -> bool {
+    control.lifecycle == "held"
+        && control.stage == "download_write"
+        && [
+            "payload file identity changed (replaced inode)",
+            "conflicting payload aliases",
+            "writer proven range identity conflict",
+        ]
+        .iter()
+        .any(|marker| control.message.contains(marker))
 }
 
 /// An allocation that failed because the volume stopped answering retries on

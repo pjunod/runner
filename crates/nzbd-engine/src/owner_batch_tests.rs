@@ -16,6 +16,7 @@ fn owner_fixture(
         &temp.path().join("state"),
         None,
         None,
+        None,
         temp.path().join("dest"),
         Vec::new(),
         None,

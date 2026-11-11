@@ -18,9 +18,49 @@ main_dir = "~/downloads"            # default Usenet processing root + state
 dest_dir = "~/downloads/complete"   # finished downloads (per-category overrides below)
 # inter_dir = "~/downloads/inter"   # processing override; absent/empty uses main_dir
 # nzb_watch_dir = "~/downloads/nzb" # drop .nzb files here to auto-queue them
-# queue_dir = "~/downloads/queue"   # journal + queue snapshots (default: <main_dir>/queue)
+# queue_dir = "~/downloads/queue"   # the state directory (default: <main_dir>/queue)
+# workspace_dir = "~/downloads/.workspaces" # PAR repair / extraction scratch
+#                                   # (default: <state dir>/transform-workspaces)
 # temp_dir = "/tmp/nzbd"            # scratch space
 ```
+
+**The state directory** (`queue_dir`, default `<main_dir>/queue`) holds
+everything that is not payload: `queue.json` and its snapshots, the per-job
+journals, `artifacts.sqlite` (file lifecycle), the history index
+(`history.sqlite`, unless `[history] index_dir` moves it), the history
+journal, parked NZBs (`nzbs/`), torrent session state and the identity
+sidecars. It is small and fsync-heavy: a local disk is the right place.
+
+**`workspace_dir`** is where post-processing builds a PAR repair or an
+extraction before the result is moved into the job's processing directory.
+It holds payload-sized data while a transform runs, and its output reaches
+processing by `rename` only when both are on the same filesystem — on
+different volumes every result is copied. Unset, it stays under the state
+directory (nothing changes for existing installs). Put it on the processing
+volume when the state directory is a small local disk. Moving it later is
+supported: stop nzbd, move the directory, set `workspace_dir`, start; at
+startup every recorded workspace path under the old default
+(`<state dir>/transform-workspaces`) is rewritten to the new directory and
+the moved workspaces are re-stamped (a no-op on every later start). If the
+old directory still holds workspaces (not moved), nothing is rewritten:
+those finish where they are and only new workspaces use `workspace_dir`. It
+must not be nested inside the default location (or contain it).
+
+**Recommended layout with a small local state disk** (state local, payload on
+one processing volume):
+
+```toml
+[paths]
+queue_dir     = "/srv/nzbd/state"          # local disk: state only
+main_dir      = "/processing"              # processing volume
+workspace_dir = "/processing/.workspaces"  # same volume as main_dir
+dest_dir      = "/processing/completed"    # same volume: publish = rename
+```
+
+`dest_dir` on the same filesystem as the job's processing directory
+publishes by same-volume rename (decided by device number; no bytes are
+copied). On a GlusterFS FUSE mount every path of the volume shares one
+device, so `/processing/completed` qualifies.
 
 The watch dir is polled by the daemon; a dropped `.nzb` is queued and the
 file removed. In cluster mode only the current leader watches it.
@@ -212,6 +252,14 @@ quota_start_day = 1          # day of month the monthly quota resets
 root, not only `paths.dest_dir`. A zero value disables the hold but keeps the
 same cached inventory visible in native status.
 
+The free-space reading is a forecast. A write that actually fails with
+ENOSPC/EDQUOT latches the hold regardless of it, and the latch clears only
+when probe writes (eight 1 MiB files, each fsynced, then removed) succeed in
+the directory that failed — retried every 30 s, doubling to 10 minutes — or
+when the operator resumes the queue. A free-space reading never clears it:
+on a Gluster distribute volume statvfs sums the bricks and reports space
+while one brick is full.
+
 `max_active_downloads` decides how many jobs are worked on at the same
 time. At `1` — the default, and what nzbd has always done — the top job
 takes every connection until it has no segments left to hand out. Raising
@@ -369,17 +417,31 @@ password_hold_deadline_secs = 604800   # the same, for an archive waiting on
 after its terminal is recorded and after any salvage (the usable part of a
 failed job, published as a `kind: "salvage"` delivery) is settled. Precedence:
 
-1. `keep_on_failure` on the job — the files stay where they are.
-2. Reasons `publish`, `io`, `identity` and `hold_expired` are **always
-   parked**, whatever `failure_action` says. These failures are Runner's or the
-   environment's, not the release's, so the bytes are kept for recovery
-   (contract §2.6 default, "park-always").
-3. Everything else — `health`, `par`, `unpack`, `script`, `fetch` — follows
-   `failure_action`.
+1. `keep_on_failure` on the job — the files stay where they are, kept
+   indefinitely (no retention clock) and never re-assessed in a loop: a
+   failed assessment settles as `unknown` and the source stays.
+2. A job Curator admitted (it carries `monarr-transfer`) follows
+   `failure_action` for **every** reason once its salvage has settled —
+   Curator has already re-grabbed it, and any verified payload went out as
+   the salvage delivery. With the default `delete` the source is removed;
+   with `park` it moves to `failed_dir` and expires after
+   `failed_retention_days`. (0.9.0: this replaces "park-always" for
+   `publish`, `io`, `identity` and `hold_expired`; sources an older build
+   parked that way are expired by the normal retention path on upgrade.)
+3. Any other job: reasons `publish`, `io`, `identity` and `hold_expired`
+   are parked whatever `failure_action` says (nobody will re-grab them, so
+   the bytes are the only copy), and a source not assessed `unusable` is
+   parked rather than deleted. Everything else follows `failure_action`.
 
-Before 0.3.0, a job admitted by Curator (`monarr-delivery=1`) forced `delete`
-regardless of the setting. That override is gone; `failure_action` and the
-park-always list above are the whole rule.
+Parked failures expire at their wall-clock deadline (`failed_retention_days`,
+default 7) whether or not file-lifecycle automation is enabled and across
+restarts; Keep holds them. A job's source directory is a closed scope: once
+its delivery is a success (or a failure it does not keep), whatever the
+publication did not take — PAR sets, samples, `.exe`, consumed or obfuscated
+archive pieces, files a repair rewrote — is removed with the directory, and
+nothing is held for review. A job's subtitles (`srt`, `ass`, `ssa`, `sub`,
+`idx`, `sup`, `vtt`, anywhere in the tree — `Subs/2_English.srt` included)
+are published with its video at their relative path.
 
 **Holds always end.** A hold is environmental only — the job's own content
 never holds it — and is retried automatically on the hold ladder. Each hold

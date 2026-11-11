@@ -573,8 +573,9 @@ curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/deliveries?after=0&limit=
 
 After the terminal, runner disposes of a failed job's processing source per
 `[post] failure_action` (`delete` by default, `park`, `none`) — overridden by
-the job's Keep flag, and by the park-always reasons (§2.2) — and only once
-any salvage obligation has settled. Disposal is owned by the artifact record
+the job's Keep flag (kept, never deleted) and, for jobs Curator did not admit,
+by the park-always reasons (§2.2) — and only once any salvage obligation has
+settled. Disposal is owned by the artifact record
 and gated by the `job_terminals` row, not the queue row; it runs on the
 artifact operation's own retry ladder (`Operation.next_retry`: 30 s, 1 m,
 2 m, then every 5 m) and, in a cluster, under the operation's lease, so one

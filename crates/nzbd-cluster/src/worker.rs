@@ -3264,6 +3264,7 @@ mod tests {
             pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
+            workspace_dir: None,
         };
         let client = ClusterClient::new("secret".into());
         for _ in 0..8 {
@@ -3704,6 +3705,7 @@ mod tests {
             pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
+            workspace_dir: None,
         };
         let client = ClusterClient::new("secret".into());
         let active: ActiveLeases = Default::default();

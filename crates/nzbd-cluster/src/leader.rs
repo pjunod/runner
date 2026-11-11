@@ -3648,6 +3648,7 @@ mod tests {
             pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
+            workspace_dir: None,
         };
         drop(raft);
         drop(api);
@@ -4039,6 +4040,7 @@ mod tests {
             pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
+            workspace_dir: None,
         };
         drop(raft);
         drop(api);
@@ -4265,6 +4267,7 @@ mod tests {
             pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
+            workspace_dir: None,
         };
         let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4842,6 +4845,7 @@ mod tests {
             pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
+            workspace_dir: None,
         };
         let hist = Arc::new(
             nzbd_state::history::HistoryDb::open(
@@ -4998,6 +5002,7 @@ mod tests {
             pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
+            workspace_dir: None,
         };
         let shared = LeaderShared::new(
             engine.clone(),
@@ -5322,6 +5327,7 @@ mod tests {
             pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
+            workspace_dir: None,
         };
         let shared = LeaderShared::new(
             engine.clone(),
@@ -5400,6 +5406,7 @@ mod tests {
             pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
+            workspace_dir: None,
         };
         drop(raft);
         drop(api);
@@ -5621,6 +5628,7 @@ mod tests {
             pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
+            workspace_dir: None,
         };
         drop(raft);
         drop(api);
@@ -5778,6 +5786,7 @@ mod tests {
             pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
+            workspace_dir: None,
         };
         drop(raft);
         drop(api);

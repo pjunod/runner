@@ -411,6 +411,7 @@ async fn fresh_admission_prepares_root_before_startup_callback_and_refuses_missi
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metadata_boot_and_other_root_controls_do_not_wait_for_blocked_active_allocation() {
+    // A paused job's allocation stays untouched through boot (no-wedge).
     use std::io::Write;
     let (tmp, mut owner, _adapter, mut messages) = control_test_owner();
     let state_dir = owner.state_dir.clone();
@@ -445,7 +446,7 @@ async fn metadata_boot_and_other_root_controls_do_not_wait_for_blocked_active_al
         .status()
         .unwrap()
         .success());
-    let (opened, reader_started) = oneshot::channel();
+    let (opened, mut reader_started) = oneshot::channel();
     let opening_path = marker.clone();
     let writer = std::thread::spawn(move || {
         let file = std::fs::OpenOptions::new()
@@ -467,35 +468,6 @@ async fn metadata_boot_and_other_root_controls_do_not_wait_for_blocked_active_al
         .expect("payload I/O blocked healthy queue metadata construction")
         .unwrap()
         .unwrap();
-    let blocked = tokio::time::timeout(Duration::from_secs(2), reader_started)
-        .await
-        .expect(
-            "active-allocation capability worker did not reach the explicit sidecar read barrier",
-        )
-        .unwrap();
-    writer.join().unwrap();
-    // Restore the pathname before releasing the existing descriptor, so
-    // later verification observes ordinary identity material rather than
-    // accidentally creating a second FIFO barrier.
-    struct Release {
-        path: PathBuf,
-        bytes: Vec<u8>,
-        writer: Option<std::fs::File>,
-    }
-    impl Drop for Release {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-            let _ = std::fs::write(&self.path, &self.bytes);
-            if let Some(mut writer) = self.writer.take() {
-                let _ = writer.write_all(&self.bytes);
-            }
-        }
-    }
-    let release = Release {
-        path: marker,
-        bytes: original,
-        writer: Some(blocked),
-    };
     assert_eq!(
         engine.snapshot().jobs.len(),
         2,
@@ -535,11 +507,24 @@ async fn metadata_boot_and_other_root_controls_do_not_wait_for_blocked_active_al
             .unwrap(),
         "healthy-state durable metadata control cannot wait for root A"
     );
+    // No-wedge item 3: a paused job is not touched at boot at all — its
+    // allocation's identity sidecar (the FIFO barrier) is never opened.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
-        release.writer.is_some(),
-        "the barrier remains closed through every metadata/control assertion"
+        matches!(
+            reader_started.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "boot opened the paused job's allocation sidecar"
     );
-    drop(release);
+    // Release the FIFO's writer by opening its read end, then restore it.
+    let reader = std::fs::File::open(&marker).unwrap();
+    let mut blocked = reader_started.await.unwrap();
+    writer.join().unwrap();
+    drop(reader);
+    let _ = std::fs::remove_file(&marker);
+    std::fs::write(&marker, &original).unwrap();
+    let _ = blocked.write_all(&original);
     assert!(
         tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
             .await
@@ -577,6 +562,7 @@ fn guard_test_owner_with_backend(
     let (backend, adapter) = crate::backend::backend_channel(1, 1);
     let owner = Owner::recover(
         &tmp.path().join("state"),
+        None,
         None,
         None,
         tmp.path().join("dest"),
@@ -1463,16 +1449,32 @@ fn control_test_owner_with_persistence(
 ) {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir(tmp.path().join("dest")).unwrap();
+    let (owner, adapter, engine_messages) =
+        control_test_owner_at(tmp.path(), persist, persist_guard);
+    (tmp, owner, adapter, engine_messages)
+}
+
+/// An owner over an existing state and payload directory: a restart.
+fn control_test_owner_at(
+    base: &std::path::Path,
+    persist: bool,
+    persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> (
+    Owner,
+    crate::backend::BackendAdapterPort,
+    mpsc::Receiver<EngineMsg>,
+) {
     let (budget_tx, _) = watch::channel(crate::pool::BudgetEnvelope::default());
     let (events, _) = broadcast::channel(1);
     let (epoch_tx, _) = watch::channel(0);
     let (engine_tx, engine_messages) = mpsc::channel(1);
     let (backend, adapter) = crate::backend::backend_channel(1, 1);
     let owner = Owner::recover(
-        &tmp.path().join("state"),
+        &base.join("state"),
         None,
         None,
-        tmp.path().join("dest"),
+        None,
+        base.join("dest"),
         Vec::new(),
         None,
         Arc::new(Vec::new()),
@@ -1496,7 +1498,7 @@ fn control_test_owner_with_persistence(
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
     )
     .unwrap();
-    (tmp, owner, adapter, engine_messages)
+    (owner, adapter, engine_messages)
 }
 
 #[tokio::test]
@@ -4605,26 +4607,290 @@ fn complete_high_probe_releases_a_forecast_hold() {
     );
 }
 
+/// W5a: statvfs is a forecast. However much free space a complete probe
+/// reports (Gluster DHT sums its bricks), it never clears a latch that a
+/// real write set.
 #[test]
-fn write_latch_requires_twice_the_floor_from_a_complete_probe() {
-    let below_clear = DiskGuardReading {
-        available_bytes: Some(199),
+fn statvfs_never_clears_an_observed_write_latch() {
+    for free in [199, 200, u64::MAX] {
+        let reading = DiskGuardReading {
+            available_bytes: Some(free),
+            all_roots_known: true,
+            ..Default::default()
+        };
+        assert_eq!(disk_guard_decision(true, true, &reading, 100), (true, true));
+    }
+}
+
+/// A Gluster distribute volume in miniature: new files land on the brick
+/// with room and succeed; the file that failed lives on the full brick.
+struct SplitBrickFs {
+    full: std::sync::Mutex<bool>,
+    failing_file: PathBuf,
+}
+impl crate::space_probe::ProbeFs for SplitBrickFs {
+    fn probe_file(&self, path: &std::path::Path) -> crate::space_probe::ProbeResult {
+        if path == self.failing_file && *self.full.lock().unwrap() {
+            crate::space_probe::ProbeResult::Holds("No space left on device (os error 28)".into())
+        } else {
+            crate::space_probe::ProbeResult::Cleared
+        }
+    }
+    fn probe_dir(&self, _: &std::path::Path) -> crate::space_probe::ProbeResult {
+        crate::space_probe::ProbeResult::Cleared
+    }
+}
+
+/// R3 / W5a (finding 3): statvfs says free and new files succeed, but the
+/// partial whose write failed sits on the full brick. The latch holds through
+/// high readings and through new-file success, ignores a probe planned
+/// before a newer report of the same failure, and clears only when an
+/// allocation on that same file succeeds.
+#[tokio::test]
+async fn write_latch_clears_only_on_evidence_from_the_failed_file() {
+    use crate::space_probe::{Planned, ProbeFs, ProbeResult, SpaceOp, Target};
+    let tuning = Tuning {
+        min_free_disk_bytes: 100,
+        ..Tuning::default()
+    };
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(tuning);
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(2));
+    let part = tmp.path().join("dest/job/.runner-file-20.part");
+    // The partial's directory exists: a missing one means the file is gone.
+    std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+    let fs = SplitBrickFs {
+        full: std::sync::Mutex::new(true),
+        failing_file: part.clone(),
+    };
+    let op = SpaceOp::Write {
+        job: JobId(2),
+        file: FileId(20),
+    };
+    owner.observe_space_failure(
+        "write x.part: No space left on device",
+        op.clone(),
+        Some(part.clone()),
+    );
+    owner.disk_guard.store(Arc::new(DiskGuardReading {
+        available_bytes: Some(132_000_000_000),
         all_roots_known: true,
         ..Default::default()
+    }));
+    for _ in 0..3 {
+        owner.update_disk_guard();
+        assert!(
+            owner.enospc_latched && owner.disk_low,
+            "statvfs is not evidence"
+        );
+    }
+    let plan = |owner: &Owner| {
+        vec![Planned {
+            op: op.clone(),
+            observed: owner.enospc_failures[&op].observed,
+            target: Target::File(part.clone(), Default::default()),
+        }]
     };
-    let at_clear = DiskGuardReading {
-        available_bytes: Some(200),
-        all_roots_known: true,
+    // New files would succeed (probe_dir), but the failing file still fails.
+    assert_eq!(
+        fs.probe_dir(tmp.path()),
+        ProbeResult::Cleared,
+        "the fake places new files on the brick with room"
+    );
+    owner.on_space_probed(crate::space_probe::run(&plan(&owner), &fs));
+    assert!(owner.enospc_latched, "new-file success is not evidence");
+    assert!(
+        owner.space_probe_after > Instant::now(),
+        "a failed probe backs off"
+    );
+    // A probe planned before a newer report of the same failure proves nothing.
+    let stale = plan(&owner);
+    owner.observe_space_failure("write again", op.clone(), Some(part.clone()));
+    *fs.full.lock().unwrap() = false;
+    owner.on_space_probed(crate::space_probe::run(&stale, &fs));
+    assert!(owner.enospc_latched);
+    owner.on_space_probed(crate::space_probe::run(&plan(&owner), &fs));
+    assert!(!owner.enospc_latched);
+    assert!(!owner.disk_low, "the forecast is above the floor");
+    assert!(owner.enospc_failures.is_empty());
+
+    // The writer's own next write to that file is evidence too.
+    owner.observe_space_failure("write", op.clone(), Some(part.clone()));
+    assert!(owner.enospc_latched);
+    owner.space_op_succeeded(&op);
+    assert!(!owner.enospc_latched);
+
+    // A finalize failure waits for its own job's retry, which hold recovery
+    // may run while the latch holds; a job that is gone drops its failure.
+    let finalize = SpaceOp::Finalize {
+        job: JobId(2),
+        file: FileId(20),
+    };
+    owner.observe_space_failure("finalize", finalize.clone(), Some(part.clone()));
+    assert!(owner.space_retry_jobs().contains(&JobId(2)));
+    owner.space_probe_after = Instant::now();
+    owner.maybe_probe_space();
+    assert!(owner.enospc_latched, "a live job's finalize retry decides");
+    owner.state.jobs.retain(|job| job.id != JobId(2));
+    owner.maybe_probe_space();
+    assert!(!owner.enospc_latched, "nothing is left to retry");
+}
+
+/// Review finding 2: a grouped filesystem (two bind mounts of one volume,
+/// common path `/`) is recorded per member root with the group's device and
+/// its parent's — never as `/` — and an every-root failure probes a member.
+#[tokio::test]
+async fn grouped_roots_are_recorded_per_member() {
+    use crate::space_probe::{GuardedVolume, SpaceOp, Target};
+    use crate::volumes::{StorageMemberReading, StorageVolumeReading};
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    let downloads = tmp.path().join("downloads");
+    let media = tmp.path().join("media");
+    let member = |path: &PathBuf| StorageMemberReading {
+        path: path.clone(),
+        parent_device_id: Some(1),
+    };
+    owner.evaluated_disk_guard = Arc::new(DiskGuardReading {
+        volumes: vec![StorageVolumeReading {
+            label: "processing · completed".into(),
+            path: PathBuf::from("/"),
+            available_bytes: Some(0),
+            total_bytes: Some(1),
+            device_id: Some(7),
+            current: true,
+            roles: vec!["processing".into(), "completed".into()],
+            members: vec![member(&downloads), member(&media)],
+        }],
         ..Default::default()
+    });
+    owner.observe_out_of_space_in("torrent", None);
+    let failure = &owner.enospc_failures[&SpaceOp::Directory(PathBuf::new())];
+    for root in [&downloads, &media] {
+        assert!(failure.volumes.contains(&GuardedVolume {
+            root: root.clone(),
+            device: Some(7),
+            parent_device: Some(1),
+        }));
+    }
+    assert!(
+        !failure
+            .volumes
+            .iter()
+            .any(|volume| volume.root == Path::new("/")),
+        "the group's common path is another filesystem"
+    );
+    let plan = owner.space_probe_plan();
+    let Target::Dirs(dirs) = &plan[0].target else {
+        panic!("a directory probe");
     };
-    assert_eq!(
-        disk_guard_decision(true, true, &below_clear, 100),
-        (true, true)
+    let probed: Vec<_> = dirs
+        .iter()
+        .filter(|(_, bound)| bound.device == Some(7))
+        .collect();
+    assert_eq!(probed.len(), 1, "one member per device");
+    assert_eq!(probed[0].0, downloads);
+}
+
+/// Finding 4: a finalize or post-processing failure whose job cannot run its
+/// own retry (paused by a person, operator-held, post-processing paused) is
+/// probed instead of waiting on a manual resume, and a write failure with no
+/// recorded partial probes the job's directory. Finding 6: a file with a
+/// live writer is not probed (its own write is the evidence).
+#[tokio::test]
+async fn a_failure_whose_job_cannot_retry_is_probed() {
+    use crate::space_probe::{SpaceOp, Target};
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(2));
+    owner.state.jobs.push(pending_job(3));
+    let part = tmp.path().join("dest/job/.runner-file-20.part");
+    let finalize = SpaceOp::Finalize {
+        job: JobId(2),
+        file: FileId(20),
+    };
+    let post = SpaceOp::Post { job: JobId(3) };
+    owner.observe_space_failure("finalize", finalize.clone(), Some(part.clone()));
+    owner.observe_space_failure("post", post.clone(), None);
+    assert!(
+        !owner.space_retry_jobs().contains(&JobId(3)),
+        "a post-side hold is never gated by the latch; only finalize is listed"
     );
-    assert_eq!(
-        disk_guard_decision(true, true, &at_clear, 100),
-        (false, false)
+    assert!(
+        owner.space_probe_plan().is_empty(),
+        "runnable jobs retry themselves"
     );
+
+    owner.state.job_mut(JobId(2)).unwrap().status = JobStatus::Paused;
+    owner.state.post_paused = true;
+    let plan = owner.space_probe_plan();
+    assert_eq!(plan.len(), 2, "{plan:?}");
+    for planned in &plan {
+        match (&planned.op, &planned.target) {
+            (SpaceOp::Finalize { .. }, Target::File(path, _)) => assert_eq!(path, &part),
+            (SpaceOp::Post { .. }, Target::Dirs(dirs)) => assert!(!dirs.is_empty()),
+            other => panic!("unexpected plan {other:?}"),
+        }
+    }
+    // Held for review by an operator: no automatic retry either.
+    owner.state.post_paused = false;
+    {
+        let record = owner.state.job_mut(JobId(3)).unwrap();
+        record.status = JobStatus::Held;
+        record.set_control(&nzbd_types::JobControl {
+            version: 1,
+            revision: "1".into(),
+            lifecycle: "held".into(),
+            cause: "capacity".into(),
+            stage: "post".into(),
+            retry_policy: "review".into(),
+            message: String::new(),
+            instance: String::new(),
+            previous_status: None,
+            manual_pause: false,
+            retry_attempt: 0,
+            next_retry_at_unix: None,
+            blocked_since_unix: None,
+            released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
+        });
+    }
+    assert!(owner
+        .space_probe_plan()
+        .iter()
+        .any(|planned| planned.op == post));
+
+    // A write failure with no recorded partial: the job's directory.
+    owner.enospc_failures.clear();
+    let write = SpaceOp::Write {
+        job: JobId(2),
+        file: FileId(20),
+    };
+    owner.observe_space_failure("write", write.clone(), None);
+    assert!(matches!(
+        owner.space_probe_plan().as_slice(),
+        [planned] if matches!(planned.target, Target::Dirs(_))
+    ));
+    // A live writer on that file: its own write decides.
+    owner.observe_space_failure("write", write.clone(), Some(part.clone()));
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let (_stopped_tx, stopped) = tokio::sync::watch::channel(false);
+    owner.writers.insert(
+        FileId(20),
+        WriterHandle {
+            tx,
+            stop: tokio_util::sync::CancellationToken::new(),
+            stopped,
+            generation: 0,
+        },
+    );
+    assert!(owner.space_probe_plan().is_empty());
+    owner.writers.clear();
+    assert!(matches!(
+        owner.space_probe_plan().as_slice(),
+        [planned] if matches!(planned.target, Target::File(_, _))
+    ));
 }
 
 #[tokio::test]
@@ -5863,10 +6129,23 @@ async fn journal_replay_preserves_expected_size_for_fold_and_restart_verificatio
         } else {
             engine.fold_job_journals(job.id).await.unwrap();
         }
-        let recovered = export_job_ready_for_test(&engine, job.id)
-            .await
-            .unwrap()
-            .unwrap();
+        // No-wedge: a restart no longer verifies the job up front. Its
+        // finalize takes the lazy path (allocation at first use, the legacy
+        // range stamped from a stat), so wait for that instead.
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let recovered = export_job_ready_for_test(&engine, job.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if recovered.files[0].finalized {
+                    return recovered;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the restarted file finalizes through the lazy path");
         assert!(matches!(
             recovered.files[0].segments[0].state,
             SegmentState::Done { .. }
@@ -7929,6 +8208,39 @@ async fn write_failure_is_io_not_health() {
     assert!(!owner.post_admissions.contains_key(&JobId(7)));
 }
 
+/// Finding 1: a finalize the writer reports as failed never marks the file
+/// finalized (its partial may be the only copy, and the startup sweep only
+/// touches partials of finalized files); the failure is the job's durable
+/// `failed/io` terminal, not an in-memory note a restart forgets.
+#[tokio::test]
+async fn failed_finalize_is_durable_and_never_marks_the_file_finalized() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    let mut job = pending_job(17);
+    job.files[0].segments[0].state = SegmentState::Done {
+        offset: 0,
+        len: 100,
+        crc: 1,
+    };
+    recompute_job_totals(&mut job);
+    let file = job.files[0].id;
+    owner.state.jobs.push(job);
+    owner.on_msg(EngineMsg::WriterFinalized {
+        job: JobId(17),
+        file,
+        ok: false,
+        final_path: None,
+        combined_crc: None,
+    });
+    let terminal = settle_terminal(&mut owner, &mut messages, 17).await;
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Io));
+    assert!(!terminal.blames_release);
+    let job = owner.state.job(JobId(17)).unwrap();
+    assert_eq!(job.status, JobStatus::Failed);
+    assert!(!job.files[0].finalized);
+    assert!(!owner.write_failures.contains_key(&JobId(17)));
+}
+
 /// Contract §2.1 / plan M1 (d): articles below critical health are the
 /// owner's `failed/health` terminal, recorded at download end without any
 /// post-processing admission; a job that fetched nothing owes no salvage.
@@ -8691,6 +9003,7 @@ async fn pending_next_writer_returns_already_granted_leases() {
 fn torrent_transfer_is_charged_to_its_payload_filesystem() {
     use crate::volumes::StorageVolumeReading;
     let volume = |device: u64, roles: &[&str]| StorageVolumeReading {
+        members: Vec::new(),
         label: roles.join(" · "),
         path: std::path::PathBuf::from("/x"),
         available_bytes: Some(1),
@@ -8719,4 +9032,590 @@ fn torrent_transfer_is_charged_to_its_payload_filesystem() {
         torrent_payload_device(&[volume(2, &["downloads"])], None),
         None
     );
+}
+
+// ---------------------------------------------------------------------------
+// No-wedge startup (items 3–6): restart acceptance.
+
+const GLUSTER_MOUNT: &str = "linux\n14:fuse.glusterfs\n4:/gv0";
+const SEGMENT: usize = 100;
+
+fn segment_bytes(job: u32, number: u32) -> Vec<u8> {
+    (0..SEGMENT)
+        .map(|index| (job as usize * 31 + number as usize * 7 + index) as u8)
+        .collect()
+}
+
+/// A restart fixture job: `segments` articles of 100 bytes; the first
+/// `done` are on disk in the partial. `proof` records the writer proof
+/// (with `mount` replacing its mount identity); without it the ranges are
+/// legacy (a pre-proof build).
+fn restart_job(
+    owner: &mut Owner,
+    id: u32,
+    segments: u32,
+    done: u32,
+    proof: Option<&str>,
+    paused: bool,
+) -> Job {
+    let mut job = pending_job(id);
+    let file = job.files[0].id;
+    job.files[0].segments = (1..=segments)
+        .map(|number| nzbd_types::Segment {
+            message_id: format!("article-{id}-{number}@example").into(),
+            number,
+            size: SEGMENT as u32,
+            state: if number <= done {
+                SegmentState::Done {
+                    offset: u64::from(number - 1) * SEGMENT as u64,
+                    len: SEGMENT as u32,
+                    crc: crc32fast::hash(&segment_bytes(id, number)),
+                }
+            } else {
+                SegmentState::Pending
+            },
+        })
+        .collect();
+    if paused {
+        job.status = JobStatus::Paused;
+    }
+    let dir = owner.dest_dir.join(&job.dir_name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let part = dir.join(format!(".runner-file-{}.part", file.0));
+    let bytes = (1..=done)
+        .flat_map(|number| segment_bytes(id, number))
+        .collect::<Vec<_>>();
+    std::fs::write(&part, &bytes).unwrap();
+    owner
+        .artifacts
+        .register_legacy_active(id, &owner.dest_dir.clone(), &dir)
+        .unwrap();
+    let allocation = owner.artifacts.for_job(id).unwrap().unwrap();
+    job.params.push((
+        format!("*File:size:{}", file.0),
+        (u64::from(segments) * SEGMENT as u64).to_string(),
+    ));
+    if let Some(mount) = proof {
+        let mut identity =
+            crate::recovery::capture_identity(&std::fs::File::open(&part).unwrap()).unwrap();
+        if !mount.is_empty() {
+            identity.mount_id = mount.into();
+        }
+        let generation = format!("boot-{id}");
+        let proof = crate::recovery::DurableFileProof {
+            protocol: crate::recovery::WRITER_PROTOCOL,
+            generation: generation.clone(),
+            allocation_generation: allocation.generation.clone(),
+            installation: owner.artifacts.installation.clone(),
+            identity,
+            ranges: job.files[0]
+                .segments
+                .iter()
+                .filter_map(|segment| match segment.state {
+                    SegmentState::Done { offset, len, crc } => Some(ProvenRange {
+                        seg_number: segment.number,
+                        offset,
+                        len,
+                        crc,
+                    }),
+                    _ => None,
+                })
+                .collect(),
+            publication_name: None,
+        };
+        job.params
+            .push((format!("*File:generation:{}", file.0), generation));
+        job.params.push((
+            format!("*File:proof:{}", file.0),
+            serde_json::to_string(&proof).unwrap(),
+        ));
+    }
+    recompute_job_totals(&mut job);
+    owner.allocation_cache.insert(job.id, allocation);
+    job
+}
+
+/// Finding 9 (no-wedge review): the admission stat's `Short` answer queues
+/// a verification and refuses the admission. For a job verification cannot
+/// act on (post-processing done, as on a failed download kept for its
+/// follow-up) that refusal would repeat on every retry, so the stat is not
+/// owed at all; an ordinary job still owes it.
+#[tokio::test]
+async fn a_terminal_job_owes_no_admission_stat() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("dest")).unwrap();
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    pump(&mut owner, &mut messages).await;
+    let mut job = restart_job(&mut owner, 7, 4, 2, Some(""), false);
+    job.status = JobStatus::Failed;
+    owner.state.jobs = vec![job];
+    assert!(
+        owner.pp_admission_stat_needed(JobId(7)).is_some(),
+        "an ordinary job is stat-checked"
+    );
+    owner
+        .state
+        .job_mut(JobId(7))
+        .unwrap()
+        .params
+        .push((nzbd_types::PP_DONE_PARAM.into(), "FAILURE".into()));
+    // The file is now short of its proof: a stat would say Short, and the
+    // verification it queues is a no-op for this job.
+    let dir = owner.allocation_cache[&JobId(7)].path.clone();
+    let part = dir.join(".runner-file-70.part");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&part)
+        .unwrap()
+        .set_len(1)
+        .unwrap();
+    owner.queue_verification(JobId(7));
+    assert!(!owner.verification.contains_key(&JobId(7)));
+    assert!(owner.pp_admission_stat_needed(JobId(7)).is_none());
+}
+
+/// Persist the queue and stop the owner the way a killed process does:
+/// no shutdown path, only the inventory's process lock released.
+async fn stop_like_kill(mut owner: Owner, mut messages: mpsc::Receiver<EngineMsg>, persist: bool) {
+    if persist {
+        persist_snapshot_for_test(&mut owner, &mut messages).await;
+    }
+    owner.artifacts.close().unwrap();
+    drop(owner);
+    drop(messages);
+}
+
+#[tokio::test]
+async fn restart_with_large_fuse_queue_leases_within_two_seconds_without_reading_payload() {
+    const JOBS: u32 = 300;
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("dest")).unwrap();
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    pump(&mut owner, &mut messages).await;
+    let mut jobs = Vec::new();
+    for id in 1..=JOBS {
+        // Job 1 is the one about to lease: its proof names the real file.
+        // Every other proof names a GlusterFS FUSE object; restart never
+        // compares those against the disk.
+        let mount = if id == 1 { "" } else { GLUSTER_MOUNT };
+        jobs.push(restart_job(&mut owner, id, 4, 2, Some(mount), id == 2));
+    }
+    // A paused legacy job (no proof at all) is not touched either.
+    jobs.push(restart_job(&mut owner, JOBS + 1, 4, 2, None, true));
+    owner.state.jobs = jobs;
+    stop_like_kill(owner, messages, true).await;
+
+    let paused_proven = crate::recovery::probe::watch(&temp.path().join("dest").join("job-2"));
+    let paused_legacy =
+        crate::recovery::probe::watch(&temp.path().join("dest").join(format!("job-{}", JOBS + 1)));
+    let everything = crate::recovery::probe::watch(&temp.path().join("dest"));
+    let started = Instant::now();
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    install_control_test_server(&mut owner);
+    let leases = grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1).await;
+    let elapsed = started.elapsed();
+    eprintln!(
+        "restart: first lease after {elapsed:?}, phases {:?}",
+        owner.startup_phases
+    );
+    assert_eq!(leases.len(), 1, "a proven job must lease after restart");
+    assert_eq!(leases[0].r.job, JobId(1));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "first lease took {elapsed:?}"
+    );
+    pump(&mut owner, &mut messages).await;
+    assert_eq!(everything.bytes(), 0, "restart read payload bytes");
+    assert_eq!(
+        paused_proven.opens(),
+        0,
+        "restart opened a paused job's file"
+    );
+    assert_eq!(
+        paused_legacy.opens(),
+        0,
+        "restart opened a paused legacy file"
+    );
+    assert!(
+        owner.verification.is_empty(),
+        "proven/paused jobs got verification tickets: {:?}",
+        owner.verification.keys().collect::<Vec<_>>()
+    );
+    let phases = &owner.startup_phases;
+    assert_eq!(phases.startup_tickets, 0);
+    assert_eq!(phases.startup_untouched, JOBS + 1);
+    assert!(phases.classified_ms.is_some() && phases.first_lease_ms.is_some());
+    assert!(phases
+        .roots
+        .iter()
+        .all(|root| root.ok == Some(true) && root.duration_ms.is_some()));
+    // Every Done range survived untouched.
+    for job in &owner.state.jobs {
+        assert_eq!(
+            job.files[0]
+                .segments
+                .iter()
+                .filter(|segment| matches!(segment.state, SegmentState::Done { .. }))
+                .count(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn replaced_inode_redownloads_only_that_file_and_others_keep_downloading() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("dest")).unwrap();
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    pump(&mut owner, &mut messages).await;
+    let jobs = (1..=2)
+        .map(|id| restart_job(&mut owner, id, 3, 1, Some(""), false))
+        .collect();
+    owner.state.jobs = jobs;
+    stop_like_kill(owner, messages, true).await;
+    // Replace job 1's partial with a new inode holding different bytes.
+    let part = temp.path().join("dest/job-1/.runner-file-10.part");
+    let replacement = temp.path().join("dest/job-1/replacement");
+    std::fs::write(&replacement, b"foreign bytes that are not the download").unwrap();
+    std::fs::rename(&replacement, &part).unwrap();
+
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    install_control_test_server(&mut owner);
+    let mut leased = HashSet::new();
+    let mut fed = false;
+    for _ in 0..12 {
+        for lease in grant_work_for_test(&mut owner, &mut messages, ServerId(1), 4).await {
+            leased.insert(lease.r.job);
+            // Only a writer that started after the discard sees a segment.
+            let reset = owner
+                .state
+                .job(JobId(1))
+                .unwrap()
+                .params
+                .iter()
+                .any(|(key, _)| key.starts_with(crate::owner::IDENTITY_RESETS_PREFIX));
+            if lease.r.job == JobId(1) && reset && !fed {
+                feed(&mut owner, &mut messages, &lease).await;
+                fed = true;
+            }
+        }
+        pump(&mut owner, &mut messages).await;
+        if fed && leased.contains(&JobId(2)) {
+            break;
+        }
+    }
+    pump(&mut owner, &mut messages).await;
+    let first = owner.state.job(JobId(1)).unwrap();
+    assert!(!first.held(), "a replaced inode never holds its job");
+    assert_eq!(
+        first
+            .params
+            .iter()
+            .find(|(key, _)| key == "*File:identity-resets:10")
+            .map(|(_, value)| value.as_str()),
+        Some("1"),
+        "one reset recorded"
+    );
+    assert!(!first
+        .params
+        .iter()
+        .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM));
+    assert!(fed, "the file is re-downloaded");
+    // The foreign bytes are gone: the re-downloaded file holds only what
+    // the new writer wrote.
+    let written = std::fs::read(&part).unwrap_or_default();
+    assert!(
+        !written.starts_with(b"foreign"),
+        "the replaced object was discarded"
+    );
+    let second = owner.state.job(JobId(2)).unwrap();
+    assert!(!second.held(), "an unrelated job is never held");
+    assert!(
+        matches!(second.files[0].segments[0].state, SegmentState::Done { .. }),
+        "an unrelated job keeps its ranges"
+    );
+    assert!(
+        leased.contains(&JobId(2)),
+        "the other job keeps downloading"
+    );
+}
+
+/// Finding 5: a filesystem that keeps replacing the inode is the storage's
+/// fault: the job ends `failed/io` (blameless, salvage allowed), and the
+/// message names the identity cause.
+#[tokio::test]
+async fn recurring_identity_mismatch_fails_the_job_io_after_the_limit() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(1));
+    owner.state.jobs.push(pending_job(2));
+    let file = owner.state.job(JobId(1)).unwrap().files[0].id;
+    owner.state.job_mut(JobId(1)).unwrap().files[0].segments[0].state = SegmentState::Done {
+        offset: 0,
+        len: 1,
+        crc: 0,
+    };
+    for attempt in 1..=crate::owner::IDENTITY_RESET_LIMIT {
+        owner.on_msg(EngineMsg::WriterIdentityMismatch {
+            job: JobId(1),
+            file,
+            error: "write admission: payload file identity changed (replaced inode)".into(),
+        });
+        pump(&mut owner, &mut messages).await;
+        let job = owner.state.job(JobId(1)).unwrap();
+        assert!(!job.held());
+        assert_ne!(job.status, JobStatus::Failed, "attempt {attempt}");
+        assert!(job.files[0]
+            .segments
+            .iter()
+            .all(|segment| matches!(segment.state, SegmentState::Pending)));
+        assert!(job
+            .params
+            .iter()
+            .any(|(key, _)| key == &format!("*File:identity-discard:{}", file.0)));
+    }
+    owner.on_msg(EngineMsg::WriterIdentityMismatch {
+        job: JobId(1),
+        file,
+        error: "write admission: payload file identity changed (replaced inode)".into(),
+    });
+    for _ in 0..20 {
+        pump(&mut owner, &mut messages).await;
+        if owner
+            .artifacts
+            .terminal(1)
+            .unwrap()
+            .is_some_and(|t| t.emitted)
+        {
+            break;
+        }
+    }
+    let terminal = owner.artifacts.terminal(1).unwrap().unwrap();
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Io));
+    assert!(!terminal.blames_release);
+    assert!(terminal.reason.unwrap().salvage_possible());
+    assert!(terminal
+        .message
+        .as_deref()
+        .is_some_and(|message| message.starts_with("identity:")));
+    assert_eq!(owner.state.job(JobId(1)).unwrap().status, JobStatus::Failed);
+    let other = owner.state.job(JobId(2)).unwrap();
+    assert!(!other.held() && other.status != JobStatus::Failed);
+}
+
+#[test]
+fn a_legacy_identity_hold_retries_now() {
+    let control = nzbd_types::JobControl {
+        version: 1,
+        revision: "4".into(),
+        lifecycle: "held".into(),
+        cause: "storage_unavailable".into(),
+        stage: "download_write".into(),
+        retry_policy: "scheduled_retry".into(),
+        message:
+            "write admission: payload file identity changed (replaced inode); evidence retained"
+                .into(),
+        instance: String::new(),
+        previous_status: None,
+        manual_pause: false,
+        retry_attempt: 3,
+        next_retry_at_unix: Some(10_000),
+        blocked_since_unix: Some(1),
+        released_at_unix: None,
+        deadline_in_s: None,
+        deadline_unix: None,
+    };
+    let rearmed = crate::owner::rearmed_hold(control.clone(), 100).unwrap();
+    assert_eq!(rearmed.next_retry_at_unix, Some(100));
+    // Idempotent: once due, nothing further changes.
+    assert!(crate::owner::rearmed_hold(rearmed, 100).is_none());
+    let mut other = control;
+    other.message = "ENOTCONN".into();
+    assert!(crate::owner::rearmed_hold(other, 100).is_none());
+}
+
+/// Where the simulated kill -9 lands.
+#[derive(Clone, Copy, Debug)]
+enum KillPoint {
+    BeforeSync,
+    AfterSync,
+    AfterJournalAppend,
+}
+
+async fn feed(owner: &mut Owner, messages: &mut mpsc::Receiver<EngineMsg>, lease: &Lease) {
+    let data = segment_bytes(lease.r.job.0, lease.r.seg_number);
+    lease
+        .writer
+        .send(WriteCmd::Segment {
+            seg_number: lease.r.seg_number,
+            offset: u64::from(lease.r.seg_number - 1) * SEGMENT as u64,
+            crc: crc32fast::hash(&data),
+            data,
+            file_size: 3 * SEGMENT as u64,
+            server: ServerId(1),
+        })
+        .await
+        .unwrap();
+    let _ = (owner, messages);
+}
+
+async fn kill_and_resume(point: KillPoint, id: u32) {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("dest")).unwrap();
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    pump(&mut owner, &mut messages).await;
+    install_control_test_server(&mut owner);
+    let job = restart_job(&mut owner, id, 3, 0, None, false);
+    owner.allocation_cache.remove(&job.id);
+    owner.state.jobs = vec![job];
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    // The writer's second durability batch (segment 2) dies at the point.
+    let (killed, observed) = std::sync::mpsc::channel::<()>();
+    if let Some(stage) = match point {
+        KillPoint::BeforeSync => Some("before_sync"),
+        KillPoint::AfterSync => Some("after_sync"),
+        KillPoint::AfterJournalAppend => None,
+    } {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let killed = std::sync::Mutex::new(Some(killed.clone()));
+        owner.writer_sync_hook = Some(Arc::new(move |at| {
+            if at == stage && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                if let Some(signal) = killed.lock().unwrap().take() {
+                    let _ = signal.send(());
+                }
+                panic!("simulated kill -9 at {at}");
+            }
+        }));
+    }
+    // Segment 1 is written and acknowledged normally.
+    let lease = grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1)
+        .await
+        .pop()
+        .expect("segment 1 lease");
+    assert_eq!(lease.r.seg_number, 1);
+    feed(&mut owner, &mut messages, &lease).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !owner
+            .state
+            .job(JobId(id))
+            .is_some_and(|job| matches!(job.files[0].segments[0].state, SegmentState::Done { .. }))
+        {
+            pump(&mut owner, &mut messages).await;
+        }
+    })
+    .await
+    .expect("segment 1 acknowledged");
+    pump(&mut owner, &mut messages).await;
+    let lease = grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1)
+        .await
+        .pop()
+        .expect("segment 2 lease");
+    assert_eq!(lease.r.seg_number, 2);
+    if matches!(point, KillPoint::AfterJournalAppend) {
+        // The writer acknowledges; the owner appends to the journal and the
+        // lane dies before the sync.
+        *persistence_worker::JOURNAL_KILL_AFTER_APPEND
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(JobId(id));
+    }
+    feed(&mut owner, &mut messages, &lease).await;
+    // Let the kill land, without waiting on a lane that is now dead.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && observed.try_recv().is_err() {
+        if let Ok(Some(message)) =
+            tokio::time::timeout(Duration::from_millis(20), messages.recv()).await
+        {
+            owner.on_msg(message);
+        }
+    }
+    for _ in 0..20 {
+        match tokio::time::timeout(Duration::from_millis(20), messages.recv()).await {
+            Ok(Some(message)) => owner.on_msg(message),
+            _ => break,
+        }
+    }
+    if matches!(point, KillPoint::AfterJournalAppend) {
+        *persistence_worker::JOURNAL_KILL_AFTER_APPEND
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+    stop_like_kill(owner, messages, false).await;
+
+    // Restart: only unacknowledged segments are fetched again.
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    install_control_test_server(&mut owner);
+    let mut refetched = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if owner
+                .state
+                .job(JobId(id))
+                .is_some_and(|job| job.files[0].finalized)
+            {
+                break;
+            }
+            for lease in grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1).await {
+                refetched.push(lease.r.seg_number);
+                feed(&mut owner, &mut messages, &lease).await;
+            }
+            pump(&mut owner, &mut messages).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let job = owner.state.job(JobId(id)).unwrap();
+        panic!(
+            "{point:?}: download did not complete after restart: refetched {refetched:?}, \
+             verification {:?}, status {:?}, control {:?}, segments {:?}, allocated {}",
+            owner.verification.keys().collect::<Vec<_>>(),
+            job.status,
+            job.control(),
+            job.files[0]
+                .segments
+                .iter()
+                .map(|segment| &segment.state)
+                .collect::<Vec<_>>(),
+            owner.allocated_jobs.contains(&JobId(id)),
+        );
+    });
+    refetched.sort_unstable();
+    refetched.dedup();
+    assert!(
+        !refetched.contains(&1),
+        "{point:?}: acknowledged segment 1 re-fetched"
+    );
+    assert!(refetched.contains(&3), "{point:?}: segment 3 never fetched");
+    match point {
+        KillPoint::BeforeSync | KillPoint::AfterSync => {
+            assert_eq!(refetched, vec![2, 3], "{point:?}")
+        }
+        // The append reached the file before the kill, so replay may keep
+        // segment 2; either way it is fetched at most once more.
+        KillPoint::AfterJournalAppend => assert!(refetched == vec![2, 3] || refetched == vec![3]),
+    }
+    let published = std::fs::read(temp.path().join(format!("dest/job-{id}/payload.bin"))).unwrap();
+    let expected = (1..=3)
+        .flat_map(|number| segment_bytes(id, number))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        crc32fast::hash(&published),
+        crc32fast::hash(&expected),
+        "{point:?}: final CRC"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kill_before_sync_refetches_only_the_unacknowledged_segment() {
+    kill_and_resume(KillPoint::BeforeSync, 9101).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kill_after_sync_refetches_only_the_unacknowledged_segment() {
+    kill_and_resume(KillPoint::AfterSync, 9102).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kill_after_journal_append_before_sync_keeps_the_final_crc() {
+    kill_and_resume(KillPoint::AfterJournalAppend, 9103).await;
 }

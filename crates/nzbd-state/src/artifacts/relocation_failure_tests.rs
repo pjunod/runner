@@ -414,3 +414,32 @@ fn abandoned_move_cannot_resurrect_and_a_new_move_uses_a_new_operation() {
         b"PAR_FAILURE retained input"
     );
 }
+
+#[test]
+fn a_relocation_in_review_is_abandoned_automatically_and_keeps_the_original() {
+    let (_tmp, db, _source, target) = fixture();
+    FAULTS.with(|f| f.borrow_mut().insert("before_move", libc::EINVAL));
+    assert!(db.relocate(91, &target).is_err());
+    let source = db.for_job(91).unwrap().unwrap();
+    let op = db.pending_relocations(&source.id).unwrap().remove(0);
+    assert_eq!(op.state, "review", "{:?}", op.error);
+    let mut aged = db.get(&source.id).unwrap();
+    aged.updated_at = now() - 2 * super::exits::HOLD_EXIT_SECONDS;
+    save_artifact(&db.db.lock().unwrap(), &aged).unwrap();
+    // Database-only at open: a relocation is never touched there.
+    assert_eq!(db.exit_wedged_states(0, false).unwrap().abandoned, 0);
+    let report = db
+        .exit_wedged_states(super::exits::HOLD_EXIT_SECONDS, true)
+        .unwrap();
+    assert_eq!(report.abandoned, 1, "{report:?}");
+    assert_eq!(db.operation(&op.id).unwrap().state, "cancelled");
+    let after = db.for_job(91).unwrap().unwrap();
+    assert!(after.hold.is_none());
+    assert_eq!(
+        std::fs::read(after.path.join("media.mkv")).unwrap(),
+        b"PAR_FAILURE retained input",
+        "the original stays where it was"
+    );
+    // Idempotent.
+    assert_eq!(db.exit_wedged_states(0, true).unwrap().abandoned, 0);
+}
