@@ -402,7 +402,14 @@ impl Owner {
         let Some(current) = self.state.job(job) else {
             return;
         };
-        if current.torrent.is_some() || super::transitions::failed_cleanup_only(current) {
+        if current.torrent.is_some()
+            || super::transitions::failed_cleanup_only(current)
+            || current
+                .params
+                .iter()
+                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+        {
+            // A terminal job downloads nothing more: there is nothing to prove.
             return;
         }
         let total_bytes = done_bytes(current);
@@ -466,18 +473,21 @@ impl Owner {
     /// verification, and a job under verification can be neither exported
     /// nor admitted. Drop exactly those waiting verifications.
     ///
-    /// Only a successful, stamped completion qualifies: a failed job's
-    /// retained or partially deleted source (failed cleanup included) keeps
-    /// its verification, which fences export and admission until its `Done`
-    /// bits are proven or dropped.
+    /// Any stamped terminal qualifies, failed ones included (0.9.0): a
+    /// terminal job never downloads again, so its `Done` bits fence nothing.
+    /// A failed job's verification used to stay — and a file deleted from its
+    /// retained source then held it in a review-required verification that
+    /// refused the export and admission its salvage and disposal need,
+    /// forever. Salvage proves what it publishes from transform/CRC evidence
+    /// and the journaled digests; disposal needs no proof. Failed-cleanup
+    /// rows keep their own path.
     pub(super) fn drop_unneeded_verifications(&mut self) {
         let stale = self
             .state
             .jobs
             .iter()
             .filter(|job| {
-                job.status == JobStatus::Completed
-                    && job.torrent.is_none()
+                job.torrent.is_none()
                     && !super::transitions::failed_cleanup_only(job)
                     && job
                         .params

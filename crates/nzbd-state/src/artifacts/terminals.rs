@@ -579,37 +579,6 @@ impl Inventory {
         Ok(source)
     }
 
-    /// W8: a kept failure's bytes stay where they are. Recording that is a
-    /// state change, not a re-capture of the directory: a drifted or
-    /// partly missing source must not keep the follow-up looping.
-    pub fn retain_kept_failure(&self, job: u32, path: &Path) -> Result<bool> {
-        let _guard = self.mutation_guard()?;
-        let Some(mut artifact) = self.for_job(job)? else {
-            return Ok(false);
-        };
-        if artifact.path != path || !artifact.owned {
-            return Ok(false);
-        }
-        if artifact.state == "retained" {
-            return Ok(true);
-        }
-        if !matches!(
-            artifact.state.as_str(),
-            "active" | "transitioning" | "retiring"
-        ) {
-            return Ok(false);
-        }
-        artifact.state = "retained".into();
-        artifact.revision += 1;
-        artifact.updated_at = now();
-        let mut db = self.db.lock().unwrap();
-        let tx = db.transaction()?;
-        save_artifact(&tx, &artifact)?;
-        event(&tx, &artifact.id, "finalized", "retained")?;
-        tx.commit()?;
-        Ok(true)
-    }
-
     /// Record the disposal of a failed source; disposal is then done.
     pub fn record_disposal(&self, job: u32, note: &str) -> Result<()> {
         let db = self.db.lock().unwrap();

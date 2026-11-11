@@ -1278,14 +1278,10 @@ async fn kept_failure_with_a_drifted_source_settles_and_stops() {
         .fail_job(job_id, FailureReason::Unpack, None, "unpack", "bad archive")
         .await
         .unwrap());
-    // The owner settles the re-imported row first (its verification reads
-    // the files it just imported); the drift comes after, as on nuc3.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while engine.export_job(job_id).await.is_err() {
-        assert!(tokio::time::Instant::now() < deadline, "owner settles");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    // Drift after the snapshot: one sibling gone, one rewritten.
+    // Drift after the snapshot, while the owner is still verifying the
+    // re-imported row: one sibling gone, one rewritten. A terminal job's
+    // verification must not hold its follow-up forever over a missing file.
+
     std::fs::remove_file(source.join("notes.bin")).unwrap();
     std::thread::sleep(Duration::from_millis(20));
     std::fs::write(source.join("part.r00"), b"rewritten by a repair, longer").unwrap();

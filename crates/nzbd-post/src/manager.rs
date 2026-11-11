@@ -1387,17 +1387,12 @@ async fn dispose_failed_source(
         } else {
             "retained"
         };
-        // A kept failure is recorded where it is, without re-capturing a
-        // directory that may have drifted (W8, 2710/2535).
-        let kept_in_place =
-            state == "retained" && matches!(inventory.retain_kept_failure(job.0, path), Ok(true));
-        let recorded = kept_in_place
-            || inventory
-                .finish(job.0, path, path.parent().unwrap_or(dest_dir), state)
-                .inspect_err(|error| {
-                    tracing::warn!(job = job.0, %error, "failed-source inventory record remains pending");
-                })
-                .is_ok();
+        let recorded = inventory
+            .finish(job.0, path, path.parent().unwrap_or(dest_dir), state)
+            .inspect_err(|error| {
+                tracing::warn!(job = job.0, %error, "failed-source inventory record remains pending");
+            })
+            .is_ok();
         if !recorded {
             return false;
         }
