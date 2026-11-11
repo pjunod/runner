@@ -199,9 +199,12 @@ pub fn parse_proc_io(text: &str) -> Option<Totals> {
 
 /// Follows one child process and charges its I/O to `device` as it runs.
 /// Call [`ProcessMeter::sample`] periodically; each call charges only what
-/// is new since the last. An exited child's counters stay readable until it
-/// is reaped, so a caller that can sample between exit and reap loses
-/// nothing; one that cannot loses at most one sampling interval.
+/// is new since the last. Two limits, both measured on the nucs (kernel
+/// 7.0): an exited child's counters are not readable even before it is
+/// reaped there (older kernels allow it), so the last sampling interval
+/// before exit is lost; and copies made with splice() or
+/// copy_file_range() never reach these counters. par2, 7z and unrar use
+/// read/write and are counted.
 pub struct ProcessMeter {
     pid: u32,
     device: Option<u64>,
@@ -284,24 +287,44 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_running_child_is_charged_as_it_works() {
-        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        // The child does plain read(2)/write(2), the way par2, 7z and unrar
+        // do. (Distro tools are no good here: uutils coreutils copy with
+        // splice(), which the counters never see.) It then blocks on a pipe
+        // until the test closes it, so sampling never races its exit.
         let tmp = tempfile::tempdir().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(tmp.path().join("work.bin"))
+            .unwrap();
+        let fd = file.as_raw_fd();
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // Child: async-signal-safe calls only.
+            unsafe {
+                libc::close(pipe[1]);
+                let block = [7u8; 65536];
+                for _ in 0..4 {
+                    libc::write(fd, block.as_ptr().cast(), block.len());
+                }
+                libc::lseek(fd, 0, libc::SEEK_SET);
+                let mut back = [0u8; 65536];
+                while libc::read(fd, back.as_mut_ptr().cast(), back.len()) > 0 {}
+                let mut byte = 0u8;
+                libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::close(pipe[0]) };
         let device = u64::MAX - 9;
         let before = totals(device);
-        // tee copies its stdin to out.bin and stays alive until stdin
-        // closes, so the samples below never race its exit.
-        let mut child = std::process::Command::new("tee")
-            .arg("out.bin")
-            .current_dir(tmp.path())
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        let mut meter = ProcessMeter::new(pid, Some(device));
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(&vec![5u8; 256 * 1024]).unwrap();
-        stdin.flush().unwrap();
+        let mut meter = ProcessMeter::new(pid as u32, Some(device));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             meter.sample();
@@ -313,9 +336,9 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "tee's I/O never reached the meter: {:?} (proc io {:?})",
+                "the child's I/O never reached the meter: {:?} (proc io {:?})",
                 seen,
-                process_io(pid)
+                process_io(pid as u32)
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -326,8 +349,9 @@ mod tests {
             charged,
             "a repeat sample charges nothing new"
         );
-        drop(stdin);
-        child.wait().unwrap();
+        unsafe { libc::close(pipe[1]) };
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
     }
 
     #[cfg(target_os = "linux")]
@@ -345,11 +369,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "true did not exit");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(
-            process_io(pid).is_some(),
-            "an exited, unreaped child's counters stay readable"
-        );
-        child.wait().unwrap();
-        assert!(process_io(pid).is_none() || pid == std::process::id());
+        // Still ours to reap: exit was observed without consuming it.
+        assert!(child.wait().unwrap().success());
     }
 }

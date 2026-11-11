@@ -1446,29 +1446,30 @@ mod tests {
 #[cfg(all(test, target_os = "linux"))]
 mod io_meter_tests {
     #[tokio::test]
-    async fn a_tool_run_is_charged_to_its_directory_even_when_it_is_quick() {
+    async fn a_tool_run_is_charged_to_its_directory() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("in.bin"), vec![3u8; 512 * 1024]).unwrap();
         let device = nzbd_state::io_meter::device_of(tmp.path()).unwrap();
         let before = nzbd_state::io_meter::totals(device);
+        // The shell's printf builtin writes with write(2), as par2 and 7z
+        // do (uutils coreutils copy with splice(), which the counters never
+        // see). The trailing sleep keeps the tool alive across many
+        // samples: kernel 7.0 hides an exited child's counters, so a run
+        // shorter than one sampling interval would otherwise be lost.
         let out = super::run_tool(
-            "dd",
-            &["if=in.bin", "of=out.bin", "bs=65536", "status=none"],
+            "sh",
+            &[
+                "-c",
+                "i=0; while [ $i -lt 1024 ]; do printf '%01024d' 0; i=$((i+1)); done > out.txt; sleep 1",
+            ],
             tmp.path(),
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(20),
         )
         .await
         .unwrap();
         assert_eq!(out.code, 0, "{}", out.stderr);
         let after = nzbd_state::io_meter::totals(device);
-        // dd finishes well inside one sampling interval; the WNOWAIT exit
-        // check still reads its counters before the child is reaped.
         assert!(
-            after.read_bytes - before.read_bytes >= 512 * 1024,
-            "{after:?}"
-        );
-        assert!(
-            after.write_bytes - before.write_bytes >= 512 * 1024,
+            after.write_bytes - before.write_bytes >= 1024 * 1024,
             "{after:?}"
         );
     }
