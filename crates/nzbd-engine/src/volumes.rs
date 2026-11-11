@@ -264,10 +264,35 @@ pub struct StorageVolumeReading {
     /// present, are conservative last-known data retained after a timeout or
     /// inaccessible path.
     pub current: bool,
-    /// What the configured paths on this filesystem are for, which is what
-    /// the dashboard names the row by.
-    pub kinds: StorageKinds,
+    /// The configured roles on this filesystem, one entry per role as
+    /// `Config::storage_roots` names them (`label` is these joined with
+    /// ` · `, which cannot be split back safely: a category name may
+    /// contain ` · ` itself).
+    pub roles: Vec<String>,
 }
+
+impl StorageVolumeReading {
+    /// What the dashboard names the row: processing, completed, or both.
+    pub fn name(&self) -> String {
+        self.roles
+            .iter()
+            .fold(StorageKinds::default(), |kinds, role| {
+                kinds.union(StorageKinds::of_role(role))
+            })
+            .name(&self.label)
+    }
+
+    pub fn has_role(&self, role: &str) -> bool {
+        self.roles.iter().any(|candidate| candidate == role)
+    }
+}
+
+/// How role labels are joined, here and in `Config::storage_roots` (which
+/// merges roles that share an exact path into one root). Splitting on it
+/// recovers the roles; a category whose own name contains it would be split
+/// too, which only matters if that category's directory is also on a
+/// different filesystem from the torrent root.
+const ROLE_JOIN: &str = " · ";
 
 /// What a filesystem holds, from the roles of the configured paths on it.
 ///
@@ -556,7 +581,7 @@ fn default_probe_spawner() -> ProbeSpawner {
 
 fn unknown_storage_volume(label: String, path: PathBuf) -> StorageVolumeReading {
     StorageVolumeReading {
-        kinds: StorageKinds::of_role(&label),
+        roles: vec![label.clone()],
         label,
         path,
         available_bytes: None,
@@ -748,18 +773,18 @@ pub fn storage_volume_readings(roots: &[DiskGuardRoot]) -> Vec<StorageVolumeRead
                     .iter()
                     .map(|member| member.root.label.as_str())
                     .collect::<Vec<_>>()
-                    .join(" · "),
+                    .join(ROLE_JOIN),
                 path: common_storage_path(&group.members),
                 available_bytes: space.map(|reading| reading.available),
                 total_bytes: space.map(|reading| reading.total),
                 device_id: group.device,
                 current: space.is_some(),
-                kinds: group
+                roles: group
                     .members
                     .iter()
-                    .fold(StorageKinds::default(), |kinds, member| {
-                        kinds.union(StorageKinds::of_role(&member.root.label))
-                    }),
+                    .flat_map(|member| member.root.label.split(ROLE_JOIN))
+                    .map(str::to_owned)
+                    .collect(),
             }
         })
         .collect()
@@ -856,11 +881,11 @@ fn coalesce_storage_volumes(
         });
         if let Some(index) = existing {
             let group = &mut groups[index];
-            group.label.push_str(" · ");
+            group.label.push_str(ROLE_JOIN);
             group.label.push_str(&reading.label);
             group.path = common_path_pair(&group.path, &reading.path);
             group.current &= reading.current;
-            group.kinds = group.kinds.union(reading.kinds);
+            group.roles.extend(reading.roles);
             if let Some(available) = reading.available_bytes {
                 let should_replace = group
                     .available_bytes
@@ -994,7 +1019,7 @@ mod tests {
                 available_bytes: Some(900),
                 total_bytes: Some(1000),
                 device_id: Some(1),
-                kinds: StorageKinds::default(),
+                roles: Vec::new(),
                 current: true,
             },
             StorageVolumeReading {
@@ -1003,7 +1028,7 @@ mod tests {
                 available_bytes: Some(100),
                 total_bytes: Some(1000),
                 device_id: Some(2),
-                kinds: StorageKinds::default(),
+                roles: Vec::new(),
                 current: true,
             },
             StorageVolumeReading {
@@ -1012,7 +1037,7 @@ mod tests {
                 available_bytes: Some(500),
                 total_bytes: Some(1000),
                 device_id: Some(3),
-                kinds: StorageKinds::default(),
+                roles: Vec::new(),
                 current: true,
             },
         ]);
@@ -1032,7 +1057,7 @@ mod tests {
             available_bytes: None,
             total_bytes: None,
             device_id: None,
-            kinds: StorageKinds::default(),
+            roles: Vec::new(),
             current: false,
         }]);
         assert_eq!(reading.available_bytes, None);
@@ -1063,7 +1088,7 @@ mod tests {
                 available_bytes: Some(10),
                 total_bytes: Some(1000),
                 device_id: Some(1),
-                kinds: StorageKinds::default(),
+                roles: Vec::new(),
                 current: false,
             },
             StorageVolumeReading {
@@ -1072,7 +1097,7 @@ mod tests {
                 available_bytes: Some(900),
                 total_bytes: Some(1000),
                 device_id: Some(2),
-                kinds: StorageKinds::default(),
+                roles: Vec::new(),
                 current: true,
             },
         ]);
@@ -1090,7 +1115,7 @@ mod tests {
                 available_bytes: Some(900),
                 total_bytes: Some(1000),
                 device_id: Some(7),
-                kinds: StorageKinds::default(),
+                roles: Vec::new(),
                 current: false,
             },
             StorageVolumeReading {
@@ -1099,7 +1124,7 @@ mod tests {
                 available_bytes: Some(10),
                 total_bytes: Some(1000),
                 device_id: Some(7),
-                kinds: StorageKinds::default(),
+                roles: Vec::new(),
                 current: true,
             },
         ]));
@@ -1117,7 +1142,7 @@ mod tests {
             available_bytes: Some(10),
             total_bytes: Some(1000),
             device_id: Some(7),
-            kinds: StorageKinds::default(),
+            roles: Vec::new(),
             current: true,
         };
         let unknown = StorageVolumeReading {
@@ -1126,7 +1151,7 @@ mod tests {
             available_bytes: None,
             total_bytes: None,
             device_id: Some(7),
-            kinds: StorageKinds::default(),
+            roles: Vec::new(),
             current: false,
         };
         for readings in [
@@ -1163,7 +1188,7 @@ mod tests {
                     available_bytes: Some(500),
                     total_bytes: Some(1000),
                     device_id: None,
-                    kinds: StorageKinds::default(),
+                    roles: Vec::new(),
                     current: true,
                 })
             })
@@ -1299,7 +1324,7 @@ mod tests {
                     available_bytes: Some(1),
                     total_bytes: Some(2),
                     device_id: None,
-                    kinds: StorageKinds::default(),
+                    roles: Vec::new(),
                     current: true,
                 })
             },
@@ -1348,7 +1373,7 @@ mod tests {
                     available_bytes: Some(100),
                     total_bytes: Some(200),
                     device_id: None,
-                    kinds: StorageKinds::default(),
+                    roles: Vec::new(),
                     current: true,
                 })
             },
@@ -1469,7 +1494,7 @@ mod tests {
                 available_bytes: Some(500),
                 total_bytes: Some(1000),
                 device_id: None,
-                kinds: StorageKinds::default(),
+                roles: Vec::new(),
                 current: true,
             })
         };
@@ -1497,7 +1522,7 @@ mod tests {
                     available_bytes: Some(600),
                     total_bytes: Some(1000),
                     device_id: None,
-                    kinds: StorageKinds::default(),
+                    roles: Vec::new(),
                     current: true,
                 })
             })
@@ -1564,7 +1589,6 @@ mod tests {
         assert!(!reading[0].current);
     }
 
-    #[cfg(unix)]
     #[test]
     fn roles_name_a_filesystem_processing_or_completed() {
         let name = |roles: &[&str]| {
@@ -1594,6 +1618,7 @@ mod tests {
         assert_eq!(name(&[]), "fallback");
     }
 
+    #[cfg(unix)]
     #[test]
     fn configured_roots_on_one_filesystem_are_one_failure_domain() {
         let tmp = tempfile::tempdir().unwrap();

@@ -219,7 +219,7 @@ fn measure_storage(targets: &[StorageTarget]) -> Vec<StoragePathDto> {
 #[cfg(test)]
 fn storage_path_dto(reading: nzbd_engine::volumes::StorageVolumeReading) -> StoragePathDto {
     StoragePathDto {
-        name: reading.kinds.name(&reading.label),
+        name: reading.name(),
         label: reading.label,
         path: reading.path.to_string_lossy().into_owned(),
         available_bytes: reading.available_bytes,

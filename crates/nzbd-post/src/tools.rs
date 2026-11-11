@@ -87,9 +87,10 @@ async fn run_tool_owned(
 
     let group = child.id();
     // The tool's reads and writes land in the directory it runs in (par2
-    // repairs in place; archives extract to a staging dir inside the job).
-    // Charge them to that filesystem for the dashboard's I/O graph. The
-    // last quarter second before exit is not seen: wait() reaps the child.
+    // repairs in place; archives extract to a staging dir inside the job's
+    // attempt workspace). Charge them to that filesystem for the
+    // dashboard's I/O graph. On Linux the exit is observed without reaping,
+    // so the final sample sees everything; elsewhere there is no procfs.
     let device = tokio::fs::metadata(cwd)
         .await
         .ok()
@@ -133,18 +134,26 @@ async fn run_tool_owned(
         _ = cancellation.cancelled() => None,
         result = tokio::time::timeout(timeout, async {
         let waited = async {
-            let mut tick = tokio::time::interval(Duration::from_millis(250));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! {
-                    status = child.wait() => break status,
-                    _ = tick.tick() => {
-                        if let Some(meter) = meter.as_mut() {
-                            meter.sample();
-                        }
+            #[cfg(target_os = "linux")]
+            if let Some(pid) = group {
+                // Poll for exit with WNOWAIT instead of racing wait(),
+                // which would reap the child before its last bytes are read.
+                let mut tick = tokio::time::interval(Duration::from_millis(100));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let exited = nzbd_state::io_meter::exited_unreaped(pid);
+                    if let Some(meter) = meter.as_mut() {
+                        meter.sample();
+                    }
+                    if exited {
+                        break;
                     }
                 }
             }
+            #[cfg(not(target_os = "linux"))]
+            let _ = meter.take();
+            child.wait().await
         };
         let (o, e, status) = tokio::join!(read_capped(out), read_err, waited);
         (o, e, status)
@@ -1415,5 +1424,36 @@ mod tests {
         } else {
             assert!(!require_tool(missing));
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod io_meter_tests {
+    #[tokio::test]
+    async fn a_tool_run_is_charged_to_its_directory_even_when_it_is_quick() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("in.bin"), vec![3u8; 512 * 1024]).unwrap();
+        let device = nzbd_state::io_meter::device_of(tmp.path()).unwrap();
+        let before = nzbd_state::io_meter::totals(device);
+        let out = super::run_tool(
+            "dd",
+            &["if=in.bin", "of=out.bin", "bs=65536", "status=none"],
+            tmp.path(),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let after = nzbd_state::io_meter::totals(device);
+        // dd finishes well inside one sampling interval; the WNOWAIT exit
+        // check still reads its counters before the child is reaped.
+        assert!(
+            after.read_bytes - before.read_bytes >= 512 * 1024,
+            "{after:?}"
+        );
+        assert!(
+            after.write_bytes - before.write_bytes >= 512 * 1024,
+            "{after:?}"
+        );
     }
 }

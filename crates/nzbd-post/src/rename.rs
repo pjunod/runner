@@ -671,7 +671,9 @@ fn sfv_restore_archives(dir: &Path, custody: Custody<'_>) -> Renames {
         {
             continue;
         }
-        let mut input = nzbd_state::fileops::open(path).map_err(std::io::Error::other)?;
+        let mut input = nzbd_state::io_meter::Metered::new(
+            nzbd_state::fileops::open(path).map_err(std::io::Error::other)?,
+        );
         let mut digest = crc32fast::Hasher::new();
         let mut buffer = [0; 65536];
         loop {

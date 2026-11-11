@@ -1153,6 +1153,25 @@ pub(crate) struct Owner {
     rotate: usize,
 }
 
+/// The filesystem a torrent's payload lives on, from the capacity probe's
+/// last reading (memory only; the owner never stats a volume). A category
+/// with its own torrent directory uses that; anything else uses the
+/// torrent payload root.
+pub(crate) fn torrent_payload_device(
+    volumes: &[crate::volumes::StorageVolumeReading],
+    category: Option<&str>,
+) -> Option<u64> {
+    let holding = |role: &str| {
+        volumes
+            .iter()
+            .find(|volume| volume.has_role(role))
+            .and_then(|volume| volume.device_id)
+    };
+    category
+        .and_then(|category| holding(&format!("torrent category: {category}")))
+        .or_else(|| holding("torrent payloads"))
+}
+
 fn disk_guard_decision(
     was_held: bool,
     mut write_latched: bool,
@@ -8910,7 +8929,8 @@ impl Owner {
             // Payload transfer is disk traffic on the torrent's filesystem:
             // verified pieces were written, uploaded pieces were read.
             if verified_delta > 0 || uploaded_delta > 0 {
-                let device = self.torrent_payload_device(category.as_deref());
+                let device =
+                    torrent_payload_device(&self.evaluated_disk_guard.volumes, category.as_deref());
                 nzbd_state::io_meter::write(device, verified_delta);
                 nzbd_state::io_meter::read(device, uploaded_delta);
             }
@@ -8929,23 +8949,6 @@ impl Owner {
         if changed {
             self.dirty = true;
         }
-    }
-
-    /// The filesystem a torrent's payload lives on, from the capacity
-    /// probe's last reading (memory only; the owner never stats a volume).
-    /// A category with its own torrent directory uses that; anything else
-    /// uses the torrent payload root.
-    fn torrent_payload_device(&self, category: Option<&str>) -> Option<u64> {
-        let volumes = &self.evaluated_disk_guard.volumes;
-        let holding = |role: &str| {
-            volumes
-                .iter()
-                .find(|volume| volume.label.split(" · ").any(|label| label == role))
-                .and_then(|volume| volume.device_id)
-        };
-        category
-            .and_then(|category| holding(&format!("torrent category: {category}")))
-            .or_else(|| holding("torrent payloads"))
     }
 
     fn schedule_torrent_starts(&mut self) {
@@ -9899,7 +9902,7 @@ impl Owner {
                 .volumes
                 .iter()
                 .map(|volume| StorageVolumeSnapshot {
-                    name: volume.kinds.name(&volume.label),
+                    name: volume.name(),
                     label: volume.label.clone(),
                     path: volume.path.to_string_lossy().into_owned(),
                     available_bytes: volume.available_bytes,

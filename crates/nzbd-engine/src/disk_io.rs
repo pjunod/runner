@@ -86,7 +86,7 @@ pub struct VolumeIo {
     pub device_id: u64,
     pub source: IoSource,
     /// Bytes per second since the previous sample. `None` on the first
-    /// sample for a device, after a counter reset, or when unsupported.
+    /// sample for a device, after a counter reset, or when its source changed.
     pub read_bps: Option<u64>,
     pub write_bps: Option<u64>,
 }

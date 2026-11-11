@@ -1050,9 +1050,10 @@ pub(crate) fn validate_range_checked(
     {
         return false;
     }
-    let Ok(mut file) = nzbd_state::fileops::open(path) else {
+    let Ok(file) = nzbd_state::fileops::open(path) else {
         return false;
     };
+    let mut file = nzbd_state::io_meter::Metered::new(file);
     if file.seek(SeekFrom::Start(offset)).is_err() {
         return false;
     }

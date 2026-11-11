@@ -96,6 +96,53 @@ pub fn device_of(path: &std::path::Path) -> Option<u64> {
         .and_then(device_of_metadata)
 }
 
+/// A file whose reads are charged to its filesystem. Wrap the handle of a
+/// pass that reads payload (hashing, CRC checks, readbacks); it derefs to
+/// the `File` for metadata and the like, and every `read` (including
+/// `read_exact` and `read_to_end`) is counted.
+pub struct Metered {
+    file: std::fs::File,
+    device: Option<u64>,
+}
+
+impl Metered {
+    pub fn new(file: std::fs::File) -> Self {
+        let device = device_of_file(&file);
+        Metered { file, device }
+    }
+
+    pub fn into_inner(self) -> std::fs::File {
+        self.file
+    }
+}
+
+impl std::io::Read for Metered {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.file.read(buf)?;
+        read(self.device, n as u64);
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for Metered {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
+impl std::ops::Deref for Metered {
+    type Target = std::fs::File;
+    fn deref(&self) -> &std::fs::File {
+        &self.file
+    }
+}
+
+impl std::ops::DerefMut for Metered {
+    fn deref_mut(&mut self) -> &mut std::fs::File {
+        &mut self.file
+    }
+}
+
 /// One tool's cumulative I/O as `/proc/<pid>/io` counts it: `rchar` and
 /// `wchar`, every byte through read/write syscalls. These are used rather
 /// than `read_bytes`/`write_bytes` because those count only block-layer
@@ -112,6 +159,23 @@ pub fn process_io(_pid: u32) -> Option<Totals> {
     None
 }
 
+/// True once our child `pid` has exited, without reaping it, so its
+/// `/proc/<pid>/io` can still be read for a final sample. Also true when
+/// the pid is no longer ours to wait for, so a caller never waits forever.
+#[cfg(target_os = "linux")]
+pub fn exited_unreaped(pid: u32) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    rc != 0 || unsafe { info.si_pid() } != 0
+}
+
 pub fn parse_proc_io(text: &str) -> Option<Totals> {
     let field = |name: &str| {
         text.lines()
@@ -124,8 +188,10 @@ pub fn parse_proc_io(text: &str) -> Option<Totals> {
 }
 
 /// Follows one child process and charges its I/O to `device` as it runs.
-/// Call [`ProcessMeter::sample`] periodically and once more just before the
-/// child is reaped; each call charges only what is new since the last.
+/// Call [`ProcessMeter::sample`] periodically; each call charges only what
+/// is new since the last. An exited child's counters stay readable until it
+/// is reaped, so a caller that can sample between exit and reap loses
+/// nothing; one that cannot loses at most one sampling interval.
 pub struct ProcessMeter {
     pid: u32,
     device: Option<u64>,
@@ -171,6 +237,25 @@ mod tests {
         assert_eq!(after.read_bytes - before.read_bytes, 100);
         assert_eq!(after.write_bytes - before.write_bytes, 40);
         assert_eq!(totals(u64::MAX - 8), Totals::default());
+    }
+
+    #[test]
+    fn a_metered_file_charges_every_read_to_its_filesystem() {
+        use std::io::{Read, Seek, SeekFrom};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("payload");
+        std::fs::write(&path, vec![1u8; 10_000]).unwrap();
+        let device = device_of(&path).unwrap();
+        let before = totals(device).read_bytes;
+        let mut file = Metered::new(std::fs::File::open(&path).unwrap());
+        assert_eq!(file.metadata().unwrap().len(), 10_000, "derefs to the File");
+        let mut head = [0u8; 100];
+        file.read_exact(&mut head).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut all = Vec::new();
+        file.read_to_end(&mut all).unwrap();
+        // Other tests may read from the same filesystem concurrently.
+        assert!(totals(device).read_bytes - before >= 10_100);
     }
 
     #[test]

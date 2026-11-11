@@ -8686,3 +8686,37 @@ async fn pending_next_writer_returns_already_granted_leases() {
     );
     assert!(next_pending);
 }
+
+#[test]
+fn torrent_transfer_is_charged_to_its_payload_filesystem() {
+    use crate::volumes::StorageVolumeReading;
+    let volume = |device: u64, roles: &[&str]| StorageVolumeReading {
+        label: roles.join(" · "),
+        path: std::path::PathBuf::from("/x"),
+        available_bytes: Some(1),
+        total_bytes: Some(2),
+        device_id: Some(device),
+        current: true,
+        roles: roles.iter().map(|role| role.to_string()).collect(),
+    };
+    let volumes = [
+        volume(1, &["working", "torrent payloads", "state"]),
+        volume(2, &["downloads"]),
+        volume(3, &["torrent category: anime"]),
+    ];
+    assert_eq!(torrent_payload_device(&volumes, None), Some(1));
+    assert_eq!(
+        torrent_payload_device(&volumes, Some("tv")),
+        Some(1),
+        "a category without its own dir uses the root"
+    );
+    assert_eq!(
+        torrent_payload_device(&volumes, Some("anime")),
+        Some(3),
+        "a category with its own dir uses it"
+    );
+    assert_eq!(
+        torrent_payload_device(&[volume(2, &["downloads"])], None),
+        None
+    );
+}
