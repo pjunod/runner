@@ -604,12 +604,20 @@ static RESTART_EXPIRED: std::sync::Mutex<Option<RestartPending>> = std::sync::Mu
 /// The backend currently serving (each in-process reload builds a new
 /// engine and setup handle): a deferred restart polls and restarts *this*
 /// one, never the one it was asked under.
-static CURRENT_BACKEND: std::sync::Mutex<Option<(EngineHandle, Arc<SetupHandle>)>> =
+///
+/// It holds only what the poller reads — the published queue snapshot and
+/// the config-only setup handle — never an [`EngineHandle`]. The handle owns
+/// the backend's `artifacts.sqlite` inventory and history store, both opened
+/// `locking_mode=EXCLUSIVE` behind directory locks: a process-wide clone of
+/// it outlived the backend's teardown, and the reload's fresh instance could
+/// then never acquire them (it is registered here only *after* opening them),
+/// so every in-process restart stayed `backend_loading` forever.
+static CURRENT_BACKEND: std::sync::Mutex<Option<(nzbd_engine::SharedSnapshot, Arc<SetupHandle>)>> =
     std::sync::Mutex::new(None);
 static BACKEND_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn register_backend(engine: &EngineHandle, setup: &Arc<SetupHandle>) {
-    *CURRENT_BACKEND.lock().unwrap() = Some((engine.clone(), setup.clone()));
+    *CURRENT_BACKEND.lock().unwrap() = Some((engine.shared_snapshot(), setup.clone()));
     BACKEND_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     // A restart deferred under the previous backend is settled by this
     // reload (or expired); either way its drain ends here, even if the task
@@ -3146,7 +3154,7 @@ fn poll_pending_restart(now: i64) -> RestartStep {
     let step = settle_restart(&mut pending, now, generation, || {
         backend
             .as_ref()
-            .map(|(engine, _)| restart_blockers(&engine.snapshot()))
+            .map(|(snapshot, _)| restart_blockers(&snapshot.load_full()))
     });
     sync_restart_drain(&pending);
     drop(pending);

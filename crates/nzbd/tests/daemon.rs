@@ -80,7 +80,8 @@ fn wait_healthy_authenticated(
         if start.elapsed() > deadline {
             return Err(format!(
                 "daemon did not become healthy at {addr} within {deadline:?} \
-                 (process still alive)"
+                 (process still alive)\n--- daemon stderr (tail) ---\n{}",
+                daemon.stderr_tail()
             ));
         }
         std::thread::sleep(Duration::from_millis(100));
