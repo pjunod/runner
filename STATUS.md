@@ -1,5 +1,39 @@
 # nzbd — Project Status
 
+## Processing drain: NFS publication fix + SQLite advisory — 2026-11-11
+
+**Status:** open [#304](https://github.com/pjunod/runner/pull/304), owner
+Claude (Opus 5.5 session; taken over from the GPT/codex session that opened
+it). Next: adversarial review → fold in findings → CI once → merge.
+**Deployed ahead of merge** on nuc3 (image `nzbd:processing-drain-2b5f9e4`,
+binary SHA256 `718dc859…5845`, rollback tag
+`nzbd:before-processing-drain-20261109`) because the running image kept
+failing publications with "publication file changed before commit" and
+holding `/processing` full. The deployed build is `2b5f9e4`; the advisory
+bump below is dependency-only and ships with the next main build.
+
+- **Root cause (state).** The NFS link/unlink rename fallback kept the
+  old-name descriptor open past the unlink, so NFS's deferred
+  silly-rename unlink bumped the published inode's ctime after the intent
+  captured its identity. Old-name handles now close only after the verified
+  target handle pins the inode (`rename_exclusive_from_open` takes the
+  caller's guard into the fallback; the keep-source link branch still holds
+  it). Live probe: 6/20 late ctime changes with old handles open, 0/20 when
+  closed first.
+- **RUSTSEC-2026-0459.** `rusqlite` 0.40 → 0.41 (workspace and vendored
+  hiqlite), `serde_rusqlite` 0.43 → 0.44, so `libsqlite3-sys` is 0.39.1.
+  `uuid` moves 1.24 → 1.29 because rusqlite 0.41 requires it. hiqlite's
+  three `stmt.columns()` call sites collect the new iterator; recorded as a
+  local vendor delta in `vendor/README.md`. plurx's vendored copy still pins
+  0.40 and needs the same bump.
+- **Ops on nuc3 (not code).** Brick-level ENOSPC with 132 GiB free in
+  aggregate: the Gluster distribute volume's nuc3 brick was at 0 bytes while
+  nuc4 had free space. Both bricks carried a 5 % ext4 root reserve that
+  Gluster's posix space check cannot use; set to 0 % (Gluster's own
+  `storage.reserve`, default 1 %, is the guard). nuc3 brick +3 GiB from its
+  VG. Eight ctime-only publication intents re-verified by SHA256 and repaired
+  offline with receipts under the NAS task root `claude/`.
+
 ## Storage I/O in the overview — 2026-11-08
 
 **Status:** draft [#303](https://github.com/pjunod/runner/pull/303) (runner
