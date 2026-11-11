@@ -4657,6 +4657,8 @@ async fn write_latch_clears_only_on_evidence_from_the_failed_file() {
     pump(&mut owner, &mut messages).await;
     owner.state.jobs.push(pending_job(2));
     let part = tmp.path().join("dest/job/.runner-file-20.part");
+    // The partial's directory exists: a missing one means the file is gone.
+    std::fs::create_dir_all(part.parent().unwrap()).unwrap();
     let fs = SplitBrickFs {
         full: std::sync::Mutex::new(true),
         failing_file: part.clone(),
@@ -4686,7 +4688,7 @@ async fn write_latch_clears_only_on_evidence_from_the_failed_file() {
         vec![Planned {
             op: op.clone(),
             observed: owner.enospc_failures[&op].observed,
-            target: Target::File(part.clone()),
+            target: Target::File(part.clone(), Default::default()),
         }]
     };
     // New files would succeed (probe_dir), but the failing file still fails.
@@ -4732,6 +4734,107 @@ async fn write_latch_clears_only_on_evidence_from_the_failed_file() {
     owner.state.jobs.retain(|job| job.id != JobId(2));
     owner.maybe_probe_space();
     assert!(!owner.enospc_latched, "nothing is left to retry");
+}
+
+/// Finding 4: a finalize or post-processing failure whose job cannot run its
+/// own retry (paused by a person, operator-held, post-processing paused) is
+/// probed instead of waiting on a manual resume, and a write failure with no
+/// recorded partial probes the job's directory. Finding 6: a file with a
+/// live writer is not probed (its own write is the evidence).
+#[tokio::test]
+async fn a_failure_whose_job_cannot_retry_is_probed() {
+    use crate::space_probe::{SpaceOp, Target};
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(2));
+    owner.state.jobs.push(pending_job(3));
+    let part = tmp.path().join("dest/job/.runner-file-20.part");
+    let finalize = SpaceOp::Finalize {
+        job: JobId(2),
+        file: FileId(20),
+    };
+    let post = SpaceOp::Post { job: JobId(3) };
+    owner.observe_space_failure("finalize", finalize.clone(), Some(part.clone()));
+    owner.observe_space_failure("post", post.clone(), None);
+    assert!(
+        owner.space_retry_jobs().contains(&JobId(3)),
+        "post retries under the latch"
+    );
+    assert!(
+        owner.space_probe_plan().is_empty(),
+        "runnable jobs retry themselves"
+    );
+
+    owner.state.job_mut(JobId(2)).unwrap().status = JobStatus::Paused;
+    owner.state.post_paused = true;
+    let plan = owner.space_probe_plan();
+    assert_eq!(plan.len(), 2, "{plan:?}");
+    for planned in &plan {
+        match (&planned.op, &planned.target) {
+            (SpaceOp::Finalize { .. }, Target::File(path, _)) => assert_eq!(path, &part),
+            (SpaceOp::Post { .. }, Target::Dirs(dirs)) => assert!(!dirs.is_empty()),
+            other => panic!("unexpected plan {other:?}"),
+        }
+    }
+    // Held for review by an operator: no automatic retry either.
+    owner.state.post_paused = false;
+    {
+        let record = owner.state.job_mut(JobId(3)).unwrap();
+        record.status = JobStatus::Held;
+        record.set_control(&nzbd_types::JobControl {
+            version: 1,
+            revision: "1".into(),
+            lifecycle: "held".into(),
+            cause: "capacity".into(),
+            stage: "post".into(),
+            retry_policy: "review".into(),
+            message: String::new(),
+            instance: String::new(),
+            previous_status: None,
+            manual_pause: false,
+            retry_attempt: 0,
+            next_retry_at_unix: None,
+            blocked_since_unix: None,
+            released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
+        });
+    }
+    assert!(owner
+        .space_probe_plan()
+        .iter()
+        .any(|planned| planned.op == post));
+
+    // A write failure with no recorded partial: the job's directory.
+    owner.enospc_failures.clear();
+    let write = SpaceOp::Write {
+        job: JobId(2),
+        file: FileId(20),
+    };
+    owner.observe_space_failure("write", write.clone(), None);
+    assert!(matches!(
+        owner.space_probe_plan().as_slice(),
+        [planned] if matches!(planned.target, Target::Dirs(_))
+    ));
+    // A live writer on that file: its own write decides.
+    owner.observe_space_failure("write", write.clone(), Some(part.clone()));
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let (_stopped_tx, stopped) = tokio::sync::watch::channel(false);
+    owner.writers.insert(
+        FileId(20),
+        WriterHandle {
+            tx,
+            stop: tokio_util::sync::CancellationToken::new(),
+            stopped,
+            generation: 0,
+        },
+    );
+    assert!(owner.space_probe_plan().is_empty());
+    owner.writers.clear();
+    assert!(matches!(
+        owner.space_probe_plan().as_slice(),
+        [planned] if matches!(planned.target, Target::File(_, _))
+    ));
 }
 
 #[tokio::test]

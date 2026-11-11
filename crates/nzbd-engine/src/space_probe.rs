@@ -60,6 +60,38 @@ pub(crate) struct SpaceFailure {
     /// The engine's ENOSPC count when this failure was last reported: a
     /// probe started before a newer report of the same failure proves nothing.
     pub observed: u64,
+    /// The guarded volumes (root, device) as they were when the failure was
+    /// reported — the mount was there, a write had just reached it. A probe
+    /// never walks above the root containing its target and requires the
+    /// device recorded here, so an unmounted volume (its mount point now on
+    /// the parent filesystem) is never mistaken for one with room.
+    pub volumes: Vec<(PathBuf, Option<u64>)>,
+}
+
+impl SpaceFailure {
+    /// The bound for a probe of `path`: the deepest recorded volume root
+    /// containing it, with its recorded device.
+    pub fn bound(&self, path: &Path) -> Bound {
+        self.volumes
+            .iter()
+            .filter(|(root, _)| !root.as_os_str().is_empty() && path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
+            .map(|(root, device)| Bound {
+                root: Some(root.clone()),
+                device: *device,
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Where a probe may look: never above `root`, and only on `device`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Bound {
+    /// The guarded root containing the target; None when no guarded root
+    /// does (the target itself is then the only place to look).
+    pub root: Option<PathBuf>,
+    /// The device the failing write reached, when known.
+    pub device: Option<u64>,
 }
 
 /// What one probe found.
@@ -79,6 +111,14 @@ pub(crate) trait ProbeFs: Send + Sync {
     fn probe_file(&self, path: &Path) -> ProbeResult;
     /// Write, fsync and remove probe files in a directory.
     fn probe_dir(&self, dir: &Path) -> ProbeResult;
+    /// The device of `path` when it is an existing directory.
+    fn dir_device(&self, path: &Path) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path)
+            .ok()
+            .filter(std::fs::Metadata::is_dir)
+            .map(|metadata| metadata.dev())
+    }
 }
 
 /// One planned probe.
@@ -91,8 +131,8 @@ pub(crate) struct Planned {
 
 #[derive(Debug, Clone)]
 pub(crate) enum Target {
-    File(PathBuf),
-    Dirs(Vec<PathBuf>),
+    File(PathBuf, Bound),
+    Dirs(Vec<(PathBuf, Bound)>),
 }
 
 /// Run the planned probes; each answers for its own failure only.
@@ -100,19 +140,32 @@ pub(crate) fn run(plan: &[Planned], fs: &dyn ProbeFs) -> Vec<(SpaceOp, u64, Prob
     plan.iter()
         .map(|planned| {
             let result = match &planned.target {
-                Target::File(path) => fs.probe_file(path),
+                Target::File(path, bound) => {
+                    let parent = path.parent().unwrap_or(path);
+                    match locate(parent, bound, fs) {
+                        Located::Unavailable(reason) => ProbeResult::Holds(reason),
+                        // The volume is there and the file's directory is
+                        // gone: so is the file.
+                        Located::Gone => ProbeResult::Gone,
+                        Located::Dir(_) => fs.probe_file(path),
+                    }
+                }
                 Target::Dirs(dirs) => {
                     let mut result = ProbeResult::Gone;
-                    for dir in dirs {
-                        match existing_ancestor(dir) {
-                            Some(dir) => match fs.probe_dir(&dir) {
+                    for (dir, bound) in dirs {
+                        match locate(dir, bound, fs) {
+                            Located::Dir(dir) => match fs.probe_dir(&dir) {
                                 ProbeResult::Cleared => result = ProbeResult::Cleared,
                                 other => {
                                     result = other;
                                     break;
                                 }
                             },
-                            None => continue,
+                            Located::Unavailable(reason) => {
+                                result = ProbeResult::Holds(reason);
+                                break;
+                            }
+                            Located::Gone => continue,
                         }
                     }
                     result
@@ -123,18 +176,52 @@ pub(crate) fn run(plan: &[Planned], fs: &dyn ProbeFs) -> Vec<(SpaceOp, u64, Prob
         .collect()
 }
 
+/// Where [`locate`] found the place to probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Located {
+    /// This existing directory, on the recorded device.
+    Dir(PathBuf),
+    /// Nothing exists and no guarded root bounds it: the object is gone.
+    Gone,
+    /// The guarded root is missing or is not the recorded device (an
+    /// unmounted volume): not evidence of anything, and not gone either.
+    Unavailable(String),
+}
+
 /// Finding 2: a failing directory removed later is probed through its
-/// nearest existing ancestor (still on the volume that failed), never
-/// reported as NotFound forever.
-pub(crate) fn existing_ancestor(dir: &Path) -> Option<PathBuf> {
-    let mut current = Some(dir);
-    while let Some(path) = current {
-        if !path.as_os_str().is_empty() && path.is_dir() {
-            return Some(path.to_path_buf());
+/// nearest existing ancestor — but never above the guarded root containing
+/// it, and only on the device the failure was recorded on. An unmounted
+/// volume leaves its mount point on the parent filesystem; probing that
+/// would report room the failed volume does not have.
+pub(crate) fn locate(dir: &Path, bound: &Bound, fs: &dyn ProbeFs) -> Located {
+    let mut current = dir;
+    loop {
+        if !current.as_os_str().is_empty() {
+            if let Some(device) = fs.dir_device(current) {
+                if bound.device.is_some_and(|recorded| recorded != device) {
+                    return Located::Unavailable(format!(
+                        "{} is not on the volume that failed (not mounted?)",
+                        current.display()
+                    ));
+                }
+                return Located::Dir(current.to_path_buf());
+            }
         }
-        current = path.parent();
+        let Some(root) = &bound.root else {
+            return Located::Gone;
+        };
+        match current.parent() {
+            Some(parent) if current != root.as_path() && parent.starts_with(root) => {
+                current = parent;
+            }
+            _ => {
+                return Located::Unavailable(format!(
+                    "guarded root {} is missing (not mounted?)",
+                    root.display()
+                ))
+            }
+        }
     }
-    None
 }
 
 /// The real filesystem.
@@ -191,8 +278,11 @@ fn allocate_on(path: &Path) -> std::io::Result<()> {
         };
         if rc == 0 {
             let synced = file.sync_data();
-            // Truncating to the unchanged size frees the post-EOF blocks.
-            let released = file.set_len(len);
+            // Truncating to the current size frees the post-EOF blocks. Read
+            // it again: never cut bytes a writer appended meanwhile (the
+            // owner skips files with a live writer; this closes the rest).
+            let current = file.metadata().map_or(len, |metadata| metadata.len());
+            let released = file.set_len(current.max(len));
             synced?;
             if let Err(error) = released {
                 tracing::warn!(path = %path.display(), %error, "space probe could not release its preallocation");
@@ -291,17 +381,33 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
+    fn bound(root: &Path, device: Option<u64>) -> Bound {
+        Bound {
+            root: Some(root.to_path_buf()),
+            device,
+        }
+    }
+
+    fn device_of(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().dev()
+    }
+
     /// Finding 2: a deleted failing directory is probed via its nearest
-    /// existing ancestor instead of failing NotFound forever.
+    /// existing ancestor instead of failing NotFound forever — within its
+    /// guarded root.
     #[test]
     fn a_removed_directory_is_probed_through_its_ancestor() {
         let dir = tempfile::tempdir().unwrap();
-        let gone = dir.path().join("job/sub");
-        assert_eq!(existing_ancestor(&gone).unwrap(), dir.path());
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let gone = root.join("job/sub");
+        let bound = bound(&root, Some(device_of(&root)));
+        assert_eq!(locate(&gone, &bound, &RealFs), Located::Dir(root.clone()));
         let plan = [Planned {
             op: SpaceOp::Directory(gone.clone()),
             observed: 1,
-            target: Target::Dirs(vec![gone]),
+            target: Target::Dirs(vec![(gone, bound)]),
         }];
         let results = run(&plan, &RealFs);
         assert_eq!(results[0].2, ProbeResult::Cleared);
@@ -314,6 +420,115 @@ mod tests {
             &RealFs,
         );
         assert_eq!(results[0].2, ProbeResult::Gone);
+    }
+
+    /// The filesystem as an unmounted volume leaves it: the mount point is
+    /// still a directory, now on the parent filesystem's device.
+    struct Unmounted {
+        mount: PathBuf,
+    }
+    impl ProbeFs for Unmounted {
+        fn probe_file(&self, path: &Path) -> ProbeResult {
+            RealFs.probe_file(path)
+        }
+        fn probe_dir(&self, dir: &Path) -> ProbeResult {
+            RealFs.probe_dir(dir)
+        }
+        fn dir_device(&self, path: &Path) -> Option<u64> {
+            let device = RealFs.dir_device(path)?;
+            Some(if path.starts_with(&self.mount) {
+                device + 1
+            } else {
+                device
+            })
+        }
+    }
+
+    /// Finding 5: a probe never walks above the guarded root and requires
+    /// the recorded device. An unmounted volume (mount point on the parent
+    /// fs), a missing root, and a missing .part on a dropped mount all hold
+    /// — none reports Cleared or Gone.
+    #[test]
+    fn an_unmounted_or_missing_root_is_not_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mnt");
+        std::fs::create_dir_all(root.join("job")).unwrap();
+        let part = root.join("job/.runner-file-1.part");
+        std::fs::write(&part, b"abc").unwrap();
+        let recorded = bound(&root, Some(device_of(&root)));
+        let fs = Unmounted {
+            mount: root.clone(),
+        };
+        let probe = |target: Target, fs: &dyn ProbeFs| {
+            run(
+                &[Planned {
+                    op: SpaceOp::Directory(root.clone()),
+                    observed: 1,
+                    target,
+                }],
+                fs,
+            )
+            .remove(0)
+            .2
+        };
+        // Mounted: the same targets answer.
+        assert_eq!(
+            probe(
+                Target::Dirs(vec![(root.join("job/gone"), recorded.clone())]),
+                &RealFs
+            ),
+            ProbeResult::Cleared
+        );
+        assert_eq!(
+            probe(Target::File(part.clone(), recorded.clone()), &RealFs),
+            ProbeResult::Cleared
+        );
+        // Unmounted: the mount point is another device.
+        for target in [
+            Target::Dirs(vec![(root.join("job/gone"), recorded.clone())]),
+            Target::File(part.clone(), recorded.clone()),
+            Target::File(root.join("job/.runner-file-2.part"), recorded.clone()),
+        ] {
+            assert!(
+                matches!(probe(target, &fs), ProbeResult::Holds(_)),
+                "unmounted is neither cleared nor gone"
+            );
+        }
+        // The root itself missing: never probes its parent.
+        std::fs::remove_dir_all(&root).unwrap();
+        for target in [
+            Target::Dirs(vec![(root.join("job"), recorded.clone())]),
+            Target::File(part.clone(), recorded.clone()),
+        ] {
+            assert!(matches!(probe(target, &RealFs), ProbeResult::Holds(_)));
+        }
+    }
+
+    /// A failure with no guarded root around it: only the directory itself
+    /// is looked at, and when it is gone so is the failure.
+    #[test]
+    fn an_unbounded_directory_is_gone_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        assert_eq!(locate(&gone, &Bound::default(), &RealFs), Located::Gone);
+    }
+
+    #[test]
+    fn the_failure_records_its_deepest_volume() {
+        let failure = SpaceFailure {
+            path: None,
+            observed: 1,
+            volumes: vec![
+                (PathBuf::from("/mnt"), Some(1)),
+                (PathBuf::from("/mnt/proc"), Some(2)),
+                (PathBuf::new(), None),
+            ],
+        };
+        assert_eq!(
+            failure.bound(Path::new("/mnt/proc/job/x.part")),
+            bound(Path::new("/mnt/proc"), Some(2))
+        );
+        assert_eq!(failure.bound(Path::new("/srv/x")), Bound::default());
     }
 
     #[test]
