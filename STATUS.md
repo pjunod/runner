@@ -1,5 +1,60 @@
 # nzbd — Project Status
 
+## Storage I/O on every filesystem; mobile graphs and versions — 2026-11-11
+
+**Status:** branch `fix/storage-io-mobile` (runner 0.8.1, mobile 1.1.8).
+Owner: Claude (Opus 5.5 session). Server deploy and phone installs are
+Paul's. Adversarial review (Sonnet) ran and its findings are folded in.
+
+**Local gate (NZBD_REQUIRE_TOOLS=1, nothing skipped):** fmt; clippy
+`--workspace --all-targets -D warnings`; nzbd-state `io_meter` 4 and
+`fileops` 3; nzbd-engine `disk_io` 10, `volumes` (all but the root-only
+permission test, which fails identically on main), `writer::tests` 17,
+torrent device mapping; nzbd-post `tools` 16 (including a sub-interval dd
+run charged in full) and `fingerprint` 3; nzbd-api lib 92; engine e2e
+storage inventory; UI harnesses (1,025 DOM assertions, boot); mobile
+typecheck and jest 206. The meter tests also ran on nynuc itself (the CI
+runner, kernel 7.0, uutils coreutils), where two CI attempts had failed on
+the tests' choice of `dd`/`tee`.
+
+**Why:** on nuc3 only the completed row graphed. `/processing` is a
+GlusterFS FUSE mount, which has no kernel I/O counters, so it read "I/O
+n/a". It was also named "processing · completed" because torrent payloads
+were classed as completed.
+
+- **Engine.** `nzbd_state::io_meter` counts Runner's own bytes per
+  filesystem at the payload paths: article writer; par2/7z/unrar from
+  `/proc/<pid>/io`, sampled every 100 ms while they run (probed on nynuc
+  and nuc3, kernel 7.0: live counters are exact; an exited child's are
+  denied even before reaping, so each run's last interval is lost;
+  splice()-based copies such as uutils `tee`/`dd` are never counted, and
+  par2/7z/unrar don't use them); the cross-filesystem copy and its readbacks;
+  hashing/CRC passes, quick checks and writer readbacks through a `Metered`
+  file wrapper; torrent transfer (verified bytes written, uploaded bytes
+  read). Filesystems without kernel counters now report `source: runner`.
+  Header sniffs of a few KiB are not counted.
+- **Naming.** Torrent payloads and per-category torrent folders are
+  processing. Volume readings carry their exact role list.
+- **Mobile 1.1.8.** Storage rows show the same 3-minute write/read graph
+  and rates (side by side with capacity on phones, below it on iPad), from
+  the `storage_io` stream frame. The split Downloads / Post-processing
+  toggles were already in 1.1.7.
+- **Mobile versions.** 1.1.5–1.1.7 bumped only `app.json`; the committed
+  native projects stayed at 1.1.4 (iOS build 14, Android 13), so every
+  device build since installed as 1.1.4. All four version sources now say
+  1.1.8 (iOS 20, Android 19) and a test fails if they disagree.
+
+**Post-deploy checks:** both nuc3 rows draw a graph; hover `/processing`'s
+graph and it says "Runner's own"; `/processing` is named processing. On each
+phone, Settings or About shows 1.1.8, and the queue header has Downloads
+and Post-processing toggles.
+
+**Decisions made without Paul (review later):** on GlusterFS the graph is
+Runner's own traffic, labelled as such, because nothing inside the
+container can see the volume's other clients. A category whose name
+contains " · " is split as two roles when it shares an exact path with
+another role; harmless unless that category's torrent folder is also on a
+different filesystem from the torrent root.
 ## Processing drain: NFS publication fix + SQLite advisory — 2026-11-11
 
 **Status:** open [#304](https://github.com/pjunod/runner/pull/304), owner

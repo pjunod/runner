@@ -467,6 +467,10 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     const na = T.storageIoModel({ source: "unsupported", detail: "cifs", read_bps: null, write_bps: null });
     ok(na.ioQuiet && na.ioA === "I/O n/a" && na.ioTip.includes("(cifs)"),
       "a filesystem without counters names its type rather than drawing a flat line");
+    const own = T.storageIoModel({ source: "runner", detail: "fuse.glusterfs", read_bps: 1024, write_bps: 2048 });
+    ok(!own.ioQuiet && own.ioA === "W 2.0 KiB/s" && own.ioTip.includes("Runner's own") &&
+      own.ioTip.includes("fuse.glusterfs"),
+      "a filesystem without kernel counters graphs Runner's own I/O and says so");
     const stale = T.storageIoModel({ source: "stale", detail: "sda1", read_bps: null, write_bps: null });
     eq(stale.ioA, "I/O stalled", "a stopped sampler is reported, not frozen");
   }

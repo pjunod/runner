@@ -189,8 +189,9 @@ pub struct StoragePathDto {
 
 /// Throughput for one filesystem. `source` says what the numbers mean:
 /// `block` is device-wide (every program on that disk), `nfs` is this
-/// machine's traffic to the server, `unsupported` has no counters (`detail`
-/// names the filesystem type), and `stale` means the sampler stopped.
+/// machine's traffic to the server, `runner` is Runner's own I/O on a
+/// filesystem the kernel keeps no counters for (FUSE such as GlusterFS, SMB;
+/// `detail` names the type), and `stale` means the sampler stopped.
 /// Rates are `null` until a second sample exists.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StorageIoDto {
@@ -218,7 +219,7 @@ fn measure_storage(targets: &[StorageTarget]) -> Vec<StoragePathDto> {
 #[cfg(test)]
 fn storage_path_dto(reading: nzbd_engine::volumes::StorageVolumeReading) -> StoragePathDto {
     StoragePathDto {
-        name: reading.kinds.name(&reading.label),
+        name: reading.name(),
         label: reading.label,
         path: reading.path.to_string_lossy().into_owned(),
         available_bytes: reading.available_bytes,

@@ -6,6 +6,7 @@ import { mergePendingJobs, overlayPendingObservations } from '../controlPending'
 import { JobActionResult, runJobAction } from '../api/jobActions';
 import { NzbdClient } from '../api/client';
 import { SseParser } from '../api/sse';
+import { StorageIoStore, createStorageIoStore } from '../storageIo';
 import {
   AddNzbOptions,
   AddNzbResult,
@@ -23,6 +24,8 @@ interface HookResult {
   error: string | null;
   busyKey: string | null;
   lastUpdated: number | null;
+  /** Three minutes of per-filesystem read/write throughput. */
+  storageIo: StorageIoStore;
   refresh: () => Promise<void>;
   queueAction: (action: 'pause' | 'resume' | 'pause-post' | 'resume-post') => Promise<void>;
   jobAction: (
@@ -59,6 +62,8 @@ export function useNzbd(config: ConnectionConfig): HookResult {
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
   const refreshPromise = useRef<Promise<void> | null>(null);
   const lastFrameAt = useRef(0);
+  // One history per server; a new client starts empty.
+  const storageIo = useMemo(() => createStorageIoStore(), [client]);
 
   const refresh = useCallback(async () => {
     if (activeClient.current !== client) return;
@@ -68,6 +73,7 @@ export function useNzbd(config: ConnectionConfig): HookResult {
       .then((next) => {
         if (activeClient.current !== client) return;
         setSnapshot(next);
+        storageIo.note(next.status.storage, Date.now());
         setLastUpdated(Date.now());
         setError(null);
         if (Date.now() - lastFrameAt.current > 7_000) setConnectionState('polling');
@@ -84,7 +90,7 @@ export function useNzbd(config: ConnectionConfig): HookResult {
       });
     refreshPromise.current = request;
     return request;
-  }, [client]);
+  }, [client, storageIo]);
 
   const refreshPendingObservations = useCallback(() => {
     if (activeClient.current !== client || pendingObservation.current?.client === client) return;
@@ -120,6 +126,13 @@ export function useNzbd(config: ConnectionConfig): HookResult {
           setLastUpdated(Date.now());
         } catch {
           setError('Runner sent a queue update the app could not read.');
+        }
+      } else if (event === 'storage_io') {
+        try {
+          const next = JSON.parse(data) as { storage?: QueueSnapshot['status']['storage'] };
+          storageIo.note(next.storage, Date.now());
+        } catch {
+          // A malformed throughput frame only costs one graph sample.
         }
       } else if (event === 'reset' || event === 'lagged') {
         void refresh().catch(() => undefined);
@@ -165,6 +178,12 @@ export function useNzbd(config: ConnectionConfig): HookResult {
         refreshPendingObservations();
       }
     }, 5_000);
+    // One graph sample a second from the latest known rates.
+    const storageClock = setInterval(() => {
+      const rows = snapshotRef.current?.status.storage;
+      if (!rows?.length) return;
+      storageIo.sample(rows, Date.now() - lastFrameAt.current < 6_500, Date.now());
+    }, 1_000);
     const appState = AppState.addEventListener('change', (state) => {
       if (state === 'active') void refresh().catch(() => undefined);
     });
@@ -174,9 +193,10 @@ export function useNzbd(config: ConnectionConfig): HookResult {
       controller.abort();
       if (pendingObservation.current?.client === client) pendingObservation.current.controller.abort();
       clearInterval(poll);
+      clearInterval(storageClock);
       appState.remove();
     };
-  }, [client, refresh, refreshPendingObservations]);
+  }, [client, refresh, refreshPendingObservations, storageIo]);
 
   const mutate = useCallback(
     async <T,>(key: string, operation: () => Promise<T>): Promise<T> => {
@@ -202,6 +222,7 @@ export function useNzbd(config: ConnectionConfig): HookResult {
     error,
     busyKey,
     lastUpdated,
+    storageIo,
     refresh,
     queueAction: (action) => mutate(`queue:${action}`, () => client.queueAction(action)),
     jobAction: (id, action) =>

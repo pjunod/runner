@@ -1153,6 +1153,25 @@ pub(crate) struct Owner {
     rotate: usize,
 }
 
+/// The filesystem a torrent's payload lives on, from the capacity probe's
+/// last reading (memory only; the owner never stats a volume). A category
+/// with its own torrent directory uses that; anything else uses the
+/// torrent payload root.
+pub(crate) fn torrent_payload_device(
+    volumes: &[crate::volumes::StorageVolumeReading],
+    category: Option<&str>,
+) -> Option<u64> {
+    let holding = |role: &str| {
+        volumes
+            .iter()
+            .find(|volume| volume.has_role(role))
+            .and_then(|volume| volume.device_id)
+    };
+    category
+        .and_then(|category| holding(&format!("torrent category: {category}")))
+        .or_else(|| holding("torrent payloads"))
+}
+
 fn disk_guard_decision(
     was_held: bool,
     mut write_latched: bool,
@@ -8889,20 +8908,32 @@ impl Owner {
         let latest = self.backend.latest_progress();
         let mut changed = false;
         for (job_id, progress) in latest {
-            let verified_delta = {
+            let (verified_delta, uploaded_delta, category) = {
                 let Some(job) = self.state.job_mut(job_id) else {
                     continue;
                 };
-                let before = job
-                    .torrent
-                    .as_ref()
-                    .map_or(0, |torrent| torrent.downloaded_bytes);
+                let (before, uploaded_before) = job.torrent.as_ref().map_or((0, 0), |torrent| {
+                    (torrent.downloaded_bytes, torrent.uploaded_bytes)
+                });
                 changed |=
                     crate::torrent_runtime::reconcile_progress(job, &progress).durable_changed;
-                job.torrent
-                    .as_ref()
-                    .map_or(0, |torrent| torrent.downloaded_bytes.saturating_sub(before))
+                let (after, uploaded_after) = job.torrent.as_ref().map_or((0, 0), |torrent| {
+                    (torrent.downloaded_bytes, torrent.uploaded_bytes)
+                });
+                (
+                    after.saturating_sub(before),
+                    uploaded_after.saturating_sub(uploaded_before),
+                    job.category.clone(),
+                )
             };
+            // Payload transfer is disk traffic on the torrent's filesystem:
+            // verified pieces were written, uploaded pieces were read.
+            if verified_delta > 0 || uploaded_delta > 0 {
+                let device =
+                    torrent_payload_device(&self.evaluated_disk_guard.volumes, category.as_deref());
+                nzbd_state::io_meter::write(device, verified_delta);
+                nzbd_state::io_meter::read(device, uploaded_delta);
+            }
             if verified_delta > 0 {
                 self.volumes.add(
                     crate::volumes::TORRENT_SOURCE_ID,
@@ -9871,7 +9902,7 @@ impl Owner {
                 .volumes
                 .iter()
                 .map(|volume| StorageVolumeSnapshot {
-                    name: volume.kinds.name(&volume.label),
+                    name: volume.name(),
                     label: volume.label.clone(),
                     path: volume.path.to_string_lossy().into_owned(),
                     available_bytes: volume.available_bytes,

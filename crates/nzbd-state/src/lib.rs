@@ -24,6 +24,7 @@ pub mod capacity;
 pub mod fileops;
 mod fsx;
 pub mod history;
+pub mod io_meter;
 mod snapshot_codec;
 mod snapshot_encoder;
 pub use snapshot_encoder::{SnapshotEncoder, SnapshotEncoderStats};

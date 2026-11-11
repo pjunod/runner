@@ -264,9 +264,10 @@ pub struct StorageVolumeSnapshot {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StorageIoSnapshot {
     /// `block` (device-wide counters, every program on that disk),
-    /// `nfs` (this machine's traffic to the server), `unsupported` (no
-    /// counters exist; `detail` names the filesystem type), or `stale`
-    /// (the sampler has stopped publishing; rates are withheld).
+    /// `nfs` (this machine's traffic to the server), `runner` (the kernel
+    /// keeps no counters, e.g. GlusterFS/FUSE or SMB, so this is Runner's
+    /// own I/O there; `detail` names the filesystem type), or `stale` (the
+    /// sampler has stopped publishing; rates are withheld).
     pub source: &'static str,
     /// The device name, NFS export, or reason.
     pub detail: String,

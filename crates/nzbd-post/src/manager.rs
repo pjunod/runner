@@ -5806,7 +5806,9 @@ fn assess_file_inputs(
                     .iter()
                     .find(|entry| !entry.identity.directory && entry.path == path),
             ) {
-                let mut input = std::fs::File::open(source.path.join(&path))?;
+                let mut input = nzbd_state::io_meter::Metered::new(std::fs::File::open(
+                    source.path.join(&path),
+                )?);
                 let before = input.metadata()?;
                 if !diagnostic_metadata_matches(&before, entry) {
                     return Err(PostError::Io(std::io::Error::other(format!(
@@ -6000,7 +6002,7 @@ fn par_repairable_evidence_with_partials(
                 continue;
             };
             let mut input = match std::fs::File::open(&absolute) {
-                Ok(input) => input,
+                Ok(input) => nzbd_state::io_meter::Metered::new(input),
                 Err(error) => return Err(PostError::Io(error)),
             };
             let before = input.metadata()?;
@@ -6303,7 +6305,7 @@ fn verified_direct_payload_paths_excluding(
             continue;
         };
         let path = source.path.join(actual_relative);
-        let mut input = std::fs::File::open(&path)?;
+        let mut input = nzbd_state::io_meter::Metered::new(std::fs::File::open(&path)?);
         let before = input.metadata()?;
         if !diagnostic_metadata_matches(&before, entry) {
             return Err(PostError::Io(std::io::Error::other(format!(

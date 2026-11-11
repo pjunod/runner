@@ -3358,6 +3358,7 @@ function storageIoModel(io) {
   if (!io) return quiet("no I/O data",
     "Runner has no device identity for this filesystem (its path could not be read, or the " +
     "platform does not provide one), so it cannot sample its I/O.");
+  // 0.8.0 daemons report "unsupported" where 0.8.1 graphs Runner's own I/O.
   if (io.source === "unsupported") return quiet("I/O n/a",
     "No transfer counters exist for this filesystem (" + io.detail + "). Runner graphs block " +
     "devices and NFS mounts; SMB, FUSE and overlay mounts expose none.");
@@ -3366,6 +3367,10 @@ function storageIoModel(io) {
   const tip = io.source === "nfs"
     ? "This machine's traffic to " + io.detail + " over the last 3 minutes. " +
       "Other clients of that server are not visible from here."
+    : io.source === "runner"
+    ? "Runner's own reads and writes on this filesystem over the last 3 minutes: article " +
+      "writes, par2 and unpacking, the copy to completed, and torrent transfer. " +
+      io.detail + " keeps no kernel I/O counters, so other programs using it are not included."
     : "Device-wide reads and writes on " + io.detail + " over the last 3 minutes, " +
       "including any other program using that disk.";
   if (io.read_bps == null || io.write_bps == null) return quiet("measuring…", tip);

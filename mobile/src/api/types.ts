@@ -137,12 +137,27 @@ export interface ServerVolume {
   rate_bps: number;
 }
 
+/** One filesystem's throughput. `block` is device-wide, `nfs` is this
+ * Runner host's traffic to the server, `runner` is Runner's own I/O where
+ * the kernel keeps no counters, `stale` means the sampler stopped. */
+export interface StorageIo {
+  source: 'block' | 'nfs' | 'runner' | 'stale' | 'unsupported' | string;
+  detail: string;
+  read_bps: number | null;
+  write_bps: number | null;
+}
+
 export interface StoragePath {
+  /** What the filesystem is for: processing, completed, or both. Absent on older daemons. */
+  name?: string;
+  /** The configured roles on this filesystem. */
   label: string;
   path: string;
   available_bytes: number | null;
   total_bytes: number | null;
   current?: boolean;
+  /** Present on /api/v1/status and storage_io frames; ticks leave it out. */
+  io?: StorageIo | null;
 }
 
 export interface StatusDto {

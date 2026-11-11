@@ -422,6 +422,10 @@ async fn writer_task(
     };
     let part_path = dir.join(format!(".runner-file-{}.part", file_id.0));
     let mut final_path = dir.join(&final_name);
+    // The filesystem this job writes to, for the dashboard's I/O graph on
+    // filesystems the kernel keeps no counters for. Taken from the open
+    // file on the first write (the directory may not exist yet here).
+    let mut device: Option<u64> = None;
     let resolved = match recovery::resolve_payload(&dir, file_id, &final_name) {
         Ok(payload) => payload,
         Err(error) => {
@@ -646,11 +650,18 @@ async fn writer_task(
                     }
                     let f = out.as_mut().unwrap();
                     let result = async {
-                        if file_size > 0 && f.metadata().await?.len() < file_size {
-                            f.set_len(file_size).await?;
+                        if file_size > 0 || device.is_none() {
+                            let metadata = f.metadata().await?;
+                            if device.is_none() {
+                                device = nzbd_state::io_meter::device_of_metadata(&metadata);
+                            }
+                            if file_size > 0 && metadata.len() < file_size {
+                                f.set_len(file_size).await?;
+                            }
                         }
                         f.seek(SeekFrom::Start(offset)).await?;
                         f.write_all(&data).await?;
+                        nzbd_state::io_meter::write(device, data.len() as u64);
                         // Drain Tokio's buffered write before checking identity or
                         // seeking for another member. Durability is shared below.
                         f.flush().await?;
@@ -1039,9 +1050,10 @@ pub(crate) fn validate_range_checked(
     {
         return false;
     }
-    let Ok(mut file) = nzbd_state::fileops::open(path) else {
+    let Ok(file) = nzbd_state::fileops::open(path) else {
         return false;
     };
+    let mut file = nzbd_state::io_meter::Metered::new(file);
     if file.seek(SeekFrom::Start(offset)).is_err() {
         return false;
     }

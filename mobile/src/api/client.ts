@@ -198,7 +198,8 @@ export class NzbdClient {
   }
 
   async openEventStream(signal: AbortSignal, lastEventId?: string): Promise<Response> {
-    return fetch(`${this.config.baseUrl}/api/v1/events`, {
+    // storage_io: per-filesystem throughput for the Storage block's graphs.
+    return fetch(`${this.config.baseUrl}/api/v1/events?storage_io=1`, {
       method: 'GET',
       headers: this.headers({
         accept: 'text/event-stream',

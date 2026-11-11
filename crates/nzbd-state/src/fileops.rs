@@ -137,6 +137,7 @@ pub fn copy_publish_checked(
     let identity = fs::identity_for_file(&input)?;
     let hash = |file: &mut File| -> Result<Vec<u8>> {
         let before = fs::identity_for_file(file)?;
+        let device = crate::io_meter::device_of_file(file);
         file.rewind()?;
         let mut h = Sha256::new();
         let mut buf = [0; 65536];
@@ -144,6 +145,7 @@ pub fn copy_publish_checked(
             checkpoint()?;
             let n = file.read(&mut buf)?;
             payload_read(n);
+            crate::io_meter::read(device, n as u64);
             if n == 0 {
                 break;
             }
@@ -225,6 +227,8 @@ pub fn copy_publish_checked(
             (previous, expected)
         } else {
             let mut output = unsafe { File::from_raw_fd(fd) };
+            let input_device = crate::io_meter::device_of_file(&input);
+            let output_device = crate::io_meter::device_of_file(&output);
             let mut digest = Sha256::new();
             let mut count = 0u64;
             let mut buffer = [0; 65536];
@@ -232,10 +236,12 @@ pub fn copy_publish_checked(
                 checkpoint()?;
                 let n = input.read(&mut buffer)?;
                 payload_read(n);
+                crate::io_meter::read(input_device, n as u64);
                 if n == 0 {
                     break;
                 }
                 output.write_all(&buffer[..n])?;
+                crate::io_meter::write(output_device, n as u64);
                 digest.update(&buffer[..n]);
                 count += n as u64;
             }

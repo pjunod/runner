@@ -2054,11 +2054,8 @@ async fn storage_inventory_publishes_when_the_enforcing_floor_is_disabled() {
             let snapshot = engine.snapshot();
             let io = snapshot.storage_volumes[0].io.clone();
             let done = match &io {
-                Some(io) if io.source == "unsupported" => {
-                    assert!(io.read_bps.is_none() && !io.detail.is_empty());
-                    true
-                }
-                Some(io) if io.source == "block" || io.source == "nfs" => {
+                Some(io) if ["block", "nfs", "runner"].contains(&io.source) => {
+                    assert!(!io.detail.is_empty());
                     io.read_bps.is_some() && io.write_bps.is_some()
                 }
                 _ => false,
