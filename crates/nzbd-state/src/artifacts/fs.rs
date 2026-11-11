@@ -407,8 +407,13 @@ mod unix {
 
     /// The mount id of `name` in `dir` (not followed), or of `dir` itself
     /// when `name` is empty. None where statx or the field is unavailable.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn mount_id_at(dir: &File, name: &CStr) -> Option<u64> {
+        mount_id_or_reason(dir, name).ok()
+    }
+
+    /// [`mount_id_at`], with why the id is unavailable.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn mount_id_or_reason(dir: &File, name: &CStr) -> std::result::Result<u64, String> {
         let mut buf = std::mem::MaybeUninit::<libc::statx>::zeroed();
         let flags = libc::AT_SYMLINK_NOFOLLOW
             | if name.to_bytes().is_empty() {
@@ -427,29 +432,49 @@ mod unix {
             )
         };
         if rc != 0 {
-            return None;
+            return Err(format!("statx failed: {}", std::io::Error::last_os_error()));
         }
         let stat = unsafe { buf.assume_init() };
         if stat.stx_mask & libc::STATX_MNT_ID == 0 {
-            return None;
+            return Err("statx did not report STATX_MNT_ID (kernel older than 5.8?)".into());
         }
         #[cfg(test)]
         if FAKE_BIND_MOUNTS.with(|fake| fake.borrow().contains(&stat.stx_ino)) {
-            return Some(stat.stx_mnt_id ^ (1 << 62));
+            return Ok(stat.stx_mnt_id ^ (1 << 62));
         }
-        Some(stat.stx_mnt_id)
+        Ok(stat.stx_mnt_id)
     }
     #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-    fn mount_id_at(_: &File, _: &CStr) -> Option<u64> {
-        None
+    fn mount_id_or_reason(_: &File, _: &CStr) -> std::result::Result<u64, String> {
+        Err("statx mount id is not available on this target".into())
+    }
+
+    /// The remover's scope falls back to the device alone (bind mounts of
+    /// the same filesystem are then indistinguishable): say so, once.
+    fn warn_device_only_scope(reason: &str) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                reason,
+                "tree remover: mount id unavailable; scoping removals by device only \
+                 (a bind mount of the same filesystem inside a removed tree is not detected)"
+            );
+        });
     }
 
     impl MountScope {
         fn of(root: &File) -> Result<Self> {
             use std::os::unix::fs::MetadataExt;
+            let mount = match mount_id_or_reason(root, c"") {
+                Ok(mount) => Some(mount),
+                Err(reason) => {
+                    warn_device_only_scope(&reason);
+                    None
+                }
+            };
             Ok(Self {
                 device: root.metadata()?.dev(),
-                mount: mount_id_at(root, c""),
+                mount,
             })
         }
         /// `name` in `dir` (a directory with device `device`) is on this
