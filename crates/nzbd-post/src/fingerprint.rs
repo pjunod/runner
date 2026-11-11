@@ -60,7 +60,9 @@ fn scan_checked(
     }
     let mut input =
         nzbd_state::fileops::open(path).map_err(|e| PostError::Subprocess(e.to_string()))?;
-    let before = FileStamp::of(&input.metadata()?);
+    let metadata = input.metadata()?;
+    let before = FileStamp::of(&metadata);
+    let device = nzbd_state::io_meter::device_of_metadata(&metadata);
     let blocks = before.length.div_ceil(slice);
     if blocks.saturating_mul(4) > 64 * 1024 * 1024 {
         return Err(PostError::Subprocess(
@@ -80,6 +82,7 @@ fn scan_checked(
             break;
         }
         read_bytes += n as u64;
+        nzbd_state::io_meter::read(device, n as u64);
         scanned(n as u64);
         md5.update(&buffer[..n]);
         let mut offset = 0;

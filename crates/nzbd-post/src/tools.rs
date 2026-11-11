@@ -86,6 +86,16 @@ async fn run_tool_owned(
         .map_err(|e| PostError::ToolMissing(format!("{cmd}: {e}")))?;
 
     let group = child.id();
+    // The tool's reads and writes land in the directory it runs in (par2
+    // repairs in place; archives extract to a staging dir inside the job).
+    // Charge them to that filesystem for the dashboard's I/O graph. The
+    // last quarter second before exit is not seen: wait() reaps the child.
+    let device = tokio::fs::metadata(cwd)
+        .await
+        .ok()
+        .as_ref()
+        .and_then(nzbd_state::io_meter::device_of_metadata);
+    let mut meter = group.map(|pid| nzbd_state::io_meter::ProcessMeter::new(pid, device));
     let out = child.stdout.take().unwrap();
     let mut err = child.stderr.take().unwrap();
     let read_capped = |mut r: tokio::process::ChildStdout| async move {
@@ -122,7 +132,21 @@ async fn run_tool_owned(
     let result = tokio::select! {
         _ = cancellation.cancelled() => None,
         result = tokio::time::timeout(timeout, async {
-        let (o, e, status) = tokio::join!(read_capped(out), read_err, child.wait());
+        let waited = async {
+            let mut tick = tokio::time::interval(Duration::from_millis(250));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    status = child.wait() => break status,
+                    _ = tick.tick() => {
+                        if let Some(meter) = meter.as_mut() {
+                            meter.sample();
+                        }
+                    }
+                }
+            }
+        };
+        let (o, e, status) = tokio::join!(read_capped(out), read_err, waited);
         (o, e, status)
     }) => Some(result),
     };
