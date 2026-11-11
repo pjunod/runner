@@ -2,10 +2,10 @@
 
 ## No wedges: runner side of the pipeline rewrite plan — 2026-11-11 (0.9.0)
 
-**Status:** built (startup items 1–7 plus no-wedge tasks 1–3), awaiting
-adversarial review. Branch `claude/no-wedge` (pushed; no PR yet). Owner:
-Claude (Opus 5.5 session). Next: adversarial review → fold in findings →
-full CI once → PR → merge. Not deployed.
+**Status:** built (startup items 1–7 plus no-wedge tasks 1–3); Fable's
+adversarial review (12 findings) folded in — see *Review fixes* below.
+Branch `claude/no-wedge` (pushed; no PR yet). Owner: Claude (Opus 5.5
+session). Next: full CI once → PR → merge. Not deployed.
 Rebased on main after #305 (0.8.1).
 
 Every stuck state named in the 2026-11-11 brief now has an automatic exit
@@ -41,19 +41,33 @@ through the normal paths; nothing below needs a one-off script on upgrade.
   rows convert at startup). An ambiguous/unprovable transform replay
   (`par_restore`, `extract`, `par_repair`) is cancelled and post-processing
   re-runs it, instead of `review` + Keep on the source; old review rows are
-  abandoned at open. Startup sweeps `.runner-file-*.part` that no writer will
-  resume (a GFID orphan inside a brick is not visible to runner — infra).
-- **W5a latch.** Write-observed ENOSPC clears only after probe writes
-  (8 × 1 MiB, fsynced) succeed in the failing directory, or operator resume;
-  statvfs never clears it.
+  abandoned at open. Startup removes a `.runner-file-N.part` only when its
+  file is finalized and the publication is the same object (a leftover
+  second name of link-then-unlink) — never the only copy (a GFID orphan
+  inside a brick is not visible to runner — infra).
+- **W5a latch.** Each write-observed ENOSPC is recorded by the operation
+  that failed and clears only on evidence from that operation: an
+  allocation on the same partial (fallocate past EOF, fsync, given back) or
+  the writer's next write to it; a finalize by its own job's retry (allowed
+  while latched); the terminal store by its replay; a post write when that
+  job's terminal lands. New-file probes (which Gluster DHT may place on the
+  other brick) remain only for unattributed reports (torrent backend), with
+  their prefix excluded from manifests and swept at startup; a removed
+  directory is probed via its nearest existing ancestor; a failure whose
+  object or job is gone is dropped. Operator resume still clears it;
+  statvfs never does.
 - **W5b no -shm.** Both DBs `locking_mode=EXCLUSIVE` before first access;
   HistoryDb's second (reader) connection removed; `Inventory::close`
   releases its connection for in-process reloads.
 - **W10 restart.** `POST /api/v1/restart` takes `Idempotency-Key` and
   `?not_after=`; the UI sends both. It defers while PAR repair or
   extraction runs (`restart_pending` in status; `?force=true` overrides) and
-  restarts when they finish. *Not built:* checkpoint/resume of a repair
-  across a forced restart.
+  restarts when they finish; meanwhile no new repair or extraction starts
+  (drain). It expires at `not_after` (`restart_expired` in status), each
+  poll follows the backend currently serving (a reload since settles it),
+  a resent key answers pending/executed/expired/cancelled, and
+  `DELETE /api/v1/restart` cancels it. *Not built:* checkpoint/resume of a
+  repair across a forced restart.
 - **Cluster.** The copy ledger no longer exempts curator-admitted failures
   under park-always (same policy as single-node). An engine without a
   supplied history store opens a per-node `engine-history.<node>.sqlite`
@@ -82,10 +96,12 @@ through the normal paths; nothing below needs a one-off script on upgrade.
   conflicting aliases or ranges incoherent with the recorded object no
   longer hold the job: that one file's Done ranges and proof are discarded,
   the next writer removes the file's names in the job's own directory and
-  re-downloads it. After 3 resets of the same file the job ends
-  `failed/identity` (which blames the release under contract §2.2 — Paul to
-  confirm that is wanted for a filesystem that keeps swapping inodes). An
-  existing hold for one of these refusals retries at once on load.
+  re-downloads it. After 3 resets of the same file the job ends `failed/io`
+  (blameless, salvage allowed; the message says identity). Proven ranges
+  are checked against the file's live size (one stat at writer spawn, and
+  one per proven file at post-processing admission, off the owner loop): a
+  truncated or missing file is re-downloaded / verified. An existing hold
+  for one of these refusals retries at once on load.
 - **Every review/retained state has an exit (task 2).** `artifacts::exits`
   registers each state and hold with its exit, and
   `Inventory::exit_wedged_states` carries them out: at open (database-only,
@@ -95,8 +111,15 @@ through the normal paths; nothing below needs a one-off script on upgrade.
   disposed; anything that may hold payload bytes is parked with the failed
   TTL (Keep / keep_on_failure still retain it); locks on healthy rows are
   released; refused disposals re-snapshot the closed scope and retry;
-  relocations in review are abandoned (original verified and kept, target
-  closed without deleting). Unowned/adopted content is never touched.
+  relocations in review are abandoned (original verified and kept; of a
+  target that cannot be put back, Runner-placed duplicates are removed and
+  an only-copy residue is owned and parked with the failed TTL). Lifting a
+  forced Keep (restore quarantine, pinned holds) restores the Keep the row
+  had or an operator gave it. Closed-scope removal walks raw names (never
+  follows symlinks; special files, non-UTF-8, any depth or count). Silent
+  recovery handoffs are cancelled after `failed_retention_days`; a held
+  cluster copy answers `retry`, not `retained`. Unowned/adopted content is
+  never touched.
   Every exit is idempotent.
 - **Registry test (task 3).** `exits::tests` scans every crate's production
   sources for state and hold strings the code writes and fails if one has no
@@ -105,14 +128,29 @@ through the normal paths; nothing below needs a one-off script on upgrade.
   below is printed by `cargo test -p nzbd-state --lib exits::tests::exit_table
   -- --nocapture`.
 - **Decisions made without Paul (review later):** startup orphans park
-  whatever their eligibility flag (closed scope); a restored backup's
-  hold is released but the Keep the restore set stays (a person clears it);
-  an interrupted move whose target cannot be put back leaves the target as
-  discovered (unowned) content in the library, never deleted.
-- **Not done:** the cluster copy ledger records `retained` when a copy's
-  delete op was in review; whether it re-asks once that op takes its exit
-  is not verified. Recovery handoffs waiting on a consumer (`published`,
-  `claimed`) have no TTL. Full suite not run (fast lane on the PR).
+  whatever their eligibility flag (closed scope); an irrecoverable move's
+  residue that is the only copy is parked with the failed TTL rather than
+  deleted at once (review asked to delete Runner-placed files; that would
+  delete the only copy — conflict for Paul); a silent recovery consumer's
+  quiescence is taken as given after the failed TTL.
+- **Not done:** full suite not run (fast lane on the PR).
+
+### Review fixes (Fable, 2026-11-11)
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | failed finalize marked finalized → sweep deletes only copy | never finalized on failure; durable `failed/io`; sweep needs same-object publication |
+| 2 | ENOSPC dirs never pruned | gone object dropped; removed dir probed via existing ancestor |
+| 3 | new-file probe lands on the other brick | per-operation evidence (same file / own retry); dir probe only unattributed |
+| 4 | closed-scope removal refuses manifest-refused names | `fs::remove_tree_contents` (raw names, no-follow, one device, bottom-up) |
+| 5 | replaced inode blamed the release | `failed/io`, message `identity:` |
+| 6 | restart deferral could wait/fire late/go stale | drain, expiry, per-poll backend, key outcomes, cancel |
+| 7 | truncated same inode passed | live size vs highest proven end at spawn and PP admission |
+| 8 | restore Keep never lifted | prior Keep recorded and restored on release (upgrade rule) |
+| 9 | old history index opened with -shm | RW + EXCLUSIVE + no checkpoint |
+| 10 | PARK_PIN dropped operator Keep | only the pin's Keep cleared |
+| 11 | irrecoverable move target unowned forever | duplicates removed, only-copy residue owned + parked |
+| 12 | handoffs no TTL; ledger `retained` for held copy | TTL cancel; held copy answers `retry` |
 
 ### State and hold exits
 
@@ -165,16 +203,16 @@ through the normal paths; nothing below needs a one-off script on upgrade.
 | operation | `transferred` | terminal |
 | recovery | `staging` | event: publication finishes or fails; reconcile_recoveries resumes it |
 | recovery | `publishing` | event: publication finishes or fails; reconcile_recoveries resumes it |
-| recovery | `published` | event: consumer claim/import receipt or cancellation |
-| recovery | `claimed` | event: consumer import receipt or cancellation |
-| recovery | `cancel_pending` | event: worker quiescence acknowledgement; unclaimed ones cancel on reconcile |
+| recovery | `published` | timer: consumer claim/import receipt or cancellation; cancelled after failed_retention_days without a claim |
+| recovery | `claimed` | timer: consumer import receipt or cancellation; cancelled after failed_retention_days without a claim heartbeat |
+| recovery | `cancel_pending` | event: worker quiescence acknowledgement (taken as given after failed_retention_days of silence); unclaimed ones cancel on reconcile |
 | recovery | `imported` | timer: receipt-scoped source prune (automatic after HOLD_EXIT_SECONDS), then the source's TTL |
 | recovery | `partial` | timer: receipt-scoped source prune (automatic after HOLD_EXIT_SECONDS), then the source's TTL |
 | recovery | `review` | timer: restored backup: cancelled by exit_wedged_states; its staged copy is disposed |
 | recovery | `pruned` | terminal |
 | intent | `open` | event: restart reconciliation decides finish or unwind |
 | intent | `finishing` | event: finish completes; a refusal goes to the review-op exit |
-| intent | `unwinding` | event: unwind completes; a refusal goes to the review-op exit (close, never delete) |
+| intent | `unwinding` | event: unwind completes; a refusal goes to the review-op exit (close; never an only copy) |
 | intent | `committed` | terminal |
 | intent | `unwound` | terminal |
 | delivery cleanup | `pending` | event: the delivery's source cleanup runs |
@@ -199,7 +237,7 @@ through the normal paths; nothing below needs a one-off script on upgrade.
 | artifact hold | `review: unselected source files remain after receipt cleanup` | timer: released; the source follows its TTL |
 | artifact hold | `review: relocation staging` | event: its relocate operation ends; left over after that, parked with the failed TTL |
 | artifact hold | `review: abandoned relocation staging` | timer: copy disposed; abandon verified the original source |
-| artifact hold | `review: interrupted move` | timer: move abandoned (unwind, or close without deleting); the job fails io and parks the source |
+| artifact hold | `review: interrupted move` | timer: move abandoned (unwind; else Runner-placed duplicates removed and an only-copy residue parked with the failed TTL); the job fails io and parks the source |
 | artifact hold | `review: workspace cleanup` | timer: scratch re-snapshotted (closed scope) and its retirement retried |
 | artifact hold | `review: subprocess quiescence unconfirmed` | timer: released at the next open (no subprocess outlives the process) or after HOLD_EXIT_SECONDS |
 | artifact hold | `review: interrupted transform` | timer: released; post-processing re-runs the transform (W9) |
@@ -210,7 +248,7 @@ through the normal paths; nothing below needs a one-off script on upgrade.
 | artifact hold | `review: previous external job generation` | timer: owned: parked with the failed TTL; unowned: adoption |
 | artifact hold | `review: managed seed metainfo mismatch` | timer: seed directory (closed scope) parked with the failed TTL |
 | artifact hold | `review retained source` | timer: parked with the failed TTL |
-| artifact hold | `restored backup: review required` | policy: released; the Keep a restore sets stays until a person clears it |
+| artifact hold | `restored backup: review required` | timer: released; the row gets back the Keep it had before the restore |
 
 ## Storage I/O on every filesystem; mobile graphs and versions — 2026-11-11
 

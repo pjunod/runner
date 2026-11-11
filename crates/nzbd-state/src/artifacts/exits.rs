@@ -111,7 +111,7 @@ pub const STATE_EXITS: &[StateExit] = &[
     // relocation_intents.state
     s("intent", "open", Exit::Event("restart reconciliation decides finish or unwind")),
     s("intent", "finishing", Exit::Event("finish completes; a refusal goes to the review-op exit")),
-    s("intent", "unwinding", Exit::Event("unwind completes; a refusal goes to the review-op exit (close, never delete)")),
+    s("intent", "unwinding", Exit::Event("unwind completes; a refusal goes to the review-op exit (close; never an only copy)")),
     s("intent", "committed", Exit::Terminal),
     s("intent", "unwound", Exit::Terminal),
     // deliveries.cleanup_status
