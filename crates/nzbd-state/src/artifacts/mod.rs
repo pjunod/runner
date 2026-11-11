@@ -697,6 +697,12 @@ impl Inventory {
             Connection::open(state_dir.join("artifacts.sqlite"))?
         };
         db.busy_timeout(Duration::from_secs(5))?;
+        // W5b: EXCLUSIVE before the first access, so WAL never creates or
+        // maps `-shm` (unsupported on network filesystems; a truncated one
+        // crash-looped nzbd with SIGBUS). The inventory is one connection
+        // behind `artifacts.lock`; the CLI's backup/restore open it the same
+        // way and refuse while the daemon holds it.
+        db.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
         if let Some(expected) = expected {
             let actual: String = db.query_row(
                 "SELECT value FROM meta WHERE key='installation'",
@@ -949,7 +955,8 @@ impl Inventory {
         })
     }
     /// Called only after the engine's writers and maintenance tasks finish.
-    /// Old API handles retain read access but cannot mutate a restarted daemon.
+    /// Old API handles can no longer read or mutate a restarted daemon's
+    /// store: the connection (and its EXCLUSIVE lock) is released.
     pub fn close(&self) -> Result<()> {
         let first_close = {
             let _guard = self.mutation.lock().unwrap();
@@ -958,6 +965,11 @@ impl Inventory {
         self.invalidate_all_writer_naming();
         self.drain_writer_naming();
         if first_close {
+            // W5b: the store's EXCLUSIVE lock goes with its connection, so a
+            // replacement backend in this process can open it. A stale
+            // handle's reads now fail instead of answering from a store
+            // another owner is writing.
+            *self.db.lock().unwrap() = Connection::open_in_memory()?;
             self._process_lock.unlock()?;
         }
         Ok(())
@@ -3286,6 +3298,38 @@ mod identity_preflight_tests {
                 (entry.file_name(), std::fs::read(entry.path()).unwrap())
             })
             .collect()
+    }
+
+    /// R3 / W5b: neither state database ever has a `-shm`; a truncated one
+    /// left by an older build (the nuc3 SIGBUS) is never mapped.
+    #[test]
+    fn state_databases_run_without_shm_even_over_a_truncated_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inventory = Inventory::open(tmp.path()).unwrap();
+        inventory
+            .configure_scan(serde_json::json!({"roots": []}))
+            .unwrap();
+        assert!(!tmp.path().join("artifacts.sqlite-shm").exists());
+        inventory.close().unwrap();
+        drop(inventory);
+        std::fs::write(tmp.path().join("artifacts.sqlite-shm"), b"abc").unwrap();
+        let history_path = tmp.path().join("history.sqlite");
+        let history = crate::history::HistoryDb::open(&history_path, None).unwrap();
+        drop(history);
+        std::fs::write(tmp.path().join("history.sqlite-shm"), b"abc").unwrap();
+        let inventory = Inventory::open(tmp.path()).unwrap();
+        inventory
+            .configure_scan(serde_json::json!({"roots": []}))
+            .unwrap();
+        let history = crate::history::HistoryDb::open(&history_path, None).unwrap();
+        assert_eq!(history.count_filtered(true).unwrap(), 0);
+        for shm in ["artifacts.sqlite-shm", "history.sqlite-shm"] {
+            assert_eq!(
+                std::fs::read(tmp.path().join(shm)).unwrap(),
+                b"abc",
+                "{shm} untouched"
+            );
+        }
     }
 
     #[test]

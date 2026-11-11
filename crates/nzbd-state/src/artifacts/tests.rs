@@ -2781,7 +2781,7 @@ fn compact_keeps_the_size_of_a_cleared_payload() {
 
 #[test]
 fn a_closed_inventory_leaves_queued_tasks_for_the_next_boot() {
-    let (_tmp, db, root) = fixture();
+    let (tmp, db, root) = fixture();
     let op = db
         .submit_task(
             "scan",
@@ -2792,7 +2792,9 @@ fn a_closed_inventory_leaves_queued_tasks_for_the_next_boot() {
         .unwrap();
     db.close().unwrap();
     db.run_tasks().unwrap();
-    assert_eq!(db.operation(&op.id).unwrap().state, "queued");
+    drop(db);
+    let next = Inventory::open(&tmp.path().join("state")).unwrap();
+    assert_eq!(next.operation(&op.id).unwrap().state, "queued");
 }
 
 #[test]

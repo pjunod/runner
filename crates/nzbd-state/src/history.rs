@@ -99,7 +99,6 @@ fn unix_now() -> i64 {
 
 pub struct HistoryDb {
     conn: Mutex<Connection>,
-    reader: Mutex<Connection>,
     sync: SyncControl,
     _writer_locks: Vec<File>,
     jsonl: Option<PathBuf>,
@@ -160,8 +159,15 @@ impl HistoryDb {
         sync::prepare_index(db_path, jsonl_dir, tag, spool_dir)?;
         let conn = Connection::open(db_path)
             .map_err(|e| StateError::Corrupt(format!("sqlite open {}: {e}", db_path.display())))?;
+        // W5b: one connection, EXCLUSIVE locking set before the first WAL
+        // access, so SQLite keeps the WAL index in heap memory and never
+        // creates or maps `-shm` — which a network filesystem cannot share
+        // and which crash-looped nzbd with SIGBUS once truncated. Every read
+        // goes through this same connection (a second one would be locked
+        // out); offline inspection runs with the daemon stopped.
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
+            "PRAGMA locking_mode=EXCLUSIVE;
+             PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS history (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  job_id INTEGER NOT NULL,
@@ -238,12 +244,6 @@ impl HistoryDb {
                             ON history(completed_at DESC, id DESC);",
         )
         .map_err(|e| StateError::Corrupt(format!("history ordering index: {e}")))?;
-        let reader =
-            Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(|e| StateError::Corrupt(format!("history reader: {e}")))?;
-        reader
-            .busy_timeout(Duration::from_millis(100))
-            .map_err(|e| StateError::Corrupt(format!("history reader timeout: {e}")))?;
         let paused = conn
             .query_row(
                 "SELECT value FROM meta WHERE key = 'history_sync_paused'",
@@ -263,7 +263,6 @@ impl HistoryDb {
         });
         let db = HistoryDb {
             conn: Mutex::new(conn),
-            reader: Mutex::new(reader),
             sync: SyncControl::new(mode, paused, db_path),
             _writer_locks: writer_locks,
             jsonl,
@@ -474,7 +473,7 @@ impl HistoryDb {
 
     /// Visible row count — what the pager divides into pages.
     pub fn count_filtered(&self, include_hidden: bool) -> Result<u64, StateError> {
-        let conn = self.reader.lock().unwrap();
+        let conn = self.conn.lock().unwrap();
         let sql = format!(
             "SELECT COUNT(*) FROM history {}",
             if include_hidden {
@@ -960,7 +959,7 @@ impl HistoryDb {
         offset: usize,
         since: Option<i64>,
     ) -> Result<(Vec<HistoryEntry>, u64), StateError> {
-        let mut conn = self.reader.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| StateError::Corrupt(e.to_string()))?;
@@ -1008,7 +1007,7 @@ impl HistoryDb {
         sql: &str,
         params: &[&dyn rusqlite::ToSql],
     ) -> Result<Vec<HistoryEntry>, StateError> {
-        let conn = self.reader.lock().unwrap();
+        let conn = self.conn.lock().unwrap();
         Self::query_on(&conn, sql, params)
     }
 

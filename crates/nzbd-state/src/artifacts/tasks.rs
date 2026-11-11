@@ -198,6 +198,11 @@ impl Inventory {
     /// task twice. Bounded so a task that re-queues itself cannot spin.
     pub fn run_tasks(&self) -> Result<()> {
         let _runner = self.tasks.lock().unwrap();
+        // A kicked runner can outlive shutdown: a closed inventory has
+        // released its store, so leave everything for the next boot.
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
         self.retry_delivery_cleanup()?;
         for _ in 0..400 {
             // A kicked runner can outlive shutdown; leave the rest queued for
