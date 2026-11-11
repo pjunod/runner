@@ -13,7 +13,9 @@ permission test, which fails identically on main), `writer::tests` 17,
 torrent device mapping; nzbd-post `tools` 16 (including a sub-interval dd
 run charged in full) and `fingerprint` 3; nzbd-api lib 92; engine e2e
 storage inventory; UI harnesses (1,025 DOM assertions, boot); mobile
-typecheck and jest 205.
+typecheck and jest 206. The meter tests also ran on nynuc itself (the CI
+runner, kernel 7.0, uutils coreutils), where two CI attempts had failed on
+the tests' choice of `dd`/`tee`.
 
 **Why:** on nuc3 only the completed row graphed. `/processing` is a
 GlusterFS FUSE mount, which has no kernel I/O counters, so it read "I/O
@@ -22,8 +24,11 @@ were classed as completed.
 
 - **Engine.** `nzbd_state::io_meter` counts Runner's own bytes per
   filesystem at the payload paths: article writer; par2/7z/unrar from
-  `/proc/<pid>/io` (exit observed with `waitid(WNOWAIT)` so the last bytes
-  are read before reaping); the cross-filesystem copy and its readbacks;
+  `/proc/<pid>/io`, sampled every 100 ms while they run (probed on nynuc
+  and nuc3, kernel 7.0: live counters are exact; an exited child's are
+  denied even before reaping, so each run's last interval is lost;
+  splice()-based copies such as uutils `tee`/`dd` are never counted, and
+  par2/7z/unrar don't use them); the cross-filesystem copy and its readbacks;
   hashing/CRC passes, quick checks and writer readbacks through a `Metered`
   file wrapper; torrent transfer (verified bytes written, uploaded bytes
   read). Filesystems without kernel counters now report `source: runner`.
