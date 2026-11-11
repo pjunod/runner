@@ -269,6 +269,10 @@ pub fn copy_publish_checked(
         {
             return Err(Error::Conflict("copy publication identity changed".into()));
         }
+        // Closing private-name handles before unlink prevents deferred NFS
+        // sillyrename cleanup from changing the published inode after readback.
+        drop(temporary);
+        drop(output);
         // The source is retained. Verify the final name after our last
         // namespace mutation so link/unlink ctime changes do not cause scans.
         fs::unlink(&parent, Path::new(&tmp_name), false)?;
@@ -300,6 +304,22 @@ pub fn rename_exclusive(source: &Path, target: &Path) -> Result<()> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
+        fs::rename_exclusive(source, target)
+    }
+}
+
+/// [`rename_exclusive`] for a caller holding the verified source handle. The
+/// caller must close every other handle on `source` first: on NFS an open old
+/// name is silly-renamed and its deferred removal changes the target's ctime
+/// after publication captures its identity.
+pub fn rename_exclusive_from_open(source: &Path, target: &Path, guard: File) -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        fs::rename_exclusive_verified_from_open(source, target, guard)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        drop(guard);
         fs::rename_exclusive(source, target)
     }
 }
@@ -352,6 +372,49 @@ pub fn writer(path: &Path, create: bool) -> Result<File> {
 #[cfg(test)]
 mod copy_budget_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn copy_publication_closes_private_name_before_unlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        std::fs::write(&source, b"source and publication both survive").unwrap();
+        let parent = tmp.path().to_path_buf();
+        fs::BEFORE_UNLINK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_, name| {
+                assert!(name.to_string_lossy().starts_with(".runner-publish-"));
+                fs::assert_name_not_open_for_test(&parent.join(name));
+            }));
+        });
+        copy_publish_checked(&source, &target, &|| Ok(())).unwrap();
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            std::fs::read(&target).unwrap()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rename_from_open_closes_guard_before_unlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("stage");
+        let to = tmp.path().join("published");
+        std::fs::write(&from, b"staged torrent payload").unwrap();
+        let guard = File::open(&from).unwrap();
+        let (old_name, new_name) = (from.clone(), to.clone());
+        fs::BEFORE_UNLINK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_, _| {
+                fs::assert_name_not_open_for_test(&old_name);
+                fs::assert_name_open_for_test(&new_name);
+            }));
+        });
+        fs::RENAME_FAILURE.with(|value| value.set(Some(libc::EOPNOTSUPP)));
+        rename_exclusive_from_open(&from, &to, guard).unwrap();
+        assert!(fs::BEFORE_UNLINK.with(|hook| hook.borrow().is_none()));
+        assert_eq!(std::fs::read(&to).unwrap(), b"staged torrent payload");
+        assert!(!from.exists());
+    }
 
     #[test]
     fn final_readback_rejects_replaced_ancestor_even_when_old_descriptor_is_intact() {
