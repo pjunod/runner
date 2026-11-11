@@ -33,6 +33,15 @@ bump below is dependency-only and ships with the next main build.
   `storage.reserve`, default 1 %, is the guard). nuc3 brick +3 GiB from its
   VG. Eight ctime-only publication intents re-verified by SHA256 and repaired
   offline with receipts under the NAS task root `claude/`.
+- **Adversarial review (Sonnet subagent), folded in.** Found the same
+  old-name-open-at-unlink bug in the torrent staging publish (`staged`,
+  `output`, `copied` open across `rename_exclusive`): now closes the first
+  two and hands `copied` to the new `fileops::rename_exclusive_from_open`.
+  The fallback test now asserts the target inode is pinned at unlink and
+  that the hook ran. Not taken (pre-existing, recorded for later): unlink
+  by name after verify is not pinned against a concurrent name swap; native
+  `renameat2` success does not compare the guard with the renamed inode;
+  `rename_identity_matches` ignores ctime; no real-NFS integration test.
 
 ## Storage I/O in the overview — 2026-11-08
 
