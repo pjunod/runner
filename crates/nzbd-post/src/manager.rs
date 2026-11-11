@@ -1369,10 +1369,13 @@ async fn dispose_failed_source(
         })
     else {
         if observed.out_of_space {
-            engine.report_out_of_space(format!(
-                "failed-file disposition for job {}: {}",
-                job.0, observed.note
-            ));
+            engine.report_out_of_space_at(
+                format!(
+                    "failed-file disposition for job {}: {}",
+                    job.0, observed.note
+                ),
+                &source,
+            );
         }
         tracing::warn!(job = job.0, outcome = %observed.note,
             "failed-source disposition is incomplete; its operation retries on its own ladder");

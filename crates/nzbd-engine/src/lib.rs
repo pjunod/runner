@@ -36,6 +36,7 @@ pub use lifecycle::frozen_lifecycle_timing;
 mod owner;
 mod pool;
 mod recovery;
+mod space_probe;
 mod url_dispatch;
 mod writer;
 
@@ -2998,6 +2999,16 @@ impl EngineHandle {
     pub fn report_out_of_space(&self, whence: impl Into<String>) {
         let _ = self.cmd_tx.try_send(EngineMsg::OutOfSpace {
             whence: whence.into(),
+            dir: None,
+        });
+    }
+
+    /// [`Self::report_out_of_space`] with the path whose write failed: the
+    /// latch clears only after probe writes succeed in that directory (W5a).
+    pub fn report_out_of_space_at(&self, whence: impl Into<String>, path: &std::path::Path) {
+        let _ = self.cmd_tx.try_send(EngineMsg::OutOfSpace {
+            whence: whence.into(),
+            dir: Some(crate::space_probe::dir_of(path)),
         });
     }
 

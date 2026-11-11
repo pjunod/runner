@@ -906,6 +906,14 @@ pub(crate) enum EngineMsg {
     /// latches the disk guard immediately.
     OutOfSpace {
         whence: String,
+        /// The directory whose write failed, when the reporter knows it.
+        dir: Option<PathBuf>,
+    },
+    /// W5a: a probe write+fsync round finished (`observed` is the ENOSPC
+    /// count when it started; a newer failure voids a success).
+    SpaceProbed {
+        observed: u64,
+        result: Result<(), String>,
     },
 }
 
@@ -1147,6 +1155,12 @@ pub(crate) struct Owner {
     enospc_latched: bool,
     enospc_observed: u64,
     enospc_where: Option<String>,
+    /// W5a: directories a write reported ENOSPC in, probed before the latch
+    /// clears; empty means every guarded root.
+    enospc_dirs: std::collections::BTreeSet<PathBuf>,
+    space_probe_inflight: bool,
+    space_probe_after: Instant,
+    space_probe_failures: u32,
     guard_tick: u32,
     /// Round-robin cursor over the active set, advanced per granted
     /// lease. See `SelectionCtx::rotate`.
@@ -1172,21 +1186,16 @@ pub(crate) fn torrent_payload_device(
         .or_else(|| holding("torrent payloads"))
 }
 
+/// statvfs is a forecast that can hold intake; it is never evidence that a
+/// write-observed ENOSPC recovered (W5a: Gluster DHT sums its bricks). The
+/// latch is cleared only by a successful probe write or the operator.
 fn disk_guard_decision(
     was_held: bool,
-    mut write_latched: bool,
+    write_latched: bool,
     reading: &DiskGuardReading,
     floor: u64,
 ) -> (bool, bool) {
     let free = reading.available_bytes;
-    let clear_at = floor.saturating_mul(2);
-    if write_latched
-        && clear_at > 0
-        && reading.all_roots_known
-        && free.is_some_and(|available| available >= clear_at)
-    {
-        write_latched = false;
-    }
     let below_floor = floor > 0 && free.is_some_and(|available| available < floor);
     // Once held, an incomplete cycle is not recovery evidence. Retain the
     // hold until every configured root was measured and the minimum is above
@@ -1611,6 +1620,10 @@ impl Owner {
             enospc_latched: false,
             enospc_observed: 0,
             enospc_where: None,
+            enospc_dirs: std::collections::BTreeSet::new(),
+            space_probe_inflight: false,
+            space_probe_after: Instant::now(),
+            space_probe_failures: 0,
             rotate: 0,
             guard_tick: 0,
         };
@@ -2052,7 +2065,8 @@ impl Owner {
                 final_path,
                 combined_crc,
             } => self.on_writer_finalized(job, file, ok, final_path, combined_crc),
-            EngineMsg::OutOfSpace { whence } => self.observe_out_of_space(&whence),
+            EngineMsg::OutOfSpace { whence, dir } => self.observe_out_of_space_in(&whence, dir),
+            EngineMsg::SpaceProbed { observed, result } => self.on_space_probed(observed, result),
             EngineMsg::WriterError {
                 job,
                 file,
@@ -2065,7 +2079,14 @@ impl Owner {
                 // anything else (a digest or size mismatch) is the job's
                 // terminal failure rather than a re-check forever.
                 if crate::out_of_space(cause.as_ref()) {
-                    self.observe_out_of_space(&error);
+                    // The job's own directory is where the write failed.
+                    let dir = self
+                        .artifacts
+                        .for_job(job.0)
+                        .ok()
+                        .flatten()
+                        .map(|artifact| artifact.path);
+                    self.observe_out_of_space_in(&error, dir);
                 }
                 let stage = if error.starts_with("finalize") {
                     "finalize"
@@ -8570,9 +8591,18 @@ impl Owner {
     /// downloading at wire speed while writers, finalize and PP were all
     /// being told there was no space — 725 GB burned in a day. A failed
     /// write is not a forecast, so it does not go through the threshold:
-    /// it latches the guard directly and only a statvfs reading of twice
-    /// the floor (or an operator resume) clears it.
+    /// it latches the guard directly and only a successful probe
+    /// write+fsync where the write failed (or an operator resume) clears it.
     pub(crate) fn observe_out_of_space(&mut self, whence: &str) {
+        self.observe_out_of_space_in(whence, None);
+    }
+
+    pub(crate) fn observe_out_of_space_in(&mut self, whence: &str, dir: Option<PathBuf>) {
+        if let Some(dir) = dir.filter(|dir| !dir.as_os_str().is_empty()) {
+            self.enospc_dirs.insert(dir);
+        }
+        self.space_probe_failures = 0;
+        self.space_probe_after = Instant::now() + Duration::from_secs(30);
         self.enospc_observed += 1;
         self.enospc_where = Some(whence.to_string());
         if !self.enospc_latched {
@@ -8597,6 +8627,8 @@ impl Owner {
     pub(crate) fn clear_enospc_latch(&mut self) {
         if self.enospc_latched {
             self.enospc_latched = false;
+            self.enospc_dirs.clear();
+            self.space_probe_failures = 0;
             // Drop only the previous latch-derived hold before reevaluating.
             // A current below-floor reading immediately restores disk_low;
             // an unknown reading does not defeat the explicit override.
@@ -8626,14 +8658,11 @@ impl Owner {
             self.tuning.min_free_disk_bytes,
         );
         self.evaluated_disk_guard = reading.clone();
-        if was_latched && !self.enospc_latched {
-            tracing::info!(
-                free = free.unwrap_or_default(),
-                clear_at = self.tuning.min_free_disk_bytes.saturating_mul(2),
-                limiting_path = ?reading.limiting_path,
-                "out-of-space latch cleared — every volume reports twice the floor free"
-            );
-        }
+        debug_assert!(
+            !was_latched || self.enospc_latched,
+            "statvfs never clears the latch"
+        );
+        self.maybe_probe_space();
         if self.disk_low != was {
             if self.disk_low {
                 self.pause_incomplete_torrents_for_storage();
@@ -8654,6 +8683,63 @@ impl Owner {
                 );
             }
             self.publish_guard_change(was, self.disk_low);
+        }
+    }
+
+    /// W5a: while latched, try real writes where the failure happened, on
+    /// a backoff (30 s doubling to 10 min). Off the owner thread.
+    fn maybe_probe_space(&mut self) {
+        if !self.enospc_latched
+            || self.space_probe_inflight
+            || Instant::now() < self.space_probe_after
+        {
+            return;
+        }
+        let mut dirs: Vec<PathBuf> = self.enospc_dirs.iter().cloned().collect();
+        if dirs.is_empty() {
+            dirs = self
+                .evaluated_disk_guard
+                .volumes
+                .iter()
+                .map(|volume| volume.path.clone())
+                .collect();
+            dirs.push(self.dest_dir.clone());
+            dirs.sort();
+            dirs.dedup();
+        }
+        self.space_probe_inflight = true;
+        let observed = self.enospc_observed;
+        let tx = self.engine_tx.clone();
+        self.tracker.spawn_blocking(move || {
+            let result = crate::space_probe::probe(&dirs);
+            let _ = tx.blocking_send(EngineMsg::SpaceProbed { observed, result });
+        });
+    }
+
+    pub(crate) fn on_space_probed(&mut self, observed: u64, result: Result<(), String>) {
+        self.space_probe_inflight = false;
+        match result {
+            Ok(()) if self.enospc_latched && observed == self.enospc_observed => {
+                tracing::info!(
+                    observed = self.enospc_observed,
+                    dirs = ?self.enospc_dirs,
+                    "out-of-space latch cleared — probe writes succeeded where the write failed"
+                );
+                self.enospc_latched = false;
+                self.enospc_dirs.clear();
+                self.space_probe_failures = 0;
+                self.update_disk_guard();
+                self.publish_now();
+            }
+            Ok(()) => {}
+            Err(error) => {
+                self.space_probe_failures = self.space_probe_failures.saturating_add(1);
+                let backoff = 30u64
+                    .saturating_mul(1 << self.space_probe_failures.min(5))
+                    .min(600);
+                self.space_probe_after = Instant::now() + Duration::from_secs(backoff);
+                tracing::debug!(%error, backoff, "out-of-space latch holds; probe write failed");
+            }
         }
     }
 
@@ -9277,7 +9363,8 @@ impl Owner {
                         .first()
                         .map(|root| format!("torrent payload write under {}", root.display()))
                         .unwrap_or_else(|| "torrent payload write".to_owned());
-                    self.observe_out_of_space(&whence);
+                    let dir = self.torrent_payload_roots.first().cloned();
+                    self.observe_out_of_space_in(&whence, dir);
                 }
             }
         }

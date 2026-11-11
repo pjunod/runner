@@ -4605,26 +4605,72 @@ fn complete_high_probe_releases_a_forecast_hold() {
     );
 }
 
+/// W5a: statvfs is a forecast. However much free space a complete probe
+/// reports (Gluster DHT sums its bricks), it never clears a latch that a
+/// real write set.
 #[test]
-fn write_latch_requires_twice_the_floor_from_a_complete_probe() {
-    let below_clear = DiskGuardReading {
-        available_bytes: Some(199),
+fn statvfs_never_clears_an_observed_write_latch() {
+    for free in [199, 200, u64::MAX] {
+        let reading = DiskGuardReading {
+            available_bytes: Some(free),
+            all_roots_known: true,
+            ..Default::default()
+        };
+        assert_eq!(disk_guard_decision(true, true, &reading, 100), (true, true));
+    }
+}
+
+/// R3 / W5a: a fake volume where statvfs says free but writes fail: the
+/// latch holds through high readings and failed probes, ignores a probe that
+/// started before a newer ENOSPC, and clears on the first successful probe
+/// write+fsync in the directory that failed.
+#[tokio::test]
+async fn write_latch_clears_only_on_a_successful_probe_where_the_write_failed() {
+    let tuning = Tuning {
+        min_free_disk_bytes: 100,
+        ..Tuning::default()
+    };
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(tuning);
+    pump(&mut owner, &mut messages).await;
+    let failing = tmp.path().join("dest");
+    owner.observe_out_of_space_in(
+        "write x.part: No space left on device",
+        Some(failing.clone()),
+    );
+    assert!(owner.enospc_dirs.contains(&failing));
+    owner.disk_guard.store(Arc::new(DiskGuardReading {
+        available_bytes: Some(132_000_000_000),
         all_roots_known: true,
         ..Default::default()
-    };
-    let at_clear = DiskGuardReading {
-        available_bytes: Some(200),
-        all_roots_known: true,
-        ..Default::default()
-    };
-    assert_eq!(
-        disk_guard_decision(true, true, &below_clear, 100),
-        (true, true)
+    }));
+    for _ in 0..3 {
+        owner.update_disk_guard();
+        assert!(
+            owner.enospc_latched && owner.disk_low,
+            "statvfs is not evidence"
+        );
+    }
+    let observed = owner.enospc_observed;
+    owner.on_space_probed(
+        observed,
+        Err("No space left on device (os error 28)".into()),
     );
-    assert_eq!(
-        disk_guard_decision(true, true, &at_clear, 100),
-        (false, false)
+    assert!(owner.enospc_latched);
+    assert!(
+        owner.space_probe_after > Instant::now(),
+        "a failed probe backs off"
     );
+    owner.observe_out_of_space("another write failed");
+    owner.on_space_probed(observed, Ok(()));
+    assert!(
+        owner.enospc_latched,
+        "a probe older than the newest ENOSPC proves nothing"
+    );
+    crate::space_probe::probe(&owner.enospc_dirs.iter().cloned().collect::<Vec<_>>()).unwrap();
+    owner.on_space_probed(owner.enospc_observed, Ok(()));
+    assert!(!owner.enospc_latched);
+    assert!(!owner.disk_low, "the forecast is above the floor");
+    assert!(owner.enospc_dirs.is_empty());
 }
 
 #[tokio::test]
