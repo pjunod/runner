@@ -269,6 +269,33 @@ pub struct StorageVolumeReading {
     /// ` · `, which cannot be split back safely: a category name may
     /// contain ` · ` itself).
     pub roles: Vec<String>,
+    /// The configured roots on this filesystem, each as measured. `path`
+    /// is their common path, which for two bind mounts of one filesystem
+    /// (`/downloads`, `/media`) is another filesystem (`/`): anything that
+    /// stats the volume uses a member root instead.
+    pub members: Vec<StorageMemberReading>,
+}
+
+/// One configured root of a [`StorageVolumeReading`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageMemberReading {
+    pub path: PathBuf,
+    /// The device of the filesystem holding the root's parent directory:
+    /// what the root shows when its own volume is not mounted.
+    pub parent_device_id: Option<u64>,
+}
+
+impl StorageMemberReading {
+    fn measure(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            parent_device_id: path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .and_then(nearest_existing_ancestor)
+                .and_then(|parent| filesystem_device_id(&parent)),
+        }
+    }
 }
 
 impl StorageVolumeReading {
@@ -583,11 +610,15 @@ fn unknown_storage_volume(label: String, path: PathBuf) -> StorageVolumeReading 
     StorageVolumeReading {
         roles: vec![label.clone()],
         label,
-        path,
         available_bytes: None,
         total_bytes: None,
         device_id: None,
         current: false,
+        members: vec![StorageMemberReading {
+            path: path.clone(),
+            parent_device_id: None,
+        }],
+        path,
     }
 }
 
@@ -785,6 +816,11 @@ pub fn storage_volume_readings(roots: &[DiskGuardRoot]) -> Vec<StorageVolumeRead
                     .flat_map(|member| member.root.label.split(ROLE_JOIN))
                     .map(str::to_owned)
                     .collect(),
+                members: group
+                    .members
+                    .iter()
+                    .map(|member| StorageMemberReading::measure(&member.root.path))
+                    .collect(),
             }
         })
         .collect()
@@ -886,6 +922,7 @@ fn coalesce_storage_volumes(
             group.path = common_path_pair(&group.path, &reading.path);
             group.current &= reading.current;
             group.roles.extend(reading.roles);
+            group.members.extend(reading.members);
             if let Some(available) = reading.available_bytes {
                 let should_replace = group
                     .available_bytes
@@ -1014,6 +1051,7 @@ mod tests {
     fn disk_guard_selects_the_lowest_volume_and_keeps_its_identity() {
         let reading = select_limiting_volume([
             StorageVolumeReading {
+                members: Vec::new(),
                 label: "state".into(),
                 path: PathBuf::from("/state"),
                 available_bytes: Some(900),
@@ -1023,6 +1061,7 @@ mod tests {
                 current: true,
             },
             StorageVolumeReading {
+                members: Vec::new(),
                 label: "category: tv".into(),
                 path: PathBuf::from("/library/tv"),
                 available_bytes: Some(100),
@@ -1032,6 +1071,7 @@ mod tests {
                 current: true,
             },
             StorageVolumeReading {
+                members: Vec::new(),
                 label: "temporary".into(),
                 path: PathBuf::from("/scratch"),
                 available_bytes: Some(500),
@@ -1052,6 +1092,7 @@ mod tests {
     #[test]
     fn disk_guard_without_a_measurement_is_explicitly_unknown() {
         let reading = select_limiting_volume([StorageVolumeReading {
+            members: Vec::new(),
             label: "unavailable".into(),
             path: PathBuf::from("/missing"),
             available_bytes: None,
@@ -1083,6 +1124,7 @@ mod tests {
     fn stale_low_reading_is_retained_but_never_counts_as_recovery_proof() {
         let reading = select_limiting_volume([
             StorageVolumeReading {
+                members: Vec::new(),
                 label: "stale".into(),
                 path: PathBuf::from("/stale"),
                 available_bytes: Some(10),
@@ -1092,6 +1134,7 @@ mod tests {
                 current: false,
             },
             StorageVolumeReading {
+                members: Vec::new(),
                 label: "healthy".into(),
                 path: PathBuf::from("/healthy"),
                 available_bytes: Some(900),
@@ -1110,6 +1153,7 @@ mod tests {
     fn fresh_low_root_on_a_shared_filesystem_beats_stale_high_evidence() {
         let reading = select_limiting_volume(coalesce_storage_volumes([
             StorageVolumeReading {
+                members: Vec::new(),
                 label: "stale role".into(),
                 path: PathBuf::from("/shared/stale"),
                 available_bytes: Some(900),
@@ -1119,6 +1163,7 @@ mod tests {
                 current: false,
             },
             StorageVolumeReading {
+                members: Vec::new(),
                 label: "fresh role".into(),
                 path: PathBuf::from("/shared/fresh"),
                 available_bytes: Some(10),
@@ -1137,6 +1182,7 @@ mod tests {
     #[test]
     fn unknown_shared_filesystem_member_never_erases_a_known_capacity() {
         let known = StorageVolumeReading {
+            members: Vec::new(),
             label: "known".into(),
             path: PathBuf::from("/shared/known"),
             available_bytes: Some(10),
@@ -1146,6 +1192,7 @@ mod tests {
             current: true,
         };
         let unknown = StorageVolumeReading {
+            members: Vec::new(),
             label: "unknown".into(),
             path: PathBuf::from("/shared/unknown"),
             available_bytes: None,
@@ -1183,6 +1230,7 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
                 Some(StorageVolumeReading {
+                    members: Vec::new(),
                     label: root.label,
                     path: root.path,
                     available_bytes: Some(500),
@@ -1319,6 +1367,7 @@ mod tests {
             default_probe_spawner(),
             |root| {
                 Some(StorageVolumeReading {
+                    members: Vec::new(),
                     label: root.label,
                     path: root.path,
                     available_bytes: Some(1),
@@ -1368,6 +1417,7 @@ mod tests {
                 // individual call remains inside its own response window.
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 Some(StorageVolumeReading {
+                    members: Vec::new(),
                     label: root.label,
                     path: root.path,
                     available_bytes: Some(100),
@@ -1489,6 +1539,7 @@ mod tests {
             calls_for_probe.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(120));
             Some(StorageVolumeReading {
+                members: Vec::new(),
                 label: root.label,
                 path: root.path,
                 available_bytes: Some(500),
@@ -1517,6 +1568,7 @@ mod tests {
         let third = probe
             .probe_with(&roots, std::time::Duration::from_millis(20), |root| {
                 Some(StorageVolumeReading {
+                    members: Vec::new(),
                     label: root.label,
                     path: root.path,
                     available_bytes: Some(600),

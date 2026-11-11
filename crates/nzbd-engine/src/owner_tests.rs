@@ -4736,6 +4736,62 @@ async fn write_latch_clears_only_on_evidence_from_the_failed_file() {
     assert!(!owner.enospc_latched, "nothing is left to retry");
 }
 
+/// Review finding 2: a grouped filesystem (two bind mounts of one volume,
+/// common path `/`) is recorded per member root with the group's device and
+/// its parent's — never as `/` — and an every-root failure probes a member.
+#[tokio::test]
+async fn grouped_roots_are_recorded_per_member() {
+    use crate::space_probe::{GuardedVolume, SpaceOp, Target};
+    use crate::volumes::{StorageMemberReading, StorageVolumeReading};
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    let downloads = tmp.path().join("downloads");
+    let media = tmp.path().join("media");
+    let member = |path: &PathBuf| StorageMemberReading {
+        path: path.clone(),
+        parent_device_id: Some(1),
+    };
+    owner.evaluated_disk_guard = Arc::new(DiskGuardReading {
+        volumes: vec![StorageVolumeReading {
+            label: "processing · completed".into(),
+            path: PathBuf::from("/"),
+            available_bytes: Some(0),
+            total_bytes: Some(1),
+            device_id: Some(7),
+            current: true,
+            roles: vec!["processing".into(), "completed".into()],
+            members: vec![member(&downloads), member(&media)],
+        }],
+        ..Default::default()
+    });
+    owner.observe_out_of_space_in("torrent", None);
+    let failure = &owner.enospc_failures[&SpaceOp::Directory(PathBuf::new())];
+    for root in [&downloads, &media] {
+        assert!(failure.volumes.contains(&GuardedVolume {
+            root: root.clone(),
+            device: Some(7),
+            parent_device: Some(1),
+        }));
+    }
+    assert!(
+        !failure
+            .volumes
+            .iter()
+            .any(|volume| volume.root == Path::new("/")),
+        "the group's common path is another filesystem"
+    );
+    let plan = owner.space_probe_plan();
+    let Target::Dirs(dirs) = &plan[0].target else {
+        panic!("a directory probe");
+    };
+    let probed: Vec<_> = dirs
+        .iter()
+        .filter(|(_, bound)| bound.device == Some(7))
+        .collect();
+    assert_eq!(probed.len(), 1, "one member per device");
+    assert_eq!(probed[0].0, downloads);
+}
+
 /// Finding 4: a finalize or post-processing failure whose job cannot run its
 /// own retry (paused by a person, operator-held, post-processing paused) is
 /// probed instead of waiting on a manual resume, and a write failure with no
@@ -4757,8 +4813,8 @@ async fn a_failure_whose_job_cannot_retry_is_probed() {
     owner.observe_space_failure("finalize", finalize.clone(), Some(part.clone()));
     owner.observe_space_failure("post", post.clone(), None);
     assert!(
-        owner.space_retry_jobs().contains(&JobId(3)),
-        "post retries under the latch"
+        !owner.space_retry_jobs().contains(&JobId(3)),
+        "a post-side hold is never gated by the latch; only finalize is listed"
     );
     assert!(
         owner.space_probe_plan().is_empty(),
@@ -8947,6 +9003,7 @@ async fn pending_next_writer_returns_already_granted_leases() {
 fn torrent_transfer_is_charged_to_its_payload_filesystem() {
     use crate::volumes::StorageVolumeReading;
     let volume = |device: u64, roles: &[&str]| StorageVolumeReading {
+        members: Vec::new(),
         label: roles.join(" · "),
         path: std::path::PathBuf::from("/x"),
         available_bytes: Some(1),

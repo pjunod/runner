@@ -302,7 +302,8 @@ pub struct QueueSnapshot {
     /// hold.
     pub disk_low: bool,
     /// W5a: jobs whose own finalize retry is the evidence an out-of-space
-    /// failure needs; hold recovery may release them while `disk_low`.
+    /// failure needs; hold recovery may release their (download-side)
+    /// storage hold while `disk_low`. Post-side holds are never gated.
     #[serde(skip)]
     pub space_retry_jobs: std::collections::HashSet<JobId>,
     /// Lowest measured free space across every configured write root. None

@@ -933,14 +933,10 @@ pub(crate) enum EngineMsg {
         job: Option<JobId>,
     },
     /// W5a: a probe round finished: per failure, the ENOSPC count it was
-    /// planned under (a newer report of the same failure voids a success)
-    /// and what it found.
+    /// planned under (a newer report of the same failure voids a success),
+    /// what it found, and the guarded roots it found remounted.
     SpaceProbed {
-        results: Vec<(
-            crate::space_probe::SpaceOp,
-            u64,
-            crate::space_probe::ProbeResult,
-        )>,
+        results: Vec<crate::space_probe::Probed>,
     },
 }
 
@@ -9060,20 +9056,47 @@ impl Owner {
         });
     }
 
-    /// The guarded volumes (root, device) as the disk guard last measured
-    /// them, plus the completed directory; recorded with each failure.
-    fn guarded_volumes(&self) -> Vec<(PathBuf, Option<u64>)> {
-        let mut volumes: Vec<(PathBuf, Option<u64>)> = self
+    /// The guarded volumes as the disk guard last measured them — each
+    /// configured member root with its filesystem's device and its parent's
+    /// (never a group's common path, which for two bind mounts of one
+    /// filesystem is another filesystem) — plus the completed directory;
+    /// recorded with each failure.
+    fn guarded_volumes(&self) -> Vec<crate::space_probe::GuardedVolume> {
+        use crate::space_probe::GuardedVolume;
+        let mut volumes: Vec<GuardedVolume> = self
             .evaluated_disk_guard
             .volumes
             .iter()
-            .map(|volume| (volume.path.clone(), volume.device_id))
+            .flat_map(|volume| {
+                let members: Vec<GuardedVolume> = if volume.members.is_empty() {
+                    vec![GuardedVolume {
+                        root: volume.path.clone(),
+                        device: volume.device_id,
+                        parent_device: None,
+                    }]
+                } else {
+                    volume
+                        .members
+                        .iter()
+                        .map(|member| GuardedVolume {
+                            root: member.path.clone(),
+                            device: volume.device_id,
+                            parent_device: member.parent_device_id,
+                        })
+                        .collect()
+                };
+                members
+            })
             .collect();
         if !volumes
             .iter()
-            .any(|(root, _)| self.dest_dir.starts_with(root))
+            .any(|volume| self.dest_dir.starts_with(&volume.root))
         {
-            volumes.push((self.dest_dir.clone(), None));
+            volumes.push(GuardedVolume {
+                root: self.dest_dir.clone(),
+                device: None,
+                parent_device: None,
+            });
         }
         volumes.sort();
         volumes.dedup();
@@ -9144,13 +9167,7 @@ impl Owner {
                 .or_else(|| self.allocation_cache.get(&job).map(|a| a.path.clone()));
             match dir {
                 Some(dir) => Target::Dirs(vec![(dir.clone(), failure.bound(&dir))]),
-                None => Target::Dirs(
-                    failure
-                        .volumes
-                        .iter()
-                        .map(|(root, _)| (root.clone(), failure.bound(root)))
-                        .collect(),
-                ),
+                None => Target::Dirs(failure.probe_roots()),
             }
         };
         self.enospc_failures
@@ -9181,13 +9198,9 @@ impl Owner {
                         }
                         job_dir(*job, failure)
                     }
-                    SpaceOp::Directory(dir) if dir.as_os_str().is_empty() => Target::Dirs(
-                        failure
-                            .volumes
-                            .iter()
-                            .map(|(root, _)| (root.clone(), failure.bound(root)))
-                            .collect(),
-                    ),
+                    SpaceOp::Directory(dir) if dir.as_os_str().is_empty() => {
+                        Target::Dirs(failure.probe_roots())
+                    }
                     SpaceOp::Directory(dir) => {
                         Target::Dirs(vec![(dir.clone(), failure.bound(dir))])
                     }
@@ -9202,18 +9215,21 @@ impl Owner {
             .collect()
     }
 
-    pub(crate) fn on_space_probed(
-        &mut self,
-        results: Vec<(
-            crate::space_probe::SpaceOp,
-            u64,
-            crate::space_probe::ProbeResult,
-        )>,
-    ) {
+    pub(crate) fn on_space_probed(&mut self, results: Vec<crate::space_probe::Probed>) {
         use crate::space_probe::ProbeResult;
         self.space_probe_inflight = false;
         let mut held = false;
-        for (op, observed, result) in results {
+        for (op, observed, result, rebound) in results {
+            if let Some(failure) = self.enospc_failures.get_mut(&op) {
+                if !rebound.is_empty() {
+                    tracing::info!(
+                        ?op,
+                        ?rebound,
+                        "guarded volume mounted again on a new device; rebound"
+                    );
+                    failure.rebind(&rebound);
+                }
+            }
             let current = self
                 .enospc_failures
                 .get(&op)
@@ -9311,16 +9327,16 @@ impl Owner {
         (self.pp_stat_passed.get(&job) != Some(&epoch)).then_some((epoch, dir, files))
     }
 
-    /// Jobs whose own retry is the evidence a finalize or post-processing
-    /// failure needs: hold recovery may release them while the latch holds
-    /// (they fetch nothing). Without that a post-processing job held on
-    /// ENOSPC waited on the latch, and the latch on it.
+    /// Jobs whose own retry is the evidence a finalize failure needs: hold
+    /// recovery may release their download-side storage hold while the
+    /// latch holds (a finalize fetches nothing). Post-processing failures
+    /// are not listed: a post-side hold is released through the custody
+    /// check, which `disk_low` never gates, so its retry already runs.
     pub(crate) fn space_retry_jobs(&self) -> HashSet<JobId> {
         self.enospc_failures
             .keys()
             .filter_map(|op| match op {
-                crate::space_probe::SpaceOp::Finalize { job, .. }
-                | crate::space_probe::SpaceOp::Post { job } => Some(*job),
+                crate::space_probe::SpaceOp::Finalize { job, .. } => Some(*job),
                 _ => None,
             })
             .collect()

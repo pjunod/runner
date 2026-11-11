@@ -52,6 +52,20 @@ pub(crate) enum SpaceOp {
     Directory(PathBuf),
 }
 
+/// One guarded root as it was when a failure was reported.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct GuardedVolume {
+    /// A configured write root (one member of a grouped filesystem, never
+    /// the group's common path: two bind mounts of one filesystem share a
+    /// device but their common path is another filesystem).
+    pub root: PathBuf,
+    /// The device the root was on — the volume a write had just reached.
+    pub device: Option<u64>,
+    /// The device of the filesystem holding the root's parent: what the
+    /// root shows when its volume is not mounted.
+    pub parent_device: Option<u64>,
+}
+
 /// One recorded failure.
 #[derive(Debug, Clone)]
 pub(crate) struct SpaceFailure {
@@ -60,27 +74,54 @@ pub(crate) struct SpaceFailure {
     /// The engine's ENOSPC count when this failure was last reported: a
     /// probe started before a newer report of the same failure proves nothing.
     pub observed: u64,
-    /// The guarded volumes (root, device) as they were when the failure was
-    /// reported — the mount was there, a write had just reached it. A probe
-    /// never walks above the root containing its target and requires the
-    /// device recorded here, so an unmounted volume (its mount point now on
-    /// the parent filesystem) is never mistaken for one with room.
-    pub volumes: Vec<(PathBuf, Option<u64>)>,
+    /// The guarded volumes as they were when the failure was reported — the
+    /// mount was there, a write had just reached it. A probe never walks
+    /// above the root containing its target, and an unmounted volume (its
+    /// root now on the parent filesystem, or missing) is never mistaken for
+    /// one with room. A remount (a new device that is not the parent's)
+    /// rebinds the recorded device.
+    pub volumes: Vec<GuardedVolume>,
 }
 
 impl SpaceFailure {
     /// The bound for a probe of `path`: the deepest recorded volume root
-    /// containing it, with its recorded device.
+    /// containing it, with its recorded devices.
     pub fn bound(&self, path: &Path) -> Bound {
         self.volumes
             .iter()
-            .filter(|(root, _)| !root.as_os_str().is_empty() && path.starts_with(root))
-            .max_by_key(|(root, _)| root.components().count())
-            .map(|(root, device)| Bound {
-                root: Some(root.clone()),
-                device: *device,
+            .filter(|volume| !volume.root.as_os_str().is_empty() && path.starts_with(&volume.root))
+            .max_by_key(|volume| volume.root.components().count())
+            .map(|volume| Bound {
+                root: Some(volume.root.clone()),
+                device: volume.device,
+                parent_device: volume.parent_device,
             })
             .unwrap_or_default()
+    }
+
+    /// Every guarded volume, once: one member root per known device (they
+    /// are one filesystem), every root whose device is unknown.
+    pub fn probe_roots(&self) -> Vec<(PathBuf, Bound)> {
+        let mut seen = std::collections::HashSet::new();
+        self.volumes
+            .iter()
+            .filter(|volume| volume.device.is_none_or(|device| seen.insert(device)))
+            .map(|volume| (volume.root.clone(), self.bound(&volume.root)))
+            .collect()
+    }
+
+    /// Apply a probe's rebinds: the volume at `root` is mounted again on
+    /// `device`.
+    pub fn rebind(&mut self, rebound: &[(PathBuf, u64)]) {
+        for (root, device) in rebound {
+            for volume in self
+                .volumes
+                .iter_mut()
+                .filter(|volume| &volume.root == root)
+            {
+                volume.device = Some(*device);
+            }
+        }
     }
 }
 
@@ -92,6 +133,8 @@ pub(crate) struct Bound {
     pub root: Option<PathBuf>,
     /// The device the failing write reached, when known.
     pub device: Option<u64>,
+    /// The device under the root's mount point, when known.
+    pub parent_device: Option<u64>,
 }
 
 /// What one probe found.
@@ -135,45 +178,88 @@ pub(crate) enum Target {
     Dirs(Vec<(PathBuf, Bound)>),
 }
 
+/// One probe's answer: the failure, the count it was planned under, what
+/// it found, and the roots found mounted again on a new device.
+pub(crate) type Probed = (SpaceOp, u64, ProbeResult, Vec<(PathBuf, u64)>);
+
 /// Run the planned probes; each answers for its own failure only.
-pub(crate) fn run(plan: &[Planned], fs: &dyn ProbeFs) -> Vec<(SpaceOp, u64, ProbeResult)> {
+pub(crate) fn run(plan: &[Planned], fs: &dyn ProbeFs) -> Vec<Probed> {
     plan.iter()
         .map(|planned| {
+            let mut rebound = Vec::new();
+            let mut mounted = |bound: &Bound| -> Result<Bound, String> {
+                let current = mounted_bound(bound, fs)?;
+                if let (Some(root), Some(device)) = (&current.root, current.device) {
+                    if current.device != bound.device {
+                        rebound.push((root.clone(), device));
+                    }
+                }
+                Ok(current)
+            };
             let result = match &planned.target {
                 Target::File(path, bound) => {
                     let parent = path.parent().unwrap_or(path);
-                    match locate(parent, bound, fs) {
-                        Located::Unavailable(reason) => ProbeResult::Holds(reason),
+                    match mounted(bound).map(|bound| locate(parent, &bound, fs)) {
+                        Err(reason) | Ok(Located::Unavailable(reason)) => {
+                            ProbeResult::Holds(reason)
+                        }
                         // The volume is there and the file's directory is
                         // gone: so is the file.
-                        Located::Gone => ProbeResult::Gone,
-                        Located::Dir(_) => fs.probe_file(path),
+                        Ok(Located::Gone) => ProbeResult::Gone,
+                        Ok(Located::Dir(_)) => fs.probe_file(path),
                     }
                 }
                 Target::Dirs(dirs) => {
                     let mut result = ProbeResult::Gone;
                     for (dir, bound) in dirs {
-                        match locate(dir, bound, fs) {
-                            Located::Dir(dir) => match fs.probe_dir(&dir) {
+                        match mounted(bound).map(|bound| locate(dir, &bound, fs)) {
+                            Ok(Located::Dir(dir)) => match fs.probe_dir(&dir) {
                                 ProbeResult::Cleared => result = ProbeResult::Cleared,
                                 other => {
                                     result = other;
                                     break;
                                 }
                             },
-                            Located::Unavailable(reason) => {
+                            Err(reason) | Ok(Located::Unavailable(reason)) => {
                                 result = ProbeResult::Holds(reason);
                                 break;
                             }
-                            Located::Gone => continue,
+                            Ok(Located::Gone) => continue,
                         }
                     }
                     result
                 }
             };
-            (planned.op.clone(), planned.observed, result)
+            rebound.sort();
+            rebound.dedup();
+            (planned.op.clone(), planned.observed, result, rebound)
         })
         .collect()
+}
+
+/// Is the guarded root's volume mounted now, and on which device? The root
+/// missing, or on its parent's device, is an unmounted volume: not evidence.
+/// Any other device than the recorded one is the volume mounted again (an
+/// NFS/autofs remount gets a new device): the bound is rebound to it.
+pub(crate) fn mounted_bound(bound: &Bound, fs: &dyn ProbeFs) -> Result<Bound, String> {
+    let (Some(root), Some(recorded)) = (&bound.root, bound.device) else {
+        return Ok(bound.clone());
+    };
+    match fs.dir_device(root) {
+        None => Err(format!(
+            "guarded root {} is missing (not mounted?)",
+            root.display()
+        )),
+        Some(now) if now == recorded => Ok(bound.clone()),
+        Some(now) if bound.parent_device == Some(now) => Err(format!(
+            "guarded root {} is on its parent filesystem (not mounted?)",
+            root.display()
+        )),
+        Some(now) => Ok(Bound {
+            device: Some(now),
+            ..bound.clone()
+        }),
+    }
 }
 
 /// Where [`locate`] found the place to probe.
@@ -279,10 +365,11 @@ fn allocate_on(path: &Path) -> std::io::Result<()> {
         if rc == 0 {
             let synced = file.sync_data();
             // Truncating to the current size frees the post-EOF blocks. Read
-            // it again: never cut bytes a writer appended meanwhile (the
-            // owner skips files with a live writer; this closes the rest).
+            // it again: never cut bytes a writer appended meanwhile, nor
+            // re-extend a file truncated meanwhile (the owner skips files
+            // with a live writer; this closes the rest).
             let current = file.metadata().map_or(len, |metadata| metadata.len());
-            let released = file.set_len(current.max(len));
+            let released = file.set_len(current);
             synced?;
             if let Err(error) = released {
                 tracing::warn!(path = %path.display(), %error, "space probe could not release its preallocation");
@@ -385,6 +472,7 @@ mod tests {
         Bound {
             root: Some(root.to_path_buf()),
             device,
+            parent_device: None,
         }
     }
 
@@ -422,12 +510,21 @@ mod tests {
         assert_eq!(results[0].2, ProbeResult::Gone);
     }
 
-    /// The filesystem as an unmounted volume leaves it: the mount point is
-    /// still a directory, now on the parent filesystem's device.
-    struct Unmounted {
+    /// Injected device identities: paths under `mount` report `volume`,
+    /// everything else `parent`; existence is the real filesystem's.
+    struct Devices {
         mount: PathBuf,
+        volume: std::sync::atomic::AtomicU64,
     }
-    impl ProbeFs for Unmounted {
+    const PARENT: u64 = 1;
+    const VOLUME: u64 = 10;
+    impl Devices {
+        fn set(&self, device: u64) {
+            self.volume
+                .store(device, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl ProbeFs for Devices {
         fn probe_file(&self, path: &Path) -> ProbeResult {
             RealFs.probe_file(path)
         }
@@ -435,29 +532,35 @@ mod tests {
             RealFs.probe_dir(dir)
         }
         fn dir_device(&self, path: &Path) -> Option<u64> {
-            let device = RealFs.dir_device(path)?;
+            RealFs.dir_device(path)?;
             Some(if path.starts_with(&self.mount) {
-                device + 1
+                self.volume.load(std::sync::atomic::Ordering::SeqCst)
             } else {
-                device
+                PARENT
             })
         }
     }
 
-    /// Finding 5: a probe never walks above the guarded root and requires
-    /// the recorded device. An unmounted volume (mount point on the parent
-    /// fs), a missing root, and a missing .part on a dropped mount all hold
-    /// — none reports Cleared or Gone.
+    /// Finding 5: a probe never walks above the guarded root. An unmounted
+    /// volume (the root on its parent's device), a missing root, and a
+    /// missing .part on a dropped mount all hold — none reports Cleared or
+    /// Gone. A remount (any other new device) is the volume again: it is
+    /// probed normally and the recorded device is rebound.
     #[test]
-    fn an_unmounted_or_missing_root_is_not_evidence() {
+    fn an_unmounted_or_missing_root_is_not_evidence_and_a_remount_rebinds() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("mnt");
         std::fs::create_dir_all(root.join("job")).unwrap();
         let part = root.join("job/.runner-file-1.part");
         std::fs::write(&part, b"abc").unwrap();
-        let recorded = bound(&root, Some(device_of(&root)));
-        let fs = Unmounted {
+        let recorded = Bound {
+            root: Some(root.clone()),
+            device: Some(VOLUME),
+            parent_device: Some(PARENT),
+        };
+        let fs = Devices {
             mount: root.clone(),
+            volume: VOLUME.into(),
         };
         let probe = |target: Target, fs: &dyn ProbeFs| {
             run(
@@ -469,38 +572,55 @@ mod tests {
                 fs,
             )
             .remove(0)
-            .2
         };
-        // Mounted: the same targets answer.
-        assert_eq!(
-            probe(
+        let targets = || {
+            [
                 Target::Dirs(vec![(root.join("job/gone"), recorded.clone())]),
-                &RealFs
-            ),
-            ProbeResult::Cleared
-        );
-        assert_eq!(
-            probe(Target::File(part.clone(), recorded.clone()), &RealFs),
-            ProbeResult::Cleared
-        );
-        // Unmounted: the mount point is another device.
-        for target in [
-            Target::Dirs(vec![(root.join("job/gone"), recorded.clone())]),
-            Target::File(part.clone(), recorded.clone()),
-            Target::File(root.join("job/.runner-file-2.part"), recorded.clone()),
-        ] {
+                Target::File(part.clone(), recorded.clone()),
+            ]
+        };
+        // Mounted: the targets answer, nothing rebinds.
+        for target in targets() {
+            let (_, _, result, rebound) = probe(target, &fs);
+            assert_eq!(result, ProbeResult::Cleared);
+            assert!(rebound.is_empty());
+        }
+        // Unmounted: the root is on its parent's device.
+        fs.set(PARENT);
+        for target in targets().into_iter().chain([Target::File(
+            root.join("job/.runner-file-2.part"),
+            recorded.clone(),
+        )]) {
             assert!(
-                matches!(probe(target, &fs), ProbeResult::Holds(_)),
+                matches!(probe(target, &fs).2, ProbeResult::Holds(_)),
                 "unmounted is neither cleared nor gone"
             );
         }
+        // Remounted (NFS/autofs: a new device): probed, and rebound.
+        fs.set(VOLUME + 1);
+        for target in targets() {
+            let (_, _, result, rebound) = probe(target, &fs);
+            assert_eq!(result, ProbeResult::Cleared, "a remount is not a wedge");
+            assert_eq!(rebound, vec![(root.clone(), VOLUME + 1)]);
+        }
+        let mut failure = SpaceFailure {
+            path: None,
+            observed: 1,
+            volumes: vec![GuardedVolume {
+                root: root.clone(),
+                device: Some(VOLUME),
+                parent_device: Some(PARENT),
+            }],
+        };
+        failure.rebind(&[(root.clone(), VOLUME + 1)]);
+        assert_eq!(failure.bound(&part).device, Some(VOLUME + 1));
         // The root itself missing: never probes its parent.
         std::fs::remove_dir_all(&root).unwrap();
         for target in [
             Target::Dirs(vec![(root.join("job"), recorded.clone())]),
             Target::File(part.clone(), recorded.clone()),
         ] {
-            assert!(matches!(probe(target, &RealFs), ProbeResult::Holds(_)));
+            assert!(matches!(probe(target, &fs).2, ProbeResult::Holds(_)));
         }
     }
 
@@ -519,9 +639,9 @@ mod tests {
             path: None,
             observed: 1,
             volumes: vec![
-                (PathBuf::from("/mnt"), Some(1)),
-                (PathBuf::from("/mnt/proc"), Some(2)),
-                (PathBuf::new(), None),
+                volume("/mnt", Some(1)),
+                volume("/mnt/proc", Some(2)),
+                volume("", None),
             ],
         };
         assert_eq!(
@@ -529,6 +649,80 @@ mod tests {
             bound(Path::new("/mnt/proc"), Some(2))
         );
         assert_eq!(failure.bound(Path::new("/srv/x")), Bound::default());
+    }
+
+    fn volume(root: &str, device: Option<u64>) -> GuardedVolume {
+        GuardedVolume {
+            root: PathBuf::from(root),
+            device,
+            parent_device: None,
+        }
+    }
+
+    /// Review finding 2: two bind mounts of one filesystem (/downloads,
+    /// /media) are recorded as their own member roots with the group's
+    /// device — never the group's common path (`/`, another filesystem) —
+    /// and an every-root probe probes one member per device.
+    #[test]
+    fn grouped_member_roots_are_bounded_and_probed_once() {
+        let failure = SpaceFailure {
+            path: None,
+            observed: 1,
+            volumes: vec![
+                volume("/downloads", Some(7)),
+                volume("/media", Some(7)),
+                volume("/srv/done", None),
+            ],
+        };
+        assert_eq!(
+            failure.bound(Path::new("/media/tv/x.mkv")),
+            bound(Path::new("/media"), Some(7))
+        );
+        assert_eq!(failure.bound(Path::new("/etc")), Bound::default());
+        let roots: Vec<PathBuf> = failure
+            .probe_roots()
+            .into_iter()
+            .map(|(root, bound)| {
+                assert_eq!(bound.root.as_ref(), Some(&root));
+                root
+            })
+            .collect();
+        assert_eq!(
+            roots,
+            vec![PathBuf::from("/downloads"), PathBuf::from("/srv/done")]
+        );
+        // A bind mount: the probe of a member root on the group's device.
+        let dir = tempfile::tempdir().unwrap();
+        let downloads = dir.path().join("downloads");
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&downloads).unwrap();
+        std::fs::create_dir_all(&media).unwrap();
+        let device = device_of(&downloads);
+        let failure = SpaceFailure {
+            path: None,
+            observed: 1,
+            volumes: vec![
+                GuardedVolume {
+                    root: downloads,
+                    device: Some(device),
+                    parent_device: None,
+                },
+                GuardedVolume {
+                    root: media,
+                    device: Some(device),
+                    parent_device: None,
+                },
+            ],
+        };
+        let results = run(
+            &[Planned {
+                op: SpaceOp::Directory(PathBuf::new()),
+                observed: 1,
+                target: Target::Dirs(failure.probe_roots()),
+            }],
+            &RealFs,
+        );
+        assert_eq!(results[0].2, ProbeResult::Cleared);
     }
 
     #[test]
