@@ -500,7 +500,20 @@ impl Inventory {
     /// unowned content).
     fn resnapshot_closed_scope(&self, a: Artifact, report: &mut ExitReport) -> Result<()> {
         let observed = match self.verify(&a) {
-            Ok(dir) => Some(fs::manifest(&dir, 100_000)?),
+            Ok(dir) => match fs::manifest(&dir, 100_000) {
+                Ok(files) => Some(files),
+                // Names a manifest refuses (symlink, special file, non-UTF-8,
+                // depth > 64, > 100k entries): closed scope, so the tree is
+                // removed by raw name and the disposal retries on the empty
+                // directory instead of failing on the same names forever.
+                Err(Error::Conflict(reason)) => {
+                    let removal = fs::remove_tree_contents(&dir)?;
+                    tracing::info!(artifact = %a.id, %reason, removed = removal.removed,
+                        "closed scope emptied by raw name; its disposal retries");
+                    Some(fs::manifest(&dir, 100_000)?)
+                }
+                Err(error) => return Err(error),
+            },
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(Error::Conflict(_)) => None,
             Err(error) => return Err(error),

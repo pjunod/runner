@@ -3883,6 +3883,42 @@ fn refused_disposal_resnapshots_the_closed_scope_and_retries() {
     assert!(!a.path.exists());
 }
 
+/// Finding 4: names the manifest refuses (a symlink out of the tree, a fifo)
+/// no longer block the re-snapshot: the closed scope is emptied by raw name
+/// (the link's target survives) and the disposal completes.
+#[cfg(unix)]
+#[test]
+fn refused_names_in_a_closed_scope_do_not_block_its_disposal() {
+    let (tmp, db, root) = fixture();
+    let a = parked(&db, &root);
+    let op = db.request_delete(&a.id, a.revision, "dispose", 0).unwrap();
+    let outside = tmp.path().join("outside.bin");
+    std::fs::write(&outside, b"not runner's").unwrap();
+    std::os::unix::fs::symlink(&outside, a.path.join("link")).unwrap();
+    let fifo = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(
+        a.path.join("pipe").as_os_str(),
+    ))
+    .unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let _ = db.execute_delete(&op.id);
+    let mut refused = db.get(&a.id).unwrap();
+    refused.hold = Some("review".into());
+    refused.state = "delete_failed".into();
+    refused.updated_at = now() - 2 * exits::HOLD_EXIT_SECONDS;
+    refused.revision += 1;
+    save_artifact(&db.db.lock().unwrap(), &refused).unwrap();
+    let mut stuck = db.operation(&op.id).unwrap();
+    stuck.state = "review".into();
+    save_operation(&db.db.lock().unwrap(), &stuck).unwrap();
+    let report = db
+        .exit_wedged_states(exits::HOLD_EXIT_SECONDS, true)
+        .unwrap();
+    assert_eq!(report.retried, 1);
+    assert_eq!(db.execute_delete(&op.id).unwrap().state, "succeeded");
+    assert!(!a.path.exists());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"not runner's");
+}
+
 #[test]
 fn a_fresh_hold_waits_for_the_grace_and_a_restart_releases_quiescence() {
     let (tmp, db, root) = fixture();

@@ -2272,7 +2272,7 @@ impl Inventory {
     }
 
     /// Remove everything under a closed-scope source root, deepest first,
-    /// by name under the verified root descriptor: no per-file identity or
+    /// by raw name under the verified root descriptor: no per-file identity or
     /// classification (a PAR repair may have rewritten a part; NFS may have
     /// moved a ctime), and nothing is retained for review. Records every
     /// outcome `removed` on the operation and the delivery row.
@@ -2283,29 +2283,16 @@ impl Inventory {
         source: &mut Artifact,
         root: &File,
     ) -> Result<()> {
-        let mut entries = fs::manifest(root, 1_000_000)?;
-        entries.sort_by_key(|entry| std::cmp::Reverse(entry.path.matches('/').count()));
-        for entry in &entries {
-            let path = Path::new(&entry.path);
-            let parent = path.parent().unwrap_or(Path::new(""));
-            let parent_dir = if parent.as_os_str().is_empty() {
-                root.try_clone()?
-            } else {
-                fs::open_relative(
-                    root,
-                    parent
-                        .to_str()
-                        .ok_or_else(|| Error::Conflict("non-UTF-8 source path".into()))?,
-                )?
-            };
-            let name = path
-                .file_name()
-                .ok_or_else(|| Error::Conflict("empty source path".into()))?;
-            match fs::unlink(&parent_dir, Path::new(name), entry.identity.directory) {
-                Ok(()) => {}
-                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
+        // Raw names, never followed, bottom-up, on the root's device only:
+        // a name a manifest refuses (symlink, special file, non-UTF-8,
+        // depth, count) must not block closed-scope cleanup forever.
+        let removal = fs::remove_tree_contents(root)?;
+        if removal.foreign_mounts > 0 {
+            tracing::warn!(
+                artifact = %source.id,
+                mounts = removal.foreign_mounts,
+                "closed-scope cleanup left mounted directories inside the source tree"
+            );
         }
         fs::sync_directory(root)?;
         for outcome in &mut movement.file_outcomes {
