@@ -337,6 +337,7 @@ impl Inventory {
         snapshot: &StartupReconciliation,
     ) -> Result<()> {
         self.reconcile_deleted_artifacts_snapshot(Some(snapshot))?;
+        self.park_legacy_startup_orphans(root)?;
         self.reconcile_relocations_root_snapshot(root, Some(snapshot))?;
         self.reconcile_transforms_root_snapshot(root, Some(snapshot))?;
         let rows = {
@@ -410,7 +411,19 @@ impl Inventory {
                 previous_hold: artifact.hold.clone(),
                 classified_revision: original.revision + 1,
             });
-            if !live {
+            if !live
+                && artifact.state == "retained"
+                && artifact.owned
+                && artifact.automatic_cleanup_eligible
+                && !artifact.keep
+                && artifact.hold.is_none()
+            {
+                // W9: an owned allocation whose job is gone is a failed
+                // source with the failed-payload TTL, not a review state.
+                // The durable binding stays, so an import/adoption that
+                // arrives later reclaims it (`reclaim_recovered_orphan`).
+                Self::park_orphan(&mut artifact, self.settings()?.failed_retention_days);
+            } else if !live {
                 // Imports/adoptions may arrive while this payload worker is
                 // running. Retain the durable binding so a later owner can
                 // still locate a nondefault root without guessing its path.
@@ -453,15 +466,66 @@ impl Inventory {
         Ok(())
     }
 
+    /// A startup orphan's failed-payload retention (W9).
+    fn park_orphan(artifact: &mut Artifact, retention_days: u32) {
+        artifact.state = "parked_failed".into();
+        artifact.hold = None;
+        artifact.retention_seconds = u64::from(retention_days) * 86400;
+        artifact.deadline = Some(now().saturating_add(artifact.retention_seconds as i64));
+    }
+
+    /// W9 upgrade: an owned orphan an older build classified as a review
+    /// hold (`retained`, Keep, "allocation has no recovered job") with no
+    /// operator change since becomes a parked failure with the TTL.
+    /// Idempotent: a converted row no longer carries the hold.
+    pub(super) fn park_legacy_startup_orphans(&self, root: &Path) -> Result<usize> {
+        let retention_days = self.settings()?.failed_retention_days;
+        let _guard = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let rows = {
+            let mut statement = tx.prepare("SELECT a.data,o.data FROM artifacts a JOIN operations o ON o.id='startup-orphan-'||a.id||'-'||json_extract(a.data,'$.generation') WHERE a.state='retained' AND json_extract(a.data,'$.hold')='review: allocation has no recovered job' AND json_extract(a.data,'$.root')=?1 AND o.state='retained'")?;
+            let rows = statement.query_map([root.to_string_lossy().as_ref()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut parked = 0;
+        for (raw, op) in rows {
+            let mut artifact: Artifact = serde_json::from_str(&raw)?;
+            let operation: Operation = serde_json::from_str(&op)?;
+            let receipt: OrphanReceipt = serde_json::from_str(&operation.request)?;
+            if !artifact.owned
+                || !artifact.automatic_cleanup_eligible
+                || receipt.previous_keep
+                || receipt.previous_hold.is_some()
+                || receipt.generation != artifact.generation
+                || artifact.revision != receipt.classified_revision
+            {
+                continue;
+            }
+            artifact.keep = false;
+            Self::park_orphan(&mut artifact, retention_days);
+            artifact.revision += 1;
+            artifact.updated_at = now();
+            save_artifact(&tx, &artifact)?;
+            event(&tx, &artifact.id, "retention", "startup orphan parked")?;
+            parked += 1;
+        }
+        tx.commit()?;
+        Ok(parked)
+    }
+
     /// Reclaim only the automatic startup classification when a job is later
     /// imported/adopted. Never infer ownership or clear an operator's choice.
     pub fn reclaim_recovered_orphan(&self, job: u32) -> Result<Option<Artifact>> {
         let Some(original) = self.for_job(job)? else {
             return Ok(None);
         };
-        if original.state != "retained"
-            || original.hold.as_deref() != Some("review: allocation has no recovered job")
-        {
+        let reviewed = original.state == "retained"
+            && original.hold.as_deref() == Some("review: allocation has no recovered job");
+        let parked = original.state == "parked_failed" && original.hold.is_none();
+        if !reviewed && !parked {
             return Ok(Some(original));
         }
         let key = format!("startup-orphan-{}-{}", original.id, original.generation);
@@ -486,6 +550,8 @@ impl Inventory {
         let mut artifact = self.get(&original.id)?;
         artifact.state = "active".into();
         artifact.hold = receipt.previous_hold;
+        artifact.retention_seconds = 0;
+        artifact.deadline = None;
         // Retention controls made after classification remain authoritative.
         if artifact.revision == receipt.classified_revision {
             artifact.keep = receipt.previous_keep;
@@ -512,6 +578,54 @@ mod snapshot_tests {
         std::fs::create_dir(&root).unwrap();
         let inventory = Inventory::open(&temporary.path().join("state")).unwrap();
         (temporary, inventory, root)
+    }
+
+    /// W9: an owned allocation with no recovered job is a parked failure
+    /// with the failed-payload TTL, not a review hold; a later import
+    /// reclaims it. An older build's review classification converts once.
+    #[test]
+    fn startup_orphan_is_parked_with_a_ttl_and_legacy_review_converts() {
+        let (_temporary, inventory, root) = inventory();
+        let path = root.join("orphan");
+        inventory
+            .allocate_for_delivery(91, &root, &path, true, true)
+            .unwrap();
+        std::fs::write(path.join("media.mkv"), b"bytes").unwrap();
+        inventory.finish(91, &path, &root, "active").unwrap();
+        let snapshot = inventory.capture_startup_reconciliation().unwrap();
+        inventory
+            .reconcile_startup_root_snapshot(&root, &[], &snapshot)
+            .unwrap();
+        let parked = inventory.for_job(91).unwrap().unwrap();
+        assert_eq!(parked.state, "parked_failed");
+        assert!(!parked.keep && parked.hold.is_none());
+        assert!(parked.deadline.is_some_and(|deadline| deadline > now()));
+        assert!(parked.earliest_expiry().is_some(), "expires on its own");
+        let reclaimed = inventory.reclaim_recovered_orphan(91).unwrap().unwrap();
+        assert_eq!(reclaimed.state, "active");
+        assert!(reclaimed.deadline.is_none());
+
+        // Legacy shape: what 0.8 wrote for the same orphan.
+        let key = format!("startup-orphan-{}-{}", parked.id, parked.generation);
+        let mut legacy = inventory.get(&parked.id).unwrap();
+        legacy.state = "retained".into();
+        legacy.keep = true;
+        legacy.hold = Some("review: allocation has no recovered job".into());
+        let mut operation = inventory.operation(&key).unwrap();
+        operation.state = "retained".into();
+        let mut receipt: OrphanReceipt = serde_json::from_str(&operation.request).unwrap();
+        receipt.classified_revision = legacy.revision;
+        operation.request = serde_json::to_string(&receipt).unwrap();
+        {
+            let db = inventory.db.lock().unwrap();
+            save_artifact(&db, &legacy).unwrap();
+            save_operation(&db, &operation).unwrap();
+        }
+        assert_eq!(inventory.park_legacy_startup_orphans(&root).unwrap(), 1);
+        assert_eq!(inventory.park_legacy_startup_orphans(&root).unwrap(), 0);
+        let converted = inventory.get(&parked.id).unwrap();
+        assert_eq!(converted.state, "parked_failed");
+        assert!(!converted.keep && converted.hold.is_none());
     }
 
     #[test]
