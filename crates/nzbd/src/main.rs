@@ -176,6 +176,8 @@ fn main() -> anyhow_lite::Result<()> {
             bind,
             monitor_bind,
         } => {
+            // Restart phase timings (status `startup`) count from here.
+            let _ = nzbd_engine::startup_phases::boot_instant();
             // No config, mirror, TLS, or state-volume access precedes this bind.
             let control = control::Controller::start(
                 control::monitor_bind(monitor_bind.as_deref())?,

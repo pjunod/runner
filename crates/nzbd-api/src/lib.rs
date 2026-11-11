@@ -555,6 +555,9 @@ pub struct StatusDto {
     /// finish first). Absent when no restart is waiting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restart_pending: Option<RestartPending>,
+    /// Restart phase timings since process start: listener bound, first
+    /// article lease, classification, per-root background reconciliation.
+    pub startup: nzbd_engine::startup_phases::StartupPhases,
 }
 
 /// A deferred restart: when it was asked for and what it waits on.
@@ -666,6 +669,7 @@ fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -
         servers: snap.server_volumes.clone(),
         storage,
         restart_pending: RESTART_PENDING.lock().unwrap().clone(),
+        startup: snap.startup.clone(),
     }
 }
 
