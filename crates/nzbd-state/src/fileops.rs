@@ -308,6 +308,22 @@ pub fn rename_exclusive(source: &Path, target: &Path) -> Result<()> {
     }
 }
 
+/// [`rename_exclusive`] for a caller holding the verified source handle. The
+/// caller must close every other handle on `source` first: on NFS an open old
+/// name is silly-renamed and its deferred removal changes the target's ctime
+/// after publication captures its identity.
+pub fn rename_exclusive_from_open(source: &Path, target: &Path, guard: File) -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        fs::rename_exclusive_verified_from_open(source, target, guard)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        drop(guard);
+        fs::rename_exclusive(source, target)
+    }
+}
+
 /// Content evidence belongs to the descriptor captured by its producer, never
 /// to a pathname recaptured after hashing.
 #[derive(Clone, Debug)]
@@ -376,6 +392,28 @@ mod copy_budget_tests {
             std::fs::read(&source).unwrap(),
             std::fs::read(&target).unwrap()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rename_from_open_closes_guard_before_unlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("stage");
+        let to = tmp.path().join("published");
+        std::fs::write(&from, b"staged torrent payload").unwrap();
+        let guard = File::open(&from).unwrap();
+        let (old_name, new_name) = (from.clone(), to.clone());
+        fs::BEFORE_UNLINK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_, _| {
+                fs::assert_name_not_open_for_test(&old_name);
+                fs::assert_name_open_for_test(&new_name);
+            }));
+        });
+        fs::RENAME_FAILURE.with(|value| value.set(Some(libc::EOPNOTSUPP)));
+        rename_exclusive_from_open(&from, &to, guard).unwrap();
+        assert!(fs::BEFORE_UNLINK.with(|hook| hook.borrow().is_none()));
+        assert_eq!(std::fs::read(&to).unwrap(), b"staged torrent payload");
+        assert!(!from.exists());
     }
 
     #[test]

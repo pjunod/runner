@@ -9,7 +9,7 @@ type UnlinkHook = Box<dyn FnOnce(&File, &Path)>;
 #[cfg(test)]
 thread_local! {
     pub(crate) static BEFORE_UNLINK: std::cell::RefCell<Option<UnlinkHook>> = const { std::cell::RefCell::new(None) };
-    pub(super) static RENAME_FAILURE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    pub(crate) static RENAME_FAILURE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
 /// Plan M3 (a) / IMPL §7.6 test support: per-inventory counts of the payload
@@ -685,6 +685,14 @@ pub fn rename_exclusive_verified(from: &Path, to: &Path) -> Result<()> {
     rename_exclusive_impl(from, to, true, None)
 }
 
+/// Content-verified rename for callers that still hold the verified source
+/// handle: the guard keeps the inode pinned and is closed with the other
+/// old-name handles before unlink.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn rename_exclusive_verified_from_open(from: &Path, to: &Path, guard: File) -> Result<()> {
+    rename_exclusive_impl(from, to, true, Some(guard))
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rename_exclusive_impl(
     from: &Path,
@@ -889,6 +897,26 @@ pub(crate) fn assert_name_not_open_for_test(path: &Path) {
     }
 }
 
+/// The verified target handle must still pin the inode when the old name is
+/// unlinked; dropping it early reopens the inode-reuse gap.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn assert_name_open_for_test(path: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let expected = path.canonicalize().unwrap();
+    let inode = std::fs::metadata(&expected).unwrap().ino();
+    let pinned = std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .flatten()
+        .any(|entry| {
+            std::fs::read_link(entry.path()).ok().as_deref() == Some(expected.as_path())
+                && std::fs::metadata(entry.path()).is_ok_and(|meta| meta.ino() == inode)
+        });
+    assert!(
+        pinned,
+        "target inode is not pinned by an open handle at unlink"
+    );
+}
+
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod exclusive_tests {
     use super::*;
@@ -902,13 +930,19 @@ mod exclusive_tests {
         for verified in [false, true] {
             fs::write(&from, b"preserved payload").unwrap();
             let old_name = from.clone();
+            let new_name = to.clone();
             BEFORE_UNLINK.with(|hook| {
                 *hook.borrow_mut() = Some(Box::new(move |_, _| {
-                    assert_name_not_open_for_test(&old_name)
+                    assert_name_not_open_for_test(&old_name);
+                    assert_name_open_for_test(&new_name);
                 }));
             });
             RENAME_FAILURE.with(|value| value.set(Some(libc::EOPNOTSUPP)));
             rename_exclusive_impl(&from, &to, verified, Some(File::open(&from).unwrap())).unwrap();
+            assert!(
+                BEFORE_UNLINK.with(|hook| hook.borrow().is_none()),
+                "the fallback unlink hook never ran"
+            );
             assert_eq!(fs::read(&to).unwrap(), b"preserved payload");
             assert!(!from.exists());
             fs::remove_file(&to).unwrap();
