@@ -4092,3 +4092,46 @@ fn parking_a_pinned_hold_keeps_an_operator_keep() {
     assert_eq!(operator.state, "parked_failed");
     assert!(operator.keep, "the operator's Keep stays");
 }
+
+/// Finding 12: a recovery handoff waiting on a consumer that never claims
+/// (`published`) or stops heartbeating its claim (`claimed`) for
+/// failed_retention_days is cancelled through the existing path; a fresh
+/// one is untouched.
+#[test]
+fn silent_recovery_handoffs_are_cancelled_after_the_failed_ttl() {
+    let (tmp, db, root) = fixture();
+    let mut ids = Vec::new();
+    for job in 1..=3u32 {
+        let path = root.join(format!("job-{job}"));
+        db.allocate(job, &root, &path).unwrap();
+        std::fs::write(path.join("episode.mkv"), b"media").unwrap();
+        let a = db.finish(job, &path, &root, "parked_failed").unwrap();
+        let r = db
+            .stage_recovery(
+                &a.id,
+                a.revision,
+                &format!("handoff-{job}"),
+                &["episode.mkv".into()],
+                &tmp.path().join(format!("recovery-{job}")),
+            )
+            .unwrap();
+        ids.push(r);
+    }
+    db.claim_recovery(&ids[1].id, "curator", "import", &ids[1].manifest_digest)
+        .unwrap();
+    let ttl = i64::from(db.settings().unwrap().failed_retention_days) * 86400;
+    for r in &ids[..2] {
+        let mut stale = db.recovery(&r.id).unwrap();
+        stale.updated_at = now() - ttl - 60;
+        super::recovery::save(&db.db.lock().unwrap(), &stale).unwrap();
+    }
+    let report = db.exit_wedged_states(0, true).unwrap();
+    assert_eq!(report.recoveries, 2, "{report:?}");
+    assert_eq!(db.recovery(&ids[0].id).unwrap().state, "cancelled");
+    assert_eq!(db.recovery(&ids[1].id).unwrap().state, "cancelled");
+    assert_ne!(db.recovery(&ids[2].id).unwrap().state, "cancelled");
+    // A late claim from the silent consumer is refused.
+    assert!(db
+        .claim_recovery(&ids[1].id, "curator", "import", &ids[1].manifest_digest)
+        .is_err());
+}

@@ -101,9 +101,9 @@ pub const STATE_EXITS: &[StateExit] = &[
     // recoveries.state
     s("recovery", "staging", Exit::Event("publication finishes or fails; reconcile_recoveries resumes it")),
     s("recovery", "publishing", Exit::Event("publication finishes or fails; reconcile_recoveries resumes it")),
-    s("recovery", "published", Exit::Event("consumer claim/import receipt or cancellation")),
-    s("recovery", "claimed", Exit::Event("consumer import receipt or cancellation")),
-    s("recovery", "cancel_pending", Exit::Event("worker quiescence acknowledgement; unclaimed ones cancel on reconcile")),
+    s("recovery", "published", Exit::Timer("consumer claim/import receipt or cancellation; cancelled after failed_retention_days without a claim")),
+    s("recovery", "claimed", Exit::Timer("consumer import receipt or cancellation; cancelled after failed_retention_days without a claim heartbeat")),
+    s("recovery", "cancel_pending", Exit::Event("worker quiescence acknowledgement (taken as given after failed_retention_days of silence); unclaimed ones cancel on reconcile")),
     s("recovery", "imported", Exit::Timer("receipt-scoped source prune (automatic after HOLD_EXIT_SECONDS), then the source's TTL")),
     s("recovery", "partial", Exit::Timer("receipt-scoped source prune (automatic after HOLD_EXIT_SECONDS), then the source's TTL")),
     s("recovery", "review", Exit::Timer("restored backup: cancelled by exit_wedged_states; its staged copy is disposed")),
@@ -272,6 +272,9 @@ impl Inventory {
         let mut report = ExitReport::default();
         self.exit_review_operations(cutoff, touch_files, &mut report)?;
         self.exit_review_recoveries(&mut report)?;
+        if touch_files {
+            self.exit_stale_handoffs(&mut report)?;
+        }
         self.exit_held_artifacts(cutoff, touch_files, &mut report)?;
         if touch_files {
             self.exit_blocked_deliveries(cutoff, &mut report)?;
@@ -569,6 +572,42 @@ impl Inventory {
             "closed scope re-snapshotted",
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Finding 12: a recovery handoff waiting on its consumer (`published`,
+    /// `claimed`, or a claimed `cancel_pending`) with no claim heartbeat for
+    /// `failed_retention_days` is cancelled through the existing path; the
+    /// silent consumer's acknowledgement is taken as given (a late claim or
+    /// receipt from it is refused). Its holds then take their own exits.
+    fn exit_stale_handoffs(&self, report: &mut ExitReport) -> Result<()> {
+        let ttl = i64::from(self.settings()?.failed_retention_days) * 86400;
+        let cutoff = now().saturating_sub(ttl.max(0));
+        let stale = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT id FROM recoveries WHERE (state IN ('published','claimed') OR (state='cancel_pending' AND json_extract(data,'$.consumer') IS NOT NULL)) AND COALESCE(json_extract(data,'$.updated_at'),0)<=?1 LIMIT 100",
+            )?;
+            let rows = statement.query_map([cutoff], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for id in stale {
+            let recovery = self.recovery(&id)?;
+            let consumer = recovery.consumer.clone();
+            let result = (|| {
+                if consumer.is_some() && recovery.state != "cancel_pending" {
+                    self.cancel_recovery(&id, consumer.as_deref(), false)?;
+                }
+                self.cancel_recovery(&id, consumer.as_deref(), true)
+            })();
+            match result {
+                Ok(_) => report.recoveries += 1,
+                Err(Error::Conflict(why)) => {
+                    tracing::info!(recovery = %id, %why, "stale recovery handoff not cancelled yet");
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(())
     }
 

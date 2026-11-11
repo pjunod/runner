@@ -306,9 +306,19 @@ impl Inventory {
             Err(Error::NotFound) => None,
             Err(error) => return Err(error),
         };
+        // Finding 12: every hold has an automatic exit (`exits`), so a held
+        // copy — a delete in review, say — is not retained: the ledger keeps
+        // asking (`retry`) and records `removed` once the exit lands.
+        if !artifact.terminal() {
+            if let Some(hold) = &artifact.hold {
+                return Ok(ClusterCopyCleanup {
+                    status: "retry".into(),
+                    error: Some(format!("held ({hold}); retried after its exit")),
+                });
+            }
+        }
         if !artifact.terminal()
             && ((artifact.keep && !explicit_cancellation)
-                || artifact.hold.is_some()
                 || (!explicit_cancellation
                     && !copy.selected
                     && outcome != "SUCCESS"
@@ -316,9 +326,7 @@ impl Inventory {
         {
             return Ok(ClusterCopyCleanup {
                 status: "retained".into(),
-                error: Some(artifact.hold.clone().unwrap_or_else(|| {
-                    "this exact source is retained by its current Keep setting".into()
-                })),
+                error: Some("this exact source is retained by its current Keep setting".into()),
             });
         }
         if let Some(operation) = existing.as_ref().filter(|_| !copy.selected) {
@@ -336,7 +344,9 @@ impl Inventory {
             return Ok(ClusterCopyCleanup {
                 status: match operation.state.as_str() {
                     "succeeded" => "removed",
-                    "cancelled" | "review" => "retained",
+                    // A delete in review takes its exit (retried or
+                    // cancelled): ask again rather than record `retained`.
+                    "cancelled" => "retained",
                     _ => "retry",
                 }
                 .into(),
@@ -1244,8 +1254,40 @@ mod tests {
                 Some(&expected),
             )
             .unwrap();
-        assert_eq!(resumed.status, "retained");
-        assert_eq!(std::fs::read(remaining).unwrap(), b"replacement bytes");
+        // Finding 12: a delete in review is not `retained`: it takes its
+        // exit, and the ledger keeps asking until the copy is removed.
+        assert_eq!(resumed.status, "retry");
+        assert_eq!(std::fs::read(&remaining).unwrap(), b"replacement bytes");
+        let mut held = inventory.get(&copy.publication.artifact).unwrap();
+        held.updated_at = now() - 2 * super::super::exits::HOLD_EXIT_SECONDS;
+        save_artifact(&inventory.db.lock().unwrap(), &held).unwrap();
+        inventory
+            .exit_wedged_states(super::super::exits::HOLD_EXIT_SECONDS, true)
+            .unwrap();
+        let mut statuses = Vec::new();
+        for _ in 0..3 {
+            let mut operation = inventory.operation(&key).unwrap();
+            operation.next_retry = 0;
+            save_operation(&inventory.db.lock().unwrap(), &operation).unwrap();
+            let asked = inventory
+                .retire_cluster_artifact_copy_with_disposition(
+                    &copy,
+                    "SUCCESS",
+                    proof(),
+                    false,
+                    Some(&expected),
+                )
+                .unwrap();
+            statuses.push(asked.status.clone());
+            if asked.status == "removed" {
+                break;
+            }
+        }
+        assert_eq!(
+            statuses.last().map(String::as_str),
+            Some("removed"),
+            "{statuses:?}"
+        );
     }
     #[test]
     fn raw_copy_seal_refuses_added_or_changed_bytes_then_drains_exact_match() {
