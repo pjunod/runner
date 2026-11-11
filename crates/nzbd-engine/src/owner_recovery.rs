@@ -1685,6 +1685,69 @@ pub(super) fn file_evidence(
     }
 }
 
+/// What one stat per file found at post-processing admission (finding 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum AdmissionStat {
+    /// Every proven file is the proof's object and large enough.
+    Fits,
+    /// A file is gone, replaced, or shorter than its highest proven range:
+    /// its ranges are not on disk.
+    Short(String),
+    /// The storage did not answer; retried later, never proof of loss.
+    Unavailable(String),
+}
+
+/// The files of a job whose recorded ranges a proof vouches for, as
+/// `(file, publication name, proof object, highest proven end)`.
+pub(super) fn proven_files(job: &Job) -> Vec<(nzbd_types::FileId, String, Identity, u64)> {
+    job.files
+        .iter()
+        .filter_map(|file| {
+            let done = ranges(file);
+            let end = done.iter().filter_map(ProvenRange::end).max()?;
+            let raw = parameter(job, &format!("*File:proof:{}", file.id.0))
+                .or_else(|| parameter(job, &format!("*File:publication-proof:{}", file.id.0)))?;
+            let proof = serde_json::from_str::<DurableFileProof>(raw).ok()?;
+            let name = proof
+                .publication_name
+                .clone()
+                .unwrap_or_else(|| file.filename.clone());
+            Some((file.id, name, proof.identity, end))
+        })
+        .collect()
+}
+
+/// One stat per proven file, through the writer's own resolver: same
+/// object as the proof and size at least the highest proven range end.
+pub(super) fn stat_proven_files(
+    dir: &std::path::Path,
+    files: &[(nzbd_types::FileId, String, Identity, u64)],
+) -> AdmissionStat {
+    for (file, name, identity, end) in files {
+        match recovery::resolve_payload(dir, *file, name) {
+            Ok(Some(payload)) => {
+                if !payload.identity.same_object(identity) {
+                    return AdmissionStat::Short(format!("file {} was replaced", file.0));
+                }
+                if payload.identity.bytes < *end {
+                    return AdmissionStat::Short(format!(
+                        "file {} is {} bytes, shorter than its proven {end}",
+                        file.0, payload.identity.bytes
+                    ));
+                }
+            }
+            Ok(None) => return AdmissionStat::Short(format!("file {} is missing", file.0)),
+            Err(recovery::ResolveError::IdentityConflict) => {
+                return AdmissionStat::Short(format!("file {} has conflicting aliases", file.0))
+            }
+            Err(recovery::ResolveError::Unavailable { message, .. }) => {
+                return AdmissionStat::Unavailable(message)
+            }
+        }
+    }
+    AdmissionStat::Fits
+}
+
 impl Owner {
     /// Whether every recorded range of the job rests on evidence that needs
     /// no verification pass before its writer or post-processing admission.
@@ -2256,5 +2319,47 @@ mod tests {
         assert_eq!(std::fs::read(&publication).unwrap(), b"abcdef");
         assert!(!allocation.path.join(".runner-file-1.part").exists());
         drop(held);
+    }
+}
+
+#[cfg(test)]
+mod admission_stat_tests {
+    use super::*;
+
+    /// Finding 7: post-processing admission stats each proven file once: a
+    /// same-inode file truncated below its highest proven end, a replaced
+    /// one and a missing one all fail; the intact one fits.
+    #[test]
+    fn admission_stat_requires_the_proof_object_and_its_proven_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+        std::fs::write(&path, b"abcdefgh").unwrap();
+        let identity =
+            recovery::capture_identity(&nzbd_state::fileops::open(&path).unwrap()).unwrap();
+        let files = vec![(nzbd_types::FileId(2), "out.bin".to_string(), identity, 8)];
+        assert_eq!(stat_proven_files(dir.path(), &files), AdmissionStat::Fits);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(4)
+            .unwrap();
+        assert!(matches!(
+            stat_proven_files(dir.path(), &files),
+            AdmissionStat::Short(why) if why.contains("shorter")
+        ));
+        // A new object at the name (created before the old one goes, so its
+        // inode differs).
+        std::fs::write(dir.path().join("new.bin"), b"abcdefgh").unwrap();
+        std::fs::rename(dir.path().join("new.bin"), &path).unwrap();
+        assert!(matches!(
+            stat_proven_files(dir.path(), &files),
+            AdmissionStat::Short(why) if why.contains("replaced")
+        ));
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            stat_proven_files(dir.path(), &files),
+            AdmissionStat::Short(why) if why.contains("missing")
+        ));
     }
 }

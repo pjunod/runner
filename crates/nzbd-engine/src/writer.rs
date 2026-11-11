@@ -529,12 +529,15 @@ async fn writer_task(
             }
         }
     }
+    // Finding 7: the proven ranges must fit the file as it is *now* (the one
+    // stat above), not as the proof recorded it: a same-inode file that was
+    // truncated, or is missing altogether, no longer holds them. That is
+    // proof the bytes are gone — the reset path re-downloads this one file.
+    let live_bytes = resolved.as_ref().map(|payload| payload.identity.bytes);
     if !scope.proven.is_empty()
         && (scope.expected_identity.is_none()
-            || !recovery::coherent_ranges(
-                &scope.proven,
-                scope.expected_identity.as_ref().unwrap().bytes,
-            ))
+            || live_bytes.is_none()
+            || !recovery::coherent_ranges(&scope.proven, live_bytes.unwrap()))
     {
         report
             .send(WriterFact::IdentityMismatch {
@@ -1834,6 +1837,62 @@ mod tests {
         writer.stop.cancel();
         let mut stopped = writer.stopped.clone();
         stopped.wait_for(|done| *done).await.unwrap();
+    }
+
+    /// Finding 7: the same inode truncated below its highest proven range
+    /// end (or gone) no longer holds those ranges: the writer reports an
+    /// identity mismatch (the owner's reset re-downloads that file) instead
+    /// of trusting the size the proof recorded.
+    #[tokio::test]
+    async fn a_same_inode_file_truncated_below_its_proof_is_a_mismatch() {
+        for remove in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(".runner-file-2.part");
+            std::fs::write(&path, b"abcdefgh").unwrap();
+            let identity =
+                recovery::capture_identity(&nzbd_state::fileops::open(&path).unwrap()).unwrap();
+            if remove {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(3)
+                    .unwrap();
+            }
+            let tracker = TaskTracker::new();
+            let (tx, mut rx) = channel(8);
+            let _writer = spawn_writer_scoped(
+                &tracker,
+                JobId(1),
+                FileId(2),
+                dir.path().to_path_buf(),
+                "out".into(),
+                tx,
+                WriterScope {
+                    generation: 4,
+                    proven: vec![ProvenRange {
+                        seg_number: 1,
+                        offset: 4,
+                        len: 4,
+                        crc: 42,
+                    }],
+                    expected_identity: Some(identity),
+                    ..WriterScope::default()
+                },
+            );
+            assert!(
+                matches!(
+                    rx.recv().await,
+                    Some(EngineMsg::ScopedWriter {
+                        fact: WriterFact::IdentityMismatch { .. },
+                        ..
+                    })
+                ),
+                "removed={remove}"
+            );
+        }
     }
 
     #[tokio::test]

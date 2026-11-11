@@ -1196,6 +1196,10 @@ pub(crate) struct Owner {
     enospc_latched: bool,
     enospc_observed: u64,
     enospc_where: Option<String>,
+    /// Finding 7: jobs whose proven files passed the post-processing
+    /// admission stat, by job epoch; and the ones being stat'ed now.
+    pp_stat_passed: HashMap<JobId, u64>,
+    pp_stat_inflight: HashSet<JobId>,
     /// W5a: every write that reported ENOSPC, by the operation that failed.
     /// The latch clears when each has evidence from its own operation
     /// (`space_probe`), never from a write somewhere else.
@@ -1683,6 +1687,8 @@ impl Owner {
             enospc_latched: false,
             enospc_observed: 0,
             enospc_where: None,
+            pp_stat_passed: HashMap::new(),
+            pp_stat_inflight: HashSet::new(),
             enospc_failures: std::collections::BTreeMap::new(),
             space_probe_fs: Arc::new(crate::space_probe::RealFs),
             space_probe_inflight: false,
@@ -2717,6 +2723,15 @@ impl Owner {
                         let _ = reply.send(None);
                         return;
                     }
+                }
+                // Finding 7: a proof says which object holds the ranges, not
+                // that the object still holds them. One stat per proven file
+                // (off this loop) before post-processing reads it: a replaced,
+                // missing or truncated file goes to verification, which
+                // reopens its missing ranges for download.
+                if !self.pp_admission_stat_passed(job) {
+                    let _ = reply.send(None);
+                    return;
                 }
                 if self.state.job(job).is_some_and(|job| {
                     job.files.iter().any(|file| {
@@ -6609,8 +6624,9 @@ impl Owner {
     /// it from an empty file (the next writer removes whatever sits at its
     /// names; the job directory is Runner's closed scope). Other files and
     /// other jobs are untouched. After [`IDENTITY_RESET_LIMIT`] resets of the
-    /// same file the job ends `failed/identity` and follows its terminal
-    /// policy, so a filesystem that keeps swapping the object cannot loop.
+    /// same file the job ends `failed/io` (the storage's fault, never the
+    /// release's; salvage allowed) and follows its terminal policy, so a
+    /// filesystem that keeps swapping the object cannot loop.
     fn on_writer_identity_mismatch(&mut self, job: JobId, file: FileId, error: &str) {
         let resets_key = format!("{IDENTITY_RESETS_PREFIX}{}", file.0);
         let Some(record) = self.state.job_mut(job) else {
@@ -6631,12 +6647,15 @@ impl Owner {
             .unwrap_or(0);
         if resets >= IDENTITY_RESET_LIMIT {
             tracing::warn!(job = job.0, file = file.0, %error, resets, "writer identity mismatch recurred; failing job");
+            // A filesystem that keeps replacing the object is the storage's
+            // fault, not the release's: `failed/io` (blameless, parked,
+            // salvage allowed), with the cause named in the message.
             self.fail_job_terminal(
                 job,
-                nzbd_types::FailureReason::Identity,
+                nzbd_types::FailureReason::Io,
                 None,
                 "download_write",
-                &format!("{error}; recurred after {resets} re-downloads of the file"),
+                &format!("identity: {error}; recurred after {resets} re-downloads of the file"),
             );
             return;
         }
@@ -9100,6 +9119,63 @@ impl Owner {
         self.update_disk_guard();
         self.publish_now();
         true
+    }
+
+    /// Finding 7: true once this job's proven files were stat'ed for the
+    /// current epoch and fit their proofs. Otherwise starts the stat (off the
+    /// owner loop) and answers false; the admission is asked again when it
+    /// answers (the epoch bump re-runs the post manager's scan).
+    fn pp_admission_stat_passed(&mut self, job: JobId) -> bool {
+        let Some(record) = self.state.job(job) else {
+            return false;
+        };
+        if record
+            .params
+            .iter()
+            .any(|(key, _)| key == "*Recovery:download-retired")
+        {
+            return true; // checked at its first admission; transforms own it since
+        }
+        let files = recovery_worker::proven_files(record);
+        let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+        if files.is_empty() || self.pp_stat_passed.get(&job) == Some(&epoch) {
+            return true;
+        }
+        let Some(dir) = self.allocation_cache.get(&job).map(|a| a.path.clone()) else {
+            return true; // no allocation: verification already decided above
+        };
+        if !self.pp_stat_inflight.insert(job) {
+            return false;
+        }
+        self.background_then(
+            format!("pp-stat-{}", job.0),
+            move || Ok(recovery_worker::stat_proven_files(&dir, &files)),
+            move |owner, result| {
+                owner.pp_stat_inflight.remove(&job);
+                if owner.job_epochs.get(&job) != Some(&epoch) {
+                    return;
+                }
+                match result {
+                    Ok(recovery_worker::AdmissionStat::Fits) => {
+                        owner.pp_stat_passed.insert(job, epoch);
+                    }
+                    Ok(recovery_worker::AdmissionStat::Short(why)) => {
+                        tracing::warn!(job = job.0, %why,
+                            "proven payload no longer fits its proof; verifying before post-processing");
+                        owner.queue_verification(job);
+                    }
+                    Ok(recovery_worker::AdmissionStat::Unavailable(why)) => {
+                        tracing::warn!(job = job.0, %why, "payload stat unavailable; post-processing admission retries");
+                    }
+                    Err(error) => {
+                        tracing::warn!(job = job.0, %error, "payload stat failed; post-processing admission retries");
+                    }
+                }
+                owner.publish_now();
+                owner.bump_epoch();
+            },
+        );
+        false
     }
 
     /// Jobs whose own retry is the evidence a finalize failure needs: hold

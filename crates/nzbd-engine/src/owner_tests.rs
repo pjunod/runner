@@ -9139,8 +9139,11 @@ async fn replaced_inode_redownloads_only_that_file_and_others_keep_downloading()
     );
 }
 
+/// Finding 5: a filesystem that keeps replacing the inode is the storage's
+/// fault: the job ends `failed/io` (blameless, salvage allowed), and the
+/// message names the identity cause.
 #[tokio::test]
-async fn recurring_identity_mismatch_fails_the_job_identity_after_the_limit() {
+async fn recurring_identity_mismatch_fails_the_job_io_after_the_limit() {
     let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
     pump(&mut owner, &mut messages).await;
     owner.state.jobs.push(pending_job(1));
@@ -9187,7 +9190,13 @@ async fn recurring_identity_mismatch_fails_the_job_identity_after_the_limit() {
         }
     }
     let terminal = owner.artifacts.terminal(1).unwrap().unwrap();
-    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Identity));
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Io));
+    assert!(!terminal.blames_release);
+    assert!(terminal.reason.unwrap().salvage_possible());
+    assert!(terminal
+        .message
+        .as_deref()
+        .is_some_and(|message| message.starts_with("identity:")));
     assert_eq!(owner.state.job(JobId(1)).unwrap().status, JobStatus::Failed);
     let other = owner.state.job(JobId(2)).unwrap();
     assert!(!other.held() && other.status != JobStatus::Failed);
