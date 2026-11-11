@@ -50,6 +50,10 @@ pub(crate) struct WriterScope {
     pub proven: Vec<ProvenRange>,
     pub expected_identity: Option<Identity>,
     pub collect_naming: bool,
+    /// The owner discarded this file's ranges and proof after an identity
+    /// mismatch (no-wedge task 1): remove whatever sits at the file's
+    /// names in the job's own directory and start the file from empty.
+    pub discard_existing: bool,
     pub naming_inventory: Option<std::sync::Arc<nzbd_state::artifacts::Inventory>>,
     #[cfg(test)]
     pub naming_test_hook: Option<std::sync::Arc<dyn Fn(&'static str) + Send + Sync>>,
@@ -81,6 +85,11 @@ pub(crate) enum WriterFact {
         /// refusal with no errno (an identity conflict, a bad range).
         cause: Option<nzbd_types::HoldCause>,
     },
+    /// The file on disk is not the object its proof names (a replaced
+    /// inode, conflicting aliases, ranges incoherent with the recorded
+    /// size). Nothing was written. The owner discards this one file's
+    /// ranges and proof and re-downloads it, bounded.
+    IdentityMismatch { error: String },
     Rejected {
         seg_number: u32,
         server: ServerId,
@@ -225,6 +234,11 @@ impl Reporter {
                     error,
                     cause,
                 },
+                WriterFact::IdentityMismatch { error } => EngineMsg::WriterIdentityMismatch {
+                    job: self.job,
+                    file: self.file,
+                    error,
+                },
                 WriterFact::Rejected { reason, .. } => EngineMsg::WriterError {
                     job: self.job,
                     file: self.file,
@@ -272,6 +286,34 @@ impl Reporter {
         };
         self.send(fact).await;
     }
+}
+
+/// Remove the file's three possible names inside the job's own directory
+/// (closed scope: everything in it came from this download). Only regular
+/// files are removed; anything else is left for `resolve_payload` to refuse.
+fn discard_payload(dir: &Path, file: FileId, publication_name: &str) -> std::io::Result<()> {
+    let mut names = vec![dir.join(format!(".runner-file-{}.part", file.0))];
+    if recovery::safe_name(publication_name) {
+        names.push(dir.join(format!("{publication_name}.part")));
+        names.push(dir.join(publication_name));
+    }
+    let mut removed = false;
+    for path in names {
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+            Ok(metadata) if !metadata.is_file() => continue,
+            Ok(_) => {}
+        }
+        match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => removed = true,
+        }
+    }
+    if removed {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 async fn file_identity(file: &File) -> std::io::Result<Identity> {
@@ -429,25 +471,34 @@ async fn writer_task(
     // file on the first write (the directory may not exist yet here).
     let mut device: Option<u64> = None;
     // No-wedge item 4: the lazy identity check of a restart happens here,
-    // at the first open of the one file being written. Whatever it finds
-    // holds only this job, with its evidence retained: a failed stat (EIO,
-    // ENOTCONN, ...) is never proof that bytes are gone, and a replaced
-    // inode is a hold an operator (or the hold ladder) resolves, never a
-    // terminal failure or a demotion of `Done` ranges.
+    // at the first open of the one file being written. A failed stat (EIO,
+    // ENOTCONN, ...) is never proof that bytes are gone: it holds only this
+    // job on its storage cause. An identity mismatch (a replaced inode,
+    // conflicting aliases) is proof the recorded ranges are not on disk:
+    // the owner discards this one file's ranges and re-downloads it
+    // (no-wedge task 1), bounded, then `failed/identity`.
+    if scope.discard_existing {
+        if let Err(error) = discard_payload(&dir, file_id, &final_name) {
+            report.io_error("discard replaced payload", &error).await;
+            return;
+        }
+    }
     let resolved = match recovery::resolve_payload(&dir, file_id, &final_name) {
         Ok(payload) => payload,
-        Err(error) => {
-            let (message, cause) = match error {
-                recovery::ResolveError::Unavailable { message, cause } => (message, cause),
-                recovery::ResolveError::IdentityConflict => (
-                    "conflicting payload aliases; evidence retained".into(),
-                    None,
-                ),
-            };
+        Err(recovery::ResolveError::Unavailable { message, cause }) => {
             report
                 .send(WriterFact::Error {
                     error: format!("write admission / payload resolution: {message}"),
                     cause: Some(cause.unwrap_or(nzbd_types::HoldCause::StorageUnavailable)),
+                })
+                .await;
+            return;
+        }
+        Err(recovery::ResolveError::IdentityConflict) => {
+            report
+                .send(WriterFact::IdentityMismatch {
+                    error: "write admission / payload resolution: conflicting payload aliases"
+                        .into(),
                 })
                 .await;
             return;
@@ -465,11 +516,8 @@ async fn writer_task(
             .is_some_and(|saved| !saved.same_object(&payload.identity))
         {
             report
-                .send(WriterFact::Error {
-                    error: "write admission: payload file identity changed (replaced inode); \
-                            evidence retained"
-                        .into(),
-                    cause: Some(nzbd_types::HoldCause::StorageUnavailable),
+                .send(WriterFact::IdentityMismatch {
+                    error: "write admission: payload file identity changed (replaced inode)".into(),
                 })
                 .await;
             return;
@@ -488,7 +536,11 @@ async fn writer_task(
                 scope.expected_identity.as_ref().unwrap().bytes,
             ))
     {
-        report.error("writer proven range identity conflict").await;
+        report
+            .send(WriterFact::IdentityMismatch {
+                error: "writer proven range identity conflict".into(),
+            })
+            .await;
         return;
     }
     // Linking a legacy alias updates ctime. Refresh only the object just established.
@@ -1616,7 +1668,11 @@ mod tests {
             .unwrap();
         assert!(matches!(
             engine_rx.recv().await,
-            Some(EngineMsg::WriterFinalized { ok: false, .. } | EngineMsg::WriterError { .. })
+            Some(
+                EngineMsg::WriterFinalized { ok: false, .. }
+                    | EngineMsg::WriterError { .. }
+                    | EngineMsg::WriterIdentityMismatch { .. }
+            )
         ));
     }
     #[tokio::test]
@@ -2138,5 +2194,40 @@ mod tests {
         );
         assert_eq!(std::fs::read(part).unwrap(), b"foreign mutation");
         assert!(!temp.path().join("out").exists());
+    }
+
+    #[tokio::test]
+    async fn conflicting_aliases_are_an_identity_mismatch_and_discard_starts_fresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let part = temp.path().join(".runner-file-2.part");
+        std::fs::write(&part, b"old partial").unwrap();
+        std::fs::write(temp.path().join("out"), b"a different object").unwrap();
+        let commands = || vec![batch_segment(1, 0, b"ab", 2)];
+        let (mut events, _, task) = queued_writer(temp.path(), commands(), WriterScope::default());
+        let facts = batch_facts(&mut events).await;
+        task.await.unwrap();
+        assert!(
+            matches!(&facts[..], [WriterFact::IdentityMismatch { error }] if error.contains("aliases")),
+            "{facts:?}"
+        );
+        assert_eq!(std::fs::read(&part).unwrap(), b"old partial");
+
+        let scope = WriterScope {
+            discard_existing: true,
+            ..Default::default()
+        };
+        let (mut events, _, task) = queued_writer(temp.path(), commands(), scope);
+        let facts = batch_facts(&mut events).await;
+        task.await.unwrap();
+        assert!(
+            matches!(&facts[0], WriterFact::Written { seg_number: 1, .. }),
+            "{facts:?}"
+        );
+        assert!(
+            !temp.path().join("out").exists()
+                || std::fs::read(temp.path().join("out")).unwrap() == b"ab"
+        );
+        let partial = std::fs::read(&part).unwrap_or_default();
+        assert!(!partial.starts_with(b"old"), "the discarded object is gone");
     }
 }

@@ -8970,7 +8970,7 @@ async fn restart_with_large_fuse_queue_leases_within_two_seconds_without_reading
 }
 
 #[tokio::test]
-async fn replaced_inode_holds_only_its_job_and_others_keep_downloading() {
+async fn replaced_inode_redownloads_only_that_file_and_others_keep_downloading() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp.path().join("dest")).unwrap();
     let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
@@ -8980,42 +8980,156 @@ async fn replaced_inode_holds_only_its_job_and_others_keep_downloading() {
         .collect();
     owner.state.jobs = jobs;
     stop_like_kill(owner, messages, true).await;
-    // Replace job 1's partial with a new inode holding the same bytes.
+    // Replace job 1's partial with a new inode holding different bytes.
     let part = temp.path().join("dest/job-1/.runner-file-10.part");
     let replacement = temp.path().join("dest/job-1/replacement");
-    std::fs::write(&replacement, segment_bytes(1, 1)).unwrap();
+    std::fs::write(&replacement, b"foreign bytes that are not the download").unwrap();
     std::fs::rename(&replacement, &part).unwrap();
 
     let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
     install_control_test_server(&mut owner);
     let mut leased = HashSet::new();
-    for _ in 0..8 {
-        for lease in grant_work_for_test(&mut owner, &mut messages, ServerId(1), 2).await {
+    let mut fed = false;
+    for _ in 0..12 {
+        for lease in grant_work_for_test(&mut owner, &mut messages, ServerId(1), 4).await {
             leased.insert(lease.r.job);
+            // Only a writer that started after the discard sees a segment.
+            let reset = owner
+                .state
+                .job(JobId(1))
+                .unwrap()
+                .params
+                .iter()
+                .any(|(key, _)| key.starts_with(crate::owner::IDENTITY_RESETS_PREFIX));
+            if lease.r.job == JobId(1) && reset && !fed {
+                feed(&mut owner, &mut messages, &lease).await;
+                fed = true;
+            }
         }
         pump(&mut owner, &mut messages).await;
-        if owner.state.job(JobId(1)).is_some_and(|job| job.held()) && leased.contains(&JobId(2)) {
+        if fed && leased.contains(&JobId(2)) {
             break;
         }
     }
+    pump(&mut owner, &mut messages).await;
     let first = owner.state.job(JobId(1)).unwrap();
-    assert!(first.held(), "the replaced inode must hold its job");
-    assert!(
-        matches!(first.files[0].segments[0].state, SegmentState::Done { .. }),
-        "a hold never demotes completed ranges"
+    assert!(!first.held(), "a replaced inode never holds its job");
+    assert_eq!(
+        first
+            .params
+            .iter()
+            .find(|(key, _)| key == "*File:identity-resets:10")
+            .map(|(_, value)| value.as_str()),
+        Some("1"),
+        "one reset recorded"
     );
     assert!(!first
         .params
         .iter()
         .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM));
+    assert!(fed, "the file is re-downloaded");
+    // The foreign bytes are gone: the re-downloaded file holds only what
+    // the new writer wrote.
+    let written = std::fs::read(&part).unwrap_or_default();
+    assert!(
+        !written.starts_with(b"foreign"),
+        "the replaced object was discarded"
+    );
     let second = owner.state.job(JobId(2)).unwrap();
     assert!(!second.held(), "an unrelated job is never held");
+    assert!(
+        matches!(second.files[0].segments[0].state, SegmentState::Done { .. }),
+        "an unrelated job keeps its ranges"
+    );
     assert!(
         leased.contains(&JobId(2)),
         "the other job keeps downloading"
     );
-    let again = grant_work_for_test(&mut owner, &mut messages, ServerId(1), 4).await;
-    assert!(again.iter().all(|lease| lease.r.job == JobId(2)));
+}
+
+#[tokio::test]
+async fn recurring_identity_mismatch_fails_the_job_identity_after_the_limit() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(1));
+    owner.state.jobs.push(pending_job(2));
+    let file = owner.state.job(JobId(1)).unwrap().files[0].id;
+    owner.state.job_mut(JobId(1)).unwrap().files[0].segments[0].state = SegmentState::Done {
+        offset: 0,
+        len: 1,
+        crc: 0,
+    };
+    for attempt in 1..=crate::owner::IDENTITY_RESET_LIMIT {
+        owner.on_msg(EngineMsg::WriterIdentityMismatch {
+            job: JobId(1),
+            file,
+            error: "write admission: payload file identity changed (replaced inode)".into(),
+        });
+        pump(&mut owner, &mut messages).await;
+        let job = owner.state.job(JobId(1)).unwrap();
+        assert!(!job.held());
+        assert_ne!(job.status, JobStatus::Failed, "attempt {attempt}");
+        assert!(job.files[0]
+            .segments
+            .iter()
+            .all(|segment| matches!(segment.state, SegmentState::Pending)));
+        assert!(job
+            .params
+            .iter()
+            .any(|(key, _)| key == &format!("*File:identity-discard:{}", file.0)));
+    }
+    owner.on_msg(EngineMsg::WriterIdentityMismatch {
+        job: JobId(1),
+        file,
+        error: "write admission: payload file identity changed (replaced inode)".into(),
+    });
+    for _ in 0..20 {
+        pump(&mut owner, &mut messages).await;
+        if owner
+            .artifacts
+            .terminal(1)
+            .unwrap()
+            .is_some_and(|t| t.emitted)
+        {
+            break;
+        }
+    }
+    let terminal = owner.artifacts.terminal(1).unwrap().unwrap();
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Identity));
+    assert_eq!(owner.state.job(JobId(1)).unwrap().status, JobStatus::Failed);
+    let other = owner.state.job(JobId(2)).unwrap();
+    assert!(!other.held() && other.status != JobStatus::Failed);
+}
+
+#[test]
+fn a_legacy_identity_hold_retries_now() {
+    let control = nzbd_types::JobControl {
+        version: 1,
+        revision: "4".into(),
+        lifecycle: "held".into(),
+        cause: "storage_unavailable".into(),
+        stage: "download_write".into(),
+        retry_policy: "scheduled_retry".into(),
+        message:
+            "write admission: payload file identity changed (replaced inode); evidence retained"
+                .into(),
+        instance: String::new(),
+        previous_status: None,
+        manual_pause: false,
+        retry_attempt: 3,
+        next_retry_at_unix: Some(10_000),
+        blocked_since_unix: Some(1),
+        released_at_unix: None,
+        deadline_in_s: None,
+        deadline_unix: None,
+    };
+    let rearmed = crate::owner::rearmed_hold(control.clone(), 100).unwrap();
+    assert_eq!(rearmed.next_retry_at_unix, Some(100));
+    // Idempotent: once due, nothing further changes.
+    assert!(crate::owner::rearmed_hold(rearmed, 100).is_none());
+    let mut other = control;
+    other.message = "ENOTCONN".into();
+    assert!(crate::owner::rearmed_hold(other, 100).is_none());
 }
 
 /// Where the simulated kill -9 lands.

@@ -67,6 +67,14 @@ use tokio_util::sync::CancellationToken;
 /// Refuse a new control request once this bound is reached rather than growing
 /// owner memory without limit while no adapter is attached.
 const MAX_PENDING_BACKEND_COMMANDS: usize = 64;
+/// No-wedge task 1: how many times one file may be discarded and
+/// re-downloaded after an identity mismatch before the job fails
+/// `identity`.
+pub(crate) const IDENTITY_RESET_LIMIT: u32 = 3;
+/// Job param: identity resets taken so far for a file (`<prefix><file>`).
+pub(crate) const IDENTITY_RESETS_PREFIX: &str = "*File:identity-resets:";
+/// Job param: the next writer for this file must start from an empty file.
+pub(crate) const IDENTITY_DISCARD_PREFIX: &str = "*File:identity-discard:";
 
 // Only an unenrolled configured root may be initialized. A missing enrolled
 // mount remains unavailable; creating a replacement directory cannot prove it.
@@ -905,6 +913,13 @@ pub(crate) enum EngineMsg {
         /// The hold the writer's `io::Error` named by errno
         /// ([`crate::io_error_hold_cause`]); `None` is a terminal `failed/io`.
         cause: Option<nzbd_types::HoldCause>,
+    },
+    /// The writer found the file on disk is not the object its proof names
+    /// (no-wedge task 1). Nothing was written.
+    WriterIdentityMismatch {
+        job: JobId,
+        file: FileId,
+        error: String,
     },
     /// A real write ran out of space (ENOSPC/EDQUOT). Reported from
     /// wherever it happened — writer, finalize, post-processing — and
@@ -2111,6 +2126,9 @@ impl Owner {
             } => self.on_writer_finalized(job, file, ok, final_path, combined_crc),
             EngineMsg::OutOfSpace { whence, dir } => self.observe_out_of_space_in(&whence, dir),
             EngineMsg::SpaceProbed { observed, result } => self.on_space_probed(observed, result),
+            EngineMsg::WriterIdentityMismatch { job, file, error } => {
+                self.on_writer_identity_mismatch(job, file, &error)
+            }
             EngineMsg::WriterError {
                 job,
                 file,
@@ -6523,6 +6541,13 @@ impl Owner {
                     cause,
                 });
             }
+            WriterFact::IdentityMismatch { error } => {
+                if let Some(writer) = self.writers.remove(&file) {
+                    self.retire_writer_handle(job, writer);
+                }
+                self.writer_epochs.remove(&file);
+                self.on_msg(EngineMsg::WriterIdentityMismatch { job, file, error });
+            }
             WriterFact::Rejected {
                 seg_number,
                 server,
@@ -6540,6 +6565,76 @@ impl Owner {
                 );
             }
         }
+    }
+
+    /// No-wedge task 1. The writer found that the file on disk is not the
+    /// object its proof names. The recorded ranges are therefore not on
+    /// disk: discard this one file's Done ranges and proof and re-download
+    /// it from an empty file (the next writer removes whatever sits at its
+    /// names; the job directory is Runner's closed scope). Other files and
+    /// other jobs are untouched. After [`IDENTITY_RESET_LIMIT`] resets of the
+    /// same file the job ends `failed/identity` and follows its terminal
+    /// policy, so a filesystem that keeps swapping the object cannot loop.
+    fn on_writer_identity_mismatch(&mut self, job: JobId, file: FileId, error: &str) {
+        let resets_key = format!("{IDENTITY_RESETS_PREFIX}{}", file.0);
+        let Some(record) = self.state.job_mut(job) else {
+            return;
+        };
+        if record
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+        {
+            return;
+        }
+        let resets = record
+            .params
+            .iter()
+            .find(|(key, _)| key == &resets_key)
+            .and_then(|(_, value)| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        if resets >= IDENTITY_RESET_LIMIT {
+            tracing::warn!(job = job.0, file = file.0, %error, resets, "writer identity mismatch recurred; failing job");
+            self.fail_job_terminal(
+                job,
+                nzbd_types::FailureReason::Identity,
+                None,
+                "download_write",
+                &format!("{error}; recurred after {resets} re-downloads of the file"),
+            );
+            return;
+        }
+        tracing::warn!(job = job.0, file = file.0, %error, attempt = resets + 1, "writer identity mismatch; re-downloading the file");
+        set_owner_param(
+            &mut record.params,
+            &resets_key,
+            Some((resets + 1).to_string()),
+        );
+        set_owner_param(
+            &mut record.params,
+            &format!("{IDENTITY_DISCARD_PREFIX}{}", file.0),
+            Some("1".into()),
+        );
+        set_owner_param(&mut record.params, &format!("*File:proof:{}", file.0), None);
+        if let Some(entry) = record.files.iter_mut().find(|entry| entry.id == file) {
+            for segment in &mut entry.segments {
+                if matches!(
+                    segment.state,
+                    SegmentState::Done { .. } | SegmentState::Leased { .. }
+                ) {
+                    segment.state = SegmentState::Pending;
+                }
+            }
+            entry.finalized = false;
+            entry.crc32 = None;
+        }
+        recompute_job_totals(record);
+        self.file_sizes.remove(&file);
+        self.finalize_sent.remove(&file);
+        self.attempts.retain(|reference, _| reference.file != file);
+        self.dirty = true;
+        self.publish_now();
+        self.bump_epoch();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6571,6 +6666,15 @@ impl Owner {
             return; // duplicate (e.g. recovery overlap)
         }
         seg.state = SegmentState::Done { offset, len, crc };
+        if let Some(record) = self.state.job_mut(job) {
+            // The writer that took this write started from an empty file:
+            // the discard it was asked for is done.
+            set_owner_param(
+                &mut record.params,
+                &format!("{IDENTITY_DISCARD_PREFIX}{}", file.0),
+                None,
+            );
+        }
         self.append_journal(
             JournalRecord {
                 job,
@@ -8214,6 +8318,8 @@ impl Owner {
             return closed();
         }
         let expected_identity = proof.as_ref().map(|proof| proof.identity.clone());
+        let discard_key = format!("{IDENTITY_DISCARD_PREFIX}{}", file.0);
+        let discard_existing = record.params.iter().any(|(key, _)| key == &discard_key);
         let filename = record
             .params
             .iter()
@@ -8263,6 +8369,7 @@ impl Owner {
                 proven,
                 expected_identity,
                 collect_naming,
+                discard_existing,
                 naming_inventory: collect_naming.then(|| owner.artifacts.clone()),
                 #[cfg(test)]
                 naming_test_hook: None,
@@ -10595,7 +10702,19 @@ pub(crate) fn rearmed_hold(
     }
     let policy = cause.policy();
     let unscheduled = policy.timed() && control.next_retry_at_unix.is_none();
-    if control.cause == cause.as_str() && control.retry_policy == policy.as_str() && !unscheduled {
+    // No-wedge task 1: a writer identity mismatch used to hold the job on
+    // storage until the deadline. It now discards the file and re-downloads,
+    // so the existing hold retries at once and takes that exit.
+    let identity_wedge =
+        writer_identity_hold(&control) && control.next_retry_at_unix.is_some_and(|at| at > now);
+    if identity_wedge {
+        control.next_retry_at_unix = Some(now);
+    }
+    if control.cause == cause.as_str()
+        && control.retry_policy == policy.as_str()
+        && !unscheduled
+        && !identity_wedge
+    {
         return None;
     }
     control.revision = control
@@ -10612,6 +10731,20 @@ pub(crate) fn rearmed_hold(
         None
     };
     Some(control)
+}
+
+/// A hold an earlier build wrote for a writer identity mismatch (the three
+/// refusals that are now [`EngineMsg::WriterIdentityMismatch`]).
+pub(crate) fn writer_identity_hold(control: &nzbd_types::JobControl) -> bool {
+    control.lifecycle == "held"
+        && control.stage == "download_write"
+        && [
+            "payload file identity changed (replaced inode)",
+            "conflicting payload aliases",
+            "writer proven range identity conflict",
+        ]
+        .iter()
+        .any(|marker| control.message.contains(marker))
 }
 
 /// An allocation that failed because the volume stopped answering retries on
