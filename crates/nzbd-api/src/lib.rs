@@ -550,6 +550,45 @@ pub struct StatusDto {
     pub servers: Vec<nzbd_engine::ServerVolume>,
     /// Cached capacity readings for the paths this process relies on.
     pub storage: Vec<StoragePathDto>,
+    /// W10: a restart waiting for post-processing to reach a resumable
+    /// boundary (PAR repair and extraction restart from scratch, so they
+    /// finish first). Absent when no restart is waiting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_pending: Option<RestartPending>,
+}
+
+/// A deferred restart: when it was asked for and what it waits on.
+#[derive(Clone, Debug, Serialize)]
+pub struct RestartPending {
+    pub requested_at_unix: i64,
+    pub waiting_for: Vec<RestartWait>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RestartWait {
+    pub job: u32,
+    pub name: String,
+    pub stage: &'static str,
+}
+
+static RESTART_PENDING: std::sync::Mutex<Option<RestartPending>> = std::sync::Mutex::new(None);
+
+/// Post-processing a restart would throw away: a running PAR repair or
+/// extraction (both restart from the beginning after a reload).
+fn restart_blockers(snap: &QueueSnapshot) -> Vec<RestartWait> {
+    snap.jobs
+        .iter()
+        .filter_map(|job| match job.status {
+            JobStatus::Post {
+                stage: stage @ (nzbd_types::PostStage::ParRepair | nzbd_types::PostStage::Unpack),
+            } => Some(RestartWait {
+                job: job.id.0,
+                name: job.name.clone(),
+                stage: stage.as_str(),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 pub fn status_dto(snap: &QueueSnapshot) -> StatusDto {
@@ -626,6 +665,7 @@ fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -
         }),
         servers: snap.server_volumes.clone(),
         storage,
+        restart_pending: RESTART_PENDING.lock().unwrap().clone(),
     }
 }
 
@@ -2968,6 +3008,9 @@ struct RestartQuery {
     /// that timed out on the client and is re-sent, or delivered late, is
     /// refused instead of cancelling work started since.
     not_after: Option<i64>,
+    /// Restart now even if PAR repair or extraction is running (W10).
+    #[serde(default)]
+    force: bool,
 }
 
 /// Idempotency keys of restarts already executed by this process. Kept
@@ -3045,9 +3088,49 @@ async fn post_restart(
         }
         Ok(true) => {}
     }
+    // W10: never cancel hours of PAR repair or extraction silently. Unless
+    // the operator forces it, the restart waits for them (visible in
+    // /api/v1/status as `restart_pending`) and then runs.
+    let waiting = restart_blockers(&st.engine.snapshot());
+    if !query.force && !waiting.is_empty() {
+        let already = RESTART_PENDING.lock().unwrap().replace(RestartPending {
+            requested_at_unix: now,
+            waiting_for: waiting.clone(),
+        });
+        tracing::info!(waiting = ?waiting, "restart deferred until post-processing reaches a resumable boundary");
+        if already.is_none() {
+            let engine = st.engine.clone();
+            let handle = h.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let waiting = restart_blockers(&engine.snapshot());
+                    let mut pending = RESTART_PENDING.lock().unwrap();
+                    let Some(current) = pending.as_mut() else {
+                        return;
+                    };
+                    if waiting.is_empty() {
+                        *pending = None;
+                        drop(pending);
+                        tracing::info!("post-processing reached a resumable boundary; restarting");
+                        handle
+                            .applied
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        handle.reload.notify_one();
+                        return;
+                    }
+                    current.waiting_for = waiting;
+                }
+            });
+        }
+        return Json(json!({ "ok": true, "restarting": "deferred", "waiting_for": waiting }))
+            .into_response();
+    }
+    RESTART_PENDING.lock().unwrap().take();
     tracing::info!(
         key,
         not_after = query.not_after,
+        force = query.force,
         "restart requested from the settings UI"
     );
     h.applied.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3649,6 +3732,42 @@ mod tests {
             params: vec![],
             stages: vec![],
         }
+    }
+
+    /// W10: only a running PAR repair or extraction defers a restart.
+    #[test]
+    fn restart_waits_only_for_par_repair_and_extraction() {
+        use nzbd_types::PostStage;
+        let snapshot = QueueSnapshot {
+            jobs: vec![
+                summary(
+                    1,
+                    JobStatus::Post {
+                        stage: PostStage::ParRepair,
+                    },
+                ),
+                summary(
+                    2,
+                    JobStatus::Post {
+                        stage: PostStage::Unpack,
+                    },
+                ),
+                summary(
+                    3,
+                    JobStatus::Post {
+                        stage: PostStage::ParVerify,
+                    },
+                ),
+                summary(4, JobStatus::Downloading),
+            ],
+            ..Default::default()
+        };
+        let waiting = super::restart_blockers(&snapshot);
+        assert_eq!(
+            waiting.iter().map(|w| (w.job, w.stage)).collect::<Vec<_>>(),
+            vec![(1, "par_repair"), (2, "unpack")]
+        );
+        assert!(super::restart_blockers(&QueueSnapshot::default()).is_empty());
     }
 
     #[test]
