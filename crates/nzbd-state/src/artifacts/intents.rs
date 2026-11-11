@@ -667,6 +667,9 @@ impl Inventory {
                 crate::fileops::link(&from, &to)?;
                 fs::count_op(&self.installation, "link", 1);
             } else {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                fs::rename_exclusive_from_open(&from, &to, input)?;
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 fs::rename_exclusive(&from, &to)?;
                 fs::count_op(&self.installation, "rename", 1);
             }

@@ -1317,7 +1317,16 @@ impl Inventory {
                 persist_progress(self, op, plan, index, false)?;
                 boundary("stage_complete", index)?;
                 checkpoint()?;
-                crate::fileops::rename_exclusive(&stage_path, &artifact.path.join(&entry.path))?;
+                // Only the verified handle may stay open on the stage name;
+                // it pins the inode through the rename and closes before
+                // unlink (see `fileops::rename_exclusive_from_open`).
+                drop(staged);
+                drop(output);
+                crate::fileops::rename_exclusive_from_open(
+                    &stage_path,
+                    &artifact.path.join(&entry.path),
+                    copied,
+                )?;
                 boundary("published", index)?;
             } else if !matches!(stage_open,Err(Error::Io(ref error)) if error.kind()==std::io::ErrorKind::NotFound)
                 || entry.digest.is_none()
