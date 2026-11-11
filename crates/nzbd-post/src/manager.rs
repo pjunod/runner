@@ -806,9 +806,39 @@ async fn failure_followup_settle(
         }
     };
     let Some(row) = row else {
-        // The queue row is gone (an operator delete, which owns its bytes):
-        // nothing remains for runner to salvage or dispose.
+        // The queue row is gone. A committed publication of the job is still
+        // owed as salvage (W2) and needs no row: its journal and terminal
+        // build the delivery. Otherwise (an operator delete, which owns its
+        // bytes) nothing remains for runner to salvage or dispose.
         let inventory = engine.artifacts();
+        let journaled = inventory.clone();
+        match tokio::task::spawn_blocking(move || journaled.finish_committed_salvage(job.0)).await {
+            Ok(Ok(Some(delivery))) => {
+                let publication = nzbd_types::Publication {
+                    path: delivery.publication_path.clone(),
+                    generation: delivery.publication_generation.clone(),
+                    manifest_digest: delivery.manifest_digest.clone(),
+                    files: u32::try_from(delivery.files.len()).unwrap_or(u32::MAX),
+                    cross_volume: inventory.delivery_cross_volume(&delivery),
+                };
+                let settled = inventory.clone();
+                let outcome = nzbd_state::artifacts::SalvageOutcome::Published(publication.clone());
+                if matches!(
+                    tokio::task::spawn_blocking(move || settled.settle_salvage(job.0, &outcome))
+                        .await,
+                    Ok(Ok(()))
+                ) {
+                    engine.emit_publication_ready(job, publication);
+                }
+                return Settle::Pending;
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(job = job.0, %error, "committed salvage publication remains pending");
+                return Settle::Pending;
+            }
+            Err(_) => return Settle::Pending,
+        }
         let _ = tokio::task::spawn_blocking(move || {
             inventory.settle_salvage(
                 job.0,

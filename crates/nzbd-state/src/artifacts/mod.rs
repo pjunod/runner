@@ -126,6 +126,15 @@ impl Identity {
             && self.directory == other.directory
     }
 }
+impl Identity {
+    /// Contract §2.5 / principle 5: a published file's identity is its
+    /// object, size and modification time (plus the journaled digest the
+    /// caller carries). Never ctime: link/unlink, NFS silly-rename removal
+    /// and chmod move ctime without touching the bytes.
+    pub fn same_publication(&self, other: &Self) -> bool {
+        self.same_object(other) && self.bytes == other.bytes && self.modified == other.modified
+    }
+}
 impl PartialEq for Identity {
     fn eq(&self, other: &Self) -> bool {
         self.same_object(other)
@@ -803,6 +812,41 @@ impl Inventory {
                     [],
                 )?;
             }
+        }
+        // 0.9.0: the committed manifest lives in the move journal so a
+        // delivery row never re-reads a publication its consumer may have
+        // taken (contract §2.5). Additive and idempotent.
+        let has_intent_manifest: bool = db.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('relocation_intents') WHERE name='manifest'",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n != 0),
+        )?;
+        if !has_intent_manifest {
+            db.execute(
+                "ALTER TABLE relocation_intents ADD COLUMN manifest TEXT",
+                [],
+            )?;
+        }
+        {
+            let tx = db.transaction()?;
+            terminals::reopen_salvage_for_committed_publications(&tx, None)?;
+            // 0.9.0 closed scope (W4): a source cleanup an older build
+            // blocked on retained review files or per-file identity drift is
+            // retried once under the new rule. Once per store.
+            let migrated: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='closed_scope_cleanup_migration')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !migrated {
+                tx.execute("UPDATE operations SET data=json_set(data,'$.request',(json_set(json_extract(data,'$.request'),'$.cleanup.state','retry','$.cleanup.next_retry',0,'$.cleanup.error',NULL) || '')) WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.cleanup.state')='blocked'", [])?;
+                tx.execute("UPDATE deliveries SET cleanup_status='retry',cleanup_error=NULL,cleanup_next_retry_at=0,cleanup_blocked_since=NULL WHERE cleanup_status='blocked'", [])?;
+                tx.execute(
+                    "INSERT INTO meta(key,value) VALUES('closed_scope_cleanup_migration','1')",
+                    [],
+                )?;
+            }
+            tx.commit()?;
         }
         // A `running` cleanup belongs to a worker from the previous process.
         // The inventory lock was acquired above, so no live worker can race
@@ -1786,6 +1830,31 @@ impl Inventory {
             && a.path == path
             && a.root == root
         {
+            return Ok(a);
+        }
+        // Contract §2.5: a committed per-file publication is finalized from
+        // its journal. It is visible, so its consumer may already have
+        // taken files out of it; re-reading it would only find that.
+        if matches!(state, "active" | "completed")
+            && matches!(a.state.as_str(), "active" | "completed")
+            && a.owned
+            && a.path == path
+            && a.root == root
+            && self.committed_publication_intent(&a)?.is_some()
+        {
+            if a.state == state {
+                return Ok(a);
+            }
+            a.state = state.into();
+            a.revision += 1;
+            a.updated_at = now();
+            let _coordinator = self.mutation_guard()?;
+            self.check_payload_capture(&original)?;
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
+            save_artifact(&tx, &a)?;
+            event(&tx, &a.id, "finalized", state)?;
+            tx.commit()?;
             return Ok(a);
         }
         if a.path == path && a.state == state {

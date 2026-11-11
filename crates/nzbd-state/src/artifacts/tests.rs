@@ -682,11 +682,11 @@ fn selected_delivery_copies_only_payload_and_prunes_resolved_source_files() {
         .unwrap();
     assert_eq!(replayed.len(), 4);
     let delivery = db.create_delivery(49, true, Some("t-49-test")).unwrap();
+    // Closed scope (W4): after a successful delivery nothing in the source
+    // is retained for review; the tree goes whole.
     let cleanup = db.retire_delivery_source(&delivery.delivery_id).unwrap();
-    assert_eq!(cleanup.source_cleanup.status, "blocked");
-    assert!(!source.join("Season 1/ep01.mkv").exists());
-    assert!(!source.join("readme.txt").exists());
-    assert!(source.join("unresolved.rar").exists());
+    assert_eq!(cleanup.source_cleanup.status, "succeeded");
+    assert!(!source.exists());
     let status = |path: &str| {
         cleanup
             .file_outcomes
@@ -699,12 +699,11 @@ fn selected_delivery_copies_only_payload_and_prunes_resolved_source_files() {
     assert_eq!(status("Season 1/ep01.mkv"), "removed");
     assert_eq!(status("readme.txt"), "removed");
     assert_eq!(status("consumed.rar"), "removed");
-    assert_eq!(status("unresolved.rar"), "retained");
-    assert!(!source.join("consumed.rar").exists());
+    assert_eq!(status("unresolved.rar"), "removed");
 }
 
 #[test]
-fn selected_delivery_retains_published_par_repair_dependency_without_keep() {
+fn selected_delivery_retires_published_par_repair_dependency_after_success() {
     let (tmp, db, root) = fixture();
     let source = root.join("working-par-dependency");
     db.allocate_for_delivery(54, &root, &source, true, true)
@@ -747,13 +746,14 @@ fn selected_delivery_retains_published_par_repair_dependency_without_keep() {
     let delivery = db
         .create_delivery(54, true, Some("repair-dependency-token"))
         .unwrap();
+    // A published repair input is linked, not renamed, so the PAR set stays
+    // repairable while the job can still need it. Once the delivery is a
+    // success that need is over (closed scope, W4): the source goes whole
+    // and the publication keeps its own name.
     let cleanup = db.retire_delivery_source(&delivery.delivery_id).unwrap();
-    assert_eq!(cleanup.source_cleanup.status, "blocked");
-    // A published repair input keeps its source name (linked, not renamed):
-    // the PAR set stays repairable after curator removes the publication.
-    assert!(source.join("episode.mkv").exists());
+    assert_eq!(cleanup.source_cleanup.status, "succeeded");
+    assert!(!source.exists());
     assert!(target.join("episode.mkv").exists());
-    assert!(source.join("set.par2").exists());
     let status = |path: &str| {
         cleanup
             .file_outcomes
@@ -763,8 +763,8 @@ fn selected_delivery_retains_published_par_repair_dependency_without_keep() {
             .source_cleanup_status
             .clone()
     };
-    assert_eq!(status("episode.mkv"), "retained_repair_dependency");
-    assert_eq!(status("set.par2"), "retained_repair_dependency");
+    assert_eq!(status("episode.mkv"), "removed");
+    assert_eq!(status("set.par2"), "removed");
     assert!(!db.get(&delivery.artifact_id).unwrap().keep_on_failure);
 }
 
@@ -1225,7 +1225,7 @@ fn keep_off_does_not_requeue_conflicted_failed_delete() {
 }
 
 #[test]
-fn clearing_keep_retries_partial_delivery_cleanup_without_deleting_recoverable_inputs() {
+fn clearing_keep_retries_partial_delivery_cleanup_as_a_closed_scope() {
     let (tmp, db, root) = fixture();
     let source = root.join("keep-partial-source");
     db.allocate_for_delivery(61, &root, &source, true, true)
@@ -1306,10 +1306,11 @@ fn clearing_keep_retries_partial_delivery_cleanup_without_deleting_recoverable_i
     assert!(db.set_keep_on_failure(61, false).unwrap());
     let scheduled = db.delivery(&delivery.delivery_id).unwrap();
     assert_eq!(scheduled.source_cleanup.status, "retry");
+    // Without Keep the failure follows the closed-scope rule: what the
+    // publication did not take is removed with the source.
     let refreshed = db.retire_delivery_source(&delivery.delivery_id).unwrap();
-    assert_eq!(refreshed.source_cleanup.status, "blocked");
-    assert!(!source.join("sample.txt").exists());
-    assert!(source.join("complete.rar").exists());
+    assert_eq!(refreshed.source_cleanup.status, "succeeded");
+    assert!(!source.exists());
     assert!(target.join("episode.mkv").exists());
 }
 

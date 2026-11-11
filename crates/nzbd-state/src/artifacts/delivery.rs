@@ -173,7 +173,7 @@ fn digest_files(
         .filter(|entry| !entry.identity.directory && entry.path != super::RUNNER_MANIFEST_NAME)
     {
         if let Some((landed, sha256)) = journaled.get(&entry.path) {
-            if landed == &entry.identity {
+            if landed.same_publication(&entry.identity) {
                 files.push(DeliveryFile {
                     path: entry.path.clone(),
                     size_bytes: entry.identity.bytes,
@@ -327,6 +327,9 @@ pub struct PreparedDelivery {
     pub cross_volume: bool,
     /// The publication's `.runner-manifest.json`, when it has one.
     pub manifest: Option<super::RunnerManifest>,
+    /// Built from the committed move journal, not the filesystem (contract
+    /// §2.5, consumer owns bytes after handoff): the commit re-reads nothing.
+    journaled: bool,
 }
 
 impl PreparedDelivery {
@@ -523,6 +526,21 @@ impl Inventory {
                     "delivery requires an active, owned, unheld publication".into(),
                 ));
             }
+            let publication_path = artifact.path.to_string_lossy().into_owned();
+            // Contract §2.5: a per-file publication's committed journal is
+            // the authority for what was published. Once it is visible the
+            // consumer may already have moved files out of it, so it is
+            // never read again (job 2709: curator imported before the row).
+            if let Some(intent) = self.committed_publication_intent(&artifact)? {
+                drop(_guard);
+                return self.prepare_journaled_delivery(
+                    job,
+                    artifact,
+                    intent,
+                    publication_path,
+                    existing,
+                );
+            }
             let root = self.verify(&artifact)?;
             let observed = fs::manifest(&root, 100_000)?;
             if observed != artifact.files {
@@ -530,7 +548,6 @@ impl Inventory {
                     "published payload changed before delivery receipt".into(),
                 ));
             }
-            let publication_path = artifact.path.to_string_lossy().into_owned();
             (artifact, root, observed, publication_path, existing)
         };
         let file_outcomes = self.delivery_file_outcomes(&artifact.id, &artifact.generation)?;
@@ -593,6 +610,73 @@ impl Inventory {
             manifest_digest,
             cross_volume,
             manifest,
+            journaled: false,
+        })
+    }
+
+    /// The committed move journal of the publication `artifact` names, when
+    /// it covers it (same artifact, generation and target directory, every
+    /// file digested).
+    pub(super) fn committed_publication_intent(
+        &self,
+        artifact: &Artifact,
+    ) -> Result<Option<super::RelocationIntent>> {
+        Ok(self
+            .relocation_intent(&artifact.generation)?
+            .filter(|intent| {
+                intent.artifact == artifact.id
+                    && intent.state == super::IntentState::Committed
+                    && intent.target_dir == artifact.path
+                    && !intent.files.is_empty()
+                    && intent.files.iter().all(|file| file.sha256.is_some())
+            }))
+    }
+
+    /// Everything the delivery row needs, from the committed journal alone:
+    /// the files and digests the move recorded, the manifest it wrote, the
+    /// snapshot taken at commit. No filesystem access.
+    fn prepare_journaled_delivery(
+        &self,
+        job: u32,
+        artifact: Artifact,
+        intent: super::RelocationIntent,
+        publication_path: String,
+        existing_delivery: Option<Delivery>,
+    ) -> Result<PreparedDelivery> {
+        let file_outcomes = self.delivery_file_outcomes(&artifact.id, &artifact.generation)?;
+        let (source_artifact_id, source_generation) =
+            self.delivery_source_ref(&artifact.id, &artifact.generation, &publication_path)?;
+        let manifest = self.intent_manifest(&intent)?;
+        let mut files = manifest
+            .files
+            .iter()
+            .map(|file| DeliveryFile {
+                path: file.path.clone(),
+                size_bytes: file.bytes,
+                sha256: file.sha256.clone(),
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        let manifest_digest = manifest_digest(&files);
+        if manifest_digest != manifest.digest || manifest.generation != artifact.generation {
+            return Err(Error::Conflict(
+                "publication journal disagrees with its manifest".into(),
+            ));
+        }
+        Ok(PreparedDelivery {
+            job,
+            observed: artifact.files.clone(),
+            artifact,
+            publication_path,
+            existing_delivery,
+            file_outcomes,
+            source_artifact_id,
+            source_generation,
+            files,
+            manifest_digest,
+            cross_volume: intent.cross_volume,
+            manifest: Some(manifest),
+            journaled: true,
         })
     }
 
@@ -640,6 +724,7 @@ impl Inventory {
             manifest_digest,
             cross_volume: _,
             manifest,
+            journaled,
         } = prepared;
         let id = format!("{}:{}", artifact.id, artifact.generation);
         let _guard = self.mutation_guard()?;
@@ -657,11 +742,13 @@ impl Inventory {
                 "publication changed while preparing delivery manifest".into(),
             ));
         }
-        let current_root = self.verify(&current)?;
-        if fs::manifest(&current_root, 100_000)? != observed {
-            return Err(Error::Conflict(
-                "published payload changed while preparing delivery manifest".into(),
-            ));
+        if !journaled {
+            let current_root = self.verify(&current)?;
+            if fs::manifest(&current_root, 100_000)? != observed {
+                return Err(Error::Conflict(
+                    "published payload changed while preparing delivery manifest".into(),
+                ));
+            }
         }
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;

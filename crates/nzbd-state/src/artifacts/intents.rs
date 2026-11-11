@@ -246,9 +246,7 @@ fn file_name(path: &str) -> Result<&std::ffi::OsStr> {
 
 /// Same object, same size, same modification time: what survives a rename.
 fn moved_identity_matches(recorded: &Identity, observed: &Identity) -> bool {
-    recorded.same_object(observed)
-        && recorded.bytes == observed.bytes
-        && recorded.modified == observed.modified
+    recorded.same_publication(observed)
 }
 
 fn open_optional(root: &File, path: &str) -> Result<Option<File>> {
@@ -547,6 +545,51 @@ impl Inventory {
             .into_iter()
             .filter_map(|file| Some((file.dst, (file.dst_identity?, file.sha256?))))
             .collect())
+    }
+
+    /// The `.runner-manifest.json` a committed intent wrote, from the
+    /// journal: stored at commit; an intent committed before the column
+    /// existed is rebuilt from its files (the digest covers only those;
+    /// `created_at` is then the commit time).
+    pub(super) fn intent_manifest(&self, intent: &RelocationIntent) -> Result<RunnerManifest> {
+        let stored: Option<String> = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT manifest FROM relocation_intents WHERE generation=?1",
+                [&intent.generation],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(raw) = stored {
+            let manifest: RunnerManifest = serde_json::from_str(&raw)?;
+            if manifest.verifies() {
+                return Ok(manifest);
+            }
+        }
+        let files = intent
+            .files
+            .iter()
+            .map(|file| {
+                Ok(ManifestFile {
+                    path: file.dst.clone(),
+                    bytes: file.bytes,
+                    sha256: file.sha256.clone().ok_or_else(|| {
+                        Error::Conflict(format!("journaled file has no digest: {}", file.dst))
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(RunnerManifest::new(
+            intent.generation.clone(),
+            intent.job,
+            intent.transfer.clone(),
+            intent.updated_at,
+            intent.cross_volume,
+            files,
+        ))
     }
 
     /// The selected-publication snapshot a cluster worker seals, from the
@@ -875,7 +918,14 @@ impl Inventory {
         if op.state == "succeeded" {
             let mut committed = intent.clone();
             committed.state = IntentState::Committed;
-            update_intent(&self.db.lock().unwrap(), &committed)?;
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
+            update_intent(&tx, &committed)?;
+            tx.execute(
+                "UPDATE relocation_intents SET manifest=?2 WHERE generation=?1",
+                params![intent.generation, serde_json::to_string(manifest)?],
+            )?;
+            tx.commit()?;
             return Ok(());
         }
         let mut current = self.relocation_source(&op, &movement)?.ok_or_else(|| {
@@ -908,7 +958,7 @@ impl Inventory {
             if !file
                 .dst_identity
                 .as_ref()
-                .is_some_and(|landed| landed == &entry.identity)
+                .is_some_and(|landed| landed.same_publication(&entry.identity))
             {
                 return Err(Error::Conflict(format!(
                     "publication file changed before commit: {}",
@@ -984,6 +1034,13 @@ impl Inventory {
         op.request = serde_json::to_string(&movement)?;
         save_operation(&tx, &op)?;
         update_intent(&tx, &committed)?;
+        // The manifest the publication carries, so the delivery row is
+        // rebuilt from the journal after the consumer took the files.
+        tx.execute(
+            "UPDATE relocation_intents SET manifest=?2 WHERE generation=?1",
+            params![intent.generation, serde_json::to_string(manifest)?],
+        )?;
+        super::terminals::reopen_salvage_for_committed_publications(&tx, Some(intent.job))?;
         event(
             &tx,
             &current.id,
@@ -1911,6 +1968,262 @@ mod tests {
         }
     }
 
+    /// Crash after the manifest, restart, publish into a directory the
+    /// fault left behind: shared shape for the W1/W2/W7 tests below.
+    fn crash_after(
+        base: &Path,
+        stage: &'static str,
+        id: u32,
+    ) -> (Inventory, PathBuf, PathBuf, String) {
+        let (db, root) = fixture_in(base);
+        let (source, selected, outcomes) = job(&db, &root, id, SELECTED, SIBLINGS);
+        let completed = base.join("completed");
+        std::fs::create_dir_all(&completed).unwrap();
+        let target = completed.join(format!("release.job-{id}.runner-g"));
+        super::super::relocation::FAULTS
+            .with(|faults| faults.borrow_mut().insert(stage, libc::EIO));
+        assert!(db
+            .publish_selected_with_transfer(
+                id,
+                &target,
+                selected,
+                outcomes,
+                Some("t-wedge"),
+                true,
+                &|| Ok(())
+            )
+            .is_err());
+        let generation = db.for_job(id).unwrap().unwrap().generation;
+        (db, source, target, generation)
+    }
+
+    /// R1 / W7 (job 2709): curator consumed the publication before runner
+    /// wrote its delivery row. The row is built from the committed journal
+    /// with no read of the (now empty) publication, and the source retires.
+    #[test]
+    fn consumed_publication_gets_its_delivery_row_from_the_journal() {
+        let base = tempfile::tempdir().unwrap();
+        let (db, source, target, generation) = crash_after(base.path(), "after_manifest", 81);
+        db.close().unwrap();
+        let db = Inventory::open(&base.path().join("state")).unwrap();
+        db.reconcile_relocations().unwrap();
+        let intent = db.relocation_intent(&generation).unwrap().unwrap();
+        assert_eq!(intent.state, IntentState::Committed);
+        let written = read_manifest(&fs::open_dir(&target).unwrap())
+            .unwrap()
+            .unwrap();
+        // Curator imports: the video leaves, then the directory goes.
+        std::fs::remove_file(target.join("Show.S01E01.mkv")).unwrap();
+        db.finish(81, &target, target.parent().unwrap(), "completed")
+            .unwrap();
+        std::fs::remove_dir_all(&target).unwrap();
+        crate::fileops::PAYLOAD_READ_BYTES.with(|total| total.set(0));
+        let delivery = db.create_delivery(81, true, Some("t-wedge")).unwrap();
+        assert_eq!(
+            crate::fileops::PAYLOAD_READ_BYTES.with(|total| total.get()),
+            0
+        );
+        assert_eq!(delivery.files.len(), SELECTED.len());
+        assert_eq!(delivery.manifest_digest, written.digest);
+        assert_eq!(
+            delivery.manifest.as_ref(),
+            Some(&written),
+            "the stored manifest"
+        );
+        // Replaying the delivery is idempotent, still without the directory.
+        assert_eq!(
+            db.create_delivery(81, true, Some("t-wedge"))
+                .unwrap()
+                .delivery_id,
+            delivery.delivery_id
+        );
+        let cleanup = db.retire_delivery_source(&delivery.delivery_id).unwrap();
+        assert_eq!(cleanup.source_cleanup.status, "succeeded");
+        assert!(!source.exists());
+    }
+
+    /// R2 / W1: a ctime-only change on a landed file (an NFS silly-rename
+    /// removal, a link/unlink, chmod) does not block the commit.
+    #[test]
+    fn ctime_change_on_a_landed_file_does_not_block_commit() {
+        let base = tempfile::tempdir().unwrap();
+        let (db, _source, target, generation) = crash_after(base.path(), "after_last_rename", 82);
+        let landed = target.join("Show.S01E02.mkv");
+        let before = std::fs::metadata(&landed).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let alias = target.join("alias");
+            std::fs::hard_link(&landed, &alias).unwrap();
+            std::fs::remove_file(&alias).unwrap();
+            use std::os::unix::fs::MetadataExt;
+            let after = std::fs::metadata(&landed).unwrap();
+            if (after.ctime(), after.ctime_nsec()) != (before.ctime(), before.ctime_nsec()) {
+                assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "ctime never advanced");
+        }
+        db.close().unwrap();
+        let db = Inventory::open(&base.path().join("state")).unwrap();
+        db.reconcile_relocations().unwrap();
+        let intent = db.relocation_intent(&generation).unwrap().unwrap();
+        assert_eq!(
+            intent.state,
+            IntentState::Committed,
+            "{:?}",
+            intent.evidence
+        );
+        db.create_delivery(82, true, Some("t-wedge")).unwrap();
+    }
+
+    /// R1 / W2: a failed terminal cannot settle `none` while its publication
+    /// move is open; when the move commits, the obligation reopens and the
+    /// salvage completes from the journal — without the queue row.
+    #[test]
+    fn a_later_commit_reopens_salvage_and_delivers_it() {
+        let base = tempfile::tempdir().unwrap();
+        let (db, _source, _target, _generation) = crash_after(base.path(), "after_manifest", 83);
+        let terminal = super::super::terminals::tests::failed(83, SalvageState::Pending);
+        db.record_terminal(&terminal).unwrap();
+        assert!(db
+            .settle_salvage(83, &SalvageOutcome::None { error: None })
+            .is_err());
+        // An older build settled it anyway.
+        db.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE job_terminals SET salvage='settled_none' WHERE job=83",
+                [],
+            )
+            .unwrap();
+        db.close().unwrap();
+        let db = Inventory::open(&base.path().join("state")).unwrap();
+        assert_eq!(
+            db.terminal(83).unwrap().unwrap().salvage,
+            SalvageState::SettledNone
+        );
+        db.reconcile_relocations().unwrap();
+        assert_eq!(
+            db.terminal(83).unwrap().unwrap().salvage,
+            SalvageState::Pending
+        );
+        let delivery = db.finish_committed_salvage(83).unwrap().unwrap();
+        assert_eq!(delivery.terminal_outcome, "UNPACK_FAILURE");
+        assert_eq!(delivery.files.len(), SELECTED.len());
+        db.settle_salvage(
+            83,
+            &SalvageOutcome::Published(nzbd_types::Publication {
+                path: delivery.publication_path.clone(),
+                generation: delivery.publication_generation.clone(),
+                manifest_digest: delivery.manifest_digest.clone(),
+                files: delivery.files.len() as u32,
+                cross_volume: false,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            db.terminal(83).unwrap().unwrap().salvage,
+            SalvageState::Published
+        );
+        assert!(db.finish_committed_salvage(83).unwrap().is_none());
+    }
+
+    /// 0.9.0 open-time migrations: the journal gains its `manifest` column,
+    /// a committed publication left with `settled_none` salvage reopens,
+    /// and a delivery cleanup an older build blocked is retried once.
+    /// Each is idempotent across reopens.
+    #[test]
+    fn upgrade_migrations_are_idempotent() {
+        let base = tempfile::tempdir().unwrap();
+        let (db, root) = fixture_in(base.path());
+        let (_source, selected, outcomes) = job(&db, &root, 84, SELECTED, SIBLINGS);
+        let target = base.path().join("completed/release.job-84.runner-g");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        db.publish_selected_with_transfer(84, &target, selected, outcomes, None, true, &|| Ok(()))
+            .unwrap();
+        db.record_terminal(&super::super::terminals::tests::failed(
+            84,
+            SalvageState::Pending,
+        ))
+        .unwrap();
+        let (db2, root2) = (db, root);
+        let (_s, selected, outcomes) = job(&db2, &root2, 85, SELECTED, SIBLINGS);
+        let other = base.path().join("completed/release.job-85.runner-g");
+        db2.publish_selected_with_transfer(85, &other, selected, outcomes, None, true, &|| Ok(()))
+            .unwrap();
+        let blocked = db2.create_delivery(85, true, None).unwrap();
+        {
+            let conn = db2.db.lock().unwrap();
+            conn.execute_batch(
+                "UPDATE job_terminals SET salvage='settled_none' WHERE job=84;
+                 ALTER TABLE relocation_intents DROP COLUMN manifest;
+                 DELETE FROM meta WHERE key='closed_scope_cleanup_migration';",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE deliveries SET cleanup_status='blocked' WHERE id=?1",
+                [&blocked.delivery_id],
+            )
+            .unwrap();
+        }
+        db2.close().unwrap();
+        drop(db2);
+        for round in 0..2 {
+            let db = Inventory::open(&base.path().join("state")).unwrap();
+            let has_column: bool = db
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('relocation_intents') WHERE name='manifest'",
+                    [],
+                    |r| r.get::<_, i64>(0).map(|n| n == 1),
+                )
+                .unwrap();
+            assert!(has_column, "round {round}");
+            if round == 0 {
+                assert_eq!(
+                    db.terminal(84).unwrap().unwrap().salvage,
+                    SalvageState::Pending
+                );
+                assert_eq!(
+                    db.delivery(&blocked.delivery_id)
+                        .unwrap()
+                        .source_cleanup
+                        .status,
+                    "retry"
+                );
+                // A legacy intent has no stored manifest: rebuilt from its files.
+                let delivery = db.finish_committed_salvage(84).unwrap().unwrap();
+                assert_eq!(delivery.files.len(), SELECTED.len());
+                db.db
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE deliveries SET cleanup_status='blocked' WHERE id=?1",
+                        [&blocked.delivery_id],
+                    )
+                    .unwrap();
+            } else {
+                assert_eq!(
+                    db.delivery(&blocked.delivery_id)
+                        .unwrap()
+                        .source_cleanup
+                        .status,
+                    "blocked",
+                    "the cleanup migration runs once"
+                );
+                assert_eq!(
+                    db.terminal(84).unwrap().unwrap().salvage,
+                    SalvageState::Pending
+                );
+            }
+            db.close().unwrap();
+        }
+    }
+
     /// Review #283-3: a restart that decided to finish (`Finishing`) and
     /// stopped again between a rename and its journal update re-locates the
     /// unrecorded file on the next restart instead of retrying a move whose
@@ -2359,23 +2672,20 @@ mod tests {
             assert_eq!(std::fs::read(target.join("b.mkv")).unwrap(), b"plain");
             assert!(!source.join("b.mkv").exists());
             let delivery = db.create_delivery(67, true, None).unwrap();
+            // Closed scope (W4): a repair dependency only matters until the
+            // delivery row exists; after a success the source goes whole and
+            // the publication keeps its own name for the linked input.
             let cleanup = db.retire_delivery_source(&delivery.delivery_id).unwrap();
+            assert_eq!(cleanup.source_cleanup.status, "succeeded");
+            assert!(!source.exists());
             assert_eq!(
-                cleanup.source_cleanup.status, "blocked",
-                "the repair input stays"
+                std::fs::read(target.join("a.mkv")).unwrap(),
+                b"repair input"
             );
-            assert!(source.join("a.mkv").exists());
-            let status = |path: &str| {
-                cleanup
-                    .file_outcomes
-                    .iter()
-                    .find(|outcome| outcome.source_path == path)
-                    .unwrap()
-                    .source_cleanup_status
-                    .clone()
-            };
-            assert_eq!(status("a.mkv"), "retained_repair_dependency");
-            assert_eq!(status("b.mkv"), "removed");
+            assert!(cleanup
+                .file_outcomes
+                .iter()
+                .all(|outcome| outcome.source_cleanup_status == "removed"));
         }
     }
 

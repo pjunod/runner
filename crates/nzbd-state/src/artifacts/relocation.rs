@@ -2271,6 +2271,88 @@ impl Inventory {
         save_artifact(&self.db.lock().unwrap(), &current)
     }
 
+    /// Remove everything under a closed-scope source root, deepest first,
+    /// by name under the verified root descriptor: no per-file identity or
+    /// classification (a PAR repair may have rewritten a part; NFS may have
+    /// moved a ctime), and nothing is retained for review. Records every
+    /// outcome `removed` on the operation and the delivery row.
+    fn remove_closed_scope_tree(
+        &self,
+        op: &mut Operation,
+        movement: &mut Relocation,
+        source: &mut Artifact,
+        root: &File,
+    ) -> Result<()> {
+        let mut entries = fs::manifest(root, 1_000_000)?;
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.path.matches('/').count()));
+        for entry in &entries {
+            let path = Path::new(&entry.path);
+            let parent = path.parent().unwrap_or(Path::new(""));
+            let parent_dir = if parent.as_os_str().is_empty() {
+                root.try_clone()?
+            } else {
+                fs::open_relative(
+                    root,
+                    parent
+                        .to_str()
+                        .ok_or_else(|| Error::Conflict("non-UTF-8 source path".into()))?,
+                )?
+            };
+            let name = path
+                .file_name()
+                .ok_or_else(|| Error::Conflict("empty source path".into()))?;
+            match fs::unlink(&parent_dir, Path::new(name), entry.identity.directory) {
+                Ok(()) => {}
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        fs::sync_directory(root)?;
+        for outcome in &mut movement.file_outcomes {
+            outcome.source_cleanup_status = "removed".into();
+            if !movement
+                .source_cleanup_removed
+                .contains(&outcome.source_path)
+                && outcome.publication_path.is_none()
+            {
+                movement
+                    .source_cleanup_removed
+                    .push(outcome.source_path.clone());
+            }
+        }
+        movement.source_cleanup_current = None;
+        source.files.clear();
+        op.request = serde_json::to_string(movement)?;
+        let _coordinator = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        save_operation(&tx, op)?;
+        save_artifact(&tx, source)?;
+        if let Some(raw) = tx
+            .query_row(
+                "SELECT data FROM deliveries WHERE artifact=?1 AND generation=?2",
+                params![movement.source.id, movement.source.generation],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let mut delivery: crate::artifacts::Delivery = serde_json::from_str(&raw)?;
+            for row in &mut delivery.file_outcomes {
+                row.source_cleanup_status = "removed".into();
+            }
+            tx.execute(
+                "UPDATE deliveries SET data=?3 WHERE artifact=?1 AND generation=?2",
+                params![
+                    movement.source.id,
+                    movement.source.generation,
+                    super::delivery::delivery_row_json(&delivery)?
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn retire_selected_source_entries(
         &self,
         op: &mut Operation,
@@ -2322,7 +2404,24 @@ impl Inventory {
             return Ok(true);
         }
         let root = self.verify(&source)?;
-        let observed = fs::manifest(&root, 100_000)?;
+        // Closed scope (W4, Paul): every file of a job's source came from its
+        // own download. Once the delivery is a success — or a failure the job
+        // does not keep — whatever the publication did not take is garbage:
+        // the tree is removed by root identity, not classified file by file.
+        let delivered: bool = self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM deliveries WHERE artifact=?1 AND generation=?2)",
+            params![movement.source.id, movement.source.generation],
+            |row| row.get(0),
+        )?;
+        let closed_scope = (delivered || successful) && (successful || !source.keep_on_failure);
+        if closed_scope {
+            self.remove_closed_scope_tree(op, movement, &mut source, &root)?;
+        }
+        let observed = if closed_scope {
+            Vec::new()
+        } else {
+            fs::manifest(&root, 100_000)?
+        };
         for entry in &observed {
             if !movement.source.files.iter().any(|expected| {
                 expected.path == entry.path
@@ -2339,7 +2438,7 @@ impl Inventory {
             .source
             .files
             .iter()
-            .filter(|entry| !entry.identity.directory)
+            .filter(|entry| !closed_scope && !entry.identity.directory)
         {
             let Some(outcome_index) = movement
                 .file_outcomes
@@ -2467,7 +2566,11 @@ impl Inventory {
             }
             tx.commit()?;
         }
-        let mut remaining = fs::manifest(&root, 100_000)?;
+        let mut remaining = if closed_scope {
+            Vec::new()
+        } else {
+            fs::manifest(&root, 100_000)?
+        };
         remaining.sort_by_key(|entry| std::cmp::Reverse(entry.path.matches('/').count()));
         for directory in remaining.iter().filter(|entry| entry.identity.directory) {
             if movement.file_outcomes.iter().any(|outcome| {
@@ -3670,6 +3773,9 @@ mod performance_tests {
             .unwrap();
         std::fs::write(source.join("media.mkv"), vec![23; 131073]).unwrap();
         if retained {
+            // Only a kept failure retains anything after its delivery
+            // (closed scope, W4); that is the shape these tests block on.
+            db.set_keep_on_failure(job, true).unwrap();
             std::fs::write(source.join("unresolved.rar"), b"keep this").unwrap();
         }
         let a = db.refresh_for_delivery(job).unwrap();
@@ -3712,6 +3818,20 @@ mod performance_tests {
         .unwrap()
     }
 
+    /// The delivery of a kept failure: its unresolved inputs stay.
+    fn kept_failure_delivery(db: &Inventory, job: u32, token: &str) -> Delivery {
+        db.create_delivery_with_outcome_and_keep(
+            job,
+            true,
+            Some(token),
+            "UNPACK_FAILURE",
+            Some("unpack"),
+            Some("archive failed"),
+            true,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn per_file_publication_reads_each_file_once_and_cleanup_reads_nothing() {
         let (tmp, db, root) = setup();
@@ -3742,9 +3862,7 @@ mod performance_tests {
     fn blocked_delivery_sweeps_do_not_retry_or_read_payload() {
         let (tmp, db, root) = setup();
         let moved = publish(&db, &root, &tmp.path().join("completed"), 1, true);
-        let delivery = db
-            .create_delivery(1, true, Some("performance-block"))
-            .unwrap();
+        let delivery = kept_failure_delivery(&db, 1, "performance-block");
         let blocked = db.retire_delivery_source(&delivery.delivery_id).unwrap();
         assert_eq!(blocked.source_cleanup.status, "blocked");
         let operation = db.operation(&moved.operation_id).unwrap();
@@ -3768,9 +3886,7 @@ mod performance_tests {
         let completed = tmp.path().join("completed");
         for job in 1..=25 {
             publish(&db, &root, &completed, job, true);
-            let delivery = db
-                .create_delivery(job, true, Some(&format!("blocked-{job}")))
-                .unwrap();
+            let delivery = kept_failure_delivery(&db, job, &format!("blocked-{job}"));
             assert_eq!(
                 db.retire_delivery_source(&delivery.delivery_id)
                     .unwrap()
@@ -3820,9 +3936,7 @@ mod performance_tests {
         let (tmp, db, root) = setup();
         let db = std::sync::Arc::new(db);
         let moved = publish(&db, &root, &tmp.path().join("completed"), 1, true);
-        let delivery = db
-            .create_delivery(1, true, Some("wake-during-settle"))
-            .unwrap();
+        let delivery = kept_failure_delivery(&db, 1, "wake-during-settle");
         let other = db.clone();
         let id = delivery.delivery_id.clone();
         CLEANUP_SETTLE_HOOK.with(|hook| {
@@ -3848,9 +3962,7 @@ mod performance_tests {
         let (tmp, db, root) = setup();
         let db = std::sync::Arc::new(db);
         let moved = publish(&db, &root, &tmp.path().join("completed"), 1, true);
-        let delivery = db
-            .create_delivery(1, true, Some("wake-between-ledgers"))
-            .unwrap();
+        let delivery = kept_failure_delivery(&db, 1, "wake-between-ledgers");
         let other = db.clone();
         let id = delivery.delivery_id.clone();
         DELIVERY_SETTLE_HOOK.with(|hook| {
