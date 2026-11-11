@@ -2598,6 +2598,40 @@ mod post_pause_tests {
         engine.shutdown().await;
     }
 
+    /// Finding 6: while a restart is pending, no new repair or extraction
+    /// starts (other stages still do), so the restart is not held behind a
+    /// backlog; the drain ending releases the boundary.
+    #[tokio::test]
+    async fn a_pending_restart_drains_repair_and_extraction_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, _root, _history) = post_ready(&temp).await;
+        let cfg = plain_cfg();
+        let cancel = CancellationToken::new();
+        let mut stages = Stages::new(&engine, JobId(41), "job".into(), &cfg, cancel.clone());
+        nzbd_engine::set_restart_drain(true);
+        stages.enter(PostStage::ParVerify).await.unwrap();
+        let next = stages.enter(PostStage::ParRepair);
+        tokio::pin!(next);
+        let held = tokio::time::timeout(Duration::from_millis(300), &mut next)
+            .await
+            .is_err();
+        nzbd_engine::set_restart_drain(false);
+        assert!(held, "repair must not start while a restart is pending");
+        let row = engine.export_job(JobId(41)).await.unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            JobStatus::Post {
+                stage: PostStage::ParVerify
+            },
+            "a held job is no restart blocker"
+        );
+        tokio::time::timeout(Duration::from_secs(5), &mut next)
+            .await
+            .expect("the drain ending releases the boundary")
+            .unwrap();
+        engine.shutdown().await;
+    }
+
     #[tokio::test]
     async fn cancelling_a_parked_job_starts_no_further_stage() {
         let temp = tempfile::tempdir().unwrap();
@@ -2979,6 +3013,30 @@ impl<'a> Stages<'a> {
                 )));
             }
             tracing::info!(job = self.job.0, next = ?stage, "post-processing resumed");
+        }
+        // W10: a pending restart drains repair and extraction — neither
+        // starts while it waits, so the running ones finish and the restart
+        // is not held behind a backlog. Other stages run on.
+        if matches!(stage, PostStage::ParRepair | PostStage::Unpack) && nzbd_engine::restart_drain()
+        {
+            if self.current.is_some() {
+                let ms = self.close();
+                self.engine.close_post_stage(self.job, now(), ms).await;
+            }
+            tracing::info!(job = self.job.0, next = ?stage,
+                "a restart is pending; holding before repair/extraction");
+            while nzbd_engine::restart_drain() {
+                tokio::select! {
+                    _ = self.cancel.cancelled() => {
+                        return Err(PostError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "processing attempt cancelled while a restart was pending",
+                        )));
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                }
+            }
+            tracing::info!(job = self.job.0, next = ?stage, "restart drain ended; continuing");
         }
         let prev_ms = self.close();
         // Status, timeline and event in that order. The first two are one

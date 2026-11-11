@@ -113,6 +113,24 @@ fn url_storage_error(error: nzbd_state::artifacts::Error) -> EngineError {
     }
 }
 
+/// W10 drain: set while a restart waits for post-processing to reach a
+/// resumable boundary. No new PAR repair or extraction starts while it is
+/// set (a job holds at that stage boundary), so the running ones drain and
+/// the restart cannot wait behind a backlog. Process-wide: it survives an
+/// in-process reload, and the API clears it when the restart runs, expires
+/// or is cancelled.
+static RESTART_DRAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a pending restart is draining repair/extraction admission.
+pub fn restart_drain() -> bool {
+    RESTART_DRAIN.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Start or end the restart drain (the API's restart deferral owns it).
+pub fn set_restart_drain(on: bool) {
+    RESTART_DRAIN.store(on, std::sync::atomic::Ordering::Release);
+}
+
 /// [`nzbd_types::Job::normalize_hold_status`] for a row read from storage
 /// (the queue snapshot, an import, a replicated row): a `held` row that no
 /// longer has a holding control becomes `paused`, and that is logged with
