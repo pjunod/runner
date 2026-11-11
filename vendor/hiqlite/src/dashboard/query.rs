@@ -32,7 +32,7 @@ pub(crate) async fn dashboard_query_dynamic(
         task::spawn_blocking(move || {
             let mut stmt = conn.prepare(&sql)?;
 
-            let columns = ColumnOwned::mapping_cols_from_stmt(stmt.columns())?;
+            let columns = ColumnOwned::mapping_cols_from_stmt(stmt.columns().collect())?;
 
             let mut rows = stmt.raw_query();
             let mut rows_owned = Vec::new();
