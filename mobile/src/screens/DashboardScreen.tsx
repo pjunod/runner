@@ -58,6 +58,7 @@ import { LogsView } from './LogsView';
 import { holdAction } from '../holdAction';
 import { holdDeadlineText, holdHeadline } from '../holdPresentation';
 import { QUEUE_LANES, QueueLane, laneNotice, lanePaused, laneToggleAction, laneToggleLabel, pausedIndicator } from '../queueLanes';
+import { StorageIoState, storageIoBars, storageIoText, storageKey } from '../storageIo';
 
 type AppSection = 'queue' | 'history' | 'logs';
 
@@ -89,6 +90,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
     error,
     busyKey,
     lastUpdated,
+    storageIo,
     refresh,
     queueAction,
     jobAction,
@@ -307,7 +309,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
 
       {activeSection === 'queue' && status ? (
         <View style={styles.overviewDock}>
-          <Overview status={status} styles={styles} wide={wide} />
+          <Overview status={status} storageIo={storageIo} styles={styles} wide={wide} />
         </View>
       ) : null}
 
@@ -435,10 +437,12 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
 
 function Overview({
   status,
+  storageIo,
   styles,
   wide,
 }: {
   status: StatusDto;
+  storageIo: StorageIoState;
   styles: ReturnType<typeof makeStyles>;
   wide: boolean;
 }) {
@@ -482,8 +486,14 @@ function Overview({
       <View style={styles.storageBlock}>
         <View style={styles.storageBlockHeading}>
           <Text style={styles.overviewBlockTitle}>Storage volumes</Text>
+          <View style={styles.storageLegend}>
+            <View style={[styles.storageLegendSwatch, styles.storageLegendWrite]} />
+            <Text style={styles.storageLegendText}>write</Text>
+            <View style={[styles.storageLegendSwatch, styles.storageLegendRead]} />
+            <Text style={styles.storageLegendText}>read</Text>
+          </View>
           <Text numberOfLines={1} style={styles.storageCritical}>
-            {criticalUsage && critical ? `critical: ${critical.label}` : 'measuring volumes…'}
+            {criticalUsage && critical ? `critical: ${critical.name || critical.label}` : 'measuring volumes…'}
           </Text>
         </View>
         {volumes.length > 0 ? (
@@ -491,6 +501,8 @@ function Overview({
             {volumes.map((volume, index) => (
               <StorageVolume
                 critical={criticalUsage !== null && volume === critical}
+                io={storageIo.latest[storageKey(volume, index)]}
+                ioSeries={storageIo.history[storageKey(volume, index)]}
                 key={`${volume.path}:${index}`}
                 storage={volume}
                 styles={styles}
@@ -530,11 +542,15 @@ function SummaryMetric({
 function StorageVolume({
   storage,
   critical,
+  io,
+  ioSeries,
   styles,
   wide,
 }: {
   storage: StoragePath;
   critical: boolean;
+  io: StorageIoState['latest'][string];
+  ioSeries: StorageIoState['history'][string] | undefined;
   styles: ReturnType<typeof makeStyles>;
   wide: boolean;
 }) {
@@ -554,7 +570,7 @@ function StorageVolume({
 
   return (
     <View
-      accessibilityLabel={`${storage.label}, ${storage.path}, ${percent === null ? 'capacity unavailable' : `${percent} percent used, ${capacity}`}`}
+      accessibilityLabel={`${storageEvidenceLabel(storage)}, ${storage.path}, ${percent === null ? 'capacity unavailable' : `${percent} percent used, ${capacity}`}`}
       style={[
         styles.storageRow,
         wide ? styles.storageRowWide : styles.storageRowPhone,
@@ -595,6 +611,49 @@ function StorageVolume({
       <Text numberOfLines={1} style={styles.storageCapacity}>
         {capacity}
       </Text>
+      <StorageIoGraph io={io} series={ioSeries} styles={styles} />
+    </View>
+  );
+}
+
+/** The last three minutes of writes (filled bars) and reads (marks), with the current rates beside it. */
+function StorageIoGraph({
+  io,
+  series,
+  styles,
+}: {
+  io: StorageIoState['latest'][string];
+  series: StorageIoState['history'][string] | undefined;
+  styles: ReturnType<typeof makeStyles>;
+}) {
+  const text = storageIoText(io);
+  const { bars, peak } = storageIoBars(series);
+  return (
+    <View
+      accessibilityLabel={`I/O, last 3 minutes. ${text.quiet ? text.write : `${text.write}, ${text.read}`}. ${text.describe}`}
+      style={styles.storageIo}
+    >
+      <View style={styles.storageIoPlot}>
+        {peak !== null ? (
+          <>
+            {bars.map((bar, index) => (
+              <View key={index} style={styles.storageIoColumn}>
+                {bar.write !== null ? (
+                  <View style={[styles.storageIoWrite, { height: `${Math.max(bar.write * 100, bar.write > 0 ? 4 : 0)}%` }]} />
+                ) : null}
+                {bar.read !== null && bar.read > 0 ? (
+                  <View style={[styles.storageIoRead, { bottom: `${Math.min(bar.read * 100, 96)}%` }]} />
+                ) : null}
+              </View>
+            ))}
+            <Text style={styles.storageIoScale}>{peak > 0 ? formatBytes(peak, '/s') : 'idle'}</Text>
+          </>
+        ) : null}
+      </View>
+      <View style={[styles.storageIoRates, text.quiet && styles.storageIoRatesQuiet]}>
+        <Text numberOfLines={1} style={styles.storageIoRate}>{text.write}</Text>
+        {text.quiet ? null : <Text numberOfLines={1} style={styles.storageIoRate}>{text.read}</Text>}
+      </View>
     </View>
   );
 }
@@ -1433,6 +1492,27 @@ export const makeStyles = (theme: Theme) =>
       fontVariant: ['tabular-nums'],
     },
     storageEmpty: { color: theme.textMuted, fontSize: 9, lineHeight: 12 },
+    storageLegend: { flexDirection: 'row', alignItems: 'center', marginLeft: 'auto' },
+    storageLegendSwatch: { width: 5, height: 5, borderRadius: 1.5, marginLeft: 5, marginRight: 2 },
+    storageLegendWrite: { backgroundColor: theme.accent },
+    storageLegendRead: { backgroundColor: theme.textMuted },
+    storageLegendText: { color: theme.textMuted, fontSize: 7 },
+    storageIo: { flexDirection: 'row', alignItems: 'stretch', gap: 6, marginTop: 4, height: 24 },
+    storageIoPlot: {
+      flex: 1,
+      minWidth: 0,
+      flexDirection: 'row',
+      alignItems: 'flex-end',
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: theme.border,
+    },
+    storageIoColumn: { flex: 1, height: '100%', justifyContent: 'flex-end' },
+    storageIoWrite: { backgroundColor: theme.accent, opacity: 0.55 },
+    storageIoRead: { position: 'absolute', left: 0, right: 0, height: 1.5, backgroundColor: theme.textMuted },
+    storageIoScale: { position: 'absolute', top: 0, left: 0, color: theme.textMuted, fontSize: 7 },
+    storageIoRates: { width: 66, justifyContent: 'space-between' },
+    storageIoRatesQuiet: { justifyContent: 'center' },
+    storageIoRate: { color: theme.textMuted, fontSize: 8, textAlign: 'right', fontVariant: ['tabular-nums'] },
     sectionHeading: {
       flexDirection: 'row',
       alignItems: 'flex-end',

@@ -61,7 +61,7 @@ export function diskGuardMessage(status: StatusDto): string | null {
 }
 
 export function storageEvidenceLabel(storage: StoragePath): string {
-  const label = storage.label || 'volume';
+  const label = storage.name || storage.label || 'volume';
   return storage.current === false && storage.available_bytes != null
     ? `${label} · last known`
     : label;

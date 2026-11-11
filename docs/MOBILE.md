@@ -17,7 +17,8 @@ web view and no service in between your device and the daemon.
 | Surface | Behavior |
 |---|---|
 | Queue state | Reads the full status and job snapshot from the SSE stream; polls every 5 seconds when that stream is stale |
-| Whole queue | Pause and resume |
+| Whole queue | **Downloads** and **Post-processing** toggles pause and resume each lane independently |
+| Storage | One row per filesystem, named processing or completed, with capacity and a three-minute write/read graph and current rates (same sources as the web: device-wide, this host's NFS traffic, or Runner's own I/O on FUSE/SMB) |
 | One job | Pause · resume · move top/up/down/bottom · remove from the queue |
 | Add | Picks an NZB or torrent file, or accepts a magnet / HTTP torrent URL |
 | Discovery | Scans the local network for nzbd's `_nzbd._tcp` DNS-SD service and fills the server address when selected |
@@ -26,6 +27,12 @@ web view and no service in between your device and the daemon.
 | Providers | Shows the live rate and blocked state of every configured news server |
 | Authentication | Basic username/password or bearer token, stored in iOS Keychain or Android Keystore |
 | Display | Classic/Plex/Theater navigation, ten color schemes, and independent Auto/Light/Dark appearance, stored on the device |
+
+The installed build's version must change for a phone to take a new build,
+and device builds read it from the committed native projects
+(`android/app/build.gradle`, the iOS `project.pbxproj` and `Info.plist`), not
+from `app.json`. A release bumps all four together; `app-version-test`
+fails when they disagree.
 
 Removing a job leaves downloaded files in place. When the daemon can park the
 job in history, the success message says it can be restored there. The mobile

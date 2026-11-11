@@ -1,6 +1,6 @@
 {
   "name": "nzbd-mobile",
-  "version": "1.1.7",
+  "version": "1.1.8",
   "main": "index.ts",
   "dependencies": {
     "@inthepocket/react-native-service-discovery": "^0.2.9",
