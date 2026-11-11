@@ -60,11 +60,23 @@ through the normal paths; nothing below needs a one-off script on upgrade.
 - **Subtitles.** A job's subtitles anywhere in the tree are published with
   its video at their relative path (season packs pair by stem or folder;
   ambiguous ones go alongside).
-- **Startup verification (items 1–2 of 7, plus terminal jobs).** Writer
-  proofs trusted on any filesystem; fully proven files are not opened;
-  terminal jobs are never verified. Items 3–7 (no tickets for proven jobs,
-  lazy check at writer spawn, legacy proof stamping, non-gating root
-  reconciliation, phase timings) not built.
+- **Startup verification (items 1–7, plus terminal jobs).** Paul: only the
+  file being written at restart may need anything. Writer proofs trusted on
+  any filesystem; startup classifies from metadata and tickets only jobs
+  with unproven ranges, identity conflicts or open lifecycle intents —
+  proven, paused and legacy jobs are released untouched (no file opened, no
+  byte read); allocation revalidation at lease time; lazy proof/identity
+  check at writer spawn (object = mount + inode, so an unacknowledged write
+  from the killed run no longer conflicts) and at PP admission; a mismatch
+  or a failed stat holds only that job, never demotes `Done`; legacy ranges
+  of this installation's own snapshot are stamped from a stat without a read
+  (overrides STARTUP_VERIFICATION_PLAN §3.1/§3.4/§4; PAR is the backstop);
+  root reconciliation runs on a background thread off the payload lane and
+  gates only intent jobs; `/api/v1/status` `startup` carries the phase
+  timings. Acceptance tests: 301-job GlusterFS-identity restart leases in
+  ~0.65 s (debug) with 0 payload bytes read and no paused-job opens; kill -9
+  at before_sync / after_sync / after journal append → only unacknowledged
+  segments re-fetched, final CRC correct; replaced inode holds only its job.
 - **Review/retained states still without an automatic exit** (operator or
   explicit-action states, left for a follow-up): unowned/adopted payloads
   (`review`, "files changed; adoption required"), cancelled recovery and

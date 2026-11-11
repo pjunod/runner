@@ -310,6 +310,16 @@ when the configured secure public control listener responds. Check the
 application status for queue loading, blocked storage, and recovery
 progress.
 
+A restart does not verify the queue. Jobs whose ranges carry writer proofs,
+paused jobs and legacy jobs are released without opening a file; only jobs
+with unproven ranges, identity conflicts or open lifecycle intents are
+checked, and lifecycle reconciliation of each payload root runs in the
+background. `/api/v1/status` reports the restart's phases under `startup`
+(milliseconds since process start): `listener_ms`, `owner_ready_ms`,
+`classified_ms`, `first_lease_ms`, `startup_tickets` / `startup_untouched`,
+and per-root `roots[].duration_ms`. Post-deploy check: `first_lease_ms`
+within a few seconds of `listener_ms`, and `startup_tickets` near zero.
+
 Discovery depends on `service_started`, so its advertiser can start while
 nzbd is recovering. This service advertises an endpoint; it does not promise
 that downloads are ready. `docker compose up -d` can therefore start both

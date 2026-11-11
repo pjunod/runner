@@ -1,20 +1,27 @@
 # Startup verification — root cause and proposed runtime recovery
 
-**Status (2026-11-11, 0.9.0):** partly superseded by Paul's rule — only the
-file being written at restart may need anything; a range the writer's
-durable proof covers (write → `sync_data` → `fstat` → proof) is never
-re-read, on any filesystem. Shipped on `claude/no-wedge`: the filesystem
-allowlist in `recovery::metadata_trustworthy` is gone (fuse.glusterfs and
-NFS proofs are trusted), and `verify_job_batch` does not open a file its
-proof fully covers. Not yet built: no verification tickets for proven jobs
-(§3.1/§3.4/§4 are overridden by that rule), lazy proof check at writer spawn,
-proof stamping for legacy Done ranges without reads, non-gating root
-reconciliation, phase timings. · **Written:** 2026-11-01
+**Status (2026-11-11, 0.9.0):** superseded where it conflicts with Paul's
+rule (2026-11-11) — only the file being written at restart may need
+anything; resume or re-fetch it and keep moving; per-queue-item startup
+verification is waste. Built on `claude/no-wedge`: writer proofs (write →
+`sync_data` → `fstat` → proof) are trusted on every filesystem (no
+allowlist; fuse.glusterfs and NFS included); a proven file is never opened
+at boot; startup classifies every job from metadata and tickets only jobs
+with unproven ranges, an identity conflict or an open lifecycle intent
+(relocation, transform custody, a non-active allocation) — proven, paused
+and legacy jobs are released untouched; allocation revalidation happens at
+lease time; the proof/identity check is lazy, at writer spawn and at PP
+admission, and a mismatch holds only that job; a legacy `Done` range with no
+proof is stamped at first open from a stat, without a read (PAR verification
+in post-processing is the backstop); root reconciliation runs in the
+background and gates only jobs with open intents; phase timings are in
+`/api/v1/status` `startup`. §3.1, §3.4 and §4 are overridden where marked.
+· **Written:** 2026-11-01
 · **Incident:** `nuc3`, 2026-11-01 · **Review:** revised after
 [Opus's third review](archive/STARTUP_VERIFICATION_OPUS_THIRD_REVIEW.md); these
 amendments supersede the previously approved draft and were approved by
 Astra on scoped re-review against `a253562`.
-Implementation has not started. See
+See
 [findings and disposition](archive/STARTUP_VERIFICATION_REVIEW.md).
 
 Companion to [DEPLOY.md](DEPLOY.md) (container operation),
@@ -201,6 +208,16 @@ NZBGet, and qBittorrent compatibility contracts when extending them.
 | Shutdown | Stop new work, cancel recovery, fence late results, and retain durable recovery evidence. A blocked storage read must not cause an unbounded application drain. |
 
 ### 3.1 Verification state and results must preserve uncertainty
+
+> **Overridden in part (no-wedge, 2026-11-11).** Typed outcomes, generation
+> fencing and never-demote-on-I/O-error stand. What changed: a restart no
+> longer verifies "Queued/downloading" or "Download-stage completion
+> recorded" rows up front. A row whose ranges a current writer proof covers
+> is accepted as recorded; a legacy row of this installation's own snapshot
+> is stamped from a stat (no read) when its file is first opened; only rows
+> with unproven ranges, identity conflicts or open lifecycle intents get a
+> ticket. Imported/takeover rows (last table row) are still verified by
+> reading.
 
 Track `pending`, `checking`, `verified`, and `blocked` verification states,
 with reason and progress, separately from queue lifecycle and user pause.
@@ -443,6 +460,14 @@ do not update nuc3's untracked Compose file.
 
 ### 3.4 Record durable acknowledgements instead of rereading every byte
 
+> **Overridden in part (no-wedge, 2026-11-11).** The durable-ack proof below
+> is built and is the whole basis of restart trust. Two rules here no longer
+> hold: legacy `Done` ranges with no provenance are *not* untrusted on this
+> installation's own restart — they are stamped at first open without a read
+> (Paul's call; PAR verification is the backstop) — and a writer reopening
+> its file compares the *object* (mount + inode), not size/mtime, because an
+> unacknowledged write from the killed run legitimately changed both.
+
 `write_segment` awaits `sync_data` before `SegmentWritten` at both inspected
 revisions (`writer.rs:336–339`, introduced by `3f1efc21`). A successful
 current-writer acknowledgement already proves data sync under the storage
@@ -596,6 +621,12 @@ protocol. A crash or timed-out drain must still recover an intact publication
 without demoting all ranges or colliding with it on redownload.
 
 ## 4. Guardrails and alternatives
+
+> **Overridden in part (no-wedge, 2026-11-11).** "Removing checks would trade
+> an availability bug for data loss" is superseded for checks a durable
+> writer proof already answers and for legacy ranges of this installation's
+> own snapshot (stamped; PAR is the backstop). Pause, hold and failure policy
+> guardrails stand: a paused job is not even opened at boot.
 
 This is a documentation proposal. It does not authorize a production
 restart, migration, payload deletion, or deployment.

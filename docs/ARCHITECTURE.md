@@ -257,29 +257,45 @@ Readiness means the secure control listener responds; it does not require every
 download to be runnable. See [deployment probes](DEPLOY.md#container-health-and-discovery-startup)
 and the [reviewed recovery plan](STARTUP_VERIFICATION_PLAN.md).
 
-Recovery loads queue metadata before touching payload roots. Root-scoped workers
-then reconcile lifecycle state and establish allocation capabilities
-independently, so a blocked mount does not hold engine construction or another
-root's metadata progress. The owner captures startup artifact generations,
-revisions and existing journal fingerprints before admitting runtime work.
-Root replay is limited to that snapshot; delayed startup work cannot classify
-new runtime allocations or operations as crash leftovers. Typed article-range
-workspaces allocate below their fenced nested parent. A subsequent range uses
-a fresh allocation generation, preserving the previous workspace's bytes and
-custody; preparation remains inside the engine's bounded payload lane.
+Recovery loads queue metadata before touching payload roots, then classifies
+every recovered job from metadata alone (one SQLite pass for open relocation
+intents and transform custody). Only the file being written at a restart may
+need anything (Paul, 2026-11-11), so only a job with unproven ranges, an
+identity conflict or an open lifecycle intent (relocation, transform custody,
+a non-active allocation) keeps a verification ticket. Proven, paused and
+legacy jobs are released untouched: no file is opened and no payload byte is
+read at boot. Allocation revalidation happens at lease time, only for the jobs
+actually leased. The proof/identity check is lazy — at writer spawn (the
+writer compares the recorded object, mount + inode, with the file it opens)
+and at post-processing admission (from metadata) — and a mismatch holds only
+that job, retaining its `Done` ranges. A legacy `Done` range with no writer
+proof, on a job this installation's own snapshot carried, is stamped from a
+stat at first open without a read; PAR verification in post-processing is the
+backstop. Imported and adopted rows are still verified by reading.
+
+Lifecycle root reconciliation runs on its own background thread, off the
+bounded payload lane, so a slow FUSE/NFS root never queues lease-time work
+behind it. It touches only allocations that are not live and active, and it
+gates only the jobs with open intents. The owner captures startup artifact
+generations, revisions and existing journal fingerprints before admitting
+runtime work. Root replay is limited to that snapshot; delayed startup work
+cannot classify new runtime allocations or operations as crash leftovers.
+Phase timings (listener bound, owner ready, classification, first lease,
+per-root reconciliation) are in `/api/v1/status` as `startup`. Typed
+article-range workspaces allocate below their fenced nested parent. A
+subsequent range uses a fresh allocation generation, preserving the previous
+workspace's bytes and custody; preparation remains inside the engine's bounded
+payload lane.
 Verification uses bounded batches (up to 64 ranges,
 32 MiB, or 250 ms), retaining a cursor bound to the observed file identity
 between batches. The owner publishes checked-byte progress and can admit newly
 eligible higher-priority work before a yielded job resumes; manual pauses
 remain effective. Current writer proofs bind installation, allocation and file
-generation, descriptor identity, and exact immutable ranges. Legacy ranges
-require CRC reads and a successful descriptor sync before receiving such a
-proof. Protocol 1 permits metadata-only recovery on recognized local filesystem
-identities; unqualified network/FUSE mounts, including GlusterFS, continue
-background range verification because deployment-specific identity and flush
-guarantees have not been established. Missing data, mismatches, identity
-conflicts and unavailable storage remain distinct outcomes; unavailable I/O
-never erases Done evidence.
+generation, descriptor identity, and exact immutable ranges. A writer
+acknowledges a range only after its write, `sync_data` and `fstat` succeed,
+so a proven range is never re-read on any filesystem, GlusterFS FUSE and NFS
+included. Missing data, mismatches, identity conflicts and unavailable storage
+remain distinct outcomes; unavailable I/O never erases Done evidence.
 
 The queue owner captures immutable documents and sends persistence requests to
 one bounded, ordered filesystem lane, independent from bounded payload-I/O
