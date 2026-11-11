@@ -1732,9 +1732,11 @@ impl Inventory {
             ));
             save_operation(&tx, &op)?;
             let raw: Option<String> = tx
-                .query_row("SELECT data FROM artifacts WHERE id=?1", [&op.artifact], |row| {
-                    row.get(0)
-                })
+                .query_row(
+                    "SELECT data FROM artifacts WHERE id=?1",
+                    [&op.artifact],
+                    |row| row.get(0),
+                )
                 .optional()?;
             if let Some(raw) = raw {
                 let mut source: Artifact = serde_json::from_str(&raw)?;

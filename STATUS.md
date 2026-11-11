@@ -32,12 +32,16 @@ through the normal paths; nothing below needs a one-off script on upgrade.
   indefinitely.
 - **W8 assessment loops (2710/2535).** Assessment is advisory: missing root
   → nothing to assess; drift → one re-snapshot; then settles `unknown`.
-  Kept failures are recorded in place without re-capturing the directory.
-- **W9 (partial).** A startup orphan is a parked failure with the TTL;
-  legacy "review: allocation has no recovered job" rows convert at startup.
-  *Not built:* ambiguous `par_restore` → discard workspace and re-run;
-  `.runner-file-*.part` sweep (a GFID orphan on a brick is not visible to
-  runner — infra).
+  The loop actually reproduced was a terminal job's restart verification
+  going review-required over a deleted file and refusing the follow-up's
+  export forever: terminal jobs (failed included) now get no verification
+  ticket. The W8 test runs in its original order and fails without that.
+- **W9.** A startup orphan is a parked failure with the TTL (legacy review
+  rows convert at startup). An ambiguous/unprovable transform replay
+  (`par_restore`, `extract`, `par_repair`) is cancelled and post-processing
+  re-runs it, instead of `review` + Keep on the source; old review rows are
+  abandoned at open. Startup sweeps `.runner-file-*.part` that no writer will
+  resume (a GFID orphan inside a brick is not visible to runner — infra).
 - **W5a latch.** Write-observed ENOSPC clears only after probe writes
   (8 × 1 MiB, fsynced) succeed in the failing directory, or operator resume;
   statvfs never clears it.
@@ -45,13 +49,30 @@ through the normal paths; nothing below needs a one-off script on upgrade.
   HistoryDb's second (reader) connection removed; `Inventory::close`
   releases its connection for in-process reloads.
 - **W10 restart.** `POST /api/v1/restart` takes `Idempotency-Key` and
-  `?not_after=`; the UI sends both. *Not built:* PP drain/checkpoint on
-  restart.
+  `?not_after=`; the UI sends both. It defers while PAR repair or
+  extraction runs (`restart_pending` in status; `?force=true` overrides) and
+  restarts when they finish. *Not built:* checkpoint/resume of a repair
+  across a forced restart.
+- **Cluster.** The copy ledger no longer exempts curator-admitted failures
+  under park-always (same policy as single-node). An engine without a
+  supplied history store opens a per-node `engine-history.<node>.sqlite`
+  (cluster nodes share `state_dir`; the store is EXCLUSIVE).
 - **Subtitles.** A job's subtitles anywhere in the tree are published with
   its video at their relative path (season packs pair by stem or folder;
   ambiguous ones go alongside).
-- **Startup verification (items 1–2 of 7).** Writer proofs trusted on any
-  filesystem; fully proven files are not opened. Items 3–7 not built.
+- **Startup verification (items 1–2 of 7, plus terminal jobs).** Writer
+  proofs trusted on any filesystem; fully proven files are not opened;
+  terminal jobs are never verified. Items 3–7 (no tickets for proven jobs,
+  lazy check at writer spawn, legacy proof stamping, non-gating root
+  reconciliation, phase timings) not built.
+- **Review/retained states still without an automatic exit** (operator or
+  explicit-action states, left for a follow-up): unowned/adopted payloads
+  (`review`, "files changed; adoption required"), cancelled recovery and
+  recovery staging holds, interrupted move/relocation staging holds,
+  workspace cleanup / subprocess-quiescence holds, interrupted writer
+  retirement, delete operations in `review` (generation changed,
+  pre-upgrade non-eligible, cancellation receipt changed), and
+  materialization `retained` predecessors.
 
 ## Storage I/O on every filesystem; mobile graphs and versions — 2026-11-11
 
