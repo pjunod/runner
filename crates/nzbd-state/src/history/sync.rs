@@ -746,9 +746,25 @@ pub(super) fn prepare_index(
     if fsx::exists(&tmp)? {
         fsx::remove_file(&tmp)?;
     }
+    // W5b / finding 9: an ordinary READ_ONLY open of a WAL database maps a
+    // `-shm` file (which a network filesystem cannot share). Open it like
+    // `Inventory::validate_expected`: read-write so byte-range EXCLUSIVE
+    // locking is possible (in-memory WAL index, no -shm) and no checkpoint
+    // on close so it is left as found. Not `query_only`: SQLite refuses
+    // `VACUUM INTO` under it, and the only statement run here writes the
+    // copy, never this file.
     let source_conn =
-        Connection::open_with_flags(&source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        Connection::open_with_flags(&source, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(sql_error)?;
+    source_conn
+        .set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .map_err(sql_error)?;
+    source_conn
+        .pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .map_err(sql_error)?;
     source_conn
         .execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()])
         .map_err(sql_error)?;
@@ -1194,6 +1210,8 @@ mod tests {
         assert_eq!(migrated.count_filtered(true).unwrap(), 2);
         assert_eq!(migrated.list_filtered(1, true).unwrap()[0].seq, seq);
         assert!(!t.path().join("local/history.sqlite-shm").exists());
+        // Finding 9: reading the old index for the copy maps no `-shm` either.
+        assert!(!state.join("history.sqlite-shm").exists());
     }
 
     #[test]
