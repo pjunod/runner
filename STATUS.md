@@ -3,7 +3,8 @@
 ## No wedges: runner side of the pipeline rewrite plan — 2026-11-11 (0.9.0)
 
 **Status:** built (startup items 1–7 plus no-wedge tasks 1–3); Fable's
-adversarial review (12 findings) folded in — see *Review fixes* below.
+adversarial review (12 findings) and a second pass (9) folded in — see
+*Review fixes* below.
 Branch `claude/no-wedge` (pushed; no PR yet). Owner: Claude (Opus 5.5
 session). Next: full CI once → PR → merge. Not deployed.
 Rebased on main after #305 (0.8.1).
@@ -161,6 +162,20 @@ through the normal paths; nothing below needs a one-off script on upgrade.
 | 10 | PARK_PIN dropped operator Keep | only the pin's Keep cleared |
 | 11 | irrecoverable move target unowned forever | duplicates removed, only-copy residue owned + parked |
 | 12 | handoffs no TTL; ledger `retained` for held copy | TTL cancel; held copy answers `retry` |
+
+Second review pass (2026-11-11, on `paths.workspace_dir` and the fixes above):
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | moved workspace root re-stamped only the row; journal kept old identity → reconcile could orphan an in-flight workspace | journal scratch + attempt dirs re-stamped in the same tx |
+| 2 | path rewrite counted `instr` matches → re-stamp every start | counts/touches only changed values |
+| 3 | crash between commit and sidecar → stale sidecar forever | re-stamp driven by recorded/live root mismatch; stale own sidecar repaired |
+| 4 | finalize/post ENOSPC with a job that cannot retry held intake until manual resume | partial or job-dir probe when not runnable; post jobs retry under the latch |
+| 5 | probe walked above an unmounted root → false Cleared/Gone | bounded at the guarded root, recorded device required; missing root holds |
+| 6 | probe truncated to a stale size | live-writer files skipped; release to current size |
+| 7 | restart drain set outside the slot lock | drain derived from the slot under its lock; DELETE always clears |
+| 8 | remover emptied same-device bind mounts; deep-move temp names collided after crash | mount id (statx) scope; unique temp names, collision retry |
+| 9 | admission stat `Short` looped on terminal jobs (no-op verification) | `verification_inert` jobs owe no admission stat |
 
 ### State and hold exits
 
