@@ -2962,11 +2962,94 @@ async fn put_config(
 
 /// Restart the daemon: tear down and re-run with the config on disk.
 /// The listener bounces for a moment; the UI polls /healthz.
-async fn post_restart(State(st): State<ApiState>) -> Response {
+#[derive(Deserialize, Default)]
+struct RestartQuery {
+    /// Unix seconds after which this request must not run (W10): a restart
+    /// that timed out on the client and is re-sent, or delivered late, is
+    /// refused instead of cancelling work started since.
+    not_after: Option<i64>,
+}
+
+/// Idempotency keys of restarts already executed by this process. Kept
+/// across in-process backend reloads (the API state is rebuilt by each).
+static EXECUTED_RESTARTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::VecDeque<String>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// W10: `Idempotency-Key` (header) makes a re-sent restart a no-op answer;
+/// `not_after` refuses a stale one. Both optional for existing callers.
+fn restart_admission(
+    key: Option<&str>,
+    not_after: Option<i64>,
+    now: i64,
+) -> Result<bool, &'static str> {
+    if not_after.is_some_and(|deadline| now > deadline) {
+        return Err("restart request expired (not_after has passed); send a new one");
+    }
+    let Some(key) = key.filter(|key| !key.is_empty()) else {
+        return Ok(true);
+    };
+    let mut executed = EXECUTED_RESTARTS.lock().unwrap();
+    if executed.iter().any(|seen| seen == key) {
+        return Ok(false);
+    }
+    executed.push_back(key.to_owned());
+    while executed.len() > 64 {
+        executed.pop_front();
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod restart_admission_tests {
+    /// R5 / W10: a stale restart is refused; a re-sent one runs once.
+    #[test]
+    fn stale_restart_is_refused_and_a_resend_runs_once() {
+        assert!(super::restart_admission(None, Some(99), 100).is_err());
+        assert_eq!(super::restart_admission(None, Some(100), 100), Ok(true));
+        assert_eq!(super::restart_admission(None, None, 100), Ok(true));
+        let key = "restart-test-key-r5";
+        assert_eq!(
+            super::restart_admission(Some(key), Some(200), 100),
+            Ok(true)
+        );
+        assert_eq!(
+            super::restart_admission(Some(key), Some(200), 150),
+            Ok(false)
+        );
+        assert!(super::restart_admission(Some(key), Some(200), 201).is_err());
+    }
+}
+
+async fn post_restart(
+    State(st): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<RestartQuery>,
+) -> Response {
     let Some(h) = &st.setup else {
         return error(StatusCode::NOT_FOUND, "no config handle");
     };
-    tracing::info!("restart requested from the settings UI");
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    match restart_admission(key, query.not_after, now) {
+        Err(reason) => return error(StatusCode::CONFLICT, reason),
+        Ok(false) => {
+            tracing::info!(key, "restart already executed for this idempotency key");
+            return Json(json!({ "ok": true, "restarting": false, "duplicate": true }))
+                .into_response();
+        }
+        Ok(true) => {}
+    }
+    tracing::info!(
+        key,
+        not_after = query.not_after,
+        "restart requested from the settings UI"
+    );
     h.applied.store(true, std::sync::atomic::Ordering::Relaxed);
     h.reload.notify_one();
     Json(json!({ "ok": true, "restarting": true })).into_response()
