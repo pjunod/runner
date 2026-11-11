@@ -159,13 +159,15 @@ export interface StorageIoText {
   quiet: boolean;
   write: string;
   read: string;
+  /** Both rates in one unit, for a phone row: `W 94.1 · R 1.6 MiB/s`. */
+  compact: string;
   /** What the numbers cover, for the accessibility label. */
   describe: string;
 }
 
 /** What the I/O half of a row says. The server reports where its numbers come from. */
 export function storageIoText(io: StorageIo | null | undefined): StorageIoText {
-  const quiet = (text: string, describe: string): StorageIoText => ({ quiet: true, write: text, read: '', describe });
+  const quiet = (text: string, describe: string): StorageIoText => ({ quiet: true, write: text, read: '', compact: text, describe });
   if (io === undefined) return quiet('measuring…', 'Waiting for the first I/O sample.');
   if (io === null) return quiet('no I/O data', 'Runner cannot identify this filesystem, so it cannot sample its I/O.');
   // 0.8.0 daemons report "unsupported" where 0.8.1 graphs Runner's own I/O.
@@ -177,5 +179,28 @@ export function storageIoText(io: StorageIo | null | undefined): StorageIoText {
       ? `Runner's own reads and writes; ${io.detail} keeps no I/O counters, so other programs are not included.`
       : `Device-wide reads and writes on ${io.detail}, including other programs.`;
   if (io.read_bps == null || io.write_bps == null) return quiet('measuring…', describe);
-  return { quiet: false, write: `W ${formatBytes(io.write_bps, '/s')}`, read: `R ${formatBytes(io.read_bps, '/s')}`, describe };
+  return {
+    quiet: false,
+    write: `W ${formatBytes(io.write_bps, '/s')}`,
+    read: `R ${formatBytes(io.read_bps, '/s')}`,
+    compact: compactRates(io.write_bps, io.read_bps),
+    describe,
+  };
+}
+
+const RATE_UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+
+/** Both rates in the unit of the larger, three significant digits at most. */
+export function compactRates(write: number, read: number): string {
+  let unit = 0;
+  let scale = 1;
+  while (Math.max(write, read) / scale >= 1024 && unit < RATE_UNITS.length - 1) {
+    scale *= 1024;
+    unit += 1;
+  }
+  const show = (v: number) => {
+    const n = v / scale;
+    return n === 0 ? '0' : n >= 100 || unit === 0 ? n.toFixed(0) : n >= 10 ? n.toFixed(1) : n.toFixed(2);
+  };
+  return `W ${show(write)} · R ${show(read)} ${RATE_UNITS[unit]}/s`;
 }

@@ -1,5 +1,6 @@
 import {
   STORAGE_IO_BARS,
+  compactRates,
   createStorageIoStore,
   emptyStorageIo,
   noteStorageIo,
@@ -91,6 +92,7 @@ describe('storage I/O text', () => {
     expect(text.quiet).toBe(false);
     expect(text.write).toBe('W 2.00 KiB/s');
     expect(text.read).toBe('R 1.00 KiB/s');
+    expect(text.compact).toBe('W 2.00 · R 1.00 KiB/s');
     expect(text.describe).toContain("Runner's own");
     expect(storageIoText({ source: 'nfs', detail: 'qnap:/working', read_bps: 1, write_bps: 1 }).describe)
       .toContain('other clients');
@@ -101,5 +103,13 @@ describe('storage I/O text', () => {
     expect(storageIoText(null).write).toBe('no I/O data');
     expect(storageIoText({ source: 'stale', detail: 'sda1', read_bps: null, write_bps: null }).write).toBe('I/O stalled');
     expect(storageIoText({ source: 'nfs', detail: 'x', read_bps: null, write_bps: null }).write).toBe('measuring…');
+  });
+});
+
+describe('compact rates', () => {
+  it('shares the unit of the larger rate', () => {
+    expect(compactRates(94.1 * 1024 * 1024, 1.64 * 1024 * 1024)).toBe('W 94.1 · R 1.64 MiB/s');
+    expect(compactRates(0, 110 * 1024 * 1024)).toBe('W 0 · R 110 MiB/s');
+    expect(compactRates(0, 0)).toBe('W 0 · R 0 B/s');
   });
 });

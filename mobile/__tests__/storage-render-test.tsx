@@ -46,8 +46,9 @@ test('both storage rows graph their I/O and say what it covers; both pause lanes
   expect(shown).toContain('completed');
   expect(shown).toContain('processing');
   expect(shown).not.toContain('working · torrent payloads');
-  expect(shown).toContain('W 90.0 MiB/s');
-  expect(shown).toContain('R 80.0 MiB/s');
+  // Phone rows show both rates in one unit; iPad rows show them stacked.
+  expect(shown).toMatch(/W 90\.0 MiB\/s|W 90\.0 · R 3\.00 MiB\/s/);
+  expect(shown).toMatch(/R 80\.0 MiB\/s|W 0 · R 80\.0 MiB\/s/);
   const graphs = labelled('I/O, last 3 minutes');
   expect(graphs).toHaveLength(2);
   expect(graphs[0].props.accessibilityLabel).toContain('other clients');

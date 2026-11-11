@@ -572,6 +572,11 @@ function StorageVolume({
   const capacity = usage
     ? `${formatBytes(usage.usedBytes)} used / ${formatBytes(usage.totalBytes)} total`
     : 'capacity unavailable';
+  // A phone row shares its width with the graph; the percent above already
+  // says used, so the short form is enough there.
+  const capacityShort = usage
+    ? `${formatBytes(usage.usedBytes)} / ${formatBytes(usage.totalBytes)}`
+    : 'capacity unavailable';
 
   return (
     <View
@@ -615,7 +620,7 @@ function StorageVolume({
         />
       </View>
       <Text numberOfLines={1} style={styles.storageCapacity}>
-        {capacity}
+        {wide ? capacity : capacityShort}
       </Text>
       </View>
       <StorageIoGraph io={io} series={ioSeries} styles={styles} wide={wide} />
@@ -655,13 +660,19 @@ function StorageIoGraph({
                 ) : null}
               </View>
             ))}
-            <Text style={styles.storageIoScale}>{peak > 0 ? formatBytes(peak, '/s') : 'idle'}</Text>
+            <Text numberOfLines={1} style={styles.storageIoScale}>{peak > 0 ? formatBytes(peak, '/s') : 'idle'}</Text>
           </>
         ) : null}
       </View>
-      <View style={[styles.storageIoRates, text.quiet && styles.storageIoRatesQuiet]}>
-        <Text numberOfLines={1} style={styles.storageIoRate}>{text.write}</Text>
-        {text.quiet ? null : <Text numberOfLines={1} style={styles.storageIoRate}>{text.read}</Text>}
+      <View style={[styles.storageIoRates, !wide && styles.storageIoRatesBeside, text.quiet && styles.storageIoRatesQuiet]}>
+        {wide ? (
+          <>
+            <Text numberOfLines={1} style={styles.storageIoRate}>{text.write}</Text>
+            {text.quiet ? null : <Text numberOfLines={1} style={styles.storageIoRate}>{text.read}</Text>}
+          </>
+        ) : (
+          <Text numberOfLines={1} style={styles.storageIoRate}>{text.compact}</Text>
+        )}
       </View>
     </View>
   );
@@ -1297,7 +1308,18 @@ export const makeStyles = (theme: Theme) =>
     connectionRow: { flexDirection: 'row', alignItems: 'center', gap: 5 },
     connectionDot: { width: 7, height: 7, borderRadius: 4 },
     serverName: { color: theme.textMuted, fontSize: 10, flexShrink: 1 },
-    headerActions: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 5 },
+    // Shrinks to the header's width so its buttons wrap instead of running
+    // off a phone screen (the two lane toggles made the row too wide).
+    headerActions: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      flexWrap: 'wrap',
+      justifyContent: 'flex-end',
+      gap: 5,
+      flexShrink: 1,
+      minWidth: 0,
+      maxWidth: '100%',
+    },
     queuePausedText: { color: theme.warning, fontSize: 12, fontWeight: '700' },
     errorBanner: {
       paddingHorizontal: 18,
@@ -1511,9 +1533,13 @@ export const makeStyles = (theme: Theme) =>
     storageLegendText: { color: theme.textMuted, fontSize: 7 },
     storageIo: { flexDirection: 'row', alignItems: 'stretch', gap: 6 },
     storageIoBelow: { marginTop: 4, height: 24 },
+    // Beside capacity on a phone: the plot takes the full width and the
+    // rates sit on one line under it, so the graph is not squeezed.
     storageIoBeside: {
-      flex: 1,
+      flex: 1.15,
       minWidth: 0,
+      flexDirection: 'column',
+      gap: 2,
       paddingLeft: 8,
       borderLeftWidth: StyleSheet.hairlineWidth,
       borderLeftColor: theme.border,
@@ -1540,6 +1566,7 @@ export const makeStyles = (theme: Theme) =>
     },
     storageIoRates: { width: 66, justifyContent: 'space-between' },
     storageIoRatesQuiet: { justifyContent: 'center' },
+    storageIoRatesBeside: { width: 'auto', flexDirection: 'row', justifyContent: 'space-between', gap: 6 },
     storageIoRate: { color: theme.textMuted, fontSize: 8, textAlign: 'right', fontVariant: ['tabular-nums'] },
     sectionHeading: {
       flexDirection: 'row',
