@@ -5247,6 +5247,33 @@ fn select_delivery_payload(
             ));
         }
     }
+    // Subtitles travel with the video they belong to (Paul, 2026-11-11):
+    // the published videos, as (parent, stem), for associating them.
+    let published_videos: Vec<(String, String)> = files
+        .iter()
+        .filter_map(|entry| {
+            let path = Path::new(&entry.path);
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
+            ((payload_kind(&extension) && payload_classification(&extension) == "video"
+                || !payload_kind(&extension) && probed.contains(&entry.path))
+                && verified_payload_paths.contains(&entry.path)
+                && !is_sample_or_proof(path, &stem))
+            .then(|| {
+                (
+                    path.parent()
+                        .unwrap_or(Path::new(""))
+                        .to_string_lossy()
+                        .to_ascii_lowercase(),
+                    stem,
+                )
+            })
+        })
+        .collect();
     let mut classifications = Vec::with_capacity(files.len());
 
     for entry in &files {
@@ -5288,6 +5315,17 @@ fn select_delivery_payload(
                     Some("no completed NZB/CRC or verified transform evidence identifies this payload"),
                 )),
             }
+        } else if !excluded && is_subtitle_extension(&extension) && !published_videos.is_empty() {
+            // A job's subtitles are never garbage when its video went out:
+            // publish every one, keeping its relative path (a `Subs/`
+            // folder, `2_English.srt`) so curator sees the folder context.
+            selected.push((*entry).clone());
+            selected_paths.insert(entry.path.as_str());
+            classifications.push((
+                "sidecar",
+                "published",
+                Some(subtitle_association(path, &published_videos)),
+            ));
         } else if !excluded && (is_sidecar_extension(&extension) || is_cover_name(&lower)) {
             let parent = path
                 .parent()
@@ -6338,10 +6376,66 @@ fn verified_direct_payload_paths_excluding(
     Ok(verified)
 }
 
+/// Subtitle formats; a subtitle is published with its job's video.
+fn is_subtitle_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "srt" | "ass" | "ssa" | "sub" | "idx" | "sup" | "vtt"
+    )
+}
+
+/// Which published video a subtitle belongs to, as its outcome reason. One
+/// video: all of the job's subtitles are its. Several (a season pack): the
+/// subtitle's stem starts with a video's stem, or a folder on its path is
+/// named after one (`Subs/<video stem>/2_English.srt`); otherwise it is
+/// published alongside and curator places it.
+fn subtitle_association(path: &Path, videos: &[(String, String)]) -> &'static str {
+    if videos.len() == 1 {
+        return "subtitle of the job's only published video";
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if videos
+        .iter()
+        .any(|(_, video)| stem == *video || stem.starts_with(&format!("{video}.")))
+    {
+        return "subtitle paired with a published video by name";
+    }
+    let folders = path
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .filter_map(|component| component.as_os_str().to_str())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if videos
+        .iter()
+        .any(|(_, video)| folders.iter().any(|folder| folder == video))
+    {
+        return "subtitle paired with a published video by its folder";
+    }
+    "subtitle published alongside the job's videos; no single video claims it"
+}
+
 fn is_sidecar_extension(extension: &str) -> bool {
     matches!(
         extension,
-        "srt" | "ass" | "ssa" | "sub" | "idx" | "nfo" | "jpg" | "jpeg" | "png" | "webp" | "tbn"
+        "srt"
+            | "ass"
+            | "ssa"
+            | "sub"
+            | "idx"
+            | "sup"
+            | "vtt"
+            | "nfo"
+            | "jpg"
+            | "jpeg"
+            | "png"
+            | "webp"
+            | "tbn"
     )
 }
 fn payload_kind(extension: &str) -> bool {
@@ -7418,6 +7512,103 @@ mod decision_tests {
             outcome("Season 1/ep02-sample.mkv").outcome,
             "excluded_source_cleanup"
         );
+    }
+
+    fn select_with_verified(
+        paths: &[&str],
+        verified: &[&str],
+    ) -> (
+        std::collections::HashSet<String>,
+        Vec<nzbd_state::artifacts::DeliveryFileOutcome>,
+    ) {
+        let entries = paths
+            .iter()
+            .map(|path| payload_entry(path))
+            .collect::<Vec<_>>();
+        let verified = verified.iter().map(|path| path.to_string()).collect();
+        let (selected, outcomes) = select_delivery_payload(
+            &entries,
+            &Default::default(),
+            &verified,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+        (
+            selected.into_iter().map(|entry| entry.path).collect(),
+            outcomes,
+        )
+    }
+
+    /// Subtitles in a `Subs/` folder and numbered-language names belong to
+    /// the job's only video and are published with their relative paths.
+    #[test]
+    fn subtitles_in_a_subs_folder_travel_with_the_only_video() {
+        let (selected, outcomes) = select_with_verified(
+            &[
+                "Show.S01E01.mkv",
+                "Subs/2_English.srt",
+                "Subs/English.srt",
+                "Subs/3_French.sup",
+                "Show.S01E01.vtt",
+                "readme.txt",
+            ],
+            &["Show.S01E01.mkv"],
+        );
+        for path in [
+            "Show.S01E01.mkv",
+            "Subs/2_English.srt",
+            "Subs/English.srt",
+            "Subs/3_French.sup",
+            "Show.S01E01.vtt",
+        ] {
+            assert!(selected.contains(path), "{path} must be published");
+        }
+        let subs = outcomes
+            .iter()
+            .find(|outcome| outcome.source_path == "Subs/2_English.srt")
+            .unwrap();
+        assert_eq!(subs.outcome, "published");
+        assert_eq!(subs.publication_path.as_deref(), Some("Subs/2_English.srt"));
+        assert!(!selected.contains("readme.txt"));
+    }
+
+    /// A season pack: subtitles pair by stem prefix or by a folder named
+    /// after the video; an ambiguous one is still published alongside.
+    #[test]
+    fn season_pack_subtitles_pair_by_folder_or_stem_and_are_never_dropped() {
+        let (selected, outcomes) = select_with_verified(
+            &[
+                "Show.S01E01.mkv",
+                "Show.S01E02.mkv",
+                "Subs/Show.S01E01/2_English.srt",
+                "Subs/Show.S01E02/2_English.srt",
+                "Show.S01E02.en.srt",
+                "Subs/English.srt",
+            ],
+            &["Show.S01E01.mkv", "Show.S01E02.mkv"],
+        );
+        let reason = |path: &str| {
+            let outcome = outcomes
+                .iter()
+                .find(|outcome| outcome.source_path == path)
+                .unwrap();
+            assert_eq!(outcome.outcome, "published", "{path}");
+            assert!(selected.contains(path), "{path}");
+            outcome.reason.clone().unwrap()
+        };
+        assert!(reason("Subs/Show.S01E01/2_English.srt").contains("folder"));
+        assert!(reason("Subs/Show.S01E02/2_English.srt").contains("folder"));
+        assert!(reason("Show.S01E02.en.srt").contains("by name"));
+        assert!(reason("Subs/English.srt").contains("alongside"));
+    }
+
+    /// Without a published video a subtitle keeps the sidecar rule.
+    #[test]
+    fn subtitles_without_a_published_video_follow_the_sidecar_rule() {
+        let (selected, _) =
+            select_with_verified(&["Subs/English.srt", "Album/a.flac"], &["Album/a.flac"]);
+        assert!(!selected.contains("Subs/English.srt"));
     }
 
     #[test]
@@ -10712,8 +10903,13 @@ mod decision_tests {
         );
         let delivery = inventory.delivery_for_job(41).unwrap().unwrap();
         // R3 (contract §2.2): a verified file with no recognised extension
-        // is media by its bytes (Matroska EBML here) and publishes.
-        assert_eq!(delivery.files.len(), 4);
+        // is media by its bytes (Matroska EBML here) and publishes; the
+        // job's subtitle travels with that video.
+        assert_eq!(delivery.files.len(), 5);
+        assert!(delivery
+            .files
+            .iter()
+            .any(|entry| entry.path == "unmatched.srt"));
         assert!(delivery
             .files
             .iter()
