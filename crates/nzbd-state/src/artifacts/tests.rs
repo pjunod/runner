@@ -4747,33 +4747,82 @@ fn delivered_copy(
 fn a_cleanup_blocked_by_a_renamed_mount_source_rebinds_and_completes() {
     let (tmp, db, root) = fixture();
     let (source, operation, delivery) = delivered_copy(&tmp, &db, &root, 80);
-    // Record everything as it was under the old mount source.
-    let live = fs::mount_id(&fs::open_dir(&root).unwrap()).unwrap();
-    let fields: Vec<&str> = live.split('\n').collect();
-    let (length, current_source) = fields[2].split_once(':').unwrap();
-    assert_eq!(length.parse::<usize>().unwrap(), current_source.len());
-    let alias = format!("old-alias-{current_source}");
-    let old_field = format!("{}:{alias}", alias.len());
-    // The `<len>:<source>` field reads the same at every JSON nesting level.
-    for table in ["artifacts", "operations"] {
-        db.db
-            .lock()
-            .unwrap()
-            .execute(
-                &format!("UPDATE {table} SET data=replace(data,?1,?2)"),
-                params![fields[2], old_field],
-            )
-            .unwrap();
+    // Record everything as it was under the old mount source. The old
+    // identity is rebuilt structurally — only the source field changes —
+    // and swapped as a whole mount_id at each JSON nesting level. (A text
+    // replace of the `<len>:<source>` field alone also rewrote the
+    // filesystem-type field wherever the two read the same — `overlay` on
+    // `overlay` on the CI runner — which is a different filesystem, rightly
+    // refused.)
+    let rebuilt = |live: &str| {
+        let (platform, rest) = live.split_once('\n').unwrap();
+        let fields = rest
+            .split('\n')
+            .map(|field| field.split_once(':').unwrap().1.to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(fields.len(), 4, "{live:?}");
+        let mut old = vec![platform.to_owned()];
+        for (index, value) in fields.iter().enumerate() {
+            let value = if index == 1 {
+                format!("old-alias-{value}")
+            } else {
+                value.clone()
+            };
+            old.push(format!("{}:{value}", value.len()));
+        }
+        old.join("\n")
+    };
+    let escape = |text: &str| {
+        let quoted = serde_json::to_string(text).unwrap();
+        quoted[1..quoted.len() - 1].to_owned()
+    };
+    let mut swaps = Vec::new();
+    for dir in [root.clone(), tmp.path().join("completed")] {
+        let live = fs::mount_id(&fs::open_dir(&dir).unwrap()).unwrap();
+        let old = rebuilt(&live);
+        assert!(!live.contains('\\') && !old.contains('\\'));
+        let identity = |mount_id: &str| Identity {
+            device: 1,
+            inode: 2,
+            mount_id: mount_id.to_owned(),
+            bytes: 0,
+            modified: String::new(),
+            changed: String::new(),
+            directory: true,
+        };
+        let (recorded, current) = (identity(&old), identity(&live));
+        assert!(recorded.same_object(&current), "only the source differs");
+        // Nested JSON first (a request inside a row), then one level.
+        swaps.push((escape(&escape(&live)), escape(&escape(&old))));
+        swaps.push((escape(&live), escape(&old)));
     }
-    for entry in walk(&tmp.path().join("state/artifact-identities")) {
-        let text = std::fs::read_to_string(&entry).unwrap();
-        std::fs::write(&entry, text.replace(fields[2], &old_field)).unwrap();
+    swaps.sort();
+    swaps.dedup();
+    for (from, to) in &swaps {
+        for table in ["artifacts", "operations"] {
+            db.db
+                .lock()
+                .unwrap()
+                .execute(
+                    &format!("UPDATE {table} SET data=replace(data,?1,?2)"),
+                    params![from, to],
+                )
+                .unwrap();
+        }
+        for entry in walk(&tmp.path().join("state/artifact-identities")) {
+            let text = std::fs::read_to_string(&entry).unwrap();
+            std::fs::write(&entry, text.replace(from.as_str(), to)).unwrap();
+        }
     }
-    assert!(
-        cleanup_of(&db, &operation)["source"]["root_identity"]["mount_id"]
-            .as_str()
-            .unwrap()
-            .contains("old-alias-")
+    let recorded = cleanup_of(&db, &operation);
+    let recorded = recorded["source"]["root_identity"]["mount_id"]
+        .as_str()
+        .unwrap();
+    assert!(recorded.contains("old-alias-"), "{recorded:?}");
+    assert_eq!(
+        recorded,
+        rebuilt(&fs::mount_id(&fs::open_dir(&root).unwrap()).unwrap()),
+        "only the source field was rewritten"
     );
     block_cleanup(
         &db,
@@ -4881,4 +4930,9 @@ fn a_mount_rebind_needs_type_root_and_mount_point_to_match() {
     assert!(!recorded.same_object(&id("nfs", "qnap-storage:/working", "/", "/working")));
     assert!(!recorded.same_object(&id("nfs4", "qnap-storage:/working", "/sub", "/working")));
     assert!(!recorded.same_object(&id("nfs4", "qnap-storage:/working", "/", "/elsewhere")));
+    // A source spelled like its type (`overlay` on `overlay`, a container's
+    // root filesystem) parses field by field.
+    let overlay = id("overlay", "overlay", "/", "/");
+    assert!(overlay.same_object(&id("overlay", "overlay-renamed", "/", "/")));
+    assert!(!overlay.same_object(&id("tmpfs", "overlay", "/", "/")));
 }
