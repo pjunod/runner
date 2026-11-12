@@ -253,6 +253,11 @@ pub struct Artifact {
     /// `job_terminals` so the Files tab can say why the bytes are here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+    /// Why a `source_gone` row is gone when Runner did not remove it and the
+    /// finding rests on weaker evidence than a verified root (for example
+    /// `legacy_root_rebind`). Custody reports it as gone, not removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gone_reason: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -301,6 +306,8 @@ pub struct ArtifactCustody {
     pub owned: bool,
     pub keep: bool,
     pub keep_on_failure: bool,
+    /// See `Artifact::gone_reason`: gone, not removed by Runner.
+    pub gone_reason: Option<String>,
 }
 
 impl ArtifactCustody {
@@ -312,6 +319,7 @@ impl ArtifactCustody {
             owned: header.owned,
             keep: header.keep,
             keep_on_failure: header.keep_on_failure,
+            gone_reason: header.gone_reason,
         })
     }
 }
@@ -1498,6 +1506,7 @@ impl Inventory {
             inspected_at: None,
             salvage: None,
             failure_reason: None,
+            gone_reason: None,
         };
         save_artifact(&db, &a)?;
         drop(db);
@@ -2747,6 +2756,7 @@ impl Inventory {
             inspected_at: None,
             salvage: None,
             failure_reason: None,
+            gone_reason: None,
         };
         save_artifact(&db, &a)?;
         Ok(a)
@@ -3930,6 +3940,7 @@ impl Inventory {
             inspected_at: Some(now()),
             salvage: None,
             failure_reason: None,
+            gone_reason: None,
         };
         self.sidecar(&a)?;
         let _coordinator = self.mutation_guard()?;

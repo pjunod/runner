@@ -10986,11 +10986,19 @@ fn apply_receipt_custody(
     // Runner custody, so it settles the receipt exactly like a Runner delete;
     // reporting runner_owned for it held Curator's replacement forever.
     if artifact.state == "deleted" || (artifact.state == "source_gone" && artifact.owned) {
+        // Custody ended either way. A row settled gone on weaker evidence
+        // (`gone_reason`, e.g. a legacy root rebind) was not removed by
+        // Runner: its cleanup reads `gone`, not `removed`.
+        let cleanup = if artifact.state == "source_gone" && artifact.gone_reason.is_some() {
+            "gone"
+        } else {
+            "removed"
+        };
         let changed = receipt.custody_state != "deleted_by_runner"
-            || receipt.source_cleanup_status.as_deref() != Some("removed")
+            || receipt.source_cleanup_status.as_deref() != Some(cleanup)
             || keep_changed;
         receipt.custody_state = "deleted_by_runner".into();
-        receipt.source_cleanup_status = Some("removed".into());
+        receipt.source_cleanup_status = Some(cleanup.into());
         changed
     } else if artifact.keep || artifact.keep_on_failure {
         let changed = receipt.custody_state != "kept_by_user"
