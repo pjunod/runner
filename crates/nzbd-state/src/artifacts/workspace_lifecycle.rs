@@ -931,6 +931,12 @@ impl Inventory {
             else {
                 continue;
             };
+            // A workspace belongs to its job. Once the job is over, no
+            // evidence its retirement asks for can still appear; the
+            // workspace is garbage in Runner's private root (closed scope).
+            if self.discard_workspace_of_finished_job(&mut op, &workspace, &scratch, &parent)? {
+                continue;
+            }
 
             // Revisit pre-upgrade transforms in the same bounded cursor sweep.
             // A history entry cannot grant ownership or waive any scratch check.
@@ -1077,6 +1083,170 @@ impl Inventory {
         }
         Ok(())
     }
+    /// Why the job a workspace belongs to is over, if it is: its terminal is
+    /// durable (any outcome, event emitted, salvage settled). `None` while
+    /// the job may still use it, without a terminal (the receipt-based
+    /// retirement decides those), or when the job keeps its failure.
+    fn finished_job(&self, workspace: &Workspace, parent: &Artifact) -> Result<Option<String>> {
+        let Some(job) = parent.job.or(workspace.source.job) else {
+            return Ok(None);
+        };
+        let Some(terminal) = self.terminal(job)? else {
+            return Ok(None);
+        };
+        if terminal.keep_on_failure
+            || !terminal.emitted
+            || terminal.salvage == super::SalvageState::Pending
+        {
+            return Ok(None);
+        }
+        Ok(Some(format!("job {job} is {}", terminal.outcome.as_str())))
+    }
+
+    /// A workspace whose job is over is removed (contract §2.6, closed
+    /// scope): it is Runner's own scratch — a key-named directory directly
+    /// under the private workspace root, recorded as Runner's — so neither
+    /// scratch identity drift, nor a Keep or missing ownership on its
+    /// *source* (an older startup path set those), nor the absence of a
+    /// finalization receipt applies to it. An unfinished journal of it ends
+    /// (`failed`). A source left `transitioning` only by that journal
+    /// becomes quiescent; a cancelled job's leftover source is parked with
+    /// the failed TTL. Nothing outside the private root is touched. Returns
+    /// whether the workspace was handled.
+    fn discard_workspace_of_finished_job(
+        &self,
+        op: &mut Operation,
+        workspace: &Workspace,
+        scratch: &Artifact,
+        parent: &Artifact,
+    ) -> Result<bool> {
+        let Some(why) = self.finished_job(workspace, parent)? else {
+            return Ok(false);
+        };
+        let source = SourceGeneration {
+            artifact: parent.id.clone(),
+            generation: workspace.source.generation.clone(),
+        };
+        // A person's Keep or hold on the workspace itself still stands; only
+        // the automatic transform hold is this exit's to lift.
+        if self.processing_workers_active(&source)
+            || scratch.keep
+            || scratch
+                .hold
+                .as_deref()
+                .is_some_and(|hold| hold != "transform workspace")
+        {
+            return Ok(false);
+        }
+        let private_root = self.workspace_dir();
+        let key = scratch.id.strip_prefix("scratch-").unwrap_or_default();
+        let runner_named = !key.is_empty()
+            && scratch.path.parent() == Some(private_root.as_path())
+            && scratch.path.file_name().and_then(|name| name.to_str()) == Some(key)
+            && scratch.root == private_root
+            && scratch.owned;
+        if !runner_named {
+            return Ok(false);
+        }
+        match std::fs::symlink_metadata(&scratch.path) {
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&scratch.path)?,
+            Ok(_) => return Ok(false), // not a directory: not ours to remove
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let ttl = i64::from(self.settings()?.failed_retention_days) * 86400;
+        let cancelled = parent
+            .job
+            .and_then(|job| self.terminal(job).ok().flatten())
+            .is_some_and(|terminal| terminal.outcome == nzbd_types::TerminalOutcome::Cancelled);
+        let _coordinator = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let mut gone = scratch.clone();
+        gone.state = "deleted".into();
+        gone.hold = None;
+        gone.error = None;
+        gone.files.clear();
+        gone.revision += 1;
+        gone.updated_at = now();
+        save_artifact(&tx, &gone)?;
+        event(
+            &tx,
+            &gone.id,
+            "workspace_discarded",
+            &format!("transform workspace removed: {why}"),
+        )?;
+        if matches!(op.state.as_str(), "queued" | "running" | "retry") {
+            op.state = "failed".into();
+            op.next_retry = 0;
+            op.error = Some(format!(
+                "ended: {why}{}",
+                op.error
+                    .as_deref()
+                    .map(|error| format!(" (last: {error})"))
+                    .unwrap_or_default()
+            ));
+            save_operation(&tx, op)?;
+        }
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT data FROM artifacts WHERE id=?1",
+                [&parent.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = raw {
+            let mut current: Artifact = serde_json::from_str(&raw)?;
+            let unresolved: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state NOT IN ('succeeded','cancelled','failed','transferred') AND json_extract(data,'$.kind') IN ('par_restore','par_repair','extract','relocate'))",
+                [&current.id],
+                |row| row.get(0),
+            )?;
+            let open_intent: bool = tx.query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM relocation_intents WHERE artifact=?1 AND state IN {})",
+                    super::intents::OPEN_STATES
+                ),
+                [&current.id],
+                |row| row.get(0),
+            )?;
+            if current.generation == workspace.source.generation && !unresolved && !open_intent {
+                let mut changed = false;
+                if current.state == "transitioning" {
+                    current.state = "active".into();
+                    changed = true;
+                }
+                if cancelled
+                    && current.owned
+                    && !current.keep
+                    && !current.keep_on_failure
+                    && current.state == "active"
+                {
+                    current.state = "parked_failed".into();
+                    current.hold = None;
+                    current.automatic_cleanup_eligible = true;
+                    current.retention_seconds = ttl.max(1) as u64;
+                    current.deadline = Some(now().saturating_add(ttl.max(0)));
+                    changed = true;
+                }
+                if changed {
+                    current.revision += 1;
+                    current.updated_at = now();
+                    save_artifact(&tx, &current)?;
+                    event(
+                        &tx,
+                        &current.id,
+                        "transform_ended",
+                        &format!("its transform workspace ended: {why}"),
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        tracing::info!(workspace = %gone.id, %why, "transform workspace of a finished job removed");
+        Ok(true)
+    }
+
     pub(super) fn run_workspace_retirements(&self) -> Result<()> {
         let keys = {
             let db = self.db.lock().unwrap();

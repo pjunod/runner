@@ -817,6 +817,9 @@ impl Inventory {
         current.owned = false;
         current.state = "transferred".into();
         current.hold = None;
+        // The handoff succeeded: an earlier attempt's failure (a full
+        // volume, a lost lease) is history, not this row's state.
+        current.error = None;
         current.deadline = None;
         current.revision += 1;
         current.updated_at = now();
