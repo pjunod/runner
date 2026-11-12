@@ -2020,6 +2020,95 @@ impl Inventory {
         Ok(sources)
     }
 
+    /// A failed (or cancelled) job's current generation whose directory is
+    /// gone from a verified root — removed outside Runner after its park
+    /// move committed (nuc4 job 2710) — can never be moved or deleted:
+    /// every disposal attempt fails ENOENT. It is settled `source_gone`
+    /// (`gone_reason`: gone, not removed by Runner), and any pre-publication
+    /// remainder the job still has is parked in place with the failed TTL.
+    /// Returns the disposal note when this settled the job's disposal;
+    /// `None` when the generation is present, in use, or the job is not a
+    /// durable failure.
+    pub fn settle_vanished_failed_source(&self, job: u32) -> Result<Option<String>> {
+        let Some(terminal) = self.terminal(job)? else {
+            return Ok(None);
+        };
+        if !matches!(
+            terminal.outcome,
+            nzbd_types::TerminalOutcome::Failed | nzbd_types::TerminalOutcome::Cancelled
+        ) || !terminal.emitted
+            || terminal.salvage == SalvageState::Pending
+            || self.open_intent_for_job(job)?
+        {
+            return Ok(None);
+        }
+        let Some(current) = self.for_job(job)? else {
+            return Ok(None);
+        };
+        if !current.owned
+            || !matches!(
+                current.state.as_str(),
+                "active" | "transitioning" | "retained" | "parked_failed"
+            )
+            || self.artifact_in_use(&current)?
+            || self.verify_root(&current).is_err()
+            || !matches!(
+                current.path.symlink_metadata(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        {
+            return Ok(None);
+        }
+        let unresolved: bool = self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state IN ('queued','running') AND json_extract(data,'$.kind') IN ('relocate','delete','par_repair','extract'))",
+            [&current.id],
+            |row| row.get(0),
+        )?;
+        if unresolved {
+            return Ok(None);
+        }
+        {
+            let _guard = self.mutation_guard()?;
+            let mut gone = self.get(&current.id)?;
+            if gone.revision != current.revision {
+                return Ok(None);
+            }
+            gone.state = "source_gone".into();
+            gone.hold = None;
+            gone.files.clear();
+            gone.gone_reason = Some("removed outside Runner".into());
+            gone.revision += 1;
+            gone.updated_at = now();
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
+            save_artifact(&tx, &gone)?;
+            event(
+                &tx,
+                &gone.id,
+                "source_gone",
+                "the failed job's directory is gone from its verified root; it was not removed by Runner",
+            )?;
+            tx.commit()?;
+        }
+        let mut remainders = Vec::new();
+        for (key, _) in self.deferred_publication_moves(job)? {
+            if let Some(row) =
+                self.park_publication_remainder(&key, "the published copy is gone")?
+            {
+                remainders.push(row.path.display().to_string());
+            }
+        }
+        Ok(Some(if remainders.is_empty() {
+            format!("gone: {} (not removed by Runner)", current.path.display())
+        } else {
+            format!(
+                "gone: {} (not removed by Runner); earlier processing copy parked with the failed TTL at {}",
+                current.path.display(),
+                remainders.join(", ")
+            )
+        }))
+    }
+
     /// Park a relocation's retained source row (`source-<op>`) in place with
     /// the failed TTL. `None` when it is already gone; idempotent.
     fn park_publication_remainder(&self, key: &str, why: &str) -> Result<Option<Artifact>> {

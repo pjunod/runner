@@ -5452,3 +5452,61 @@ fn a_legacy_identity_orphan_waits_without_a_live_root() {
     super::startup::MOUNTINFO.with(|value| *value.borrow_mut() = None);
     assert_eq!(db.get(&empty.id).unwrap().state, "transitioning");
 }
+
+/// nuc4 job 2710: a failed copy publication was parked to the failed root
+/// (the move committed; the row stayed `active` because an older build
+/// never recorded the disposal), then the parked directory was removed
+/// outside Runner. Every disposal attempt re-ran the park and failed ENOENT
+/// on its ladder, and `reconcile_missing` never looks at `active` rows. The
+/// generation settles `source_gone` (gone, not removed by Runner) and the
+/// pre-publication remainder is parked in place with the failed TTL.
+#[test]
+fn a_failed_jobs_vanished_parked_copy_settles_gone() {
+    let (tmp, db, root) = fixture();
+    let source = copy_published(&tmp, &db, &root, 2710);
+    fail_terminal(&db, 2710, false);
+    let failed = tmp.path().join("failed");
+    std::fs::create_dir(&failed).unwrap();
+    let parked = failed.join("Strangers with Candy (1999)-xpost.job-2710-url-a4373393948b");
+    db.relocate(2710, &parked).unwrap();
+    assert_eq!(db.for_job(2710).unwrap().unwrap().state, "active");
+    assert_eq!(
+        db.settle_vanished_failed_source(2710).unwrap(),
+        None,
+        "present: nothing to settle"
+    );
+    std::fs::remove_dir_all(&parked).unwrap(); // removed outside Runner
+    let refused = db.relocate(2710, &parked).unwrap_err();
+    assert!(refused.to_string().contains("No such file"), "{refused}");
+
+    let note = db.settle_vanished_failed_source(2710).unwrap().unwrap();
+    assert!(note.contains("not removed by Runner"), "{note}");
+    let gone = db.for_job(2710).unwrap().unwrap();
+    assert_eq!(gone.state, "source_gone");
+    assert_eq!(gone.gone_reason.as_deref(), Some("removed outside Runner"));
+    let remainder = db
+        .for_path(&source)
+        .unwrap()
+        .filter(|row| row.id.starts_with("source-"))
+        .unwrap();
+    assert_eq!(remainder.state, "parked_failed");
+    assert!(remainder.deadline.is_some_and(|due| due > now()));
+    assert!(source.join("media.rar").exists(), "TTL, not now");
+    assert_eq!(
+        db.settle_vanished_failed_source(2710).unwrap(),
+        None,
+        "settled once"
+    );
+}
+
+/// The settle needs a durable failure: a job without a terminal is left to
+/// its own lifecycle even when its directory is gone.
+#[test]
+fn a_vanished_source_of_a_live_job_is_not_settled() {
+    let (tmp, db, root) = fixture();
+    let _source = copy_published(&tmp, &db, &root, 2711);
+    let published = db.for_job(2711).unwrap().unwrap();
+    std::fs::remove_dir_all(&published.path).unwrap();
+    assert_eq!(db.settle_vanished_failed_source(2711).unwrap(), None);
+    assert_eq!(db.for_job(2711).unwrap().unwrap().state, "active");
+}
