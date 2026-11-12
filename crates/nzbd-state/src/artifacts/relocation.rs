@@ -44,6 +44,11 @@ pub(super) struct Relocation {
     pub(super) root_pending: bool,
 }
 
+/// How long a missing directory must stay missing before a failed job's
+/// generation is settled gone (`settle_vanished_failed_source`).
+pub const VANISHED_CONFIRM_SECONDS: i64 = 600;
+const VANISHED_REASON: &str = "missing from its verified root";
+
 /// Timed re-verifications a blocked relocation cleanup gets before its
 /// retained source is parked (`exit_blocked_relocation_cleanups`).
 pub(super) const BLOCKED_CLEANUP_ROUNDS: u32 = 6;
@@ -2021,14 +2026,22 @@ impl Inventory {
     }
 
     /// A failed (or cancelled) job's current generation whose directory is
-    /// gone from a verified root — removed outside Runner after its park
-    /// move committed (nuc4 job 2710) — can never be moved or deleted:
-    /// every disposal attempt fails ENOENT. It is settled `source_gone`
-    /// (`gone_reason`: gone, not removed by Runner), and any pre-publication
-    /// remainder the job still has is parked in place with the failed TTL.
-    /// Returns the disposal note when this settled the job's disposal;
-    /// `None` when the generation is present, in use, or the job is not a
-    /// durable failure.
+    /// missing from its verified root (nuc4 job 2710: parked, then removed
+    /// outside Runner) can never be moved or deleted; every disposal attempt
+    /// failed ENOENT. Absence is proven, not assumed: under the mutation
+    /// coordinator the root verifies, the root directory can be listed, and
+    /// `fstatat` relative to the root descriptor finds no entry — on two
+    /// passes at least [`VANISHED_CONFIRM_SECONDS`] apart (the first records
+    /// `first_missing_at`; an entry that reappears clears it). Nothing may
+    /// be in flight: no queued/running operation of any kind on the
+    /// artifact, no open intent for the job, and a `transitioning` row only
+    /// once its transforms have ended. Then, in one transaction, the row is
+    /// settled `source_gone` (its inventory kept, `gone_reason`: gone, not
+    /// removed by Runner) and each pre-publication remainder of the job —
+    /// the job's original download, nothing else depends on it — is parked
+    /// in place with the failed TTL. A row already settled this way with a
+    /// remainder still unparked (a crash between) resumes. Returns the
+    /// disposal note when settled.
     pub fn settle_vanished_failed_source(&self, job: u32) -> Result<Option<String>> {
         let Some(terminal) = self.terminal(job)? else {
             return Ok(None);
@@ -2038,73 +2051,171 @@ impl Inventory {
             nzbd_types::TerminalOutcome::Failed | nzbd_types::TerminalOutcome::Cancelled
         ) || !terminal.emitted
             || terminal.salvage == SalvageState::Pending
-            || self.open_intent_for_job(job)?
         {
             return Ok(None);
         }
+        let ttl = i64::from(self.settings()?.failed_retention_days) * 86400;
+        let _guard = self.mutation_guard()?;
         let Some(current) = self.for_job(job)? else {
             return Ok(None);
         };
-        if !current.owned
-            || !matches!(
-                current.state.as_str(),
-                "active" | "transitioning" | "retained" | "parked_failed"
-            )
-            || self.artifact_in_use(&current)?
-            || self.verify_root(&current).is_err()
-            || !matches!(
-                current.path.symlink_metadata(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound
-            )
-        {
-            return Ok(None);
-        }
-        let unresolved: bool = self.db.lock().unwrap().query_row(
-            "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state IN ('queued','running') AND json_extract(data,'$.kind') IN ('relocate','delete','par_repair','extract'))",
-            [&current.id],
-            |row| row.get(0),
-        )?;
-        if unresolved {
-            return Ok(None);
-        }
-        {
-            let _guard = self.mutation_guard()?;
-            let mut gone = self.get(&current.id)?;
-            if gone.revision != current.revision {
+        let resuming = current.state == "source_gone"
+            && current.gone_reason.as_deref() == Some(VANISHED_REASON);
+        if !resuming {
+            if !current.owned
+                || !matches!(
+                    current.state.as_str(),
+                    "active" | "transitioning" | "retained" | "parked_failed"
+                )
+                || self.artifact_in_use(&current)?
+                || self.open_intent_for_job(job)?
+            {
                 return Ok(None);
             }
+            let db = self.db.lock().unwrap();
+            let in_flight: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state IN ('queued','running'))",
+                [&current.id],
+                |row| row.get(0),
+            )?;
+            let transforms_open: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state NOT IN ('succeeded','cancelled','failed','transferred') AND json_extract(data,'$.kind') IN ('par_restore','par_repair','extract'))",
+                [&current.id],
+                |row| row.get(0),
+            )?;
+            drop(db);
+            if in_flight || (current.state == "transitioning" && transforms_open) {
+                return Ok(None);
+            }
+            // Proven absence: the root verifies and can be listed, and the
+            // name is absent relative to the root descriptor.
+            let Ok(root) = self.verify_root(&current) else {
+                return Ok(None);
+            };
+            let Some(name) = current
+                .path
+                .strip_prefix(&current.root)
+                .ok()
+                .filter(|relative| relative.components().count() == 1)
+                .map(|relative| relative.as_os_str().to_owned())
+            else {
+                return Ok(None);
+            };
+            if fs::names(&root).is_err() {
+                return Ok(None);
+            }
+            let key = format!("vanished:{}:{}", current.id, current.generation);
+            let missing = match fs::entry_missing_at(&root, &name) {
+                Ok(missing) => missing,
+                Err(_) => return Ok(None),
+            };
+            let db = self.db.lock().unwrap();
+            if !missing {
+                db.execute("DELETE FROM meta WHERE key=?1", [&key])?;
+                return Ok(None);
+            }
+            let first: Option<i64> = db
+                .query_row(
+                    "SELECT CAST(value AS INTEGER) FROM meta WHERE key=?1",
+                    [&key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(first) = first else {
+                db.execute(
+                    "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO NOTHING",
+                    params![key, now().to_string()],
+                )?;
+                return Ok(None);
+            };
+            if now() < first.saturating_add(VANISHED_CONFIRM_SECONDS) {
+                return Ok(None);
+            }
+        }
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        if !resuming {
+            let mut gone = current.clone();
             gone.state = "source_gone".into();
             gone.hold = None;
-            gone.files.clear();
-            gone.gone_reason = Some("removed outside Runner".into());
+            gone.gone_reason = Some(VANISHED_REASON.into());
             gone.revision += 1;
             gone.updated_at = now();
-            let mut db = self.db.lock().unwrap();
-            let tx = db.transaction()?;
             save_artifact(&tx, &gone)?;
             event(
                 &tx,
                 &gone.id,
                 "source_gone",
-                "the failed job's directory is gone from its verified root; it was not removed by Runner",
+                "directory missing from its verified root on two passes; not removed by Runner",
             )?;
-            tx.commit()?;
+            tx.execute(
+                "DELETE FROM meta WHERE key=?1",
+                [format!("vanished:{}:{}", current.id, current.generation)],
+            )?;
         }
-        let mut remainders = Vec::new();
-        for (key, _) in self.deferred_publication_moves(job)? {
-            if let Some(row) =
-                self.park_publication_remainder(&key, "the published copy is gone")?
-            {
-                remainders.push(row.path.display().to_string());
+        let keys = {
+            let mut statement = tx.prepare(
+                "SELECT o.id FROM operations o WHERE o.artifact=?1 AND o.state='succeeded' AND json_extract(o.data,'$.kind')='relocate' ORDER BY o.rowid",
+            )?;
+            let rows = statement.query_map([&current.id], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut parked = Vec::new();
+        for key in keys {
+            let raw: String =
+                tx.query_row("SELECT data FROM operations WHERE id=?1", [&key], |row| {
+                    row.get(0)
+                })?;
+            let op: Operation = serde_json::from_str(&raw)?;
+            let movement: Relocation = serde_json::from_str(&op.request)?;
+            if !movement.defer_source_retirement || movement.cleanup_done {
+                continue;
             }
+            let row: Option<String> = tx
+                .query_row(
+                    "SELECT data FROM artifacts WHERE id=?1",
+                    [format!("source-{key}")],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(row) = row else {
+                continue;
+            };
+            let mut row: Artifact = serde_json::from_str(&row)?;
+            if row.terminal() || row.state == "parked_failed" || row.keep || row.keep_on_failure {
+                continue;
+            }
+            row.hold = None;
+            row.owned = true;
+            row.state = "parked_failed".into();
+            row.automatic_cleanup_eligible = true;
+            row.retention_seconds = ttl.max(1) as u64;
+            row.deadline = Some(now().saturating_add(ttl.max(0)));
+            row.revision += 1;
+            row.updated_at = now();
+            save_artifact(&tx, &row)?;
+            event(
+                &tx,
+                &row.id,
+                "publication_remainder_parked",
+                "the job's original download, parked with the failed TTL: its published copy is gone",
+            )?;
+            parked.push(row.path.display().to_string());
         }
-        Ok(Some(if remainders.is_empty() {
-            format!("gone: {} (not removed by Runner)", current.path.display())
+        tx.commit()?;
+        for path in &parked {
+            tracing::info!(job, path = %path, "failed job's original download parked with the failed TTL (its published copy is gone)");
+        }
+        let gone = format!(
+            "gone: {} (missing from its verified root; not removed by Runner)",
+            current.path.display()
+        );
+        Ok(Some(if parked.is_empty() {
+            gone
         } else {
             format!(
-                "gone: {} (not removed by Runner); earlier processing copy parked with the failed TTL at {}",
-                current.path.display(),
-                remainders.join(", ")
+                "{gone}; original download parked with the failed TTL at {}",
+                parked.join(", ")
             )
         }))
     }
