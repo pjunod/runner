@@ -129,9 +129,44 @@ impl Identity {
             // user-reviewed actions; automatic cleanup is cohort-gated.
             self.device == other.device
         } else {
-            self.mount_id == other.mount_id
+            self.mount_id == other.mount_id || same_mount_rebound(&self.mount_id, &other.mount_id)
         }) && self.inode == other.inode
             && self.directory == other.directory
+    }
+}
+
+/// The fields of a `fs::mount_id` tuple: platform, then length-prefixed
+/// filesystem type, mount source, root within the filesystem, mount point.
+fn mount_fields(mount_id: &str) -> Option<Vec<&str>> {
+    let (platform, mut rest) = mount_id.split_once('\n')?;
+    let mut fields = vec![platform];
+    while !rest.is_empty() {
+        let (length, tail) = rest.split_once(':')?;
+        let length: usize = length.parse().ok()?;
+        let value = tail.get(..length)?;
+        fields.push(value);
+        rest = tail
+            .get(length..)?
+            .strip_prefix('\n')
+            .unwrap_or(tail.get(length..)?);
+    }
+    Some(fields)
+}
+
+/// A remount that changed only the mount *source* string — an NFS server
+/// alias (`qnap:/working` → `qnap-storage:/working`), a re-resolved FUSE
+/// source — is the same filesystem when the platform, filesystem type, root
+/// within it and mount point are unchanged. The inode (and the directory
+/// flag) are still compared by the caller, and every payload identity under
+/// it is compared the same way, so a different filesystem mounted in its
+/// place does not pass. Without this, every row recorded before such a
+/// remount reports "configured root identity changed" forever.
+fn same_mount_rebound(left: &str, right: &str) -> bool {
+    match (mount_fields(left), mount_fields(right)) {
+        (Some(a), Some(b)) if a.len() == 5 && b.len() == 5 => {
+            a[0] == b[0] && a[1] == b[1] && a[3] == b[3] && a[4] == b[4]
+        }
+        _ => false,
     }
 }
 impl Identity {
@@ -3727,13 +3762,15 @@ impl Inventory {
             due
         };
         for (key, revision) in due {
-            if let Err(e) = self.request_delete_authorized(
-                &key,
-                revision,
-                &format!("retention-{key}-{revision}"),
-                0,
-                true,
-            ) {
+            // A request id is at most 128 bytes; Runner's own derived rows
+            // (`source-move-…`, `scratch-…`) have ids longer than that, and
+            // their retention was refused on every tick. Those get a digest.
+            let mut request = format!("retention-{key}-{revision}");
+            if request.len() > 128 {
+                use sha2::Digest as _;
+                request = format!("retention-{:x}", sha2::Sha256::digest(request.as_bytes()));
+            }
+            if let Err(e) = self.request_delete_authorized(&key, revision, &request, 0, true) {
                 tracing::warn!(artifact=%key,error=%e,"expiry changed before admission");
             }
         }

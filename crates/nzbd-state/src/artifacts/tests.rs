@@ -4687,3 +4687,198 @@ fn interrupted_runner_allocations_end_instead_of_turning_foreign() {
     assert!(!other.owned, "not provably Runner's");
     assert!(stranger.join("part.bin").exists());
 }
+
+/// Force a relocation's source cleanup into the pre-0.9.1 `blocked` state
+/// (no `blocked_at`), with its delivery blocked too.
+fn block_cleanup(db: &Inventory, operation: &str, reason: &str) {
+    let mut op = db.operation(operation).unwrap();
+    let mut movement: serde_json::Value = serde_json::from_str(&op.request).unwrap();
+    movement["cleanup"]["state"] = "blocked".into();
+    movement["cleanup"]["error"] = reason.into();
+    movement["cleanup"]["next_retry"] = 0.into();
+    if let Some(object) = movement["cleanup"].as_object_mut() {
+        object.remove("blocked_at");
+    }
+    op.request = serde_json::to_string(&movement).unwrap();
+    let db_lock = db.db.lock().unwrap();
+    save_operation(&db_lock, &op).unwrap();
+    db_lock
+        .execute(
+            "UPDATE deliveries SET cleanup_status='blocked',cleanup_error=?2 WHERE artifact=?1",
+            params![op.artifact, reason],
+        )
+        .unwrap();
+}
+
+fn cleanup_of(db: &Inventory, operation: &str) -> serde_json::Value {
+    serde_json::from_str(&db.operation(operation).unwrap().request).unwrap()
+}
+
+/// A delivered copy publication of job `job`: (source dir, move op id,
+/// delivery id).
+fn delivered_copy(
+    tmp: &tempfile::TempDir,
+    db: &Inventory,
+    root: &Path,
+    job: u32,
+) -> (PathBuf, String, String) {
+    let source = root.join(format!("delivered-{job}"));
+    db.allocate_for_delivery(job, root, &source, true, true)
+        .unwrap();
+    std::fs::write(source.join("media.mkv"), b"payload").unwrap();
+    db.finish(job, &source, root, "active").unwrap();
+    let completed = tmp.path().join("completed");
+    std::fs::create_dir_all(&completed).unwrap();
+    fs::RENAME_FAILURE.with(|failure| failure.set(Some(libc::EINVAL)));
+    let moved = db
+        .relocate_for_delivery_checked(job, &completed.join(format!("release-{job}")), &|| Ok(()))
+        .unwrap();
+    let delivery = db.create_delivery(job, true, Some("t-test")).unwrap();
+    (source, moved.operation_id, delivery.delivery_id)
+}
+
+/// nuc4, 26 rows: "configured root identity changed or volume is
+/// unavailable". The NFS mount source was renamed by a remount
+/// (`qnap:/working` → `qnap-storage:/working`); type, root, mount point and
+/// inode are unchanged. Identities recorded under the old source rebind,
+/// and the cleanup blocked before 0.9.1 is re-verified on its timed exit
+/// and completes with no operator action.
+#[test]
+fn a_cleanup_blocked_by_a_renamed_mount_source_rebinds_and_completes() {
+    let (tmp, db, root) = fixture();
+    let (source, operation, delivery) = delivered_copy(&tmp, &db, &root, 80);
+    // Record everything as it was under the old mount source.
+    let live = fs::mount_id(&fs::open_dir(&root).unwrap()).unwrap();
+    let fields: Vec<&str> = live.split('\n').collect();
+    let (length, current_source) = fields[2].split_once(':').unwrap();
+    assert_eq!(length.parse::<usize>().unwrap(), current_source.len());
+    let alias = format!("old-alias-{current_source}");
+    let old_field = format!("{}:{alias}", alias.len());
+    // The `<len>:<source>` field reads the same at every JSON nesting level.
+    for table in ["artifacts", "operations"] {
+        db.db
+            .lock()
+            .unwrap()
+            .execute(
+                &format!("UPDATE {table} SET data=replace(data,?1,?2)"),
+                params![fields[2], old_field],
+            )
+            .unwrap();
+    }
+    for entry in walk(&tmp.path().join("state/artifact-identities")) {
+        let text = std::fs::read_to_string(&entry).unwrap();
+        std::fs::write(&entry, text.replace(fields[2], &old_field)).unwrap();
+    }
+    assert!(
+        cleanup_of(&db, &operation)["source"]["root_identity"]["mount_id"]
+            .as_str()
+            .unwrap()
+            .contains("old-alias-")
+    );
+    block_cleanup(
+        &db,
+        &operation,
+        "configured root identity changed or volume is unavailable",
+    );
+
+    db.exit_wedged_states(0, true).unwrap();
+    assert_eq!(cleanup_of(&db, &operation)["cleanup"]["state"], "retry");
+    db.retire_delivery_source(&delivery).unwrap();
+    assert_eq!(cleanup_of(&db, &operation)["cleanup_done"], true);
+    assert!(
+        !source.exists(),
+        "closed scope removed the delivered source"
+    );
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(walk(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// Any cause that keeps blocking: after its rounds of timed re-verification
+/// the retained source is parked for retention (immediately for a delivered
+/// success), retention removes it, and the cleanup closes — no operator.
+#[test]
+fn a_cleanup_that_stays_blocked_ends_through_retention() {
+    let (tmp, db, root) = fixture();
+    let (source, operation, delivery) = delivered_copy(&tmp, &db, &root, 81);
+    let source_row = format!("source-{operation}");
+    let mut row = db.get(&source_row).unwrap();
+    row.hold = Some("a hold that never lifts".into());
+    save_artifact(&db.db.lock().unwrap(), &row).unwrap();
+    block_cleanup(
+        &db,
+        &operation,
+        "source retirement is blocked by ownership/hold state (retained)",
+    );
+    for _ in 0..super::relocation::BLOCKED_CLEANUP_ROUNDS {
+        db.exit_wedged_states(0, true).unwrap();
+        // The normal driver retries and is refused again.
+        let mut op = db.operation(&operation).unwrap();
+        let mut movement: serde_json::Value = serde_json::from_str(&op.request).unwrap();
+        movement["cleanup"]["next_retry"] = 0.into();
+        op.request = serde_json::to_string(&movement).unwrap();
+        save_operation(&db.db.lock().unwrap(), &op).unwrap();
+        let _ = db.retire_delivery_source(&delivery);
+        assert_eq!(cleanup_of(&db, &operation)["cleanup"]["state"], "blocked");
+        let mut op = db.operation(&operation).unwrap();
+        let mut movement: serde_json::Value = serde_json::from_str(&op.request).unwrap();
+        movement["cleanup"]["blocked_at"] = 0.into();
+        op.request = serde_json::to_string(&movement).unwrap();
+        save_operation(&db.db.lock().unwrap(), &op).unwrap();
+    }
+    db.exit_wedged_states(0, true).unwrap();
+    let parked = db.get(&source_row).unwrap();
+    assert_eq!(parked.state, "parked_failed");
+    assert!(parked.hold.is_none());
+    assert!(
+        parked.deadline.is_some_and(|due| due <= now()),
+        "delivered: immediate"
+    );
+    db.tick().unwrap();
+    db.run_due_deletes().unwrap();
+    assert!(
+        db.get(&source_row).unwrap().terminal(),
+        "retention removes a long-id derived row too"
+    );
+    assert!(!source.exists());
+    // Gone: the next sweep closes the cleanup.
+    block_cleanup(&db, &operation, "anything");
+    db.exit_wedged_states(0, true).unwrap();
+    assert_eq!(cleanup_of(&db, &operation)["cleanup_done"], true);
+}
+
+/// Rebinding tolerates only a renamed mount source: a different filesystem
+/// type, root or mount point is still a different object.
+#[test]
+fn a_mount_rebind_needs_type_root_and_mount_point_to_match() {
+    let id = |kind: &str, source: &str, root: &str, point: &str| Identity {
+        device: 1,
+        inode: 39714832,
+        mount_id: format!(
+            "linux\n{}:{kind}\n{}:{source}\n{}:{root}\n{}:{point}",
+            kind.len(),
+            source.len(),
+            root.len(),
+            point.len()
+        ),
+        bytes: 0,
+        modified: String::new(),
+        changed: String::new(),
+        directory: true,
+    };
+    let recorded = id("nfs4", "qnap:/working", "/", "/working");
+    assert!(recorded.same_object(&id("nfs4", "qnap-storage:/working", "/", "/working")));
+    assert!(!recorded.same_object(&id("nfs", "qnap-storage:/working", "/", "/working")));
+    assert!(!recorded.same_object(&id("nfs4", "qnap-storage:/working", "/sub", "/working")));
+    assert!(!recorded.same_object(&id("nfs4", "qnap-storage:/working", "/", "/elsewhere")));
+}

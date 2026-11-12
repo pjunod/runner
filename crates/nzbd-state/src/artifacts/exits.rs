@@ -363,6 +363,7 @@ impl Inventory {
         self.exit_held_artifacts(cutoff, touch_files, &mut report)?;
         if touch_files {
             self.exit_blocked_deliveries(cutoff, &mut report)?;
+            report.retried += self.exit_blocked_relocation_cleanups(cutoff)?;
         }
         if report.total() > 0 {
             tracing::info!(

@@ -443,3 +443,33 @@ fn a_relocation_in_review_is_abandoned_automatically_and_keeps_the_original() {
     // Idempotent.
     assert_eq!(db.exit_wedged_states(0, true).unwrap().abandoned, 0);
 }
+
+/// nuc4, 2 rows: "published generation changed during source unlink". A
+/// hard-link park whose source was already unlinked, and whose parked
+/// publication is since gone (`source_gone`): there is nothing left to
+/// refresh. The cleanup blocked before 0.9.1 is re-run on its timed exit
+/// and closes with no operator action.
+#[test]
+fn a_hardlink_cleanup_blocked_on_a_vanished_publication_completes() {
+    let (_temp, inventory, source, target) = fixture();
+    fs::RENAME_FAILURE.with(|f| f.set(Some(libc::EINVAL)));
+    super::relocation::FAIL_SOURCE_UNLINK_REFRESH.with(|fail| fail.set(true));
+    let relocation = inventory.relocate(91, &target).unwrap();
+    assert!(!source.exists());
+    let mut published = inventory.for_job(91).unwrap().unwrap();
+    published.state = "source_gone".into();
+    save_artifact(&inventory.db.lock().unwrap(), &published).unwrap();
+    let mut operation = inventory.operation(&relocation.operation_id).unwrap();
+    let mut movement: serde_json::Value = serde_json::from_str(&operation.request).unwrap();
+    assert_eq!(movement["cleanup_done"], false);
+    movement["cleanup"]["state"] = "blocked".into();
+    movement["cleanup"]["error"] = "published generation changed during source unlink".into();
+    operation.request = serde_json::to_string(&movement).unwrap();
+    save_operation(&inventory.db.lock().unwrap(), &operation).unwrap();
+
+    inventory.exit_wedged_states(0, true).unwrap();
+    inventory.reconcile_relocations().unwrap();
+    let operation = inventory.operation(&relocation.operation_id).unwrap();
+    let movement: serde_json::Value = serde_json::from_str(&operation.request).unwrap();
+    assert_eq!(movement["cleanup_done"], true, "{}", movement["cleanup"]);
+}

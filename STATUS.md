@@ -65,9 +65,21 @@ What the 2026-11-11 state-dir move on nuc4 exposed, and what changed:
   removed) no longer block their source cleanup on "published generation
   changed during source unlink".
 
-Open: relocation cleanups already `blocked` before this release (e.g.
-"configured root identity changed") now show in attention; they still wait
-for a policy change or explicit retry.
+- **Blocked relocation cleanups get a timed exit.** nuc4 had 28 (read-only
+  copy of its inventory, 2026-11-12): 26 "configured root identity changed
+  or volume is unavailable" — the NFS mount source was renamed by a remount
+  (`qnap:/working` → `qnap-storage:/working`; same type, root, mount point
+  and inode), so every identity recorded before it mismatched; identities
+  now rebind when only the mount source changed. 2 "published generation
+  changed during source unlink" — hard-link parks whose parked copy is since
+  gone; nothing is left to refresh, so the cleanup completes. Every blocked
+  cleanup is re-verified on a backoff (now, then 1 h, 2 h, … ≤ 1 day, 6
+  rounds); if it stays blocked, the retained source is parked for retention
+  (immediately for a delivered success or a Delete, the failed TTL
+  otherwise) and the cleanup closes once it is gone.
+- **Retention of long-id rows.** Retention requests for Runner's derived
+  rows (`source-move-…`, `scratch-…`, ids over 110 bytes) were refused by
+  the 128-byte request-id limit on every tick; they now use a digest id.
 
 ## No wedges: runner side of the pipeline rewrite plan — 2026-11-11 (0.9.0)
 
