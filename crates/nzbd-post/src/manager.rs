@@ -1357,6 +1357,22 @@ async fn dispose_failed_source(
         return false;
     }
     if action != FailureAction::None {
+        // The job's generation vanished from its verified root (removed
+        // outside Runner): no move or delete can ever succeed; it settles
+        // gone instead of retrying ENOENT on the ladder.
+        let settling = inventory.clone();
+        match tokio::task::spawn_blocking(move || settling.settle_vanished_failed_source(job.0))
+            .await
+        {
+            Ok(Ok(Some(note))) => return record(note).await,
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(job = job.0, %error, "vanished failed-source check did not complete")
+            }
+            Err(error) => {
+                tracing::warn!(job = job.0, %error, "vanished failed-source check stopped")
+            }
+        }
         // A transform journal the failed attempt left unfinished pins the
         // source `transitioning`; it ends with the attempt (contract §2.6).
         let ending = inventory.clone();

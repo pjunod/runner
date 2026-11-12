@@ -1,5 +1,34 @@
 # nzbd — Project Status
 
+## Park ENOENT (job 2710) — 2026-11-12 (0.9.4)
+
+**Status:** built; branch `claude/park-enoent` (from main 5e15dd3, pushed;
+no PR). Owner: Claude (Opus 5.5 session). Next: review → CI → merge →
+deploy.
+
+Root cause (read-only copy of nuc4's inventory, logs, filesystem): job 2710
+failed `publish`; on 2026-11-10 04:09Z its publication was parked to
+`/processing/failed/Strangers with Candy (1999)…job-2710-url-a4373393948b`
+(the move committed), but the row stayed `active` because the pre-0.9.1
+disposal never recorded. That parked directory was later removed outside
+Runner (no Runner delete exists for it; the row is still `active`). Every
+disposal attempt re-ran the park against a path that no longer exists →
+ENOENT on the ladder; `reconcile_missing` only checks completed / retained /
+unknown / retiring rows, so nothing noticed. The pre-publication remainder
+(65 files at `/processing/…job-2710-…`) is still there.
+
+Fix: a durable failed/cancelled job's current, owned generation is settled
+`source_gone` only on proven absence — under the mutation coordinator the
+root verifies and can be listed, and `fstatat` relative to the root
+descriptor finds no entry on two passes at least 10 min apart (the first
+records `first_missing_at`; a reappearance clears it) — and only with
+nothing in flight (no queued/running operation of any kind, no open intent,
+`transitioning` only once its transforms ended). In one transaction the row
+keeps its inventory, gets `gone_reason = missing from its verified root`
+(custody: gone, not removed), and the job's original download is parked in
+place with the failed TTL (its path logged). A crash between resumes. The
+disposal then records instead of retrying ENOENT.
+
 ## Orphan 1704 — 2026-11-12 (0.9.3)
 
 **Status:** built; branch `claude/orphan-1704` (from main c05a15d, pushed;

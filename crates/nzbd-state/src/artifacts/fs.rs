@@ -556,6 +556,19 @@ mod unix {
         result
     }
 
+    /// Whether `name` is absent directly under `dir`: `fstatat` relative to
+    /// the directory descriptor, not following a symlink. `Ok(true)` only on
+    /// ENOENT; any other failure is an error, never "absent".
+    pub fn entry_missing_at(dir: &File, name: &std::ffi::OsStr) -> Result<bool> {
+        let name = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| Error::Conflict("name contains NUL".into()))?;
+        match lstat_at(dir, &name) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn lstat_at(dir: &File, name: &CStr) -> std::io::Result<libc::stat> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: name is NUL terminated; stat is written on success only.
@@ -737,7 +750,10 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{create_file_exclusive_at, names, open_at, open_dir, remove_tree_contents, unlink};
+pub use unix::{
+    create_file_exclusive_at, entry_missing_at, names, open_at, open_dir, remove_tree_contents,
+    unlink,
+};
 
 // Windows retains ordinary queue/PP operation and cached inspection. Checked
 // destructive ownership remains unavailable until a handle-relative unlink

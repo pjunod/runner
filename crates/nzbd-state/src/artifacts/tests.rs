@@ -5452,3 +5452,190 @@ fn a_legacy_identity_orphan_waits_without_a_live_root() {
     super::startup::MOUNTINFO.with(|value| *value.borrow_mut() = None);
     assert_eq!(db.get(&empty.id).unwrap().state, "transitioning");
 }
+
+/// nuc4 job 2710's shape: a failed copy publication parked to the failed
+/// root (the move committed; the row stayed `active` because an older
+/// build never recorded the disposal), whose parked directory is then
+/// removed outside Runner. Returns (original download, parked path).
+fn vanished_shape(
+    tmp: &tempfile::TempDir,
+    db: &Inventory,
+    root: &Path,
+    job: u32,
+) -> (PathBuf, PathBuf) {
+    let source = copy_published(tmp, db, root, job);
+    fail_terminal(db, job, false);
+    let failed = tmp.path().join("failed");
+    std::fs::create_dir_all(&failed).unwrap();
+    let parked = failed.join(format!(
+        "Strangers with Candy (1999)-xpost.job-{job}-url-a4373393948b"
+    ));
+    db.relocate(job, &parked).unwrap();
+    assert_eq!(db.for_job(job).unwrap().unwrap().state, "active");
+    (source, parked)
+}
+
+/// Move the first-missing stamp back past the confirmation grace.
+fn age_missing(db: &Inventory, job: u32) {
+    let row = db.for_job(job).unwrap().unwrap();
+    let changed = db
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE meta SET value=?2 WHERE key=?1",
+            params![
+                format!("vanished:{}:{}", row.id, row.generation),
+                (now() - super::relocation::VANISHED_CONFIRM_SECONDS - 1).to_string()
+            ],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "the first pass recorded first_missing_at");
+}
+
+/// nuc4 job 2710: every disposal re-ran the park against the vanished
+/// directory and failed ENOENT; `reconcile_missing` never looks at `active`
+/// rows. Absence confirmed on two passes ≥ 10 min apart settles the row
+/// `source_gone` (inventory kept; gone, not removed by Runner) and parks the
+/// job's original download in place with the failed TTL, in one step.
+#[test]
+fn a_failed_jobs_vanished_parked_copy_settles_gone_after_two_passes() {
+    let (tmp, db, root) = fixture();
+    let (source, parked) = vanished_shape(&tmp, &db, &root, 2710);
+    assert_eq!(
+        db.settle_vanished_failed_source(2710).unwrap(),
+        None,
+        "present"
+    );
+    std::fs::remove_dir_all(&parked).unwrap(); // removed outside Runner
+    let refused = db.relocate(2710, &parked).unwrap_err();
+    assert!(refused.to_string().contains("No such file"), "{refused}");
+
+    assert_eq!(
+        db.settle_vanished_failed_source(2710).unwrap(),
+        None,
+        "first pass only records"
+    );
+    assert_eq!(
+        db.settle_vanished_failed_source(2710).unwrap(),
+        None,
+        "within the grace"
+    );
+    age_missing(&db, 2710);
+    let note = db.settle_vanished_failed_source(2710).unwrap().unwrap();
+    assert!(note.contains("not removed by Runner"), "{note}");
+    let gone = db.for_job(2710).unwrap().unwrap();
+    assert_eq!(gone.state, "source_gone");
+    assert_eq!(
+        gone.gone_reason.as_deref(),
+        Some("missing from its verified root")
+    );
+    assert!(!gone.files.is_empty(), "the inventory is kept");
+    let remainder = db
+        .for_path(&source)
+        .unwrap()
+        .filter(|row| row.id.starts_with("source-"))
+        .unwrap();
+    assert_eq!(remainder.state, "parked_failed");
+    assert!(remainder.deadline.is_some_and(|due| due > now()));
+    assert!(source.join("media.rar").exists(), "TTL, not now");
+    // Idempotent: a repeat (the disposal record lost to a crash) reports
+    // the same settlement and changes nothing.
+    let again = db.settle_vanished_failed_source(2710).unwrap().unwrap();
+    assert!(!again.contains("original download parked"), "{again}");
+    assert_eq!(
+        db.get(&remainder.id).unwrap().revision,
+        remainder.revision,
+        "nothing re-parked"
+    );
+}
+
+/// A transient ENOENT (the directory comes back) clears the stamp; it never
+/// settles anything.
+#[test]
+fn a_transient_absence_recovers_without_settling() {
+    let (tmp, db, root) = fixture();
+    let (_source, parked) = vanished_shape(&tmp, &db, &root, 2712);
+    let moved_aside = parked.with_extension("aside");
+    std::fs::rename(&parked, &moved_aside).unwrap();
+    assert_eq!(db.settle_vanished_failed_source(2712).unwrap(), None);
+    std::fs::rename(&moved_aside, &parked).unwrap(); // back
+    assert_eq!(db.settle_vanished_failed_source(2712).unwrap(), None);
+    let row = db.for_job(2712).unwrap().unwrap();
+    let stamp: Option<String> = db
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [format!("vanished:{}:{}", row.id, row.generation)],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert!(stamp.is_none(), "a reappearance clears first_missing_at");
+    assert_eq!(row.state, "active");
+}
+
+/// Any queued or running operation on the artifact, of any kind, blocks it.
+#[test]
+fn a_vanished_source_with_an_operation_in_flight_waits() {
+    let (tmp, db, root) = fixture();
+    let (_source, parked) = vanished_shape(&tmp, &db, &root, 2713);
+    std::fs::remove_dir_all(&parked).unwrap();
+    assert_eq!(db.settle_vanished_failed_source(2713).unwrap(), None);
+    age_missing(&db, 2713);
+    let row = db.for_job(2713).unwrap().unwrap();
+    save_operation(
+        &db.db.lock().unwrap(),
+        &Operation {
+            id: "inspect-in-flight".into(),
+            artifact: row.id.clone(),
+            kind: "inspect".into(),
+            state: "queued".into(),
+            request: "{}".into(),
+            created_at: now(),
+            not_before: 0,
+            attempts: 0,
+            next_retry: 0,
+            error: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(db.settle_vanished_failed_source(2713).unwrap(), None);
+    assert_eq!(db.for_job(2713).unwrap().unwrap().state, "active");
+}
+
+/// A crash after the row was settled but before its original download was
+/// parked resumes: the next pass parks it and reports the settlement.
+#[test]
+fn a_vanished_settlement_interrupted_before_parking_resumes() {
+    let (tmp, db, root) = fixture();
+    let (source, parked) = vanished_shape(&tmp, &db, &root, 2714);
+    std::fs::remove_dir_all(&parked).unwrap();
+    let mut row = db.for_job(2714).unwrap().unwrap();
+    row.state = "source_gone".into();
+    row.gone_reason = Some("missing from its verified root".into());
+    row.updated_at = now();
+    save_artifact(&db.db.lock().unwrap(), &row).unwrap();
+    let note = db.settle_vanished_failed_source(2714).unwrap().unwrap();
+    assert!(note.contains("original download parked"), "{note}");
+    let remainder = db
+        .for_path(&source)
+        .unwrap()
+        .filter(|row| row.id.starts_with("source-"))
+        .unwrap();
+    assert_eq!(remainder.state, "parked_failed");
+}
+
+/// The settle needs a durable failure: a job without a terminal is left to
+/// its own lifecycle even when its directory is gone.
+#[test]
+fn a_vanished_source_of_a_live_job_is_not_settled() {
+    let (tmp, db, root) = fixture();
+    let _source = copy_published(&tmp, &db, &root, 2711);
+    let published = db.for_job(2711).unwrap().unwrap();
+    std::fs::remove_dir_all(&published.path).unwrap();
+    assert_eq!(db.settle_vanished_failed_source(2711).unwrap(), None);
+    assert_eq!(db.for_job(2711).unwrap().unwrap().state, "active");
+}
