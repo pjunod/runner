@@ -1924,7 +1924,13 @@ impl Inventory {
                 let workspace: Workspace = serde_json::from_str(&op.request)?;
                 obsolete |= source.generation != workspace.source.generation;
                 if !obsolete {
-                    participants.push(self.get(&workspace.scratch.id)?);
+                    let scratch = self.get(&workspace.scratch.id)?;
+                    // A scratch that never finished allocating, or is gone,
+                    // holds nothing this journal could replay.
+                    obsolete |= scratch.terminal() || scratch.state == "allocating";
+                    if !obsolete {
+                        participants.push(scratch);
+                    }
                 }
             }
             if obsolete {

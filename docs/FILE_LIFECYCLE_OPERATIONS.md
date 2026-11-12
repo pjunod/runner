@@ -48,9 +48,10 @@ not a scan failure. Open a folder's **details**; adopt unknown files only
 after reviewing the file list. Adoption enables Keep. Newly added or replaced
 content revokes ownership when inspected. A reviewed hold can be released
 explicitly; active recovery claims cannot be released that way. The list is
-filtered (**Needs attention** = live Runner rows whose hold has no automatic
-exit — empty by construction; **Not Runner's** = live content Runner did not
-create, informational only),
+filtered (**Needs attention** = live Runner rows with an error, a blocked
+cleanup, an open intent, a hold with no automatic exit, or past their
+registered exit; **Not Runner's** = live content Runner did not create,
+informational only),
 searched, sorted and paged on the server; the counts on the filter chips
 describe the whole inventory, not the current search.
 
@@ -387,11 +388,12 @@ Regression coverage lives in `missing_articles_finish_download_but_keep_partial_
 - **A copy publication whose job then failed** (a `publish` failure after the
   bytes were copied out) never becomes a delivery, so the source retirement it
   deferred "until the delivery row exists" would never fire. Once the failure
-  is durable and the job's own disposition has taken the published generation
-  (parked it, or deleted it), the processing copy is that failure's remainder
-  and retires by closed scope, as after a delivery. A job or row that keeps its
-  failure never qualifies. A retirement that is blocked leaves the copy in
-  place and the disposal settles naming it.
+  is durable, the processing copy follows the job's own disposition: under
+  **Delete** (the published generation deleted) it retires by closed scope;
+  under **Park** it is parked in place with the failed TTL — recovery input
+  (PAR volumes, archives) is never wiped by a park. A blocked retirement is
+  parked with the TTL too. A job or row that keeps its failure never
+  qualifies.
 - **A failed job's unfinished transforms** (`extract`/`par_repair` journals
   still `running`/`retry`, often with their workspace gone) end with the failed
   attempt: the journal becomes `failed`, a missing workspace `source_gone`, and
@@ -399,13 +401,20 @@ Regression coverage lives in `missing_articles_finish_download_but_keep_partial_
   touched.
 - **Every incomplete disposal is bounded.** One that holds no operation ladder
   of its own retries on a durable ladder (1 min doubling to 6 h); after 12
-  attempts (about a day) it settles with what remains retained under its own
-  rows' exits. Retry now bypasses the wait.
+  attempts (about a day) it settles and every live row of the job is parked
+  with the failed TTL in the same transaction. Retry now bypasses the wait
+  and does not spend the budget.
+- **An interrupted allocation** at a name only Runner gives (a transform
+  key, a `.job-<N>-` directory) stays Runner's: empty and orphaned it is
+  removed (never recursively); with bytes it is parked with the failed TTL;
+  for a live job it becomes its allocation.
 - **A scan never records a publication still landing** (an open intent's
-  target, an unresolved move's destination). Runner publications an older
-  build recorded as unknown/Keep/review are folded back: a duplicate of
-  Runner's own row is removed; an unregistered directory with a verifying
-  `.runner-manifest.json` becomes `transferred`. Content without one stays
+  target, an unresolved move's destination, a directory containing one,
+  `.runner-*` staging). Runner publications an older build recorded as
+  unknown/Keep/review are folded back: a duplicate of Runner's own row (same
+  directory object) is closed with a pointer to it; an unregistered
+  directory whose verifying `.runner-manifest.json` names one of this
+  installation's generations becomes `transferred`. Anything else stays
   **Not Runner's**.
 - **An interrupted writer retirement whose directory is already gone** is
   settled `source_gone` at startup instead of re-arming its hold every boot.

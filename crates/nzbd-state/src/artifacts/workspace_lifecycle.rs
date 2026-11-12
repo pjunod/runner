@@ -1435,6 +1435,69 @@ mod tests {
             .all(|recorded| !recorded.starts_with(&old_state)));
     }
 
+    /// One recorded workspace fixture: a state directory at `state` with a
+    /// par_repair workspace for job 12 under its default root.
+    fn recorded_workspace(temp: &tempfile::TempDir, state: &Path) -> Workspace {
+        let root = temp.path().join("processing");
+        std::fs::create_dir_all(&root).unwrap();
+        let inventory = Inventory::open(state).unwrap();
+        inventory
+            .allocate_for_delivery(12, &root, &root.join("job"), false, false)
+            .unwrap();
+        std::fs::write(root.join("job/original"), b"original").unwrap();
+        let workspace = inventory.workspace(12, "par_repair", "abc").unwrap();
+        inventory.close().unwrap();
+        workspace
+    }
+
+    /// The state directory moved wholesale, workspaces inside it, and no
+    /// `workspace_dir` is set: the default root of the new state directory
+    /// is where the recorded workspaces now are, and they are found there.
+    #[test]
+    fn wholesale_state_move_resolves_workspaces_under_the_new_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_state = temp.path().join("queue");
+        let workspace = recorded_workspace(&temp, &old_state);
+        let state = temp.path().join("state");
+        std::fs::rename(&old_state, &state).unwrap();
+        let inventory = Inventory::open(&state).unwrap();
+        let default = state.join("transform-workspaces");
+        assert!(inventory.configure_workspace_dir(&default).unwrap() > 0);
+        let scratch = inventory.get(&workspace.scratch.id).unwrap();
+        assert!(scratch.path.starts_with(&default), "{:?}", scratch.path);
+        inventory.verify(&scratch).unwrap();
+        assert_eq!(inventory.configure_workspace_dir(&default).unwrap(), 0);
+    }
+
+    /// Workspaces still at their recorded root on `workspace_dir`'s
+    /// filesystem are renamed into `workspace_dir` (same inodes), so every
+    /// workspace ends up under the configured root.
+    #[test]
+    fn workspaces_left_at_the_recorded_root_are_renamed_into_workspace_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_state = temp.path().join("processing/queue");
+        let workspace = recorded_workspace(&temp, &old_state);
+        // Only the state files moved; the workspaces stayed where they were.
+        let state = temp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        for entry in std::fs::read_dir(&old_state).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name() != "transform-workspaces" {
+                std::fs::rename(entry.path(), state.join(entry.file_name())).unwrap();
+            }
+        }
+        let dir = temp.path().join("processing/transform-workspaces");
+        let inventory = Inventory::open(&state).unwrap();
+        assert!(inventory.configure_workspace_dir(&dir).unwrap() > 0);
+        let scratch = inventory.get(&workspace.scratch.id).unwrap();
+        assert!(scratch.path.starts_with(&dir), "{:?}", scratch.path);
+        assert!(scratch.path.exists());
+        assert!(!workspace.scratch.path.exists(), "renamed, not copied");
+        inventory.verify(&scratch).unwrap();
+        let reopened = inventory.workspace(12, "par_repair", "abc").unwrap();
+        assert_eq!(reopened.operation_id, workspace.operation_id);
+    }
+
     /// An in-flight workspace (open journal, one attempt) whose root is
     /// copy-moved: the journal's copy of the scratch and its attempt are
     /// re-stamped with the row, so startup reconcile leaves it to its

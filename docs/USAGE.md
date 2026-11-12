@@ -134,9 +134,11 @@ parked** with a line saying why: the failure reason (`too few articles`,
 assessment's text, and `salvage pending` while a salvage publication is still
 owed. The retention column gives its expiry (`expires <time>`), or `keep
 indefinitely` when keep is on. The same line is in the folder's details panel.
-**Needs attention** lists only what a person must act on: a Runner row whose
-hold has no automatic exit, which the exit registry makes impossible (so it is
-empty unless something is wrong). Folders Runner found but did not write are
+**Needs attention** lists Runner rows a person should look at: an error, a
+blocked cleanup or an open publication intent (shown while their own exit
+runs), a hold with no automatic exit, and any row that has outlived its
+registered exit (a timed hold past its hour, a retention deadline past due,
+an in-progress state older than a day). A healthy row is never there. Folders Runner found but did not write are
 listed apart under **Not Runner's**: never deleted automatically, they block
 nothing; "release review hold" and adoption apply to them. Runner
 publications handed to Curator are `transferred`, never either. No job is

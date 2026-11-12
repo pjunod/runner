@@ -82,9 +82,9 @@ pub struct SupersededSource {
 pub enum SupersededOutcome {
     /// Removed by closed scope.
     Retired,
-    /// Cleanup is blocked (identity or ownership changed): the bytes are
-    /// retained where they are, under the source row's own exit.
-    Blocked(String),
+    /// Parked where it is with the failed TTL (a Park disposition, or a
+    /// blocked retirement): its retention deletion is its exit.
+    Parked(String),
     /// Still on the relocation's cleanup ladder.
     Pending(String),
 }
@@ -1833,30 +1833,25 @@ impl Inventory {
         Ok(())
     }
 
-    /// Contract §2.6 (W3/W4): a deferred publication move (source retained
-    /// "until the delivery row exists") whose publication never became a
-    /// delivery, because the job failed instead — a `publish` failure after
-    /// the bytes were copied out. No delivery will ever come for it. Once the
-    /// failure is durable (terminal emitted, salvage settled, no open intent)
-    /// and the failed job's own disposition has taken custody of the
-    /// published generation — relocated it onward (park) or deleted it — the
-    /// pre-publication source is that failure's remainder, and it retires by
-    /// closed scope exactly as it would after a delivery. A job or artifact
-    /// that keeps its failure never qualifies, nor does a publication still
-    /// at its destination or one that unwound back onto the source path.
-    pub(super) fn publication_superseded_by_failure(&self, movement: &Relocation) -> Result<bool> {
+    /// The durable failure a deferred publication move (source retained
+    /// "until the delivery row exists") ended in instead of a delivery — a
+    /// `publish` failure after the bytes were copied out — when its
+    /// remainder may follow the failure's disposition: terminal emitted,
+    /// salvage settled, no open intent, and neither the job, the move's
+    /// source nor the current row keeps its failure.
+    fn failed_publication_remainder(&self, movement: &Relocation) -> Result<Option<Artifact>> {
         if !movement.defer_source_retirement
             || movement.cleanup_done
             || movement.source.keep
             || movement.source.keep_on_failure
         {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(job) = movement.source.job else {
-            return Ok(false);
+            return Ok(None);
         };
         let Some(terminal) = self.terminal(job)? else {
-            return Ok(false);
+            return Ok(None);
         };
         if terminal.outcome != nzbd_types::TerminalOutcome::Failed
             || terminal.keep_on_failure
@@ -1864,28 +1859,55 @@ impl Inventory {
             || terminal.salvage == SalvageState::Pending
             || self.open_intent_for_job(job)?
         {
-            return Ok(false);
+            return Ok(None);
         }
         let current = match self.get(&movement.source.id) {
             Ok(current) => current,
-            Err(Error::NotFound) => return Ok(false),
+            Err(Error::NotFound) => return Ok(None),
             Err(error) => return Err(error),
         };
-        if current.keep || current.keep_on_failure || current.hold.is_some() {
+        if current.keep
+            || current.keep_on_failure
+            || current.hold.is_some()
+            || current.generation != movement.source.generation
+            || current.path == movement.source.path
+        {
+            return Ok(None);
+        }
+        Ok(Some(current))
+    }
+
+    /// Closed scope (W4) for a failed publication's remainder is granted
+    /// only by a **Delete** disposition: the published generation itself
+    /// was deleted (`deleted`, by a succeeded delete operation of this
+    /// artifact). A Park disposition keeps payload for recovery — PAR
+    /// volumes, unextracted archives — so it never grants it
+    /// (`park_superseded_publication_sources` parks the remainder instead).
+    /// A merely terminal row (`source_gone`) is not proof of a deletion.
+    pub(super) fn publication_superseded_by_failure(&self, movement: &Relocation) -> Result<bool> {
+        let Some(current) = self.failed_publication_remainder(movement)? else {
+            return Ok(false);
+        };
+        if current.state != "deleted" {
             return Ok(false);
         }
-        if current.path == movement.source.path {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state='succeeded' AND json_extract(data,'$.kind')='delete')",
+            [&current.id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The published generation was relocated onward from the move's
+    /// destination by a committed relocation (a Park disposition).
+    fn publication_relocated_onward(
+        &self,
+        movement: &Relocation,
+        current: &Artifact,
+    ) -> Result<bool> {
+        if current.path == movement.destination || current.terminal() {
             return Ok(false);
         }
-        if current.terminal() {
-            // The disposition deleted the published generation.
-            return Ok(true);
-        }
-        if current.path == movement.destination {
-            return Ok(false);
-        }
-        // Relocated onward: a committed move took the publication from the
-        // destination to where the artifact now is.
         let raws = {
             let db = self.db.lock().unwrap();
             let mut statement = db.prepare(
@@ -1906,13 +1928,9 @@ impl Inventory {
         Ok(false)
     }
 
-    /// Retire every pre-publication source of `job` that the failed job's
-    /// disposition superseded (`publication_superseded_by_failure`). Each
-    /// runs on its relocation's own cleanup ladder; the result says, per
-    /// source, whether it is gone, blocked (retained for review — a
-    /// terminal answer the disposal records) or still pending on that
-    /// ladder.
-    pub fn retire_superseded_publication_sources(&self, job: u32) -> Result<Vec<SupersededSource>> {
+    /// The job's deferred publication moves that have not retired their
+    /// source, oldest first.
+    fn deferred_publication_moves(&self, job: u32) -> Result<Vec<(String, Relocation)>> {
         let raws = {
             let db = self.db.lock().unwrap();
             let mut statement = db.prepare(
@@ -1921,9 +1939,25 @@ impl Inventory {
             let rows = statement.query_map([job], |row| row.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        let mut sources = Vec::new();
+        let mut moves = Vec::new();
         for key in raws {
             let movement: Relocation = serde_json::from_str(&self.operation(&key)?.request)?;
+            if movement.defer_source_retirement && !movement.cleanup_done {
+                moves.push((key, movement));
+            }
+        }
+        Ok(moves)
+    }
+
+    /// Delete disposition: retire every pre-publication source of `job`
+    /// that the deletion superseded (`publication_superseded_by_failure`),
+    /// by closed scope on its relocation's own cleanup ladder. A retirement
+    /// the cleanup blocks is parked in place with the failed TTL — its
+    /// retention deletion re-snapshots the closed scope — so it never waits
+    /// on a person.
+    pub fn retire_superseded_publication_sources(&self, job: u32) -> Result<Vec<SupersededSource>> {
+        let mut sources = Vec::new();
+        for (key, movement) in self.deferred_publication_moves(job)? {
             if !self.publication_superseded_by_failure(&movement)? {
                 continue;
             }
@@ -1933,7 +1967,9 @@ impl Inventory {
             let outcome = if after.cleanup_done {
                 SupersededOutcome::Retired
             } else if after.cleanup.state == CleanupState::Blocked {
-                SupersededOutcome::Blocked(after.cleanup.error.unwrap_or_default())
+                let reason = after.cleanup.error.unwrap_or_default();
+                self.park_publication_remainder(&key, &reason)?;
+                SupersededOutcome::Parked(format!("retirement blocked ({reason})"))
             } else {
                 SupersededOutcome::Pending(match attempt {
                     Err(error) => error.to_string(),
@@ -1946,6 +1982,69 @@ impl Inventory {
             sources.push(SupersededSource { path, outcome });
         }
         Ok(sources)
+    }
+
+    /// Park disposition: the published generation was parked onward, and the
+    /// pre-publication remainder (PAR volumes, archives, anything the
+    /// publication did not take) is parked where it is with the failed TTL,
+    /// under Runner's custody, instead of retiring by closed scope. Its
+    /// retention TTL is its exit; nothing is deleted now.
+    pub fn park_superseded_publication_sources(&self, job: u32) -> Result<Vec<SupersededSource>> {
+        let mut sources = Vec::new();
+        for (key, movement) in self.deferred_publication_moves(job)? {
+            let Some(current) = self.failed_publication_remainder(&movement)? else {
+                continue;
+            };
+            if !self.publication_relocated_onward(&movement, &current)? {
+                continue;
+            }
+            let path = movement.source.path.clone();
+            let outcome = match self
+                .park_publication_remainder(&key, "the publication was parked")?
+            {
+                Some(_) => SupersededOutcome::Parked("parked in place with the failed TTL".into()),
+                None => SupersededOutcome::Retired,
+            };
+            sources.push(SupersededSource { path, outcome });
+        }
+        Ok(sources)
+    }
+
+    /// Park a relocation's retained source row (`source-<op>`) in place with
+    /// the failed TTL. `None` when it is already gone; idempotent.
+    fn park_publication_remainder(&self, key: &str, why: &str) -> Result<Option<Artifact>> {
+        let ttl = i64::from(self.settings()?.failed_retention_days) * 86400;
+        let _guard = self.mutation_guard()?;
+        let mut row = match self.get(&format!("source-{key}")) {
+            Ok(row) => row,
+            Err(Error::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if row.terminal() {
+            return Ok(None);
+        }
+        if row.state == "parked_failed" {
+            return Ok(Some(row));
+        }
+        row.hold = None;
+        row.owned = true;
+        row.state = "parked_failed".into();
+        row.automatic_cleanup_eligible = true;
+        row.retention_seconds = ttl.max(1) as u64;
+        row.deadline = Some(now().saturating_add(ttl.max(0)));
+        row.revision += 1;
+        row.updated_at = now();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        save_artifact(&tx, &row)?;
+        event(
+            &tx,
+            &row.id,
+            "publication_remainder_parked",
+            &format!("failed publication's remainder parked with the failed TTL: {why}"),
+        )?;
+        tx.commit()?;
+        Ok(Some(row))
     }
 
     fn retire_relocation_source(&self, key: &str) -> Result<()> {
@@ -2277,6 +2376,15 @@ impl Inventory {
             return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
         }
         let published = self.get(&movement.source.id)?;
+        // A failed job's disposition already took the publication (parked it
+        // onward, which re-snapshotted it, or deleted it): there is no
+        // hard-linked publication at the destination left to refresh.
+        if published.generation == movement.source.generation
+            && ((published.state == "deleted" && published.path != movement.source.path)
+                || self.publication_relocated_onward(movement, &published)?)
+        {
+            return Ok(());
+        }
         if published.generation != movement.source.generation
             || published.path != movement.destination
             || !matches!(

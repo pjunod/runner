@@ -611,6 +611,65 @@ impl Inventory {
         Ok(())
     }
 
+    /// The bounded exit of an exhausted disposal ladder: in one transaction
+    /// the obligation settles (`disposal`) and the payload gets a timed
+    /// exit too — every live row of the job (and every retained source row
+    /// of its relocations) that is not already on one is parked with the
+    /// failed TTL, so retention deletion ends it. A row the job or a person
+    /// keeps stays retained under that policy. Returns the rows parked.
+    pub fn settle_exhausted_disposal(&self, job: u32, note: &str) -> Result<usize> {
+        let ttl = i64::from(self.settings()?.failed_retention_days) * 86400;
+        let _guard = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let raws = {
+            let mut statement = tx.prepare(
+                "SELECT data FROM artifacts WHERE (job=?1 OR id IN (SELECT 'source-'||o.id FROM operations o JOIN artifacts a ON a.id=o.artifact WHERE a.job=?1 AND json_extract(o.data,'$.kind')='relocate')) \
+                 AND state IN ('active','active_unverified','transitioning','retained','delete_failed')",
+            )?;
+            let rows = statement.query_map([job], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut parked = 0;
+        for raw in raws {
+            let mut row: Artifact = serde_json::from_str(&raw)?;
+            if !row.owned {
+                continue;
+            }
+            if row.keep || row.keep_on_failure {
+                if row.state != "retained" {
+                    row.state = "retained".into();
+                    row.revision += 1;
+                    row.updated_at = now();
+                    save_artifact(&tx, &row)?;
+                }
+                continue;
+            }
+            row.hold = None;
+            row.state = "parked_failed".into();
+            row.automatic_cleanup_eligible = true;
+            row.retention_seconds = ttl.max(1) as u64;
+            row.deadline = Some(now().saturating_add(ttl.max(0)));
+            row.revision += 1;
+            row.updated_at = now();
+            save_artifact(&tx, &row)?;
+            event(
+                &tx,
+                &row.id,
+                "disposal_settled",
+                "disposal could not complete within its budget; parked with the failed TTL",
+            )?;
+            parked += 1;
+        }
+        tx.execute(
+            "UPDATE job_terminals SET disposal=?2,updated_at=?3 WHERE job=?1",
+            rusqlite::params![job, note, now()],
+        )?;
+        tx.execute("DELETE FROM meta WHERE key=?1", [disposal_ladder_key(job)])?;
+        tx.commit()?;
+        Ok(parked)
+    }
+
     /// When the job's disposal may next be attempted on its own ladder
     /// (`note_disposal_incomplete`); `None` when no attempt was incomplete.
     pub fn disposal_ladder(&self, job: u32) -> Result<Option<DisposalLadder>> {

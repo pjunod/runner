@@ -1345,9 +1345,14 @@ impl Owner {
         );
         // `paths.workspace_dir`, and the migration of rows recorded under the
         // default root, before anything reads a workspace path.
-        if let Some(dir) = workspace_dir {
+        // Unset, the default root is configured too: workspaces recorded
+        // under a previous state directory (a wholesale move) are resolved.
+        let dir = workspace_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| artifacts.workspace_dir());
+        if workspace_dir.is_some() || dir.is_absolute() {
             artifacts
-                .configure_workspace_dir(dir)
+                .configure_workspace_dir(&dir)
                 .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
         }
         // Capture the metadata boundary before runtime Inventory handles can

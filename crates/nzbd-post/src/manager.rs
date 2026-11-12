@@ -943,7 +943,16 @@ async fn failure_followup_settle(
     let done = if terminal.salvage == nzbd_state::artifacts::SalvageState::Pending {
         false
     } else {
-        dispose_failed_source(&scoped, cfg, dest_dir, &admitted_gate, &row, &terminal).await
+        dispose_failed_source(
+            &scoped,
+            cfg,
+            dest_dir,
+            &admitted_gate,
+            &row,
+            &terminal,
+            force,
+        )
+        .await
     };
     if let Err(error) = engine.end_post_admission(admission).await {
         tracing::warn!(job = job.0, %error, "failed-job follow-up custody release remains pending");
@@ -1258,6 +1267,7 @@ async fn dispose_failed_source(
     gate: &PpGate,
     row: &Job,
     terminal: &nzbd_state::artifacts::JobTerminal,
+    force: bool,
 ) -> bool {
     let job = row.id;
     let inventory = engine.artifacts();
@@ -1379,23 +1389,31 @@ async fn dispose_failed_source(
         );
         return false;
     }
-    // The pre-publication source of a publication the failure superseded
-    // retires with the disposition (closed scope); a blocked retirement
-    // leaves it retained, which is a settled answer, not a retry.
-    let superseded = if action != FailureAction::None
-        && observed.files_at.as_deref() != Some(source.as_path())
+    // The pre-publication remainder of a publication the failure
+    // superseded follows the disposition: a Delete retires it by closed
+    // scope; a Park parks it in place with the failed TTL (recovery input —
+    // PAR volumes, archives — is never wiped by a park).
+    let superseded = if observed.files_at.as_deref() != Some(source.as_path())
+        && matches!(action, FailureAction::Delete | FailureAction::Park)
     {
-        let retiring = inventory.clone();
-        tokio::task::spawn_blocking(move || retiring.retire_superseded_publication_sources(job.0))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
+        let following = inventory.clone();
+        let delete = action == FailureAction::Delete;
+        tokio::task::spawn_blocking(move || {
+            if delete {
+                following.retire_superseded_publication_sources(job.0)
+            } else {
+                following.park_superseded_publication_sources(job.0)
+            }
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
     } else {
         Vec::new()
     };
     let retained_source = superseded.iter().find_map(|left| match &left.outcome {
-        nzbd_state::artifacts::SupersededOutcome::Blocked(reason) if left.path == source => {
+        nzbd_state::artifacts::SupersededOutcome::Parked(reason) if left.path == source => {
             Some(reason.clone())
         }
         _ => None,
@@ -1436,25 +1454,40 @@ async fn dispose_failed_source(
                 _ => None,
             })
             .unwrap_or_else(|| observed.note.clone());
+        // Only an attempt with no operation ladder of its own counts (a
+        // retrying delete/relocate owns its retries), and an operator's
+        // forced retry never spends the budget.
         let noting = inventory.clone();
         let noted = outcome.clone();
-        let ladder =
-            tokio::task::spawn_blocking(move || noting.note_disposal_incomplete(job.0, &noted))
-                .await
-                .ok()
-                .and_then(Result::ok);
+        let ladder = tokio::task::spawn_blocking(move || {
+            if force || noting.disposal_in_flight(job.0).unwrap_or(true) {
+                return Ok(None);
+            }
+            noting.note_disposal_incomplete(job.0, &noted).map(Some)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
         match ladder {
             Some(ladder) if ladder.exhausted => {
-                // Bounded exit: what remains stays retained under its own
-                // rows' exits (retention TTL, hold exits); the obligation
-                // settles instead of retrying forever.
+                // Bounded exit for the obligation and the payload together:
+                // the disposal settles and every live row of the job is
+                // parked with the failed TTL in the same transaction.
                 tracing::warn!(job = job.0, attempts = ladder.attempts, %outcome,
-                    "failed-source disposition did not complete within its budget; settling with the payload retained");
-                return record(format!(
-                    "retained after {} incomplete disposal attempts: {outcome}",
+                    "failed-source disposition did not complete within its budget; parking what remains with the failed TTL");
+                let note = format!(
+                    "parked with the failed TTL after {} incomplete disposal attempts: {outcome}",
                     ladder.attempts
-                ))
-                .await;
+                );
+                let settling = inventory.clone();
+                return matches!(
+                    tokio::task::spawn_blocking(
+                        move || settling.settle_exhausted_disposal(job.0, &note)
+                    )
+                    .await,
+                    Ok(Ok(_))
+                );
             }
             Some(ladder) => {
                 tracing::warn!(job = job.0, attempts = ladder.attempts,
@@ -1954,7 +1987,7 @@ fn canonical_failed_disposition(
     };
     let retained_note = |note: String| match retained_source {
         Some(reason) if source.exists() => format!(
-            "{note}; earlier processing copy retained at {}: {reason}",
+            "{note}; earlier processing copy at {} parked with the failed TTL: {reason}",
             source.display()
         ),
         _ => note,
@@ -2976,8 +3009,8 @@ mod admission_tests {
         engine.shutdown().await;
     }
 
-    /// A superseded processing copy whose retirement is blocked does not
-    /// keep the disposition open forever: it settles, naming what stayed.
+    /// A superseded processing copy parked in place does not keep the
+    /// disposition open forever: it settles, naming what was parked.
     /// Without that answer the same state stays incomplete.
     #[test]
     fn a_blocked_superseded_source_settles_the_disposition_retained() {
@@ -2998,7 +3031,11 @@ mod admission_tests {
                 .unwrap();
         assert_eq!(settled.files_at, Some(failed.join("job")));
         assert!(settled.note.starts_with("parked at "), "{}", settled.note);
-        assert!(settled.note.contains("retained at"), "{}", settled.note);
+        assert!(
+            settled.note.contains("parked with the failed TTL"),
+            "{}",
+            settled.note
+        );
         assert!(source.exists(), "nothing deleted");
     }
 

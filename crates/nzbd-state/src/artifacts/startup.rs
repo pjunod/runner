@@ -155,6 +155,22 @@ impl Drop for ReconciliationLease<'_> {
     }
 }
 
+/// The name only Runner gives a directory: a transform scratch is named by
+/// its operation key (`scratch-<key>` row, `<key>` directory), a job
+/// directory carries `.job-<N>-` for its own job.
+fn runner_named(artifact: &Artifact) -> bool {
+    let Some(name) = artifact.path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    match artifact.job {
+        Some(job) => name.contains(&format!(".job-{job}-")),
+        None => artifact
+            .id
+            .strip_prefix("scratch-")
+            .is_some_and(|key| key == name),
+    }
+}
+
 impl Inventory {
     pub(super) fn reconciliation_in_use(&self, artifact: &Artifact) -> bool {
         self.reconciliation_uses
@@ -353,7 +369,9 @@ impl Inventory {
             if !snapshot.allows_artifact(self, &original)? {
                 continue;
             }
-            if self.is_transform_scratch(&original)? {
+            // A transform's scratch follows its journal — except an
+            // interrupted allocation, which no journal ever used.
+            if original.state != "allocating" && self.is_transform_scratch(&original)? {
                 continue;
             }
             let live = original.job.is_some_and(|job| live_jobs.contains(&job));
@@ -380,6 +398,43 @@ impl Inventory {
                 }
                 if !artifact.path.try_exists()? {
                     artifact.state = "source_gone".into();
+                } else if runner_named(&artifact) {
+                    // The directory sits at the name only Runner gives (a
+                    // transform key, a `.job-<N>-` job directory): Runner
+                    // made it; the interruption only lost the identity
+                    // commit. It stays Runner's.
+                    let dir = fs::open_dir(&artifact.path)?;
+                    let files = fs::manifest(&dir, 100_000)?;
+                    artifact.identity = Some(fs::identity_for_file(&dir)?);
+                    artifact.owned = true;
+                    artifact.files = files;
+                    artifact.inspected_at = Some(now());
+                    if live {
+                        artifact.state = "active".into();
+                        self.sidecar(&artifact)?;
+                    } else if artifact.files.is_empty() {
+                        // Nothing was ever written: remove the empty
+                        // directory (never recursively) and close the row.
+                        drop(dir);
+                        match std::fs::remove_dir(&artifact.path) {
+                            Ok(()) => {
+                                artifact.state = "deleted".into();
+                                artifact.hold = None;
+                                retirement_gone = true;
+                            }
+                            Err(_) => {
+                                artifact.state = "retained".into();
+                                artifact.hold = None;
+                                self.sidecar(&artifact)?;
+                            }
+                        }
+                    } else {
+                        // Bytes an interrupted Runner allocation wrote: a
+                        // failed payload, parked below with the failed TTL.
+                        artifact.state = "retained".into();
+                        artifact.hold = None;
+                        self.sidecar(&artifact)?;
+                    }
                 } else {
                     // mkdir without a committed sidecar cannot prove ownership.
                     artifact.identity =
