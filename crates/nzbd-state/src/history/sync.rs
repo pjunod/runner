@@ -696,6 +696,42 @@ fn index_marker(dir: &Path, tag: Option<&str>) -> PathBuf {
     )
 }
 
+/// The active index a marker names. A relative marker is relative to the
+/// state directory. An absolute one (written by older builds) is taken as
+/// is when it exists; when it does not — the state directory was moved — the
+/// same index under this state directory is found by its trailing path
+/// (shortest tail first: `history.sqlite`, then `<dir>/history.sqlite`, …),
+/// so a moved state directory opens without editing the marker. Only the
+/// configured index (`target`) is accepted that way: an absolute marker
+/// naming an index elsewhere (`history.index_dir` on a mount that is down)
+/// is never swapped for a different file. Otherwise the recorded path
+/// stands and the caller reports it missing.
+fn resolve_index_marker(raw: &str, state: &Path, target: &Path) -> PathBuf {
+    let recorded = PathBuf::from(raw.trim_end_matches(['\n', '\r']));
+    if recorded.is_relative() {
+        return state.join(recorded);
+    }
+    if recorded.exists() {
+        return recorded;
+    }
+    let parts = recorded
+        .components()
+        .filter_map(|part| match part {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for start in (0..parts.len()).rev() {
+        let candidate = parts[start..]
+            .iter()
+            .fold(state.to_path_buf(), |path, part| path.join(part));
+        if candidate == target && candidate.exists() {
+            return candidate;
+        }
+    }
+    recorded
+}
+
 /// Startup holds the portable writer lock, so a new location cannot race an
 /// already running daemon using the same history authority. VACUUM INTO reads
 /// committed WAL state and preserves rowids and sqlite_sequence.
@@ -710,7 +746,7 @@ pub(super) fn prepare_index(
     };
     let marker = index_marker(logs, tag);
     let source = match fsx::read_to_string(&marker) {
-        Ok(path) => PathBuf::from(path),
+        Ok(path) => resolve_index_marker(&path, state, target),
         Err(e) if e.is_not_found() => state.join("history.sqlite"),
         Err(e) => return Err(e),
     };
@@ -787,9 +823,21 @@ pub(super) fn record_index_path(
     };
     let path = index_marker(logs, tag);
     let target = fsx::canonicalize(target)?;
+    // An index inside the state directory is recorded relative to it, so
+    // moving the whole state directory needs no marker edit. One elsewhere
+    // (`history.index_dir`) stays absolute.
+    let state = spool
+        .and_then(Path::parent)
+        .and_then(|state| fsx::canonicalize(state).ok());
+    let recorded = state
+        .as_deref()
+        .and_then(|state| target.strip_prefix(state).ok())
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| target.clone());
     let tmp = path.with_extension("tmp");
     let mut f = fsx::create(&tmp)?;
-    fsx::write_whole(&mut f, target.to_string_lossy().as_bytes(), &tmp)?;
+    fsx::write_whole(&mut f, recorded.to_string_lossy().as_bytes(), &tmp)?;
     fsx::sync_data(&f, &tmp)?;
     fsx::rename(&tmp, &path)?;
     fsx::sync_parent(&path)
@@ -1225,6 +1273,60 @@ mod tests {
         assert!(db.start_worker().is_err());
         worker.stop();
         assert!(db.refresh().is_err());
+    }
+
+    /// Moving the whole state directory (here `queue` → `state`) opens the
+    /// same index without editing the marker: it is recorded relative to the
+    /// state directory, and an older build's absolute marker naming the old
+    /// location resolves to the same index under the new one.
+    #[test]
+    fn moving_the_state_directory_needs_no_marker_edit() {
+        let t = tempfile::tempdir().unwrap();
+        let old = t.path().join("queue");
+        {
+            let db = local(&old, &old);
+            db.record(&entry(1, 100)).unwrap();
+        }
+        let marker = |state: &Path| state.join("history/.history-index-path");
+        assert_eq!(
+            std::fs::read_to_string(marker(&old)).unwrap(),
+            "history.sqlite",
+            "recorded relative to the state directory"
+        );
+        let new = t.path().join("state");
+        std::fs::rename(&old, &new).unwrap();
+        {
+            let db = local(&new, &new);
+            assert_eq!(db.count_filtered(true).unwrap(), 1);
+            db.record(&entry(2, 200)).unwrap();
+        }
+        // The pre-fix marker: the absolute path of the old location.
+        std::fs::write(
+            marker(&new),
+            old.join("history.sqlite").to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let db = local(&new, &new);
+        assert_eq!(db.count_filtered(true).unwrap(), 2);
+        drop(db);
+        // A missing index whose path does not end in the configured one is
+        // never swapped for a different file.
+        std::fs::write(
+            marker(&new),
+            t.path()
+                .join("elsewhere/other.sqlite")
+                .to_string_lossy()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(HistoryDb::open_configured(
+            &new.join("history.sqlite"),
+            Some(&new.join("history")),
+            None,
+            HistoryMode::LocalOnly,
+            Some(&new.join("nzbs"))
+        )
+        .is_err());
     }
 
     #[test]
