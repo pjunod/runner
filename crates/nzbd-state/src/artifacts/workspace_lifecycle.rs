@@ -918,7 +918,20 @@ impl Inventory {
             let Ok(mut scratch) = self.get(&workspace.scratch.id) else {
                 continue;
             };
-            if scratch.terminal() || matches!(scratch.state.as_str(), "deleting" | "delete_failed")
+            // A `deleting` scratch with no delete/retirement operation is an
+            // interrupted finished-job discard: it resumes below.
+            let interrupted_discard = scratch.state == "deleting"
+                && {
+                    let db = self.db.lock().unwrap();
+                    !db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND json_extract(data,'$.kind') IN ('delete','retire_workspace'))",
+                    [&scratch.id],
+                    |row| row.get::<_, bool>(0),
+                )?
+                };
+            if scratch.terminal()
+                || (matches!(scratch.state.as_str(), "deleting" | "delete_failed")
+                    && !interrupted_discard)
             {
                 continue;
             }
@@ -1083,14 +1096,23 @@ impl Inventory {
         }
         Ok(())
     }
-    /// Why the job a workspace belongs to is over, if it is: its terminal is
-    /// durable (any outcome, event emitted, salvage settled). `None` while
-    /// the job may still use it, without a terminal (the receipt-based
-    /// retirement decides those), or when the job keeps its failure.
-    fn finished_job(&self, workspace: &Workspace, parent: &Artifact) -> Result<Option<String>> {
-        let Some(job) = parent.job.or(workspace.source.job) else {
+    /// The job a workspace belongs to and its terminal, when the job is over:
+    /// the terminal is durable (any outcome, event emitted, salvage
+    /// settled). The job is the one the workspace journal names; a source
+    /// row naming another job does not count. `None` while the job may still
+    /// use it, without a terminal (the receipt-based retirement decides
+    /// those), or when the job or its source keeps its failure.
+    fn finished_job(
+        &self,
+        workspace: &Workspace,
+        parent: &Artifact,
+    ) -> Result<Option<(u32, super::JobTerminal)>> {
+        let Some(job) = workspace.source.job.or(parent.job) else {
             return Ok(None);
         };
+        if parent.job.is_some_and(|other| other != job) || parent.keep_on_failure {
+            return Ok(None);
+        }
         let Some(terminal) = self.terminal(job)? else {
             return Ok(None);
         };
@@ -1100,7 +1122,30 @@ impl Inventory {
         {
             return Ok(None);
         }
-        Ok(Some(format!("job {job} is {}", terminal.outcome.as_str())))
+        Ok(Some((job, terminal)))
+    }
+
+    /// Whether anything the job handed on names this workspace: the
+    /// terminal's publication or a delivery row pointing at the scratch
+    /// (its id, or a path under it). Such a workspace is not garbage.
+    fn workspace_is_published(
+        &self,
+        terminal: &super::JobTerminal,
+        scratch: &Artifact,
+    ) -> Result<bool> {
+        if terminal
+            .publication
+            .as_ref()
+            .is_some_and(|publication| Path::new(&publication.path).starts_with(&scratch.path))
+        {
+            return Ok(true);
+        }
+        let path = scratch.path.to_string_lossy();
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM deliveries WHERE artifact=?1 OR instr(data,?1)>0 OR instr(data,?2)>0)",
+            params![scratch.id, path],
+            |row| row.get(0),
+        )?)
     }
 
     /// A workspace whose job is over is removed (contract §2.6, closed
@@ -1108,11 +1153,15 @@ impl Inventory {
     /// under the private workspace root, recorded as Runner's — so neither
     /// scratch identity drift, nor a Keep or missing ownership on its
     /// *source* (an older startup path set those), nor the absence of a
-    /// finalization receipt applies to it. An unfinished journal of it ends
-    /// (`failed`). A source left `transitioning` only by that journal
+    /// finalization receipt applies to it. It is not removed while anything
+    /// the job handed on names it, while a person's Keep or hold is on it,
+    /// or — for a completed job — unless its transform failed or published
+    /// its output. The root must verify (an unmounted volume is never taken
+    /// for a removed workspace). The removal is journaled (`deleting`, then
+    /// `deleted`) so a crash between resumes it. An unfinished journal of it
+    /// ends (`failed`); a source left `transitioning` only by that journal
     /// becomes quiescent; a cancelled job's leftover source is parked with
-    /// the failed TTL. Nothing outside the private root is touched. Returns
-    /// whether the workspace was handled.
+    /// the failed TTL. Returns whether the workspace was handled.
     fn discard_workspace_of_finished_job(
         &self,
         op: &mut Operation,
@@ -1120,9 +1169,16 @@ impl Inventory {
         scratch: &Artifact,
         parent: &Artifact,
     ) -> Result<bool> {
-        let Some(why) = self.finished_job(workspace, parent)? else {
+        let Some((job, terminal)) = self.finished_job(workspace, parent)? else {
             return Ok(false);
         };
+        let why = format!("job {job} is {}", terminal.outcome.as_str());
+        if terminal.outcome == nzbd_types::TerminalOutcome::Completed
+            && !(op.state == "failed"
+                || (op.state == "succeeded" && workspace.published_files.is_some()))
+        {
+            return Ok(false);
+        }
         let source = SourceGeneration {
             artifact: parent.id.clone(),
             generation: workspace.source.generation.clone(),
@@ -1135,6 +1191,7 @@ impl Inventory {
                 .hold
                 .as_deref()
                 .is_some_and(|hold| hold != "transform workspace")
+            || self.workspace_is_published(&terminal, scratch)?
         {
             return Ok(false);
         }
@@ -1145,9 +1202,35 @@ impl Inventory {
             && scratch.path.file_name().and_then(|name| name.to_str()) == Some(key)
             && scratch.root == private_root
             && scratch.owned;
-        if !runner_named {
+        if !runner_named || self.verify_root(scratch).is_err() {
             return Ok(false);
         }
+        // Journal the removal under the coordinator against the exact
+        // revision assessed, then remove without holding it.
+        let mut deleting = {
+            let _coordinator = self.mutation_guard()?;
+            let current = self.get(&scratch.id)?;
+            if current.revision != scratch.revision || current.generation != scratch.generation {
+                return Ok(false);
+            }
+            let mut deleting = current;
+            if deleting.state != "deleting" {
+                deleting.state = "deleting".into();
+                deleting.revision += 1;
+                deleting.updated_at = now();
+                let mut db = self.db.lock().unwrap();
+                let tx = db.transaction()?;
+                save_artifact(&tx, &deleting)?;
+                event(
+                    &tx,
+                    &deleting.id,
+                    "workspace_discarding",
+                    &format!("transform workspace removal begins: {why}"),
+                )?;
+                tx.commit()?;
+            }
+            deleting
+        };
         match std::fs::symlink_metadata(&scratch.path) {
             Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&scratch.path)?,
             Ok(_) => return Ok(false), // not a directory: not ours to remove
@@ -1155,21 +1238,21 @@ impl Inventory {
             Err(error) => return Err(error.into()),
         }
         let ttl = i64::from(self.settings()?.failed_retention_days) * 86400;
-        let cancelled = parent
-            .job
-            .and_then(|job| self.terminal(job).ok().flatten())
-            .is_some_and(|terminal| terminal.outcome == nzbd_types::TerminalOutcome::Cancelled);
+        let cancelled = terminal.outcome == nzbd_types::TerminalOutcome::Cancelled;
         let _coordinator = self.mutation_guard()?;
+        if self.get(&deleting.id)?.revision != deleting.revision {
+            return Ok(false);
+        }
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
-        let mut gone = scratch.clone();
+        let gone = &mut deleting;
         gone.state = "deleted".into();
         gone.hold = None;
         gone.error = None;
         gone.files.clear();
         gone.revision += 1;
         gone.updated_at = now();
-        save_artifact(&tx, &gone)?;
+        save_artifact(&tx, gone)?;
         event(
             &tx,
             &gone.id,

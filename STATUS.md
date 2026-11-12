@@ -22,11 +22,21 @@ appear.
   touched. An unfinished journal of it ends `failed`; a source it left
   `transitioning` becomes quiescent, and a cancelled job's leftover source
   is parked with the failed TTL.
+- **Guards (Fable review):** never while the terminal's publication or a
+  delivery row names the scratch; a completed job's workspace only when its
+  transform failed or published its output; the job is the one the journal
+  names (a source row naming another job does not count); a source that
+  keeps its failure blocks it; the workspace root must verify (an unmounted
+  volume is never read as a removed workspace); the removal is journaled
+  (`deleting` → `deleted`) against the assessed revision and resumes after
+  a crash. Checked against a fresh read-only copy of nuc4's inventory: all
+  39 rows qualify (the 40th workspace belongs to a job with no terminal yet).
 - **Stale errors:** a `transferred` row carries no earlier attempt's error
   (ENOSPC, lost lease); cleared at open and at delivery.
 - **Stale `transitioning`:** a row no transform, relocation or intent holds
   is classified at startup like an orphaned allocation (parked with the
-  failed TTL).
+  failed TTL) — also when its directory no longer verifies, instead of a
+  writer-retirement hold whose exit would release it back.
 - Jobs 2871/2900/2902 converged on 0.9.1 (disposed 03:13Z). 2710 is on the
   bounded disposal ladder (ENOENT on its park move); it settles within the
   12-attempt budget.

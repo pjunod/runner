@@ -477,6 +477,15 @@ impl Inventory {
                 artifact.hold = None;
                 artifact.files.clear();
                 retirement_gone = true;
+            } else if original.state == "transitioning" && artifact.owned {
+                // A leftover `transitioning` row (nothing holds it) whose
+                // directory no longer verifies is no interrupted writer
+                // retirement: that hold's exit would release it back to a
+                // state with no exit. Runner's own failed payload: parked
+                // below with the failed TTL (its retention deletion
+                // re-snapshots the closed scope).
+                artifact.state = "retained".into();
+                artifact.hold = None;
             } else {
                 artifact.hold = Some("review: interrupted writer retirement".into());
             }

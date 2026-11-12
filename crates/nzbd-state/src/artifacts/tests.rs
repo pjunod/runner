@@ -4970,6 +4970,12 @@ fn finished_jobs_workspaces_and_stale_rows_end_without_an_operator() {
     let set_op = |workspace: &Workspace, state: &str| {
         let mut op = db.operation(&workspace.operation_id).unwrap();
         op.state = state.into();
+        if state == "succeeded" {
+            // A finished transform records what it published (live shape).
+            let mut journal: Workspace = serde_json::from_str(&op.request).unwrap();
+            journal.published_files = Some(Vec::new());
+            op.request = serde_json::to_string(&journal).unwrap();
+        }
         save_operation(&db.db.lock().unwrap(), &op).unwrap();
     };
     let edit = |id: &str, change: &dyn Fn(&mut Artifact)| {
@@ -5132,4 +5138,173 @@ fn a_finished_jobs_workspace_outside_the_private_root_is_not_removed() {
     db.reconcile_workspace_retirements().unwrap();
     assert!(foreign.join("movie.mkv").exists());
     assert_ne!(db.get(&workspace.scratch.id).unwrap().state, "deleted");
+}
+
+/// Shared shape for the finished-job discard guards: a failed job 4000
+/// (or `outcome`) with a real workspace under the private root, its
+/// transform `op_state`, scratch retained.
+fn finished_workspace(
+    db: &Inventory,
+    root: &Path,
+    job: u32,
+    outcome: nzbd_types::TerminalOutcome,
+    op_state: &str,
+) -> Workspace {
+    let source = root.join(format!("Release.job-{job}-url-abc"));
+    db.allocate_for_delivery(job, root, &source, true, true)
+        .unwrap();
+    let workspace = db.workspace(job, "extract", "abc").unwrap();
+    std::fs::write(workspace.scratch.path.join("out.mkv"), b"output").unwrap();
+    let mut op = db.operation(&workspace.operation_id).unwrap();
+    op.state = op_state.into();
+    save_operation(&db.db.lock().unwrap(), &op).unwrap();
+    let mut scratch = db.get(&workspace.scratch.id).unwrap();
+    scratch.state = "retained".into();
+    save_artifact(&db.db.lock().unwrap(), &scratch).unwrap();
+    let mut terminal = terminals::tests::failed(job, SalvageState::SettledNone);
+    terminal.outcome = outcome;
+    db.record_terminal(&terminal).unwrap();
+    db.mark_terminal_step(job, &TerminalStep::Emitted).unwrap();
+    workspace
+}
+
+/// Review fix 1: a workspace something the job handed on names — the
+/// terminal's publication, a delivery row — is never discarded, and a
+/// completed job's workspace goes only when its transform failed or
+/// published its output.
+#[test]
+fn a_finished_jobs_workspace_that_was_handed_on_is_kept() {
+    use nzbd_types::TerminalOutcome::{Completed, Failed};
+    let (_tmp, db, root) = fixture();
+    // Completed, transform `succeeded` but no published output recorded.
+    let unpublished = finished_workspace(&db, &root, 4001, Completed, "succeeded");
+    // A delivery row naming the scratch path.
+    let delivered = finished_workspace(&db, &root, 4002, Failed, "failed");
+    db.db
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO deliveries(sequence,id,artifact,generation,data) VALUES(999,'d-4002','other','g',?1)",
+            [serde_json::json!({ "publicationPath": delivered.scratch.path }).to_string()],
+        )
+        .unwrap();
+    // The terminal's publication lives inside the scratch.
+    let published = finished_workspace(&db, &root, 4003, Failed, "failed");
+    db.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE job_terminals SET publication=?2 WHERE job=?1",
+            params![
+                4003,
+                serde_json::to_string(&nzbd_types::Publication {
+                    path: published
+                        .scratch
+                        .path
+                        .join("out")
+                        .to_string_lossy()
+                        .into_owned(),
+                    generation: "g".into(),
+                    manifest_digest: String::new(),
+                    files: 1,
+                    cross_volume: false,
+                })
+                .unwrap()
+            ],
+        )
+        .unwrap();
+    // Control: a failed job's workspace with nothing naming it goes.
+    let garbage = finished_workspace(&db, &root, 4004, Failed, "failed");
+    for _ in 0..3 {
+        db.reconcile_workspace_retirements().unwrap();
+    }
+    for kept in [&unpublished, &delivered, &published] {
+        assert!(
+            kept.scratch.path.join("out.mkv").exists(),
+            "{}",
+            kept.scratch.id
+        );
+        assert_ne!(db.get(&kept.scratch.id).unwrap().state, "deleted");
+    }
+    assert_eq!(db.get(&garbage.scratch.id).unwrap().state, "deleted");
+    assert!(!garbage.scratch.path.exists());
+}
+
+/// Review fix 2: when the workspace root does not verify (an unmounted or
+/// replaced volume), nothing is removed and no row is marked deleted — not
+/// even when the directory looks absent.
+#[test]
+fn a_finished_jobs_workspace_on_an_unverified_root_is_left_alone() {
+    let (_tmp, db, root) = fixture();
+    let workspace = finished_workspace(
+        &db,
+        &root,
+        4010,
+        nzbd_types::TerminalOutcome::Failed,
+        "failed",
+    );
+    let mut scratch = db.get(&workspace.scratch.id).unwrap();
+    scratch.root_identity.inode += 1; // not the live root object
+    save_artifact(&db.db.lock().unwrap(), &scratch).unwrap();
+    db.reconcile_workspace_retirements().unwrap();
+    assert!(workspace.scratch.path.join("out.mkv").exists());
+    std::fs::remove_dir_all(&workspace.scratch.path).unwrap(); // looks gone
+    db.reconcile_workspace_retirements().unwrap();
+    assert_ne!(db.get(&workspace.scratch.id).unwrap().state, "deleted");
+}
+
+/// Review fix 4: the job is the one the workspace journal names; a source
+/// row that names another job (whose terminal is final) does not make the
+/// workspace garbage, and the cancelled-source parking follows the
+/// journal's job.
+#[test]
+fn a_workspace_follows_the_job_its_journal_names() {
+    let (_tmp, db, root) = fixture();
+    let workspace = finished_workspace(
+        &db,
+        &root,
+        4020,
+        nzbd_types::TerminalOutcome::Failed,
+        "failed",
+    );
+    // Its own job is still running: drop that terminal.
+    db.db
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM job_terminals WHERE job=4020", [])
+        .unwrap();
+    // The source row names a different, cancelled job.
+    let mut parent = db.get(&workspace.source.id).unwrap();
+    parent.job = Some(4021);
+    save_artifact(&db.db.lock().unwrap(), &parent).unwrap();
+    let mut terminal = terminals::tests::failed(4021, SalvageState::SettledNone);
+    terminal.outcome = nzbd_types::TerminalOutcome::Cancelled;
+    db.record_terminal(&terminal).unwrap();
+    db.mark_terminal_step(4021, &TerminalStep::Emitted).unwrap();
+    db.reconcile_workspace_retirements().unwrap();
+    assert!(workspace.scratch.path.join("out.mkv").exists());
+    assert_ne!(db.get(&workspace.scratch.id).unwrap().state, "deleted");
+    assert_ne!(db.get(&workspace.source.id).unwrap().state, "parked_failed");
+}
+
+/// Review fix 6: an orphan `transitioning` row whose directory no longer
+/// verifies is parked with the failed TTL, not given a hold whose exit
+/// would release it back into `transitioning`.
+#[test]
+fn an_unverifiable_leftover_transitioning_row_is_parked() {
+    let (_tmp, db, root) = fixture();
+    let path = root.join("Old.Release.job-1705-url-x");
+    db.allocate(1705, &root, &path).unwrap();
+    std::fs::write(path.join("media.mkv"), b"old").unwrap();
+    let mut row = db.finish(1705, &path, &root, "active").unwrap();
+    row.state = "transitioning".into();
+    if let Some(identity) = row.identity.as_mut() {
+        identity.inode += 1;
+    }
+    save_artifact(&db.db.lock().unwrap(), &row).unwrap();
+    db.reconcile_startup_root(&root, &[]).unwrap();
+    let after = db.get(&row.id).unwrap();
+    assert_eq!(after.state, "parked_failed");
+    assert!(after.hold.is_none() && after.deadline.is_some());
+    assert!(path.join("media.mkv").exists(), "TTL, not now");
 }
