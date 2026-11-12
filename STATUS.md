@@ -10,10 +10,17 @@ deploy.
 a pre-mount-id identity (`mount_id` empty). Root cause: legacy identities
 compare by device + inode, and the remount changed `/working`'s device
 number (70 → 80; inode 39714832 unchanged), so startup's root check failed
-and skipped the row silently every boot. Now, when a legacy root identity
-fails only that way — the root at the recorded path is the same inode — and
-the row's own path is gone, the row is settled `source_gone` (a record; no
-bytes are removed on this weaker proof).
+and skipped the row silently every boot. Now a legacy record whose root
+fails only that way is rebound to the live device when there is positive
+evidence the root is the live volume: same root inode, the root directory is
+not empty, and its device is the device of the mount covering it in
+`/proc/self/mountinfo`, a real mount (not the root filesystem an unmounted
+mountpoint falls through to). The row then proceeds through the normal
+startup classification for its state (allocating / retiring / active /
+transitioning): a gone path settles `source_gone` with
+`gone_reason = legacy_root_rebind` (custody reports cleanup `gone`, not
+`removed`); a present path continues as any orphan. Without that evidence
+nothing changes.
 
 ## Workspace exit — 2026-11-12 (0.9.2)
 

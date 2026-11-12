@@ -598,6 +598,7 @@ impl Inventory {
                             inspected_at: Some(now()),
                             salvage: None,
                             failure_reason: None,
+                            gone_reason: None,
                         });
                     }
                 }
@@ -640,6 +641,7 @@ impl Inventory {
                     inspected_at: Some(now()),
                     salvage: None,
                     failure_reason: None,
+                    gone_reason: None,
                 };
                 drop(db);
                 let record = Materialization {

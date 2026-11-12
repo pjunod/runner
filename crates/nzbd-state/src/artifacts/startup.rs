@@ -155,6 +155,36 @@ impl Drop for ReconciliationLease<'_> {
     }
 }
 
+/// Rebind a legacy record (empty `mount_id`) to the live device: the
+/// root, the payload directory and every file of the same filesystem.
+fn rebind_legacy_device(artifact: &mut Artifact, device: u64) {
+    artifact.root_identity.device = device;
+    if let Some(identity) = artifact.identity.as_mut().filter(|i| i.mount_id.is_empty()) {
+        identity.device = device;
+    }
+    for file in artifact
+        .files
+        .iter_mut()
+        .filter(|f| f.identity.mount_id.is_empty())
+    {
+        file.identity.device = device;
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test support: the mount table `live_legacy_root_device` reads.
+    pub(super) static MOUNTINFO: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn mountinfo_text() -> Option<String> {
+    #[cfg(test)]
+    if let Some(text) = MOUNTINFO.with(|value| value.borrow().clone()) {
+        return Some(text);
+    }
+    std::fs::read_to_string("/proc/self/mountinfo").ok()
+}
+
 /// The name only Runner gives a directory: a transform scratch is named by
 /// its operation key (`scratch-<key>` row, `<key>` directory), a job
 /// directory carries `.job-<N>-` for its own job.
@@ -172,21 +202,50 @@ fn runner_named(artifact: &Artifact) -> bool {
 }
 
 impl Inventory {
-    /// A legacy root identity (no `mount_id`) still names `a.root` when
-    /// the directory there is the same inode (the device number is not
-    /// stable across remounts).
-    fn legacy_root_matches(&self, a: &Artifact) -> bool {
-        if !a.root_identity.mount_id.is_empty() {
-            return false;
+    /// Positive evidence that a legacy record's root (empty `mount_id`) is
+    /// the live volume it named: the directory at the recorded root is the
+    /// same inode; it is not empty; and its device is the device of the
+    /// mount currently covering it in `/proc/self/mountinfo`, which is a
+    /// real mount of its own — not the parent (root) filesystem an
+    /// unmounted, empty mountpoint would fall through to. Returns that
+    /// device.
+    fn live_legacy_root_device(&self, a: &Artifact) -> Option<u64> {
+        if !a.root_identity.mount_id.is_empty() || !a.root_identity.directory {
+            return None;
         }
-        let Ok(root) = fs::open_dir(&a.root) else {
-            return false;
-        };
-        fs::identity_for_file(&root).is_ok_and(|observed| {
-            observed.inode == a.root_identity.inode
-                && observed.directory
-                && a.root_identity.directory
-        })
+        let root = fs::open_dir(&a.root).ok()?;
+        let observed = fs::identity_for_file(&root).ok()?;
+        if observed.inode != a.root_identity.inode || !observed.directory {
+            return None;
+        }
+        if !std::fs::read_dir(&a.root).ok()?.any(|entry| entry.is_ok()) {
+            return None;
+        }
+        let path = std::fs::canonicalize(&a.root).ok()?;
+        let mountinfo = mountinfo_text()?;
+        let mut best: Option<(usize, u64, String)> = None;
+        for line in mountinfo.lines() {
+            let Some((before, _)) = line.split_once(" - ") else {
+                continue;
+            };
+            let fields: Vec<_> = before.split_ascii_whitespace().collect();
+            if fields.len() < 5 {
+                continue;
+            }
+            let point = fields[4].replace("\\040", " ");
+            let covers = path == Path::new(&point)
+                || path
+                    .strip_prefix(&point)
+                    .is_ok_and(|rest| point == "/" || !rest.as_os_str().is_empty());
+            if !covers || best.as_ref().is_some_and(|(len, _, _)| *len > point.len()) {
+                continue;
+            }
+            let (major, minor) = fields[2].split_once(':')?;
+            let device = libc::makedev(major.parse().ok()?, minor.parse().ok()?);
+            best = Some((point.len(), device as u64, point));
+        }
+        let (_, device, point) = best?;
+        (point != "/" && device == observed.device).then_some(device)
     }
     pub(super) fn reconciliation_in_use(&self, artifact: &Artifact) -> bool {
         self.reconciliation_uses
@@ -409,43 +468,25 @@ impl Inventory {
                 continue;
             }
             let mut artifact = original.clone();
+            // A pre-mount-id record (empty `mount_id`) identifies its root
+            // by device + inode, and a remount changes the device number, so
+            // it never verified again and the row was skipped every boot
+            // (nuc4 job 1704). With positive evidence that the root is the
+            // live volume (see `live_legacy_root_device`) the record is
+            // rebound to the current device and continues normally.
+            let mut legacy_rebound = false;
             if self.verify_root(&artifact).is_err() {
-                // A pre-mount-id record (empty `mount_id`) identifies its
-                // root by device + inode, and the device number changes with
-                // every remount, so it never verifies again and the row had
-                // no exit (nuc4 job 1704). When the root directory is the
-                // same object by inode and the row's own path is gone, the
-                // row is settled `source_gone` — a record only; nothing is
-                // deleted, and nothing is ever removed on this weaker proof.
-                if !self.legacy_root_matches(&artifact)
-                    || !matches!(
-                        artifact.path.symlink_metadata(),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                    )
-                {
+                let Some(device) = self.live_legacy_root_device(&artifact) else {
+                    continue;
+                };
+                rebind_legacy_device(&mut artifact, device);
+                if self.verify_root(&artifact).is_err() {
                     continue;
                 }
-                let _coordinator = self.mutation_guard()?;
-                let mut current = self.get(&original.id)?;
-                if current.revision != original.revision {
-                    continue;
+                if artifact.owned && artifact.path.symlink_metadata().is_ok() {
+                    self.sidecar(&artifact)?;
                 }
-                current.state = "source_gone".into();
-                current.hold = None;
-                current.files.clear();
-                current.revision += 1;
-                current.updated_at = now();
-                let mut db = self.db.lock().unwrap();
-                let tx = db.transaction()?;
-                save_artifact(&tx, &current)?;
-                event(
-                    &tx,
-                    &current.id,
-                    "source_gone",
-                    "legacy root identity (pre-mount-id) rebound by inode; the path is gone",
-                )?;
-                tx.commit()?;
-                continue;
+                legacy_rebound = true;
             }
             let mut retirement_gone = false;
             if artifact.state == "allocating" {
@@ -568,6 +609,10 @@ impl Inventory {
                 // still locate a nondefault root without guessing its path.
                 artifact.keep = true;
                 artifact.hold = Some("review: allocation has no recovered job".into());
+            }
+            if legacy_rebound && artifact.state == "source_gone" {
+                // Gone, not removed: the finding rests on the rebind.
+                artifact.gone_reason = Some("legacy_root_rebind".into());
             }
             let _coordinator = self.mutation_guard()?;
             let current = self.get(&original.id)?;

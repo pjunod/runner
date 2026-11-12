@@ -22,6 +22,7 @@ fn expected_custody(artifact: &Artifact) -> ArtifactCustody {
         owned: artifact.owned,
         keep: artifact.keep,
         keep_on_failure: artifact.keep_on_failure,
+        gone_reason: artifact.gone_reason.clone(),
     }
 }
 
@@ -5309,72 +5310,102 @@ fn an_unverifiable_leftover_transitioning_row_is_parked() {
     assert!(path.join("media.mkv").exists(), "TTL, not now");
 }
 
-/// nuc4, 0.9.2's last attention row (job 1704): `transitioning`, owned,
-/// no hold, no error, not cleanup-eligible, no delivery lifecycle, deadline
-/// long past, a pre-mount-id identity (empty `mount_id`) whose device
-/// number changed with a remount, its path gone, a failed extract its only
-/// transform. Its root never verified, so it had no exit. It settles
-/// `source_gone` (a record only). With its path still present, or the root
-/// a different directory, it is left alone.
-#[test]
-fn a_legacy_identity_orphan_whose_path_is_gone_settles() {
-    let (_tmp, db, root) = fixture();
-    let shape = |job: u32, name: &str| {
-        let path = root.join(name);
-        db.allocate(job, &root, &path).unwrap();
-        let mut row = db.finish(job, &path, &root, "active").unwrap();
-        row.state = "transitioning".into();
-        row.owned = true;
-        row.hold = None;
-        row.error = None;
-        row.automatic_cleanup_eligible = false;
-        row.delivery_lifecycle = false;
-        row.deadline = Some(1791324948);
-        for identity in [Some(&mut row.root_identity), row.identity.as_mut()]
-            .into_iter()
-            .flatten()
-        {
-            identity.mount_id.clear();
-            identity.changed.clear();
-            identity.device += 10; // the remount gave the volume a new device
-        }
-        save_artifact(&db.db.lock().unwrap(), &row).unwrap();
-        save_operation(
-            &db.db.lock().unwrap(),
-            &Operation {
-                id: format!("extract-{}-old", row.id),
-                artifact: row.id.clone(),
-                kind: "extract".into(),
-                state: "failed".into(),
-                request: "{}".into(),
-                created_at: 0,
-                not_before: 0,
-                attempts: 1,
-                next_retry: 0,
-                error: Some("Operator approved discard of abandoned scratch".into()),
-            },
-        )
-        .unwrap();
-        row
+/// A legacy-identity row (empty `mount_id`, device changed by a remount)
+/// in the shape of nuc4's job 1704: `transitioning`, owned, no hold, no
+/// error, not cleanup-eligible, no delivery lifecycle, deadline long past,
+/// a failed extract its only transform.
+fn legacy_row(db: &Inventory, root: &Path, job: u32, name: &str) -> Artifact {
+    let path = root.join(name);
+    db.allocate(job, root, &path).unwrap();
+    std::fs::write(path.join("media.mkv"), b"old").unwrap();
+    let mut row = db.finish(job, &path, root, "active").unwrap();
+    row.state = "transitioning".into();
+    row.owned = true;
+    row.hold = None;
+    row.error = None;
+    row.automatic_cleanup_eligible = false;
+    row.delivery_lifecycle = false;
+    row.deadline = Some(1791324948);
+    let legacy = |identity: &mut Identity| {
+        identity.mount_id.clear();
+        identity.changed.clear();
+        identity.device += 10; // the remount gave the volume a new device
     };
-    let gone = shape(
+    legacy(&mut row.root_identity);
+    if let Some(identity) = row.identity.as_mut() {
+        legacy(identity);
+    }
+    for file in &mut row.files {
+        legacy(&mut file.identity);
+    }
+    save_artifact(&db.db.lock().unwrap(), &row).unwrap();
+    save_operation(
+        &db.db.lock().unwrap(),
+        &Operation {
+            id: format!("extract-{}-old", row.id),
+            artifact: row.id.clone(),
+            kind: "extract".into(),
+            state: "failed".into(),
+            request: "{}".into(),
+            created_at: 0,
+            not_before: 0,
+            attempts: 1,
+            next_retry: 0,
+            error: Some("Operator approved discard of abandoned scratch".into()),
+        },
+    )
+    .unwrap();
+    row
+}
+
+/// A mount table whose only real mount covers `point`, with `point`'s
+/// actual device, plus the root filesystem.
+fn mount_table(point: &Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let device = std::fs::metadata(point).unwrap().dev();
+    let canonical = std::fs::canonicalize(point).unwrap();
+    format!(
+        "1 0 253:0 / / rw - ext4 /dev/root rw\n100 1 {}:{} / {} rw - nfs4 qnap-storage:/working rw\n",
+        libc::major(device),
+        libc::minor(device),
+        canonical.display()
+    )
+}
+
+/// nuc4 job 1704, with positive evidence the root is the live volume (its
+/// device is the current mount's): a legacy row whose path is gone settles
+/// `source_gone`, marked `legacy_root_rebind` (gone, not removed); one whose
+/// path is present is rebound to the live device and proceeds normally (an
+/// orphan: parked with the failed TTL); a root that is a different directory
+/// leaves its row alone.
+#[test]
+fn a_legacy_identity_orphan_rebinds_on_a_live_root() {
+    let (_tmp, db, root) = fixture();
+    std::fs::write(root.join("someone-else.txt"), b"the root is not empty").unwrap();
+    let gone = legacy_row(
+        &db,
+        &root,
         1704,
         "Heated.Rivalry.S01E05.MULTI.2160p.WEB.H265-BAWLS-xpost",
     );
     std::fs::remove_dir_all(&gone.path).unwrap();
-    let present = shape(1706, "Still.Here-xpost");
-    let elsewhere = shape(1707, "Other.Root-xpost");
-    std::fs::remove_dir_all(&elsewhere.path).unwrap();
+    let present = legacy_row(&db, &root, 1706, "Still.Here-xpost");
+    let elsewhere = legacy_row(&db, &root, 1707, "Other.Root-xpost");
     let mut moved = db.get(&elsewhere.id).unwrap();
     moved.root_identity.inode += 1; // the root is a different directory now
     save_artifact(&db.db.lock().unwrap(), &moved).unwrap();
 
+    super::startup::MOUNTINFO.with(|value| *value.borrow_mut() = Some(mount_table(&root)));
     db.reconcile_startup_root(&root, &[]).unwrap();
+    super::startup::MOUNTINFO.with(|value| *value.borrow_mut() = None);
+
     let settled = db.get(&gone.id).unwrap();
     assert_eq!(settled.state, "source_gone");
-    assert!(settled.hold.is_none());
-    assert_eq!(db.get(&present.id).unwrap().state, "transitioning");
-    assert!(present.path.exists(), "nothing removed on the weaker proof");
+    assert_eq!(settled.gone_reason.as_deref(), Some("legacy_root_rebind"));
+    let rebound = db.get(&present.id).unwrap();
+    assert_eq!(rebound.state, "parked_failed", "proceeds like any orphan");
+    assert_ne!(rebound.root_identity.device, present.root_identity.device);
+    assert!(present.path.join("media.mkv").exists(), "TTL, not now");
     assert_eq!(db.get(&elsewhere.id).unwrap().state, "transitioning");
     let attention = db
         .list_page(&ListQuery {
@@ -5384,4 +5415,40 @@ fn a_legacy_identity_orphan_whose_path_is_gone_settles() {
         })
         .unwrap();
     assert!(!attention.rows.iter().any(|row| row.artifact.id == gone.id));
+}
+
+/// Without positive evidence nothing settles: a root that only the parent
+/// (root) filesystem covers — an unmounted volume's mountpoint — or an
+/// empty root directory leaves legacy rows exactly as they were.
+#[test]
+fn a_legacy_identity_orphan_waits_without_a_live_root() {
+    let (tmp, db, root) = fixture();
+    std::fs::write(root.join("someone-else.txt"), b"not empty").unwrap();
+    let unmounted = legacy_row(&db, &root, 1708, "Unmounted-xpost");
+    std::fs::remove_dir_all(&unmounted.path).unwrap();
+    // Only the root filesystem covers the root: the volume is not mounted.
+    let only_rootfs = {
+        use std::os::unix::fs::MetadataExt;
+        let device = std::fs::metadata(&root).unwrap().dev();
+        format!(
+            "1 0 {}:{} / / rw - ext4 /dev/root rw\n",
+            libc::major(device),
+            libc::minor(device)
+        )
+    };
+    super::startup::MOUNTINFO.with(|value| *value.borrow_mut() = Some(only_rootfs));
+    db.reconcile_startup_root(&root, &[]).unwrap();
+    assert_eq!(db.get(&unmounted.id).unwrap().state, "transitioning");
+
+    // An empty mountpoint, even one a mount line claims.
+    let empty_root = tmp.path().join("empty-mountpoint");
+    std::fs::create_dir(&empty_root).unwrap();
+    std::fs::write(empty_root.join("placeholder"), b"x").unwrap();
+    let empty = legacy_row(&db, &empty_root, 1709, "Was.Here-xpost");
+    std::fs::remove_dir_all(&empty.path).unwrap();
+    std::fs::remove_file(empty_root.join("placeholder")).unwrap();
+    super::startup::MOUNTINFO.with(|value| *value.borrow_mut() = Some(mount_table(&empty_root)));
+    db.reconcile_startup_root(&empty_root, &[]).unwrap();
+    super::startup::MOUNTINFO.with(|value| *value.borrow_mut() = None);
+    assert_eq!(db.get(&empty.id).unwrap().state, "transitioning");
 }
