@@ -1,5 +1,46 @@
 # nzbd — Project Status
 
+## Workspace exit — 2026-11-12 (0.9.2)
+
+**Status:** built; branch `claude/workspace-exit` (from main 8991151, pushed;
+no PR). Owner: Claude (Opus 5.5 session). Next: review → CI → merge →
+deploy to nuc4.
+
+0.9.1 on nuc4 raised attention from 28 to 44: the overdue check surfaced
+transform workspaces of long-finished jobs that had no exit. Every one of
+the 39 had a durable job terminal, yet retirement still demanded a
+finalization receipt and fresh scratch/source identities that can no longer
+appear.
+
+- **A finished job's workspace is removed** (closed scope): once the job's
+  terminal is durable (any outcome, emitted, salvage settled; not
+  keep-on-failure), a key-named, Runner-owned scratch directly under the
+  private workspace root is deleted. Scratch identity drift, a Keep or
+  missing ownership on the *source* (set by the old startup-orphan path),
+  and the missing receipt no longer apply. A person's Keep or hold on the
+  workspace itself still stands; nothing outside the private root is
+  touched. An unfinished journal of it ends `failed`; a source it left
+  `transitioning` becomes quiescent, and a cancelled job's leftover source
+  is parked with the failed TTL.
+- **Guards (Fable review):** never while the terminal's publication or a
+  delivery row names the scratch; a completed job's workspace only when its
+  transform failed or published its output; the job is the one the journal
+  names (a source row naming another job does not count); a source that
+  keeps its failure blocks it; the workspace root must verify (an unmounted
+  volume is never read as a removed workspace); the removal is journaled
+  (`deleting` → `deleted`) against the assessed revision and resumes after
+  a crash. Checked against a fresh read-only copy of nuc4's inventory: all
+  39 rows qualify (the 40th workspace belongs to a job with no terminal yet).
+- **Stale errors:** a `transferred` row carries no earlier attempt's error
+  (ENOSPC, lost lease); cleared at open and at delivery.
+- **Stale `transitioning`:** a row no transform, relocation or intent holds
+  is classified at startup like an orphaned allocation (parked with the
+  failed TTL) — also when its directory no longer verifies, instead of a
+  writer-retirement hold whose exit would release it back.
+- Jobs 2871/2900/2902 converged on 0.9.1 (disposed 03:13Z). 2710 is on the
+  bounded disposal ladder (ENOENT on its park move); it settles within the
+  12-attempt budget.
+
 ## Post-move fixes — 2026-11-12 (0.9.1)
 
 **Status:** built; Fable's adversarial review (8 findings + 4 low) folded in.

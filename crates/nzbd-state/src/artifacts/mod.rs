@@ -891,6 +891,13 @@ impl Inventory {
                 [],
             )?;
         }
+        // 0.9.2: a publication handed to its consumer carries no earlier
+        // attempt's error (the successful delivery is the later evidence).
+        // Idempotent.
+        db.execute(
+            "UPDATE artifacts SET data=json_set(data,'$.error',NULL) WHERE state='transferred' AND json_extract(data,'$.error') IS NOT NULL",
+            [],
+        )?;
         {
             let tx = db.transaction()?;
             terminals::reopen_salvage_for_committed_publications(&tx, None)?;

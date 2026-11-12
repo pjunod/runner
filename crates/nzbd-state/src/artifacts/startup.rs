@@ -358,7 +358,9 @@ impl Inventory {
         self.reconcile_transforms_root_snapshot(root, Some(snapshot))?;
         let rows = {
             let db = self.db.lock().unwrap();
-            let mut statement = db.prepare("SELECT data FROM artifacts WHERE state IN ('allocating','retiring','active') AND json_extract(data,'$.root')=?1")?;
+            // A `transitioning` row no transform, relocation or intent
+            // holds any more is an `active` one whose state was left behind.
+            let mut statement = db.prepare(&format!("SELECT data FROM artifacts a WHERE json_extract(a.data,'$.root')=?1 AND (state IN ('allocating','retiring','active') OR (state='transitioning' AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.artifact=a.id AND o.state NOT IN ('succeeded','cancelled','failed','transferred') AND json_extract(o.data,'$.kind') IN ('par_restore','par_repair','extract','relocate')) AND NOT EXISTS(SELECT 1 FROM relocation_intents i WHERE i.artifact=a.id AND i.state IN {})))", intents::OPEN_STATES))?;
             let rows = statement.query_map([root.to_string_lossy().as_ref()], |row| {
                 row.get::<_, String>(0)
             })?;
@@ -375,6 +377,10 @@ impl Inventory {
                 continue;
             }
             let live = original.job.is_some_and(|job| live_jobs.contains(&job));
+            if original.state == "transitioning" && live {
+                // A live job's attempt may still own it.
+                continue;
+            }
             if original.state == "active" && live {
                 continue;
             }
@@ -471,6 +477,15 @@ impl Inventory {
                 artifact.hold = None;
                 artifact.files.clear();
                 retirement_gone = true;
+            } else if original.state == "transitioning" && artifact.owned {
+                // A leftover `transitioning` row (nothing holds it) whose
+                // directory no longer verifies is no interrupted writer
+                // retirement: that hold's exit would release it back to a
+                // state with no exit. Runner's own failed payload: parked
+                // below with the failed TTL (its retention deletion
+                // re-snapshots the closed scope).
+                artifact.state = "retained".into();
+                artifact.hold = None;
             } else {
                 artifact.hold = Some("review: interrupted writer retirement".into());
             }
