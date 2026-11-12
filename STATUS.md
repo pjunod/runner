@@ -1,5 +1,20 @@
 # nzbd — Project Status
 
+## Orphan 1704 — 2026-11-12 (0.9.3)
+
+**Status:** built; branch `claude/orphan-1704` (from main c05a15d, pushed;
+no PR). Owner: Claude (Opus 5.5 session). Next: review → CI → merge →
+deploy.
+
+0.9.2 left one attention row on nuc4: job 1704, `transitioning`, path gone,
+a pre-mount-id identity (`mount_id` empty). Root cause: legacy identities
+compare by device + inode, and the remount changed `/working`'s device
+number (70 → 80; inode 39714832 unchanged), so startup's root check failed
+and skipped the row silently every boot. Now, when a legacy root identity
+fails only that way — the root at the recorded path is the same inode — and
+the row's own path is gone, the row is settled `source_gone` (a record; no
+bytes are removed on this weaker proof).
+
 ## Workspace exit — 2026-11-12 (0.9.2)
 
 **Status:** built; branch `claude/workspace-exit` (from main 8991151, pushed;

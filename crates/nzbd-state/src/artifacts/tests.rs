@@ -5308,3 +5308,80 @@ fn an_unverifiable_leftover_transitioning_row_is_parked() {
     assert!(after.hold.is_none() && after.deadline.is_some());
     assert!(path.join("media.mkv").exists(), "TTL, not now");
 }
+
+/// nuc4, 0.9.2's last attention row (job 1704): `transitioning`, owned,
+/// no hold, no error, not cleanup-eligible, no delivery lifecycle, deadline
+/// long past, a pre-mount-id identity (empty `mount_id`) whose device
+/// number changed with a remount, its path gone, a failed extract its only
+/// transform. Its root never verified, so it had no exit. It settles
+/// `source_gone` (a record only). With its path still present, or the root
+/// a different directory, it is left alone.
+#[test]
+fn a_legacy_identity_orphan_whose_path_is_gone_settles() {
+    let (_tmp, db, root) = fixture();
+    let shape = |job: u32, name: &str| {
+        let path = root.join(name);
+        db.allocate(job, &root, &path).unwrap();
+        let mut row = db.finish(job, &path, &root, "active").unwrap();
+        row.state = "transitioning".into();
+        row.owned = true;
+        row.hold = None;
+        row.error = None;
+        row.automatic_cleanup_eligible = false;
+        row.delivery_lifecycle = false;
+        row.deadline = Some(1791324948);
+        for identity in [Some(&mut row.root_identity), row.identity.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            identity.mount_id.clear();
+            identity.changed.clear();
+            identity.device += 10; // the remount gave the volume a new device
+        }
+        save_artifact(&db.db.lock().unwrap(), &row).unwrap();
+        save_operation(
+            &db.db.lock().unwrap(),
+            &Operation {
+                id: format!("extract-{}-old", row.id),
+                artifact: row.id.clone(),
+                kind: "extract".into(),
+                state: "failed".into(),
+                request: "{}".into(),
+                created_at: 0,
+                not_before: 0,
+                attempts: 1,
+                next_retry: 0,
+                error: Some("Operator approved discard of abandoned scratch".into()),
+            },
+        )
+        .unwrap();
+        row
+    };
+    let gone = shape(
+        1704,
+        "Heated.Rivalry.S01E05.MULTI.2160p.WEB.H265-BAWLS-xpost",
+    );
+    std::fs::remove_dir_all(&gone.path).unwrap();
+    let present = shape(1706, "Still.Here-xpost");
+    let elsewhere = shape(1707, "Other.Root-xpost");
+    std::fs::remove_dir_all(&elsewhere.path).unwrap();
+    let mut moved = db.get(&elsewhere.id).unwrap();
+    moved.root_identity.inode += 1; // the root is a different directory now
+    save_artifact(&db.db.lock().unwrap(), &moved).unwrap();
+
+    db.reconcile_startup_root(&root, &[]).unwrap();
+    let settled = db.get(&gone.id).unwrap();
+    assert_eq!(settled.state, "source_gone");
+    assert!(settled.hold.is_none());
+    assert_eq!(db.get(&present.id).unwrap().state, "transitioning");
+    assert!(present.path.exists(), "nothing removed on the weaker proof");
+    assert_eq!(db.get(&elsewhere.id).unwrap().state, "transitioning");
+    let attention = db
+        .list_page(&ListQuery {
+            limit: 50,
+            filter: ListFilter::Attention,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(!attention.rows.iter().any(|row| row.artifact.id == gone.id));
+}

@@ -172,6 +172,22 @@ fn runner_named(artifact: &Artifact) -> bool {
 }
 
 impl Inventory {
+    /// A legacy root identity (no `mount_id`) still names `a.root` when
+    /// the directory there is the same inode (the device number is not
+    /// stable across remounts).
+    fn legacy_root_matches(&self, a: &Artifact) -> bool {
+        if !a.root_identity.mount_id.is_empty() {
+            return false;
+        }
+        let Ok(root) = fs::open_dir(&a.root) else {
+            return false;
+        };
+        fs::identity_for_file(&root).is_ok_and(|observed| {
+            observed.inode == a.root_identity.inode
+                && observed.directory
+                && a.root_identity.directory
+        })
+    }
     pub(super) fn reconciliation_in_use(&self, artifact: &Artifact) -> bool {
         self.reconciliation_uses
             .lock()
@@ -394,6 +410,41 @@ impl Inventory {
             }
             let mut artifact = original.clone();
             if self.verify_root(&artifact).is_err() {
+                // A pre-mount-id record (empty `mount_id`) identifies its
+                // root by device + inode, and the device number changes with
+                // every remount, so it never verifies again and the row had
+                // no exit (nuc4 job 1704). When the root directory is the
+                // same object by inode and the row's own path is gone, the
+                // row is settled `source_gone` — a record only; nothing is
+                // deleted, and nothing is ever removed on this weaker proof.
+                if !self.legacy_root_matches(&artifact)
+                    || !matches!(
+                        artifact.path.symlink_metadata(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                    )
+                {
+                    continue;
+                }
+                let _coordinator = self.mutation_guard()?;
+                let mut current = self.get(&original.id)?;
+                if current.revision != original.revision {
+                    continue;
+                }
+                current.state = "source_gone".into();
+                current.hold = None;
+                current.files.clear();
+                current.revision += 1;
+                current.updated_at = now();
+                let mut db = self.db.lock().unwrap();
+                let tx = db.transaction()?;
+                save_artifact(&tx, &current)?;
+                event(
+                    &tx,
+                    &current.id,
+                    "source_gone",
+                    "legacy root identity (pre-mount-id) rebound by inode; the path is gone",
+                )?;
+                tx.commit()?;
                 continue;
             }
             let mut retirement_gone = false;
