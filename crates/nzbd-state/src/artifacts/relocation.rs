@@ -44,6 +44,10 @@ pub(super) struct Relocation {
     pub(super) root_pending: bool,
 }
 
+/// Timed re-verifications a blocked relocation cleanup gets before its
+/// retained source is parked (`exit_blocked_relocation_cleanups`).
+pub(super) const BLOCKED_CLEANUP_ROUNDS: u32 = 6;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(super) struct CleanupSchedule {
     #[serde(default)]
@@ -58,6 +62,12 @@ pub(super) struct CleanupSchedule {
     wake_revision: u64,
     #[serde(default)]
     retry_on_release: bool,
+    /// When the cleanup last became `Blocked` (0: before 0.9.1).
+    #[serde(default)]
+    blocked_at: i64,
+    /// How many timed re-verifications a blocked cleanup has had.
+    #[serde(default)]
+    blocked_rounds: u32,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +78,25 @@ pub(super) enum CleanupState {
     Retry,
     Blocked,
     Succeeded,
+}
+
+/// A pre-publication source a failed job's disposition superseded, and
+/// what became of it (`Inventory::retire_superseded_publication_sources`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupersededSource {
+    pub path: PathBuf,
+    pub outcome: SupersededOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SupersededOutcome {
+    /// Removed by closed scope.
+    Retired,
+    /// Parked where it is with the failed TTL (a Park disposition, or a
+    /// blocked retirement): its retention deletion is its exit.
+    Parked(String),
+    /// Still on the relocation's cleanup ladder.
+    Pending(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1681,6 +1710,9 @@ impl Inventory {
         current.identity = Some(target_identity);
         current.files = files;
         current.state = "active".into();
+        // An earlier attempt's failure (a full volume, a refused rename) is
+        // history once the move commits; the row must not keep showing it.
+        current.error = None;
         current.revision += 2;
         self.sidecar(&current)?;
         let mut db = self.db.lock().unwrap();
@@ -1811,6 +1843,330 @@ impl Inventory {
         Ok(())
     }
 
+    /// The durable failure a deferred publication move (source retained
+    /// "until the delivery row exists") ended in instead of a delivery — a
+    /// `publish` failure after the bytes were copied out — when its
+    /// remainder may follow the failure's disposition: terminal emitted,
+    /// salvage settled, no open intent, and neither the job, the move's
+    /// source nor the current row keeps its failure.
+    fn failed_publication_remainder(&self, movement: &Relocation) -> Result<Option<Artifact>> {
+        if !movement.defer_source_retirement
+            || movement.cleanup_done
+            || movement.source.keep
+            || movement.source.keep_on_failure
+        {
+            return Ok(None);
+        }
+        let Some(job) = movement.source.job else {
+            return Ok(None);
+        };
+        let Some(terminal) = self.terminal(job)? else {
+            return Ok(None);
+        };
+        if terminal.outcome != nzbd_types::TerminalOutcome::Failed
+            || terminal.keep_on_failure
+            || !terminal.emitted
+            || terminal.salvage == SalvageState::Pending
+            || self.open_intent_for_job(job)?
+        {
+            return Ok(None);
+        }
+        let current = match self.get(&movement.source.id) {
+            Ok(current) => current,
+            Err(Error::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if current.keep
+            || current.keep_on_failure
+            || current.hold.is_some()
+            || current.generation != movement.source.generation
+            || current.path == movement.source.path
+        {
+            return Ok(None);
+        }
+        Ok(Some(current))
+    }
+
+    /// Closed scope (W4) for a failed publication's remainder is granted
+    /// only by a **Delete** disposition: the published generation itself
+    /// was deleted (`deleted`, by a succeeded delete operation of this
+    /// artifact). A Park disposition keeps payload for recovery — PAR
+    /// volumes, unextracted archives — so it never grants it
+    /// (`park_superseded_publication_sources` parks the remainder instead).
+    /// A merely terminal row (`source_gone`) is not proof of a deletion.
+    pub(super) fn publication_superseded_by_failure(&self, movement: &Relocation) -> Result<bool> {
+        let Some(current) = self.failed_publication_remainder(movement)? else {
+            return Ok(false);
+        };
+        if current.state != "deleted" {
+            return Ok(false);
+        }
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state='succeeded' AND json_extract(data,'$.kind')='delete')",
+            [&current.id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The published generation was relocated onward from the move's
+    /// destination by a committed relocation (a Park disposition).
+    fn publication_relocated_onward(
+        &self,
+        movement: &Relocation,
+        current: &Artifact,
+    ) -> Result<bool> {
+        if current.path == movement.destination || current.terminal() {
+            return Ok(false);
+        }
+        let raws = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT data FROM operations WHERE artifact=?1 AND state='succeeded' AND json_extract(data,'$.kind')='relocate'",
+            )?;
+            let rows = statement.query_map([&movement.source.id], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in raws {
+            let op: Operation = serde_json::from_str(&raw)?;
+            let Ok(onward) = serde_json::from_str::<Relocation>(&op.request) else {
+                continue;
+            };
+            if onward.source.path == movement.destination && onward.destination == current.path {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The job's deferred publication moves that have not retired their
+    /// source, oldest first.
+    fn deferred_publication_moves(&self, job: u32) -> Result<Vec<(String, Relocation)>> {
+        let raws = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT o.id FROM operations o JOIN artifacts a ON a.id=o.artifact WHERE a.job=?1 AND o.state='succeeded' AND json_extract(o.data,'$.kind')='relocate' ORDER BY o.rowid",
+            )?;
+            let rows = statement.query_map([job], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut moves = Vec::new();
+        for key in raws {
+            let movement: Relocation = serde_json::from_str(&self.operation(&key)?.request)?;
+            if movement.defer_source_retirement && !movement.cleanup_done {
+                moves.push((key, movement));
+            }
+        }
+        Ok(moves)
+    }
+
+    /// Delete disposition: retire every pre-publication source of `job`
+    /// that the deletion superseded (`publication_superseded_by_failure`),
+    /// by closed scope on its relocation's own cleanup ladder. A retirement
+    /// the cleanup blocks is parked in place with the failed TTL — its
+    /// retention deletion re-snapshots the closed scope — so it never waits
+    /// on a person.
+    pub fn retire_superseded_publication_sources(&self, job: u32) -> Result<Vec<SupersededSource>> {
+        let mut sources = Vec::new();
+        for (key, movement) in self.deferred_publication_moves(job)? {
+            if !self.publication_superseded_by_failure(&movement)? {
+                continue;
+            }
+            let path = movement.source.path.clone();
+            let attempt = self.retire_relocation_source(&key);
+            let after: Relocation = serde_json::from_str(&self.operation(&key)?.request)?;
+            let outcome = if after.cleanup_done {
+                SupersededOutcome::Retired
+            } else if after.cleanup.state == CleanupState::Blocked {
+                let reason = after.cleanup.error.unwrap_or_default();
+                self.park_publication_remainder(&key, &reason)?;
+                SupersededOutcome::Parked(format!("retirement blocked ({reason})"))
+            } else {
+                SupersededOutcome::Pending(match attempt {
+                    Err(error) => error.to_string(),
+                    Ok(()) => after
+                        .cleanup
+                        .error
+                        .unwrap_or_else(|| "source cleanup is pending".into()),
+                })
+            };
+            sources.push(SupersededSource { path, outcome });
+        }
+        Ok(sources)
+    }
+
+    /// Park disposition: the published generation was parked onward, and the
+    /// pre-publication remainder (PAR volumes, archives, anything the
+    /// publication did not take) is parked where it is with the failed TTL,
+    /// under Runner's custody, instead of retiring by closed scope. Its
+    /// retention TTL is its exit; nothing is deleted now.
+    pub fn park_superseded_publication_sources(&self, job: u32) -> Result<Vec<SupersededSource>> {
+        let mut sources = Vec::new();
+        for (key, movement) in self.deferred_publication_moves(job)? {
+            let Some(current) = self.failed_publication_remainder(&movement)? else {
+                continue;
+            };
+            if !self.publication_relocated_onward(&movement, &current)? {
+                continue;
+            }
+            let path = movement.source.path.clone();
+            let outcome = match self
+                .park_publication_remainder(&key, "the publication was parked")?
+            {
+                Some(_) => SupersededOutcome::Parked("parked in place with the failed TTL".into()),
+                None => SupersededOutcome::Retired,
+            };
+            sources.push(SupersededSource { path, outcome });
+        }
+        Ok(sources)
+    }
+
+    /// Park a relocation's retained source row (`source-<op>`) in place with
+    /// the failed TTL. `None` when it is already gone; idempotent.
+    fn park_publication_remainder(&self, key: &str, why: &str) -> Result<Option<Artifact>> {
+        let ttl = i64::from(self.settings()?.failed_retention_days) * 86400;
+        let _guard = self.mutation_guard()?;
+        let mut row = match self.get(&format!("source-{key}")) {
+            Ok(row) => row,
+            Err(Error::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if row.terminal() {
+            return Ok(None);
+        }
+        if row.state == "parked_failed" {
+            return Ok(Some(row));
+        }
+        row.hold = None;
+        row.owned = true;
+        row.state = "parked_failed".into();
+        row.automatic_cleanup_eligible = true;
+        row.retention_seconds = ttl.max(1) as u64;
+        row.deadline = Some(now().saturating_add(ttl.max(0)));
+        row.revision += 1;
+        row.updated_at = now();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        save_artifact(&tx, &row)?;
+        event(
+            &tx,
+            &row.id,
+            "publication_remainder_parked",
+            &format!("failed publication's remainder parked with the failed TTL: {why}"),
+        )?;
+        tx.commit()?;
+        Ok(Some(row))
+    }
+
+    /// Timed exit of a blocked relocation cleanup (no-wedge rule: nothing
+    /// waits on a person). A blocked cleanup older than `cutoff` is
+    /// re-verified on a backoff — its cleanup goes back to `retry` (a
+    /// delivery's cleanup with it) so the normal drivers re-snapshot and
+    /// retry it; identities that only moved with a remount rebind
+    /// (`Identity::same_object`). After `BLOCKED_CLEANUP_ROUNDS` the
+    /// retained source row is parked: for a delivered success, or a failure
+    /// whose publication a Delete removed, with an immediate deadline
+    /// (closed-scope removal by retention); otherwise with the failed TTL.
+    /// Once that row is gone the cleanup is closed. Returns how many
+    /// cleanups moved.
+    pub(super) fn exit_blocked_relocation_cleanups(&self, cutoff: i64) -> Result<usize> {
+        let raws = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT data FROM operations WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.cleanup.state')='blocked' AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup.blocked_at'),0)<=?1 ORDER BY rowid LIMIT 200",
+            )?;
+            let rows = statement.query_map([cutoff], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let ttl = i64::from(self.settings()?.failed_retention_days) * 86400;
+        let mut moved = 0;
+        for raw in raws {
+            let snapshot: Operation = serde_json::from_str(&raw)?;
+            let _guard = self.mutation_guard()?;
+            let mut op = self.operation(&snapshot.id)?;
+            if op.request != snapshot.request {
+                continue;
+            }
+            let mut movement: Relocation = serde_json::from_str(&op.request)?;
+            let source_row = match self.get(&format!("source-{}", op.id)) {
+                Ok(row) => Some(row),
+                Err(Error::NotFound) => None,
+                Err(error) => return Err(error),
+            };
+            let delivered_success: bool = self.db.lock().unwrap().query_row(
+                "SELECT EXISTS(SELECT 1 FROM deliveries WHERE artifact=?1 AND generation=?2 AND json_extract(data,'$.terminalOutcome')='SUCCESS')",
+                params![movement.source.id, movement.source.generation],
+                |row| row.get(0),
+            )?;
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
+            if movement.cleanup.blocked_rounds < BLOCKED_CLEANUP_ROUNDS {
+                movement.cleanup.blocked_rounds += 1;
+                movement.cleanup.state = CleanupState::Retry;
+                // Round 1 retries now (the block already aged past the
+                // grace); later rounds back off 1 h, 2 h, … capped at a day.
+                let backoff = super::exits::HOLD_EXIT_SECONDS
+                    .saturating_mul((1i64 << (movement.cleanup.blocked_rounds - 1).min(6)) - 1)
+                    .min(86400);
+                movement.cleanup.next_retry = now().saturating_add(backoff);
+                tx.execute(
+                    "UPDATE deliveries SET cleanup_status='retry',cleanup_next_retry_at=?3 WHERE artifact=?1 AND generation=?2 AND cleanup_status='blocked'",
+                    params![movement.source.id, movement.source.generation, movement.cleanup.next_retry],
+                )?;
+            } else if let Some(mut row) = source_row.filter(|row| !row.terminal()) {
+                // Out of rounds: the retained source gets its timed exit.
+                if row.keep || row.keep_on_failure || !row.owned {
+                    // A person's or the job's Keep is the policy exit; the
+                    // cleanup stops asking.
+                    movement.cleanup.state = CleanupState::Retry;
+                    movement.cleanup.next_retry = i64::MAX / 2;
+                } else if row.state != "parked_failed" {
+                    let immediate =
+                        delivered_success || self.publication_superseded_by_failure(&movement)?;
+                    let wait = if immediate { 0 } else { ttl.max(0) };
+                    row.hold = None;
+                    row.state = "parked_failed".into();
+                    row.automatic_cleanup_eligible = true;
+                    row.retention_seconds = wait.max(1) as u64;
+                    row.deadline = Some(now().saturating_add(wait));
+                    row.revision += 1;
+                    row.updated_at = now();
+                    save_artifact(&tx, &row)?;
+                    event(
+                        &tx,
+                        &row.id,
+                        "automatic_exit",
+                        &format!(
+                            "source cleanup stayed blocked ({}); parked for retention",
+                            movement.cleanup.error.as_deref().unwrap_or("blocked")
+                        ),
+                    )?;
+                    movement.cleanup.state = CleanupState::Retry;
+                    movement.cleanup.next_retry =
+                        row.deadline.unwrap_or_default().saturating_add(60);
+                } else {
+                    movement.cleanup.state = CleanupState::Retry;
+                    movement.cleanup.next_retry =
+                        row.deadline.unwrap_or_default().saturating_add(60);
+                }
+            } else {
+                // The retained source is gone (retention removed it, or it
+                // never existed): nothing is left to retire.
+                movement.cleanup_done = true;
+                movement.cleanup.state = CleanupState::Succeeded;
+                movement.cleanup.error = None;
+                tx.execute(
+                    "UPDATE deliveries SET cleanup_status='succeeded',cleanup_error=NULL,cleanup_next_retry_at=NULL,cleanup_blocked_since=NULL WHERE artifact=?1 AND generation=?2",
+                    params![movement.source.id, movement.source.generation],
+                )?;
+            }
+            op.request = serde_json::to_string(&movement)?;
+            save_operation(&tx, &op)?;
+            tx.commit()?;
+            moved += 1;
+        }
+        Ok(moved)
+    }
+
     fn retire_relocation_source(&self, key: &str) -> Result<()> {
         let op = self.operation(key)?;
         let movement: Relocation = serde_json::from_str(&op.request)?;
@@ -1858,6 +2214,7 @@ impl Inventory {
                         &movement.source.id,
                         &movement.source.generation,
                     )?
+                    && !self.publication_superseded_by_failure(&movement)?
                 {
                     return Ok(());
                 }
@@ -1919,6 +2276,7 @@ impl Inventory {
                 let message = error.to_string();
                 movement.cleanup.state = CleanupState::Blocked;
                 movement.cleanup.error = Some(message.clone());
+                movement.cleanup.blocked_at = now();
                 tracing::warn!(operation=%key, error=%message, "source cleanup blocked; waiting for policy change or explicit retry");
                 Err(Error::CleanupBlocked(message))
             }
@@ -1993,7 +2351,8 @@ impl Inventory {
                 || self.cluster_retirement_accepted(
                     &movement.source.id,
                     &movement.source.generation,
-                )?;
+                )?
+                || self.publication_superseded_by_failure(&movement)?;
             if !ready || !movement.source.delivery_lifecycle {
                 return Err(Error::Conflict(
                     "deferred relocation source cannot retire before durable delivery".into(),
@@ -2138,6 +2497,19 @@ impl Inventory {
             return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
         }
         let published = self.get(&movement.source.id)?;
+        // A failed job's disposition already took the publication (parked it
+        // onward, which re-snapshotted it, or deleted it): there is no
+        // hard-linked publication at the destination left to refresh.
+        // The publication no longer exists as this generation (deleted, or
+        // gone since), or the failed job's disposition parked it onward
+        // (which re-snapshotted it): there is no hard-linked publication at
+        // the destination left to refresh.
+        if published.generation == movement.source.generation
+            && ((published.terminal() && published.path != movement.source.path)
+                || self.publication_relocated_onward(movement, &published)?)
+        {
+            return Ok(());
+        }
         if published.generation != movement.source.generation
             || published.path != movement.destination
             || !matches!(
@@ -2400,6 +2772,9 @@ impl Inventory {
             params![movement.source.id, movement.source.generation],
             |row| row.get(0),
         )?;
+        // A publication the failed job's own disposition superseded never
+        // becomes a delivery; that durable failure stands in for it.
+        let delivered = delivered || self.publication_superseded_by_failure(movement)?;
         let closed_scope = (delivered || successful) && (successful || !source.keep_on_failure);
         if closed_scope {
             self.remove_closed_scope_tree(op, movement, &mut source, &root)?;

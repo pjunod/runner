@@ -40,8 +40,18 @@ directory (nothing changes for existing installs). Put it on the processing
 volume when the state directory is a small local disk. Moving it later is
 supported: stop nzbd, move the directory, set `workspace_dir`, start; at
 startup every recorded workspace path under the old default
-(`<state dir>/transform-workspaces`) is rewritten to the new directory and
-the moved workspaces are re-stamped (a no-op on every later start). If the
+(`<state dir>/transform-workspaces`) — or under whatever root the transform
+journals recorded, which is what matters when the state directory itself
+moved too — is resolved to where those workspaces now are: workspaces on
+`workspace_dir`'s filesystem are renamed into it, and the recorded paths are
+rewritten only to a place that holds every live workspace that still
+exists. An unreadable root leaves everything as it is. The moved workspaces
+are re-stamped (a no-op on every later start). The state directory can be
+moved as a whole: the history index marker is written both absolute
+(`history/.history-index-path`, read by every build) and relative to the
+state directory (`.history-index-path.rel`, preferred), and an older
+absolute-only marker naming the old place resolves to the same index under
+the new one. If the
 old directory still holds workspaces (not moved), nothing is rewritten:
 those finish where they are and only new workspaces use `workspace_dir`. It
 must not be nested inside the default location (or contain it).

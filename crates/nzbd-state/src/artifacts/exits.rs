@@ -226,6 +226,91 @@ pub fn hold_exit(hold: &str) -> Option<&'static HoldExit> {
         })
 }
 
+/// How long past its registered exit a row may sit before it is flagged:
+/// one maintenance interval of slack beyond the exit's own deadline.
+pub const OVERDUE_GRACE_SECONDS: i64 = 3600;
+/// An in-progress state (`allocating`, `transitioning`, `retiring`,
+/// `deleting`, `delete_failed`) older than this has outlived any worker.
+pub const STUCK_PROGRESS_SECONDS: i64 = 86400;
+
+/// "Needs attention" (a person must act, or Runner failed to act): a
+/// Runner row with any of
+/// * a hold with no automatic exit (unregistered, or an `Operator` exit —
+///   which the registry allows only for content Runner did not create);
+/// * an error, a blocked cleanup, or an open publication intent (kept
+///   visible: they say what went wrong while their exit runs);
+/// * a row that has outlived its registered exit: a timed hold past
+///   [`HOLD_EXIT_SECONDS`], a retention deadline past due, or an
+///   in-progress state older than [`STUCK_PROGRESS_SECONDS`] (each plus
+///   [`OVERDUE_GRACE_SECONDS`]). A healthy row is never here; a row that
+///   is here and stays here is a missing or broken exit.
+///
+/// Built once from [`HOLD_EXITS`] so the filter and the registry cannot
+/// disagree.
+pub(super) static ATTENTION_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let quote = |text: &str| text.replace('\'', "''");
+    let list = |rules: &mut dyn Iterator<Item = &HoldExit>| {
+        rules
+            .map(|rule| format!("'{}'", quote(rule.hold)))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let prefixes = |rules: &mut dyn Iterator<Item = &HoldExit>| {
+        rules
+            .map(|rule| {
+                format!(
+                    " AND substr(json_extract(data,'$.hold'),1,{})<>'{}'",
+                    rule.hold.len(),
+                    quote(rule.hold)
+                )
+            })
+            .collect::<String>()
+    };
+    let automatic = || {
+        HOLD_EXITS
+            .iter()
+            .filter(|rule| !matches!(rule.exit, Exit::Operator(_)))
+    };
+    let timed = || {
+        HOLD_EXITS
+            .iter()
+            .filter(|rule| !matches!(rule.action, HoldAction::InFlight | HoldAction::Adoption))
+    };
+    let hold = "json_extract(data,'$.hold')";
+    let no_exit = format!(
+        "({hold} IS NOT NULL AND {hold} NOT IN ({}){})",
+        list(&mut automatic().filter(|rule| !rule.prefix)),
+        prefixes(&mut automatic().filter(|rule| rule.prefix)),
+    );
+    let timed_holds = list(&mut timed().filter(|rule| !rule.prefix));
+    let timed_prefix = timed()
+        .filter(|rule| rule.prefix)
+        .map(|rule| {
+            format!(
+                " OR substr({hold},1,{})='{}'",
+                rule.hold.len(),
+                quote(rule.hold)
+            )
+        })
+        .collect::<String>();
+    let held_too_long = format!(
+        "(({hold} IN ({timed_holds}){timed_prefix}) AND updated_at < unixepoch() - {})",
+        HOLD_EXIT_SECONDS + OVERDUE_GRACE_SECONDS
+    );
+    let expired = format!(
+        "(json_extract(data,'$.deadline') IS NOT NULL AND json_extract(data,'$.keep')=0 AND json_extract(data,'$.deadline') < unixepoch() - {OVERDUE_GRACE_SECONDS})"
+    );
+    let stuck = format!(
+        "(state IN ('allocating','transitioning','retiring','deleting','delete_failed') AND updated_at < unixepoch() - {})",
+        STUCK_PROGRESS_SECONDS + OVERDUE_GRACE_SECONDS
+    );
+    let visible = "json_extract(data,'$.error') IS NOT NULL \
+        OR id IN (SELECT artifact FROM relocation_intents WHERE state IN ('open','finishing','unwinding')) \
+        OR id IN (SELECT artifact FROM deliveries WHERE cleanup_status='blocked') \
+        OR id IN (SELECT artifact FROM operations WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.cleanup.state')='blocked')";
+    format!("({no_exit} OR {held_too_long} OR {expired} OR {stuck} OR {visible})")
+});
+
 /// What one sweep did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ExitReport {
@@ -278,6 +363,7 @@ impl Inventory {
         self.exit_held_artifacts(cutoff, touch_files, &mut report)?;
         if touch_files {
             self.exit_blocked_deliveries(cutoff, &mut report)?;
+            report.retried += self.exit_blocked_relocation_cleanups(cutoff)?;
         }
         if report.total() > 0 {
             tracing::info!(

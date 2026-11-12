@@ -1741,6 +1741,8 @@ impl Owner {
             match result {
                 Ok((mut roots, intents)) => {
                     roots.push(owner.dest_dir.clone());
+                    roots.push(owner.artifacts.workspace_dir());
+                    roots.extend(owner.configured_payload_roots.iter().cloned());
                     roots.extend(owner.allocation_cache.values().map(|allocation| allocation.root.clone()));
                     roots.sort();
                     roots.dedup();
@@ -1893,8 +1895,20 @@ impl Owner {
                 duration_ms: None,
                 ok: None,
             });
+        let configured = worker_root == self.artifacts.workspace_dir()
+            || self.configured_payload_roots.contains(&worker_root);
         self.background_then(format!("reconcile-{}", root.display()), move || {
             if worker_root == default_root { prepare_unenrolled_payload_root(&inventory, &worker_root)?; }
+            // A configured root nothing has used yet (no row names it, the
+            // directory does not exist) has nothing to reconcile. An
+            // enrolled root that is missing stays a failure: its mount may
+            // be unavailable.
+            if configured && worker_root != default_root && matches!(
+                std::fs::symlink_metadata(&worker_root),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) && !inventory.startup_reconciliation_roots().map_err(failure)?.contains(&worker_root) {
+                return Ok(());
+            }
             inventory.reconcile_startup_root_snapshot(&worker_root, &live, &snapshot).map_err(failure)?;
             for (dir, finalized) in &parts {
                 sweep_stale_parts(dir, finalized);

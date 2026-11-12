@@ -1274,7 +1274,8 @@ try {
     <div class="files-toolbar">
       <div class="seg" id="files-filter" role="group" aria-label="which folders">
         <button data-action="f-filter" data-filter="live" class="on">All <span class="cnt" id="files-cnt-live">–</span></button>
-        <button data-action="f-filter" data-filter="attention">Needs review <span class="cnt" id="files-cnt-attention">–</span></button>
+        <button data-action="f-filter" data-filter="attention">Needs attention <span class="cnt" id="files-cnt-attention">–</span></button>
+        <button data-action="f-filter" data-filter="foreign" title="Folders Runner did not create: never deleted automatically, nothing waits on them">Not Runner's <span class="cnt" id="files-cnt-foreign">–</span></button>
         <button data-action="f-filter" data-filter="owned">Owned <span class="cnt" id="files-cnt-owned">–</span></button>
         <button data-action="f-filter" data-filter="cleared">Cleared <span class="cnt" id="files-cnt-cleared">–</span></button>
       </div>
@@ -5381,7 +5382,7 @@ function applyHb() {
 // a row says "—" until it has been measured, the scan measures what it
 // finds, and a queued walk is polled and announced.
 const FILES_PAGE_SIZES = [25, 50, 100, 200], FILES_PAGE_SIZE_DEFAULT = 50;
-const FILES_FILTERS = ["live", "attention", "owned", "cleared"];
+const FILES_FILTERS = ["live", "attention", "foreign", "owned", "cleared"];
 const FILES_SORTS = ["updated", "size", "files", "name"];
 const FILES_DETAIL_PAGE = 200;
 const filesView = { filter: "live", sort: "updated", q: "", page: 0, size: FILES_PAGE_SIZE_DEFAULT, total: 0 };
@@ -5474,7 +5475,7 @@ const FILES_STATES = {
   deleted: ["deleted", "dim"], source_gone: ["gone", "dim"],
 };
 function filesStateModel(a) {
-  if (a.state === "retained" && a.error) return { label: "retained · needs attention", cls: "st bad" };
+  if (a.state === "retained" && a.error) return { label: "retained · " + a.error, cls: "st bad" };
   const m = FILES_STATES[a.state] || [a.state, "dim"];
   return { label: m[0], cls: "st " + m[1] };
 }
@@ -5870,7 +5871,8 @@ function renderFiles() {
   else if (f === "off") models = [{ key: "__off", kind: "empty", span: 6, text: "file inventory unavailable" }];
   else if (!f.entries.length) {
     const what = filesView.q ? "nothing matches “" + filesView.q + "”"
-      : filesView.filter === "attention" ? "nothing needs review"
+      : filesView.filter === "attention" ? "nothing needs a person"
+      : filesView.filter === "foreign" ? "no folders from outside Runner"
       : filesView.filter === "owned" ? "Runner owns no folders yet"
       : filesView.filter === "cleared" ? "nothing has been cleared"
       : f.discovery ? "no folders on this page" : "no folders yet — scan to find what is on disk";

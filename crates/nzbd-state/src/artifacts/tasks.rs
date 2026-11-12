@@ -155,6 +155,11 @@ impl Inventory {
                         if !entry.file_type()?.is_dir() {
                             continue;
                         }
+                        // A publication still landing is Runner's, not a
+                        // discovery; the next scan sees it committed.
+                        if self.publication_in_flight(&path)? {
+                            continue;
+                        }
                         count += 1;
                         let a = self.discover(&root, &path, active.contains(&path))?;
                         // A row that says "0 files · 0 B" for a folder nobody
@@ -172,6 +177,7 @@ impl Inventory {
                         }
                     }
                 }
+                self.fold_rediscovered_publications()?;
                 if !failures.is_empty() {
                     return Err(Error::Conflict(failures.join("; ")));
                 }

@@ -48,7 +48,10 @@ not a scan failure. Open a folder's **details**; adopt unknown files only
 after reviewing the file list. Adoption enables Keep. Newly added or replaced
 content revokes ownership when inspected. A reviewed hold can be released
 explicitly; active recovery claims cannot be released that way. The list is
-filtered (**Needs review** = live rows that are unowned, held or in error),
+filtered (**Needs attention** = live Runner rows with an error, a blocked
+cleanup, an open intent, a hold with no automatic exit, or past their
+registered exit; **Not Runner's** = live content Runner did not create,
+informational only),
 searched, sorted and paged on the server; the counts on the filter chips
 describe the whole inventory, not the current search.
 
@@ -133,8 +136,7 @@ consumers never cause expiry. A missing heartbeat is diagnostic only.
 - Category moves and failed-file parking journal their source and destination.
   A destination root that cannot be created (for example a park volume that is
   not mounted) is journaled too: the move's operation waits on its retry
-  ladder with the error, visible under Files → **Attention**, and the same move
-  retries. Publication refuses an existing destination. Cross-volume whole-directory
+  ladder with the error (shown on the row), and the same move retries. Publication refuses an existing destination. Cross-volume whole-directory
   moves verify copies before exact-entry source cleanup. Incomplete scratch is
   retained for review.
 - A selected publication moves **file by file** under a journaled intent
@@ -144,8 +146,7 @@ consumers never cause expiry. A missing heartbeat is diagnostic only.
   unchanged in the target or the source) or unwound (moved files put back by
   identity, the target removed, the job failed `io` and parked) — never both.
   While an intent is open, deletion, disposal and queue retirement refuse
-  either side; the source shows under Files → **Attention** in state
-  `transitioning`. Same-volume files are renamed (no copy, one digest read at
+  either side; the source shows in state `transitioning`. Same-volume files are renamed (no copy, one digest read at
   most); cross-volume files are streamed once, hashing as they are written. A
   published file that a retained PAR set still needs is linked instead, and
   its source name is retained as `retained_repair_dependency`.
@@ -381,3 +382,39 @@ extraction verdict.
 Regression coverage lives in `missing_articles_finish_download_but_keep_partial_private`,
 `private_partial_repairs_with_par_and_fails_without_par`, and
 `sfv_restores_obfuscated_old_rar_without_volume_numbers`.
+
+## Failed publications, failed transforms and rediscovery
+
+- **A copy publication whose job then failed** (a `publish` failure after the
+  bytes were copied out) never becomes a delivery, so the source retirement it
+  deferred "until the delivery row exists" would never fire. Once the failure
+  is durable, the processing copy follows the job's own disposition: under
+  **Delete** (the published generation deleted) it retires by closed scope;
+  under **Park** it is parked in place with the failed TTL — recovery input
+  (PAR volumes, archives) is never wiped by a park. A blocked retirement is
+  parked with the TTL too. A job or row that keeps its failure never
+  qualifies.
+- **A failed job's unfinished transforms** (`extract`/`par_repair` journals
+  still `running`/`retry`, often with their workspace gone) end with the failed
+  attempt: the journal becomes `failed`, a missing workspace `source_gone`, and
+  the source leaves `transitioning`, so the disposition can move it. No file is
+  touched.
+- **Every incomplete disposal is bounded.** One that holds no operation ladder
+  of its own retries on a durable ladder (1 min doubling to 6 h); after 12
+  attempts (about a day) it settles and every live row of the job is parked
+  with the failed TTL in the same transaction. Retry now bypasses the wait
+  and does not spend the budget.
+- **An interrupted allocation** at a name only Runner gives (a transform
+  key, a `.job-<N>-` directory) stays Runner's: empty and orphaned it is
+  removed (never recursively); with bytes it is parked with the failed TTL;
+  for a live job it becomes its allocation.
+- **A scan never records a publication still landing** (an open intent's
+  target, an unresolved move's destination, a directory containing one,
+  `.runner-*` staging). Runner publications an older build recorded as
+  unknown/Keep/review are folded back: a duplicate of Runner's own row (same
+  directory object) is closed with a pointer to it; an unregistered
+  directory whose verifying `.runner-manifest.json` names one of this
+  installation's generations becomes `transferred`. Anything else stays
+  **Not Runner's**.
+- **An interrupted writer retirement whose directory is already gone** is
+  settled `source_gone` at startup instead of re-arming its hold every boot.

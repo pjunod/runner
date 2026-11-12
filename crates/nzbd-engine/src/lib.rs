@@ -509,6 +509,9 @@ pub struct EngineConfig {
     pub dest_dir: PathBuf,
     /// Ordered configured torrent payload roots used only for removal safety.
     pub torrent_payload_roots: Vec<PathBuf>,
+    /// Configured payload roots outside `dest_dir` (completed, failed,
+    /// category destinations) reconciled at startup with the recorded ones.
+    pub payload_roots: Vec<PathBuf>,
     /// Durable terminal history. Torrent removal is not retired from the
     /// queue until this store confirms its append+fsync protocol.
     pub history: Option<Arc<nzbd_state::history::HistoryDb>>,
@@ -555,6 +558,7 @@ impl EngineConfig {
             }],
             dest_dir,
             torrent_payload_roots: Vec::new(),
+            payload_roots: Vec::new(),
             history: None,
             tuning,
             max_active_downloads: None,
@@ -627,7 +631,7 @@ impl Engine {
         }
 
         let owner_heartbeat = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let owner = Owner::recover(
+        let mut owner = Owner::recover(
             &cfg.state_dir,
             cfg.artifact_dir.as_deref(),
             cfg.workspace_dir.as_deref(),
@@ -655,6 +659,7 @@ impl Engine {
             cancel.clone(),
             owner_heartbeat.clone(),
         )?;
+        owner.configured_payload_roots = cfg.payload_roots.clone();
         // Seed the shared snapshot with recovered state synchronously, so
         // the API never serves an empty queue in the window before the
         // async run loop's first publish (UI "queue is empty" flash).

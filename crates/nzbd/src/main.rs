@@ -345,6 +345,28 @@ fn disk_guard_roots(cfg: &nzbd_config::Config) -> Vec<nzbd_engine::volumes::Disk
         .collect()
 }
 
+/// Configured payload roots startup reconciles besides the recorded ones:
+/// the completed and failed directories and every category destination.
+fn payload_roots(cfg: &nzbd_config::Config) -> Vec<PathBuf> {
+    let mut roots = vec![
+        cfg.dest_dir(),
+        cfg.post
+            .failed_dir
+            .as_ref()
+            .map(|path| nzbd_config::expand_home(path))
+            .unwrap_or_else(|| nzbd_config::expand_home(&cfg.paths.main_dir).join("failed")),
+    ];
+    roots.extend(
+        cfg.categories
+            .iter()
+            .filter_map(|category| category.dest_dir.as_ref())
+            .map(|path| nzbd_config::expand_home(path)),
+    );
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 fn torrent_payload_roots(cfg: &nzbd_config::Config) -> Vec<PathBuf> {
     let mut roots = vec![cfg.torrent_dir()];
     roots.extend(
@@ -1254,6 +1276,7 @@ fn run(
     engine_cfg.max_active_downloads = cfg.max_active_downloads();
     engine_cfg.expected_installation_id = expected_identity;
     engine_cfg.workspace_dir = cfg.configured_workspace_dir();
+    engine_cfg.payload_roots = payload_roots(&cfg);
 
     // Keep a shutdown handle outside the startup future: any later failure
     // (torrent restore, watch roots, router setup) must drain the accepted

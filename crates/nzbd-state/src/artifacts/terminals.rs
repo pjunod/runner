@@ -118,6 +118,25 @@ pub struct JobTerminal {
     pub updated_at: i64,
 }
 
+/// Attempts an incomplete failed-source disposal gets before it settles with
+/// what remains retained (`Inventory::note_disposal_incomplete`).
+pub const DISPOSAL_ATTEMPT_BUDGET: u32 = 12;
+const DISPOSAL_LADDER_BASE_SECONDS: i64 = 60;
+const DISPOSAL_LADDER_CAP_SECONDS: i64 = 6 * 60 * 60;
+
+fn disposal_ladder_key(job: u32) -> String {
+    format!("disposal-ladder:{job}")
+}
+
+/// The durable retry ladder of a failed source's incomplete disposal.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisposalLadder {
+    pub attempts: u32,
+    pub next_attempt_at: i64,
+    pub last_outcome: String,
+    pub exhausted: bool,
+}
+
 impl JobTerminal {
     /// Every step done: nothing to replay.
     pub fn finished(&self) -> bool {
@@ -581,12 +600,115 @@ impl Inventory {
 
     /// Record the disposal of a failed source; disposal is then done.
     pub fn record_disposal(&self, job: u32, note: &str) -> Result<()> {
-        let db = self.db.lock().unwrap();
-        db.execute(
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
             "UPDATE job_terminals SET disposal=?2,updated_at=?3 WHERE job=?1",
             rusqlite::params![job, note, now()],
         )?;
+        tx.execute("DELETE FROM meta WHERE key=?1", [disposal_ladder_key(job)])?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// The bounded exit of an exhausted disposal ladder: in one transaction
+    /// the obligation settles (`disposal`) and the payload gets a timed
+    /// exit too — every live row of the job (and every retained source row
+    /// of its relocations) that is not already on one is parked with the
+    /// failed TTL, so retention deletion ends it. A row the job or a person
+    /// keeps stays retained under that policy. Returns the rows parked.
+    pub fn settle_exhausted_disposal(&self, job: u32, note: &str) -> Result<usize> {
+        let ttl = i64::from(self.settings()?.failed_retention_days) * 86400;
+        let _guard = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let raws = {
+            let mut statement = tx.prepare(
+                "SELECT data FROM artifacts WHERE (job=?1 OR id IN (SELECT 'source-'||o.id FROM operations o JOIN artifacts a ON a.id=o.artifact WHERE a.job=?1 AND json_extract(o.data,'$.kind')='relocate')) \
+                 AND state IN ('active','active_unverified','transitioning','retained','delete_failed')",
+            )?;
+            let rows = statement.query_map([job], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut parked = 0;
+        for raw in raws {
+            let mut row: Artifact = serde_json::from_str(&raw)?;
+            if !row.owned {
+                continue;
+            }
+            if row.keep || row.keep_on_failure {
+                if row.state != "retained" {
+                    row.state = "retained".into();
+                    row.revision += 1;
+                    row.updated_at = now();
+                    save_artifact(&tx, &row)?;
+                }
+                continue;
+            }
+            row.hold = None;
+            row.state = "parked_failed".into();
+            row.automatic_cleanup_eligible = true;
+            row.retention_seconds = ttl.max(1) as u64;
+            row.deadline = Some(now().saturating_add(ttl.max(0)));
+            row.revision += 1;
+            row.updated_at = now();
+            save_artifact(&tx, &row)?;
+            event(
+                &tx,
+                &row.id,
+                "disposal_settled",
+                "disposal could not complete within its budget; parked with the failed TTL",
+            )?;
+            parked += 1;
+        }
+        tx.execute(
+            "UPDATE job_terminals SET disposal=?2,updated_at=?3 WHERE job=?1",
+            rusqlite::params![job, note, now()],
+        )?;
+        tx.execute("DELETE FROM meta WHERE key=?1", [disposal_ladder_key(job)])?;
+        tx.commit()?;
+        Ok(parked)
+    }
+
+    /// When the job's disposal may next be attempted on its own ladder
+    /// (`note_disposal_incomplete`); `None` when no attempt was incomplete.
+    pub fn disposal_ladder(&self, job: u32) -> Result<Option<DisposalLadder>> {
+        let raw: Option<String> = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key=?1",
+                [disposal_ladder_key(job)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()))
+    }
+
+    /// Contract §2.6, every state has a bounded exit: a disposal attempt
+    /// that could not complete and holds no operation ladder of its own
+    /// (the obstruction is not a retrying `delete`/`relocate`) is retried on
+    /// this durable ladder — 1 min doubling to 6 h — and after
+    /// `DISPOSAL_ATTEMPT_BUDGET` attempts (about a day) the caller settles
+    /// it with what remains retained. Returns the updated ladder.
+    pub fn note_disposal_incomplete(&self, job: u32, outcome: &str) -> Result<DisposalLadder> {
+        let previous = self.disposal_ladder(job)?.unwrap_or_default();
+        let attempts = previous.attempts.saturating_add(1);
+        let delay = DISPOSAL_LADDER_BASE_SECONDS
+            .saturating_mul(1i64 << attempts.saturating_sub(1).min(20))
+            .min(DISPOSAL_LADDER_CAP_SECONDS);
+        let ladder = DisposalLadder {
+            attempts,
+            next_attempt_at: now().saturating_add(delay),
+            last_outcome: outcome.to_owned(),
+            exhausted: attempts >= DISPOSAL_ATTEMPT_BUDGET,
+        };
+        self.db.lock().unwrap().execute(
+            "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![disposal_ladder_key(job), serde_json::to_string(&ladder)?],
+        )?;
+        Ok(ladder)
     }
 
     /// The disposal gate (contract §2.5–2.6): `Some(terminal)` only when the
@@ -768,6 +890,48 @@ pub(crate) mod tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    /// An incomplete disposal with no operation ladder climbs a durable
+    /// ladder (1 min doubling, 6 h cap) and is exhausted after its budget;
+    /// recording the disposal clears it. It survives a reopen.
+    #[test]
+    fn incomplete_disposal_ladder_is_durable_bounded_and_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let inventory = Inventory::open(dir.path()).unwrap();
+        inventory
+            .record_terminal(&failed(9, SalvageState::SettledNone))
+            .unwrap();
+        assert!(inventory.disposal_ladder(9).unwrap().is_none());
+        let first = inventory
+            .note_disposal_incomplete(9, "source remains")
+            .unwrap();
+        assert_eq!(first.attempts, 1);
+        assert!(!first.exhausted);
+        assert!((first.next_attempt_at - now() - 60).abs() <= 1);
+        let second = inventory
+            .note_disposal_incomplete(9, "source remains")
+            .unwrap();
+        assert!((second.next_attempt_at - now() - 120).abs() <= 1);
+        inventory.close().unwrap();
+        drop(inventory);
+        let inventory = Inventory::open(dir.path()).unwrap();
+        assert_eq!(inventory.disposal_ladder(9).unwrap().unwrap().attempts, 2);
+        let mut last = second;
+        for _ in 2..DISPOSAL_ATTEMPT_BUDGET {
+            last = inventory
+                .note_disposal_incomplete(9, "source remains")
+                .unwrap();
+            assert!(last.next_attempt_at - now() <= DISPOSAL_LADDER_CAP_SECONDS);
+        }
+        assert_eq!(last.attempts, DISPOSAL_ATTEMPT_BUDGET);
+        assert!(last.exhausted);
+        inventory.record_disposal(9, "retained").unwrap();
+        assert!(inventory.disposal_ladder(9).unwrap().is_none());
+        assert_eq!(
+            inventory.terminal(9).unwrap().unwrap().disposal.as_deref(),
+            Some("retained")
+        );
     }
 
     #[test]

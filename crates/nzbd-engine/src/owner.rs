@@ -1173,6 +1173,10 @@ pub(crate) struct Owner {
     dest_dir: PathBuf,
     pub(crate) artifacts: Arc<nzbd_state::artifacts::Inventory>,
     torrent_payload_roots: Vec<PathBuf>,
+    /// Configured payload roots (completed, failed, category destinations)
+    /// that startup reconciles alongside the recorded ones, so every
+    /// configured root is a reconciled root even before a row names it.
+    pub(crate) configured_payload_roots: Vec<PathBuf>,
 
     engine_tx: mpsc::Sender<EngineMsg>,
     tracker: TaskTracker,
@@ -1341,9 +1345,14 @@ impl Owner {
         );
         // `paths.workspace_dir`, and the migration of rows recorded under the
         // default root, before anything reads a workspace path.
-        if let Some(dir) = workspace_dir {
+        // Unset, the default root is configured too: workspaces recorded
+        // under a previous state directory (a wholesale move) are resolved.
+        let dir = workspace_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| artifacts.workspace_dir());
+        if workspace_dir.is_some() || dir.is_absolute() {
             artifacts
-                .configure_workspace_dir(dir)
+                .configure_workspace_dir(&dir)
                 .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
         }
         // Capture the metadata boundary before runtime Inventory handles can
@@ -1664,6 +1673,7 @@ impl Owner {
             tuning,
             download_enabled,
             dest_dir,
+            configured_payload_roots: Vec::new(),
             artifacts,
             torrent_payload_roots,
             engine_tx,

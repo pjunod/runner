@@ -2559,13 +2559,13 @@ fn scan_reports_a_folder_it_cannot_measure_without_failing_the_scan() {
     let attention = db
         .list_page(&ListQuery {
             limit: 10,
-            filter: ListFilter::Attention,
+            filter: ListFilter::Foreign,
             ..Default::default()
         })
         .unwrap();
     assert_eq!(
         attention.total, 2,
-        "unknown folders need a person either way"
+        "folders Runner did not create are listed apart, as not Runner's"
     );
 }
 
@@ -2643,7 +2643,8 @@ fn list_page_filters_sorts_searches_and_counts() {
         ListCounts {
             all: 5,
             live: 4,
-            attention: 3,
+            attention: 0,
+            foreign: 3,
             owned: 1,
             cleared: 1,
             live_bytes: live.counts.live_bytes
@@ -3729,7 +3730,7 @@ fn park_root_creation_failure_lands_on_the_operation_ladder() {
             .rows
             .iter()
             .any(|row| row.artifact.id == artifact.id),
-        "visible under Attention"
+        "visible under Attention while its error stands"
     );
     assert!(source.join("episode.mkv").exists(), "nothing moved");
     // A second failure climbs the ladder.
@@ -4134,4 +4135,804 @@ fn silent_recovery_handoffs_are_cancelled_after_the_failed_ttl() {
     assert!(db
         .claim_recovery(&ids[1].id, "curator", "import", &ids[1].manifest_digest)
         .is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Post-move fixes (2026-11-11): failed publications, failed transforms,
+// rediscovered publications, the attention rule.
+// ---------------------------------------------------------------------------
+
+fn fail_terminal(db: &Inventory, job: u32, keep_on_failure: bool) {
+    let mut terminal = terminals::tests::failed(job, SalvageState::SettledNone);
+    terminal.keep_on_failure = keep_on_failure;
+    db.record_terminal(&terminal).unwrap();
+    db.mark_terminal_step(job, &TerminalStep::Emitted).unwrap();
+}
+
+/// A copy publication of `job` from `root/job-<job>` (media + a PAR volume
+/// + an archive) to `<tmp>/completed/release`; its source stays behind.
+fn copy_published(tmp: &tempfile::TempDir, db: &Inventory, root: &Path, job: u32) -> PathBuf {
+    let source = root.join(format!("job-{job}"));
+    db.allocate_for_delivery(job, root, &source, true, true)
+        .unwrap();
+    std::fs::write(source.join("media.mkv"), b"payload").unwrap();
+    std::fs::write(source.join("media.vol00+01.par2"), b"recovery volume").unwrap();
+    std::fs::write(source.join("media.rar"), b"unextracted archive").unwrap();
+    db.finish(job, &source, root, "active").unwrap();
+    let completed = tmp.path().join("completed");
+    std::fs::create_dir_all(&completed).unwrap();
+    fs::RENAME_FAILURE.with(|failure| failure.set(Some(libc::EINVAL)));
+    db.relocate_for_delivery_checked(job, &completed.join(format!("release-{job}")), &|| Ok(()))
+        .unwrap();
+    assert!(source.exists(), "copy publication retains its source");
+    source
+}
+
+/// Park disposition of a failed copy publication: the remainder the
+/// publication did not take (PAR volumes, archives — recovery input) is
+/// never wiped. It is parked in place with the failed TTL, so retention is
+/// its exit; closed scope is not granted; a second pass is a no-op.
+#[test]
+fn a_parked_failed_publications_remainder_is_parked_not_wiped() {
+    let (tmp, db, root) = fixture();
+    let source = copy_published(&tmp, &db, &root, 47);
+    fail_terminal(&db, 47, false);
+    assert!(
+        db.park_superseded_publication_sources(47)
+            .unwrap()
+            .is_empty(),
+        "the publication is still at its destination: nothing supersedes it"
+    );
+    let failed = tmp.path().join("failed");
+    std::fs::create_dir(&failed).unwrap();
+    db.relocate(47, &failed.join("release")).unwrap();
+    assert!(
+        db.retire_superseded_publication_sources(47)
+            .unwrap()
+            .is_empty(),
+        "a park never grants closed scope"
+    );
+    let parked = db.park_superseded_publication_sources(47).unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].path, source);
+    assert!(matches!(parked[0].outcome, SupersededOutcome::Parked(_)));
+    assert!(source.join("media.vol00+01.par2").exists());
+    assert!(source.join("media.rar").exists());
+    let remainder = db
+        .for_path(&source)
+        .unwrap()
+        .filter(|row| row.id.starts_with("source-"))
+        .unwrap();
+    assert_eq!(remainder.state, "parked_failed");
+    assert!(remainder.owned && remainder.deadline.is_some_and(|due| due > now()));
+    assert_eq!(
+        db.park_superseded_publication_sources(47).unwrap()[0].outcome,
+        SupersededOutcome::Parked("parked in place with the failed TTL".into()),
+        "idempotent"
+    );
+}
+
+/// Delete disposition: once the published generation itself is deleted (a
+/// succeeded delete operation), the pre-publication source retires by
+/// closed scope, as after a delivery.
+#[test]
+fn a_deleted_failed_publications_source_retires_by_closed_scope() {
+    let (tmp, db, root) = fixture();
+    let db = Arc::new(db);
+    let source = copy_published(&tmp, &db, &root, 49);
+    fail_terminal(&db, 49, false);
+    let guard = db.acquire_terminal_use(49, &|| Ok(())).unwrap().unwrap();
+    let op = db.delete_failed_payload(&guard, 49, &|| Ok(())).unwrap();
+    assert_eq!(op.state, "succeeded");
+    drop(guard);
+    let retired = db.retire_superseded_publication_sources(49).unwrap();
+    assert_eq!(
+        retired,
+        vec![SupersededSource {
+            path: source.clone(),
+            outcome: SupersededOutcome::Retired,
+        }]
+    );
+    assert!(!source.exists());
+    assert!(db
+        .retire_superseded_publication_sources(49)
+        .unwrap()
+        .is_empty());
+}
+
+/// A terminal row that was not deleted (`source_gone`) is no proof of a
+/// Delete disposition: no closed scope.
+#[test]
+fn a_vanished_publication_grants_no_closed_scope() {
+    let (tmp, db, root) = fixture();
+    let source = copy_published(&tmp, &db, &root, 50);
+    fail_terminal(&db, 50, false);
+    let mut published = db.for_job(50).unwrap().unwrap();
+    published.state = "source_gone".into();
+    save_artifact(&db.db.lock().unwrap(), &published).unwrap();
+    assert!(db
+        .retire_superseded_publication_sources(50)
+        .unwrap()
+        .is_empty());
+    assert!(source.join("media.rar").exists());
+}
+
+/// Keep-on-failure content is never deleted nor parked away.
+#[test]
+fn a_kept_failure_keeps_its_superseded_publication_source() {
+    let (tmp, db, root) = fixture();
+    let source = copy_published(&tmp, &db, &root, 48);
+    fail_terminal(&db, 48, true);
+    let failed = tmp.path().join("failed");
+    std::fs::create_dir(&failed).unwrap();
+    db.relocate(48, &failed.join("release")).unwrap();
+    assert!(db
+        .retire_superseded_publication_sources(48)
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .park_superseded_publication_sources(48)
+        .unwrap()
+        .is_empty());
+    assert!(source.join("media.mkv").exists());
+}
+
+/// An exhausted disposal ladder settles the obligation and gives the
+/// payload a timed exit in the same transaction: live rows are parked with
+/// the failed TTL; a kept row stays retained.
+#[test]
+fn an_exhausted_disposal_parks_what_remains() {
+    let (_tmp, db, root) = fixture();
+    let path = root.join("job-70");
+    db.allocate(70, &root, &path).unwrap();
+    std::fs::write(path.join("payload.bin"), b"bytes").unwrap();
+    let mut row = db.finish(70, &path, &root, "active").unwrap();
+    row.state = "transitioning".into();
+    save_artifact(&db.db.lock().unwrap(), &row).unwrap();
+    fail_terminal(&db, 70, false);
+    assert_eq!(db.settle_exhausted_disposal(70, "settled").unwrap(), 1);
+    let after = db.get(&row.id).unwrap();
+    assert_eq!(after.state, "parked_failed");
+    assert!(after.deadline.is_some_and(|due| due > now()));
+    assert_eq!(
+        db.terminal(70).unwrap().unwrap().disposal.as_deref(),
+        Some("settled")
+    );
+    assert!(path.join("payload.bin").exists(), "nothing deleted now");
+}
+
+/// A transform journal the failed attempt left `running` with its workspace
+/// gone pinned the source `transitioning`, and every disposal was refused
+/// as "not quiescent". It ends with the attempt; the source becomes
+/// quiescent and the disposition moves it.
+#[test]
+fn a_failed_jobs_unfinished_transform_ends_and_the_source_can_be_disposed() {
+    let (tmp, db, root) = fixture();
+    let source = root.join("job-5");
+    db.allocate_for_delivery(5, &root, &source, true, true)
+        .unwrap();
+    std::fs::write(source.join("a.rar"), b"archive").unwrap();
+    let workspace = db.workspace(5, "extract", "abc").unwrap();
+    assert_eq!(db.for_job(5).unwrap().unwrap().state, "transitioning");
+    std::fs::remove_dir_all(&workspace.scratch.path).unwrap();
+    let failed = tmp.path().join("failed");
+    std::fs::create_dir(&failed).unwrap();
+    let refused = db.relocate(5, &failed.join("job-5")).unwrap_err();
+    assert!(refused.to_string().contains("not quiescent"), "{refused}");
+
+    assert_eq!(
+        db.end_failed_job_transforms(5).unwrap(),
+        0,
+        "no terminal yet: the attempt may still own it"
+    );
+    fail_terminal(&db, 5, false);
+    assert_eq!(db.end_failed_job_transforms(5).unwrap(), 1);
+    assert_eq!(
+        db.operation(&workspace.operation_id).unwrap().state,
+        "failed"
+    );
+    assert_eq!(db.get(&workspace.scratch.id).unwrap().state, "source_gone");
+    assert_eq!(db.for_job(5).unwrap().unwrap().state, "active");
+    assert_eq!(db.end_failed_job_transforms(5).unwrap(), 0, "idempotent");
+    db.relocate(5, &failed.join("job-5")).unwrap();
+    assert_eq!(
+        std::fs::read(failed.join("job-5/a.rar")).unwrap(),
+        b"archive",
+        "nothing was deleted; the disposition moved it"
+    );
+}
+
+/// A scan that walked a publication's destination before it committed
+/// recorded Runner's own publication as unknown/Keep/review. Such a
+/// duplicate (same path and directory object) is closed with a pointer to
+/// Runner's row, keeping its record; a different object at the path is not
+/// folded. An unregistered directory whose verifying manifest names one of
+/// this installation's generations becomes `transferred`; one naming a
+/// generation this installation never recorded, or none, stays foreign.
+/// Idempotent, and manifests are not re-read on every pass.
+#[test]
+fn rediscovered_runner_publications_fold_back_into_custody() {
+    let (_tmp, db, root) = fixture();
+    let ours = root.join("published");
+    db.allocate(61, &root, &ours).unwrap();
+    std::fs::write(ours.join("ep.mkv"), b"episode").unwrap();
+    let runner_row = db.finish(61, &ours, &root, "active").unwrap();
+    let duplicate = {
+        let stray = root.join("stray");
+        std::fs::create_dir(&stray).unwrap();
+        let mut duplicate = db.discover(&root, &stray, false).unwrap();
+        std::fs::remove_dir(&stray).unwrap();
+        duplicate.path = ours.clone();
+        duplicate.identity = runner_row.identity.clone();
+        save_artifact(&db.db.lock().unwrap(), &duplicate).unwrap();
+        duplicate
+    };
+    let impostor = {
+        let other = root.join("other");
+        std::fs::create_dir(&other).unwrap();
+        let mut impostor = db.discover(&root, &other, false).unwrap();
+        impostor.path = ours.clone();
+        save_artifact(&db.db.lock().unwrap(), &impostor).unwrap();
+        impostor
+    };
+
+    let manifest_dir = |name: &str, generation: &str| {
+        let dir = root.join(name);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("ep.mkv"), b"payload!").unwrap();
+        let manifest = intents::RunnerManifest::new(
+            generation.into(),
+            62,
+            Some("t-62".into()),
+            0,
+            false,
+            vec![intents::ManifestFile {
+                path: "ep.mkv".into(),
+                bytes: 8,
+                sha256: "00".into(),
+            }],
+        );
+        std::fs::write(
+            dir.join(intents::RUNNER_MANIFEST_NAME),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        db.discover(&root, &dir, false).unwrap()
+    };
+    let orphan_row = manifest_dir("orphan.job-62.runner-a", &runner_row.generation);
+    let stranger_row = manifest_dir("stranger", "0123456789abcdef");
+    let foreign = root.join("hermes-cinema");
+    std::fs::create_dir(&foreign).unwrap();
+    std::fs::write(foreign.join("movie.mkv"), b"not ours").unwrap();
+    let foreign_row = db.discover(&root, &foreign, false).unwrap();
+
+    assert_eq!(db.fold_rediscovered_publications().unwrap(), 2);
+    let closed = db.get(&duplicate.id).unwrap();
+    assert_eq!(closed.state, "deleted", "closed, not erased");
+    assert_eq!(closed.created_at, duplicate.created_at, "first seen kept");
+    assert!(ours.join("ep.mkv").exists(), "no bytes touched");
+    assert_eq!(db.get(&impostor.id).unwrap().state, "unknown");
+    let transferred = db.get(&orphan_row.id).unwrap();
+    assert_eq!(transferred.state, "transferred");
+    assert!(!transferred.owned && !transferred.keep && transferred.hold.is_none());
+    assert_eq!(db.get(&stranger_row.id).unwrap().state, "unknown");
+    assert_eq!(db.get(&foreign_row.id).unwrap().state, "unknown");
+    assert!(foreign.join("movie.mkv").exists(), "never deleted");
+    assert_eq!(
+        db.fold_rediscovered_publications().unwrap(),
+        0,
+        "idempotent"
+    );
+    let checked: i64 = db
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM meta WHERE key LIKE 'publication-fold-checked:%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(checked >= 2, "foreign manifests are read once per revision");
+
+    let page = |filter| {
+        db.list_page(&ListQuery {
+            limit: 50,
+            filter,
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    assert_eq!(page(ListFilter::Attention).total, 0);
+    assert_eq!(page(ListFilter::Foreign).total, 3);
+}
+
+/// A scan never records a publication still landing — an unresolved
+/// relocation's destination, a directory containing one (a category), or
+/// Runner's private `.runner-*` staging — as discovered content.
+#[test]
+fn a_scan_skips_a_publication_still_in_flight() {
+    let (_tmp, db, root) = fixture();
+    let landing = root.join("landing");
+    let category = root.join("tv");
+    let staging = root.join(".runner-move-abc");
+    for dir in [&landing, &category, &staging] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    for (id, destination) in [
+        ("move-landing", landing.clone()),
+        ("move-tv", category.join("Show.S01E01")),
+    ] {
+        save_operation(
+            &db.db.lock().unwrap(),
+            &Operation {
+                id: id.into(),
+                artifact: "elsewhere".into(),
+                kind: "relocate".into(),
+                state: "retry".into(),
+                request: serde_json::json!({ "destination": destination }).to_string(),
+                created_at: now(),
+                not_before: 0,
+                attempts: 1,
+                next_retry: now() + 60,
+                error: None,
+            },
+        )
+        .unwrap();
+    }
+    let op = db
+        .submit_task(
+            "scan",
+            "installation",
+            "",
+            serde_json::json!({"roots":[root],"excluded":[],"active":[]}),
+        )
+        .unwrap();
+    db.run_tasks().unwrap();
+    assert_eq!(db.operation(&op.id).unwrap().state, "succeeded");
+    for dir in [&landing, &category, &staging] {
+        assert!(db.for_path(dir).unwrap().is_none(), "{}", dir.display());
+    }
+}
+
+/// Owner's rule (Paul, 2026-11-11): nothing Runner created may sit in
+/// "Needs attention" while its exit is running. Every artifact state ×
+/// every hold Runner writes, on a fresh Runner row with no error, stays out
+/// of it; content Runner did not create is listed apart as foreign. What
+/// must show does: an error, a hold with no registered exit, and any row
+/// that has outlived its registered exit (an expired timed hold, a
+/// retention deadline long past, an in-progress state no worker finished).
+#[test]
+fn attention_holds_only_what_needs_a_person_or_outlived_its_exit() {
+    let (_tmp, db, root) = fixture();
+    let base = root.join("base");
+    db.allocate(1, &root, &base).unwrap();
+    let template = db.finish(1, &base, &root, "active").unwrap();
+    let holds = std::iter::once(None)
+        .chain(
+            exits::HOLD_EXITS
+                .iter()
+                .filter(|rule| !matches!(rule.exit, exits::Exit::Operator(_)))
+                .map(|rule| {
+                    Some(if rule.prefix {
+                        format!("{}x", rule.hold)
+                    } else {
+                        rule.hold.to_string()
+                    })
+                }),
+        )
+        .collect::<Vec<_>>();
+    let mut states = exits::STATE_EXITS
+        .iter()
+        .filter(|state| state.scope == "artifact")
+        .map(|state| state.state)
+        .collect::<Vec<_>>();
+    states.push("transferred");
+    let save = |id: &str, edit: &dyn Fn(&mut Artifact)| {
+        let mut a = template.clone();
+        a.id = id.into();
+        edit(&mut a);
+        save_artifact(&db.db.lock().unwrap(), &a).unwrap();
+    };
+    let mut rows = 0;
+    for state in &states {
+        for hold in &holds {
+            rows += 1;
+            save(&format!("runner-{rows}"), &|a| {
+                a.state = (*state).into();
+                // Custody handed to the consumer is the one unowned state
+                // Runner creates.
+                a.owned = *state != "transferred";
+                a.keep = true;
+                a.hold = hold.clone();
+                a.updated_at = now();
+            });
+        }
+    }
+    let attention = || {
+        db.list_page(&ListQuery {
+            limit: 200,
+            filter: ListFilter::Attention,
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    assert_eq!(attention().total, 0, "{:?}", attention().rows.first());
+    for rule in exits::HOLD_EXITS {
+        if matches!(rule.exit, exits::Exit::Operator(_)) {
+            assert_eq!(
+                rule.action,
+                exits::HoldAction::Adoption,
+                "{}: an operator exit is for content Runner did not create",
+                rule.hold
+            );
+        }
+    }
+    let late = now() - exits::STUCK_PROGRESS_SECONDS - 2 * exits::OVERDUE_GRACE_SECONDS;
+    save("errored", &|a| {
+        a.error = Some("No space left on device".into())
+    });
+    save("missing-exit", &|a| {
+        a.hold = Some("a hold nothing registered".into())
+    });
+    save("overdue-hold", &|a| {
+        a.state = "retained".into();
+        a.hold = Some("review: cancelled recovery".into());
+        a.updated_at = late;
+    });
+    save("expired", &|a| {
+        a.state = "parked_failed".into();
+        a.keep = false;
+        a.deadline = Some(late);
+    });
+    save("stuck", &|a| {
+        a.state = "transitioning".into();
+        a.updated_at = late;
+    });
+    // In flight for a day is not overdue: its own event ends it.
+    save("long-transform", &|a| {
+        a.state = "retained".into();
+        a.hold = Some("transform workspace".into());
+        a.updated_at = late;
+    });
+    let mut flagged = attention()
+        .rows
+        .into_iter()
+        .map(|row| row.artifact.id)
+        .collect::<Vec<_>>();
+    flagged.sort();
+    assert_eq!(
+        flagged,
+        [
+            "errored",
+            "expired",
+            "missing-exit",
+            "overdue-hold",
+            "stuck"
+        ]
+    );
+}
+
+/// The interrupted-writer-retirement hold's exit ("gone → source_gone")
+/// is reached at startup when the path is already gone, instead of being
+/// re-armed (and its timer restarted) at every boot.
+#[test]
+fn startup_settles_a_retirement_whose_directory_is_gone() {
+    let (_tmp, db, root) = fixture();
+    let path = root.join("job-2595");
+    db.allocate(2595, &root, &path).unwrap();
+    let mut a = db.finish(2595, &path, &root, "active").unwrap();
+    a.keep = true;
+    save_artifact(&db.db.lock().unwrap(), &a).unwrap();
+    std::fs::remove_dir_all(&path).unwrap();
+    db.reconcile_startup_root(&root, &[]).unwrap();
+    let after = db.get(&a.id).unwrap();
+    assert_eq!(after.state, "source_gone");
+    assert!(after.hold.is_none());
+    assert!(db
+        .operation(&format!("startup-orphan-{}-{}", a.id, a.generation))
+        .is_err());
+}
+
+/// An interrupted allocation (identity never committed) at a name only
+/// Runner gives stays Runner's: empty and orphaned it is removed (rmdir,
+/// never recursive) and closed; with bytes and orphaned it is parked with
+/// the failed TTL; for a live job it becomes its active allocation. A
+/// directory at any other name is not claimed.
+#[test]
+fn interrupted_runner_allocations_end_instead_of_turning_foreign() {
+    let (_tmp, db, root) = fixture();
+    let allocating = |id: &str, job: Option<u32>, name: &str, bytes: bool| {
+        let path = root.join(name);
+        std::fs::create_dir(&path).unwrap();
+        if bytes {
+            std::fs::write(path.join("part.bin"), b"partial").unwrap();
+        }
+        let mut a = db.discover(&root, &path, false).unwrap();
+        a.id = id.into();
+        a.job = job;
+        a.state = "allocating".into();
+        a.owned = true;
+        a.keep = false;
+        a.hold = None;
+        a.identity = None;
+        save_artifact(&db.db.lock().unwrap(), &a).unwrap();
+        db.db
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM artifacts WHERE path=?1 AND id<>?2",
+                params![path.to_string_lossy(), id],
+            )
+            .unwrap();
+        path
+    };
+    let empty = allocating("scratch-extract-k1", None, "extract-k1", false);
+    let full = allocating("scratch-extract-k2", None, "extract-k2", true);
+    let live = allocating("live", Some(77), "Show.job-77-url-abc", true);
+    let stranger = allocating("stranger", Some(78), "someone-elses-dir", true);
+    db.reconcile_startup_root(&root, &[77, 78]).unwrap();
+
+    assert_eq!(db.get("scratch-extract-k1").unwrap().state, "deleted");
+    assert!(!empty.exists());
+    let parked = db.get("scratch-extract-k2").unwrap();
+    assert_eq!(parked.state, "parked_failed");
+    assert!(parked.owned && parked.deadline.is_some());
+    assert!(full.join("part.bin").exists());
+    let active = db.get("live").unwrap();
+    assert_eq!(active.state, "active");
+    assert!(active.owned && active.identity.is_some() && active.hold.is_none());
+    assert!(live.exists());
+    let other = db.get("stranger").unwrap();
+    assert!(!other.owned, "not provably Runner's");
+    assert!(stranger.join("part.bin").exists());
+}
+
+/// Force a relocation's source cleanup into the pre-0.9.1 `blocked` state
+/// (no `blocked_at`), with its delivery blocked too.
+fn block_cleanup(db: &Inventory, operation: &str, reason: &str) {
+    let mut op = db.operation(operation).unwrap();
+    let mut movement: serde_json::Value = serde_json::from_str(&op.request).unwrap();
+    movement["cleanup"]["state"] = "blocked".into();
+    movement["cleanup"]["error"] = reason.into();
+    movement["cleanup"]["next_retry"] = 0.into();
+    if let Some(object) = movement["cleanup"].as_object_mut() {
+        object.remove("blocked_at");
+    }
+    op.request = serde_json::to_string(&movement).unwrap();
+    let db_lock = db.db.lock().unwrap();
+    save_operation(&db_lock, &op).unwrap();
+    db_lock
+        .execute(
+            "UPDATE deliveries SET cleanup_status='blocked',cleanup_error=?2 WHERE artifact=?1",
+            params![op.artifact, reason],
+        )
+        .unwrap();
+}
+
+fn cleanup_of(db: &Inventory, operation: &str) -> serde_json::Value {
+    serde_json::from_str(&db.operation(operation).unwrap().request).unwrap()
+}
+
+/// A delivered copy publication of job `job`: (source dir, move op id,
+/// delivery id).
+fn delivered_copy(
+    tmp: &tempfile::TempDir,
+    db: &Inventory,
+    root: &Path,
+    job: u32,
+) -> (PathBuf, String, String) {
+    let source = root.join(format!("delivered-{job}"));
+    db.allocate_for_delivery(job, root, &source, true, true)
+        .unwrap();
+    std::fs::write(source.join("media.mkv"), b"payload").unwrap();
+    db.finish(job, &source, root, "active").unwrap();
+    let completed = tmp.path().join("completed");
+    std::fs::create_dir_all(&completed).unwrap();
+    fs::RENAME_FAILURE.with(|failure| failure.set(Some(libc::EINVAL)));
+    let moved = db
+        .relocate_for_delivery_checked(job, &completed.join(format!("release-{job}")), &|| Ok(()))
+        .unwrap();
+    let delivery = db.create_delivery(job, true, Some("t-test")).unwrap();
+    (source, moved.operation_id, delivery.delivery_id)
+}
+
+/// nuc4, 26 rows: "configured root identity changed or volume is
+/// unavailable". The NFS mount source was renamed by a remount
+/// (`qnap:/working` → `qnap-storage:/working`); type, root, mount point and
+/// inode are unchanged. Identities recorded under the old source rebind,
+/// and the cleanup blocked before 0.9.1 is re-verified on its timed exit
+/// and completes with no operator action.
+#[test]
+fn a_cleanup_blocked_by_a_renamed_mount_source_rebinds_and_completes() {
+    let (tmp, db, root) = fixture();
+    let (source, operation, delivery) = delivered_copy(&tmp, &db, &root, 80);
+    // Record everything as it was under the old mount source. The old
+    // identity is rebuilt structurally — only the source field changes —
+    // and swapped as a whole mount_id at each JSON nesting level. (A text
+    // replace of the `<len>:<source>` field alone also rewrote the
+    // filesystem-type field wherever the two read the same — `overlay` on
+    // `overlay` on the CI runner — which is a different filesystem, rightly
+    // refused.)
+    let rebuilt = |live: &str| {
+        let (platform, rest) = live.split_once('\n').unwrap();
+        let fields = rest
+            .split('\n')
+            .map(|field| field.split_once(':').unwrap().1.to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(fields.len(), 4, "{live:?}");
+        let mut old = vec![platform.to_owned()];
+        for (index, value) in fields.iter().enumerate() {
+            let value = if index == 1 {
+                format!("old-alias-{value}")
+            } else {
+                value.clone()
+            };
+            old.push(format!("{}:{value}", value.len()));
+        }
+        old.join("\n")
+    };
+    let escape = |text: &str| {
+        let quoted = serde_json::to_string(text).unwrap();
+        quoted[1..quoted.len() - 1].to_owned()
+    };
+    let mut swaps = Vec::new();
+    for dir in [root.clone(), tmp.path().join("completed")] {
+        let live = fs::mount_id(&fs::open_dir(&dir).unwrap()).unwrap();
+        let old = rebuilt(&live);
+        assert!(!live.contains('\\') && !old.contains('\\'));
+        let identity = |mount_id: &str| Identity {
+            device: 1,
+            inode: 2,
+            mount_id: mount_id.to_owned(),
+            bytes: 0,
+            modified: String::new(),
+            changed: String::new(),
+            directory: true,
+        };
+        let (recorded, current) = (identity(&old), identity(&live));
+        assert!(recorded.same_object(&current), "only the source differs");
+        // Nested JSON first (a request inside a row), then one level.
+        swaps.push((escape(&escape(&live)), escape(&escape(&old))));
+        swaps.push((escape(&live), escape(&old)));
+    }
+    swaps.sort();
+    swaps.dedup();
+    for (from, to) in &swaps {
+        for table in ["artifacts", "operations"] {
+            db.db
+                .lock()
+                .unwrap()
+                .execute(
+                    &format!("UPDATE {table} SET data=replace(data,?1,?2)"),
+                    params![from, to],
+                )
+                .unwrap();
+        }
+        for entry in walk(&tmp.path().join("state/artifact-identities")) {
+            let text = std::fs::read_to_string(&entry).unwrap();
+            std::fs::write(&entry, text.replace(from.as_str(), to)).unwrap();
+        }
+    }
+    let recorded = cleanup_of(&db, &operation);
+    let recorded = recorded["source"]["root_identity"]["mount_id"]
+        .as_str()
+        .unwrap();
+    assert!(recorded.contains("old-alias-"), "{recorded:?}");
+    assert_eq!(
+        recorded,
+        rebuilt(&fs::mount_id(&fs::open_dir(&root).unwrap()).unwrap()),
+        "only the source field was rewritten"
+    );
+    block_cleanup(
+        &db,
+        &operation,
+        "configured root identity changed or volume is unavailable",
+    );
+
+    db.exit_wedged_states(0, true).unwrap();
+    assert_eq!(cleanup_of(&db, &operation)["cleanup"]["state"], "retry");
+    db.retire_delivery_source(&delivery).unwrap();
+    assert_eq!(cleanup_of(&db, &operation)["cleanup_done"], true);
+    assert!(
+        !source.exists(),
+        "closed scope removed the delivered source"
+    );
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(walk(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// Any cause that keeps blocking: after its rounds of timed re-verification
+/// the retained source is parked for retention (immediately for a delivered
+/// success), retention removes it, and the cleanup closes — no operator.
+#[test]
+fn a_cleanup_that_stays_blocked_ends_through_retention() {
+    let (tmp, db, root) = fixture();
+    let (source, operation, delivery) = delivered_copy(&tmp, &db, &root, 81);
+    let source_row = format!("source-{operation}");
+    let mut row = db.get(&source_row).unwrap();
+    row.hold = Some("a hold that never lifts".into());
+    save_artifact(&db.db.lock().unwrap(), &row).unwrap();
+    block_cleanup(
+        &db,
+        &operation,
+        "source retirement is blocked by ownership/hold state (retained)",
+    );
+    for _ in 0..super::relocation::BLOCKED_CLEANUP_ROUNDS {
+        db.exit_wedged_states(0, true).unwrap();
+        // The normal driver retries and is refused again.
+        let mut op = db.operation(&operation).unwrap();
+        let mut movement: serde_json::Value = serde_json::from_str(&op.request).unwrap();
+        movement["cleanup"]["next_retry"] = 0.into();
+        op.request = serde_json::to_string(&movement).unwrap();
+        save_operation(&db.db.lock().unwrap(), &op).unwrap();
+        let _ = db.retire_delivery_source(&delivery);
+        assert_eq!(cleanup_of(&db, &operation)["cleanup"]["state"], "blocked");
+        let mut op = db.operation(&operation).unwrap();
+        let mut movement: serde_json::Value = serde_json::from_str(&op.request).unwrap();
+        movement["cleanup"]["blocked_at"] = 0.into();
+        op.request = serde_json::to_string(&movement).unwrap();
+        save_operation(&db.db.lock().unwrap(), &op).unwrap();
+    }
+    db.exit_wedged_states(0, true).unwrap();
+    let parked = db.get(&source_row).unwrap();
+    assert_eq!(parked.state, "parked_failed");
+    assert!(parked.hold.is_none());
+    assert!(
+        parked.deadline.is_some_and(|due| due <= now()),
+        "delivered: immediate"
+    );
+    db.tick().unwrap();
+    db.run_due_deletes().unwrap();
+    assert!(
+        db.get(&source_row).unwrap().terminal(),
+        "retention removes a long-id derived row too"
+    );
+    assert!(!source.exists());
+    // Gone: the next sweep closes the cleanup.
+    block_cleanup(&db, &operation, "anything");
+    db.exit_wedged_states(0, true).unwrap();
+    assert_eq!(cleanup_of(&db, &operation)["cleanup_done"], true);
+}
+
+/// Rebinding tolerates only a renamed mount source: a different filesystem
+/// type, root or mount point is still a different object.
+#[test]
+fn a_mount_rebind_needs_type_root_and_mount_point_to_match() {
+    let id = |kind: &str, source: &str, root: &str, point: &str| Identity {
+        device: 1,
+        inode: 39714832,
+        mount_id: format!(
+            "linux\n{}:{kind}\n{}:{source}\n{}:{root}\n{}:{point}",
+            kind.len(),
+            source.len(),
+            root.len(),
+            point.len()
+        ),
+        bytes: 0,
+        modified: String::new(),
+        changed: String::new(),
+        directory: true,
+    };
+    let recorded = id("nfs4", "qnap:/working", "/", "/working");
+    assert!(recorded.same_object(&id("nfs4", "qnap-storage:/working", "/", "/working")));
+    assert!(!recorded.same_object(&id("nfs", "qnap-storage:/working", "/", "/working")));
+    assert!(!recorded.same_object(&id("nfs4", "qnap-storage:/working", "/sub", "/working")));
+    assert!(!recorded.same_object(&id("nfs4", "qnap-storage:/working", "/", "/elsewhere")));
+    // A source spelled like its type (`overlay` on `overlay`, a container's
+    // root filesystem) parses field by field.
+    let overlay = id("overlay", "overlay", "/", "/");
+    assert!(overlay.same_object(&id("overlay", "overlay-renamed", "/", "/")));
+    assert!(!overlay.same_object(&id("tmpfs", "overlay", "/", "/")));
 }

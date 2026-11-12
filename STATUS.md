@@ -1,5 +1,86 @@
 # nzbd — Project Status
 
+## Post-move fixes — 2026-11-12 (0.9.1)
+
+**Status:** built; Fable's adversarial review (8 findings + 4 low) folded in.
+Branch `claude/post-move-fixes` (pushed; no PR yet). Owner: Claude (Opus 5.5
+session). Next: PR → full CI once → merge → deploy to nuc4. Not deployed.
+
+What the 2026-11-11 state-dir move on nuc4 exposed, and what changed:
+
+- **Failed copy publications (2713/2770/2811/2812/2856/2885).** The publish
+  move kept its source "until the delivery row exists"; the job failed
+  `publish` instead, so the processing copy stayed forever and every
+  disposal pass reported "incomplete". Now the remainder follows the
+  disposition: **Delete** (the published generation deleted by a succeeded
+  delete op) retires it by closed scope; **Park** parks it *in place* with
+  the failed TTL — PAR volumes and unextracted archives are never wiped by a
+  park. A blocked retirement also parks with the TTL. Keep-on-failure: never.
+- **Failed jobs' unfinished transforms (2871/2900/2902).** Extract journals
+  stuck in `retry` (startup-only ladder, ENOENT workspace) pinned the
+  source `transitioning`. They end with the failed attempt (journal
+  `failed`, missing scratch `source_gone`, source `active`); a journal
+  whose scratch is gone or never finished allocating is cancelled at
+  startup. No file is touched.
+- **Bounded disposal.** An incomplete disposal with no operation ladder of
+  its own climbs a durable ladder (1 min doubling, 6 h cap; forced retries
+  and attempts with a live operation ladder do not count). After 12 it
+  settles *and* parks every live row of the job with the failed TTL in the
+  same transaction.
+- **Interrupted allocations.** An `allocating` row at a name only Runner
+  gives (transform key, `.job-<N>-`) stays Runner's: empty + orphaned →
+  rmdir (non-recursive) and `deleted`; with bytes → parked with the TTL;
+  live job → its active allocation. Other names keep the old unowned path.
+- **workspace_dir.** Migration resolves every root the transform journals
+  recorded to where its live workspaces are (the old root, `workspace_dir`,
+  or the new state dir's default), renames same-filesystem ones into
+  `workspace_dir`, rewrites only to a location holding every live workspace
+  that still exists, and treats an unreadable root as unknown. Runs with
+  the default root too. On nuc4 the 39 workspaces are already at
+  `/processing/transform-workspaces` (`/processing/queue` no longer exists;
+  checked read-only 2026-11-12), so the rows are rewritten there.
+- **Reconciled roots.** Startup also reconciles the configured completed,
+  failed, category and workspace roots (a missing unused one is a no-op).
+- **History marker.** Written in two forms: the absolute
+  `.history-index-path` (every build reads it; rollback-safe) and
+  `.history-index-path.rel` (relative to the state dir, preferred). An old
+  absolute marker whose file is gone resolves to the configured index by
+  its trailing path. **Known limitation:** with only an old-format marker
+  and the old copy still present (copy-style move by an older build), open
+  still refuses — the same check protects switching back from `index_dir`.
+- **Rediscovery.** Scans skip in-flight destinations, directories holding
+  one (categories) and `.runner-*` staging. A duplicate `unknown` row of
+  Runner's own row (same path *and* directory object) is closed (`deleted`
+  record, event pointer, no bytes touched); an unregistered directory with
+  a verifying manifest naming one of this installation's generations
+  becomes `transferred`. Manifests are read once per row revision.
+- **Attention / Not Runner's.** Content Runner did not create is listed as
+  `foreign` ("Not Runner's"), never deleted, blocking nothing. Attention
+  keeps errors, blocked cleanups and open intents visible and adds a
+  time check: a timed hold past `HOLD_EXIT_SECONDS`, a retention deadline
+  past due, or an in-progress state older than a day (each + 1 h) is
+  flagged. Tested over every state × hold, with overdue fixtures that must
+  appear.
+- **Hard-link publications** that a park moved onward (or a delete
+  removed) no longer block their source cleanup on "published generation
+  changed during source unlink".
+
+- **Blocked relocation cleanups get a timed exit.** nuc4 had 28 (read-only
+  copy of its inventory, 2026-11-12): 26 "configured root identity changed
+  or volume is unavailable" — the NFS mount source was renamed by a remount
+  (`qnap:/working` → `qnap-storage:/working`; same type, root, mount point
+  and inode), so every identity recorded before it mismatched; identities
+  now rebind when only the mount source changed. 2 "published generation
+  changed during source unlink" — hard-link parks whose parked copy is since
+  gone; nothing is left to refresh, so the cleanup completes. Every blocked
+  cleanup is re-verified on a backoff (now, then 1 h, 2 h, … ≤ 1 day, 6
+  rounds); if it stays blocked, the retained source is parked for retention
+  (immediately for a delivered success or a Delete, the failed TTL
+  otherwise) and the cleanup closes once it is gone.
+- **Retention of long-id rows.** Retention requests for Runner's derived
+  rows (`source-move-…`, `scratch-…`, ids over 110 bytes) were refused by
+  the 128-byte request-id limit on every tick; they now use a digest id.
+
 ## No wedges: runner side of the pipeline rewrite plan — 2026-11-11 (0.9.0)
 
 **Status:** built (startup items 1–7 plus no-wedge tasks 1–3); Fable's
