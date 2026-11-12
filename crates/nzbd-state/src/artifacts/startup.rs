@@ -372,6 +372,7 @@ impl Inventory {
             if self.verify_root(&artifact).is_err() {
                 continue;
             }
+            let mut retirement_gone = false;
             if artifact.state == "allocating" {
                 if !artifact.path.try_exists()? && live {
                     std::fs::create_dir(&artifact.path)?;
@@ -402,10 +403,23 @@ impl Inventory {
                         Some("review".into())
                     };
                 }
+            } else if matches!(
+                artifact.path.symlink_metadata(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) {
+                // The root verified and nothing is at the path: the
+                // retirement finished before the interruption, or the bytes
+                // are gone. That is the hold's own registered exit ("gone →
+                // source_gone"), reached now instead of being re-armed (and
+                // its timer restarted) at every boot.
+                artifact.state = "source_gone".into();
+                artifact.hold = None;
+                artifact.files.clear();
+                retirement_gone = true;
             } else {
                 artifact.hold = Some("review: interrupted writer retirement".into());
             }
-            let orphan_receipt = (!live).then(|| OrphanReceipt {
+            let orphan_receipt = (!live && !retirement_gone).then(|| OrphanReceipt {
                 generation: artifact.generation.clone(),
                 previous_keep: artifact.keep,
                 previous_hold: artifact.hold.clone(),

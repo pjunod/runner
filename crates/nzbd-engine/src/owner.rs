@@ -1173,6 +1173,10 @@ pub(crate) struct Owner {
     dest_dir: PathBuf,
     pub(crate) artifacts: Arc<nzbd_state::artifacts::Inventory>,
     torrent_payload_roots: Vec<PathBuf>,
+    /// Configured payload roots (completed, failed, category destinations)
+    /// that startup reconciles alongside the recorded ones, so every
+    /// configured root is a reconciled root even before a row names it.
+    pub(crate) configured_payload_roots: Vec<PathBuf>,
 
     engine_tx: mpsc::Sender<EngineMsg>,
     tracker: TaskTracker,
@@ -1664,6 +1668,7 @@ impl Owner {
             tuning,
             download_enabled,
             dest_dir,
+            configured_payload_roots: Vec::new(),
             artifacts,
             torrent_payload_roots,
             engine_tx,

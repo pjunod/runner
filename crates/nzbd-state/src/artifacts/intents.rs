@@ -71,7 +71,7 @@ impl IntentState {
     }
 }
 
-const OPEN_STATES: &str = "('open','finishing','unwinding')";
+pub(super) const OPEN_STATES: &str = "('open','finishing','unwinding')";
 
 /// One selected file of a journaled move.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -1709,6 +1709,149 @@ impl Inventory {
 }
 
 impl Inventory {
+    /// Contract §2.6: a failed job's transforms end with the attempt that
+    /// ran them. A `par_repair`/`extract` journal still `running`/`retry`
+    /// once the job's failure is durable (terminal emitted, salvage
+    /// settled) has no worker and no future: nothing re-runs a failed job's
+    /// attempt, and startup reconciliation only replays it at the next boot
+    /// (an `Io` replay error — a workspace that no longer exists — climbs a
+    /// ladder no one else drives). Left as is, it pins the source
+    /// `transitioning` and every disposal is refused as "not quiescent".
+    ///
+    /// Each such journal becomes `failed` (terminal; workspace retirement
+    /// may then dispose a scratch that still exists, by its own proofs); a
+    /// scratch whose directory is gone becomes `source_gone`. The source
+    /// returns to `active` once no transform, relocation or intent of it is
+    /// unresolved. No file is touched: retained originals stay in the source
+    /// under their backup names, which the disposal moves with it. Returns
+    /// how many journals were ended; a source in use by a worker is left
+    /// alone (`WouldBlock`).
+    pub fn end_failed_job_transforms(&self, job: u32) -> Result<usize> {
+        let Some(terminal) = self.terminal(job)? else {
+            return Ok(0);
+        };
+        if terminal.outcome != nzbd_types::TerminalOutcome::Failed
+            || !terminal.emitted
+            || terminal.salvage == SalvageState::Pending
+        {
+            return Ok(0);
+        }
+        let Some(source) = self.for_job(job)? else {
+            return Ok(0);
+        };
+        let generation = SourceGeneration {
+            artifact: source.id.clone(),
+            generation: source.generation.clone(),
+        };
+        if self.source_in_use(&generation) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "the failed job's processing files are still in use by a worker",
+            )
+            .into());
+        }
+        let _guard = self.mutation_guard()?;
+        let raws = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT data FROM operations WHERE artifact=?1 AND state IN ('queued','running','retry') AND json_extract(data,'$.kind') IN ('par_repair','extract')",
+            )?;
+            let rows = statement.query_map([&source.id], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let mut ended = 0;
+        for raw in &raws {
+            let mut op: Operation = serde_json::from_str(raw)?;
+            let workspace: Workspace = serde_json::from_str(&op.request)?;
+            op.state = "failed".into();
+            op.next_retry = 0;
+            op.error = Some(format!(
+                "ended with the failed attempt{}",
+                op.error
+                    .as_deref()
+                    .map(|error| format!(" (last: {error})"))
+                    .unwrap_or_default()
+            ));
+            save_operation(&tx, &op)?;
+            let scratch: Option<String> = tx
+                .query_row(
+                    "SELECT data FROM artifacts WHERE id=?1",
+                    [&workspace.scratch.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(raw) = scratch {
+                let mut scratch: Artifact = serde_json::from_str(&raw)?;
+                let missing = matches!(
+                    std::fs::symlink_metadata(&scratch.path),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                );
+                if missing && !scratch.terminal() {
+                    scratch.state = "source_gone".into();
+                    scratch.files.clear();
+                    scratch.revision += 1;
+                    scratch.updated_at = now();
+                    save_artifact(&tx, &scratch)?;
+                    event(
+                        &tx,
+                        &scratch.id,
+                        "source_gone",
+                        "transform workspace no longer exists; its journal ended with the failed attempt",
+                    )?;
+                }
+            }
+            ended += 1;
+        }
+        let unresolved: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state NOT IN ('succeeded','cancelled','failed','transferred') AND json_extract(data,'$.kind') IN ('par_restore','par_repair','extract','relocate'))",
+            [&source.id],
+            |row| row.get(0),
+        )?;
+        let open_intent: bool = tx.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM relocation_intents WHERE artifact=?1 AND state IN {})",
+                super::intents::OPEN_STATES
+            ),
+            [&source.id],
+            |row| row.get(0),
+        )?;
+        let raw: String = tx.query_row(
+            "SELECT data FROM artifacts WHERE id=?1",
+            [&source.id],
+            |row| row.get(0),
+        )?;
+        let mut current: Artifact = serde_json::from_str(&raw)?;
+        if current.state == "transitioning"
+            && current.generation == source.generation
+            && !unresolved
+            && !open_intent
+        {
+            current.state = "active".into();
+            current.revision += 1;
+            current.updated_at = now();
+            save_artifact(&tx, &current)?;
+            event(
+                &tx,
+                &current.id,
+                "transform_ended",
+                "failed attempt's transforms ended; source is quiescent for disposal",
+            )?;
+        }
+        tx.commit()?;
+        if ended > 0 {
+            tracing::info!(
+                job,
+                ended,
+                "failed job's unfinished transforms ended with its attempt"
+            );
+        }
+        Ok(ended)
+    }
+}
+
+impl Inventory {
     /// Reconcile one root's journaled mappings before new queue or PP
     /// operations start (startup runs it for every reconciliation root).
     /// W9 upgrade: transforms an older build parked in `review` (and the

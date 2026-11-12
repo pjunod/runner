@@ -134,8 +134,13 @@ parked** with a line saying why: the failure reason (`too few articles`,
 assessment's text, and `salvage pending` while a salvage publication is still
 owed. The retention column gives its expiry (`expires <time>`), or `keep
 indefinitely` when keep is on. The same line is in the folder's details panel.
-The **Needs review** chip and "release review hold" belong to folders Runner
-found but did not write; no job is ever held for review.
+**Needs attention** lists only what a person must act on: a Runner row whose
+hold has no automatic exit, which the exit registry makes impossible (so it is
+empty unless something is wrong). Folders Runner found but did not write are
+listed apart under **Not Runner's**: never deleted automatically, they block
+nothing; "release review hold" and adoption apply to them. Runner
+publications handed to Curator are `transferred`, never either. No job is
+ever held for review.
 
 **Torrent lifecycle.** Ready torrents share in **Seeding** and move to
 **Completed** when seeding stops. An idle seed is still available to peers;
@@ -414,10 +419,10 @@ GET  /api/v1/history
 POST /api/v1/history/{id}/actions/{action}  hide|restore|delete|delete-files|requeue
 GET  /api/v1/events                 SSE stream of queue changes
 GET  /api/v1/logs                   recent daemon log
-GET  /api/v1/artifacts              folder inventory: ?filter=live|attention|owned|cleared|all
+GET  /api/v1/artifacts              folder inventory: ?filter=live|attention|foreign|owned|cleared|all
                                     &sort=updated|size|files|name &q=<name> &offset &limit(≤200)
                                     → entries[{artifact,files,bytes,measured,earliest_expiry}],
-                                      total, counts{live,attention,owned,cleared,all,live_bytes}, discovery
+                                      total, counts{live,attention,foreign,owned,cleared,all,live_bytes}, discovery
 POST /api/v1/artifacts/scan         walk the configured roots (202, runs immediately)
 GET  /api/v1/artifacts/{id}/files   manifest page (200 entries) + file_count, bytes, measured
 POST /api/v1/artifacts/{id}/inspect|adopt|release-review|retention|delete

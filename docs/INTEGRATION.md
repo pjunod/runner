@@ -559,8 +559,11 @@ replicated `cluster_deliveries.accepted_at` column remains, always NULL.
 
 ```bash
 # no open intents after a restart (post-deploy check)
-curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/artifacts?filter=attention" \
+curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/artifacts?filter=live&limit=200" \
   | python3 -m json.tool | grep -c '"state": "transitioning"'
+# nothing waits on a person
+curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/artifacts?filter=attention" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["counts"]["attention"])'
 # a publication's manifest and its feed row agree
 jq -r .digest "<completed>/<publication>/.runner-manifest.json"
 curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/deliveries?after=0&limit=100" \
@@ -586,7 +589,9 @@ source carry `failure_reason` (the same wire string as
 `job_pp_finished.reason`), `salvage` (`pending` · `published` ·
 `settled_none`) and the operation's error; the queue row's
 `failed_cleanup.attempts` counts disposal attempts. Parked sources follow
-`failed_retention_days`; Files → Attention shows a stuck operation. Details
+`failed_retention_days`; a disposal that cannot complete retries on a bounded
+ladder and then settles with what remains retained (its outcome is on the
+history row). Details
 in [FILE_LIFECYCLE_OPERATIONS.md](FILE_LIFECYCLE_OPERATIONS.md).
 
 ---

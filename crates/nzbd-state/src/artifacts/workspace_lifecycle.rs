@@ -1382,6 +1382,59 @@ mod tests {
         assert_eq!(inventory.workspace_dir(), new);
     }
 
+    /// The state directory itself moved (`queue` → `state`) and its
+    /// workspaces were moved to a configured `paths.workspace_dir`: the
+    /// "old default" computed from the new state directory names nothing, so
+    /// the journals' own recorded root is the one migrated. The workspace
+    /// reopens at its new place; a second start changes nothing.
+    #[test]
+    fn moved_state_dir_migrates_workspaces_from_their_recorded_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("processing");
+        std::fs::create_dir(&root).unwrap();
+        let old_state = temp.path().join("processing/queue");
+        let inventory = Inventory::open(&old_state).unwrap();
+        inventory
+            .allocate_for_delivery(12, &root, &root.join("job"), false, false)
+            .unwrap();
+        std::fs::write(root.join("job/original"), b"original").unwrap();
+        let workspace = inventory.workspace(12, "par_repair", "abc").unwrap();
+        assert!(workspace
+            .scratch
+            .path
+            .starts_with(old_state.join("transform-workspaces")));
+        inventory.close().unwrap();
+        drop(inventory);
+        // The operator's move: workspaces first, then the state directory.
+        let moved = temp.path().join("processing/transform-workspaces");
+        std::fs::rename(old_state.join("transform-workspaces"), &moved).unwrap();
+        let state = temp.path().join("state");
+        std::fs::rename(&old_state, &state).unwrap();
+
+        let inventory = Inventory::open(&state).unwrap();
+        assert!(inventory.configure_workspace_dir(&moved).unwrap() > 0);
+        let scratch = inventory.get(&workspace.scratch.id).unwrap();
+        assert!(scratch.path.starts_with(&moved), "{:?}", scratch.path);
+        assert_eq!(scratch.root, moved);
+        inventory.verify(&scratch).unwrap();
+        let reopened = inventory.workspace(12, "par_repair", "abc").unwrap();
+        assert_eq!(reopened.operation_id, workspace.operation_id);
+        assert!(reopened.scratch.path.starts_with(&moved));
+        inventory.close().unwrap();
+        drop(inventory);
+        let inventory = Inventory::open(&state).unwrap();
+        assert_eq!(
+            inventory.configure_workspace_dir(&moved).unwrap(),
+            0,
+            "idempotent"
+        );
+        assert!(inventory
+            .startup_reconciliation_roots()
+            .unwrap()
+            .iter()
+            .all(|recorded| !recorded.starts_with(&old_state)));
+    }
+
     /// An in-flight workspace (open journal, one attempt) whose root is
     /// copy-moved: the journal's copy of the scratch and its attempt are
     /// re-stamped with the row, so startup reconcile leaves it to its

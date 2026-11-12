@@ -2559,13 +2559,13 @@ fn scan_reports_a_folder_it_cannot_measure_without_failing_the_scan() {
     let attention = db
         .list_page(&ListQuery {
             limit: 10,
-            filter: ListFilter::Attention,
+            filter: ListFilter::Foreign,
             ..Default::default()
         })
         .unwrap();
     assert_eq!(
         attention.total, 2,
-        "unknown folders need a person either way"
+        "folders Runner did not create are listed apart, as not Runner's"
     );
 }
 
@@ -2643,7 +2643,8 @@ fn list_page_filters_sorts_searches_and_counts() {
         ListCounts {
             all: 5,
             live: 4,
-            attention: 3,
+            attention: 0,
+            foreign: 3,
             owned: 1,
             cleared: 1,
             live_bytes: live.counts.live_bytes
@@ -3725,11 +3726,11 @@ fn park_root_creation_failure_lands_on_the_operation_ladder() {
         })
         .unwrap();
     assert!(
-        attention
+        !attention
             .rows
             .iter()
             .any(|row| row.artifact.id == artifact.id),
-        "visible under Attention"
+        "on its own retry ladder, not waiting on a person (the error shows on the row)"
     );
     assert!(source.join("episode.mkv").exists(), "nothing moved");
     // A second failure climbs the ladder.
@@ -4133,5 +4134,350 @@ fn silent_recovery_handoffs_are_cancelled_after_the_failed_ttl() {
     // A late claim from the silent consumer is refused.
     assert!(db
         .claim_recovery(&ids[1].id, "curator", "import", &ids[1].manifest_digest)
+        .is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Post-move fixes (2026-11-11): failed publications, failed transforms,
+// rediscovered publications, the attention rule.
+// ---------------------------------------------------------------------------
+
+fn fail_terminal(db: &Inventory, job: u32, keep_on_failure: bool) {
+    let mut terminal = terminals::tests::failed(job, SalvageState::SettledNone);
+    terminal.keep_on_failure = keep_on_failure;
+    db.record_terminal(&terminal).unwrap();
+    db.mark_terminal_step(job, &TerminalStep::Emitted).unwrap();
+}
+
+/// A copy publication whose job failed (publish) never becomes a delivery,
+/// so its deferred source retirement never fired: the processing copy sat
+/// beside the parked publication forever and every disposal pass saw it.
+/// Once the failure's own disposition takes the publication (park), the
+/// pre-publication source retires by closed scope; a second pass is a
+/// no-op.
+#[test]
+fn failed_publication_source_retires_once_the_disposition_takes_the_publication() {
+    let (tmp, db, root) = fixture();
+    let source = root.join("job-47");
+    db.allocate_for_delivery(47, &root, &source, true, true)
+        .unwrap();
+    std::fs::write(source.join("media.mkv"), b"payload").unwrap();
+    std::fs::write(source.join("media.rar"), b"consumed archive").unwrap();
+    db.finish(47, &source, &root, "active").unwrap();
+    let completed = tmp.path().join("completed");
+    std::fs::create_dir(&completed).unwrap();
+    fs::RENAME_FAILURE.with(|failure| failure.set(Some(libc::EINVAL)));
+    db.relocate_for_delivery_checked(47, &completed.join("release"), &|| Ok(()))
+        .unwrap();
+    assert!(source.exists(), "copy publication retains its source");
+
+    fail_terminal(&db, 47, false);
+    assert!(
+        db.retire_superseded_publication_sources(47)
+            .unwrap()
+            .is_empty(),
+        "the publication is still at its destination: nothing supersedes it"
+    );
+    assert!(source.exists());
+
+    let failed = tmp.path().join("failed");
+    std::fs::create_dir(&failed).unwrap();
+    db.relocate(47, &failed.join("release")).unwrap();
+    let retired = db.retire_superseded_publication_sources(47).unwrap();
+    assert_eq!(
+        retired,
+        vec![SupersededSource {
+            path: source.clone(),
+            outcome: SupersededOutcome::Retired,
+        }]
+    );
+    assert!(!source.exists(), "the processing remainder is gone");
+    assert_eq!(
+        std::fs::read(failed.join("release/media.mkv")).unwrap(),
+        b"payload",
+        "the parked publication keeps the payload"
+    );
+    assert!(db
+        .retire_superseded_publication_sources(47)
+        .unwrap()
+        .is_empty());
+}
+
+/// Keep-on-failure content is never deleted: the same superseded source of a
+/// job that keeps its failure stays where it is.
+#[test]
+fn a_kept_failure_keeps_its_superseded_publication_source() {
+    let (tmp, db, root) = fixture();
+    let source = root.join("job-48");
+    db.allocate_for_delivery(48, &root, &source, true, true)
+        .unwrap();
+    std::fs::write(source.join("media.mkv"), b"payload").unwrap();
+    db.finish(48, &source, &root, "active").unwrap();
+    let completed = tmp.path().join("completed");
+    std::fs::create_dir(&completed).unwrap();
+    fs::RENAME_FAILURE.with(|failure| failure.set(Some(libc::EINVAL)));
+    db.relocate_for_delivery_checked(48, &completed.join("release"), &|| Ok(()))
+        .unwrap();
+    fail_terminal(&db, 48, true);
+    let failed = tmp.path().join("failed");
+    std::fs::create_dir(&failed).unwrap();
+    db.relocate(48, &failed.join("release")).unwrap();
+    assert!(db
+        .retire_superseded_publication_sources(48)
+        .unwrap()
+        .is_empty());
+    assert!(source.join("media.mkv").exists());
+}
+
+/// A transform journal the failed attempt left `running` with its workspace
+/// gone pinned the source `transitioning`, and every disposal was refused
+/// as "not quiescent". It ends with the attempt; the source becomes
+/// quiescent and the disposition moves it.
+#[test]
+fn a_failed_jobs_unfinished_transform_ends_and_the_source_can_be_disposed() {
+    let (tmp, db, root) = fixture();
+    let source = root.join("job-5");
+    db.allocate_for_delivery(5, &root, &source, true, true)
+        .unwrap();
+    std::fs::write(source.join("a.rar"), b"archive").unwrap();
+    let workspace = db.workspace(5, "extract", "abc").unwrap();
+    assert_eq!(db.for_job(5).unwrap().unwrap().state, "transitioning");
+    std::fs::remove_dir_all(&workspace.scratch.path).unwrap();
+    let failed = tmp.path().join("failed");
+    std::fs::create_dir(&failed).unwrap();
+    let refused = db.relocate(5, &failed.join("job-5")).unwrap_err();
+    assert!(refused.to_string().contains("not quiescent"), "{refused}");
+
+    assert_eq!(
+        db.end_failed_job_transforms(5).unwrap(),
+        0,
+        "no terminal yet: the attempt may still own it"
+    );
+    fail_terminal(&db, 5, false);
+    assert_eq!(db.end_failed_job_transforms(5).unwrap(), 1);
+    assert_eq!(
+        db.operation(&workspace.operation_id).unwrap().state,
+        "failed"
+    );
+    assert_eq!(db.get(&workspace.scratch.id).unwrap().state, "source_gone");
+    assert_eq!(db.for_job(5).unwrap().unwrap().state, "active");
+    assert_eq!(db.end_failed_job_transforms(5).unwrap(), 0, "idempotent");
+    db.relocate(5, &failed.join("job-5")).unwrap();
+    assert_eq!(
+        std::fs::read(failed.join("job-5/a.rar")).unwrap(),
+        b"archive",
+        "nothing was deleted; the disposition moved it"
+    );
+}
+
+/// A scan that walked a publication's destination before it committed
+/// recorded Runner's own publication as unknown/Keep/review. Such
+/// duplicates fold into Runner's row; an unregistered directory carrying a
+/// verifying Runner manifest becomes `transferred`; anything else stays
+/// foreign. Idempotent.
+#[test]
+fn rediscovered_runner_publications_fold_back_into_custody() {
+    let (_tmp, db, root) = fixture();
+    let ours = root.join("published");
+    db.allocate(61, &root, &ours).unwrap();
+    std::fs::write(ours.join("ep.mkv"), b"episode").unwrap();
+    db.finish(61, &ours, &root, "active").unwrap();
+    let stray = root.join("stray");
+    std::fs::create_dir(&stray).unwrap();
+    let duplicate = db.discover(&root, &stray, false).unwrap();
+    db.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE artifacts SET path=?2, data=json_set(data,'$.path',?2) WHERE id=?1",
+            params![duplicate.id, ours.to_string_lossy()],
+        )
+        .unwrap();
+    std::fs::remove_dir(&stray).unwrap();
+
+    let orphan = root.join("orphan.job-62.runner-abc");
+    std::fs::create_dir(&orphan).unwrap();
+    std::fs::write(orphan.join("ep.mkv"), b"payload!").unwrap();
+    let manifest = intents::RunnerManifest::new(
+        "abc".into(),
+        62,
+        Some("t-62".into()),
+        0,
+        false,
+        vec![intents::ManifestFile {
+            path: "ep.mkv".into(),
+            bytes: 8,
+            sha256: "00".into(),
+        }],
+    );
+    std::fs::write(
+        orphan.join(intents::RUNNER_MANIFEST_NAME),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let orphan_row = db.discover(&root, &orphan, false).unwrap();
+    let foreign = root.join("hermes-cinema");
+    std::fs::create_dir(&foreign).unwrap();
+    std::fs::write(foreign.join("movie.mkv"), b"not ours").unwrap();
+    let foreign_row = db.discover(&root, &foreign, false).unwrap();
+
+    assert_eq!(db.fold_rediscovered_publications().unwrap(), 2);
+    assert!(matches!(db.get(&duplicate.id), Err(Error::NotFound)));
+    assert_eq!(db.for_path(&ours).unwrap().unwrap().job, Some(61));
+    let transferred = db.get(&orphan_row.id).unwrap();
+    assert_eq!(transferred.state, "transferred");
+    assert!(!transferred.owned && !transferred.keep && transferred.hold.is_none());
+    let untouched = db.get(&foreign_row.id).unwrap();
+    assert_eq!(untouched.state, "unknown");
+    assert!(foreign.join("movie.mkv").exists(), "never deleted");
+    assert_eq!(
+        db.fold_rediscovered_publications().unwrap(),
+        0,
+        "idempotent"
+    );
+
+    let page = |filter| {
+        db.list_page(&ListQuery {
+            limit: 50,
+            filter,
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    assert_eq!(page(ListFilter::Attention).total, 0);
+    let foreign_page = page(ListFilter::Foreign);
+    assert_eq!(foreign_page.total, 1);
+    assert_eq!(foreign_page.rows[0].artifact.id, foreign_row.id);
+}
+
+/// A scan never records a publication still landing (an unresolved
+/// relocation's destination) as discovered content.
+#[test]
+fn a_scan_skips_a_publication_still_in_flight() {
+    let (_tmp, db, root) = fixture();
+    let landing = root.join("landing");
+    std::fs::create_dir(&landing).unwrap();
+    save_operation(
+        &db.db.lock().unwrap(),
+        &Operation {
+            id: "move-landing".into(),
+            artifact: "elsewhere".into(),
+            kind: "relocate".into(),
+            state: "retry".into(),
+            request: serde_json::json!({ "destination": landing }).to_string(),
+            created_at: now(),
+            not_before: 0,
+            attempts: 1,
+            next_retry: now() + 60,
+            error: None,
+        },
+    )
+    .unwrap();
+    let op = db
+        .submit_task(
+            "scan",
+            "installation",
+            "",
+            serde_json::json!({"roots":[root],"excluded":[],"active":[]}),
+        )
+        .unwrap();
+    db.run_tasks().unwrap();
+    assert_eq!(db.operation(&op.id).unwrap().state, "succeeded");
+    assert!(db.for_path(&landing).unwrap().is_none());
+}
+
+/// Owner's rule (Paul, 2026-11-11): nothing Runner created may sit in
+/// "Needs attention". Every artifact state × every hold Runner writes (with
+/// and without an error) on a Runner row stays out of it; content Runner did
+/// not create is listed apart as foreign; a hold with no registered exit —
+/// a missing exit, i.e. a bug — is the only thing that shows.
+#[test]
+fn nothing_runner_creates_can_land_in_attention() {
+    let (_tmp, db, root) = fixture();
+    let base = root.join("base");
+    db.allocate(1, &root, &base).unwrap();
+    let template = db.finish(1, &base, &root, "active").unwrap();
+    let holds = std::iter::once(None)
+        .chain(
+            exits::HOLD_EXITS
+                .iter()
+                .filter(|rule| !matches!(rule.exit, exits::Exit::Operator(_)))
+                .map(|rule| {
+                    Some(if rule.prefix {
+                        format!("{}x", rule.hold)
+                    } else {
+                        rule.hold.to_string()
+                    })
+                }),
+        )
+        .collect::<Vec<_>>();
+    let mut states = exits::STATE_EXITS
+        .iter()
+        .filter(|state| state.scope == "artifact")
+        .map(|state| state.state)
+        .collect::<Vec<_>>();
+    states.push("transferred");
+    let mut rows = 0;
+    for state in &states {
+        for hold in &holds {
+            for error in [None, Some("No space left on device (os error 28)")] {
+                rows += 1;
+                let mut a = template.clone();
+                a.id = format!("runner-{rows}");
+                a.state = (*state).into();
+                // Custody handed to the consumer is the one unowned state
+                // Runner creates.
+                a.owned = *state != "transferred";
+                a.keep = true;
+                a.hold = hold.clone();
+                a.error = error.map(str::to_owned);
+                save_artifact(&db.db.lock().unwrap(), &a).unwrap();
+            }
+        }
+    }
+    let attention = || {
+        db.list_page(&ListQuery {
+            limit: 200,
+            filter: ListFilter::Attention,
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    assert_eq!(attention().total, 0, "{:?}", attention().rows.first());
+    for rule in exits::HOLD_EXITS {
+        if matches!(rule.exit, exits::Exit::Operator(_)) {
+            assert_eq!(
+                rule.action,
+                exits::HoldAction::Adoption,
+                "{}: an operator exit is for content Runner did not create",
+                rule.hold
+            );
+        }
+    }
+    let mut missing = template.clone();
+    missing.id = "missing-exit".into();
+    missing.hold = Some("a hold nothing registered".into());
+    save_artifact(&db.db.lock().unwrap(), &missing).unwrap();
+    assert_eq!(attention().total, 1, "a missing exit is visible");
+}
+
+/// The interrupted-writer-retirement hold's exit ("gone → source_gone")
+/// is reached at startup when the path is already gone, instead of being
+/// re-armed (and its timer restarted) at every boot.
+#[test]
+fn startup_settles_a_retirement_whose_directory_is_gone() {
+    let (_tmp, db, root) = fixture();
+    let path = root.join("job-2595");
+    db.allocate(2595, &root, &path).unwrap();
+    let mut a = db.finish(2595, &path, &root, "active").unwrap();
+    a.keep = true;
+    save_artifact(&db.db.lock().unwrap(), &a).unwrap();
+    std::fs::remove_dir_all(&path).unwrap();
+    db.reconcile_startup_root(&root, &[]).unwrap();
+    let after = db.get(&a.id).unwrap();
+    assert_eq!(after.state, "source_gone");
+    assert!(after.hold.is_none());
+    assert!(db
+        .operation(&format!("startup-orphan-{}-{}", a.id, a.generation))
         .is_err());
 }

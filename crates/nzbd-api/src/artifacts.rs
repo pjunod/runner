@@ -160,7 +160,8 @@ struct Page {
     after: i64,
     /// Page size, 1..=200 (default 50).
     limit: Option<usize>,
-    /// `live` (default) · `attention` · `owned` · `cleared` · `all`.
+    /// `live` (default) · `attention` (a person must act) · `foreign`
+    /// (content Runner did not create) · `owned` · `cleared` · `all`.
     filter: Option<ListFilter>,
     /// `updated` (default) · `size` · `files` · `name`.
     sort: Option<ListSort>,
@@ -767,11 +768,14 @@ mod tests {
         std::fs::write(folder.join("ep.mkv"), vec![b'x'; 4096]).unwrap();
         let a = engine.artifacts().discover(&root, &folder, false).unwrap();
 
-        let (status, page) = get(&engine, "/api/v1/artifacts?filter=attention&limit=10").await;
+        // Content Runner did not create is informational ("not Runner's"),
+        // never "needs attention".
+        let (status, page) = get(&engine, "/api/v1/artifacts?filter=foreign&limit=10").await;
         assert_eq!(status, 200);
         assert_eq!(page["total"], 1);
         assert_eq!(page["limit"], 10);
-        assert_eq!(page["counts"]["attention"], 1);
+        assert_eq!(page["counts"]["foreign"], 1);
+        assert_eq!(page["counts"]["attention"], 0);
         assert_eq!(page["counts"]["owned"], 0);
         assert_eq!(
             page["entries"][0]["measured"], false,

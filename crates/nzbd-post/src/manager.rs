@@ -791,6 +791,18 @@ async fn failure_followup_settle(
         if retry_at.is_some_and(|at| at > now()) {
             return Settle::Pending;
         }
+        // An incomplete disposal with no operation ladder of its own waits
+        // on the terminal's durable ladder (bounded; see
+        // `note_disposal_incomplete`).
+        let inventory = engine.artifacts();
+        let ladder = tokio::task::spawn_blocking(move || inventory.disposal_ladder(job.0))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten();
+        if ladder.is_some_and(|ladder| ladder.next_attempt_at > now()) {
+            return Settle::Pending;
+        }
     }
     let row = match engine.export_job(job).await {
         Ok(row) => row,
@@ -1334,6 +1346,16 @@ async fn dispose_failed_source(
     if gate.as_ref().is_some_and(|claim| !claim(job)) {
         return false;
     }
+    if action != FailureAction::None {
+        // A transform journal the failed attempt left unfinished pins the
+        // source `transitioning`; it ends with the attempt (contract §2.6).
+        let ending = inventory.clone();
+        if let Ok(Err(error)) =
+            tokio::task::spawn_blocking(move || ending.end_failed_job_transforms(job.0)).await
+        {
+            tracing::debug!(job = job.0, %error, "failed job's transforms not ended yet");
+        }
+    }
     let observed = dispose_failed(
         inventory.clone(),
         &failure_cfg,
@@ -1357,17 +1379,43 @@ async fn dispose_failed_source(
         );
         return false;
     }
-    let Some(disposition) =
-        canonical_failed_disposition(&failure_cfg, dest_dir, &dir_name, &source).or_else(|| {
-            // Nothing was ever written for this attempt: there is nothing to
-            // move or delete.
-            (!source.exists() && observed.note != "kept").then(|| Disposition {
-                note: "already gone".into(),
-                files_at: None,
-                ..Default::default()
-            })
+    // The pre-publication source of a publication the failure superseded
+    // retires with the disposition (closed scope); a blocked retirement
+    // leaves it retained, which is a settled answer, not a retry.
+    let superseded = if action != FailureAction::None
+        && observed.files_at.as_deref() != Some(source.as_path())
+    {
+        let retiring = inventory.clone();
+        tokio::task::spawn_blocking(move || retiring.retire_superseded_publication_sources(job.0))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let retained_source = superseded.iter().find_map(|left| match &left.outcome {
+        nzbd_state::artifacts::SupersededOutcome::Blocked(reason) if left.path == source => {
+            Some(reason.clone())
+        }
+        _ => None,
+    });
+    let Some(disposition) = canonical_failed_disposition(
+        &failure_cfg,
+        dest_dir,
+        &dir_name,
+        &source,
+        retained_source.as_deref(),
+    )
+    .or_else(|| {
+        // Nothing was ever written for this attempt: there is nothing to
+        // move or delete.
+        (!source.exists() && observed.note != "kept").then(|| Disposition {
+            note: "already gone".into(),
+            files_at: None,
+            ..Default::default()
         })
-    else {
+    }) else {
         if observed.out_of_space {
             engine.report_out_of_space_at(
                 format!(
@@ -1377,8 +1425,46 @@ async fn dispose_failed_source(
                 &source,
             );
         }
-        tracing::warn!(job = job.0, outcome = %observed.note,
-            "failed-source disposition is incomplete; its operation retries on its own ladder");
+        let outcome = superseded
+            .iter()
+            .find_map(|left| match &left.outcome {
+                nzbd_state::artifacts::SupersededOutcome::Pending(why) => Some(format!(
+                    "{}; superseded source {} pending: {why}",
+                    observed.note,
+                    left.path.display()
+                )),
+                _ => None,
+            })
+            .unwrap_or_else(|| observed.note.clone());
+        let noting = inventory.clone();
+        let noted = outcome.clone();
+        let ladder =
+            tokio::task::spawn_blocking(move || noting.note_disposal_incomplete(job.0, &noted))
+                .await
+                .ok()
+                .and_then(Result::ok);
+        match ladder {
+            Some(ladder) if ladder.exhausted => {
+                // Bounded exit: what remains stays retained under its own
+                // rows' exits (retention TTL, hold exits); the obligation
+                // settles instead of retrying forever.
+                tracing::warn!(job = job.0, attempts = ladder.attempts, %outcome,
+                    "failed-source disposition did not complete within its budget; settling with the payload retained");
+                return record(format!(
+                    "retained after {} incomplete disposal attempts: {outcome}",
+                    ladder.attempts
+                ))
+                .await;
+            }
+            Some(ladder) => {
+                tracing::warn!(job = job.0, attempts = ladder.attempts,
+                    next_attempt_at = ladder.next_attempt_at, %outcome,
+                    "failed-source disposition is incomplete; retrying on its ladder");
+            }
+            None => {
+                tracing::warn!(job = job.0, %outcome, "failed-source disposition is incomplete");
+            }
+        }
         return false;
     };
     if let Some(path) = disposition.files_at.as_deref() {
@@ -1857,7 +1943,22 @@ fn canonical_failed_disposition(
     dest_dir: &Path,
     dir_name: &str,
     source: &Path,
+    retained_source: Option<&str>,
 ) -> Option<Disposition> {
+    // A superseded pre-publication source whose retirement is blocked stays
+    // where it is: the disposition is settled with it retained and named.
+    let source_gone = |exists: std::io::Result<bool>| match exists {
+        Ok(false) => true,
+        Ok(true) => retained_source.is_some(),
+        Err(_) => false,
+    };
+    let retained_note = |note: String| match retained_source {
+        Some(reason) if source.exists() => format!(
+            "{note}; earlier processing copy retained at {}: {reason}",
+            source.display()
+        ),
+        _ => note,
+    };
     match cfg.failure_action {
         FailureAction::None => match source.try_exists() {
             Ok(true) => Some(Disposition {
@@ -1872,23 +1973,20 @@ fn canonical_failed_disposition(
             }),
             Err(_) => None,
         },
-        FailureAction::Delete => match source.try_exists() {
-            Ok(false) => Some(Disposition {
-                note: "deleted".into(),
-                files_at: None,
-                ..Default::default()
-            }),
-            _ => None,
-        },
+        FailureAction::Delete => source_gone(source.try_exists()).then(|| Disposition {
+            note: retained_note("deleted".into()),
+            files_at: None,
+            ..Default::default()
+        }),
         FailureAction::Park => {
             let target = cfg
                 .failed_dir
                 .clone()
                 .unwrap_or_else(|| dest_dir.join(".failed"))
                 .join(dir_name);
-            match (source.try_exists(), target.try_exists()) {
-                (Ok(false), Ok(true)) => Some(Disposition {
-                    note: format!("parked at {}", target.display()),
+            match (source_gone(source.try_exists()), target.try_exists()) {
+                (true, Ok(true)) => Some(Disposition {
+                    note: retained_note(format!("parked at {}", target.display())),
                     files_at: Some(target),
                     ..Default::default()
                 }),
@@ -2878,6 +2976,32 @@ mod admission_tests {
         engine.shutdown().await;
     }
 
+    /// A superseded processing copy whose retirement is blocked does not
+    /// keep the disposition open forever: it settles, naming what stayed.
+    /// Without that answer the same state stays incomplete.
+    #[test]
+    fn a_blocked_superseded_source_settles_the_disposition_retained() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let source = dest.join("job");
+        std::fs::create_dir_all(&source).unwrap();
+        let failed = tmp.path().join("failed");
+        std::fs::create_dir_all(failed.join("job")).unwrap();
+        let park = PostConfig {
+            failure_action: FailureAction::Park,
+            failed_dir: Some(failed.clone()),
+            ..PostConfig::default()
+        };
+        assert!(canonical_failed_disposition(&park, &dest, "job", &source, None).is_none());
+        let settled =
+            canonical_failed_disposition(&park, &dest, "job", &source, Some("identity changed"))
+                .unwrap();
+        assert_eq!(settled.files_at, Some(failed.join("job")));
+        assert!(settled.note.starts_with("parked at "), "{}", settled.note);
+        assert!(settled.note.contains("retained at"), "{}", settled.note);
+        assert!(source.exists(), "nothing deleted");
+    }
+
     #[test]
     fn failover_recomputes_identical_committed_dispositions() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2888,10 +3012,10 @@ mod admission_tests {
             failure_action: FailureAction::Delete,
             ..PostConfig::default()
         };
-        assert!(canonical_failed_disposition(&delete, &dest, "job", &source).is_none());
+        assert!(canonical_failed_disposition(&delete, &dest, "job", &source, None).is_none());
         std::fs::remove_dir_all(&source).unwrap();
-        let first = canonical_failed_disposition(&delete, &dest, "job", &source).unwrap();
-        let successor = canonical_failed_disposition(&delete, &dest, "job", &source).unwrap();
+        let first = canonical_failed_disposition(&delete, &dest, "job", &source, None).unwrap();
+        let successor = canonical_failed_disposition(&delete, &dest, "job", &source, None).unwrap();
         assert_eq!(first.note, successor.note);
         assert_eq!(first.files_at, successor.files_at);
 
@@ -2902,8 +3026,8 @@ mod admission_tests {
             ..PostConfig::default()
         };
         std::fs::create_dir_all(failed.join("job")).unwrap();
-        let first = canonical_failed_disposition(&park, &dest, "job", &source).unwrap();
-        let successor = canonical_failed_disposition(&park, &dest, "job", &source).unwrap();
+        let first = canonical_failed_disposition(&park, &dest, "job", &source, None).unwrap();
+        let successor = canonical_failed_disposition(&park, &dest, "job", &source, None).unwrap();
         assert_eq!(first.note, successor.note);
         assert_eq!(first.files_at, successor.files_at);
     }

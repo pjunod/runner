@@ -30,11 +30,14 @@ mod relocation;
 pub use delivery::{
     Delivery, DeliveryFile, DeliveryFileOutcome, DeliveryRunnerStages, PreparedDelivery,
 };
-pub use relocation::{RelocationResult, SelectedPublication};
+pub use relocation::{RelocationResult, SelectedPublication, SupersededOutcome, SupersededSource};
 mod startup;
 mod terminals;
 pub use startup::StartupReconciliation;
-pub use terminals::{JobTerminal, SalvageOutcome, SalvageState, TerminalStep};
+pub use terminals::{
+    DisposalLadder, JobTerminal, SalvageOutcome, SalvageState, TerminalStep,
+    DISPOSAL_ATTEMPT_BUDGET,
+};
 #[cfg(test)]
 mod operation_index_tests;
 mod operation_queries;
@@ -361,26 +364,36 @@ pub enum ListFilter {
     /// Everything still on disk (the default view).
     #[default]
     Live,
-    /// Live records that need a person: not owned, on hold, in error, or
-    /// the source of a publication move still open after a restart.
+    /// Live records a person must act on (owner's rule, Paul 2026-11-11):
+    /// Runner's own rows whose hold has no automatic exit. Every state and
+    /// hold Runner writes is registered with one (`exits`), so this is
+    /// empty by construction; a row here is a missing exit, i.e. a bug.
     Attention,
+    /// Live content Runner did not create (unowned, not handed off by
+    /// Runner): informational, never deleted automatically, blocks nothing.
+    Foreign,
     /// Live records Runner owns outright.
     Owned,
     /// Deleted / source-gone records kept for the audit trail.
     Cleared,
 }
+/// Live content Runner did not create: unowned and not a publication
+/// Runner handed to its consumer (`transferred`).
+const FOREIGN_SQL: &str = "json_extract(data,'$.owned')=0 AND state<>'transferred'";
 impl ListFilter {
-    fn sql(self) -> &'static str {
+    fn sql(self) -> String {
         match self {
-            Self::All => "1=1",
-            Self::Live => "state NOT IN ('deleted','source_gone')",
-            Self::Attention => {
-                "state NOT IN ('deleted','source_gone') AND (json_extract(data,'$.owned')=0 OR json_extract(data,'$.hold') IS NOT NULL OR json_extract(data,'$.error') IS NOT NULL OR id IN (SELECT artifact FROM relocation_intents WHERE state IN ('open','finishing','unwinding')))"
-            }
+            Self::All => "1=1".into(),
+            Self::Live => "state NOT IN ('deleted','source_gone')".into(),
+            Self::Attention => format!(
+                "state NOT IN ('deleted','source_gone') AND NOT ({FOREIGN_SQL}) AND {}",
+                exits::ATTENTION_HOLD_SQL.as_str()
+            ),
+            Self::Foreign => format!("state NOT IN ('deleted','source_gone') AND {FOREIGN_SQL}"),
             Self::Owned => {
-                "state NOT IN ('deleted','source_gone') AND json_extract(data,'$.owned')=1"
+                "state NOT IN ('deleted','source_gone') AND json_extract(data,'$.owned')=1".into()
             }
-            Self::Cleared => "state IN ('deleted','source_gone')",
+            Self::Cleared => "state IN ('deleted','source_gone')".into(),
         }
     }
 }
@@ -416,6 +429,7 @@ pub struct ListCounts {
     pub all: u64,
     pub live: u64,
     pub attention: u64,
+    pub foreign: u64,
     pub owned: u64,
     pub cleared: u64,
     pub live_bytes: u64,
@@ -1115,7 +1129,7 @@ impl Inventory {
     pub fn list_page(&self, q: &ListQuery) -> Result<ListPage> {
         let db = self.db.lock().unwrap();
         let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        let mut where_sql = String::from(q.filter.sql());
+        let mut where_sql = q.filter.sql();
         let needle = q.q.trim();
         if !needle.is_empty() {
             let escaped = needle
@@ -1169,6 +1183,7 @@ impl Inventory {
             (ListFilter::All, &mut counts.all),
             (ListFilter::Live, &mut counts.live),
             (ListFilter::Attention, &mut counts.attention),
+            (ListFilter::Foreign, &mut counts.foreign),
             (ListFilter::Owned, &mut counts.owned),
             (ListFilter::Cleared, &mut counts.cleared),
         ] {
@@ -1807,12 +1822,83 @@ impl Inventory {
                 rewritten = self.rewrite_workspace_paths(&old_text, &new_text)?;
             }
         }
+        // The previous root is not always `<state_dir>/transform-workspaces`
+        // of *this* state_dir: when the state directory itself moved, the
+        // workspaces were recorded under the old state_dir's default (or an
+        // older explicit `workspace_dir`). The roots the transform journals
+        // actually recorded are authoritative; each one that is not `dir`,
+        // holds nothing any more, and whose recorded workspaces are now
+        // present under `dir` was moved there, and is rewritten.
+        for recorded in self.recorded_workspace_roots()? {
+            if recorded == dir || recorded == old {
+                continue;
+            }
+            if dir.starts_with(&recorded) || recorded.starts_with(dir) {
+                continue;
+            }
+            if std::fs::read_dir(&recorded).is_ok_and(|mut entries| entries.next().is_some()) {
+                tracing::warn!(old = %recorded.display(), new = %dir.display(),
+                    "workspace_dir changed but a recorded workspace root still holds workspaces; \
+                     existing ones finish where they are");
+                continue;
+            }
+            if !self.workspaces_moved_to(&recorded, dir)? {
+                continue;
+            }
+            let Some(recorded_text) = recorded.to_str() else {
+                continue;
+            };
+            let count = self.rewrite_workspace_paths(recorded_text, &new_text)?;
+            tracing::info!(from = %recorded.display(), to = %dir.display(), rewritten = count,
+                "transform workspace paths migrated from a recorded root");
+            rewritten += count;
+        }
         let restamped = self.restamp_moved_workspaces(dir, &new_text)?;
         if rewritten > 0 || restamped > 0 {
             tracing::info!(from = %old.display(), to = %dir.display(), rewritten, restamped,
                 "transform workspace paths migrated");
         }
         Ok(rewritten)
+    }
+
+    /// Every root a transform journal recorded its scratch workspace under.
+    fn recorded_workspace_roots(&self) -> Result<Vec<PathBuf>> {
+        let db = self.db.lock().unwrap();
+        let mut statement = db.prepare(
+            "SELECT DISTINCT json_extract(json_extract(data,'$.request'),'$.scratch.root') FROM operations WHERE json_extract(data,'$.kind') IN ('extract','par_repair') AND json_extract(json_extract(data,'$.request'),'$.scratch.root') IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut roots = rows
+            .map(|root| root.map(PathBuf::from))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        roots.sort();
+        roots.dedup();
+        Ok(roots)
+    }
+
+    /// Evidence that `old`'s workspaces were moved to `dir` (rather than
+    /// lost with an unmounted volume): at least one workspace recorded under
+    /// `old` whose scratch row is still live is present, by name, under
+    /// `dir`. With none recorded live there is nothing to point anywhere,
+    /// and the rewrite is still correct for the history it carries.
+    fn workspaces_moved_to(&self, old: &Path, dir: &Path) -> Result<bool> {
+        let names = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT path FROM artifacts WHERE json_extract(data,'$.root')=?1 AND state NOT IN ('deleted','source_gone')",
+            )?;
+            let rows =
+                statement.query_map([old.to_string_lossy()], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if names.is_empty() {
+            return Ok(true);
+        }
+        Ok(names.iter().any(|path| {
+            Path::new(path)
+                .file_name()
+                .is_some_and(|name| dir.join(name).symlink_metadata().is_ok())
+        }))
     }
 
     /// Rewrite every recorded path under `old_text` to `new_text` in every
@@ -2231,6 +2317,156 @@ impl Inventory {
             ));
         }
         Ok(current)
+    }
+    /// Whether `path` is the destination of a publication still in flight:
+    /// an open per-file intent's target, or an unresolved relocation's
+    /// destination. A scan that walks it mid-publication sees a directory no
+    /// row names yet; recording that as foreign content is what left Runner
+    /// publications as `unknown`/Keep/review duplicates.
+    pub(super) fn publication_in_flight(&self, path: &Path) -> Result<bool> {
+        let path = path.to_string_lossy();
+        let db = self.db.lock().unwrap();
+        let intent: bool = db.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM relocation_intents WHERE target_dir=?1 AND state IN {})",
+                intents::OPEN_STATES
+            ),
+            [&path],
+            |row| row.get(0),
+        )?;
+        if intent {
+            return Ok(true);
+        }
+        Ok(db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE state NOT IN ('succeeded','cancelled','failed','transferred') AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.destination')=?1)",
+            [&path],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Runner's own publications recorded as discovered foreign content are
+    /// folded back into Runner's custody record (contract §2.5: a directory
+    /// carrying a valid `.runner-manifest.json` is a Runner publication
+    /// handed to its consumer — custody transferred, never unknown, Keep or
+    /// review). Two cases, both idempotent:
+    ///
+    /// * the same path has Runner's own row (the scan walked the
+    ///   destination before the publication committed): the duplicate
+    ///   observation is removed and an event on Runner's row says so;
+    /// * no row names it, but the directory's manifest verifies and lists
+    ///   exactly its files: the row becomes `transferred` (unowned, no
+    ///   Keep, no hold) — it is the consumer's, and Runner never deletes it.
+    ///
+    /// Content without a verifying manifest stays unknown. Returns how many
+    /// rows changed.
+    pub fn fold_rediscovered_publications(&self) -> Result<usize> {
+        let duplicates = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT u.id, c.id FROM artifacts u JOIN artifacts c ON c.path=u.path AND c.id<>u.id \
+                 WHERE u.state='unknown' AND u.job IS NULL AND json_extract(u.data,'$.owned')=0 \
+                 AND c.state NOT IN ('unknown','deleted','source_gone') \
+                 AND (c.job IS NOT NULL OR json_extract(c.data,'$.owned')=1 OR c.state='transferred') \
+                 AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.artifact=u.id) \
+                 AND NOT EXISTS(SELECT 1 FROM recoveries r WHERE r.artifact=u.id) \
+                 GROUP BY u.id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut changed = 0;
+        if !duplicates.is_empty() {
+            let _guard = self.mutation_guard()?;
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
+            for (duplicate, runner) in &duplicates {
+                changed += tx.execute(
+                    "DELETE FROM artifacts WHERE id=?1 AND state='unknown' AND job IS NULL",
+                    [duplicate],
+                )?;
+                tx.execute("DELETE FROM events WHERE artifact=?1", [duplicate])?;
+                event(
+                    &tx,
+                    runner,
+                    "rediscovery_folded",
+                    &format!("a scan had recorded this publication as unknown content ({duplicate}); folded into Runner's record"),
+                )?;
+            }
+            tx.commit()?;
+        }
+        let orphans = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT data FROM artifacts WHERE state='unknown' AND job IS NULL AND json_extract(data,'$.owned')=0",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in orphans {
+            let candidate: Artifact = serde_json::from_str(&raw)?;
+            let Ok(dir) = fs::open_dir(&candidate.path) else {
+                continue;
+            };
+            let Ok(Some(manifest)) = intents::read_manifest(&dir) else {
+                continue;
+            };
+            let Ok(files) = fs::manifest(&dir, 100_000) else {
+                continue;
+            };
+            let payload = files
+                .iter()
+                .filter(|entry| {
+                    !entry.identity.directory && entry.path != intents::RUNNER_MANIFEST_NAME
+                })
+                .collect::<Vec<_>>();
+            let matches = payload.len() == manifest.files.len()
+                && manifest.files.iter().all(|listed| {
+                    payload.iter().any(|entry| {
+                        entry.path == listed.path && entry.identity.bytes == listed.bytes
+                    })
+                });
+            if !matches {
+                continue;
+            }
+            let _guard = self.mutation_guard()?;
+            let mut current = self.get(&candidate.id)?;
+            if current.revision != candidate.revision || current.state != "unknown" {
+                continue;
+            }
+            current.state = "transferred".into();
+            current.owned = false;
+            current.keep = false;
+            current.keep_on_failure = false;
+            current.hold = None;
+            current.deadline = None;
+            current.automatic_cleanup_eligible = false;
+            current.files = files;
+            current.revision += 1;
+            current.updated_at = now();
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
+            save_artifact(&tx, &current)?;
+            event(
+                &tx,
+                &current.id,
+                "rediscovery_folded",
+                &format!(
+                    "Runner publication of job {} (generation {}); custody transferred to its consumer",
+                    manifest.job, manifest.generation
+                ),
+            )?;
+            tx.commit()?;
+            changed += 1;
+        }
+        if changed > 0 {
+            tracing::info!(
+                changed,
+                "rediscovered Runner publications folded into custody records"
+            );
+        }
+        Ok(changed)
     }
     fn discover_unlocked(&self, root: &Path, path: &Path) -> Result<Artifact> {
         self.discover_record(root, path, false)

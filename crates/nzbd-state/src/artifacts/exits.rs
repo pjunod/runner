@@ -226,6 +226,41 @@ pub fn hold_exit(hold: &str) -> Option<&'static HoldExit> {
         })
 }
 
+/// The attention predicate over a row's hold: a hold is attention only when
+/// no automatic exit is registered for it (none, or an `Operator` exit —
+/// which the registry allows only for content Runner did not create, and
+/// that content is classified foreign, not attention). Built once from
+/// [`HOLD_EXITS`] so the filter and the registry cannot disagree.
+pub(super) static ATTENTION_HOLD_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(
+    || {
+        let quote = |text: &str| text.replace('\'', "''");
+        let automatic = HOLD_EXITS
+            .iter()
+            .filter(|rule| !matches!(rule.exit, Exit::Operator(_)))
+            .collect::<Vec<_>>();
+        let exact = automatic
+            .iter()
+            .filter(|rule| !rule.prefix)
+            .map(|rule| format!("'{}'", quote(rule.hold)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let prefixes = automatic
+            .iter()
+            .filter(|rule| rule.prefix)
+            .map(|rule| {
+                format!(
+                    " AND substr(json_extract(data,'$.hold'),1,{})<>'{}'",
+                    rule.hold.len(),
+                    quote(rule.hold)
+                )
+            })
+            .collect::<String>();
+        format!(
+            "json_extract(data,'$.hold') IS NOT NULL AND json_extract(data,'$.hold') NOT IN ({exact}){prefixes}"
+        )
+    },
+);
+
 /// What one sweep did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ExitReport {

@@ -9619,3 +9619,42 @@ async fn kill_after_sync_refetches_only_the_unacknowledged_segment() {
 async fn kill_after_journal_append_before_sync_keeps_the_final_crc() {
     kill_and_resume(KillPoint::AfterJournalAppend, 9103).await;
 }
+
+/// Configured payload roots and the workspace root are reconciled at startup
+/// even before any row names them; a configured root that does not exist
+/// yet reconciles as an empty success instead of failing.
+#[tokio::test]
+async fn startup_reconciles_configured_roots_before_any_row_names_them() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("dest")).unwrap();
+    let completed = temp.path().join("completed");
+    std::fs::create_dir(&completed).unwrap();
+    let not_yet = temp.path().join("failed");
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    owner.configured_payload_roots = vec![completed.clone(), not_yet.clone()];
+    pump(&mut owner, &mut messages).await;
+    for _ in 0..50 {
+        if owner
+            .startup_phases
+            .roots
+            .iter()
+            .all(|root| root.ok.is_some())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        pump(&mut owner, &mut messages).await;
+    }
+    let reconciled = |path: &std::path::Path| {
+        owner
+            .startup_phases
+            .roots
+            .iter()
+            .find(|root| root.root == path.display().to_string())
+            .and_then(|root| root.ok)
+    };
+    assert_eq!(reconciled(&completed), Some(true));
+    assert_eq!(reconciled(&not_yet), Some(true));
+    assert_eq!(reconciled(&owner.artifacts.workspace_dir()), Some(true));
+    assert!(!not_yet.exists(), "reconciliation creates nothing");
+}
