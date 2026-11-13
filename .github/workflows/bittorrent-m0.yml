@@ -25,6 +25,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Match every cargo invocation (including scripts) to the installed targets.
+  RUSTUP_TOOLCHAIN: "1.95"
 
 jobs:
   dependency-policy:
