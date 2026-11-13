@@ -13,6 +13,7 @@ on:
       - crates/nzbd-torrent/**
       - crates/nzbd/src/main.rs
       - crates/nzbd/src/tls.rs
+      - scripts/check-windows-native-state.py
       - scripts/check-bittorrent-deps.sh
       - scripts/check-private-discovery-leaks.sh
       - scripts/check-bittorrent-storage-full-probe.sh

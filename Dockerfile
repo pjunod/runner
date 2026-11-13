@@ -21,7 +21,7 @@ ARG NZBD_GIT_DESCRIBE
 ENV NZBD_GIT_DESCRIBE=${NZBD_GIT_DESCRIBE}
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p nzbd
+RUN cargo build --locked --release -p nzbd
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime-tools
 # The configured defaults require par2, real UnRAR and 7z. Debian's UnRAR
