@@ -320,7 +320,7 @@ impl Inventory {
         if TERMINAL_INSERT_FAILURES
             .lock()
             .unwrap()
-            .remove(&terminal.job)
+            .remove(&(self.installation.clone(), terminal.job))
         {
             return Err(Error::Io(std::io::Error::other(
                 "injected job_terminals insert failure (os error 5)",
@@ -728,7 +728,10 @@ impl Inventory {
     /// after `after`, as a crash there would.
     #[cfg(feature = "test-support")]
     pub fn inject_terminal_crash(&self, job: u32, after: TerminalStep) {
-        TERMINAL_CRASHES.lock().unwrap().insert(job, after.key());
+        TERMINAL_CRASHES
+            .lock()
+            .unwrap()
+            .insert((self.installation.clone(), job), after.key());
     }
 
     /// The job's source artifact by role (see `set_artifact_salvage`): a
@@ -764,7 +767,10 @@ impl Inventory {
     /// outcome is recorded (as an owner fence or shutdown would).
     #[cfg(feature = "test-support")]
     pub fn inject_disposal_admission_loss(&self, job: u32) {
-        DISPOSAL_ADMISSION_LOSSES.lock().unwrap().insert(job);
+        DISPOSAL_ADMISSION_LOSSES
+            .lock()
+            .unwrap()
+            .insert((self.installation.clone(), job));
     }
 
     /// Consulted by disposal after the move. Always false outside the
@@ -772,7 +778,10 @@ impl Inventory {
     pub fn take_injected_disposal_admission_loss(&self, job: u32) -> bool {
         #[cfg(feature = "test-support")]
         {
-            return DISPOSAL_ADMISSION_LOSSES.lock().unwrap().remove(&job);
+            return DISPOSAL_ADMISSION_LOSSES
+                .lock()
+                .unwrap()
+                .remove(&(self.installation.clone(), job));
         }
         #[allow(unreachable_code)]
         {
@@ -807,7 +816,10 @@ impl Inventory {
     /// row is written, as a refused write would.
     #[cfg(feature = "test-support")]
     pub fn inject_terminal_insert_failure(&self, job: u32) {
-        TERMINAL_INSERT_FAILURES.lock().unwrap().insert(job);
+        TERMINAL_INSERT_FAILURES
+            .lock()
+            .unwrap()
+            .insert((self.installation.clone(), job));
     }
 
     /// Consulted by the terminal orchestration between steps. Always false
@@ -816,8 +828,9 @@ impl Inventory {
         #[cfg(feature = "test-support")]
         {
             let mut crashes = TERMINAL_CRASHES.lock().unwrap();
-            if crashes.get(&job) == Some(&after.key()) {
-                crashes.remove(&job);
+            let key = (self.installation.clone(), job);
+            if crashes.get(&key) == Some(&after.key()) {
+                crashes.remove(&key);
                 return true;
             }
         }
@@ -827,18 +840,56 @@ impl Inventory {
 }
 
 #[cfg(feature = "test-support")]
-static TERMINAL_CRASHES: std::sync::LazyLock<Mutex<std::collections::HashMap<u32, u8>>> =
-    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+type TerminalFaultKey = (String, u32);
+
 #[cfg(feature = "test-support")]
-static DISPOSAL_ADMISSION_LOSSES: std::sync::LazyLock<Mutex<std::collections::HashSet<u32>>> =
-    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+static TERMINAL_CRASHES: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<TerminalFaultKey, u8>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 #[cfg(feature = "test-support")]
-static TERMINAL_INSERT_FAILURES: std::sync::LazyLock<Mutex<std::collections::HashSet<u32>>> =
-    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+static DISPOSAL_ADMISSION_LOSSES: std::sync::LazyLock<
+    Mutex<std::collections::HashSet<TerminalFaultKey>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+#[cfg(feature = "test-support")]
+static TERMINAL_INSERT_FAILURES: std::sync::LazyLock<
+    Mutex<std::collections::HashSet<TerminalFaultKey>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn injected_terminal_faults_are_scoped_to_the_inventory() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = Inventory::open(first_dir.path()).unwrap();
+        let second = Inventory::open(second_dir.path()).unwrap();
+        assert_ne!(first.installation, second.installation);
+        let job = 7;
+
+        first.inject_terminal_crash(job, TerminalStep::MarkersStamped);
+        assert!(!second.take_injected_terminal_crash(job, &TerminalStep::MarkersStamped));
+        assert!(first.take_injected_terminal_crash(job, &TerminalStep::MarkersStamped));
+        assert!(!first.take_injected_terminal_crash(job, &TerminalStep::MarkersStamped));
+
+        first.inject_disposal_admission_loss(job);
+        assert!(!second.take_injected_disposal_admission_loss(job));
+        assert!(first.take_injected_disposal_admission_loss(job));
+        assert!(!first.take_injected_disposal_admission_loss(job));
+
+        first.inject_terminal_insert_failure(job);
+        second
+            .record_terminal(&failed(job, SalvageState::None))
+            .unwrap();
+        assert!(first
+            .record_terminal(&failed(job, SalvageState::None))
+            .is_err());
+        first
+            .record_terminal(&failed(job, SalvageState::None))
+            .unwrap();
+    }
 
     fn entry(job: u32) -> crate::HistoryEntry {
         crate::HistoryEntry {
