@@ -4744,6 +4744,7 @@ fn delivered_copy(
 /// inode are unchanged. Identities recorded under the old source rebind,
 /// and the cleanup blocked before 0.9.1 is re-verified on its timed exit
 /// and completes with no operator action.
+#[cfg(target_os = "linux")] // Exercises the Linux mountinfo source-alias contract.
 #[test]
 fn a_cleanup_blocked_by_a_renamed_mount_source_rebinds_and_completes() {
     let (tmp, db, root) = fixture();
@@ -4841,6 +4842,7 @@ fn a_cleanup_blocked_by_a_renamed_mount_source_rebinds_and_completes() {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn walk(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {

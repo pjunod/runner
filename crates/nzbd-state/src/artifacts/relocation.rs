@@ -4225,7 +4225,7 @@ impl Inventory {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod lease_replay_tests {
     use super::*;
     /// A post-processing grant that expires between two per-file moves stops
@@ -4312,7 +4312,7 @@ mod lease_replay_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod performance_tests {
     use super::*;
 
