@@ -350,10 +350,7 @@ async fn mixed_worker_grants_post_while_fast_downloads_keep_slots_and_backlog_av
     }
     let worker = start_node(tmp.path(), "mixed", true, provider.port(), seen.clone()).await;
     let history_path = tmp.path().join(".nzbd-cluster/history/history.mixed.jsonl");
-    // Cold verification/durability can delay eligibility between each job.
-    // Fairness is bounded by consecutive eligible polls below, while this
-    // deadline bounds setup and collection of three real competing grants.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     loop {
         let history = std::fs::read_to_string(&history_path);
         let successes = history

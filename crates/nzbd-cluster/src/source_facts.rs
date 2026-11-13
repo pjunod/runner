@@ -76,7 +76,7 @@ pub(crate) fn bind_owned(shared: &LeaderShared, job: &mut Job) -> Result<bool, S
 }
 
 /// Before scheduler admission, make already-owned writer custody durable.
-/// Caller holds mutation_serial and then restores the committed projection.
+/// Caller holds mutation_serial and refreshes only the bound job projections.
 /// Returned IDs remain ineligible for this pass: recovery may finish after a
 /// skipped export, but new custody still needs its own checked binding pass.
 pub(crate) async fn reconcile(shared: &LeaderShared) -> Result<HashSet<JobId>, String> {
@@ -142,7 +142,11 @@ pub(crate) async fn reconcile(shared: &LeaderShared) -> Result<HashSet<JobId>, S
         control
             .commit_job_delta_guarded(&changes, &fences, &[], Some(issuer))
             .await?;
-        shared.restore_control_projection().await?;
+        let bound: Vec<_> = changes
+            .iter()
+            .map(|(id, _)| JobId(u32::try_from(*id).expect("source fact IDs originate as u32")))
+            .collect();
+        shared.restore_control_jobs_projection(&bound).await?;
     }
     Ok(pending)
 }
