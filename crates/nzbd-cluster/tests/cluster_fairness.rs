@@ -350,7 +350,10 @@ async fn mixed_worker_grants_post_while_fast_downloads_keep_slots_and_backlog_av
     }
     let worker = start_node(tmp.path(), "mixed", true, provider.port(), seen.clone()).await;
     let history_path = tmp.path().join(".nzbd-cluster/history/history.mixed.jsonl");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    // Cold verification/durability can delay eligibility between each job.
+    // Fairness is bounded by consecutive eligible polls below, while this
+    // deadline bounds setup and collection of three real competing grants.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
     loop {
         let history = std::fs::read_to_string(&history_path);
         let successes = history
@@ -362,7 +365,23 @@ async fn mixed_worker_grants_post_while_fast_downloads_keep_slots_and_backlog_av
                     .count()
             })
             .unwrap_or(0);
-        if successes >= 3 && provider.total_hits() >= 8 {
+        // A completed Post can have been granted while the download lane
+        // was full. Keep observing until three grants actually competed with
+        // a free download lane; all observed grant-order windows remain checked.
+        let competing_post_grants = seen
+            .lock()
+            .unwrap()
+            .polls
+            .iter()
+            .filter(|poll| {
+                poll.free_download_slots > 0
+                    && poll.free_pp_slots > 0
+                    && poll.queued_backlog > 0
+                    && poll.eligible_post_jobs > 0
+                    && poll.granted_kinds.iter().any(|kind| kind == "post")
+            })
+            .count();
+        if successes >= 3 && provider.total_hits() >= 8 && competing_post_grants >= 3 {
             break;
         }
         assert!(
