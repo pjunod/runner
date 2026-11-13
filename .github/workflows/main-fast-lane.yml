@@ -13,11 +13,14 @@ concurrency:
   group: main-fast-lane-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   scope:
     name: Select affected validation
     if: github.event.pull_request.draft == false
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
@@ -26,7 +29,7 @@ jobs:
       docs: ${{ steps.scope.outputs.docs }}
       docs_only: ${{ steps.scope.outputs.docs_only }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
       - id: scope
@@ -37,11 +40,11 @@ jobs:
   preflight:
     name: Static contracts
     needs: scope
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 3
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
       - run: scripts/check-fast-lane-contract
@@ -55,17 +58,17 @@ jobs:
     name: Rust merge candidate
     needs: [scope, preflight]
     if: needs.scope.outputs.rust == 'true'
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     # Cold native-code dependency builds plus every selected regression lane
     # exceeded 20 minutes while tests were still completing (PR #301).
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.97.1"
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install bounded post-processing dependencies
         if: runner.environment == 'github-hosted'
         run: sudo apt-get update && sudo apt-get install -y par2 p7zip-full
@@ -89,28 +92,28 @@ jobs:
     needs: [scope, preflight]
     # The Rust lane runs these itself; a docs-only change runs just these.
     if: needs.scope.outputs.docs == 'true' && needs.scope.outputs.rust != 'true'
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.97.1"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: make fast-check-docs
 
   mobile:
     name: Mobile compile and unit lane
     needs: [scope, preflight]
     if: needs.scope.outputs.mobile == 'true'
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 12
     defaults:
       run:
         working-directory: mobile
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
           cache: npm
@@ -123,7 +126,7 @@ jobs:
     name: Main promotion gate
     if: always() && github.event.pull_request.draft == false
     needs: [scope, preflight, rust, docs, mobile]
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
       - name: Require every selected lane
@@ -134,9 +137,9 @@ jobs:
           DOCS: ${{ needs.docs.result }}
           MOBILE: ${{ needs.mobile.result }}
         run: |
-          for result in "$SCOPE" "$PREFLIGHT" "$RUST" "$DOCS" "$MOBILE"; do
+          for result in "$SCOPE" "$PREFLIGHT" "$RUST" "$MOBILE"; do
             case "$result" in
-              success|skipped) ;;
+              success) ;;
               *) echo "Selected lane ended with: $result"; exit 1 ;;
             esac
           done

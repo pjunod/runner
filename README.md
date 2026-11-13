@@ -141,15 +141,23 @@ config), [`kubernetes/`](examples/kubernetes/) (full manifest set) and
 
 ## Development
 
-Three GitHub Actions workflows gate every push/PR — **Tests** (unit +
-engine e2e + multi-node cluster tests + the whole-daemon test, plus an
-MSRV 1.95 check), **Lint** (`cargo fmt --check`, `clippy -D warnings`),
-and **Coverage** (`cargo llvm-cov`, self-hosted badges). Coverage runs every
-workspace test target even after a failure, then fails the job before reports
-or badges can be published unless the whole instrumented suite passed. It also
-rejects line-coverage regressions below the single `MINIMUM_LINE_COVERAGE`
-constant in [`.github/workflows/coverage.yml`](.github/workflows/coverage.yml);
-raise that value only after a complete `main` run proves the new floor.
+Every pull request runs **Main fast lane** (Rust compile, formatting,
+Clippy, recovery/cluster regressions, and mobile type/unit checks), **Tests**
+(the complete workspace suite, MSRV 1.95, and Android signing guards),
+**Supply chain** (dependency policy and RustSec), and **CodeQL** (Rust and
+JavaScript/TypeScript). Metadata and build-number changes use the same real
+Rust and mobile checks. CI uses fresh GitHub-hosted runners; Linux jobs use
+Ubuntu 24.04. Main requires up-to-date branches, resolved conversations,
+and verified CI publishers, including for administrators. Solo-owner
+maintenance requires zero approving reviews; this does not provide an
+independent review or erase historical Scorecard evidence.
+
+**Lint** and **Coverage** remain manually dispatched. Coverage rejects a
+failed test suite before publishing reports or badges and enforces
+`MINIMUM_LINE_COVERAGE` in
+[`.github/workflows/coverage.yml`](.github/workflows/coverage.yml). Raise that
+floor only after a complete main run proves it. Release jobs run only on
+version tags; pull-request validation never publishes production artifacts.
 
 The `Makefile` wraps the whole workflow — `make` (or `make help`) lists
 every target:

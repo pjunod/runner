@@ -5,8 +5,8 @@ base=${1:?usage: scripts/ci-scope BASE_SHA}
 git cat-file -e "${base}^{commit}"
 mapfile -t changed < <(git diff --name-only "$base"...HEAD)
 
-rust=false
-mobile=false
+rust=true
+mobile=true
 torrent=false
 docs=false
 docs_only=true

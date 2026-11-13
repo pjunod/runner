@@ -11,7 +11,7 @@
 # side doesn't exist yet makes Docker create a directory in its place,
 # and the first-run setup UI couldn't persist the config it writes.
 
-FROM rust:1.97.1-bookworm AS build
+FROM rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS build
 # The build context deliberately excludes `.git` (see .dockerignore), so
 # the binary cannot work out its own commit — it has to be told. Without
 # this the daemon reports `<version>+unknown`, which is deliberately loud:
@@ -23,7 +23,7 @@ WORKDIR /src
 COPY . .
 RUN cargo build --release -p nzbd
 
-FROM debian:bookworm-slim AS runtime-tools
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime-tools
 # The configured defaults require par2, real UnRAR and 7z. Debian's UnRAR
 # package is in non-free; unrar-free cannot reliably handle multi-volume RAR.
 # Keep both 7z and modern 7zz available for fallback and other archive formats.
