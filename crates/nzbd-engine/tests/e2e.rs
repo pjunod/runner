@@ -2366,18 +2366,21 @@ async fn legacy_coverage_hold_recovers_without_repeating_valid_articles() {
         engine.import_ready(job, false, false).await.unwrap();
         engine.shutdown().await;
         let engine = spawn_engine(tmp.path(), vec![]).await;
-        for _ in 0..100 {
-            if engine
-                .export_ready(JobId(991))
-                .await
-                .unwrap()
-                .is_some_and(|j| j.files[0].finalized)
-            {
+        // Recovery acknowledges verification, publication intent and the
+        // partial checkpoint through separate durable owner continuations.
+        // A one-second poll window can end before the next owner tick even
+        // without test contention. Wait for the actual finalized fact while
+        // retaining a bounded failure deadline and every integrity assertion.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let recovered = engine.export_ready(JobId(991)).await.unwrap().unwrap();
+            if manual || recovered.files[0].finalized {
                 break;
             }
-            if manual {
-                break;
-            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "legacy recovery did not finalize its partial checkpoint: {recovered:?}"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let job = engine.export_ready(JobId(991)).await.unwrap().unwrap();
