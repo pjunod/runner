@@ -2,6 +2,8 @@
 //!
 //! SQLite owns intent and policy; external sidecars own allocation identity.
 //! Nothing in a media payload is a marker or grants permission to remove it.
+mod cleanup_review;
+pub use cleanup_review::CleanupReview;
 mod cluster;
 mod cluster_keep;
 pub use cluster::{remove_cluster_generation_copy, ClusterArtifactCopy, ClusterCopyCleanup};

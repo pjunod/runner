@@ -94,6 +94,27 @@ source cleanup uses its existing independent action, and polling preserves its
 button and focus. Phone queue and History details show the same receipt and
 provide visible retry results.
 
+## Failed deletion review
+
+A changed manifest or legacy device-only root identity stays in review. Normal
+inspection, expiry and deletion never relax those checks. To explicitly review
+the *current* bytes, use `GET /api/v1/artifacts/{id}/cleanup-review`. It hashes
+regular files through descriptors and returns old/current root and allocation
+identities, the current manifest, revision, generation and a fingerprint. A
+changed root or payload inode, missing allocation marker, active writer,
+recovery or publication move refuses the preview. Legacy remount review also
+requires a current stable mount identity; an unmounted fallback cannot pass.
+
+After reviewing that exact root and content, POST to the same endpoint with
+`revision`, `generation`, `fingerprint` and `acknowledged: true`. Any intervening
+metadata/content change refuses acceptance. Present files receive a **new
+generation**, fresh immutable allocation sidecar and **Keep**, with automatic
+cleanup disabled. Old delete approvals are cancelled. Acceptance deletes
+nothing; release Keep and submit a new ordinary guarded deletion separately.
+An explicitly reviewed absent payload becomes `source_gone` after current-root
+verification. A failed database commit leaves the old allocation sidecar intact.
+Review acceptance is recorded in the artifact event ledger.
+
 ## 2. Recover media into Curator
 
 1. Inspect and, if needed, adopt the source. Select regular media files.

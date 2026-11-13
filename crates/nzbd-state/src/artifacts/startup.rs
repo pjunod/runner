@@ -209,7 +209,7 @@ impl Inventory {
     /// real mount of its own — not the parent (root) filesystem an
     /// unmounted, empty mountpoint would fall through to. Returns that
     /// device.
-    fn live_legacy_root_device(&self, a: &Artifact) -> Option<u64> {
+    pub(super) fn live_legacy_root_device(&self, a: &Artifact) -> Option<u64> {
         if !a.root_identity.mount_id.is_empty() || !a.root_identity.directory {
             return None;
         }

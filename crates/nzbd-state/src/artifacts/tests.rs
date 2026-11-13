@@ -5363,6 +5363,8 @@ fn legacy_row(db: &Inventory, root: &Path, job: u32, name: &str) -> Artifact {
 fn mount_table(point: &Path) -> String {
     use std::os::unix::fs::MetadataExt;
     let device = std::fs::metadata(point).unwrap().dev();
+    #[cfg(target_os = "macos")]
+    let device = device as libc::dev_t;
     let canonical = std::fs::canonicalize(point).unwrap();
     format!(
         "1 0 253:0 / / rw - ext4 /dev/root rw\n100 1 {}:{} / {} rw - nfs4 qnap-storage:/working rw\n",
@@ -5430,6 +5432,8 @@ fn a_legacy_identity_orphan_waits_without_a_live_root() {
     let only_rootfs = {
         use std::os::unix::fs::MetadataExt;
         let device = std::fs::metadata(&root).unwrap().dev();
+        #[cfg(target_os = "macos")]
+        let device = device as libc::dev_t;
         format!(
             "1 0 {}:{} / / rw - ext4 /dev/root rw\n",
             libc::major(device),
