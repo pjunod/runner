@@ -3,10 +3,6 @@ set -euo pipefail
 
 base=${1:?usage: scripts/ci-scope BASE_SHA}
 git cat-file -e "${base}^{commit}"
-changed=()
-while IFS= read -r path; do
-  changed+=("$path")
-done < <(git diff --name-only "$base"...HEAD)
 
 rust=true
 mobile=true
@@ -14,7 +10,7 @@ torrent=false
 docs=false
 docs_only=true
 
-for path in "${changed[@]}"; do
+while IFS= read -r path; do
   case "$path" in
     *.md|docs/*) docs=true ;;
     *) docs_only=false ;;
@@ -34,6 +30,6 @@ for path in "${changed[@]}"; do
       torrent=true
       ;;
   esac
-done
+done < <(git diff --name-only "$base"...HEAD)
 
 printf 'rust=%s\nmobile=%s\ntorrent=%s\ndocs=%s\ndocs_only=%s\n' "$rust" "$mobile" "$torrent" "$docs" "$docs_only"
