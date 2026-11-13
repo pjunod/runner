@@ -3,6 +3,11 @@ use super::*;
 use sha2::Digest;
 use std::io::Read;
 
+#[cfg(test)]
+type CaptureHook = Box<dyn FnOnce()>;
+#[cfg(test)]
+thread_local! { static AFTER_CAPTURE: std::cell::RefCell<Option<CaptureHook>> = const { std::cell::RefCell::new(None) }; }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CleanupReview {
     pub artifact: String,
@@ -161,6 +166,26 @@ impl Inventory {
                 ));
             }
             observed_identity = Some(observed);
+        }
+        #[cfg(test)]
+        AFTER_CAPTURE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        // Hashes describe the opened objects. Recheck their names too so an
+        // external rename during a long read cannot accept an already stale
+        // allocation (even though ordinary deletion would still refuse it).
+        let named_root = self.verify_root(&candidate)?;
+        let named = fs::open_at(&named_root, Path::new(a.path.file_name().unwrap()), true);
+        match (&observed_identity, named) {
+            (Some(expected), Ok(file)) if fs::identity_for_file(&file)? == *expected => {}
+            (None, Err(Error::Io(e))) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {
+                return Err(Error::Conflict(
+                    "allocation name changed during cleanup review".into(),
+                ))
+            }
         }
         let mut review = CleanupReview {
             artifact: a.id.clone(),
@@ -409,6 +434,25 @@ mod tests {
         assert_eq!(std::fs::read(marker).unwrap(), before);
         assert_eq!(db.get(&a.id).unwrap().revision, a.revision);
         assert!(db.preview_cleanup_review(&a.id).is_ok());
+    }
+
+    #[test]
+    fn cleanup_review_refuses_name_replacement_during_capture() {
+        let (_tmp, db, root, a, _) = failed();
+        let path = a.path.clone();
+        AFTER_CAPTURE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(&path, root.join("old-allocation")).unwrap();
+                std::fs::create_dir(&path).unwrap();
+                std::fs::write(path.join("media.mkv"), b"replacement").unwrap();
+            }))
+        });
+        assert!(db.preview_cleanup_review(&a.id).is_err());
+        assert_eq!(db.get(&a.id).unwrap().revision, a.revision);
+        assert_eq!(
+            std::fs::read(a.path.join("media.mkv")).unwrap(),
+            b"replacement"
+        );
     }
 
     #[cfg(target_os = "linux")]
