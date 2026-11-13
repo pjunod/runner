@@ -15,4 +15,6 @@ jobs:
         with:
           toolchain: "1.97.1"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          cache-on-failure: true
       - run: cargo test --locked -p nzbd-cluster --test cluster_fairness -- --nocapture
