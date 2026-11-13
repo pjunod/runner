@@ -3,7 +3,10 @@ set -euo pipefail
 
 base=${1:?usage: scripts/ci-scope BASE_SHA}
 git cat-file -e "${base}^{commit}"
-mapfile -t changed < <(git diff --name-only "$base"...HEAD)
+changed=()
+while IFS= read -r path; do
+  changed+=("$path")
+done < <(git diff --name-only "$base"...HEAD)
 
 rust=true
 mobile=true

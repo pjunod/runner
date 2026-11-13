@@ -43,3 +43,8 @@ grep -Fq 'make fast-check-docs' "$lane"
 grep -Eq "^  pull_request:" .github/workflows/ci.yml
 grep -Fq "rust=true" scripts/ci-scope
 grep -Fq "mobile=true" scripts/ci-scope
+
+# An empty/metadata-only diff still selects real Rust and mobile validation.
+scope="$(scripts/ci-scope HEAD)"
+grep -Fxq 'rust=true' <<<"$scope"
+grep -Fxq 'mobile=true' <<<"$scope"
