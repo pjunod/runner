@@ -3894,6 +3894,10 @@ fn refused_names_in_a_closed_scope_do_not_block_its_disposal() {
     let (tmp, db, root) = fixture();
     let a = parked(&db, &root);
     let op = db.request_delete(&a.id, a.revision, "dispose", 0).unwrap();
+    // A regular late file first causes a real, authorized review state.
+    // Add refused names only after that, before the automatic re-snapshot.
+    std::fs::write(a.path.join("late.part"), b"after the snapshot").unwrap();
+    assert_eq!(db.execute_delete(&op.id).unwrap().state, "review");
     let outside = tmp.path().join("outside.bin");
     std::fs::write(&outside, b"not runner's").unwrap();
     std::os::unix::fs::symlink(&outside, a.path.join("link")).unwrap();
@@ -3902,16 +3906,10 @@ fn refused_names_in_a_closed_scope_do_not_block_its_disposal() {
     ))
     .unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-    let _ = db.execute_delete(&op.id);
     let mut refused = db.get(&a.id).unwrap();
-    refused.hold = Some("review".into());
-    refused.state = "delete_failed".into();
+    assert_eq!(refused.hold.as_deref(), Some("review"));
     refused.updated_at = now() - 2 * exits::HOLD_EXIT_SECONDS;
-    refused.revision += 1;
     save_artifact(&db.db.lock().unwrap(), &refused).unwrap();
-    let mut stuck = db.operation(&op.id).unwrap();
-    stuck.state = "review".into();
-    save_operation(&db.db.lock().unwrap(), &stuck).unwrap();
     let report = db
         .exit_wedged_states(exits::HOLD_EXIT_SECONDS, true)
         .unwrap();

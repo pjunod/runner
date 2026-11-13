@@ -2438,7 +2438,18 @@ async fn review_missing_parity_requests_available_paused_volume() {
     let engine = spawn_engine(tmp.path()).await;
     let dir = tmp.path().join("dest/delayed-review");
     std::fs::create_dir_all(&dir).unwrap();
-    let data: Vec<u8> = (0..50_000u32).map(|i| ((i * 7) % 253) as u8).collect();
+    // Repeated byte patterns let par2 recover a damaged slice from another
+    // offset without fetching any recovery blocks. Use deterministic,
+    // nonperiodic bytes so this fixture really requires paused parity.
+    let mut seed = 0x6d2b79f5u32;
+    let data: Vec<u8> = (0..50_000)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed >> 24) as u8
+        })
+        .collect();
     std::fs::write(dir.join("payload.bin"), &data).unwrap();
     par2_create(&dir, 4, &["payload.bin"]);
     let mut pars = par2_entries(&dir, 910);
@@ -2465,7 +2476,7 @@ async fn review_missing_parity_requests_available_paused_volume() {
         )
         .await
         .unwrap();
-    let _ = process_job(
+    let outcome = process_job(
         &engine,
         &PostConfig {
             unpack: false,
@@ -2487,7 +2498,7 @@ async fn review_missing_parity_requests_available_paused_volume() {
         job.files
             .iter()
             .any(|f| paused.contains(&f.id) && !f.paused),
-        "repair gave up while all available recovery volumes remained paused; control={:?}",
+        "repair gave up while all available recovery volumes remained paused; outcome={outcome:?}; control={:?}",
         job.control()
     );
 }
