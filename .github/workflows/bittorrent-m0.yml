@@ -97,9 +97,9 @@ jobs:
           key: bittorrent-m0-${{ matrix.target }}
       - name: Run the isolated adapter suite
         run: cargo test --locked -p nzbd-torrent --target ${{ matrix.target }}
-      - name: Verify pending-source Windows ACL
+      - name: Verify native Windows ACL, wire format and refusal contracts
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo test --locked -p nzbd-state --target ${{ matrix.target }}
+        run: python scripts/check-windows-native-state.py
       - name: Bound sampled 100-torrent resident-memory growth
         run: >-
           cargo run --locked -p nzbd-torrent --release

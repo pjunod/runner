@@ -759,7 +759,7 @@ impl Inventory {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod snapshot_tests {
     use super::*;
 
