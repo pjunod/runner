@@ -11,23 +11,22 @@ permissions:
 
 jobs:
   maintained-series:
-    name: "blocking: maintained rqbit v8.1.1 series / Rust 1.85"
+    name: "blocking: maintained rqbit v8.1.1 series / Rust 1.95"
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    env:
+      RUSTUP_TOOLCHAIN: "1.95"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "22"
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: "1.85"
+          toolchain: "1.95"
           components: rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          shared-key: rqbit-maintained-v8.1.1-1.85
+          shared-key: rqbit-maintained-v8.1.1-1.95
       - name: Re-derive and test the shipped patch series
         env:
           RQBIT_UPSTREAM_CACHE: ${{ runner.temp }}/rqbit-source-cache/rqbit-v8.1.1.tar.gz

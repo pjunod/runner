@@ -141,9 +141,9 @@ fi
   cd "$source_dir"
   cargo fmt --all -- --check
 
-  librqbit_tests="$(cargo test -p librqbit --lib --no-default-features --features rust-tls -- --list)"
-  tracker_tests="$(cargo test -p librqbit-tracker-comms --lib --no-default-features --features sha1-ring -- --list)"
-  dht_tests="$(cargo test -p librqbit-dht --lib --no-default-features --features sha1-ring -- --list)"
+  librqbit_tests="$(cargo test --locked -p librqbit --lib --no-default-features --features rust-tls -- --list)"
+  tracker_tests="$(cargo test --locked -p librqbit-tracker-comms --lib --no-default-features --features sha1-ring -- --list)"
+  dht_tests="$(cargo test --locked -p librqbit-dht --lib --no-default-features --features sha1-ring -- --list)"
   readonly librqbit_tests tracker_tests dht_tests
 
   readonly -a expected_librqbit_tests=(
@@ -201,11 +201,13 @@ fi
     exit 1
   fi
 
-  cargo test -p librqbit --lib --no-default-features --features rust-tls
-  cargo test -p librqbit-tracker-comms --lib --no-default-features --features sha1-ring
-  cargo test -p librqbit-dht --lib --no-default-features --features sha1-ring
+  cargo test --locked -p librqbit --lib --no-default-features --features rust-tls
+  cargo test --locked -p librqbit-tracker-comms --lib --no-default-features --features sha1-ring
+  cargo test --locked -p librqbit-dht --lib --no-default-features --features sha1-ring
   check_dht_dispatch
-  cargo check --workspace --exclude rqbit-desktop
+  # Validate maintained library APIs without executing the unshipped stock
+  # CLI web UI build script (npm install) or the desktop packaging stack.
+  cargo check --locked --workspace --exclude rqbit-desktop --exclude rqbit
 )
 
-echo "rqbit maintained patch series: twelve revert-sensitive contracts passed"
+echo "rqbit maintained patch series: contracts and locked upstream tests passed"

@@ -44,8 +44,8 @@ The maintained series is:
 | 10 | `0019-disable-peer-exchange.patch` | Make the daemon's PEX setting authoritative for inbound messages and outgoing advertisement. |
 | 11 | `0020-expose-test-only-dht-bootstrap.patch` | Expose a feature-gated constructor for deterministic loopback DHT tests and a typed invalid-resolved-metadata marker without adding an nzbd runtime bootstrap setting. |
 | 12 | `0021-configurable-client-identity-and-announce-lifecycle.patch` | Let the embedder set the tracker HTTP `User-Agent` and BEP 10 `v`, and make announces tracker-compliant: keep the tracker URL's own query (passkeys), send a stable `key`, echo `tracker id`, report session-relative `downloaded`, send `completed` once and promptly, back off failed announces, and send a bounded `stopped` when the torrent's tracker session ends (ordered before a restart's `started`; awaited by `Session::stop`). Peer lookups send no events. |
-
 | 13 | `0022-read-only-piece-verifier.patch` | Reuse the existing piece verifier against an FD-bound read-only snapshot before native processing copies; verify boundary bytes and avoid rescanning preceding files for every piece. |
+| 14 | `0023-upgrade-upnp-xml-parser.patch` | Require fixed XML parsing in both UPnP crates without enabling UPnP; lock compatible security fixes for maintained upstream proofs. |
 
 The checked-in [`vendor/`](vendor/) tree is generated from those inputs. It
 contains the derived upstream `LICENSE`, `README.md`, and `crates/` tree needed
@@ -110,10 +110,20 @@ the previously reviewed archive from a trusted cache, and pass it through
 `RQBIT_UPSTREAM_ARCHIVE`. Changing the checksum is an ADR-19 and gate-9 review,
 not a recovery shortcut.
 
-CI runs the complete proof. The ordinary workspace resolves `librqbit` through
-`contrib/rqbit/vendor/crates/librqbit`, keeps default features off, enables only
-`rust-tls`, and separately proves that the production daemon graph remains
-free of `nzbd-torrent` and every `librqbit*` package.
+CI runs the complete maintained library proof with Rust 1.95 and `--locked`. The
+ordinary workspace resolves `librqbit` through
+`contrib/rqbit/vendor/crates/librqbit`, keeps default features off, and enables
+`rust-tls`. [`check-bittorrent-deps.sh`](../../scripts/check-bittorrent-deps.sh)
+checks the active daemon's maintained engine, Rust TLS, and narrow qBittorrent
+shim. The upstream lock also fixes the selected proof graph; optional upstream
+CLI and desktop snapshots are not the shipped daemon dependency graph.
+The compatibility check excludes the unshipped `rqbit` CLI and desktop; it
+checks the remaining library workspace without running the stock CLI web UI's
+`npm install` build hook. The stock CLI retains `parse_duration`'s
+RUSTSEC-2021-0041 in operator-supplied argument parsing. The default-TLS library
+compatibility graph also retains the `crypto-hash` unmaintained notice. Neither
+package appears in the three executed maintained test graphs or the shipped
+daemon. These findings are reported, not suppressed.
 
 Every maintained behavior has a test that fails when its guard, permit
 lifetime, propagation, or admission boundary is reverted. A patch applying is
