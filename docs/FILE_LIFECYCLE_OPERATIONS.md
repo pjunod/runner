@@ -231,6 +231,10 @@ Linux and macOS use descriptor-relative, no-follow access and exclusive
 publication. Windows keeps ordinary queue operation and inspection; destructive
 ownership is refused where equivalent deletion primitives are unavailable.
 This is an operation-level inability to prove safe deletion, not an enable gate.
+The native Windows tests verify ACLs, queue/wire behavior, and that unsupported
+descriptor-relative absence proofs and deletion refuse without touching payload.
+Owned publication/retirement fixtures require Unix descriptors and run on Linux
+and macOS; their exclusion does not certify those operations on Windows.
 
 Each cluster node keeps its inventory in its local control directory. Imported
 pre-existing worker payloads remain unowned. A remote writer lease must retire

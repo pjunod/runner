@@ -581,7 +581,7 @@ impl Inventory {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     fn fixture() -> (
@@ -1470,7 +1470,7 @@ pub fn remove_cluster_generation_copy(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod generation_tests {
     use super::*;
     #[test]

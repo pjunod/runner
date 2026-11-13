@@ -1926,7 +1926,6 @@ impl Inventory {
         dir: &Path,
         dir_text: &str,
     ) -> Result<usize> {
-        use std::os::unix::fs::MetadataExt;
         let names = {
             let db = self.db.lock().unwrap();
             let mut statement = db.prepare(
@@ -1969,13 +1968,16 @@ impl Inventory {
             };
         }
         std::fs::create_dir_all(dir)?;
-        let dir_device = std::fs::metadata(dir)?.dev();
+        let Some(dir_device) = crate::io_meter::device_of_metadata(&std::fs::metadata(dir)?) else {
+            // Unknown volume identity cannot authorize moving legacy work.
+            return Ok(0);
+        };
         let mut moved = 0usize;
         for place in places.iter().filter(|place| place.as_path() != dir) {
             let Ok(meta) = std::fs::metadata(place) else {
                 continue;
             };
-            if meta.dev() != dir_device {
+            if crate::io_meter::device_of_metadata(&meta) != Some(dir_device) {
                 continue;
             }
             for name in &names {

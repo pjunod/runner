@@ -451,15 +451,14 @@ impl Inventory {
     /// its source did (`publication.cross_volume`, contract §2.1). Reported
     /// only when both are observed; a retired source reads as not.
     pub fn delivery_cross_volume(&self, delivery: &Delivery) -> bool {
-        use std::os::unix::fs::MetadataExt;
         let publication = std::fs::metadata(&delivery.publication_path)
             .ok()
-            .map(|meta| meta.dev());
+            .and_then(|meta| crate::io_meter::device_of_metadata(&meta));
         let source = self
             .get(&delivery.source_artifact_id)
             .ok()
             .and_then(|source| std::fs::metadata(&source.root).ok())
-            .map(|meta| meta.dev());
+            .and_then(|meta| crate::io_meter::device_of_metadata(&meta));
         matches!((publication, source), (Some(a), Some(b)) if a != b)
     }
 
@@ -588,13 +587,15 @@ impl Inventory {
         let cross_volume = if let Some(manifest) = &manifest {
             manifest.cross_volume
         } else {
-            use std::os::unix::fs::MetadataExt;
-            let publication_dev = root.metadata().ok().map(|meta| meta.dev());
+            let publication_dev = root
+                .metadata()
+                .ok()
+                .and_then(|meta| crate::io_meter::device_of_metadata(&meta));
             let source_dev = self
                 .get(&source_artifact_id)
                 .ok()
                 .and_then(|source| std::fs::metadata(&source.root).ok())
-                .map(|meta| meta.dev());
+                .and_then(|meta| crate::io_meter::device_of_metadata(&meta));
             matches!((publication_dev, source_dev), (Some(a), Some(b)) if a != b)
         };
         Ok(PreparedDelivery {
