@@ -1,8 +1,8 @@
 {
-  "name": "deepmerge",
-  "version": "4.3.1",
+  "name": "@runner/deepmerge-compat",
+  "version": "1.0.0",
   "private": true,
   "main": "index.cjs",
   "license": "MIT",
-  "description": "deepmerge 4.3.1 with local safe own-property writes; see UPSTREAM.json"
+  "description": "Private compatibility fork of deepmerge 4.3.1 with safe own-property writes; see UPSTREAM.json"
 }

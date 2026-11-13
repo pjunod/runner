@@ -296,8 +296,8 @@ an intercepted connection.
 
 As of 2026-11-13, the lockfile updates compatible Expo/Jest dependencies
 and uses fixed minimatch 11 for `@expo/fingerprint`. The licensed local
-[`deepmerge`](../mobile/vendor/deepmerge/UPSTREAM.json) copy retains upstream
-name/version 4.3.1 and changes destination writes to own data properties,
+[`deepmerge`](../mobile/vendor/deepmerge/UPSTREAM.json) fork is explicitly named `@runner/deepmerge-compat` version 1.0.0, records
+its deepmerge 4.3.1 origin, and changes destination writes to own data properties,
 closing GHSA-gcqx-w48m-w2h4 without inventing an upstream release. Its seven
 regressions run during `npm ci`; three fail on the original upstream code.
 The complete mobile unit suite verifies Jest/Expo compatibility.

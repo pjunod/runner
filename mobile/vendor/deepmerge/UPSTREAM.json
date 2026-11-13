@@ -10,5 +10,5 @@
   },
   "patched_cjs_sha256": "3ff0466609247b7d08c3f45e08c193c7f7224517faec7d0500b067ffe46580e7",
   "regressions": "regressions.cjs (three prototype regressions fail on original upstream; seven tests pass on the patch)",
-  "distribution": "Local file override retains upstream name/version and includes modified code; not a claim of a published fixed release."
+  "distribution": "Private @runner/deepmerge-compat 1.0.0 fork with modified destination writes; upstream origin remains deepmerge 4.3.1. Not a claim of a published upstream fixed release."
 }
