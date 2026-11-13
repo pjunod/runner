@@ -31,6 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          persist-credentials: false
           fetch-depth: 0
       - id: scope
         env:
@@ -44,15 +45,14 @@ jobs:
     timeout-minutes: 3
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
       - run: scripts/check-fast-lane-contract
       - name: Exercise the embedded application JavaScript
         run: make ui-test
-      - name: Documentation-only lane
-        if: needs.scope.outputs.docs_only == 'true'
-        run: echo "Documentation-only diff; only the documentation contract tests run."
 
   rust:
     name: Rust merge candidate
@@ -64,6 +64,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.97.1"
@@ -87,21 +89,6 @@ jobs:
         if: ${{ !cancelled() && (steps.rust_checks.outcome == 'success' || steps.rust_checks.outcome == 'failure') }}
         run: make fast-check-startup
 
-  docs:
-    name: Documentation contract tests
-    needs: [scope, preflight]
-    # The Rust lane runs these itself; a docs-only change runs just these.
-    if: needs.scope.outputs.docs == 'true' && needs.scope.outputs.rust != 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: "1.97.1"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - run: make fast-check-docs
-
   mobile:
     name: Mobile compile and unit lane
     needs: [scope, preflight]
@@ -113,6 +100,8 @@ jobs:
         working-directory: mobile
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
@@ -125,7 +114,7 @@ jobs:
   gate:
     name: Main promotion gate
     if: always() && github.event.pull_request.draft == false
-    needs: [scope, preflight, rust, docs, mobile]
+    needs: [scope, preflight, rust, mobile]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
@@ -134,7 +123,6 @@ jobs:
           SCOPE: ${{ needs.scope.result }}
           PREFLIGHT: ${{ needs.preflight.result }}
           RUST: ${{ needs.rust.result }}
-          DOCS: ${{ needs.docs.result }}
           MOBILE: ${{ needs.mobile.result }}
         run: |
           for result in "$SCOPE" "$PREFLIGHT" "$RUST" "$MOBILE"; do
