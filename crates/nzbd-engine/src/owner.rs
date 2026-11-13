@@ -4758,6 +4758,17 @@ impl Owner {
                     && !self.failed_cleanup_admissions.contains_key(&job)
                     && !self.projection_transition
                     && !replacement_pending;
+                if !exportable && job.0 <= 3 {
+                    let ticket = self.verification.get(&job);
+                    tracing::warn!(target: "nzbd_engine::verification_diag", job=job.0,
+                        phase=?ticket.map(|s| s.phase.as_str()), ticket_generation=?ticket.map(|s|s.generation),
+                        owner_generation=?self.job_epochs.get(&job), in_flight=self.persistence.in_flight(),
+                        callbacks=self.persistence_callbacks.len(), io=self.io_callbacks.len(),
+                        allocating=self.allocating_jobs.contains(&job), cached=self.allocation_cache.contains_key(&job),
+                        pending_commit=self.pending_control_commits.contains(&job), transition=self.record_transitions.contains(&job),
+                        retirement=self.retiring_writers.contains_key(&job), projection=self.projection_transition,
+                        replacement_pending, deferred=self.deferred_replacements.len(), "export fence diagnostic");
+                }
                 let result = if exportable {
                     self.state.job(job).cloned().map(Box::new)
                 } else {

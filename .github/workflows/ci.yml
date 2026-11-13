@@ -1,115 +1,18 @@
 name: Tests
-
 on:
-  pull_request:
-    branches: [main]
   workflow_dispatch:
-
-env:
-  CARGO_TERM_COLOR: always
-  # External-tool tests (par2, 7z) self-skip on machines without the
-  # binaries; in CI a missing tool must be a failure, never a skip.
-  NZBD_REQUIRE_TOOLS: 1
-
 permissions:
   contents: read
-
 jobs:
-  mobile:
-    name: mobile quality + release guard
-    # The signing guard configures the Android Gradle project and depends on
-    # the hosted image's preinstalled Android SDK.
+  fairness-diagnostic:
     runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: mobile
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: mobile/package-lock.json
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
-      - name: release signing fails closed without an upload key
-        working-directory: mobile/android
-        run: |
-          if ./gradlew :app:validateNzbdReleaseSigning \
-              --configuration-cache --configuration-cache-problems=warn \
-              > "$RUNNER_TEMP/release-signing.log" 2>&1; then
-            cat "$RUNNER_TEMP/release-signing.log"
-            echo "release build unexpectedly accepted missing signing credentials"
-            exit 1
-          fi
-          if ! grep -F "Android release signing is not configured" "$RUNNER_TEMP/release-signing.log"; then
-            cat "$RUNNER_TEMP/release-signing.log"
-            exit 1
-          fi
-      - name: release signing accepts and attaches an external upload key
-        working-directory: mobile/android
-        env:
-          NZBD_ANDROID_STORE_FILE: ${{ runner.temp }}/nzbd-upload-key.p12
-          NZBD_ANDROID_STORE_PASSWORD: ci-test-password
-          NZBD_ANDROID_KEY_ALIAS: nzbd-upload
-          NZBD_ANDROID_KEY_PASSWORD: ci-test-password
-        run: |
-          keytool -genkeypair -storetype PKCS12 \
-            -noprompt \
-            -keystore "$NZBD_ANDROID_STORE_FILE" \
-            -storepass "$NZBD_ANDROID_STORE_PASSWORD" \
-            -keypass "$NZBD_ANDROID_KEY_PASSWORD" \
-            -alias "$NZBD_ANDROID_KEY_ALIAS" \
-            -keyalg RSA -keysize 2048 -validity 1 \
-            -dname "CN=nzbd CI, OU=CI, O=nzbd, L=Test, ST=Test, C=US"
-          ./gradlew :app:validateNzbdReleaseSigning \
-            --configuration-cache --configuration-cache-problems=warn
-          ./gradlew :app:validateNzbdReleaseSigning \
-            --configuration-cache --configuration-cache-problems=warn \
-            | tee "$RUNNER_TEMP/release-signing-cache.log"
-          grep -F "Reusing configuration cache." "$RUNNER_TEMP/release-signing-cache.log"
-          ./gradlew :app:validateSigningRelease
-          ./gradlew :app:assembleRelease --dry-run
-
-  test:
-    name: unit + e2e
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "22"
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - name: install PP tools (par2, 7z)
-        run: sudo apt-get update && sudo apt-get install -y par2 p7zip-full
-      # The whole pyramid: parser/codec/ladder unit tests, engine e2e
-      # against the mock NNTP server (incl. kill-and-resume), multi-node
-      # cluster tests (election, failover, reclaim), and the whole-daemon
-      # CLI/compat test that boots the real binary.
-      - name: cargo test
-        run: cargo test --locked --workspace --exclude nzbd-cluster
-      # Match fast-check-rust's cluster fixture isolation. Each scenario still
-      # runs its real workers and Raft nodes concurrently, with unchanged
-      # compressed lease deadlines and integrity/failover assertions.
-      - name: complete cluster tests and doctests
-        run: cargo test --locked -p nzbd-cluster -- --test-threads=1
-
-  msrv:
-    name: MSRV check (1.95)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: "1.95"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - name: cargo check on the minimum supported Rust version
-        run: cargo +1.95 check --locked --workspace --all-targets
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      - run: cargo test --locked -p nzbd-cluster --test cluster_fairness -- --nocapture

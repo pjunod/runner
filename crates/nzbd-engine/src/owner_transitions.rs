@@ -1944,6 +1944,9 @@ impl Owner {
 
     /// One classification path for boot, import and both authority adoptions.
     pub(super) fn queue_payload_recovery(&mut self, job: JobId) {
+        if job.0 <= 3 {
+            tracing::warn!(target:"nzbd_engine::verification_diag",job=job.0,needs=self.state.job(job).is_some_and(needs_payload), pending=self.pending_control_commits.contains(&job), allocating=self.allocating_jobs.contains(&job),ticket=?self.verification.get(&job).map(|s|(s.generation,s.phase.as_str(),s.running)),"queue payload recovery diagnostic");
+        }
         if !self.state.job(job).is_some_and(needs_payload) {
             return;
         }

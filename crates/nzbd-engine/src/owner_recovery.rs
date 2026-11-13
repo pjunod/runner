@@ -925,6 +925,7 @@ impl Owner {
             state.running = false;
         }
         self.persist_then(move |owner,committed| {
+            if job.0 <= 3 {tracing::warn!(target:"nzbd_engine::verification_diag",job=job.0,generation,committed,current=?owner.job_epochs.get(&job),ticket=?owner.verification.get(&job).map(|s|(s.generation,s.phase.as_str())),"verification snapshot ack diagnostic");}
             if owner.job_epochs.get(&job)!=Some(&generation)
                 || !owner.verification.get(&job).is_some_and(|state|state.generation==generation && state.phase=="saving") {return;}
             if !committed {
