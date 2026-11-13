@@ -62,13 +62,7 @@ jobs:
       - name: Restore vendored crates to registry provenance
         run: scripts/vendor-audit-lock --output target/vendor-audit/Cargo.lock
       - name: Audit workspace and vendored release identities
-        # The repository exception contract freezes these exact identifiers,
-        # dependency paths, and feature sets before this job. cargo-audit does
-        # not read deny.toml, so keep its invocation aligned explicitly.
-        run: >-
-          cargo audit --file target/vendor-audit/Cargo.lock
-          --ignore RUSTSEC-2026-0194
-          --ignore RUSTSEC-2026-0195
+        run: cargo audit --file target/vendor-audit/Cargo.lock
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # 3c6349835b2b7b196a839186cb8b78e02f7b5f25
         with:
           rust-version: "1.95"

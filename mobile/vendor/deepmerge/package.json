@@ -1,0 +1,8 @@
+{
+  "name": "deepmerge",
+  "version": "4.3.1",
+  "private": true,
+  "main": "index.cjs",
+  "license": "MIT",
+  "description": "deepmerge 4.3.1 with local safe own-property writes; see UPSTREAM.json"
+}

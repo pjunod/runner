@@ -1,0 +1,18 @@
+From: runner maintainers
+Subject: [PATCH] upnp: require fixed quick-xml 0.41
+
+Resolve RUSTSEC-2026-0194 and RUSTSEC-2026-0195 without enabling
+UPnP. Keep the serialize API and upstream license unchanged.
+
+diff --git a/crates/upnp/Cargo.toml b/crates/upnp/Cargo.toml
+--- a/crates/upnp/Cargo.toml
++++ b/crates/upnp/Cargo.toml
+@@ -22,7 +22,7 @@
+ network-interface = { version = "2" }
+ httparse = "1.9.4"
+ bstr = "1.10.0"
+-quick-xml = { version = "0.37.1", features = ["serialize"] }
++quick-xml = { version = "0.41.0", features = ["serialize"] }
+ 
+ [dev-dependencies]
+ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

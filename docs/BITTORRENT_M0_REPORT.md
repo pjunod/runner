@@ -1,5 +1,13 @@
 # BitTorrent M0 report — maintained rqbit v8.1.1 closes the engine boundary
 
+**Security amendment, 2026-11-13:** maintained patch
+[`0023-upgrade-upnp-xml-parser.patch`](../contrib/rqbit/0023-upgrade-upnp-xml-parser.patch)
+upgrades the compiled UPnP helper to fixed quick-xml 0.41 and removes both
+XML advisory exceptions. UPnP remains unavailable. Earlier exception tables
+and native matrix measurements below record historical evidence; the
+[gate 9 advisory scope](BITTORRENT_GATE9_REVIEW.md#2-advisory-scope--fixed-parser-no-rustsec-exceptions)
+is authoritative for the updated dependency policy.
+
 **Status:** all eleven gates pass locally and on the native matrix; independent
 review complete; remaining M2 slices tracked by #154–#160 with activation owned
 solely by #163; daemon wiring remains disabled ·

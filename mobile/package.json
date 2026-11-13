@@ -36,10 +36,15 @@
     "test:watch": "jest --watch",
     "doctor": "expo-doctor",
     "export": "expo export --platform all",
-    "postinstall": "patch-package --error-on-fail"
+    "postinstall": "patch-package --error-on-fail && npm run test:dependency-security",
+    "test:dependency-security": "node --test vendor/deepmerge/regressions.cjs"
   },
   "overrides": {
-    "uuid": "11.1.1"
+    "uuid": "11.1.1",
+    "@expo/fingerprint": {
+      "minimatch": "^11.0.5"
+    },
+    "deepmerge": "file:vendor/deepmerge"
   },
   "expo": {
     "doctor": {
