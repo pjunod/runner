@@ -40,7 +40,7 @@ jobs:
         run: ${{ matrix.setup }}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Build
-        run: cargo build --release -p nzbd --target ${{ matrix.target }}
+        run: cargo build --locked --release -p nzbd --target ${{ matrix.target }}
       - name: Package
         run: |
           cd target/${{ matrix.target }}/release
