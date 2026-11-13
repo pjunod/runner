@@ -44,6 +44,10 @@ pub fn router() -> Router<ApiState> {
             "/api/v1/artifact-operations/{id}/abandon-relocation",
             post(abandon_relocation),
         )
+        .route(
+            "/api/v1/artifacts/{id}/cleanup-review",
+            get(cleanup_review).post(accept_cleanup_review),
+        )
         .route("/api/v1/artifacts/{id}/inspect", post(inspect))
         .route("/api/v1/artifacts/{id}/adopt", post(adopt))
         .route(
@@ -321,6 +325,40 @@ async fn operation(State(st): State<ApiState>, Path(id): Path<String>) -> Respon
 async fn cancel(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
     let db = st.engine.artifacts();
     work(move || db.cancel_delete(&id)).await
+}
+async fn cleanup_review(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
+    if let Err(response) = validate_artifact_role(&st, &id) {
+        return response;
+    }
+    let db = st.engine.artifacts();
+    work(move || db.preview_cleanup_review(&id)).await
+}
+#[derive(Deserialize)]
+struct AcceptCleanupReview {
+    revision: u64,
+    generation: String,
+    fingerprint: String,
+    acknowledged: bool,
+}
+async fn accept_cleanup_review(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<AcceptCleanupReview>,
+) -> Response {
+    if let Err(response) = validate_artifact_role(&st, &id) {
+        return response;
+    }
+    let db = st.engine.artifacts();
+    work(move || {
+        db.accept_cleanup_review(
+            &id,
+            body.revision,
+            &body.generation,
+            &body.fingerprint,
+            body.acknowledged,
+        )
+    })
+    .await
 }
 async fn inspect(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
     let db = st.engine.artifacts();
@@ -700,6 +738,68 @@ mod tests {
     async fn response_json(response: axum::response::Response) -> serde_json::Value {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cleanup_review_api_requires_acknowledged_current_evidence_and_never_deletes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("dest");
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            tmp.path().join("state"),
+            root.clone(),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("review-payload");
+        let db = engine.artifacts();
+        db.allocate(900, &root, &path).unwrap();
+        std::fs::write(path.join("media.mkv"), b"original").unwrap();
+        let a = db.finish(900, &path, &root, "parked_failed").unwrap();
+        let operation = db
+            .request_delete(&a.id, a.revision, "api-review-delete", 0)
+            .unwrap();
+        std::fs::write(path.join("media.mkv"), b"changed bytes").unwrap();
+        assert_eq!(db.execute_delete(&operation.id).unwrap().state, "review");
+        let (status, preview) = get(
+            &engine,
+            &format!("/api/v1/artifacts/{}/cleanup-review", a.id),
+        )
+        .await;
+        assert_eq!(status, 200);
+        for acknowledged in [false, true] {
+            let body = serde_json::json!({"revision":preview["revision"],"generation":preview["generation"],"fingerprint":preview["fingerprint"],"acknowledged":acknowledged});
+            let response = crate::router(engine.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/artifacts/{}/cleanup-review", a.id))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if acknowledged {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CONFLICT
+                }
+            );
+        }
+        let accepted = db.get(&a.id).unwrap();
+        assert_ne!(accepted.generation, a.generation);
+        assert!(accepted.keep);
+        assert_eq!(accepted.state, "retained");
+        assert_eq!(
+            std::fs::read(path.join("media.mkv")).unwrap(),
+            b"changed bytes"
+        );
     }
 
     #[test]
