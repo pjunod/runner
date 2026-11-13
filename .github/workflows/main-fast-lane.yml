@@ -121,6 +121,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - name: Audit installed mobile dependencies
+        run: npm audit --audit-level=low
 
   gate:
     name: Main promotion gate
