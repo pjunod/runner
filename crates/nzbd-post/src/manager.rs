@@ -9558,7 +9558,10 @@ mod decision_tests {
             ))),
             PostError::Io(std::io::Error::from_raw_os_error(libc::EROFS)),
             PostError::Subprocess(
-                "restore /processing/x -> /processing/y: Transport endpoint is not connected (os error 107)".into(),
+                format!(
+                    "restore /processing/x -> /processing/y: Transport endpoint is not connected (os error {})",
+                    libc::ENOTCONN
+                ),
             ),
             PostError::Io(std::io::Error::from_raw_os_error(libc::EIO)),
             PostError::Artifact(nzbd_state::artifacts::Error::Io(
