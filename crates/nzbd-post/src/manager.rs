@@ -8901,6 +8901,12 @@ mod decision_tests {
             vec![("monarr-transfer".into(), "mixed-token".into())],
         );
         request.delivery_lifecycle = true;
+        // This fixture tests a kept failed source. The closed-scope policy
+        // deliberately disposes all unpublished bytes of an unkept failure.
+        request
+            .params
+            .push(("*Runner:KeepOnFailure".into(), "1".into()));
+        inventory.set_keep_on_failure(request.id.0, true).unwrap();
         let fake = temp.path().join("failed-par-tool");
         std::fs::write(
             &fake,
@@ -8997,8 +9003,18 @@ mod decision_tests {
                 && outcome.outcome == "retained_processing"
                 && outcome.repair_dependency));
         assert!(source.join("set.par2").exists());
-        assert!(source.join("episode-02.en.srt").exists());
-        assert!(!source.join("readme.txt").exists());
+        // Sidecars publish alongside the independent good payload; source
+        // retention keeps unresolved repair input, not a second sidecar copy.
+        assert_eq!(
+            std::fs::read(salvage.published_path.join("episode-02.en.srt")).unwrap(),
+            b"subtitle for retained episode"
+        );
+        assert!(outcomes
+            .iter()
+            .any(|outcome| outcome.source_path == "episode-02.en.srt"
+                && outcome.outcome == "published"));
+        // Keep-on-failure also preserves incidental input, not just PAR data.
+        assert!(source.join("readme.txt").exists());
         std::fs::remove_dir_all(&salvage.published_path).unwrap();
         let verify = std::process::Command::new("par2")
             .args([
