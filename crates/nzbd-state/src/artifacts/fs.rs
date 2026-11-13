@@ -929,7 +929,17 @@ pub fn manifest(dir: &File, limit: usize) -> Result<Vec<FileEntry>> {
                 .to_owned();
             // Opening a directory as a regular descriptor is allowed. Symlinks
             // are refused by O_NOFOLLOW, special files by the metadata check.
-            let child = open_at(dir, Path::new(&n), false)?;
+            let child = match open_at(dir, Path::new(&n), false) {
+                // A single relative component plus O_NOFOLLOW makes ELOOP a
+                // refused symlink, not a transient storage failure. Classify
+                // it like other unsupported namespace entries so closed-scope
+                // disposal can unlink the name without following its target.
+                #[cfg(unix)]
+                Err(Error::Io(error)) if error.raw_os_error() == Some(libc::ELOOP) => {
+                    return Err(Error::Conflict(format!("symlink: {display}")));
+                }
+                result => result?,
+            };
             let meta = child.metadata()?;
             if !meta.is_file() && !meta.is_dir() {
                 return Err(Error::Conflict(format!("special file: {display}")));
@@ -1413,6 +1423,28 @@ mod exclusive_tests {
 
 #[cfg(all(test, unix))]
 mod remove_tree_tests {
+    #[test]
+    fn manifest_classifies_a_lone_symlink_as_a_namespace_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = tmp.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, b"never follow this").unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("link")).unwrap();
+        let dir = super::open_dir(&tree).unwrap();
+        assert!(matches!(
+            super::manifest(&dir, 100),
+            Err(super::Error::Conflict(_))
+        ));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"never follow this");
+        assert!(tree
+            .join("link")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
     use super::*;
     use std::os::unix::ffi::OsStrExt;
 
