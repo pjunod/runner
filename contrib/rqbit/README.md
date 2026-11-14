@@ -196,4 +196,9 @@ matching schemas/configurations. A replacement needs an explicit data-format
 migration and cross-version recovery proof; this patch preserves those bytes
 and keeps the notices visible. Optional stock rqbit CLI/UI and unselected
 Hiqlite feature graphs remain provenance snapshots, separately inventoried
-from the shipped product and executed compatibility-test graphs.
+from the shipped product and maintained compatibility-test graphs. Optional
+contribution probes still test separately fetched upstream sources; their CLI
+compile checks retain every other upstream default integration feature (including
+TLS/Postgres and current-main Prometheus) while disabling the unrelated
+stock web UI/npm build hook. These probes do not establish a clean audit of
+every upstream feature or replace the maintained engine proofs.

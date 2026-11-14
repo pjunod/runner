@@ -657,8 +657,11 @@ Raft/WAL encodings are unchanged: the 3.0.0 package is a compile-error
 retirement marker, and replacing it with another serializer would require
 schema/configuration and cross-version migration proof. Optional stock CLI/
 UI and unselected vendor-feature snapshots are inventoried separately from
-actual product and executed CI graphs; their presence is not described as a
-fixed or supported runtime. No advisory suppression is introduced.
+actual product and maintained compatibility graphs; their presence is not
+described as a fixed or supported runtime. Optional contribution probes
+compile the CLI without its unrelated stock web UI/npm hook and still target
+independent upstream sources, with their own upstream limitations. No
+advisory suppression is introduced.
 
 ### 4.4 Consequences
 
