@@ -22,6 +22,11 @@ for name, fixture in reference["peer"].items():
 (folder / "overflowing-bencode-length").write_bytes(
     bytes([0, 0, 0, 71, 20, 66]) + b"lllllll" + b"0" * 39 + b"18446744073709551615:l\xa3"
 )
+# Regression seed: an unknown extended message of nested list openers
+# recursed until the stack overflowed (patch 0027).
+(folder / "deep-bencode-nesting").write_bytes(
+    (2 + 4096).to_bytes(4, "big") + bytes([20, 200]) + b"l" * 4096
+)
 data = bytes.fromhex(reference["keys_hex"])
 folder = root / "key_bundle"
 (folder / "legacy-native-keys").write_bytes(data)

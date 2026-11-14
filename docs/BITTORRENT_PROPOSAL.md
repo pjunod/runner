@@ -692,9 +692,13 @@ The bounded peer-protocol fuzzer added with this renewal found a latent upstream
 decoder defect: a peer-supplied bencode byte-string length near `usize::MAX`
 overflowed the end-offset addition in `parse_bytes`. Debug and fuzz builds
 panicked; release builds wrapped and failed only by accident of slice bounds.
-Patch 0026 uses checked addition and returns an ordinary decode error, bringing
-the canonical series to seventeen. The crash input is a permanent fuzz seed and
-a named unit proof in the maintained derivation.
+Patch 0026 uses checked addition and returns an ordinary decode error. Review
+of that fix found the same decoder recursed once per list/dict opener with no
+limit, and extended messages with an unknown id decode peer bytes into the
+recursive `BencodeValue`: one frame of openers overflowed the stack and aborted
+the process. Patch 0027 bounds nesting at 64 levels, bringing the canonical
+series to eighteen. Both inputs are permanent fuzz seeds and named unit proofs
+in the maintained derivation.
 
 
 ### 4.4 Consequences

@@ -6,7 +6,7 @@ readonly series_file="$repository_root/contrib/rqbit/maintained-series.txt"
 readonly checksum_file="$repository_root/contrib/rqbit/upstream-v8.1.1.sha256"
 readonly vendor_dir="$repository_root/contrib/rqbit/vendor"
 readonly upstream_url="https://github.com/ikatson/rqbit/archive/refs/tags/v8.1.1.tar.gz"
-readonly expected_series=$'0001-allow-persistence-without-auto-restore.patch\n0005-bound-tracker-requests.patch\n0007-bound-session-peers.patch\n0009-bound-pending-incoming-handshakes.patch\n0010-bound-known-peer-records.patch\n0012-bound-peer-response-backlog.patch\n0014-bound-discovery-pressure.patch\n0016-limit-peer-metadata-before-allocation.patch\n0018-propagate-file-sizing-errors.patch\n0019-disable-peer-exchange.patch\n0020-expose-test-only-dht-bootstrap.patch\n0021-configurable-client-identity-and-announce-lifecycle.patch\n0022-read-only-piece-verifier.patch\n0023-upgrade-upnp-xml-parser.patch\n0024-replace-unmaintained-retry-and-sha1-backends.patch\n0025-maintained-peer-codec.patch\n0026-reject-overflowing-bencode-lengths.patch'
+readonly expected_series=$'0001-allow-persistence-without-auto-restore.patch\n0005-bound-tracker-requests.patch\n0007-bound-session-peers.patch\n0009-bound-pending-incoming-handshakes.patch\n0010-bound-known-peer-records.patch\n0012-bound-peer-response-backlog.patch\n0014-bound-discovery-pressure.patch\n0016-limit-peer-metadata-before-allocation.patch\n0018-propagate-file-sizing-errors.patch\n0019-disable-peer-exchange.patch\n0020-expose-test-only-dht-bootstrap.patch\n0021-configurable-client-identity-and-announce-lifecycle.patch\n0022-read-only-piece-verifier.patch\n0023-upgrade-upnp-xml-parser.patch\n0024-replace-unmaintained-retry-and-sha1-backends.patch\n0025-maintained-peer-codec.patch\n0026-reject-overflowing-bencode-lengths.patch\n0027-bound-bencode-nesting-depth.patch'
 readonly expected_vendor_entries=$'LICENSE\nREADME.md\ncrates'
 
 if [[ "$(<"$series_file")" != "$expected_series" ]]; then
@@ -152,8 +152,13 @@ check_retry_and_sha1() (
   cargo test --locked -p librqbit-peer-protocol --lib --no-default-features --features sha1-ring
   readonly bencode_test='serde_bencode_de::length_overflow_tests::byte_string_length_overflowing_the_buffer_offset_is_an_error'
   bencode_tests="$(cargo test --locked -p librqbit-bencode --lib --no-default-features --features sha1-ring -- --list)"
-  grep -Fxq "$bencode_test: test" <<<"$bencode_tests" || { echo "missing bencode length-overflow proof" >&2; exit 1; }
-  cargo test --locked -p librqbit-bencode --lib --no-default-features --features sha1-ring "$bencode_test" -- --exact
+  for exact_test in \
+    "$bencode_test" \
+    serde_bencode_de::nesting_depth_tests::nesting_at_the_limit_decodes_and_one_deeper_is_an_error \
+    serde_bencode_de::nesting_depth_tests::hostile_nesting_is_rejected_on_a_small_stack; do
+    grep -Fxq "$exact_test: test" <<<"$bencode_tests" || { echo "missing bencode decoder proof: $exact_test" >&2; exit 1; }
+  done
+  cargo test --locked -p librqbit-bencode --lib --no-default-features --features sha1-ring serde_bencode_de::
 )
 
 if [[ "${RQBIT_SERIES_RETRY_SHA1_ONLY:-0}" == "1" ]]; then

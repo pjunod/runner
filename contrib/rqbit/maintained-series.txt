@@ -15,3 +15,4 @@
 0024-replace-unmaintained-retry-and-sha1-backends.patch
 0025-maintained-peer-codec.patch
 0026-reject-overflowing-bencode-lengths.patch
+0027-bound-bencode-nesting-depth.patch

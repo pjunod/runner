@@ -2,7 +2,7 @@
 
 **Status:** active single-node BitTorrent engine · **Upstream base:**
 rqbit v8.1.1, commit `00b97485160ff5b5aa2b379ea0815d568ec665f0` ·
-**Stable patch delta:** exactly seventeen ordered patches ·
+**Stable patch delta:** exactly eighteen ordered patches ·
 **Production daemon:** starts it only when `[torrent].enabled = true`
 
 Companion to
@@ -52,6 +52,8 @@ The maintained series is:
 | 16 | `0025-maintained-peer-codec.patch` | Select maintained Fugue bincode 1 with independent legacy peer bytes, error outcomes, native platform and fuzz proofs; preserve framing and encoding configuration. |
 
 | 17 | `0026-reject-overflowing-bencode-lengths.patch` | Return a decode error, not an arithmetic overflow, when a peer-supplied bencode byte-string length overflows the buffer offset; found by the bounded peer-protocol fuzzer. |
+
+| 18 | `0027-bound-bencode-nesting-depth.patch` | Reject bencode list/dict nesting deeper than 64 levels so a peer frame of nested openers cannot overflow the decoding stack and abort the process. |
 
 The checked-in [`vendor/`](vendor/) tree is generated from those inputs. It
 contains the derived upstream `LICENSE`, `README.md`, and `crates/` tree needed

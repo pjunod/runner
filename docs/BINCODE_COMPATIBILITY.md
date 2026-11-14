@@ -27,7 +27,7 @@ forks honestly. No advisory is ignored or dismissed.
 Fugue's registry metadata retains an older upstream repository URL; the release
 commit linked above and the checksum in the lockfile identify the reviewed
 source. Patch `0025-maintained-peer-codec.patch` records the peer dependency and
-upstream lock change. The immutable rqbit archive, ordered seventeen-patch series
+upstream lock change. The immutable rqbit archive, ordered eighteen-patch series
 and byte-for-byte vendor derivation remain mandatory.
 
 [Vendored Cryptr](../vendor/cryptr/) comes from the checksum-verified 0.10.0
