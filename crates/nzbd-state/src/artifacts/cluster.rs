@@ -277,7 +277,97 @@ impl Inventory {
                 "cluster cleanup belongs to another storage instance".into(),
             ));
         }
-        let mut artifact = self.get(&copy.publication.artifact)?;
+        let artifact = self.get(&copy.publication.artifact)?;
+        self.retire_cluster_artifact_copy_from_observation(
+            copy,
+            outcome,
+            proof,
+            unusable,
+            raw_files,
+            explicit_cancellation,
+            result,
+            artifact,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn retire_cluster_artifact_copy_from_observation(
+        &self,
+        copy: &ClusterArtifactCopy,
+        outcome: &str,
+        proof: FinalizationProof,
+        unusable: bool,
+        raw_files: Option<&[DeliveryFile]>,
+        explicit_cancellation: bool,
+        result: Option<&str>,
+        artifact: Artifact,
+    ) -> Result<ClusterCopyCleanup> {
+        let first = self.retire_cluster_artifact_copy_once(
+            copy,
+            outcome,
+            proof.clone(),
+            unusable,
+            raw_files,
+            explicit_cancellation,
+            result,
+            artifact,
+        );
+        let stale_filesystem = match &first {
+            Ok(result) => {
+                result.status == "retained"
+                    && result
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.starts_with("review required: raw "))
+            }
+            Err(Error::Io(error)) => error.kind() == std::io::ErrorKind::NotFound,
+            _ => false,
+        };
+        if stale_filesystem {
+            // A separate authorized disposal can finish after our initial
+            // artifact read and before the raw manifest scan. Serialize this
+            // observation with actual inventory mutations, then re-enter the
+            // complete policy once using its durable terminal state. A live,
+            // changed or unowned source never gains deletion authority here.
+            let current = {
+                let _guard = self.mutation_guard()?;
+                self.get(&copy.publication.artifact)?
+            };
+            if current.terminal() && current.generation == copy.publication.generation {
+                return self.retire_cluster_artifact_copy_once(
+                    copy,
+                    outcome,
+                    proof,
+                    unusable,
+                    raw_files,
+                    explicit_cancellation,
+                    result,
+                    current,
+                );
+            }
+        }
+        first
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn retire_cluster_artifact_copy_once(
+        &self,
+        copy: &ClusterArtifactCopy,
+        outcome: &str,
+        proof: FinalizationProof,
+        unusable: bool,
+        raw_files: Option<&[DeliveryFile]>,
+        explicit_cancellation: bool,
+        result: Option<&str>,
+        mut artifact: Artifact,
+    ) -> Result<ClusterCopyCleanup> {
+        if copy.storage_instance_id != self.installation
+            || !matches!(proof, FinalizationProof::Cluster { .. })
+        {
+            return Err(Error::Conflict(
+                "cluster cleanup belongs to another storage instance".into(),
+            ));
+        }
         let predecessor = if artifact.job.is_none() && outcome == "SUCCESS" && !copy.selected {
             match result {
                 Some(result) => self.cluster_materialized_predecessor(copy, result)?,
@@ -1390,6 +1480,67 @@ mod tests {
             "removed"
         );
         assert!(!source.exists());
+    }
+
+    #[test]
+    fn raw_retirement_acknowledges_a_concurrent_exact_durable_delete() {
+        let (_temp, inventory, source, copy) = fixture();
+        let expected = raw_seal();
+        inventory
+            .accept_cluster_completion(&copy.publication, "SUCCESS", proof())
+            .unwrap();
+        let stale = inventory.get(&copy.publication.artifact).unwrap();
+        inventory
+            .finish(copy.job_id, &source, source.parent().unwrap(), "completed")
+            .unwrap();
+        let ready = inventory.get(&copy.publication.artifact).unwrap();
+        inventory
+            .request_delete(&ready.id, ready.revision, "concurrent-local-disposal", 0)
+            .unwrap();
+        let deleted = inventory
+            .execute_delete("concurrent-local-disposal")
+            .unwrap();
+        assert_eq!(deleted.state, "succeeded");
+        assert!(!source.exists());
+        let result = inventory
+            .retire_cluster_artifact_copy_from_observation(
+                &copy,
+                "SUCCESS",
+                proof(),
+                false,
+                Some(&expected),
+                false,
+                None,
+                stale.clone(),
+            )
+            .unwrap();
+        assert_eq!(result.status, "removed", "{result:?}");
+        // The old allocation's tombstone cannot authorize deleting bytes
+        // subsequently created at that path by another owner.
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("manual.pdf"), b"new unrelated bytes").unwrap();
+        let result = inventory.retire_cluster_artifact_copy_from_observation(
+            &copy,
+            "SUCCESS",
+            proof(),
+            false,
+            Some(&expected),
+            false,
+            None,
+            stale,
+        );
+        assert!(
+            matches!(result, Err(Error::Conflict(reason)) if reason == "payload identity changed; review required")
+        );
+        assert_eq!(
+            std::fs::read(source.join("manual.pdf")).unwrap(),
+            b"new unrelated bytes"
+        );
+
+        assert_eq!(
+            inventory.get(&copy.publication.artifact).unwrap().state,
+            "deleted"
+        );
     }
 
     #[test]
