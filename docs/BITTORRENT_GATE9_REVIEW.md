@@ -4,7 +4,7 @@
 refreshed native measurements pass; independent review complete ·
 **Date:** 2026-08-07 · **Disposition and amendment recorded:** 2026-08-14 ·
 **Accepted:** 2026-08-14 · **Status reconciled:** 2026-08-22 ·
-**Engine:** rqbit v8.1.1 archive plus the canonical fifteen-patch maintained series ·
+**Engine:** rqbit v8.1.1 archive plus the canonical sixteen-patch maintained series ·
 **Decision owner:** ADR-19 in
 [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
@@ -57,8 +57,10 @@ The immutable archive and resource/admission boundaries remain unchanged.
 Patch 0024 removes unmaintained generic retry/clock and optional hash
 libraries while preserving retry timing, BitTorrent SHA-1 outputs and the
 production AWS-LC selection. Native timing/hash/wire proofs are added to M0;
-its resource, storage, discovery and fuzz gates remain required. Bincode's
-unmaintained notices and unused provenance snapshots stay explicit. Current
+its resource, storage, discovery and fuzz gates remain required. The subsequent [serialization renewal](BINCODE_COMPATIBILITY.md) adds patch 0025
+and replaces real bincode consumers with maintained forks using independent
+legacy byte/error, mixed-version and recovery proofs. Unused provenance
+snapshots and the deliberate legacy validation oracle stay explicit. Current
 source derivation, scoped graph audits and protected checks renew the evidence;
 historical measurements above remain historical, rather than being relabeled.
 

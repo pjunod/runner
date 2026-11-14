@@ -13,3 +13,4 @@
 0022-read-only-piece-verifier.patch
 0023-upgrade-upnp-xml-parser.patch
 0024-replace-unmaintained-retry-and-sha1-backends.patch
+0025-maintained-peer-codec.patch

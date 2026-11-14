@@ -1,0 +1,94 @@
+name: Bincode compatibility
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - vendor/**
+      - contrib/rqbit/**
+      - contrib/cryptr/**
+      - scripts/bincode-compatibility/**
+      - .github/workflows/bincode-compatibility.yml
+  push:
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - vendor/**
+      - contrib/rqbit/**
+      - contrib/cryptr/**
+      - scripts/bincode-compatibility/**
+      - .github/workflows/bincode-compatibility.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cross-version:
+    name: codec bytes and recovery (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            runner: ubuntu-24.04
+            python: python3
+            profile: sqlite
+          - name: macos
+            runner: macos-latest
+            python: python3
+            profile: sqlite
+          - name: windows
+            runner: windows-latest
+            python: python
+            profile: sqlite
+          - name: linux-cache-backup
+            runner: ubuntu-24.04
+            python: python3
+            profile: cache-backup
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      RUSTUP_TOOLCHAIN: "1.95"
+      CARGO_HOME: ${{ runner.temp }}/runner-cargo-home
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      COMPAT_WORK: ${{ runner.temp }}/runner-bincode-compatibility
+    steps:
+      - name: Preserve the independently frozen source bytes
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: bincode-compatibility-${{ matrix.name }}
+      - name: Build the independent prior implementation
+        shell: bash
+        run: ${{ matrix.python }} scripts/bincode-compatibility/build.py --work-root "$COMPAT_WORK" --side legacy --profile ${{ matrix.profile }}
+      - name: Build the candidate implementation
+        shell: bash
+        run: ${{ matrix.python }} scripts/bincode-compatibility/build.py --work-root "$COMPAT_WORK" --side candidate --profile ${{ matrix.profile }}
+      - name: Prove byte, error, mixed-version and recovery contracts
+        shell: bash
+        run: ${{ matrix.python }} scripts/bincode-compatibility/run.py --work-root "$COMPAT_WORK" --profile ${{ matrix.profile }}
+      - name: Preserve compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bincode-compatibility-${{ matrix.name }}
+          path: |
+            ${{ env.COMPAT_WORK }}/compatibility-report.json
+            ${{ env.COMPAT_WORK }}/*-dependency-graph.json
+            ${{ env.COMPAT_WORK }}/source-proof/provenance.json
+            ${{ env.COMPAT_WORK }}/*-snapshot-evidence.json
+            ${{ env.COMPAT_WORK }}/*-wal-replay-evidence.json
+            ${{ env.COMPAT_WORK }}/*-fixtures/*.json
+            ${{ env.COMPAT_WORK }}/*.stderr.log
+          if-no-files-found: error

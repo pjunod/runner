@@ -25,3 +25,7 @@ mod wal;
 pub mod writer;
 #[cfg(not(feature = "migration"))]
 mod writer;
+
+#[cfg(feature = "validation-test-helpers")]
+#[doc(hidden)]
+pub mod codec_compatibility;

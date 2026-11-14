@@ -7,6 +7,10 @@ on:
       - Makefile
       - Cargo.lock
       - crates/nzbd-torrent/**
+      - vendor/cryptr/**
+      - contrib/cryptr/**
+      - contrib/rqbit/**
+      - scripts/bincode-compatibility/**
       - fuzz/**
       - scripts/check-bittorrent-fuzz-deps.sh
       - .github/workflows/bittorrent-fuzz.yml
@@ -68,6 +72,12 @@ jobs:
           FUZZ_TARGET=x86_64-unknown-linux-gnu
           FUZZ_SECONDS=300
 
+      - name: Run bounded peer and key-bundle fuzzing
+        run: >-
+          make fuzz-codecs-run
+          FUZZ_TARGET=x86_64-unknown-linux-gnu
+          FUZZ_SECONDS=${{ github.event_name == 'schedule' && '300' || '60' }}
+
       - name: Upload reproducer on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -76,4 +86,6 @@ jobs:
           path: |
             fuzz/artifacts/metainfo_preflight/
             fuzz/artifacts/magnet_preflight/
+            fuzz/artifacts/peer_protocol/
+            fuzz/artifacts/key_bundle/
           if-no-files-found: ignore

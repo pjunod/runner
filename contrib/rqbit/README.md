@@ -2,7 +2,7 @@
 
 **Status:** active single-node BitTorrent engine · **Upstream base:**
 rqbit v8.1.1, commit `00b97485160ff5b5aa2b379ea0815d568ec665f0` ·
-**Stable patch delta:** exactly fifteen ordered patches ·
+**Stable patch delta:** exactly sixteen ordered patches ·
 **Production daemon:** starts it only when `[torrent].enabled = true`
 
 Companion to
@@ -48,6 +48,8 @@ The maintained series is:
 | 14 | `0023-upgrade-upnp-xml-parser.patch` | Require fixed XML parsing in both UPnP crates without enabling UPnP; lock compatible security fixes for maintained upstream proofs. |
 
 | 15 | `0024-replace-unmaintained-retry-and-sha1-backends.patch` | Replace generic unmaintained retry/clock dependencies with owned peer/bootstrap policies preserving symmetric jitter, caps, reset and elapsed deadlines; replace the optional legacy hash backend with RustCrypto SHA-1 while keeping the historical feature interface and production AWS-LC backend. |
+
+| 16 | `0025-maintained-peer-codec.patch` | Select maintained Fugue bincode 1 with independent legacy peer bytes, error outcomes, native platform and fuzz proofs; preserve framing and encoding configuration. |
 
 The checked-in [`vendor/`](vendor/) tree is generated from those inputs. It
 contains the derived upstream `LICENSE`, `README.md`, and `crates/` tree needed
@@ -188,28 +190,20 @@ The historical `sha1-crypto-hash` feature selects maintained RustCrypto
 macOS and Windows M0 jobs run the retry regressions and known SHA-1 vectors
 with both this backend and AWS-LC. The daemon continues to select AWS-LC.
 
-The unused bincode 2 declaration in librqbit is removed from the manifest and
-derived lockfile. Its library/all-target compilation and full tests pass
-without that dependency, and the fuzz graph no longer includes bincode 2.
-This does not replace a codec: peer serialization still uses bincode 1, and
-the product's Hiqlite persistence still uses bincode 2.
+The unused bincode 2 declaration in librqbit remains removed. Patch 0025 moves
+actual peer serialization from bincode 1.3.3 to the maintained Fugue 1.3.4 fork.
+Hiqlite/WAL and native Cryptr key encoding select GroveDB's maintained bincode 2
+fork. The production graph and independent oracle graph are distinct: the latter
+retains the real retired versions solely to prove unchanged bytes and recovery.
 
-Bincode 1.3.3 and 2.0.1 still carry RustSec's unmaintained notice. They encode
-peer protocol data and persisted Raft/WAL/state records using distinct fixed
-and variable integer configurations. The retired upstream package has no
-patched release; bincode 3.0.0 is a compile-error retirement marker. Community
-[bincode-next](https://github.com/Apich-Organization/bincode) and
-[bincode_reloaded](https://github.com/butlergroup/bincode_reloaded) 3.x forks
-exist. The former adds default SIMD and new formats/configurations; the latter
-changes Serde/error/derive dependencies. Neither is an independently validated
-replacement for this project's persisted and peer data. Wincode likewise
-promises compatibility only for matching schemas/configurations. A replacement
-must prove byte-for-byte encoding, decoding of existing records, malformed-input
-behavior and cross-version recovery; any differing format needs a migration.
-This patch preserves those bytes and keeps the notices visible instead of
-renaming a codec to silence them. Optional stock rqbit CLI/UI and unselected
-Hiqlite feature graphs remain provenance snapshots, separately inventoried
-from the shipped product and maintained compatibility-test graphs. Optional
+[The serialization contract](../../docs/BINCODE_COMPATIBILITY.md) records exact
+configurations, fork/archive provenance, public error/bounds behavior, frozen
+prior fixtures, actual bidirectional WAL/snapshot recovery, mixed-version cluster
+snapshot transfers, hosted native tests and parser fuzzing. No data format,
+migration, resource/admission budget or production backend changes. Optional
+stock rqbit CLI/UI and unselected Hiqlite snapshots retain separate provenance
+inventories; these are not a clean audit of every upstream feature.
+Optional
 contribution probes still test separately fetched upstream sources; their CLI
 compile checks retain every other upstream default integration feature (including
 TLS/Postgres and current-main Prometheus) while disabling the unrelated
