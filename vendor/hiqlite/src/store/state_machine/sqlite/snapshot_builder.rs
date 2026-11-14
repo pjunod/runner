@@ -394,7 +394,13 @@ pub(crate) async fn clear_pending_snapshot(path_snapshots: &str) -> StorageResul
 }
 
 pub(crate) async fn sync_file(path: &str) -> StorageResult<()> {
-    let file = fs::File::open(path)
+    // Windows flushes through FlushFileBuffers, which requires a handle with
+    // write access: syncing a read-only handle fails with "Access is denied"
+    // (os error 5). Unix fsync accepts either, so open for writing everywhere.
+    // This never creates or truncates; the file must already exist.
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
         .await
         .map_err(|error| StorageError::IO {
             source: StorageIOError::write_state_machine(&error),
