@@ -21,7 +21,8 @@ async fn dispatch(client: &Client, request: Value) -> Value {
         "metrics" => serde_json::to_value(client.metrics_db().await.unwrap()).unwrap(),
         "snapshot" => {
             let target = client.trigger_db_snapshot().await.unwrap();
-            tokio::time::timeout(Duration::from_secs(20), async {
+            let last = std::sync::Mutex::new(None);
+            let done = tokio::time::timeout(Duration::from_secs(20), async {
                 loop {
                     let m = client.metrics_db().await.unwrap();
                     if m.snapshot.is_some_and(|s| s.index >= target)
@@ -30,11 +31,19 @@ async fn dispatch(client: &Client, request: Value) -> Value {
                     {
                         break;
                     }
+                    *last.lock().unwrap() = Some(format!("{m:?}"));
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             })
-            .await
-            .unwrap();
+            .await;
+            // Report what stalled (snapshot, purge, or a fatal storage error in
+            // the Raft running state) instead of an opaque `Elapsed`.
+            if done.is_err() {
+                panic!(
+                    "snapshot {target} did not complete within 20s; last metrics: {}",
+                    last.lock().unwrap().as_deref().unwrap_or("none observed")
+                );
+            }
             json!({"snapshot_index":target})
         }
         "stage-unapplied" => {
