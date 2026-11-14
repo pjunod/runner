@@ -1179,9 +1179,10 @@ async fn work_poll(
     let snap = s.engine.snapshot();
     let mut grants = Vec::new();
     let post_first =
-        req.free_pp_slots > 0 && post_lane_first(&mut s.post_poll_turn.lock().unwrap(), &req.node);
+        req.free_pp_slots > 0 && post_lane_first(&s.post_poll_turn.lock().unwrap(), &req.node);
     if post_first {
         if let Some(grant) = grant_post_candidate(&s, &req, &snap).await {
+            record_poll_grant(&mut s.post_poll_turn.lock().unwrap(), &req.node, grant.kind);
             grants.push(grant);
             s.apply_local_budgets().await;
             return Json(PollResponse { grants }).into_response();
@@ -1247,6 +1248,7 @@ async fn work_poll(
                     .await
                 {
                     tracing::info!(job = job_id.0, file = scope.file_id, first = scope.first_article, last = scope.last_article, node = %req.node, "article range granted");
+                    record_poll_grant(&mut s.post_poll_turn.lock().unwrap(), &req.node, grant.kind);
                     grants.push(grant);
                     s.apply_local_budgets().await;
                     return Json(PollResponse { grants }).into_response();
@@ -1287,6 +1289,11 @@ async fn work_poll(
                         .await
                     {
                         tracing::info!(job = job_id.0, node = %req.node, "assembly lease granted");
+                        record_poll_grant(
+                            &mut s.post_poll_turn.lock().unwrap(),
+                            &req.node,
+                            grant.kind,
+                        );
                         grants.push(grant);
                         s.apply_local_budgets().await;
                         return Json(PollResponse { grants }).into_response();
@@ -1333,6 +1340,7 @@ async fn work_poll(
             .await
         {
             tracing::info!(job = job_id.0, node = %req.node, lease = %grant.lease_id, "download lease granted");
+            record_poll_grant(&mut s.post_poll_turn.lock().unwrap(), &req.node, grant.kind);
             grants.push(grant);
             s.apply_local_budgets().await;
             return Json(PollResponse { grants }).into_response();
@@ -1340,6 +1348,7 @@ async fn work_poll(
     }
 
     if let Some(grant) = grant_post_candidate(&s, &req, &snap).await {
+        record_poll_grant(&mut s.post_poll_turn.lock().unwrap(), &req.node, grant.kind);
         grants.push(grant);
     }
 
@@ -1491,12 +1500,21 @@ fn grant_intent_differences(local: &nzbd_types::Job, durable: &nzbd_types::Job) 
     differences
 }
 
-fn post_lane_first(turns: &mut HashSet<String>, node: &str) -> bool {
-    if turns.remove(node) {
-        false
-    } else {
-        turns.insert(node.to_owned());
-        true
+fn post_lane_first(turns: &HashSet<String>, node: &str) -> bool {
+    !turns.contains(node)
+}
+
+fn record_poll_grant(turns: &mut HashSet<String>, node: &str, kind: LeaseKind) {
+    // Keep the next turn until work is actually granted. Empty polls during
+    // export verification, lease retirement or a temporarily absent backlog
+    // must not consume Post's turn between two competing Download grants.
+    match kind {
+        LeaseKind::Post => {
+            turns.insert(node.to_owned());
+        }
+        LeaseKind::Download | LeaseKind::Segment | LeaseKind::Assemble => {
+            turns.remove(node);
+        }
     }
 }
 
@@ -6192,12 +6210,43 @@ mod tests {
     fn bounded_poll_alternates_download_and_post_backlogs() {
         let mut turns = HashSet::new();
         let lanes = (0..10)
-            .map(|_| post_lane_first(&mut turns, "busy-worker"))
+            .map(|_| {
+                let post = post_lane_first(&turns, "busy-worker");
+                record_poll_grant(
+                    &mut turns,
+                    "busy-worker",
+                    if post {
+                        LeaseKind::Post
+                    } else {
+                        LeaseKind::Download
+                    },
+                );
+                post
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             lanes,
             vec![true, false, true, false, true, false, true, false, true, false]
         );
-        assert!(post_lane_first(&mut turns, "independent-worker"));
+        assert!(post_lane_first(&turns, "independent-worker"));
+    }
+
+    #[test]
+    fn empty_polls_preserve_post_turn_after_a_download_grant() {
+        let mut turns = HashSet::new();
+        record_poll_grant(&mut turns, "worker", LeaseKind::Post);
+        assert!(!post_lane_first(&turns, "worker"));
+        record_poll_grant(&mut turns, "worker", LeaseKind::Download);
+        for _ in 0..12 {
+            assert!(post_lane_first(&turns, "worker"));
+        }
+        record_poll_grant(&mut turns, "worker", LeaseKind::Post);
+        assert!(!post_lane_first(&turns, "worker"));
+        for kind in [LeaseKind::Segment, LeaseKind::Assemble] {
+            record_poll_grant(&mut turns, "worker", kind);
+            assert!(post_lane_first(&turns, "worker"));
+            record_poll_grant(&mut turns, "worker", LeaseKind::Post);
+        }
+        assert!(post_lane_first(&turns, "independent-worker"));
     }
 }
