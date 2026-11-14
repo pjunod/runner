@@ -43,6 +43,9 @@ async fn checked_post_candidates(
 ) -> HashSet<JobId> {
     let snapshot = engine.snapshot();
     let mut ready = HashSet::new();
+    if snapshot.post_paused {
+        return ready;
+    }
     for summary in snapshot.jobs.iter().filter(|job| {
         matches!(job.status, JobStatus::Completed)
             && !job.pp_done
@@ -157,7 +160,11 @@ async fn start_node(
         download: mixed_worker,
         max_download_jobs: if mixed_worker { 8 } else { 0 },
         post_process: mixed_worker,
-        pp_slots: 1,
+        // Keep more than one Post slot available while an actual Post runs.
+        // The scheduler counts assigned Post jobs in this node's download
+        // load, so a single Post slot otherwise hides lane competition behind
+        // the active Post occupying that only slot.
+        pp_slots: 3,
         lease_interval: Duration::from_millis(100),
         takeover_after: Duration::from_millis(900),
         worker_ttl: Duration::from_secs(2),
@@ -320,6 +327,32 @@ async fn mixed_worker_grants_post_while_fast_downloads_keep_slots_and_backlog_av
         "authority elected",
     )
     .await;
+    // Build a real Post backlog through the public pause control first.
+    // Otherwise fast Post grants usually arrive while every download slot is
+    // occupied, which proves progress but never exercises competing lanes.
+    wait_for(
+        || {
+            let (status, body) = http(
+                &authority.url,
+                "POST",
+                "/api/v1/queue/actions/pause-post",
+                b"",
+            );
+            if status == 200 {
+                return true;
+            }
+            assert!(
+                status == 503
+                    && serde_json::from_str::<Value>(&body)
+                        .is_ok_and(|error| error["error"]
+                            == "queue authority is still being adopted; retry"),
+                "pause Post for readiness setup: {status}: {body}"
+            );
+            false
+        },
+        "pause Post after initial authority adoption",
+    )
+    .await;
     // No executor exists yet. Seed enough real jobs to keep the download lane
     // continuously runnable while several PP attempts complete on the same node.
     for index in 0..96 {
@@ -349,6 +382,49 @@ async fn mixed_worker_grants_post_while_fast_downloads_keep_slots_and_backlog_av
         }
     }
     let worker = start_node(tmp.path(), "mixed", true, provider.port(), seen.clone()).await;
+    wait_for(
+        || {
+            let completed = authority
+                .runtime
+                .engine
+                .snapshot()
+                .jobs
+                .iter()
+                .filter(|job| matches!(job.status, JobStatus::Completed) && !job.pp_done)
+                .count();
+            completed >= 4
+                && provider.total_hits() >= 8
+                && seen.lock().unwrap().polls.last().is_some_and(|poll| {
+                    poll.free_download_slots > 0
+                        && poll.free_pp_slots > 0
+                        && poll.queued_backlog > 0
+                })
+        },
+        "actual completed Post backlog and free competing lanes",
+    )
+    .await;
+    wait_for(
+        || {
+            let (status, body) = http(
+                &authority.url,
+                "POST",
+                "/api/v1/queue/actions/resume-post",
+                b"",
+            );
+            if status == 200 {
+                return true;
+            }
+            assert!(
+                status == 503
+                    && serde_json::from_str::<Value>(&body)
+                        .is_ok_and(|error| error["error"] == "queue_projection_unavailable"),
+                "resume Post for competing load: {status}: {body}"
+            );
+            false
+        },
+        "resume Post after existing projection verification",
+    )
+    .await;
     let history_path = tmp.path().join(".nzbd-cluster/history/history.mixed.jsonl");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     loop {
