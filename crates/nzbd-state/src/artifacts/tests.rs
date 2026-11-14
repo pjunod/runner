@@ -6020,6 +6020,19 @@ fn expiry_checkpoint_and_outbox_are_atomic_and_empty_reboot_stop_is_rejected() {
     let before = db.get(&source.id).unwrap();
     db.park_expired_worker_sources(&receipt).unwrap();
     assert_eq!(db.get(&source.id).unwrap().revision, before.revision);
+    let deadline = before.deadline;
+    db.note_worker_expiry_error(&receipt.sources[0], "second RPC reply lost")
+        .unwrap();
+    assert_eq!(
+        db.get(&source.id).unwrap().salvage.as_deref(),
+        Some("settled_none")
+    );
+    db.park_expired_worker_sources(&receipt).unwrap();
+    let acknowledged = db.get(&source.id).unwrap();
+    assert_eq!(acknowledged.deadline, deadline);
+    assert_eq!(acknowledged.salvage.as_deref(), Some("settled_none"));
+    assert!(!acknowledged.error.unwrap().contains("pending"));
+
     let (key, raw) = db.worker_expiry_outbox("").unwrap().pop().unwrap();
     db.finish_worker_expiry_outbox(&key, "joined; sources preserved")
         .unwrap();
@@ -6081,4 +6094,42 @@ fn hold_expired_blocks_replay_of_old_failed_delete_without_deleting_bytes() {
         std::fs::read(path.join("payload.bin")).unwrap(),
         b"uncertain bytes"
     );
+}
+
+#[test]
+fn hold_expired_curator_failure_keeps_failed_ttl_through_rescan_and_tick() {
+    let (_tmp, db, root) = fixture();
+    let path = root.join("expired-ttl");
+    db.allocate_for_delivery(909, &root, &path, true, true)
+        .unwrap();
+    std::fs::write(path.join("uncertain.rar"), b"still recoverable").unwrap();
+    let mut source = db.finish(909, &path, &root, "parked_failed").unwrap();
+    let future = now() + 86400;
+    source.deadline = Some(future);
+    source.failure_reason = Some("hold_expired".into());
+    source.failure_assessment = Some(FailureAssessment {
+        disposition: "unknown".into(),
+        reason: "deadline-abandoned assessment".into(),
+        assessed_at: now(),
+    });
+    save_artifact(&db.db.lock().unwrap(), &source).unwrap();
+    let mut terminal = terminals::tests::failed(909, SalvageState::SettledNone);
+    terminal.reason = Some(nzbd_types::FailureReason::HoldExpired);
+    terminal.transfer = Some("curator-admitted".into());
+    terminal.salvage_error =
+        Some("deadline-abandoned assessment; bytes not proven unusable".into());
+    db.record_terminal(&terminal).unwrap();
+    db.mark_terminal_step(909, &TerminalStep::Emitted).unwrap();
+    assert_eq!(db.expire_parked_curator_failures().unwrap(), 0);
+    assert_eq!(db.get(&source.id).unwrap().deadline, Some(future));
+    db.tick().unwrap();
+    assert_eq!(db.get(&source.id).unwrap().deadline, Some(future));
+    assert!(path.join("uncertain.rar").exists());
+    assert!(db
+        .terminal(909)
+        .unwrap()
+        .unwrap()
+        .salvage_error
+        .unwrap()
+        .contains("not proven unusable"));
 }

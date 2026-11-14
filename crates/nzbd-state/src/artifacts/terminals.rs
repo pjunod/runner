@@ -563,7 +563,7 @@ impl Inventory {
         let tx = db.transaction()?;
         let raws = {
             let mut statement = tx.prepare(
-                "SELECT a.data FROM artifacts a JOIN job_terminals t ON t.job=a.job WHERE a.state='parked_failed' AND t.outcome='failed' AND t.keep_on_failure=0 AND t.transfer IS NOT NULL AND t.salvage<>'pending'",
+                "SELECT a.data FROM artifacts a JOIN job_terminals t ON t.job=a.job WHERE a.state='parked_failed' AND t.outcome='failed' AND t.keep_on_failure=0 AND t.transfer IS NOT NULL AND t.salvage<>'pending' AND COALESCE(t.reason,'')<>'hold_expired'",
             )?;
             let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?

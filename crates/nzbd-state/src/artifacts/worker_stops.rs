@@ -488,10 +488,9 @@ impl Inventory {
             if artifact.generation != source.generation {
                 return Err(Error::Conflict("stopped source generation changed".into()));
             }
-            if artifact.terminal()
-                || (artifact.state == "parked_failed"
-                    && artifact.failure_reason.as_deref() == Some("hold_expired"))
-            {
+            let already_parked = artifact.state == "parked_failed"
+                && artifact.failure_reason.as_deref() == Some("hold_expired");
+            if artifact.terminal() || (already_parked && artifact.salvage.as_deref()==Some("settled_none") && artifact.error.as_deref()==Some("salvage assessment abandoned at the hold deadline; stopped bytes preserved, not proven unusable")) {
                 continue;
             }
             if self.source_in_use(source) {
@@ -518,7 +517,7 @@ impl Inventory {
                 if artifact.hold.as_deref() == Some("transform workspace") {
                     artifact.hold = None;
                 }
-                if !artifact.keep && !artifact.keep_on_failure {
+                if !already_parked && !artifact.keep && !artifact.keep_on_failure {
                     artifact.deadline = Some(now().saturating_add(ttl.max(0)));
                     artifact.retention_seconds = ttl.max(1) as u64;
                 }
@@ -565,8 +564,16 @@ impl Inventory {
         if artifact.generation != source.generation || artifact.terminal() {
             return Ok(());
         }
+        let physically_preserved = artifact.state == "parked_failed"
+            && artifact.failure_reason.as_deref() == Some("hold_expired")
+            && artifact.salvage.as_deref() == Some("settled_none");
         let message = format!(
-            "Hold expired; custody unresolved pending actual writer/process stop proof: {}",
+            "Hold expired; {}: {}",
+            if physically_preserved {
+                "stopped source preserved; authoritative acknowledgment pending"
+            } else {
+                "custody unresolved pending actual writer/process stop proof"
+            },
             error.chars().take(1000).collect::<String>()
         );
         if artifact.error.as_deref() == Some(message.as_str()) {
@@ -574,7 +581,9 @@ impl Inventory {
         }
         artifact.error = Some(message);
         artifact.failure_reason = Some("hold_expired".into());
-        artifact.salvage = Some("pending".into());
+        if !physically_preserved {
+            artifact.salvage = Some("pending".into());
+        }
         artifact.revision += 1;
         artifact.updated_at = now();
         let db = self.db.lock().unwrap();
