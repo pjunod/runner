@@ -52,10 +52,13 @@ jobs:
     timeout-minutes: 35
     env:
       RUSTUP_TOOLCHAIN: "1.95"
-      CARGO_HOME: ${{ runner.temp }}/runner-cargo-home
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
-      COMPAT_WORK: ${{ runner.temp }}/runner-bincode-compatibility
     steps:
+      - name: Configure isolated compatibility directories
+        shell: bash
+        run: |
+          echo "CARGO_HOME=${{ runner.temp }}/runner-cargo-home" >> "$GITHUB_ENV"
+          echo "COMPAT_WORK=${{ runner.temp }}/runner-bincode-compatibility" >> "$GITHUB_ENV"
       - name: Preserve the independently frozen source bytes
         shell: bash
         run: git config --global core.autocrlf false
