@@ -453,6 +453,48 @@ pub fn spawn_worker(
             for (id,state) in cancelled {retire_lease(&engine,&active,&retirement_tracker,&cancel,id,state);}
         });
     }
+    // Expiry is metadata-only and independent of mount/capacity recovery.
+    // A manually paused hold still expires. The leader atomically revokes
+    // the exact grant and selects the terminal; it owns history and events.
+    {
+        let cfg = cfg.clone();
+        let engine = engine.clone();
+        let active = active.clone();
+        let view = view.clone();
+        let client = client.clone();
+        let cancel = cancel.clone();
+        let expiry_tracker = tracker.clone();
+        tracker.spawn(async move {
+            let in_flight=Arc::new(Mutex::new(std::collections::HashSet::<String>::new()));
+            let mut cursor=String::new();
+            loop {
+                if cancel.is_cancelled() { break; }
+                let current=view.borrow().clone();
+                if let Some(url)=current.leader_url() {
+                        if !current.is_me {report_expired_holds(&cfg,&engine,&active).await;}
+                        let inventory=engine.artifacts();let after=cursor.clone();
+                        if let Ok(Ok(rows))=tokio::task::spawn_blocking(move||inventory.worker_expiry_outbox(&after)).await {
+                            if rows.is_empty() {cursor.clear();}
+                            for (key,data) in rows {
+                                cursor=key.clone();
+                                let Ok(request)=serde_json::from_str::<HoldExpiryRequest>(&data) else {continue;};
+                                {let mut running=in_flight.lock().unwrap();if running.len()>=8 || !running.insert(key.clone()) {continue;}}
+                                let (cfg,engine,active,client,url,running)=(cfg.clone(),engine.clone(),active.clone(),client.clone(),url.to_owned(),in_flight.clone());
+                                expiry_tracker.spawn(async move {
+                                    let source=request.source.clone();
+                                    if let Err(error)=drive_expiry_outbox(&cfg,&engine,&client,&active,&url,&key,request).await {
+                                        tracing::warn!(%error,"worker expiry follow-through remains durable");
+                                        let inventory=engine.artifacts();let _=tokio::task::spawn_blocking(move||inventory.note_worker_expiry_error(&source,&error)).await;
+                                    }
+                                    running.lock().unwrap().remove(&key);
+                                });
+                            }
+                        }
+                }
+                tokio::select! {_=cancel.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_secs(5))=>{}}
+            }
+        });
+    }
     // Recovery probes can touch slow storage. They never occupy heartbeat or
     // completion lanes, and each release carries current in-memory grant proof.
     {
@@ -514,6 +556,153 @@ fn lease_authority(
         })
     })
 }
+async fn report_expired_holds(cfg: &ClusterConfig, engine: &EngineHandle, active: &ActiveLeases) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let leases: Vec<_> = active
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(id, state)| (id.clone(), state.clone()))
+        .collect();
+    let snapshot = engine.snapshot();
+    for (id, state) in leases {
+        let Some(control) = snapshot
+            .jobs
+            .iter()
+            .find(|job| job.id == state.job)
+            .and_then(|job| job.control.clone())
+            .filter(|c| {
+                c.lifecycle == "held"
+                    && c.deadline_unix.is_some_and(|at| at <= now)
+                    && nzbd_types::HoldCause::legacy_terminal(&c.cause).is_none()
+            })
+        else {
+            continue;
+        };
+        if !lease_authority(active, &id, &state)() {
+            continue;
+        }
+        let Ok(Some(job)) = engine.queue_job_metadata(state.job).await else {
+            continue;
+        };
+        let inventory = engine.artifacts();
+        let context = state.context.clone();
+        let job_id = state.job;
+        let Ok(Ok((Some(source), Some(stop_request)))) =
+            tokio::task::spawn_blocking(move || -> nzbd_state::artifacts::Result<_> {
+                Ok((
+                    inventory.for_job(job_id.0)?,
+                    inventory.worker_grant_request(job_id.0, &context)?,
+                ))
+            })
+            .await
+        else {
+            continue;
+        };
+        let request = HoldExpiryRequest {
+            node: cfg.node_name.clone(),
+            job: state.job,
+            context: state.context.clone(),
+            token: state.token.clone(),
+            control,
+            source: nzbd_state::artifacts::SourceGeneration {
+                artifact: source.id,
+                generation: source.generation,
+            },
+            fetched: nzbd_types::Fetched::of(&job),
+            stop_request,
+            stopped: None,
+        };
+        if let Ok(notice) = serde_json::to_string(&request) {
+            let _ = engine
+                .prepare_worker_hold_expiry(
+                    state.job,
+                    request.control.revision.clone(),
+                    notice,
+                    lease_authority(active, &id, &state),
+                )
+                .await;
+        }
+    }
+}
+
+async fn drive_expiry_outbox(
+    _cfg: &ClusterConfig,
+    engine: &EngineHandle,
+    client: &ClusterClient,
+    active: &ActiveLeases,
+    url: &str,
+    key: &str,
+    mut request: HoldExpiryRequest,
+) -> Result<(), String> {
+    let reply: serde_json::Value = client
+        .post_json(url, "/cluster/v1/work/hold-expired", &request)
+        .await
+        .map_err(|e| e.to_string())?;
+    if reply.get("accepted").and_then(|v| v.as_bool()) != Some(true) {
+        // A stale, never-selected grant gains no terminal or byte authority.
+        let inventory = engine.artifacts();
+        let key = key.to_string();
+        return tokio::task::spawn_blocking(move || {
+            inventory.finish_worker_expiry_outbox(
+                &key,
+                "not selected: stale grant; source custody unchanged",
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string());
+    }
+    // The terminal is already durable and visible. Joining may wait on slow
+    // actual writers; no deadline, reboot or transport timeout substitutes
+    // for their stop proof. Each outbox runs independently of heartbeat.
+    let removed = revoke_leases(active, |id, state| {
+        id == request.context.lease_id && state.context == request.context
+    });
+    for (_, state) in &removed {
+        state.cancel.cancel();
+    }
+    let joined = active.join_execution(&request.context.lease_id).await?;
+    let stopped = engine
+        .join_cluster_writers(request.stop_request.clone(), joined)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !stopped.sources.contains(&request.source) {
+        return Err("stopped receipt does not cover the selected source; custody retained".into());
+    }
+    let inventory = engine.artifacts();
+    let proof = stopped.clone();
+    tokio::task::spawn_blocking(move || inventory.park_expired_worker_sources(&proof))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    engine
+        .retire_worker_job(request.job, request.context.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    request.stopped = Some(stopped);
+    let reply: serde_json::Value = client
+        .post_json(url, "/cluster/v1/work/hold-expired", &request)
+        .await
+        .map_err(|e| e.to_string())?;
+    if reply.get("accepted").and_then(|v| v.as_bool()) != Some(true) {
+        return Err("joined expiry disposition awaits authoritative receipt".into());
+    }
+    let inventory = engine.artifacts();
+    let key = key.to_string();
+    tokio::task::spawn_blocking(move||inventory.finish_worker_expiry_outbox(&key,"hold_expired terminal recorded; stopped sources parked/preserved; salvage assessment abandoned with explicit error")).await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
+    active.forget_joined(&request.context.lease_id);
+    active
+        .retiring
+        .lock()
+        .unwrap()
+        .remove(&request.context.lease_id);
+    Ok(())
+}
+
 async fn recover_download_holds(
     engine: &EngineHandle,
     active: &ActiveLeases,

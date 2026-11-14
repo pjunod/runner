@@ -198,6 +198,7 @@ mod tests {
 
     fn control(revision: &str, lifecycle: &str) -> JobControl {
         JobControl {
+            expiry_pending: false,
             version: 1,
             revision: revision.into(),
             lifecycle: lifecycle.into(),

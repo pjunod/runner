@@ -19,6 +19,7 @@ pub use policy::{RetentionChange, RetentionPreview};
 mod delivery;
 pub mod exits;
 mod materialization;
+mod salvage_retry;
 pub use materialization::{
     external_generation_identity, ExternalGeneration, ExternalGenerationFile,
 };
@@ -1658,7 +1659,7 @@ impl Inventory {
     pub fn reconcile_missing(&self) -> Result<()> {
         let raws = {
             let db = self.db.lock().unwrap();
-            let mut stmt = db.prepare("SELECT data FROM artifacts WHERE state IN ('completed','retained','unknown','retiring') AND id>?1 ORDER BY id LIMIT 1000")?;
+            let mut stmt = db.prepare("SELECT data FROM artifacts WHERE state IN ('completed','retained','unknown','retiring','transferred') AND id>?1 ORDER BY id LIMIT 1000")?;
             let cursor = self.reconcile_cursor.lock().unwrap().clone();
             let rows = stmt.query_map([cursor], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -1672,6 +1673,10 @@ impl Inventory {
             let Some(_lease) = self.reserve_reconciliation(std::slice::from_ref(&original))? else {
                 continue;
             };
+            if original.state == "transferred" {
+                self.reconcile_transferred_absence(&original)?;
+                continue;
+            }
             if self.verify_root(&original).is_err() {
                 continue;
             }
@@ -1692,6 +1697,100 @@ impl Inventory {
                 save_artifact(&self.db.lock().unwrap(), &current)?;
             }
         }
+        Ok(())
+    }
+
+    /// A handoff is not proof that the source directory is gone. Only two
+    /// descriptor-relative observations under the recorded mounted root may
+    /// retire it from Live. Keep all manifests, delivery and operation audit.
+    fn reconcile_transferred_absence(&self, original: &Artifact) -> Result<()> {
+        let _guard = self.mutation_guard()?;
+        let mut current = self.get(&original.id)?;
+        if current.state != "transferred"
+            || current.generation != original.generation
+            || current.revision != original.revision
+            || current.path != original.path
+            || current.root != original.root
+            || current
+                .job
+                .is_some_and(|job| self.open_intent_for_job(job).unwrap_or(true))
+        {
+            return Ok(());
+        }
+        let key = format!(
+            "transferred-missing:{}:{}:{}",
+            current.id, current.generation, current.revision
+        );
+        let clear = || -> Result<()> {
+            self.db
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM meta WHERE key=?1", [&key])?;
+            Ok(())
+        };
+        let Ok(root) = self.verify_root(&current) else {
+            return clear();
+        };
+        let Some(name) = current
+            .path
+            .strip_prefix(&current.root)
+            .ok()
+            .filter(|relative| relative.components().count() == 1)
+            .map(|relative| relative.as_os_str().to_owned())
+        else {
+            return clear();
+        };
+        // A readable pinned root, no symlink traversal, and ENOENT only.
+        if fs::names(&root).is_err() {
+            return clear();
+        }
+        if !matches!(fs::entry_missing_at(&root, &name), Ok(true)) {
+            return clear();
+        }
+        let db = self.db.lock().unwrap();
+        let in_flight: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state NOT IN ('succeeded','cancelled','failed','transferred'))",
+            [&current.id], |row| row.get(0))?;
+        if in_flight {
+            drop(db);
+            return clear();
+        }
+        let first: Option<i64> = db
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key=?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(first) = first else {
+            db.execute(
+                "INSERT INTO meta(key,value) VALUES(?1,?2)",
+                params![key, now().to_string()],
+            )?;
+            return Ok(());
+        };
+        if now() < first.saturating_add(relocation::VANISHED_CONFIRM_SECONDS) {
+            return Ok(());
+        }
+        drop(db);
+        // Re-open the named root and recheck the leaf immediately before the
+        // disposition. A replaced root or reappearing leaf is unresolved.
+        let Ok(check) = self.verify_root(&current) else {
+            return clear();
+        };
+        if !matches!(fs::entry_missing_at(&check, &name), Ok(true)) {
+            return clear();
+        }
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        current.state = "source_gone".into();
+        current.gone_reason = Some("transferred source missing from its verified root".into());
+        current.updated_at = now();
+        current.revision += 1;
+        save_artifact(&tx, &current)?;
+        event(&tx, &current.id, "source_gone", "transferred directory absent from its verified root on two passes; not removed by Runner; handoff audit retained")?;
+        tx.execute("DELETE FROM meta WHERE key=?1", [&key])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -3533,6 +3632,27 @@ impl Inventory {
         }
         let request: DeleteRequest = serde_json::from_str(&op.request)?;
         let (_, revision, _, automatic, generation) = request.fields();
+        // A previously queued failed-source delete is not permission to
+        // override a later park-always hold expiry. Retention and explicit
+        // human/cancellation deletes keep their existing validators.
+        if a.failure_reason.as_deref() == Some("hold_expired")
+            && (op.id.starts_with("failed-delete-") || op.id.starts_with("cluster-copy-"))
+        {
+            op.state = "cancelled".into();
+            op.error = Some(
+                "hold-expired source parked; automatic failed-source delete superseded".into(),
+            );
+            let db = self.db.lock().unwrap();
+            save_operation(&db, &op)?;
+            event(
+                &db,
+                &a.id,
+                "delete_cancelled",
+                "hold-expired park supersedes failed-source deletion",
+            )?;
+            return Ok(op);
+        }
+
         let explicit_cancellation = if let DeleteRequest::ClusterCancellation((
             _,
             _,

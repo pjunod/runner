@@ -295,6 +295,7 @@ impl LeaderShared {
     }
 
     pub(crate) async fn restore_control_projection(&self) -> Result<(), String> {
+        replay_worker_hold_expiries(self).await?;
         crate::control_recovery::reconcile(self).await?;
         let jobs = crate::control_recovery::projection(self).await?;
         self.engine
@@ -312,6 +313,7 @@ impl LeaderShared {
         &self,
         ids: &[JobId],
     ) -> Result<(), String> {
+        replay_worker_hold_expiries(self).await?;
         crate::control_recovery::reconcile(self).await?;
         let wanted: HashSet<_> = ids.iter().copied().collect();
         let jobs: Vec<_> = crate::control_recovery::projection(self)
@@ -956,6 +958,7 @@ pub fn router(shared: Arc<LeaderShared>) -> Router {
         .route("/cluster/v1/work/heartbeat", post(work_heartbeat))
         .route("/cluster/v1/work/complete", post(work_complete))
         .route("/cluster/v1/work/reject", post(work_reject))
+        .route("/cluster/v1/work/hold-expired", post(work_hold_expired))
         .route(
             "/cluster/v1/keep/apply",
             post(crate::cluster_keep::apply_owner),
@@ -1521,6 +1524,227 @@ fn range_owner(workers: &[NodeRecord], index: u32) -> Option<&str> {
         slot -= weight;
     }
     None
+}
+
+/// The replicated intent is the expiry outbox. Replay does not read a worker
+/// mount and never claims that worker salvage or disposal has completed.
+async fn replay_worker_hold_expiries(s: &LeaderShared) -> Result<(), String> {
+    let Some(control) = &s.control else {
+        return Ok(());
+    };
+    for (job, _, _) in control.load_jobs().await? {
+        if !job
+            .params
+            .iter()
+            .any(|(key, _)| key == "*Cluster:ExpiredWorkerHold")
+        {
+            continue;
+        }
+        let Some(history) = &s.history else {
+            return Err("hold expiry needs authoritative history".into());
+        };
+        let inventory = s.engine.artifacts();
+        let id = job.id;
+        let existing = tokio::task::spawn_blocking(move || inventory.terminal(id.0))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        if existing.is_some_and(|row| row.finished()) {
+            continue;
+        }
+        let param = |key: &str| {
+            job.params
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("")
+        };
+        let selected: HoldExpiryRequest = serde_json::from_str(param("Failure:ExpiredWorkerHold"))
+            .map_err(|e| format!("invalid durable expiry decision: {e}"))?;
+        let mut terminal = nzbd_engine::terminal::failed_terminal(
+            &job,
+            nzbd_types::FailureReason::HoldExpired,
+            None,
+            param("Failure:Stage"),
+            param("Failure:Message"),
+        );
+        terminal.fetched = selected.fetched;
+        terminal.salvage = nzbd_state::artifacts::SalvageState::Pending;
+        terminal.salvage_error=Some("expired worker source awaits joined stop and owner-preserved disposition; assessment not completed".into());
+        for (key, value) in &mut terminal.markers {
+            if key == "Failure:Salvage" {
+                *value = "pending".into();
+            }
+        }
+        if s.engine
+            .record_terminal_in(terminal, Some(history.clone()))
+            .await
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            return Err("worker hold terminal awaits durable history".into());
+        }
+    }
+    Ok(())
+}
+
+async fn work_hold_expired(
+    State(s): State<Arc<LeaderShared>>,
+    headers: HeaderMap,
+    Json(req): Json<HoldExpiryRequest>,
+) -> Response {
+    if !authed(&s, &headers) {
+        return denied();
+    }
+    if !s.is_leader() {
+        return not_leader();
+    }
+    if !s.authority_ready() {
+        return authority_not_ready();
+    }
+    let _serial = s.mutation_serial.lock().await;
+    let result = select_worker_hold_expiry(&s, &req).await;
+    match result {
+        Ok(accepted) => Json(serde_json::json!({"accepted":accepted})).into_response(),
+        Err(error) => {
+            s.fence_authority();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error":error})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn select_worker_hold_expiry(
+    s: &LeaderShared,
+    req: &HoldExpiryRequest,
+) -> Result<bool, String> {
+    let Some(control) = &s.control else {
+        return Ok(false);
+    };
+    if s.history.is_none() {
+        return Err("authoritative history unavailable; expired hold retained".into());
+    }
+    if req.node != req.token.owner_node_id
+        || req.context.lease_id != format!("{}@{}", req.token.resource, req.token.fence)
+        || req.control.lifecycle != "held"
+        || !req.control.expiry_pending
+        || nzbd_types::HoldCause::legacy_terminal(&req.control.cause).is_some()
+        || !req
+            .control
+            .deadline_in_s
+            .is_some_and(|remaining| remaining <= 0)
+        || serde_json::to_vec(&req.control)
+            .map_err(|e| e.to_string())?
+            .len()
+            > 16384
+    {
+        return Ok(false);
+    }
+    let receipt = req.receipt_id();
+    if control.command_receipt(&receipt).await?.is_some() {
+        replay_worker_hold_expiries(s).await?;
+        if let Some(stopped) = &req.stopped {
+            if stopped.job != req.job.0
+                || stopped.context != req.context
+                || stopped.storage_instance_id != req.stop_request.storage_instance_id
+                || stopped.owner_incarnation != req.stop_request.owner_incarnation
+                || stopped.authority_source_json != req.stop_request.authority_source_json
+                || !stopped.sources.contains(&req.source)
+            {
+                return Ok(false);
+            }
+            let inventory = s.engine.artifacts();
+            let job = req.job.0;
+            let error="salvage assessment abandoned at the worker hold deadline after joined execution; bytes were not assessed as unusable; exact source owner parked or preserved the stopped copies".to_string();
+            tokio::task::spawn_blocking(move || {
+                inventory.settle_salvage(
+                    job,
+                    &nzbd_state::artifacts::SalvageOutcome::None { error: Some(error) },
+                )
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        }
+        return Ok(true);
+    }
+    let Some(lease) = control.current_lease_record(&req.token.resource).await? else {
+        return Ok(false);
+    };
+    if lease.token.resource != req.token.resource
+        || lease.token.owner_node_id != req.token.owner_node_id
+        || lease.token.owner_incarnation != req.token.owner_incarnation
+        || lease.token.fence != req.token.fence
+        || lease.token.revision < req.token.revision
+        || lease.token.expires_at_unix_ms < req.token.expires_at_unix_ms
+        || req.stop_request.job != req.job.0
+        || req.stop_request.context != req.context
+        || req.stop_request.owner_incarnation != req.token.owner_incarnation
+        || lease.job_id != u64::from(req.job.0)
+        || lease.job_incarnation != req.context.job_incarnation
+        || lease.job_revision != req.context.job_revision
+        || req.context.control_revision != lease.job_revision
+    {
+        return Ok(false);
+    }
+    let Some((mut job, revision, _)) = control.current_job_intent(req.job.0).await? else {
+        return Ok(false);
+    };
+    if revision != lease.job_revision
+        || job
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+    {
+        return Ok(false);
+    }
+    job.set_control(&req.control);
+    // This exact owner/control/source is an outstanding custody fact. The
+    // leader's admission descriptor says nothing about the worker's bytes.
+    let mut selected = req.clone();
+    selected.stopped = None;
+    job.params.push((
+        "Failure:ExpiredWorkerHold".into(),
+        serde_json::to_string(&selected).map_err(|e| e.to_string())?,
+    ));
+    let message = format!(
+        "{} hold expired after its deadline: {}",
+        req.control.cause, req.control.message
+    );
+    let mut terminal = nzbd_engine::terminal::failed_terminal(
+        &job,
+        nzbd_types::FailureReason::HoldExpired,
+        None,
+        &req.control.stage,
+        &message,
+    );
+    terminal.fetched = req.fetched;
+    terminal.salvage = nzbd_state::artifacts::SalvageState::Pending;
+    terminal.salvage_error=Some("expired worker source awaits joined stop and owner-preserved disposition; assessment not completed".into());
+    for (key, value) in &mut terminal.markers {
+        if key == "Failure:Salvage" {
+            *value = "pending".into();
+        }
+    }
+    nzbd_engine::terminal::stamp_queue_row(&mut job, &terminal);
+    job.params
+        .push(("*Cluster:ExpiredWorkerHold".into(), receipt.clone()));
+    if !control
+        .expire_worker_hold(&receipt, &lease, &job, s.authority_identity())
+        .await?
+    {
+        return Ok(false);
+    }
+    // No worker source mutation, cleanup receipt or salvage settlement follows
+    // from this decision. Old writers are revoked and joined on their node.
+    s.leases.lock().unwrap().remove(&req.context.lease_id);
+    s.restore_control_jobs_projection(&[req.job]).await?;
+    let _ = s.engine.set_delegated(req.job, None).await;
+    replay_worker_hold_expiries(s).await?;
+    Ok(true)
 }
 
 async fn work_reject(
@@ -2482,6 +2706,7 @@ pub fn spawn_leader_task(
                     Ok(()) => {
                         // Preserve pending actor transitions before replacing the local projection.
                         let _serial = shared.mutation_serial.lock().await;
+                        if let Err(error)=replay_worker_hold_expiries(&shared).await {tracing::error!(%error,"worker expiry replay incomplete");continue;}
                         if let Err(error)=crate::control_recovery::reconcile(&shared).await {tracing::error!(%error,"automatic control adoption incomplete");continue;}
                         if let Err(error)=crate::admissions::initialize(&shared).await {tracing::error!(%error,"admission authority adoption incomplete");tokio::time::sleep(shared.cfg.lease_interval).await;continue;}
                         let replicated = match &shared.control {
@@ -6199,5 +6424,230 @@ mod tests {
             vec![true, false, true, false, true, false, true, false, true, false]
         );
         assert!(post_lane_first(&mut turns, "independent-worker"));
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn worker_hold_expiry_selects_exact_lease_once_and_preserves_remote_custody_until_stop() {
+        use crate::election::{LeaderRecord, LeaderView};
+        use nzbd_engine::{Engine, EngineConfig, Tuning};
+        use nzbd_state::artifacts::{
+            SalvageState, SourceGeneration, WorkerControlContext, WorkerStopRequest,
+            WorkerStoppedReceipt,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let control = crate::control::coordinator_protocol_tests::test_store(&temp, "expiry").await;
+        let LeaseClaim::Acquired(authority) = control
+            .acquire(
+                "cluster/leader",
+                "expiry",
+                1,
+                "leader",
+                "new",
+                "leader-boot",
+                "coordinator",
+                r#"{"lifecycleProtocol":2}"#,
+                1,
+                std::time::Duration::from_secs(120),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("authority");
+        };
+        let history = Arc::new(
+            nzbd_state::history::HistoryDb::open(&temp.path().join("history.sqlite"), None)
+                .unwrap(),
+        );
+        let mut engine_config = EngineConfig::single_node(
+            Vec::new(),
+            temp.path().join("engine"),
+            temp.path().join("processing"),
+            Tuning::default(),
+            None,
+        );
+        engine_config.history = Some(history.clone());
+        let engine = Engine::spawn(engine_config).await.unwrap();
+        let cfg = ClusterConfig {
+            cluster_id: "expiry".into(),
+            node_name: "new".into(),
+            shared_dir: temp.path().join("shared"),
+            advertise_url: "http://leader.invalid".into(),
+            secret: "secret".into(),
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            pp_slots: 0,
+            lease_interval: std::time::Duration::from_millis(100),
+            takeover_after: std::time::Duration::from_secs(1),
+            worker_ttl: std::time::Duration::from_secs(120),
+            control_dir: temp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: "127.0.0.1:1".into(),
+            control_api_bind: "127.0.0.1:2".into(),
+            control_peers: Vec::new(),
+            download_weight: 1,
+            pp_weight: 1,
+            disk_guard_roots: Vec::new(),
+            torrent_payload_roots: Vec::new(),
+            workspace_dir: None,
+        };
+        let (_send, view) = watch::channel(LeaderView {
+            is_me: true,
+            record: Some(LeaderRecord {
+                epoch: authority.fence,
+                node: "new".into(),
+                api_url: "http://leader.invalid".into(),
+                seq: 1,
+            }),
+        });
+        let shared = LeaderShared::new(
+            engine.clone(),
+            SharedLayout::new(temp.path(), "new").unwrap(),
+            temp.path().join("processing"),
+            cfg,
+            Vec::new(),
+            view,
+            LeaderDurability::new(
+                Some(control.clone()),
+                Some(history.clone()),
+                "leader-boot".into(),
+            ),
+        );
+        shared.authority_ready.store(true, Ordering::Release);
+        for (id, kind) in [(910, "download"), (911, "post")] {
+            let mut job = test_job(id);
+            job.delivery_lifecycle = true;
+            job.dir_name = format!("job-{id}");
+            control
+                .seed_job(
+                    u64::from(id),
+                    &format!("inc-{id}"),
+                    &serde_json::to_string(&job).unwrap(),
+                )
+                .await
+                .unwrap();
+            engine.import_job(job.clone(), false, false).await.unwrap();
+            let resource = format!("work/job/{id}/{kind}");
+            let LeaseClaim::Acquired(token) = control
+                .acquire(
+                    &resource,
+                    "expiry",
+                    u64::from(id),
+                    &format!("inc-{id}"),
+                    "worker",
+                    "worker-boot",
+                    kind,
+                    "{}",
+                    1,
+                    std::time::Duration::from_secs(120),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("lease");
+            };
+            let context = WorkerControlContext {
+                lease_id: format!("{resource}@{}", token.fence),
+                job_incarnation: format!("inc-{id}"),
+                job_revision: 1,
+                control_revision: 1,
+                epoch: 1,
+            };
+            let held:nzbd_types::JobControl=serde_json::from_value(serde_json::json!({"version":1,"revision":"4","lifecycle":"held","cause":"capacity","stage":"unpack","retry_policy":"scheduled_retry","message":"extractor volume full","instance":format!("hold-{id}"),"manual_pause":true,"deadline_unix":i64::MAX,"deadline_in_s":0,"expiry_pending":true})).unwrap();
+            let source = SourceGeneration {
+                artifact: format!("worker-source-{id}"),
+                generation: "exact-generation".into(),
+            };
+            let mut request = HoldExpiryRequest {
+                node: "worker".into(),
+                job: JobId(id),
+                context: context.clone(),
+                token: token.clone(),
+                control: held,
+                source: source.clone(),
+                fetched: nzbd_types::Fetched {
+                    success_articles: 2,
+                    total_articles: 4,
+                    bytes: 1234,
+                },
+                stop_request: WorkerStopRequest {
+                    job: id,
+                    context: context.clone(),
+                    owner_incarnation: "worker-boot".into(),
+                    storage_instance_id: "worker-storage".into(),
+                    removal_revision: None,
+                    authority_source_json: None,
+                    start_ordered: true,
+                },
+                stopped: None,
+            };
+            let mut stale = request.clone();
+            stale.token.fence += 1;
+            stale.context.lease_id = format!("{resource}@{}", stale.token.fence);
+            stale.stop_request.context = stale.context.clone();
+            assert!(!select_worker_hold_expiry(&shared, &stale).await.unwrap());
+            let mut premature = request.clone();
+            premature.control.deadline_in_s = Some(60);
+            assert!(!select_worker_hold_expiry(&shared, &premature)
+                .await
+                .unwrap());
+            let mut missing = request.clone();
+            missing.control.deadline_in_s = None;
+            assert!(!select_worker_hold_expiry(&shared, &missing).await.unwrap());
+            assert!(select_worker_hold_expiry(&shared, &request).await.unwrap());
+            assert!(control
+                .current_lease_record(&resource)
+                .await
+                .unwrap()
+                .is_none());
+            let first = engine.artifacts().terminal(id).unwrap().unwrap();
+            assert_eq!(first.reason, Some(nzbd_types::FailureReason::HoldExpired));
+            assert_eq!(first.fetched.bytes, 1234);
+            assert_eq!(first.salvage, SalvageState::Pending);
+            assert!(first.salvage_error.is_some());
+            assert!(first.finished());
+            let history_seq = first.history_seq;
+            assert!(
+                select_worker_hold_expiry(&shared, &request).await.unwrap(),
+                "lost selection reply replays"
+            );
+            assert_eq!(
+                engine.artifacts().terminal(id).unwrap().unwrap().salvage,
+                SalvageState::Pending
+            );
+            request.stopped = Some(WorkerStoppedReceipt {
+                id: format!("stopped-{id}"),
+                job: id,
+                context,
+                owner_incarnation: "worker-boot".into(),
+                storage_instance_id: "worker-storage".into(),
+                authority_source_json: None,
+                sources: vec![source],
+                stopped_at_ms: 1,
+                never_started: false,
+            });
+            let mut wrong = request.clone();
+            wrong.stopped.as_mut().unwrap().sources[0].generation = "replacement".into();
+            assert!(!select_worker_hold_expiry(&shared, &wrong).await.unwrap());
+            assert!(select_worker_hold_expiry(&shared, &request).await.unwrap());
+            let settled = engine.artifacts().terminal(id).unwrap().unwrap();
+            assert_eq!(settled.salvage, SalvageState::SettledNone);
+            assert!(settled
+                .salvage_error
+                .as_deref()
+                .unwrap()
+                .contains("not assessed as unusable"));
+            assert_eq!(settled.history_seq, history_seq);
+            assert_eq!(settled.reason, first.reason);
+            assert!(select_worker_hold_expiry(&shared, &request).await.unwrap());
+        }
+        assert_eq!(
+            history.list(100).unwrap().len(),
+            2,
+            "one history entry per deadline, never a second terminal"
+        );
+        engine.shutdown().await;
+        control.shutdown().await.unwrap();
     }
 }

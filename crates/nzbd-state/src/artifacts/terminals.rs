@@ -355,12 +355,17 @@ impl Inventory {
             )?;
             if has_artifact {
                 set_artifact_salvage(&tx, row.job, SalvageState::Pending)?;
-            } else {
+            } else if !row
+                .entry
+                .params
+                .iter()
+                .any(|(key, _)| key == "Failure:ExpiredWorkerHold")
+            {
                 row.salvage = SalvageState::None;
             }
         }
         tx.execute(
-            &format!("INSERT INTO job_terminals({COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL,NULL,0,0,NULL,NULL,?15,?15)"),
+            &format!("INSERT INTO job_terminals({COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL,NULL,0,0,NULL,?16,?15,?15)"),
             rusqlite::params![
                 row.job,
                 row.transfer,
@@ -377,6 +382,7 @@ impl Inventory {
                 serde_json::to_string(&row.markers)?,
                 serde_json::to_string(&row.entry)?,
                 at,
+                row.salvage_error,
             ],
         )?;
         tx.commit()?;
@@ -482,6 +488,20 @@ impl Inventory {
         )?;
         if changed > 0 {
             set_artifact_salvage(&tx, job, state)?;
+            let raw: Option<String> = tx
+                .query_row(
+                    "SELECT data FROM operations WHERE id=?1 AND state='retry'",
+                    [format!("salvage:{job}")],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(raw) = raw {
+                let mut op: Operation = serde_json::from_str(&raw)?;
+                op.state = "succeeded".into();
+                op.next_retry = 0;
+                // Keep the final storage error and attempt history as audit.
+                save_operation(&tx, &op)?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -543,7 +563,7 @@ impl Inventory {
         let tx = db.transaction()?;
         let raws = {
             let mut statement = tx.prepare(
-                "SELECT a.data FROM artifacts a JOIN job_terminals t ON t.job=a.job WHERE a.state='parked_failed' AND t.outcome='failed' AND t.keep_on_failure=0 AND t.transfer IS NOT NULL AND t.salvage<>'pending'",
+                "SELECT a.data FROM artifacts a JOIN job_terminals t ON t.job=a.job WHERE a.state='parked_failed' AND t.outcome='failed' AND t.keep_on_failure=0 AND t.transfer IS NOT NULL AND t.salvage<>'pending' AND COALESCE(t.reason,'')<>'hold_expired'",
             )?;
             let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?

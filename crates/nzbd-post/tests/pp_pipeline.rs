@@ -614,6 +614,7 @@ async fn legacy_repair_timeout_recovers_automatically_and_records_terminal_failu
         // A control persisted by a pre-v2 build: a `post_failure` review
         // hold with no schedule.
         job.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: "1".into(),
             lifecycle: "held".into(),

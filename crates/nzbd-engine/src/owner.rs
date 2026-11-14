@@ -639,6 +639,13 @@ pub(crate) enum QueueCommand {
         guard: crate::hold_release::HoldReleaseGuard,
         reply: oneshot::Sender<bool>,
     },
+    PrepareWorkerHoldExpiry {
+        job: JobId,
+        revision: String,
+        notice: String,
+        guard: crate::hold_release::HoldReleaseGuard,
+        reply: oneshot::Sender<bool>,
+    },
     /// Contract §2.3: end an expired hold as `failed/hold_expired`.
     ExpireHold {
         job: JobId,
@@ -2244,6 +2251,7 @@ impl Owner {
             | QueueCommand::SetKeepOnFailure { job, .. }
             | QueueCommand::HoldJob { job, .. }
             | QueueCommand::ExpireHold { job, .. }
+            | QueueCommand::PrepareWorkerHoldExpiry { job, .. }
             | QueueCommand::FailJob { job, .. }
             | QueueCommand::RetryHold { job, .. }
             | QueueCommand::RescheduleHold { job, .. }
@@ -3994,6 +4002,7 @@ impl Owner {
                                     let prior = record.control();
                                     let revision = prior.as_ref().and_then(|control| control.revision.parse::<u64>().ok()).unwrap_or(0).saturating_add(1);
                                     record.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
                                         version: 1,
                                         revision: revision.to_string(),
                                         lifecycle: "held".into(),
@@ -5062,6 +5071,7 @@ impl Owner {
                         && self.delegated.contains_key(&job))
                     || !self.state.job(job).is_some_and(|current| {
                         guard.matches(&self.artifacts, current, self.persist)
+                            && !current.control().is_some_and(|c| c.expiry_pending)
                     })
                 {
                     let _ = reply.send(false);
@@ -5156,6 +5166,7 @@ impl Owner {
                         && self.delegated.contains_key(&job))
                     || !self.state.job(job).is_some_and(|current| {
                         guard.matches(&self.artifacts, current, self.persist)
+                            && !current.control().is_some_and(|c| c.expiry_pending)
                     })
                 {
                     let _ = reply.send(false);
@@ -5270,6 +5281,76 @@ impl Owner {
                     }
                     let _ = reply.send(ok);
                 });
+            }
+            QueueCommand::PrepareWorkerHoldExpiry {
+                job,
+                revision,
+                notice,
+                guard,
+                reply,
+            } => {
+                let before = self.state.job(job).cloned();
+                let valid = !self.persist
+                    && !self.persistence_fenced
+                    && !self.pending_control_commits.contains(&job)
+                    && before.as_ref().is_some_and(|row| {
+                        guard.worker_checked() && guard.matches(&self.artifacts, row, false)
+                    });
+                let control = before.as_ref().and_then(Job::control).filter(|c| {
+                    c.lifecycle == "held"
+                        && c.revision == revision
+                        && c.deadline_unix
+                            .is_some_and(|deadline| deadline <= unix_now())
+                        && nzbd_types::HoldCause::legacy_terminal(&c.cause).is_none()
+                });
+                let Some(mut control) = control.filter(|_| valid) else {
+                    let _ = reply.send(false);
+                    return;
+                };
+                // A regrant preserves the original frozen episode. Re-enqueue
+                // it under the exact current grant, without advancing the hold
+                // revision or restarting its deadline.
+                if !control.expiry_pending {
+                    let Some(next) = control
+                        .revision
+                        .parse::<u64>()
+                        .ok()
+                        .and_then(|value| value.checked_add(1))
+                    else {
+                        let _ = reply.send(false);
+                        return;
+                    };
+                    control.revision = next.to_string();
+                }
+                // Owner-relative, canonical due proof. Absolute timestamps
+                // are display data on a different host's clock.
+                control.deadline_in_s = Some(0);
+                control.expiry_pending = true;
+                self.state.job_mut(job).unwrap().set_control(&control);
+                self.pending_control_commits.insert(job);
+                let record = self.state.job(job).unwrap().clone();
+                let inventory = self.artifacts.clone();
+                let previous = revision.clone();
+                self.io_then(
+                    move || {
+                        inventory
+                            .checkpoint_worker_hold_expiry(&record, &previous, &notice)
+                            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))
+                    },
+                    move |owner, result| {
+                        let ok = result.is_ok();
+                        owner.pending_control_commits.remove(&job);
+                        if !ok {
+                            if let Some(before) = before {
+                                if let Some(row) = owner.state.job_mut(job) {
+                                    *row = before;
+                                }
+                            }
+                        }
+                        owner.dirty = true;
+                        let _ = reply.send(ok && guard.live());
+                    },
+                );
             }
             QueueCommand::ExpireHold {
                 job,
@@ -7043,6 +7124,14 @@ impl Owner {
         if self.persistence_fenced || self.automatic_control_pending(job) {
             return false;
         }
+        if self
+            .state
+            .job(job)
+            .and_then(Job::control)
+            .is_some_and(|c| c.expiry_pending)
+        {
+            return false;
+        }
         let before = self.state.job(job).cloned();
         let cause_str = cause.as_str().to_string();
         let Some(j) = self.state.job_mut(job) else {
@@ -7089,6 +7178,7 @@ impl Owner {
         let attempts_made = episode.map_or(0, |c| c.retry_attempt);
         let timed = policy.timed();
         let control = nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: revision.to_string(),
             lifecycle: "held".into(),
@@ -7267,6 +7357,9 @@ impl Owner {
         if control.revision != revision {
             return Err("the hold changed since it was read; reload and retry".into());
         }
+        if control.expiry_pending {
+            return Err("the expired worker hold awaits its authoritative terminal".into());
+        }
         let native_preparation = crate::torrent_acquisitions::preparation_hold(&before, &control);
         if control.hold_cause().is_storage() && !control.post_side() && !native_preparation {
             return Err("storage holds are released by the capacity check".into());
@@ -7372,10 +7465,10 @@ impl Owner {
         if self.persistence_fenced
             || self.automatic_control_pending(job)
             || (!guard.worker_checked() && self.delegated.contains_key(&job))
-            || !self
-                .state
-                .job(job)
-                .is_some_and(|current| guard.matches(&self.artifacts, current, self.persist))
+            || !self.state.job(job).is_some_and(|current| {
+                guard.matches(&self.artifacts, current, self.persist)
+                    && !current.control().is_some_and(|c| c.expiry_pending)
+            })
         {
             return false;
         }
@@ -7385,7 +7478,7 @@ impl Owner {
         };
         let Some(mut control) = j
             .control()
-            .filter(|c| c.lifecycle == "held" && c.revision == revision)
+            .filter(|c| c.lifecycle == "held" && c.revision == revision && !c.expiry_pending)
         else {
             return false;
         };

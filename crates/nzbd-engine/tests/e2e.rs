@@ -2345,6 +2345,7 @@ async fn legacy_coverage_hold_recovers_without_repeating_valid_articles() {
         )
         .unwrap();
         job.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: "7".into(),
             lifecycle: "held".into(),
@@ -2410,6 +2411,7 @@ async fn legacy_identity_conflict_hold_converts_at_boot() {
         // judge, so the conversion below is the boot conversion's alone.
         let mut job = transfer_job(991, "legacy-partial", JobStatus::Queued);
         job.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: "7".into(),
             lifecycle: "held".into(),
@@ -2524,6 +2526,7 @@ async fn stranded_storage_hold_recovers_after_restart_without_a_click() {
         let engine = spawn_engine(tmp.path(), vec![]).await;
         let mut job = transfer_job(992, "stranded", JobStatus::Queued);
         job.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: "1".into(),
             lifecycle: "held".into(),
@@ -2613,6 +2616,7 @@ async fn recovery_pass_releases_post_holds_through_custody() {
         let dir = engine.artifacts().for_job(id.0).unwrap().unwrap().path;
         let mut job = engine.export_ready(id).await.unwrap().unwrap();
         job.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: "1".into(),
             lifecycle: "held".into(),
@@ -2833,6 +2837,7 @@ async fn a_persisted_hold_reloads_held_and_recovers_and_a_050_snapshot_loads_hel
         let engine = spawn_engine(tmp.path(), vec![]).await;
         let mut job = transfer_job(993, "held-restart", JobStatus::Held);
         job.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: "3".into(),
             lifecycle: "held".into(),
