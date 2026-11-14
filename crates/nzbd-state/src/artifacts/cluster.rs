@@ -1490,6 +1490,11 @@ mod tests {
             .accept_cluster_completion(&copy.publication, "SUCCESS", proof())
             .unwrap();
         let stale = inventory.get(&copy.publication.artifact).unwrap();
+        // Create this while the original is alive, so immediate inode/file-ID
+        // reuse cannot make the replacement directory look like that source.
+        let replacement = source.with_file_name("preexisting-unrelated-directory");
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(replacement.join("manual.pdf"), b"new unrelated bytes").unwrap();
         inventory
             .finish(copy.job_id, &source, source.parent().unwrap(), "completed")
             .unwrap();
@@ -1517,8 +1522,7 @@ mod tests {
         assert_eq!(result.status, "removed", "{result:?}");
         // The old allocation's tombstone cannot authorize deleting bytes
         // subsequently created at that path by another owner.
-        std::fs::create_dir(&source).unwrap();
-        std::fs::write(source.join("manual.pdf"), b"new unrelated bytes").unwrap();
+        std::fs::rename(&replacement, &source).unwrap();
         let result = inventory.retire_cluster_artifact_copy_from_observation(
             &copy,
             "SUCCESS",
