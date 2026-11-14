@@ -381,9 +381,11 @@ Terminal history/event publication does not wait on the payload mount.
 The source owner independently joins actual writers/processes, then parks or
 preserves every stopped source and journal-bound transform generation. A hold
 deadline that ends salvage assessment records an explicit failed-assessment
-error; it does not prove the bytes unusable. `hold_expired` takes Park precedence
-over Curator-admitted `failure_action=delete`, including old automatic delete
-replay. Keep, legacy enrollment and ordinary retention validators still apply.
+error; it does not prove the bytes unusable. An unknown or abandoned
+`hold_expired` assessment takes Park precedence over Curator-admitted
+`failure_action=delete`, including old automatic delete replay. A successfully
+published salvage with no abandonment error or unresolved remote custody still
+uses the existing generation-bound Delivery retirement under W3. Keep, legacy enrollment and ordinary retention validators still apply.
 Unproven stop/custody remains Pending with an error and durable retry outbox;
 reboot, a timeout or a missing receipt never proves physical completion.
 

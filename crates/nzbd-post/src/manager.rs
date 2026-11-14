@@ -1584,7 +1584,15 @@ fn disposal_action(
 ) -> FailureAction {
     if terminal.keep_on_failure {
         FailureAction::None
-    } else if terminal.reason == Some(nzbd_types::FailureReason::HoldExpired) {
+    } else if terminal.reason == Some(nzbd_types::FailureReason::HoldExpired)
+        && (terminal.salvage != nzbd_state::artifacts::SalvageState::Published
+            || terminal.salvage_error.is_some()
+            || terminal
+                .entry
+                .params
+                .iter()
+                .any(|(key, _)| key == "Failure:ExpiredWorkerHold"))
+    {
         FailureAction::Park
     } else if terminal.transfer.is_some() {
         cfg.failure_action
@@ -2937,6 +2945,24 @@ mod admission_tests {
             ..Default::default()
         };
         assert_eq!(disposal_action(&cfg, &terminal), FailureAction::Park);
+        terminal.salvage = nzbd_state::artifacts::SalvageState::Published;
+        terminal.salvage_error = Some("deadline-abandoned assessment".into());
+        assert_eq!(disposal_action(&cfg, &terminal), FailureAction::Park);
+        terminal.salvage_error = None;
+        assert_eq!(
+            disposal_action(&cfg, &terminal),
+            FailureAction::Delete,
+            "verified published salvage enters existing generation-bound Delivery retirement"
+        );
+        terminal.entry.params.push((
+            "Failure:ExpiredWorkerHold".into(),
+            "durable remote custody decision".into(),
+        ));
+        assert_eq!(
+            disposal_action(&cfg, &terminal),
+            FailureAction::Park,
+            "unresolved expiry custody cannot borrow another publication as proof"
+        );
         engine.shutdown().await;
     }
 
