@@ -652,7 +652,9 @@ M0 resource/storage/discovery tests, fuzzing and protected CI remain required.
 This retains the small-maintainable-change decision rather than broadening
 the engine or adopting a newer major release.
 
-Bincode 1.3.3/2.0.1 maintenance notices remain visible. Its peer and persisted
+The unused librqbit bincode 2 declaration is removed, eliminating it from
+the fuzz/maintained-library graph. Real bincode 1.3.3 peer and 2.0.1 Hiqlite
+persistence uses and their maintenance notices remain visible. Its peer and persisted
 Raft/WAL encodings are unchanged: the 3.0.0 package is a compile-error
 retirement marker. Community bincode-next/bincode_reloaded 3.x forks and
 schema-based alternatives exist, but their compatibility with this project's

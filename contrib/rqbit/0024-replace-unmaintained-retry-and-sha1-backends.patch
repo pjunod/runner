@@ -18,7 +18,34 @@
  name = "backtrace"
  version = "0.3.75"
  source = "registry+https://github.com/rust-lang/crates.io-index"
-@@ -769,24 +758,6 @@
+@@ -420,26 +409,6 @@
+ checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+ dependencies = [
+  "serde",
+-]
+-
+-[[package]]
+-name = "bincode"
+-version = "2.0.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
+-dependencies = [
+- "bincode_derive",
+- "serde",
+- "unty",
+-]
+-
+-[[package]]
+-name = "bincode_derive"
+-version = "2.0.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "bf95709a440f45e986983918d0e8a1f30a9b1df04918fc828670606804ac3c09"
+-dependencies = [
+- "virtue",
+ ]
+ 
+ [[package]]
+@@ -769,24 +738,6 @@
  dependencies = [
   "bytes",
   "memchr",
@@ -43,7 +70,7 @@
  ]
  
  [[package]]
-@@ -968,18 +939,6 @@
+@@ -968,18 +919,6 @@
  ]
  
  [[package]]
@@ -62,7 +89,7 @@
  name = "cssparser"
  version = "0.27.2"
  source = "registry+https://github.com/rust-lang/crates.io-index"
-@@ -2056,12 +2015,6 @@
+@@ -2056,12 +1995,6 @@
  
  [[package]]
  name = "hex"
@@ -75,7 +102,7 @@
  version = "0.4.3"
  source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
-@@ -2449,15 +2402,6 @@
+@@ -2449,15 +2382,6 @@
  ]
  
  [[package]]
@@ -91,15 +118,17 @@
  name = "intervaltree"
  version = "0.2.7"
  source = "registry+https://github.com/rust-lang/crates.io-index"
-@@ -2738,7 +2682,6 @@
+@@ -2738,9 +2662,7 @@
   "async-stream",
   "async-trait",
   "axum 0.8.4",
 - "backoff",
   "base64 0.22.1",
-  "bincode 2.0.1",
+- "bincode 2.0.1",
   "bitvec",
-@@ -2748,7 +2691,7 @@
+  "byteorder",
+  "bytes",
+@@ -2748,7 +2670,7 @@
   "dashmap 6.1.0",
   "futures",
   "governor",
@@ -108,7 +137,7 @@
   "home",
   "http",
   "intervaltree",
-@@ -2830,7 +2773,7 @@
+@@ -2830,7 +2752,7 @@
   "bytes",
   "data-encoding",
   "directories 6.0.0",
@@ -117,7 +146,7 @@
   "itertools",
   "librqbit-bencode",
   "librqbit-buffers",
-@@ -2850,13 +2793,12 @@
+@@ -2850,13 +2772,12 @@
  version = "5.3.1"
  dependencies = [
   "anyhow",
@@ -132,7 +161,16 @@
   "indexmap 2.9.0",
   "leaky-bucket",
   "librqbit-bencode",
-@@ -2896,7 +2838,7 @@
+@@ -2878,7 +2799,7 @@
+ version = "4.3.0"
+ dependencies = [
+  "anyhow",
+- "bincode 1.3.3",
++ "bincode",
+  "bitvec",
+  "byteorder",
+  "bytes",
+@@ -2896,7 +2817,7 @@
  dependencies = [
   "assert_cfg",
   "aws-lc-rs",
@@ -141,7 +179,7 @@
  ]
  
  [[package]]
-@@ -4621,7 +4563,7 @@
+@@ -4621,7 +4542,7 @@
   "errno",
   "libc",
   "linux-raw-sys 0.12.1",
@@ -150,7 +188,7 @@
  ]
  
  [[package]]
-@@ -4920,7 +4862,7 @@
+@@ -4920,7 +4841,7 @@
   "base64 0.22.1",
   "bs58",
   "chrono",
@@ -159,7 +197,7 @@
   "indexmap 1.9.3",
   "indexmap 2.9.0",
   "schemars 0.9.0",
-@@ -4973,6 +4915,17 @@
+@@ -4973,6 +4894,17 @@
  dependencies = [
   "nodrop",
   "stable_deref_trait",
@@ -177,7 +215,7 @@
  ]
  
  [[package]]
-@@ -5220,7 +5173,7 @@
+@@ -5220,7 +5152,7 @@
   "dotenvy",
   "either",
   "heck 0.5.0",
@@ -186,7 +224,7 @@
   "once_cell",
   "proc-macro2",
   "quote",
-@@ -5250,7 +5203,7 @@
+@@ -5250,7 +5182,7 @@
   "futures-channel",
   "futures-core",
   "futures-util",
@@ -195,7 +233,33 @@
   "hkdf",
   "hmac",
   "home",
-@@ -6718,7 +6671,7 @@
+@@ -6332,12 +6264,6 @@
+ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+ 
+ [[package]]
+-name = "unty"
+-version = "0.0.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
+-
+-[[package]]
+ name = "url"
+ version = "2.5.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -6420,12 +6346,6 @@
+ version = "0.9.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+-
+-[[package]]
+-name = "virtue"
+-version = "0.0.18"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
+ 
+ [[package]]
+ name = "vswhom"
+@@ -6718,7 +6638,7 @@
  source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
  dependencies = [
@@ -246,7 +310,15 @@
              let backoff = match self
 --- a/crates/librqbit/Cargo.toml
 +++ b/crates/librqbit/Cargo.toml
-@@ -104,7 +104,6 @@
+@@ -86,7 +86,6 @@
+ ] }
+ urlencoding = "2"
+ byteorder = "1"
+-bincode = "2"
+ bitvec = "1"
+ parking_lot = "0.12"
+ tracing = "0.1.40"
+@@ -104,7 +103,6 @@
  ] } # can't upgrade yet until min version is Rust 1.81, see https://github.com/servo/rust-url/issues/992
  
  hex = "0.4"

@@ -188,6 +188,12 @@ The historical `sha1-crypto-hash` feature selects maintained RustCrypto
 macOS and Windows M0 jobs run the retry regressions and known SHA-1 vectors
 with both this backend and AWS-LC. The daemon continues to select AWS-LC.
 
+The unused bincode 2 declaration in librqbit is removed from the manifest and
+derived lockfile. Its library/all-target compilation and full tests pass
+without that dependency, and the fuzz graph no longer includes bincode 2.
+This does not replace a codec: peer serialization still uses bincode 1, and
+the product's Hiqlite persistence still uses bincode 2.
+
 Bincode 1.3.3 and 2.0.1 still carry RustSec's unmaintained notice. They encode
 peer protocol data and persisted Raft/WAL/state records using distinct fixed
 and variable integer configurations. The retired upstream package has no
