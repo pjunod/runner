@@ -141,10 +141,17 @@ mod tests {
         let interval = policy.interval;
         assert_eq!(policy.next_at(BUDGET + Duration::from_nanos(1), 0.0), None);
         assert_eq!(policy.interval, interval);
-        policy.started = Instant::now() - BUDGET - Duration::from_secs(1);
-        assert_eq!(policy.next_backoff(), None);
+        // A fresh Windows VM's Instant cannot be backdated before boot.
+        // Exhaustion is checked above with explicit elapsed time; observe reset
+        // between actual clock reads without assuming 24 hours of host uptime.
+        let before_reset = Instant::now();
         policy.reset();
-        assert!(policy.started.elapsed() < Duration::from_secs(1));
+        let after_reset = Instant::now();
+        assert!(before_reset <= policy.started && policy.started <= after_reset);
+        assert_eq!(policy.interval, INITIAL);
+        let live_delay = policy.next_backoff().unwrap();
+        assert!((Duration::from_secs(5)..=Duration::from_secs(15)).contains(&live_delay));
+        policy.reset();
         assert_eq!(
             policy.next_at(Duration::ZERO, 0.0),
             Some(Duration::from_secs(5))
