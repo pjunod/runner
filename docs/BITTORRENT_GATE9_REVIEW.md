@@ -4,7 +4,7 @@
 refreshed native measurements pass; independent review complete ·
 **Date:** 2026-08-07 · **Disposition and amendment recorded:** 2026-08-14 ·
 **Accepted:** 2026-08-14 · **Status reconciled:** 2026-08-22 ·
-**Engine:** rqbit v8.1.1 archive plus the ordered twelve-patch maintained series ·
+**Engine:** rqbit v8.1.1 archive plus the canonical fifteen-patch maintained series ·
 **Decision owner:** ADR-19 in
 [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
@@ -50,6 +50,17 @@ renewal rule the twelve-patch derivation, vendor drift check, focused upstream
 suites (including the new tracker lifecycle, backoff, UDP and identity
 proofs), release-mode DHT dispatch proof, and upstream workspace check passed
 locally on 2026-09-22; PR CI is the publication record.
+
+The 2026-11-13 security renewal is recorded in
+[ADR-19 §4.3.4](BITTORRENT_PROPOSAL.md#434-security-maintenance-renewal--2026-11-13).
+The immutable archive and resource/admission boundaries remain unchanged.
+Patch 0024 removes unmaintained generic retry/clock and optional hash
+libraries while preserving retry timing, BitTorrent SHA-1 outputs and the
+production AWS-LC selection. Native timing/hash/wire proofs are added to M0;
+its resource, storage, discovery and fuzz gates remain required. Bincode's
+unmaintained notices and unused provenance snapshots stay explicit. Current
+source derivation, scoped graph audits and protected checks renew the evidence;
+historical measurements above remain historical, rather than being relabeled.
 
 No production BitTorrent path is enabled by this review or by its recorded
 disposition. Gate 8 uses the maintained selective-restore option. Gate 7
