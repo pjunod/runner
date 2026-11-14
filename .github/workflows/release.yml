@@ -16,7 +16,7 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64-musl
-            runner: '["ubuntu-latest"]'
+            runner: '["ubuntu-24.04"]'
             target: x86_64-unknown-linux-musl
             setup: sudo apt-get update && sudo apt-get install -y musl-tools
           - name: linux-aarch64-musl
@@ -24,25 +24,23 @@ jobs:
             target: aarch64-unknown-linux-musl
             setup: sudo apt-get update && sudo apt-get install -y musl-tools
           - name: macos-aarch64
-            runner: ${{ (vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["macos-latest"]' || '["self-hosted","macOS","ARM64","lab","apple","xcode-27.2"]' }}
+            runner: '["macos-latest"]'
             target: aarch64-apple-darwin
             setup: ""
     steps:
-      - uses: actions/checkout@v5
-      - name: Verify Xcode 27.2
-        if: matrix.target == 'aarch64-apple-darwin'
-        shell: bash
-        run: |
-          xcodebuild -version | awk '{ print } NR == 1 { valid = ($0 == "Xcode 27.2") } END { exit !valid }'
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.97.1"
           targets: ${{ matrix.target }}
       - name: Setup
         if: matrix.setup != ''
         run: ${{ matrix.setup }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Build
-        run: cargo build --release -p nzbd --target ${{ matrix.target }}
+        run: cargo build --locked --release -p nzbd --target ${{ matrix.target }}
       - name: Package
         run: |
           cd target/${{ matrix.target }}/release
@@ -50,23 +48,25 @@ jobs:
           shasum -a 256 nzbd-${{ github.ref_name }}-${{ matrix.name }}.tar.gz \
             > nzbd-${{ github.ref_name }}-${{ matrix.name }}.tar.gz.sha256
       - name: Attach to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             target/${{ matrix.target }}/release/nzbd-*.tar.gz
             target/${{ matrix.target }}/release/nzbd-*.tar.gz.sha256
 
   docker:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: true

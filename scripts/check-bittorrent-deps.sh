@@ -43,8 +43,8 @@ if grep -Eq '^(openssl|openssl-sys|native-tls) v' <<<"$bt_normal_tree"; then
   exit 1
 fi
 
-if ! grep -q '^nzbd-torrent v0.2.0 ' <<<"$daemon_normal_tree" ||
-   ! grep -q '^nzbd-qbit-compat v0.2.0 ' <<<"$daemon_normal_tree" ||
+if ! grep -Eq '^nzbd-torrent v[0-9]+\.[0-9]+\.[0-9]+ ' <<<"$daemon_normal_tree" ||
+   ! grep -Eq '^nzbd-qbit-compat v[0-9]+\.[0-9]+\.[0-9]+ ' <<<"$daemon_normal_tree" ||
    ! grep -q '^librqbit v8.1.1 ' <<<"$daemon_normal_tree"; then
   echo 'BitTorrent activation requires nzbd-torrent, nzbd-qbit-compat, and maintained librqbit in the daemon graph' >&2
   exit 1

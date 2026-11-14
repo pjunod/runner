@@ -121,6 +121,16 @@ impl Inventory {
         copy: &ClusterArtifactCopy,
         writer_paths: &[String],
     ) -> Result<Vec<DeliveryFile>> {
+        self.cluster_owned_copy_file_seal(copy, writer_paths)
+    }
+
+    /// Seal existing owned members after the caller has joined the generation's
+    /// writers. This never adopts unknown files or grants deletion authority.
+    pub fn cluster_owned_copy_file_seal(
+        &self,
+        copy: &ClusterArtifactCopy,
+        writer_paths: &[String],
+    ) -> Result<Vec<DeliveryFile>> {
         use std::io::Read;
         let _guard = self.mutation_guard()?;
         let artifact = self.get(&copy.publication.artifact)?;
@@ -132,7 +142,7 @@ impl Inventory {
             || self.artifact_in_use(&artifact)?
         {
             return Err(Error::Conflict(
-                "cancelled copy identity/use changed; retain for review".into(),
+                "owned copy identity/use changed; retain for review".into(),
             ));
         }
         let directory = self.verify(&artifact)?;

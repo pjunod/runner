@@ -13,6 +13,7 @@ on:
       - crates/nzbd-torrent/**
       - crates/nzbd/src/main.rs
       - crates/nzbd/src/tls.rs
+      - scripts/check-windows-native-state.py
       - scripts/check-bittorrent-deps.sh
       - scripts/check-private-discovery-leaks.sh
       - scripts/check-bittorrent-storage-full-probe.sh
@@ -25,18 +26,22 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Match every cargo invocation (including scripts) to the installed targets.
+  RUSTUP_TOOLCHAIN: "1.95"
 
 jobs:
   dependency-policy:
     name: exact engine + Rust TLS only
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: bittorrent-m0-dependency-policy
       - name: Check the pinned engine and TLS graph
@@ -49,11 +54,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: bittorrent-m0-private-discovery-capture
       - name: Install packet-capture tools
@@ -68,10 +75,10 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64-gnu
-            runner: ${{ (vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]' }}
+            runner: '["ubuntu-24.04"]'
             target: x86_64-unknown-linux-gnu
           - name: macos-aarch64
-            runner: ${{ (vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["macos-latest"]' || '["self-hosted","macOS","ARM64","lab","apple","xcode-27.2"]' }}
+            runner: '["macos-latest"]'
             target: aarch64-apple-darwin
           - name: windows-x86_64-msvc
             runner: '["windows-latest"]'
@@ -79,24 +86,21 @@ jobs:
     runs-on: ${{ fromJSON(matrix.runner) }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - name: Verify Xcode 27.2
-        if: matrix.target == 'aarch64-apple-darwin'
-        shell: bash
-        run: |
-          xcodebuild -version | awk '{ print } NR == 1 { valid = ($0 == "Xcode 27.2") } END { exit !valid }'
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95"
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: bittorrent-m0-${{ matrix.target }}
       - name: Run the isolated adapter suite
         run: cargo test --locked -p nzbd-torrent --target ${{ matrix.target }}
-      - name: Verify pending-source Windows ACL
+      - name: Verify native Windows ACL, wire format and refusal contracts
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo test --locked -p nzbd-state --target ${{ matrix.target }}
+        run: python scripts/check-windows-native-state.py
       - name: Bound sampled 100-torrent resident-memory growth
         run: >-
           cargo run --locked -p nzbd-torrent --release
@@ -120,7 +124,7 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64-musl
-            runner: ${{ (vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]' }}
+            runner: '["ubuntu-24.04"]'
             target: x86_64-unknown-linux-musl
           - name: linux-aarch64-musl
             runner: '["ubuntu-24.04-arm"]'
@@ -128,18 +132,16 @@ jobs:
     runs-on: ${{ fromJSON(matrix.runner) }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95"
           targets: ${{ matrix.target }}
       - name: Install musl toolchain
-        if: vars.CI_RUNNER_MODE == 'github' || matrix.target == 'aarch64-unknown-linux-musl' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Verify self-hosted musl toolchain
-        if: vars.CI_RUNNER_MODE != 'github' && matrix.target == 'x86_64-unknown-linux-musl' && !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
-        run: command -v musl-gcc
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: bittorrent-m0-${{ matrix.target }}
       - name: Run the isolated adapter suite

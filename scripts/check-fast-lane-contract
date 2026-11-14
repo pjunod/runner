@@ -8,7 +8,7 @@ grep -Fq 'github.event.pull_request.draft == false' "$lane"
 grep -Fq 'cancel-in-progress: true' "$lane"
 grep -Fq 'name: Main promotion gate' "$lane"
 
-for workflow in ci.yml lint.yml coverage.yml; do
+for workflow in lint.yml coverage.yml; do
   grep -A2 '^on:' ".github/workflows/$workflow" | grep -Fq 'workflow_dispatch:'
   if grep -A3 '^on:' ".github/workflows/$workflow" | grep -Eq 'pull_request:|push:'; then
     echo "$workflow must remain manually dispatched" >&2
@@ -38,3 +38,13 @@ grep -Fq 'schedule:' .github/workflows/rqbit-patches.yml
 grep -Fq 'make fast-check-torrent' "$lane"
 # Docs-only changes still run the documentation contract tests (review #296-2).
 grep -Fq 'make fast-check-docs' "$lane"
+
+# Every PR runs the complete suite, including metadata and build-number PRs.
+grep -Eq "^  pull_request:" .github/workflows/ci.yml
+grep -Fq "rust=true" scripts/ci-scope
+grep -Fq "mobile=true" scripts/ci-scope
+
+# An empty/metadata-only diff still selects real Rust and mobile validation.
+scope="$(scripts/ci-scope HEAD)"
+grep -Fxq 'rust=true' <<<"$scope"
+grep -Fxq 'mobile=true' <<<"$scope"

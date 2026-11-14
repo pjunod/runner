@@ -23,7 +23,8 @@
     "jest": "^29.7.0",
     "jest-expo": "~57.0.5",
     "patch-package": "8.0.1",
-    "typescript": "~6.0.3"
+    "typescript": "~6.0.3",
+    "deepmerge": "file:vendor/deepmerge"
   },
   "scripts": {
     "start": "expo start",
@@ -36,10 +37,15 @@
     "test:watch": "jest --watch",
     "doctor": "expo-doctor",
     "export": "expo export --platform all",
-    "postinstall": "patch-package --error-on-fail"
+    "postinstall": "patch-package --error-on-fail && npm run test:dependency-security",
+    "test:dependency-security": "node --test vendor/deepmerge/regressions.cjs"
   },
   "overrides": {
-    "uuid": "11.1.1"
+    "uuid": "11.1.1",
+    "@expo/fingerprint": {
+      "minimatch": "^11.0.5"
+    },
+    "deepmerge": "$deepmerge"
   },
   "expo": {
     "doctor": {

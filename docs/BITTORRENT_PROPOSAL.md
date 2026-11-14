@@ -1,5 +1,13 @@
 # BitTorrent support — one queue, two transfer protocols
 
+**Security amendment, 2026-11-13:** maintained patch
+[`0023-upgrade-upnp-xml-parser.patch`](../contrib/rqbit/0023-upgrade-upnp-xml-parser.patch)
+upgrades the compiled UPnP helper to fixed quick-xml 0.41 and removes both
+XML advisory exceptions. UPnP remains unavailable. Earlier exception tables
+and native matrix measurements below record historical evidence; the
+[gate 9 advisory scope](BITTORRENT_GATE9_REVIEW.md#2-advisory-scope--fixed-parser-no-rustsec-exceptions)
+is authoritative for the updated dependency policy.
+
 **Status:** ADR-19 implemented for single-node v1; M2 lifecycle/policy/activation,
 M3 native surfaces, and M4 qBittorrent compatibility are implemented; the
 magnet DHT amendment is locally qualified and awaits PR publication ·

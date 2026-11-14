@@ -304,6 +304,38 @@ impl LeaderShared {
         crate::admissions::adopt_counters(self).await
     }
 
+    /// Refresh existing replicated rows without restarting recovery/delegation
+    /// for the rest of the catalog. Per-job import retains the normal control,
+    /// writer retirement, journal replay and payload verification boundaries.
+    /// Caller holds mutation_serial; membership changes still use full adoption.
+    pub(crate) async fn restore_control_jobs_projection(
+        &self,
+        ids: &[JobId],
+    ) -> Result<(), String> {
+        crate::control_recovery::reconcile(self).await?;
+        let wanted: HashSet<_> = ids.iter().copied().collect();
+        let jobs: Vec<_> = crate::control_recovery::projection(self)
+            .await?
+            .into_iter()
+            .filter(|job| wanted.contains(&job.id))
+            .collect();
+        if jobs.len() != wanted.len() {
+            // A durable cancellation changed membership, so retain the full
+            // authoritative removal path instead of resurrecting a missing row.
+            return self.restore_control_projection().await;
+        }
+        for job in jobs {
+            let id = job.id;
+            if let Err(error) = self.engine.import_job(job, true, false).await {
+                // Preserve the existing authoritative replay path if an
+                // asynchronous local barrier refuses a partial refresh.
+                tracing::debug!(job=id.0,%error,"targeted projection awaits full authoritative replay");
+                return self.restore_control_projection().await;
+            }
+        }
+        crate::admissions::adopt_counters(self).await
+    }
+
     /// Commit only rows changed by one serialized HTTP request. This avoids
     /// treating an incomplete local snapshot as permission to delete any
     /// unrelated replicated work.
@@ -2214,7 +2246,7 @@ async fn complete_operation(s: Arc<LeaderShared>, req: CompleteRequest) -> Respo
                 .into_response();
         }
     }
-    if let Err(error) = s.restore_control_projection().await {
+    if let Err(error) = s.restore_control_jobs_projection(&[job_id]).await {
         tracing::error!(job=job_id.0,%error,"durable completion projection awaits replay");
     }
     // Delegation is a local scheduler projection, not durable intent. Its
@@ -2773,15 +2805,17 @@ async fn ensure_cluster_delivery(
             }
             if let Some(copy) = copy_manifest.artifact_copy {
                 let raw_files = (!copy.selected).then(|| {
-                    copy_manifest
-                        .files
-                        .iter()
-                        .map(|file| nzbd_state::artifacts::DeliveryFile {
-                            path: file.path.clone(),
-                            size_bytes: file.bytes,
-                            sha256: file.sha256.clone(),
-                        })
-                        .collect::<Vec<_>>()
+                    copy.raw_files.clone().unwrap_or_else(|| {
+                        copy_manifest
+                            .files
+                            .iter()
+                            .map(|file| nzbd_state::artifacts::DeliveryFile {
+                                path: file.path.clone(),
+                                size_bytes: file.bytes,
+                                sha256: file.sha256.clone(),
+                            })
+                            .collect::<Vec<_>>()
+                    })
                 });
                 let copy_key = format!(
                     "artifact:{}:{}:{}",
@@ -3797,8 +3831,8 @@ mod tests {
             .params
             .iter()
             .any(|(key, _)| key == crate::delivery::AUTHORITY_COPY_PARAM));
-        // The binding CAS restores the whole projection. Observe actual
-        // export readiness before this test asks for a single scheduling pass.
+        // Observe actual export readiness of the bound rows before this
+        // test asks for a single scheduling pass.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             for id in [2, 4] {
                 loop {
@@ -3905,6 +3939,148 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        assert!(runtime.shutdown().await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn source_binding_preserves_unrelated_checked_delegation() {
+        let temp = tempfile::tempdir().unwrap();
+        let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = ClusterConfig {
+            cluster_id: "targeted-projection".into(),
+            node_name: "authority".into(),
+            shared_dir: temp.path().join("shared"),
+            advertise_url: "http://127.0.0.1:1".into(),
+            secret: "secret".into(),
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            pp_slots: 0,
+            lease_interval: std::time::Duration::from_millis(100),
+            takeover_after: std::time::Duration::from_secs(1),
+            worker_ttl: std::time::Duration::from_secs(30),
+            control_dir: temp.path().join("control"),
+            control_node_id: 1,
+            control_raft_bind: raft.local_addr().unwrap().to_string(),
+            control_api_bind: api.local_addr().unwrap().to_string(),
+            control_peers: vec![],
+            download_weight: 1,
+            pp_weight: 1,
+            disk_guard_roots: vec![],
+            torrent_payload_roots: vec![],
+            workspace_dir: None,
+        };
+        drop(raft);
+        drop(api);
+        let dest = temp.path().join("dest");
+        let runtime = crate::ClusterRuntime::start(
+            cfg,
+            vec![],
+            Tuning {
+                min_free_disk_bytes: 0,
+                ..Default::default()
+            },
+            dest.clone(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !runtime.leader_shared.authority_ready() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let shared = &runtime.leader_shared;
+        let control = runtime.control.as_ref().unwrap();
+        let serial = shared.mutation_serial.lock().await;
+        let mut unchanged = test_job(1);
+        unchanged.name = "unchanged".into();
+        unchanged.dir_name = "unchanged".into();
+        let mut binding = test_job(2);
+        binding.name = "binding".into();
+        binding.dir_name = "binding".into();
+        for job in [&unchanged, &binding] {
+            runtime
+                .engine
+                .artifacts()
+                .allocate_for_delivery(job.id.0, &dest, &dest.join(&job.dir_name), false, false)
+                .unwrap();
+        }
+        assert!(crate::source_facts::bind_owned(shared, &mut unchanged).unwrap());
+        let rows = vec![unchanged.clone(), binding];
+        control
+            .commit_job_delta(
+                &rows
+                    .iter()
+                    .map(|job| (u64::from(job.id.0), Some(job.clone())))
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        runtime
+            .engine
+            .adopt_replicated_authority(rows)
+            .await
+            .unwrap();
+        assert!(runtime
+            .engine
+            .set_delegated(JobId(1), Some("existing-worker".into()))
+            .await
+            .unwrap());
+        crate::source_facts::reconcile(shared).await.unwrap();
+        let assert_unrelated = || {
+            let snapshot = runtime.engine.snapshot();
+            assert_eq!(
+                snapshot
+                    .jobs
+                    .iter()
+                    .find(|job| job.id == JobId(1))
+                    .unwrap()
+                    .assigned_node
+                    .as_deref(),
+                Some("existing-worker"),
+                "binding another source must not revoke checked PP delegation"
+            );
+        };
+        assert_unrelated();
+        let mut bound = control.current_job_intent(2).await.unwrap().unwrap().0;
+        assert!(bound
+            .params
+            .iter()
+            .any(|(key, _)| key == crate::delivery::AUTHORITY_COPY_PARAM));
+        bound.priority = 9;
+        control.commit_job_delta(&[(2, Some(bound))]).await.unwrap();
+        shared
+            .restore_control_jobs_projection(&[JobId(2)])
+            .await
+            .unwrap();
+        assert_unrelated();
+        assert_eq!(
+            runtime
+                .engine
+                .export_job(JobId(2))
+                .await
+                .unwrap()
+                .unwrap()
+                .priority,
+            9
+        );
+        assert_eq!(
+            runtime
+                .engine
+                .export_job(JobId(1))
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
+            unchanged.name
+        );
+        drop(serial);
         assert!(runtime.shutdown().await);
     }
 

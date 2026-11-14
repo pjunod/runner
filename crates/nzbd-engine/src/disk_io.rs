@@ -626,9 +626,14 @@ mod tests {
             .iter()
             .map(|io| io.source.detail())
             .collect();
+        let missing_counter_detail = if cfg!(target_os = "linux") {
+            "no matching mount"
+        } else {
+            "no kernel counters on this platform"
+        };
         assert_eq!(
             fstypes,
-            ["cifs", "nfs without mountstats", "no matching mount"]
+            ["cifs", "nfs without mountstats", missing_counter_detail]
         );
         assert!(reading
             .volumes

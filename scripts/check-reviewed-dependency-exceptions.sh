@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Repository policy permits two exact RustSec exceptions and one exact
+# Repository policy permits no RustSec exceptions and one exact
 # MPL-2.0 package only while their reviewed dependency and feature boundaries
 # remain intact. Fail closed on output drift, but do not make a workspace
 # version bump look like a third-party dependency change.
@@ -73,31 +73,11 @@ inverse_tree() {
   printf '%s\n' "$output"
 }
 
-quick_xml_tree="$(
-  inverse_tree \
-    'RUSTSEC-2026-0194/0195 quick-xml scope' \
-    'quick-xml@0.37.5' \
-    'normal' \
-    're-run cargo deny, then remove or replace both quick-xml ignores in deny.toml and update the gate 9 evidence'
-)"
-quick_xml_packages="$(package_set <<<"$quick_xml_tree")"
-expected_quick_xml_packages="$(LC_ALL=C sort <<'EOF'
-librqbit v8.1.1
-librqbit-upnp v1.0.0
-nzbd (workspace)
-nzbd-api (workspace)
-nzbd-cluster (workspace)
-nzbd-compat (workspace)
-nzbd-qbit-compat (workspace)
-nzbd-torrent (workspace)
-quick-xml v0.37.5
-EOF
-)"
-require_exact_set \
-  'RUSTSEC-2026-0194/0195 quick-xml' \
-  'dependency package set' \
-  "$quick_xml_packages" \
-  "$expected_quick_xml_packages"
+normal_tree="$(cargo tree --locked --workspace --target all -e normal --prefix none)"
+if grep -E '^quick-xml v' <<<"$normal_tree" | grep -Ev '^quick-xml v0\.41\.'; then
+  echo 'advisory-affected quick-xml re-entered the normal graph' >&2
+  exit 1
+fi
 
 option_ext_tree="$(
   inverse_tree \
@@ -135,11 +115,7 @@ ignored_advisories="$(
     grep -Eo 'RUSTSEC-[0-9]{4}-[0-9]{4}' |
     LC_ALL=C sort -u || true
 )"
-expected_ignored_advisories="$(LC_ALL=C sort <<'EOF'
-RUSTSEC-2026-0194
-RUSTSEC-2026-0195
-EOF
-)"
+expected_ignored_advisories=''
 require_exact_set \
   'repository RustSec exceptions' \
   'reviewed identifier set' \

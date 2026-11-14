@@ -171,46 +171,23 @@ The normal closure is permissively licensed except for exact
 `deny.toml` accepts only that package/version under MPL-2.0; another MPL package
 or version fails the blocking policy job.
 
-## 2. Advisory scope — an exception is a capability restriction
+## 2. Advisory scope — fixed parser, no RustSec exceptions
 
-| Advisory | Locked crate | Affected surface | Enforced disposition |
-|---|---|---|---|
-| [RUSTSEC-2026-0194](https://rustsec.org/advisories/RUSTSEC-2026-0194.html) | `quick-xml 0.37.5` | Attribute iteration can consume quadratic CPU on hostile XML | The only normal path is `librqbit-upnp 1.0.0`; the adapter has no UPnP input and always passes `enable_upnp_port_forwarding: false`. |
-| [RUSTSEC-2026-0195](https://rustsec.org/advisories/RUSTSEC-2026-0195.html) | `quick-xml 0.37.5` | `NsReader` can allocate unbounded namespace state on hostile XML | Same compiled-but-disabled UPnP path. UPnP remains unavailable until the affected dependency is removed or patched. |
-| [RUSTSEC-2026-0009](https://rustsec.org/advisories/RUSTSEC-2026-0009.html) | `time 0.3.41` (historical) | RFC 2822 parsing can exhaust the stack | Resolved on 2026-09-19: the clustering compiler upgrade moved the locked graph to fixed `time 0.3.51`, so the exception was removed. |
-
-The distinction matters: `quick-xml` is still compiled, so the exception is
-not proof the crate is safe. It is acceptable only while nzbd cannot construct
-the affected UPnP runtime path. The historical `time` exception is no longer
-part of the repository policy.
+As of 2026-11-13, maintained patch
+[`0023-upgrade-upnp-xml-parser.patch`](../contrib/rqbit/0023-upgrade-upnp-xml-parser.patch)
+requires fixed `quick-xml 0.41` in the UPnP helper. The former exceptions for
+RUSTSEC-2026-0194 and RUSTSEC-2026-0195 are removed from
+[`deny.toml`](../deny.toml) and the audit invocation. The older
+RUSTSEC-2026-0009 `time` exception was removed on 2026-09-19.
 
 [`scripts/check-reviewed-dependency-exceptions.sh`](../scripts/check-reviewed-dependency-exceptions.sh)
-turns those statements into a repository-wide blocking graph check. It fails
-if:
+rejects older affected XML releases, any RustSec ignore, and drift in the
+exact MPL-2.0 `option-ext 0.2.0` dependency path. Workspace versions are
+normalized so release bumps do not masquerade as dependency changes.
 
-- the `quick-xml 0.37.5` package set differs from the reviewed active daemon
-  chain (`nzbd`, its API/compat/cluster routing crates, `nzbd-torrent`,
-  `librqbit`, and `librqbit-upnp`); the broader workspace reach reflects
-  activation, while the affected UPnP runtime path remains unconstructable;
-- the exact MPL-2.0 `option-ext 0.2.0` path changes; or
-- `deny.toml` ignores any RustSec identifier other than the two `quick-xml`
-  advisories above.
-
-Workspace package versions are normalized before comparison, so an nzbd
-release bump does not masquerade as third-party graph drift. If a pinned
-package disappears, the check fails closed with the exception or license
-entry that must be reconsidered instead of exposing Cargo's unmatched-package
-error as the only diagnosis.
-
-The check lives in the repository-wide Supply chain workflow because the
-complete RustSec ignore set is repository-wide. That
-workflow runs on every pull request and push plus a daily schedule. The daily
-run refreshes RustSec data; the locked graph assertions rerun alongside it but
-can change only when tracked dependency inputs change.
-
-The adapter unit test separately requires the constructed rqbit options to
-keep UPnP false. Graph evidence and runtime-option evidence are intentionally
-separate: either can regress without the other.
+UPnP remains disabled. Fixing the compiled dependency does not authorize
+router changes or change the accepted production capability boundary. The
+recorded August dispositions below remain historical review evidence.
 
 ## 3. Reproduction — inspect the same evidence CI enforces
 

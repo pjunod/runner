@@ -856,6 +856,12 @@ pub fn names(_: &File) -> Result<Vec<std::ffi::OsString>> {
     Err(Error::Conflict("enumeration unsupported".into()))
 }
 #[cfg(not(unix))]
+pub fn entry_missing_at(_: &File, _: &std::ffi::OsStr) -> Result<bool> {
+    Err(Error::Conflict(
+        "descriptor-relative absence proof unavailable".into(),
+    ))
+}
+#[cfg(not(unix))]
 pub fn unlink(_: &File, _: &Path, _: bool) -> Result<()> {
     Err(Error::Conflict("descriptor deletion unavailable".into()))
 }
@@ -923,7 +929,17 @@ pub fn manifest(dir: &File, limit: usize) -> Result<Vec<FileEntry>> {
                 .to_owned();
             // Opening a directory as a regular descriptor is allowed. Symlinks
             // are refused by O_NOFOLLOW, special files by the metadata check.
-            let child = open_at(dir, Path::new(&n), false)?;
+            let child = match open_at(dir, Path::new(&n), false) {
+                // A single relative component plus O_NOFOLLOW makes ELOOP a
+                // refused symlink, not a transient storage failure. Classify
+                // it like other unsupported namespace entries so closed-scope
+                // disposal can unlink the name without following its target.
+                #[cfg(unix)]
+                Err(Error::Io(error)) if error.raw_os_error() == Some(libc::ELOOP) => {
+                    return Err(Error::Conflict(format!("symlink: {display}")));
+                }
+                result => result?,
+            };
             let meta = child.metadata()?;
             if !meta.is_file() && !meta.is_dir() {
                 return Err(Error::Conflict(format!("special file: {display}")));
@@ -1407,6 +1423,28 @@ mod exclusive_tests {
 
 #[cfg(all(test, unix))]
 mod remove_tree_tests {
+    #[test]
+    fn manifest_classifies_a_lone_symlink_as_a_namespace_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = tmp.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, b"never follow this").unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("link")).unwrap();
+        let dir = super::open_dir(&tree).unwrap();
+        assert!(matches!(
+            super::manifest(&dir, 100),
+            Err(super::Error::Conflict(_))
+        ));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"never follow this");
+        assert!(tree
+            .join("link")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
     use super::*;
     use std::os::unix::ffi::OsStrExt;
 
@@ -1450,18 +1488,29 @@ mod remove_tree_tests {
     }
 
     #[test]
-    fn special_files_and_non_utf8_names_are_removed() {
+    fn special_files_are_removed() {
         let (_outside, dir, file) = root();
         let tree = dir.path().join("tree");
         let fifo = std::ffi::CString::new(tree.join("pipe").as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        let odd = tree.join(std::ffi::OsStr::from_bytes(b"bad-\xff-name"));
-        std::fs::create_dir(&odd).unwrap();
-        std::fs::write(odd.join(std::ffi::OsStr::from_bytes(b"\xfe.mkv")), b"x").unwrap();
         let socket = std::os::unix::net::UnixListener::bind(tree.join("sock")).unwrap();
         assert!(manifest(&file, 100).is_err());
         remove_tree_contents(&file).unwrap();
         drop(socket);
+        assert!(empty(&dir));
+    }
+
+    // Linux filesystems admit raw non-UTF-8 names; APFS refuses creation.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_names_are_removed() {
+        let (_outside, dir, file) = root();
+        let tree = dir.path().join("tree");
+        let odd = tree.join(std::ffi::OsStr::from_bytes(b"bad-\xff-name"));
+        std::fs::create_dir(&odd).unwrap();
+        std::fs::write(odd.join(std::ffi::OsStr::from_bytes(b"\xfe.mkv")), b"x").unwrap();
+        assert!(manifest(&file, 100).is_err());
+        remove_tree_contents(&file).unwrap();
         assert!(empty(&dir));
     }
 
@@ -1581,5 +1630,21 @@ mod remove_tree_tests {
         let report = remove_tree_contents(&file).unwrap();
         assert_eq!(report.removed, 100_005);
         assert!(empty(&dir));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_boundaries {
+    use super::*;
+
+    #[test]
+    fn unsupported_absence_and_deletion_refuse_without_touching_payload() {
+        let temporary = tempfile::tempdir().unwrap();
+        let payload = temporary.path().join("payload.bin");
+        std::fs::write(&payload, b"preserve owned work").unwrap();
+        let root = open_dir(temporary.path()).unwrap();
+        assert!(entry_missing_at(&root, std::ffi::OsStr::new("missing")).is_err());
+        assert!(remove_tree_contents(&root).is_err());
+        assert_eq!(std::fs::read(payload).unwrap(), b"preserve owned work");
     }
 }

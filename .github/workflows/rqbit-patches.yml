@@ -11,21 +11,22 @@ permissions:
 
 jobs:
   maintained-series:
-    name: "blocking: maintained rqbit v8.1.1 series / Rust 1.85"
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    name: "blocking: maintained rqbit v8.1.1 series / Rust 1.95"
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
+    env:
+      RUSTUP_TOOLCHAIN: "1.95"
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          node-version: "22"
-      - uses: dtolnay/rust-toolchain@stable
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: "1.85"
+          toolchain: "1.95"
           components: rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          shared-key: rqbit-maintained-v8.1.1-1.85
+          shared-key: rqbit-maintained-v8.1.1-1.95
       - name: Re-derive and test the shipped patch series
         env:
           RQBIT_UPSTREAM_CACHE: ${{ runner.temp }}/rqbit-source-cache/rqbit-v8.1.1.tar.gz
@@ -40,7 +41,7 @@ jobs:
 
   authoritative-restore:
     name: ${{ matrix.name }} / authoritative restore
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     # Stable evidence blocks PRs. Upstream main still runs so drift is visible,
     # but it cannot block a PR when the independently moving branch changes.
@@ -56,16 +57,18 @@ jobs:
             ref: main
             blocking_on_pr: false
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt
       - name: Clone rqbit ${{ matrix.ref }}
         run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: rqbit-${{ matrix.ref }}
           workspaces: ${{ runner.temp }}/rqbit -> target
@@ -76,7 +79,7 @@ jobs:
 
   discovery-health:
     name: ${{ matrix.name }} / discovery health
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     # Match the restore job: test current main on PRs without letting upstream
     # drift veto a change whose stable evidence remains reproducible.
@@ -92,16 +95,18 @@ jobs:
             ref: main
             blocking_on_pr: false
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt
       - name: Clone rqbit ${{ matrix.ref }}
         run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: rqbit-${{ matrix.ref }}
           workspaces: ${{ runner.temp }}/rqbit -> target
@@ -112,7 +117,7 @@ jobs:
 
   metadata-size-limit:
     name: ${{ matrix.name }} / metadata size limit
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
     strategy:
@@ -128,17 +133,19 @@ jobs:
             toolchain: stable
             blocking_on_pr: false
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt
       - name: Clone rqbit ${{ matrix.ref }}
         run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: rqbit-metadata-size-${{ matrix.ref }}-${{ matrix.toolchain }}
           workspaces: ${{ runner.temp }}/rqbit -> target
@@ -149,7 +156,7 @@ jobs:
 
   file-sizing-error:
     name: ${{ matrix.name }} / file sizing error propagation
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
     strategy:
@@ -169,11 +176,13 @@ jobs:
             toolchain: stable
             blocking_on_pr: false
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt
@@ -181,7 +190,7 @@ jobs:
         run: |
           git clone https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
           git -C "$RUNNER_TEMP/rqbit" checkout --detach "${{ matrix.ref }}"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: rqbit-sizing-error-${{ matrix.ref }}-${{ matrix.toolchain }}
           workspaces: ${{ runner.temp }}/rqbit -> target
@@ -192,7 +201,7 @@ jobs:
 
   tracker-request-budget:
     name: ${{ matrix.name }} / tracker request budget
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
     strategy:
@@ -208,17 +217,19 @@ jobs:
             toolchain: stable
             blocking_on_pr: false
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt
       - name: Clone rqbit ${{ matrix.ref }}
         run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: rqbit-tracker-budget-${{ matrix.ref }}-${{ matrix.toolchain }}
           workspaces: ${{ runner.temp }}/rqbit -> target
@@ -229,7 +240,7 @@ jobs:
 
   session-peer-budget:
     name: ${{ matrix.name }} / session peer budget
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
     strategy:
@@ -245,17 +256,19 @@ jobs:
             toolchain: stable
             blocking_on_pr: false
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt
       - name: Clone rqbit ${{ matrix.ref }}
         run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: rqbit-peer-budget-${{ matrix.ref }}-${{ matrix.toolchain }}
           workspaces: ${{ runner.temp }}/rqbit -> target
@@ -266,7 +279,7 @@ jobs:
 
   pending-handshake-budget:
     name: ${{ matrix.name }} / pending handshake budget
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
     strategy:
@@ -282,17 +295,19 @@ jobs:
             toolchain: stable
             blocking_on_pr: false
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt
       - name: Clone rqbit ${{ matrix.ref }}
         run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: rqbit-handshake-budget-${{ matrix.ref }}-${{ matrix.toolchain }}
           workspaces: ${{ runner.temp }}/rqbit -> target
@@ -303,7 +318,7 @@ jobs:
 
   known-peer-budget:
     name: ${{ matrix.name }} / known peer budget
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
     strategy:
@@ -319,17 +334,19 @@ jobs:
             toolchain: stable
             blocking_on_pr: false
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt
       - name: Clone rqbit ${{ matrix.ref }}
         run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: rqbit-known-peer-budget-${{ matrix.ref }}-${{ matrix.toolchain }}
           workspaces: ${{ runner.temp }}/rqbit -> target
@@ -340,7 +357,7 @@ jobs:
 
   peer-response-budget:
     name: ${{ matrix.name }} / peer response budget
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
     strategy:
@@ -356,17 +373,19 @@ jobs:
             toolchain: stable
             blocking_on_pr: false
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt
       - name: Clone rqbit ${{ matrix.ref }}
         run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: rqbit-peer-response-budget-${{ matrix.ref }}-${{ matrix.toolchain }}
           workspaces: ${{ runner.temp }}/rqbit -> target
@@ -377,7 +396,7 @@ jobs:
 
   discovery-pressure-budget:
     name: ${{ matrix.name }} / discovery pressure budget
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     continue-on-error: ${{ github.event_name == 'pull_request' && !matrix.blocking_on_pr }}
     strategy:
@@ -393,17 +412,19 @@ jobs:
             toolchain: stable
             blocking_on_pr: false
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt
       - name: Clone rqbit ${{ matrix.ref }}
         run: git clone --branch "${{ matrix.ref }}" https://github.com/ikatson/rqbit.git "$RUNNER_TEMP/rqbit"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: rqbit-discovery-pressure-${{ matrix.ref }}-${{ matrix.toolchain }}
           workspaces: ${{ runner.temp }}/rqbit -> target

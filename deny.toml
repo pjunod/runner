@@ -8,17 +8,9 @@
 # crate directly; transitive maintainership is still reported for review.
 unmaintained = "workspace"
 
-# librqbit 8.1.1 unconditionally compiles its UPnP helper against quick-xml
-# 0.37, even when port forwarding is disabled. Both advisories are reachable
-# only through that opt-in UPnP path, which remains disabled by M0. These exact
-# exceptions must be removed (or UPnP must remain unavailable) before the
-# production BitTorrent gate can allow port forwarding. The adapter has no
-# UPnP input, and check-reviewed-dependency-exceptions.sh freezes this
-# dependency path plus the complete repository-wide ignore set.
-ignore = [
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
-]
+# The maintained rqbit XML upgrade removes the former UPnP exceptions.
+# New vulnerability exceptions require an explicit review.
+ignore = []
 
 [licenses]
 include-dev = true

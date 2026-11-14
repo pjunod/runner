@@ -1,6 +1,8 @@
 name: Tests
 
 on:
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 env:
@@ -8,6 +10,9 @@ env:
   # External-tool tests (par2, 7z) self-skip on machines without the
   # binaries; in CI a missing tool must be a failure, never a skip.
   NZBD_REQUIRE_TOOLS: 1
+
+permissions:
+  contents: read
 
 jobs:
   mobile:
@@ -19,8 +24,10 @@ jobs:
       run:
         working-directory: mobile
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
           cache: npm
@@ -69,20 +76,18 @@ jobs:
 
   test:
     name: unit + e2e
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: install PP tools (par2, 7z)
-        if: vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
         run: sudo apt-get update && sudo apt-get install -y par2 p7zip-full
-      - name: verify self-hosted PP tools
-        if: vars.CI_RUNNER_MODE != 'github' && !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
-        run: command -v par2 && command -v 7z
       # The whole pyramid: parser/codec/ladder unit tests, engine e2e
       # against the mock NNTP server (incl. kill-and-resume), multi-node
       # cluster tests (election, failover, reclaim), and the whole-daemon
@@ -97,12 +102,14 @@ jobs:
 
   msrv:
     name: MSRV check (1.95)
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: cargo check on the minimum supported Rust version
-        run: cargo check --workspace --all-targets
+        run: cargo +1.95 check --locked --workspace --all-targets

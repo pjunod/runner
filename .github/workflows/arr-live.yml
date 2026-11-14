@@ -7,13 +7,18 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "17 6 * * 1" # weekly, Monday 06:17 UTC
+permissions:
+  contents: read
+
 jobs:
   sonarr-handshake:
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Build nzbd
         run: cargo build --release -p nzbd
       - name: Boot nzbd
@@ -32,7 +37,7 @@ jobs:
       - name: Boot Sonarr
         run: |
           docker run -d --name sonarr --network host \
-            -e SONARR__AUTH__METHOD=External linuxserver/sonarr:latest
+            -e SONARR__AUTH__METHOD=External linuxserver/sonarr:latest@sha256:673dc4609a5672bc8e46069c86ffcea283a86b48d34a6c93d8da8c24a1b87571
           for i in $(seq 1 120); do
             curl -fs http://127.0.0.1:8989/ping && break; sleep 2; done
       - name: Handshake via Sonarr API

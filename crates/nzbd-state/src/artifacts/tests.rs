@@ -3894,6 +3894,10 @@ fn refused_names_in_a_closed_scope_do_not_block_its_disposal() {
     let (tmp, db, root) = fixture();
     let a = parked(&db, &root);
     let op = db.request_delete(&a.id, a.revision, "dispose", 0).unwrap();
+    // A regular late file first causes a real, authorized review state.
+    // Add refused names only after that, before the automatic re-snapshot.
+    std::fs::write(a.path.join("late.part"), b"after the snapshot").unwrap();
+    assert_eq!(db.execute_delete(&op.id).unwrap().state, "review");
     let outside = tmp.path().join("outside.bin");
     std::fs::write(&outside, b"not runner's").unwrap();
     std::os::unix::fs::symlink(&outside, a.path.join("link")).unwrap();
@@ -3902,16 +3906,10 @@ fn refused_names_in_a_closed_scope_do_not_block_its_disposal() {
     ))
     .unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-    let _ = db.execute_delete(&op.id);
     let mut refused = db.get(&a.id).unwrap();
-    refused.hold = Some("review".into());
-    refused.state = "delete_failed".into();
+    assert_eq!(refused.hold.as_deref(), Some("review"));
     refused.updated_at = now() - 2 * exits::HOLD_EXIT_SECONDS;
-    refused.revision += 1;
     save_artifact(&db.db.lock().unwrap(), &refused).unwrap();
-    let mut stuck = db.operation(&op.id).unwrap();
-    stuck.state = "review".into();
-    save_operation(&db.db.lock().unwrap(), &stuck).unwrap();
     let report = db
         .exit_wedged_states(exits::HOLD_EXIT_SECONDS, true)
         .unwrap();
@@ -3949,9 +3947,16 @@ fn an_interrupted_writer_retirement_is_reclassified() {
     let replaced = held(&db, &root, 2, "review: interrupted writer retirement");
     let intact = held(&db, &root, 3, "review: interrupted writer retirement");
     std::fs::remove_dir_all(&gone.path).unwrap();
+    // Keep the old inode allocated: ext4 can immediately reuse it after
+    // unlink, which would make this a same-object fixture by accident.
+    let original_dir = fs::open_dir(&replaced.path).unwrap();
     std::fs::remove_dir_all(&replaced.path).unwrap();
     std::fs::create_dir(&replaced.path).unwrap();
     std::fs::write(replaced.path.join("someone-else"), b"x").unwrap();
+    let replacement = fs::open_dir(&replaced.path).unwrap();
+    assert!(!fs::identity_for_file(&original_dir)
+        .unwrap()
+        .same_object(&fs::identity_for_file(&replacement).unwrap()));
     db.exit_wedged_states(0, true).unwrap();
     assert_eq!(db.get(&gone.id).unwrap().state, "source_gone");
     let other = db.get(&replaced.id).unwrap();
@@ -4744,6 +4749,7 @@ fn delivered_copy(
 /// inode are unchanged. Identities recorded under the old source rebind,
 /// and the cleanup blocked before 0.9.1 is re-verified on its timed exit
 /// and completes with no operator action.
+#[cfg(target_os = "linux")] // Exercises the Linux mountinfo source-alias contract.
 #[test]
 fn a_cleanup_blocked_by_a_renamed_mount_source_rebinds_and_completes() {
     let (tmp, db, root) = fixture();
@@ -4841,6 +4847,7 @@ fn a_cleanup_blocked_by_a_renamed_mount_source_rebinds_and_completes() {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn walk(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {

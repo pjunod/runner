@@ -10,6 +10,10 @@ pub struct ClusterArtifactCopy {
     pub source: SourceGeneration,
     pub job_id: u32,
     pub selected: bool,
+    /// Exact owned raw members, distinct from selected publication output.
+    /// Omitted on historical descriptors to preserve their accepted identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_files: Option<Vec<DeliveryFile>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,6 +47,7 @@ impl Inventory {
             source,
             job_id: job,
             selected: false,
+            raw_files: None,
         }))
     }
 
@@ -102,6 +107,7 @@ impl Inventory {
             },
             job_id: job,
             selected,
+            raw_files: None,
         }))
     }
 
@@ -205,6 +211,7 @@ impl Inventory {
             source: copy.publication.clone(),
             job_id: copy.job_id,
             selected: false,
+            raw_files: None,
         };
         self.delete_cancelled_cluster_artifact_copy(&private, proof, files)
     }
@@ -623,6 +630,41 @@ mod tests {
         })
         .collect()
     }
+    #[test]
+    fn raw_copy_seal_is_identity_bound_and_refuses_unrecorded_members() {
+        let (_temp, inventory, source, mut copy) = fixture();
+        let historical = serde_json::to_value(&copy).unwrap();
+        assert!(historical.get("rawFiles").is_none());
+        let decoded: ClusterArtifactCopy = serde_json::from_value(historical.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), historical);
+        let identity = |copy: &ClusterArtifactCopy| {
+            super::super::external_generation_identity::<DeliveryFile>(
+                3,
+                7,
+                "incarnation",
+                "worker",
+                1,
+                "job-hash",
+                &[],
+                &Some(copy.clone()),
+                &Some((1, 2)),
+                &[],
+                &None,
+            )
+            .unwrap()
+        };
+        let old_identity = identity(&copy);
+        copy.raw_files = Some(inventory.cluster_owned_copy_file_seal(&copy, &[]).unwrap());
+        assert_eq!(copy.raw_files.as_ref().unwrap().len(), 2);
+        assert_ne!(identity(&copy), old_identity);
+        let sealed_identity = identity(&copy);
+        copy.raw_files.as_mut().unwrap()[0].sha256 = "00".repeat(32);
+        assert_ne!(identity(&copy), sealed_identity);
+        std::fs::write(source.join("unknown.txt"), b"unowned bytes").unwrap();
+        assert!(inventory.cluster_owned_copy_file_seal(&copy, &[]).is_err());
+        assert!(source.join("unknown.txt").exists());
+    }
+
     #[test]
     fn explicit_cancel_overrides_only_selected_keep_and_replays_partial_delete_after_restart() {
         let (temp, mut inventory, source, copy) = fixture();

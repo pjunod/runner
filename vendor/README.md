@@ -38,3 +38,12 @@ maintained source makes the same bump.
 Do not edit the vendored source to add nzbd application behavior. Put adapter
 logic in `crates/nzbd-cluster`; keeping the dependency delta identical to its
 maintained source makes later provenance and security review finite.
+
+As of 2026-11-13, the standalone `hiqlite/Cargo.lock` used by CI's terminal
+stream regression also selects fixed crossbeam-epoch 0.9.20, h2 0.4.16,
+rustix 1.1.6, rustls 0.23.46, rustls-webpki 0.103.17, Tokio 1.53.3 and
+webpki-root-certs 1.0.10. The WAL lock independently selects fixed rustix and
+Tokio. These compatible lockfile deltas preserve the source/API and licenses.
+The product uses the root workspace lockfile; the standalone CI feature tree
+is `--no-default-features --features sqlite`. Old optional upstream tooling
+entries in these snapshots are not evidence that those features are shipped.

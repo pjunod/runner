@@ -1836,7 +1836,7 @@ impl Inventory {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     //! Contract §2.5 / plan M3 at the inventory: per-file moves under a
     //! journaled intent, manifest last, finish-or-unwind on restart.
@@ -3210,6 +3210,11 @@ mod tests {
             assert_eq!(std::fs::read(source.join(path)).unwrap(), *bytes);
         }
     }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
 
     /// The golden vector of the deployed `runner-manifest-v1` digest, now
     /// carried by `.runner-manifest.json` (M1a deferred this to M3).
