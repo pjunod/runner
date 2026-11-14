@@ -95,8 +95,14 @@ structure. Fixtures exercise nonzero discriminants, Some/None, signed extremes,
 variable-integer boundaries, big-endian u32 values, Unicode, blobs, nested records,
 all truncated prefixes and accepted trailing bytes. Cryptr tests exercise its
 native derives and real password-sealed envelope in both directions. Candidate
-regressions also reject impossible untrusted collection/string lengths without
-header-driven allocation.
+regressions also reject impossible (`u64::MAX`) collection/string lengths at
+Cryptr's public key-bundle boundary, which uses the untrusted decoder.
+
+Not claimed: Hiqlite Raft, WAL and snapshot decoding keeps the ordinary
+(trusted-input) decoder, exactly as the prior implementation did, and no fixture
+or fuzz target exercises impossible length headers there. The key-bounds
+regression asserts rejection only; it does not cap allocation for large but
+sub-abort lengths. Both are follow-up hardening, not regressions of this renewal.
 
 [`run.py`](../scripts/bincode-compatibility/run.py) then runs real old and new
 Hiqlite processes over private loopback sockets and owned test directories:

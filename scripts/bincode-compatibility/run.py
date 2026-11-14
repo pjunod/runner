@@ -141,7 +141,8 @@ class Node:
 
     def stop(self):
         assert self.cmd("shutdown") == "stopped"
-        self.process.wait(timeout=15)
+        # A probe that panics while shutting down must not pass.
+        assert self.process.wait(timeout=15) == 0, "probe exited non-zero after shutdown"
         self.log.close()
 
 
@@ -262,9 +263,10 @@ try:
     node.kill()
     metadata = next(data.rglob("meta.hql"))
     wal = metadata.parent
-    assert inspection(executables["legacy"], wal) == inspection(
-        executables["candidate"], wal
-    )
+    pristine = inspection(executables["legacy"], wal)
+    assert pristine == inspection(executables["candidate"], wal)
+    # Equality alone would pass if both probes failed the same way.
+    assert "ok" in pristine and pristine["ok"]["invariant_verdicts"], pristine
     checked("old real WAL, vote, and standard metadata inspect identically")
     node = Node("candidate", 1, data, nodes, "single-new-recover")
     active.append(node)
