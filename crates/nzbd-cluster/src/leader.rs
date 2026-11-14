@@ -1627,16 +1627,15 @@ async fn select_worker_hold_expiry(
     if s.history.is_none() {
         return Err("authoritative history unavailable; expired hold retained".into());
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
     if req.node != req.token.owner_node_id
         || req.context.lease_id != format!("{}@{}", req.token.resource, req.token.fence)
         || req.control.lifecycle != "held"
         || !req.control.expiry_pending
         || nzbd_types::HoldCause::legacy_terminal(&req.control.cause).is_some()
-        || !req.control.deadline_unix.is_some_and(|at| at <= now)
+        || !req
+            .control
+            .deadline_in_s
+            .is_some_and(|remaining| remaining <= 0)
         || serde_json::to_vec(&req.control)
             .map_err(|e| e.to_string())?
             .len()
@@ -6555,7 +6554,7 @@ mod tests {
                 control_revision: 1,
                 epoch: 1,
             };
-            let held:nzbd_types::JobControl=serde_json::from_value(serde_json::json!({"version":1,"revision":"4","lifecycle":"held","cause":"capacity","stage":"unpack","retry_policy":"scheduled_retry","message":"extractor volume full","instance":format!("hold-{id}"),"manual_pause":true,"deadline_unix":0,"expiry_pending":true})).unwrap();
+            let held:nzbd_types::JobControl=serde_json::from_value(serde_json::json!({"version":1,"revision":"4","lifecycle":"held","cause":"capacity","stage":"unpack","retry_policy":"scheduled_retry","message":"extractor volume full","instance":format!("hold-{id}"),"manual_pause":true,"deadline_unix":i64::MAX,"deadline_in_s":0,"expiry_pending":true})).unwrap();
             let source = SourceGeneration {
                 artifact: format!("worker-source-{id}"),
                 generation: "exact-generation".into(),
@@ -6589,10 +6588,13 @@ mod tests {
             stale.stop_request.context = stale.context.clone();
             assert!(!select_worker_hold_expiry(&shared, &stale).await.unwrap());
             let mut premature = request.clone();
-            premature.control.deadline_unix = Some(i64::MAX);
+            premature.control.deadline_in_s = Some(60);
             assert!(!select_worker_hold_expiry(&shared, &premature)
                 .await
                 .unwrap());
+            let mut missing = request.clone();
+            missing.control.deadline_in_s = None;
+            assert!(!select_worker_hold_expiry(&shared, &missing).await.unwrap());
             assert!(select_worker_hold_expiry(&shared, &request).await.unwrap());
             assert!(control
                 .current_lease_record(&resource)
