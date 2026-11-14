@@ -5322,6 +5322,9 @@ impl Owner {
                     };
                     control.revision = next.to_string();
                 }
+                // Owner-relative, canonical due proof. Absolute timestamps
+                // are display data on a different host's clock.
+                control.deadline_in_s = Some(0);
                 control.expiry_pending = true;
                 self.state.job_mut(job).unwrap().set_control(&control);
                 self.pending_control_commits.insert(job);
