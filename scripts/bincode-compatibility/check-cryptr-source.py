@@ -16,7 +16,7 @@ args = parser.parse_args()
 root = Path(__file__).resolve().parents[2]
 work = Path(args.work_root).resolve()
 work.mkdir(parents=True, exist_ok=True)
-expected = (root / "contrib/cryptr/upstream-0.10.0.sha256").read_text().split()[0]
+expected = (root / "contrib/cryptr/upstream-0.10.0.sha256").read_text(encoding="utf-8").split()[0]
 archive = work / "cryptr-0.10.0.crate"
 if not archive.exists():
     cargo_home = Path(os.environ["CARGO_HOME"])
@@ -60,7 +60,7 @@ report = {
     "license": "Apache-2.0",
     "upstream_revision": "abca462b82c5d4b3b4c9eb6c1a1cafc444150593",
 }
-(work / "provenance.json").write_text(json.dumps(report, indent=2) + "\n")
+(work / "provenance.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 print(
     "Verified complete Cryptr source, Apache-2.0 license and canonical native-codec patch."
 )

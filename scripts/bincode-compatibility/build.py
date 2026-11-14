@@ -56,15 +56,15 @@ if a.side == "legacy":
             source / f"vendor/{lib}/src/codec_compatibility.rs",
         )
         f = source / f"vendor/{lib}/src/lib.rs"
-        if "pub mod codec_compatibility;" not in f.read_text():
+        if "pub mod codec_compatibility;" not in f.read_text(encoding="utf-8"):
             f.write_text(
-                f.read_text()
+                f.read_text(encoding="utf-8")
                 + '\n#[cfg(feature = "validation-test-helpers")]\npub mod codec_compatibility;\n'
             )
     f = source / "vendor/hiqlite-wal/Cargo.toml"
-    if "validation-test-helpers = []" not in f.read_text():
+    if "validation-test-helpers = []" not in f.read_text(encoding="utf-8"):
         f.write_text(
-            f.read_text().replace(
+            f.read_text(encoding="utf-8").replace(
                 "[features]\n", "[features]\nvalidation-test-helpers = []\n"
             )
         )
@@ -90,7 +90,7 @@ serde_json = "1"
 [patch.crates-io]
 hiqlite-wal = {{ path = {json.dumps(str(source/'vendor/hiqlite-wal'))} }}
 """
-(project / "Cargo.toml").write_text(manifest)
+(project / "Cargo.toml").write_text(manifest, encoding="utf-8")
 (project / "src").mkdir(exist_ok=True)
 shutil.copyfile(
     root / "scripts/bincode-compatibility/probe.rs", project / "src/main.rs"
@@ -128,7 +128,7 @@ metadata = json.loads(
             str(project / "Cargo.toml"),
         ],
         cwd=root,
-        text=True,
+        encoding="utf-8",
     )
 )
 versions = {(p["name"], p["version"]) for p in metadata["packages"]}
@@ -138,7 +138,8 @@ else:
     assert not any(name == "bincode" for name, version in versions)
     assert {("fugue-bincode", "1.3.4"), ("grovedb-bincode", "2.1.0")} <= versions
 (work / (a.side + "-dependency-graph.json")).write_text(
-    json.dumps(metadata, indent=2) + "\n"
+    json.dumps(metadata, indent=2) + "\n",
+    encoding="utf-8",
 )
 exe = (
     pathlib.Path(os.environ["CARGO_TARGET_DIR"])

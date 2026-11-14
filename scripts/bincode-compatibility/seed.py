@@ -7,7 +7,7 @@ from pathlib import Path
 parser = argparse.ArgumentParser()
 parser.add_argument("--corpus-root", required=True)
 args = parser.parse_args()
-reference = json.loads((Path(__file__).parent / "legacy-fixtures.json").read_text())
+reference = json.loads((Path(__file__).parent / "legacy-fixtures.json").read_text(encoding="utf-8"))
 root = Path(args.corpus_root)
 for target in ["peer_protocol", "key_bundle"]:
     (root / target).mkdir(parents=True, exist_ok=True)
@@ -17,6 +17,11 @@ for name, fixture in reference["peer"].items():
     (folder / name).write_bytes(data)
     for end in range(len(data)):
         (folder / f"{name}-prefix-{end:03}").write_bytes(data[:end])
+# Regression seed: an extended message whose bencode byte-string length is
+# u64::MAX overflowed the decoder's end offset (patch 0026).
+(folder / "overflowing-bencode-length").write_bytes(
+    bytes([0, 0, 0, 71, 20, 66]) + b"lllllll" + b"0" * 39 + b"18446744073709551615:l\xa3"
+)
 data = bytes.fromhex(reference["keys_hex"])
 folder = root / "key_bundle"
 (folder / "legacy-native-keys").write_bytes(data)

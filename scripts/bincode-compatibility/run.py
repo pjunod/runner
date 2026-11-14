@@ -21,7 +21,7 @@ report = {
     "baseline": "5e44e1acfb590c8657a10cf7983f8c37cb04c654",
     "profile": a.profile,
     "candidate_source": subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ["git", "rev-parse", "HEAD"], cwd=root, encoding="utf-8"
     ).strip(),
     "binary_sha256": {
         s: hashlib.sha256(e.read_bytes()).hexdigest() for s, e in executables.items()
@@ -32,7 +32,7 @@ report = {
 
 def checked(name):
     report["checks"].append(name)
-    (work / "compatibility-report.json").write_text(json.dumps(report, indent=2) + "\n")
+    (work / "compatibility-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print("PASS", name, flush=True)
 
 
@@ -59,7 +59,7 @@ checked(
 )
 frozen = {}
 for name in ["hiqlite", "wal", "peer"]:
-    data = json.loads((work / "legacy-fixtures" / (name + ".json")).read_text())
+    data = json.loads((work / "legacy-fixtures" / (name + ".json")).read_text(encoding="utf-8"))
     frozen[name] = {
         key: {
             "bytes_hex": bytes(value[0]).hex(),
@@ -77,8 +77,8 @@ frozen["public_key_error_sha256"] = hashlib.sha256(
 fixture = root / "scripts/bincode-compatibility" / ("legacy-fixtures" + tag + ".json")
 if a.freeze:
     assert not fixture.exists(), "Never silently overwrite frozen baseline fixtures"
-    fixture.write_text(json.dumps(frozen, indent=2, sort_keys=True) + "\n")
-assert json.loads(fixture.read_text()) == frozen, "Independent legacy fixtures drifted"
+    fixture.write_text(json.dumps(frozen, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+assert json.loads(fixture.read_text(encoding="utf-8")) == frozen, "Independent legacy fixtures drifted"
 checked("frozen genuine legacy bytes and malformed-input outcomes")
 if a.fixtures_only:
     raise SystemExit(0)
@@ -102,7 +102,6 @@ class Node:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=self.log,
-            text=True,
             encoding="utf8",
             bufsize=1,
         )
@@ -196,7 +195,8 @@ def assert_snapshot_received(node, minimum, tag):
             and received
         ):
             (work / (tag + "-snapshot-evidence.json")).write_text(
-                json.dumps({"metrics": metrics, "transport": status}, indent=2) + "\n"
+                json.dumps({"metrics": metrics, "transport": status}, indent=2) + "\n",
+                encoding="utf-8",
             )
             return
         assert time.monotonic() < deadline, (metrics, status)
@@ -221,14 +221,14 @@ def stage_wal_only(node, row_id, tag):
         > evidence["last_applied"]["index"]
     )
     (work / (tag + "-wal-replay-evidence.json")).write_text(
-        json.dumps(evidence, indent=2) + "\n"
+        json.dumps(evidence, indent=2) + "\n",
+        encoding="utf-8",
     )
 
 
 def inspection(exe, path):
     done = subprocess.run(
         [str(exe), "inspect", str(path)],
-        text=True,
         encoding="utf8",
         capture_output=True,
         check=True,
