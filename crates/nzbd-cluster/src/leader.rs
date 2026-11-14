@@ -6440,7 +6440,7 @@ mod tests {
             .acquire(
                 "cluster/leader",
                 "expiry",
-                0,
+                1,
                 "leader",
                 "new",
                 "leader-boot",
