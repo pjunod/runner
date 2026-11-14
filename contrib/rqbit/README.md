@@ -190,11 +190,18 @@ with both this backend and AWS-LC. The daemon continues to select AWS-LC.
 
 Bincode 1.3.3 and 2.0.1 still carry RustSec's unmaintained notice. They encode
 peer protocol data and persisted Raft/WAL/state records using distinct fixed
-and variable integer configurations. There is no maintained drop-in release:
-bincode 3.0.0 is a retirement marker, and wincode's compatibility covers only
-matching schemas/configurations. A replacement needs an explicit data-format
-migration and cross-version recovery proof; this patch preserves those bytes
-and keeps the notices visible. Optional stock rqbit CLI/UI and unselected
+and variable integer configurations. The retired upstream package has no
+patched release; bincode 3.0.0 is a compile-error retirement marker. Community
+[bincode-next](https://github.com/Apich-Organization/bincode) and
+[bincode_reloaded](https://github.com/butlergroup/bincode_reloaded) 3.x forks
+exist. The former adds default SIMD and new formats/configurations; the latter
+changes Serde/error/derive dependencies. Neither is an independently validated
+replacement for this project's persisted and peer data. Wincode likewise
+promises compatibility only for matching schemas/configurations. A replacement
+must prove byte-for-byte encoding, decoding of existing records, malformed-input
+behavior and cross-version recovery; any differing format needs a migration.
+This patch preserves those bytes and keeps the notices visible instead of
+renaming a codec to silence them. Optional stock rqbit CLI/UI and unselected
 Hiqlite feature graphs remain provenance snapshots, separately inventoried
 from the shipped product and maintained compatibility-test graphs. Optional
 contribution probes still test separately fetched upstream sources; their CLI

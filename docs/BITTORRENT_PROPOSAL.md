@@ -654,8 +654,11 @@ the engine or adopting a newer major release.
 
 Bincode 1.3.3/2.0.1 maintenance notices remain visible. Its peer and persisted
 Raft/WAL encodings are unchanged: the 3.0.0 package is a compile-error
-retirement marker, and replacing it with another serializer would require
-schema/configuration and cross-version migration proof. Optional stock CLI/
+retirement marker. Community bincode-next/bincode_reloaded 3.x forks and
+schema-based alternatives exist, but their compatibility with this project's
+actual persisted and peer records has not been independently established.
+Replacing the codec requires byte/behavior and cross-version recovery proof,
+with a migration wherever formats differ. Optional stock CLI/
 UI and unselected vendor-feature snapshots are inventoried separately from
 actual product and maintained compatibility graphs; their presence is not
 described as a fixed or supported runtime. Optional contribution probes
