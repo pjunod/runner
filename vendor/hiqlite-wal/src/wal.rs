@@ -646,6 +646,18 @@ impl WalFile {
         self.mmap = None;
     }
 
+    /// Unmap and unlink a purged file.
+    ///
+    /// Windows refuses to delete a file while a mapped section of it is open
+    /// (os error 1224), so both mappings are released first. The file is being
+    /// discarded, so its header is not rewritten on drop.
+    fn delete(mut self) -> Result<(), Error> {
+        self.mmap = None;
+        self.mmap_mut = None;
+        fs::remove_file(&self.path)?;
+        Ok(())
+    }
+
     #[inline]
     pub fn mmap_mut(&mut self) -> Result<(), Error> {
         if self.mmap_mut.is_some() {
@@ -1081,8 +1093,7 @@ impl WalFileSet {
 
         if purge_front {
             while !self.files.is_empty() && self.files.front().unwrap().id_until < id_until {
-                let file = self.files.pop_front().unwrap();
-                fs::remove_file(&file.path)?;
+                self.files.pop_front().unwrap().delete()?;
             }
             if self.files.is_empty() {
                 self.add_file(wal_size, buf)?;
@@ -1104,8 +1115,7 @@ impl WalFileSet {
             }
         } else if truncate_back {
             while !self.files.is_empty() && self.files.back().unwrap().id_from > id_from {
-                let file = self.files.pop_back().unwrap();
-                fs::remove_file(&file.path)?;
+                self.files.pop_back().unwrap().delete()?;
             }
             if self.files.is_empty() {
                 self.add_file(wal_size, buf)?;
