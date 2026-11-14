@@ -1722,7 +1722,7 @@ async fn select_worker_hold_expiry(
         &req.control.stage,
         &message,
     );
-    terminal.fetched = req.fetched.clone();
+    terminal.fetched = req.fetched;
     terminal.salvage = nzbd_state::artifacts::SalvageState::Pending;
     terminal.salvage_error=Some("expired worker source awaits joined stop and owner-preserved disposition; assessment not completed".into());
     for (key, value) in &mut terminal.markers {
