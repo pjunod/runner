@@ -6,7 +6,7 @@ readonly series_file="$repository_root/contrib/rqbit/maintained-series.txt"
 readonly checksum_file="$repository_root/contrib/rqbit/upstream-v8.1.1.sha256"
 readonly vendor_dir="$repository_root/contrib/rqbit/vendor"
 readonly upstream_url="https://github.com/ikatson/rqbit/archive/refs/tags/v8.1.1.tar.gz"
-readonly expected_series=$'0001-allow-persistence-without-auto-restore.patch\n0005-bound-tracker-requests.patch\n0007-bound-session-peers.patch\n0009-bound-pending-incoming-handshakes.patch\n0010-bound-known-peer-records.patch\n0012-bound-peer-response-backlog.patch\n0014-bound-discovery-pressure.patch\n0016-limit-peer-metadata-before-allocation.patch\n0018-propagate-file-sizing-errors.patch\n0019-disable-peer-exchange.patch\n0020-expose-test-only-dht-bootstrap.patch\n0021-configurable-client-identity-and-announce-lifecycle.patch\n0022-read-only-piece-verifier.patch\n0023-upgrade-upnp-xml-parser.patch'
+readonly expected_series=$'0001-allow-persistence-without-auto-restore.patch\n0005-bound-tracker-requests.patch\n0007-bound-session-peers.patch\n0009-bound-pending-incoming-handshakes.patch\n0010-bound-known-peer-records.patch\n0012-bound-peer-response-backlog.patch\n0014-bound-discovery-pressure.patch\n0016-limit-peer-metadata-before-allocation.patch\n0018-propagate-file-sizing-errors.patch\n0019-disable-peer-exchange.patch\n0020-expose-test-only-dht-bootstrap.patch\n0021-configurable-client-identity-and-announce-lifecycle.patch\n0022-read-only-piece-verifier.patch\n0023-upgrade-upnp-xml-parser.patch\n0024-replace-unmaintained-retry-and-sha1-backends.patch'
 readonly expected_vendor_entries=$'LICENSE\nREADME.md\ncrates'
 
 if [[ "$(<"$series_file")" != "$expected_series" ]]; then
@@ -131,11 +131,40 @@ check_dht_dispatch() (
     --features sha1-ring "$dispatch_test" -- --exact
 )
 
+check_retry_and_sha1() (
+  cd "$source_dir"
+  readonly retry_test='retry::tests::'
+  retry_tests="$(cargo test --locked -p librqbit-core --lib --no-default-features --features sha1-ring -- --list)"
+  for exact_test in \
+    retry::tests::peer_schedule_preserves_growth_jitter_and_base_cap \
+    retry::tests::bootstrap_fractional_growth_matches_original_nanosecond_vectors \
+    retry::tests::elapsed_budget_includes_work_and_sleep_and_reset_starts_over; do
+    grep -Fxq "$exact_test: test" <<<"$retry_tests" || { echo "missing retry policy proof: $exact_test" >&2; exit 1; }
+  done
+  cargo test --locked -p librqbit-core --lib --no-default-features --features sha1-ring "$retry_test"
+  readonly sha_test='tests::sha1_protocol_vectors_match_for_whole_and_segmented_input'
+  sha_tests="$(cargo test --locked -p librqbit-sha1-wrapper --lib -- --list)"
+  grep -Fxq "$sha_test: test" <<<"$sha_tests" || { echo "missing SHA-1 protocol proof" >&2; exit 1; }
+  cargo test --locked -p librqbit-sha1-wrapper --lib "$sha_test" -- --exact
+  cargo test --locked -p librqbit-sha1-wrapper --lib --no-default-features --features sha1-ring "$sha_test" -- --exact
+  protocol_tests="$(cargo test --locked -p librqbit-peer-protocol --lib --no-default-features --features sha1-ring -- --list)"
+  grep -Fxq 'tests::test_handshake_serialize: test' <<<"$protocol_tests" || { echo "missing bincode peer wire fixture" >&2; exit 1; }
+  cargo test --locked -p librqbit-peer-protocol --lib --no-default-features --features sha1-ring
+)
+
+if [[ "${RQBIT_SERIES_RETRY_SHA1_ONLY:-0}" == "1" ]]; then
+  check_retry_and_sha1
+  exit 0
+fi
+
 if [[ "${RQBIT_SERIES_DISPATCH_ONLY:-0}" == "1" ]]; then
+  check_retry_and_sha1
   check_dht_dispatch
   echo "rqbit fast lane: maintained derivation and release DHT dispatch passed"
   exit 0
 fi
+
+check_retry_and_sha1
 
 (
   cd "$source_dir"

@@ -1,0 +1,662 @@
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -376,17 +376,6 @@
+ ]
+ 
+ [[package]]
+-name = "backoff"
+-version = "0.4.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b62ddb9cb1ec0a098ad4bbf9344d0713fa193ae1a80af55febcff2627b6a00c1"
+-dependencies = [
+- "getrandom 0.2.16",
+- "instant",
+- "rand 0.8.7",
+-]
+-
+-[[package]]
+ name = "backtrace"
+ version = "0.3.75"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -420,26 +409,6 @@
+ checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+ dependencies = [
+  "serde",
+-]
+-
+-[[package]]
+-name = "bincode"
+-version = "2.0.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
+-dependencies = [
+- "bincode_derive",
+- "serde",
+- "unty",
+-]
+-
+-[[package]]
+-name = "bincode_derive"
+-version = "2.0.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "bf95709a440f45e986983918d0e8a1f30a9b1df04918fc828670606804ac3c09"
+-dependencies = [
+- "virtue",
+ ]
+ 
+ [[package]]
+@@ -769,24 +738,6 @@
+ dependencies = [
+  "bytes",
+  "memchr",
+-]
+-
+-[[package]]
+-name = "commoncrypto"
+-version = "0.2.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d056a8586ba25a1e4d61cb090900e495952c7886786fc55f909ab2f819b69007"
+-dependencies = [
+- "commoncrypto-sys",
+-]
+-
+-[[package]]
+-name = "commoncrypto-sys"
+-version = "0.2.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "1fed34f46747aa73dfaa578069fd8279d2818ade2b55f38f22a9401c7f4083e2"
+-dependencies = [
+- "libc",
+ ]
+ 
+ [[package]]
+@@ -968,18 +919,6 @@
+ ]
+ 
+ [[package]]
+-name = "crypto-hash"
+-version = "0.3.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "8a77162240fd97248d19a564a565eb563a3f592b386e4136fb300909e67dddca"
+-dependencies = [
+- "commoncrypto",
+- "hex 0.3.2",
+- "openssl",
+- "winapi",
+-]
+-
+-[[package]]
+ name = "cssparser"
+ version = "0.27.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -2056,12 +1995,6 @@
+ 
+ [[package]]
+ name = "hex"
+-version = "0.3.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "805026a5d0141ffc30abb3be3173848ad46a1b1664fe632428479619a3644d77"
+-
+-[[package]]
+-name = "hex"
+ version = "0.4.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+@@ -2449,15 +2382,6 @@
+ ]
+ 
+ [[package]]
+-name = "instant"
+-version = "0.1.13"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e0242819d153cba4b4b05a5a8f2a7e9bbf97b6055b2a002b395c96b5ff3c0222"
+-dependencies = [
+- "cfg-if",
+-]
+-
+-[[package]]
+ name = "intervaltree"
+ version = "0.2.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -2738,9 +2662,7 @@
+  "async-stream",
+  "async-trait",
+  "axum 0.8.4",
+- "backoff",
+  "base64 0.22.1",
+- "bincode 2.0.1",
+  "bitvec",
+  "byteorder",
+  "bytes",
+@@ -2748,7 +2670,7 @@
+  "dashmap 6.1.0",
+  "futures",
+  "governor",
+- "hex 0.4.3",
++ "hex",
+  "home",
+  "http",
+  "intervaltree",
+@@ -2830,7 +2752,7 @@
+  "bytes",
+  "data-encoding",
+  "directories 6.0.0",
+- "hex 0.4.3",
++ "hex",
+  "itertools",
+  "librqbit-bencode",
+  "librqbit-buffers",
+@@ -2850,13 +2772,12 @@
+ version = "5.3.1"
+ dependencies = [
+  "anyhow",
+- "backoff",
+  "byteorder",
+  "bytes",
+  "chrono",
+  "dashmap 6.1.0",
+  "futures",
+- "hex 0.4.3",
++ "hex",
+  "indexmap 2.9.0",
+  "leaky-bucket",
+  "librqbit-bencode",
+@@ -2878,7 +2799,7 @@
+ version = "4.3.0"
+ dependencies = [
+  "anyhow",
+- "bincode 1.3.3",
++ "bincode",
+  "bitvec",
+  "byteorder",
+  "bytes",
+@@ -2896,7 +2817,7 @@
+ dependencies = [
+  "assert_cfg",
+  "aws-lc-rs",
+- "crypto-hash",
++ "sha1",
+ ]
+ 
+ [[package]]
+@@ -4621,7 +4542,7 @@
+  "errno",
+  "libc",
+  "linux-raw-sys 0.12.1",
+- "windows-sys 0.59.0",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+@@ -4920,7 +4841,7 @@
+  "base64 0.22.1",
+  "bs58",
+  "chrono",
+- "hex 0.4.3",
++ "hex",
+  "indexmap 1.9.3",
+  "indexmap 2.9.0",
+  "schemars 0.9.0",
+@@ -4973,6 +4894,17 @@
+ dependencies = [
+  "nodrop",
+  "stable_deref_trait",
++]
++
++[[package]]
++name = "sha1"
++version = "0.10.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
++dependencies = [
++ "cfg-if",
++ "cpufeatures",
++ "digest",
+ ]
+ 
+ [[package]]
+@@ -5220,7 +5152,7 @@
+  "dotenvy",
+  "either",
+  "heck 0.5.0",
+- "hex 0.4.3",
++ "hex",
+  "once_cell",
+  "proc-macro2",
+  "quote",
+@@ -5250,7 +5182,7 @@
+  "futures-channel",
+  "futures-core",
+  "futures-util",
+- "hex 0.4.3",
++ "hex",
+  "hkdf",
+  "hmac",
+  "home",
+@@ -6332,12 +6264,6 @@
+ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+ 
+ [[package]]
+-name = "unty"
+-version = "0.0.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
+-
+-[[package]]
+ name = "url"
+ version = "2.5.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -6420,12 +6346,6 @@
+ version = "0.9.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+-
+-[[package]]
+-name = "virtue"
+-version = "0.0.18"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
+ 
+ [[package]]
+ name = "vswhom"
+@@ -6718,7 +6638,7 @@
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
+ dependencies = [
+- "windows-sys 0.48.0",
++ "windows-sys 0.59.0",
+ ]
+ 
+ [[package]]
+--- a/crates/dht/Cargo.toml
++++ b/crates/dht/Cargo.toml
+@@ -32,7 +32,6 @@
+ anyhow = "1"
+ parking_lot = "0.12"
+ tracing = "0.1"
+-backoff = "0.4.0"
+ futures = "0.3"
+ rand = "0.9"
+ indexmap = "2"
+--- a/crates/dht/src/dht.rs
++++ b/crates/dht/src/dht.rs
+@@ -20,12 +20,12 @@
+     INACTIVITY_TIMEOUT, REQUERY_INTERVAL, RESPONSE_TIMEOUT,
+ };
+ use anyhow::{bail, Context};
+-use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
+ use bencode::ByteBufOwned;
+ use dashmap::DashMap;
+ use futures::{
+     future::BoxFuture, stream::FuturesUnordered, FutureExt, Stream, StreamExt, TryFutureExt,
+ };
++use librqbit_core::retry::RetryPolicy;
+ 
+ use leaky_bucket::RateLimiter;
+ use librqbit_core::{
+@@ -974,12 +974,7 @@
+     }
+ 
+     async fn bootstrap_hostname_with_backoff(&self, addr: &str) -> anyhow::Result<()> {
+-        let mut backoff = ExponentialBackoffBuilder::new()
+-            .with_initial_interval(Duration::from_secs(10))
+-            .with_multiplier(1.5)
+-            .with_max_interval(Duration::from_secs(60))
+-            .with_max_elapsed_time(Some(Duration::from_secs(86400)))
+-            .build();
++        let mut backoff = RetryPolicy::bootstrap();
+ 
+         loop {
+             let backoff = match self
+--- a/crates/librqbit/Cargo.toml
++++ b/crates/librqbit/Cargo.toml
+@@ -86,7 +86,6 @@
+ ] }
+ urlencoding = "2"
+ byteorder = "1"
+-bincode = "2"
+ bitvec = "1"
+ parking_lot = "0.12"
+ tracing = "0.1.40"
+@@ -104,7 +103,6 @@
+ ] } # can't upgrade yet until min version is Rust 1.81, see https://github.com/servo/rust-url/issues/992
+ 
+ hex = "0.4"
+-backoff = "0.4.0"
+ dashmap = "6"
+ base64 = "0.22"
+ serde_with = "3.4.0"
+--- a/crates/librqbit/src/torrent_state/live/mod.rs
++++ b/crates/librqbit/src/torrent_state/live/mod.rs
+@@ -55,7 +55,6 @@
+ };
+ 
+ use anyhow::{bail, Context};
+-use backoff::backoff::Backoff;
+ use buffers::{ByteBuf, ByteBufOwned};
+ use clone_to_owned::CloneToOwned;
+ use librqbit_core::{
+--- a/crates/librqbit/src/torrent_state/live/peer/stats/atomic.rs
++++ b/crates/librqbit/src/torrent_state/live/peer/stats/atomic.rs
+@@ -6,7 +6,7 @@
+     time::Duration,
+ };
+ 
+-use backoff::{ExponentialBackoff, ExponentialBackoffBuilder};
++use librqbit_core::retry::RetryPolicy;
+ 
+ #[derive(Default, Debug)]
+ pub(crate) struct PeerCountersAtomic {
+@@ -51,19 +51,14 @@
+ #[derive(Debug)]
+ pub(crate) struct PeerStats {
+     pub counters: Arc<PeerCountersAtomic>,
+-    pub backoff: ExponentialBackoff,
++    pub backoff: RetryPolicy,
+ }
+ 
+ impl Default for PeerStats {
+     fn default() -> Self {
+         Self {
+             counters: Arc::new(Default::default()),
+-            backoff: ExponentialBackoffBuilder::new()
+-                .with_initial_interval(Duration::from_secs(10))
+-                .with_multiplier(6.)
+-                .with_max_interval(Duration::from_secs(3600))
+-                .with_max_elapsed_time(Some(Duration::from_secs(86400)))
+-                .build(),
++            backoff: RetryPolicy::peer(),
+         }
+     }
+ }
+--- a/crates/librqbit/src/torrent_state/live/peers/mod.rs
++++ b/crates/librqbit/src/torrent_state/live/peers/mod.rs
+@@ -1,7 +1,6 @@
+ use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+ 
+ use anyhow::Context;
+-use backoff::backoff::Backoff;
+ use dashmap::DashMap;
+ use librqbit_core::lengths::ValidPieceIndex;
+ use parking_lot::RwLock;
+--- a/crates/librqbit_core/src/lib.rs
++++ b/crates/librqbit_core/src/lib.rs
+@@ -5,6 +5,7 @@
+ pub mod lengths;
+ pub mod magnet;
+ pub mod peer_id;
++pub mod retry;
+ pub mod spawn_utils;
+ pub mod speed_estimator;
+ #[cfg(any(feature = "sha1-crypto-hash", feature = "sha1-ring"))]
+--- /dev/null
++++ b/crates/librqbit_core/src/retry.rs
+@@ -0,0 +1,160 @@
++//! Owned peer/bootstrap retry policy. These fixed policies preserve rqbit 8.1.1's
++//! backoff 0.4 timing: symmetric 50% jitter, a cap on the base (not jittered)
++//! interval, and a wall-clock 24-hour budget including the proposed sleep.
++//! Native std::time::Instant replaces the unmaintained instant abstraction.
++//!
++//! Nanosecond arithmetic adapted from backoff 0.4 (MIT), copyright 2015
++//! András Ihrig. Permission is granted, free of charge, to any person obtaining
++//! a copy of this software and associated documentation files, to deal in the
++//! Software without restriction, including without limitation the rights to
++//! use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
++//! of the Software, and to permit persons to whom the Software is furnished to
++//! do so, subject to the following conditions: the above copyright notice and
++//! this permission notice shall be included in all copies or substantial
++//! portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY
++//! OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
++//! OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
++//! IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
++//! DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
++//! OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
++//! USE OR OTHER DEALINGS IN THE SOFTWARE.
++
++use std::time::{Duration, Instant};
++
++const INITIAL: Duration = Duration::from_secs(10);
++const BUDGET: Duration = Duration::from_secs(86400);
++
++#[derive(Debug)]
++pub struct RetryPolicy {
++    interval: Duration,
++    maximum: Duration,
++    multiplier: f64,
++    started: Instant,
++}
++
++impl RetryPolicy {
++    pub fn peer() -> Self {
++        Self::new(6.0, 3600)
++    }
++    pub fn bootstrap() -> Self {
++        Self::new(1.5, 60)
++    }
++
++    fn new(multiplier: f64, maximum_secs: u64) -> Self {
++        Self {
++            interval: INITIAL,
++            maximum: Duration::from_secs(maximum_secs),
++            multiplier,
++            started: Instant::now(),
++        }
++    }
++
++    pub fn reset(&mut self) {
++        self.interval = INITIAL;
++        self.started = Instant::now();
++    }
++
++    pub fn next_backoff(&mut self) -> Option<Duration> {
++        self.next_at(self.started.elapsed(), rand::random())
++    }
++
++    fn next_at(&mut self, elapsed: Duration, random: f64) -> Option<Duration> {
++        if elapsed > BUDGET {
++            return None;
++        }
++        let nanos =
++            |d: Duration| d.as_secs() as f64 * 1_000_000_000.0 + f64::from(d.subsec_nanos());
++        let duration = |n: f64| {
++            Duration::new(
++                (n / 1_000_000_000.0) as u64,
++                (n as u64 % 1_000_000_000) as u32,
++            )
++        };
++        let base = nanos(self.interval);
++        // Preserve backoff 0.4's inclusive-nanosecond sampling and rounding.
++        let delay = duration(base * 0.5 + random * (base + 1.0));
++        self.interval = if base >= nanos(self.maximum) / self.multiplier {
++            self.maximum
++        } else {
++            duration(base * self.multiplier)
++        };
++        (elapsed + delay <= BUDGET).then_some(delay)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn peer_schedule_preserves_growth_jitter_and_base_cap() {
++        let mut policy = RetryPolicy::peer();
++        for seconds in [10, 60, 360, 2160, 3600, 3600] {
++            assert_eq!(
++                policy.next_at(Duration::ZERO, 0.0),
++                Some(Duration::from_secs(seconds / 2))
++            );
++        }
++        // A one-hour base cap still permits a jittered delay approaching 90m.
++        assert_eq!(
++            policy.next_at(Duration::ZERO, 0.75),
++            Some(Duration::from_secs(4500))
++        );
++    }
++
++    #[test]
++    fn bootstrap_fractional_growth_matches_original_nanosecond_vectors() {
++        let mut policy = RetryPolicy::bootstrap();
++        for nanos in [
++            5_000_000_000,
++            7_500_000_000,
++            11_250_000_000,
++            16_875_000_000,
++            25_312_500_000,
++            30_000_000_000,
++            30_000_000_000,
++        ] {
++            assert_eq!(
++                policy.next_at(Duration::ZERO, 0.0),
++                Some(Duration::from_nanos(nanos))
++            );
++        }
++        let mut policy = RetryPolicy::bootstrap();
++        assert_eq!(
++            policy.next_at(Duration::ZERO, 0.25),
++            Some(Duration::from_millis(7500))
++        );
++        assert_eq!(
++            policy.next_at(Duration::ZERO, 0.75),
++            Some(Duration::from_millis(18750))
++        );
++    }
++
++    #[test]
++    fn elapsed_budget_includes_work_and_sleep_and_reset_starts_over() {
++        let mut policy = RetryPolicy::peer();
++        assert_eq!(
++            policy.next_at(BUDGET - Duration::from_secs(5), 0.0),
++            Some(Duration::from_secs(5))
++        );
++        assert_eq!(policy.next_at(BUDGET - Duration::from_secs(5), 0.0), None);
++        let interval = policy.interval;
++        assert_eq!(policy.next_at(BUDGET + Duration::from_nanos(1), 0.0), None);
++        assert_eq!(policy.interval, interval);
++        // A fresh Windows VM's Instant cannot be backdated before boot.
++        // Exhaustion is checked above with explicit elapsed time; observe reset
++        // between actual clock reads without assuming 24 hours of host uptime.
++        let before_reset = Instant::now();
++        policy.reset();
++        let after_reset = Instant::now();
++        assert!(before_reset <= policy.started && policy.started <= after_reset);
++        assert_eq!(policy.interval, INITIAL);
++        let live_delay = policy.next_backoff().unwrap();
++        assert!((Duration::from_secs(5)..=Duration::from_secs(15)).contains(&live_delay));
++        policy.reset();
++        assert_eq!(
++            policy.next_at(Duration::ZERO, 0.0),
++            Some(Duration::from_secs(5))
++        );
++    }
++}
+--- a/crates/sha1w/Cargo.toml
++++ b/crates/sha1w/Cargo.toml
+@@ -12,10 +12,11 @@
+ 
+ [features]
+ default = ["sha1-crypto-hash"]
+-sha1-crypto-hash = ["crypto-hash"]
++# Historical feature name retained for upstream callers; implementation is RustCrypto.
++sha1-crypto-hash = ["dep:sha1"]
+ sha1-ring = ["aws-lc-rs"]
+ 
+ [dependencies]
+ assert_cfg = "0.1.0"
+-crypto-hash = { version = "0.3", optional = true }
++sha1 = { version = "0.10.6", optional = true }
+ aws-lc-rs = { version = "1.12", optional = true }
+--- a/crates/sha1w/src/lib.rs
++++ b/crates/sha1w/src/lib.rs
+@@ -1,9 +1,5 @@
+-// Wrapper for sha1 libraries to be able to swap them easily,
+-// e.g. to measure performance, or change implementations depending on platform.
+-//
+-// Sha1 computation is the majority of CPU usage of librqbit.
+-// openssl is 2-3x faster than rust's sha1.
+-// system library is the best choice probably (it's the default anyway).
++// SHA-1 is mandated by BitTorrent v1. The historical default feature now uses
++// maintained RustCrypto; the daemon's sha1-ring/AWS-LC backend is unchanged.
+ 
+ pub trait ISha1 {
+     fn new() -> Self;
+@@ -17,31 +13,21 @@
+ }
+ 
+ #[cfg(feature = "sha1-crypto-hash")]
+-mod crypto_hash_impl {
++mod portable_impl {
+     use super::ISha1;
+-
+-    pub struct Sha1CryptoHash {
+-        inner: crypto_hash::Hasher,
++    use sha1::{Digest, Sha1};
++    pub struct Sha1Portable {
++        inner: Sha1,
+     }
+-
+-    impl ISha1 for Sha1CryptoHash {
++    impl ISha1 for Sha1Portable {
+         fn new() -> Self {
+-            Self {
+-                inner: crypto_hash::Hasher::new(crypto_hash::Algorithm::SHA1),
+-            }
++            Self { inner: Sha1::new() }
+         }
+-
+         fn update(&mut self, buf: &[u8]) {
+-            use std::io::Write;
+-            self.inner.write_all(buf).unwrap();
++            self.inner.update(buf);
+         }
+-
+-        fn finish(mut self) -> [u8; 20] {
+-            let result = self.inner.finish();
+-            debug_assert_eq!(result.len(), 20);
+-            let mut result_arr = [0u8; 20];
+-            result_arr.copy_from_slice(&result);
+-            result_arr
++        fn finish(self) -> [u8; 20] {
++            self.inner.finalize().into()
+         }
+     }
+ }
+@@ -78,7 +64,35 @@
+ }
+ 
+ #[cfg(feature = "sha1-crypto-hash")]
+-pub type Sha1 = crypto_hash_impl::Sha1CryptoHash;
++pub type Sha1 = portable_impl::Sha1Portable;
+ 
+ #[cfg(feature = "sha1-ring")]
+ pub type Sha1 = ring_impl::Sha1Ring;
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn sha1_protocol_vectors_match_for_whole_and_segmented_input() {
++        for (input, expected) in [
++            (b"".as_slice(), "da39a3ee5e6b4b0d3255bfef95601890afd80709"),
++            (
++                b"abc".as_slice(),
++                "a9993e364706816aba3e25717850c26c9cd0d89d",
++            ),
++            (
++                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq".as_slice(),
++                "84983e441c3bd26ebaae4aa1f95129e5e54670f1",
++            ),
++        ] {
++            for chunk in [1, 7, 55, 56, 63, 64, 65] {
++                let mut hash = Sha1::new();
++                for bytes in input.chunks(chunk) {
++                    hash.update(bytes);
++                }
++                let result: String = hash.finish().iter().map(|b| format!("{b:02x}")).collect();
++                assert_eq!(result, expected);
++            }
++        }
++    }
++}

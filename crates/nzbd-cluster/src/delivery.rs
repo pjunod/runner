@@ -1285,6 +1285,51 @@ mod tests {
     use super::*;
     use sha2::Digest;
     use std::{collections::HashMap, time::Duration};
+    // Install a real blocking namespace entry while election projection writes
+    // continue. Only the setup race retries; the actor/adoption checks below
+    // still require an actual failed snapshot fence.
+    fn block_projection_file(path: &std::path::Path, mut after_remove: impl FnMut()) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remove fixture projection: {error}"),
+            }
+            after_remove();
+            match std::fs::create_dir(path) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "projection writer prevented fault installation: {error}"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("install projection fault directory: {error}"),
+            }
+        }
+        assert!(std::fs::symlink_metadata(path).unwrap().is_dir());
+    }
+
+    #[test]
+    fn projection_fault_setup_retries_a_competing_file_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("leader.json");
+        std::fs::write(&path, b"initial projection").unwrap();
+        let mut attempts = 0;
+        block_projection_file(&path, || {
+            if attempts == 0 {
+                // Deterministically reproduce the election writer winning the
+                // old remove_file/create_dir window observed in hosted CI.
+                std::fs::write(&path, b"competing projection").unwrap();
+            }
+            attempts += 1;
+        });
+        assert_eq!(attempts, 2);
+        assert!(path.is_dir());
+    }
+
     #[test]
     fn catalog_mutation_excludes_other_routes_and_malformed_ids() {
         for (method, path, expected) in [
@@ -2149,8 +2194,7 @@ mod tests {
         // projection rewrites until we repair it; no sleep-based race proof.
         let leader_file = runtime.leader_shared.layout.leader_file();
         let leader_bytes = std::fs::read(&leader_file).unwrap();
-        std::fs::remove_file(&leader_file).unwrap();
-        std::fs::create_dir(&leader_file).unwrap();
+        block_projection_file(&leader_file, || {});
         assert!(!runtime
             .engine
             .adopt_replicated_highwater(9000, 9000)

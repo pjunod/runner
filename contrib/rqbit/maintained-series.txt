@@ -12,3 +12,4 @@
 0021-configurable-client-identity-and-announce-lifecycle.patch
 0022-read-only-piece-verifier.patch
 0023-upgrade-upnp-xml-parser.patch
+0024-replace-unmaintained-retry-and-sha1-backends.patch
