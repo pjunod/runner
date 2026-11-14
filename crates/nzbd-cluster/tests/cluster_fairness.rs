@@ -11,7 +11,7 @@ use nzbd_nserv::{build_post, prng_bytes, NservBuilder};
 use nzbd_types::{CertLevel, JobId, JobStatus, ServerDef, ServerId, TlsMode};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -33,6 +33,7 @@ struct PollObservation {
 struct ObservationLog {
     polls: Vec<PollObservation>,
     errors: Vec<String>,
+    active_leases: HashMap<String, JobId>,
 }
 type Observations = Arc<Mutex<ObservationLog>>;
 
@@ -46,9 +47,17 @@ async fn checked_post_candidates(
     if snapshot.post_paused {
         return ready;
     }
+    let leased: HashSet<_> = observations
+        .lock()
+        .unwrap()
+        .active_leases
+        .values()
+        .copied()
+        .collect();
     for summary in snapshot.jobs.iter().filter(|job| {
         matches!(job.status, JobStatus::Completed)
             && !job.pp_done
+            && !leased.contains(&job.id)
             && job.assigned_node.as_deref() == Some(node)
     }) {
         match engine.export_job(summary.id).await {
@@ -79,6 +88,17 @@ async fn observe_poll(
     engine: EngineHandle,
     observations: Observations,
 ) -> Response {
+    if request.uri().path() == "/cluster/v1/work/complete" {
+        let (parts, body) = request.into_parts();
+        let body = to_bytes(body, 32 * 1024 * 1024).await.unwrap();
+        let complete: Value = serde_json::from_slice(&body).unwrap();
+        let lease = complete["lease_id"].as_str().unwrap().to_owned();
+        let response = next.run(Request::from_parts(parts, Body::from(body))).await;
+        if response.status().is_success() {
+            observations.lock().unwrap().active_leases.remove(&lease);
+        }
+        return response;
+    }
     if request.uri().path() != "/cluster/v1/work/poll" {
         return next.run(request).await;
     }
@@ -108,6 +128,18 @@ async fn observe_poll(
         for grant in value["grants"].as_array().unwrap() {
             if grant["kind"] == "post" {
                 eligible.insert(serde_json::from_value(grant["job"]["id"].clone()).unwrap());
+            }
+        }
+        // A checked Completed row with an outstanding Download/Post lease is
+        // not grantable. Track actual grants and successful completion receipts
+        // so the observer applies that same scheduler boundary.
+        {
+            let mut seen = observations.lock().unwrap();
+            for grant in value["grants"].as_array().unwrap() {
+                seen.active_leases.insert(
+                    grant["lease_id"].as_str().unwrap().to_owned(),
+                    serde_json::from_value(grant["job"]["id"].clone()).unwrap(),
+                );
             }
         }
         let granted_kinds = value["grants"]
@@ -160,7 +192,11 @@ async fn start_node(
         download: mixed_worker,
         max_download_jobs: if mixed_worker { 8 } else { 0 },
         post_process: mixed_worker,
-        pp_slots: 1,
+        // Keep more than one Post slot available while an actual Post runs.
+        // The scheduler counts assigned Post jobs in this node's download
+        // load, so a single Post slot otherwise hides lane competition behind
+        // the active Post occupying that only slot.
+        pp_slots: 3,
         lease_interval: Duration::from_millis(100),
         takeover_after: Duration::from_millis(900),
         worker_ttl: Duration::from_secs(2),
