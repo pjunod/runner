@@ -6395,6 +6395,7 @@ mod integration_doc_tests {
     fn every_event() -> Vec<E> {
         let job = JobId(1);
         let control = nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: "1".into(),
             lifecycle: "held".into(),

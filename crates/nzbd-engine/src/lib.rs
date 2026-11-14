@@ -2105,6 +2105,38 @@ impl EngineHandle {
         hold_recovery::pass(self, true).await
     }
 
+    /// Atomically freeze the exact worker control before reporting expiry.
+    /// The local checkpoint survives restart; a changed or revoked grant
+    /// cannot select a terminal. No payload IO or ownership upgrade occurs.
+    pub async fn prepare_worker_hold_expiry(
+        &self,
+        job: JobId,
+        revision: String,
+        notice: String,
+        authority: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<bool, EngineError> {
+        if !authority() {
+            return Ok(false);
+        }
+        let Some(record) = self.queue_job_metadata(job).await? else {
+            return Ok(false);
+        };
+        let source = self
+            .artifacts()
+            .for_job(job.0)
+            .map_err(|error| EngineError::Lifecycle(error.to_string()))?;
+        let guard =
+            hold_release::HoldReleaseGuard::prepare(&record, source.as_ref(), Some(authority));
+        self.roundtrip_bool(|reply| QueueCommand::PrepareWorkerHoldExpiry {
+            job,
+            revision,
+            notice,
+            guard,
+            reply,
+        })
+        .await
+    }
+
     /// Contract §2.3: end a hold that passed its deadline as
     /// `failed/hold_expired`. False when the hold changed or is not due.
     pub async fn expire_hold(&self, job: JobId, revision: String) -> Result<bool, EngineError> {

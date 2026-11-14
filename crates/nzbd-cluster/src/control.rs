@@ -1117,6 +1117,42 @@ impl ControlStore {
         }
     }
 
+    /// Atomically select an expired worker hold's terminal intent and revoke
+    /// its exact lease. Release-then-CAS would allow a new grant in between.
+    pub(crate) async fn expire_worker_hold(
+        &self,
+        receipt: &str,
+        lease: &DurableLease,
+        next: &nzbd_types::Job,
+        issuer: (&str, &str, u64),
+    ) -> Result<bool, String> {
+        if self.command_receipt(receipt).await?.is_some() {
+            return Ok(true);
+        }
+        let now = unix_ms()?;
+        let token = &lease.token;
+        let envelope = serde_json::json!({"command":{"op":"worker_hold_expired"},"next_intent":serde_json::to_string(next).map_err(|e|e.to_string())?,"deleted":false}).to_string();
+        let statements = vec![
+            authority_statement(issuer)?,
+            ("INSERT INTO command_receipts(command_id,job_id,expected_revision,applied_revision,command_json,applied_at_ms)
+              SELECT ?1,w.job_id,w.job_revision,w.job_revision+1,?2,?3 FROM work_leases w JOIN control_jobs j ON j.job_id=w.job_id
+              WHERE w.resource=?4 AND w.owner_node_id=?5 AND w.owner_incarnation=?6 AND w.fence=?7 AND w.revision=?8 AND w.expires_at_ms=?9
+              AND w.terminal=0 AND w.expires_at_ms>?3 AND w.job_id=?10 AND w.job_incarnation=?11 AND w.job_revision=?12
+              AND j.incarnation=w.job_incarnation AND j.revision=w.job_revision AND j.deleted=0".into(),
+             params!(receipt,envelope,now,&token.resource,&token.owner_node_id,&token.owner_incarnation,i64_value("fence",token.fence)?,i64_value("lease revision",token.revision)?,token.expires_at_unix_ms,i64_value("job",lease.job_id)?,&lease.job_incarnation,i64_value("job revision",lease.job_revision)?)),
+            ("UPDATE work_leases SET terminal=1,revision=revision+1,updated_at_ms=?1 WHERE resource=?2 AND EXISTS(SELECT 1 FROM command_receipts WHERE command_id=?3)".into(), params!(now,&token.resource,receipt))
+        ];
+        let results = self
+            .client
+            .txn(statements)
+            .await
+            .map_err(|e| format!("expire worker hold: {e}"))?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(results.get(1).copied() == Some(1))
+    }
+
     pub async fn apply_command(
         &self,
         command_id: &str,
@@ -1484,7 +1520,7 @@ impl ControlStore {
         Ok(rows.into_iter().next().map(|row| row.state_json))
     }
 
-    async fn command_receipt(&self, command_id: &str) -> Result<Option<u64>, String> {
+    pub(crate) async fn command_receipt(&self, command_id: &str) -> Result<Option<u64>, String> {
         self.scalar_revision(
             "SELECT applied_revision AS revision FROM command_receipts WHERE command_id=$1",
             command_id,

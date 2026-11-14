@@ -388,3 +388,20 @@ retirement of redundant partial raw copies is deferred.
   while new lifecycle obligations exist is unsupported.
 - This upgrade migrates receipts and metadata only. It does not sweep legacy
   or unowned payload paths or authorize backlog cleanup.
+
+## Worker hold expiry receipts
+
+`POST /cluster/v1/work/hold-expired` is authenticated like other work endpoints.
+It accepts an exact frozen control/source/grant notice, not a payload or deletion
+request. Replicated selection checks current leader authority, job incarnation
+and revision, and a live same-operation lease (renewal is allowed). Selection
+and lease revocation commit together. A duplicate resumes the original terminal
+chain; it cannot replace the first terminal or its history.
+
+The worker checkpoint and its bounded expiry outbox commit in one local SQLite
+transaction. Outbox replay runs even after the source node becomes leader.
+History is recorded by the authoritative history owner. Source disposition is
+acknowledged separately with the exact joined stop receipt. If a restart loses
+actual process/writer proof, custody remains explicitly unresolved; no empty
+stopped-source receipt, new ownership or cleanup permission is manufactured.
+Failed-assessment error, original manifests and source-copy audit remain.

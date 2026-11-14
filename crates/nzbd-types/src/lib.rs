@@ -570,6 +570,10 @@ pub const PP_DONE_PARAM: &str = "*PP:done";
 /// Versioned nonterminal control. Revisions are decimal strings on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobControl {
+    /// Exact worker hold selected for expiry. Recovery cannot release or
+    /// replace it while the authoritative terminal decision is in flight.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expiry_pending: bool,
     pub version: u32,
     pub revision: String,
     pub lifecycle: String,
@@ -608,6 +612,9 @@ pub struct JobControl {
     /// task enforces it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_unix: Option<i64>,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 impl JobControl {
     pub fn hold_cause(&self) -> HoldCause {
@@ -1368,6 +1375,7 @@ mod tests {
     fn held_is_its_own_persisted_status_and_a_050_row_loads_as_held() {
         assert_eq!(serde_json::to_string(&JobStatus::Held).unwrap(), "\"held\"");
         let control = |lifecycle: &str| JobControl {
+            expiry_pending: false,
             version: 1,
             revision: "1".into(),
             lifecycle: lifecycle.into(),

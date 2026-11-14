@@ -1976,3 +1976,14 @@ unrun in this pass.
 - ⬜ Flip repo to public (decided 2026-07-18; Settings → Danger Zone → Change visibility) — Coverage/Test-count badges render once flipped
 - ⬜ Real-provider download smoke test
 - ⬜ Real-Gluster cluster soak (CLUSTERING.md §11)
+
+## 2026-11-13 — 0.9.5 pipeline closeout candidate
+
+Fixes #298 worker hold deadlines and #299 salvage retry clocks; reconciles
+transferred-source presence with descriptor-relative, two-pass absence evidence.
+Exact control/grant/source expiry intent is durable before reporting. Terminal
+history is independent of custody joins; failed assessment parks/preserves unknown
+bytes and retains error/audit. Unproven stop/custody stays visible and pending.
+Keep, legacy enrollment, ordinary deletion validators and approval fences remain.
+Draft candidate in adversarial review; final real gate and merge not yet claimed.
+Paul deploys. No production mutation or purge in this engineering pass.

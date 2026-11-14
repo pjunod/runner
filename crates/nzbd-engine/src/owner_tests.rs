@@ -3651,6 +3651,7 @@ fn retired_cleanup_clock_params_are_dropped_on_load() {
 #[test]
 fn rearm_reclassifies_by_errno_and_derives_policy() {
     let hold = |cause: &str, policy: &str, message: &str| nzbd_types::JobControl {
+        expiry_pending: false,
         version: 1,
         revision: "4".into(),
         lifecycle: "held".into(),
@@ -3755,6 +3756,7 @@ async fn adopting_authority_rearms_holds() {
     pump(&mut owner, &mut messages).await;
     let mut job = pending_job(1);
     job.set_control(&nzbd_types::JobControl {
+        expiry_pending: false,
         version: 1,
         revision: "1".into(),
         lifecycle: "held".into(),
@@ -4838,6 +4840,7 @@ async fn a_failure_whose_job_cannot_retry_is_probed() {
         let record = owner.state.job_mut(JobId(3)).unwrap();
         record.status = JobStatus::Held;
         record.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: "1".into(),
             lifecycle: "held".into(),
@@ -5834,6 +5837,7 @@ async fn automatic_hold_recovery_bounds_each_pass_and_rotates_all_due_jobs() {
         row.status = JobStatus::Held;
         row.dir_name = format!("allocation-{id}");
         row.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: "1".into(),
             lifecycle: "held".into(),
@@ -9406,6 +9410,7 @@ async fn recurring_identity_mismatch_fails_the_job_io_after_the_limit() {
 #[test]
 fn a_legacy_identity_hold_retries_now() {
     let control = nzbd_types::JobControl {
+        expiry_pending: false,
         version: 1,
         revision: "4".into(),
         lifecycle: "held".into(),
@@ -9657,4 +9662,105 @@ async fn startup_reconciles_configured_roots_before_any_row_names_them() {
     assert_eq!(reconciled(&not_yet), Some(true));
     assert_eq!(reconciled(&owner.artifacts.workspace_dir()), Some(true));
     assert!(!not_yet.exists(), "reconciliation creates nothing");
+}
+
+#[tokio::test]
+async fn worker_expiry_freezes_due_revision_durably_and_refuses_stale_or_revoked_grants() {
+    use nzbd_state::artifacts::{WorkerControlContext, WORKER_CONTROL_CONTEXT_PARAM};
+    let (_tmp, mut owner, _adapter, mut messages) =
+        control_test_owner_with_persistence(false, None);
+    let mut row = pending_job(901);
+    mark_new_lifecycle_cohort(&mut row);
+    let context = WorkerControlContext {
+        lease_id: "lease-901".into(),
+        job_incarnation: "job-901".into(),
+        job_revision: 1,
+        control_revision: 1,
+        epoch: 1,
+    };
+    row.params.push((
+        WORKER_CONTROL_CONTEXT_PARAM.into(),
+        serde_json::to_string(&context).unwrap(),
+    ));
+    let path = owner.dest_dir.join(&row.dir_name);
+    owner
+        .artifacts
+        .allocate_for_delivery(901, &owner.dest_dir, &path, true, true)
+        .unwrap();
+    owner.artifacts.bind_worker_context(901, &context).unwrap();
+    owner.state.jobs.push(row);
+    assert!(owner.hold_job(
+        JobId(901),
+        nzbd_types::HoldCause::Capacity,
+        "download_write",
+        "full"
+    ));
+    pump(&mut owner, &mut messages).await;
+    let before = owner.state.job(JobId(901)).unwrap().clone();
+    let source = owner.artifacts.for_job(901).unwrap().unwrap();
+    let mut held = before.control().unwrap();
+    held.deadline_unix = Some(0);
+    held.manual_pause = true;
+    owner.state.job_mut(JobId(901)).unwrap().set_control(&held);
+    owner
+        .artifacts
+        .checkpoint_worker_control(owner.state.job(JobId(901)).unwrap(), &held.revision)
+        .unwrap();
+    for (revision, live, expected) in [
+        ("stale".to_string(), true, false),
+        (held.revision.clone(), false, false),
+        (held.revision.clone(), true, true),
+    ] {
+        let current = owner.state.job(JobId(901)).unwrap().clone();
+        let guard = crate::hold_release::HoldReleaseGuard::prepare(
+            &current,
+            Some(&source),
+            Some(Arc::new(move || live)),
+        );
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::PrepareWorkerHoldExpiry {
+            job: JobId(901),
+            revision,
+            guard,
+            notice:serde_json::json!({"job":901,"context":context,"source":{"artifact":source.id,"generation":source.generation}}).to_string(),
+            reply,
+        });
+        pump(&mut owner, &mut messages).await;
+        assert_eq!(result.await.unwrap(), expected);
+    }
+    let current = owner.state.job(JobId(901)).unwrap().clone();
+    let frozen = current.control().unwrap();
+    assert!(frozen.expiry_pending);
+    assert!(frozen.manual_pause);
+    let checkpoint = owner
+        .artifacts
+        .worker_control_metadata(901, &context)
+        .unwrap()
+        .unwrap();
+    assert!(checkpoint.control.expiry_pending);
+    let guard = crate::hold_release::HoldReleaseGuard::prepare(
+        &current,
+        Some(&source),
+        Some(Arc::new(|| true)),
+    );
+    assert!(!owner.reschedule_hold_proven(JobId(901), &frozen.revision, "late probe", &guard));
+    assert!(!owner.hold_job(
+        JobId(901),
+        nzbd_types::HoldCause::MissingTool,
+        "unpack",
+        "late error"
+    ));
+    assert!(owner
+        .retry_hold_proven(
+            JobId(901),
+            &frozen.revision,
+            RetryBy::Recovery,
+            true,
+            &guard
+        )
+        .is_err());
+    assert_eq!(
+        owner.state.job(JobId(901)).unwrap().control().unwrap(),
+        frozen
+    );
 }

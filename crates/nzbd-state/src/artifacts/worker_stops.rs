@@ -359,6 +359,26 @@ impl Inventory {
         let db = self.db.lock().unwrap();
         let id = key(ticket.request.job, &ticket.request.context);
         let mut record = load(&db, &id)?.ok_or(Error::NotFound)?;
+        let frozen: Option<String> = db
+            .query_row(
+                "SELECT data FROM worker_controls WHERE job=?1",
+                [ticket.request.job],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = frozen {
+            let checkpoint: WorkerControlCheckpoint = serde_json::from_str(&raw)?;
+            if checkpoint.context == ticket.request.context
+                && checkpoint.control.expiry_pending
+                && !sources.contains(&checkpoint.source)
+                && !record
+                    .receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.sources.contains(&checkpoint.source))
+            {
+                return Err(Error::Conflict("expired source has no exact joined writer/process proof; custody remains pending".into()));
+            }
+        }
         if let Some(receipt) = record.receipt {
             return Ok(receipt);
         }
@@ -385,5 +405,181 @@ impl Inventory {
         record.receipt = Some(receipt.clone());
         save(&db, &id, &record)?;
         Ok(receipt)
+    }
+    /// Deadline-abandoned assessment: preserve every exact stopped source.
+    /// This records parking, never usable/unusable proof or immediate delete.
+    /// Keep, legacy non-enrollment and unowned content retain their fences.
+    pub fn park_expired_worker_sources(&self, receipt: &WorkerStoppedReceipt) -> Result<()> {
+        let _guard = self.mutation_guard()?;
+        let ttl = i64::from(self.settings()?.failed_retention_days) * 86400;
+        let mut db = self.db.lock().unwrap();
+        let record = load(&db, &receipt.id)?.ok_or(Error::NotFound)?;
+        if record.phase != "stopped"
+            || record
+                .receipt
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?
+                != Some(serde_json::to_string(receipt)?)
+        {
+            return Err(Error::Conflict(
+                "exact joined source receipt unavailable".into(),
+            ));
+        }
+        let authority: Option<String> = db
+            .query_row(
+                "SELECT data FROM worker_authority WHERE job=?1",
+                [receipt.job],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if authority
+            .as_ref()
+            .map(|raw| serde_json::from_str::<WorkerControlContext>(raw))
+            .transpose()?
+            .is_some_and(|current| !same_worker_operation(&current, &receipt.context))
+        {
+            return Err(Error::Conflict(
+                "a newer worker grant owns this job; old expiry cannot park it".into(),
+            ));
+        }
+        let tx = db.transaction()?;
+        let mut sources = receipt.sources.clone();
+        // Successful/failed transform outputs may live outside the primary
+        // attempt. Preserve every journal-bound child generation too.
+        for source in &receipt.sources {
+            let operations = {
+                let mut stmt=tx.prepare("SELECT data FROM operations WHERE artifact=?1 AND json_extract(data,'$.kind') IN ('par_repair','extract')")?;
+                let rows = stmt.query_map([&source.artifact], |r| r.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for raw in operations {
+                let operation: Operation = serde_json::from_str(&raw)?;
+                let workspace: super::transforms::Workspace =
+                    serde_json::from_str(&operation.request)?;
+                if workspace.source.id != source.artifact
+                    || workspace.source.generation != source.generation
+                {
+                    continue;
+                }
+                let child = SourceGeneration {
+                    artifact: workspace.scratch.id,
+                    generation: workspace.scratch.generation,
+                };
+                if !sources.contains(&child) {
+                    sources.push(child);
+                }
+            }
+        }
+        for source in &sources {
+            let raw: Option<String> = tx
+                .query_row(
+                    "SELECT data FROM artifacts WHERE id=?1",
+                    [&source.artifact],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(raw) = raw else {
+                return Err(Error::Conflict(
+                    "stopped source disappeared from inventory".into(),
+                ));
+            };
+            let mut artifact: Artifact = serde_json::from_str(&raw)?;
+            if artifact.generation != source.generation {
+                return Err(Error::Conflict("stopped source generation changed".into()));
+            }
+            if artifact.terminal()
+                || (artifact.state == "parked_failed"
+                    && artifact.failure_reason.as_deref() == Some("hold_expired"))
+            {
+                continue;
+            }
+            if self.source_in_use(source) {
+                return Err(Error::Conflict(
+                    "stopped source is still in active use; preserve custody".into(),
+                ));
+            }
+            // Retain byte audit and uncertain assessment. Existing delete
+            // authorizations from a failed disposition cannot override Park.
+            let operations = {
+                let mut stmt=tx.prepare("SELECT data FROM operations WHERE artifact=?1 AND state IN ('queued','retry','running','review') AND json_extract(data,'$.kind')='delete' AND (id LIKE 'failed-delete-%' OR id LIKE 'cluster-copy-%')")?;
+                let rows = stmt.query_map([&artifact.id], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for raw in operations {
+                let mut op: Operation = serde_json::from_str(&raw)?;
+                op.state = "cancelled".into();
+                op.error =
+                    Some("hold-expired park supersedes automatic failed-source deletion".into());
+                save_operation(&tx, &op)?;
+            }
+            if artifact.owned && artifact.automatic_cleanup_eligible {
+                artifact.state = "parked_failed".into();
+                if artifact.hold.as_deref() == Some("transform workspace") {
+                    artifact.hold = None;
+                }
+                if !artifact.keep && !artifact.keep_on_failure {
+                    artifact.deadline = Some(now().saturating_add(ttl.max(0)));
+                    artifact.retention_seconds = ttl.max(1) as u64;
+                }
+            }
+            artifact.salvage = Some("settled_none".into());
+            artifact.failure_reason = Some("hold_expired".into());
+            artifact.failure_assessment = Some(FailureAssessment {
+                disposition: "unknown".into(),
+                reason: "hold deadline ended the assessment before usable/unusable proof".into(),
+                assessed_at: now(),
+            });
+            artifact.error=Some("salvage assessment abandoned at the hold deadline; stopped bytes preserved, not proven unusable".into());
+            artifact.revision += 1;
+            artifact.updated_at = now();
+            save_artifact(&tx, &artifact)?;
+            event(&tx,&artifact.id,"hold_expired_preserved",&format!("{}: deadline-abandoned assessment; exact joined source parked/preserved under existing policy",receipt.id))?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn worker_expiry_outbox(&self, after: &str) -> Result<Vec<(String, String)>> {
+        let db = self.db.lock().unwrap();
+        let mut stmt=db.prepare("SELECT key,value FROM meta WHERE key LIKE 'expiry-outbox:%' AND key>?1 ORDER BY key LIMIT 16")?;
+        let rows = stmt.query_map([after], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    pub fn finish_worker_expiry_outbox(&self, key: &str, outcome: &str) -> Result<()> {
+        if !key.starts_with("expiry-outbox:") {
+            return Err(Error::Conflict("invalid expiry outbox key".into()));
+        }
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let original: String =
+            tx.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))?;
+        tx.execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO NOTHING",params![key.replacen("expiry-outbox:","expiry-audit:",1),serde_json::json!({"request":serde_json::from_str::<serde_json::Value>(&original)?,"outcome":outcome,"at":now()}).to_string()])?;
+        tx.execute("DELETE FROM meta WHERE key=?1", [key])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn note_worker_expiry_error(&self, source: &SourceGeneration, error: &str) -> Result<()> {
+        let _guard = self.mutation_guard()?;
+        let mut artifact = self.get(&source.artifact)?;
+        if artifact.generation != source.generation || artifact.terminal() {
+            return Ok(());
+        }
+        let message = format!(
+            "Hold expired; custody unresolved pending actual writer/process stop proof: {}",
+            error.chars().take(1000).collect::<String>()
+        );
+        if artifact.error.as_deref() == Some(message.as_str()) {
+            return Ok(());
+        }
+        artifact.error = Some(message);
+        artifact.failure_reason = Some("hold_expired".into());
+        artifact.salvage = Some("pending".into());
+        artifact.revision += 1;
+        artifact.updated_at = now();
+        let db = self.db.lock().unwrap();
+        save_artifact(&db, &artifact)?;
+        event(&db, &artifact.id, "expiry_custody_pending", error)?;
+        Ok(())
     }
 }
