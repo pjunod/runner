@@ -11,7 +11,7 @@ use nzbd_nserv::{build_post, prng_bytes, NservBuilder};
 use nzbd_types::{CertLevel, JobId, JobStatus, ServerDef, ServerId, TlsMode};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -33,6 +33,7 @@ struct PollObservation {
 struct ObservationLog {
     polls: Vec<PollObservation>,
     errors: Vec<String>,
+    active_leases: HashMap<String, JobId>,
 }
 type Observations = Arc<Mutex<ObservationLog>>;
 
@@ -46,9 +47,17 @@ async fn checked_post_candidates(
     if snapshot.post_paused {
         return ready;
     }
+    let leased: HashSet<_> = observations
+        .lock()
+        .unwrap()
+        .active_leases
+        .values()
+        .copied()
+        .collect();
     for summary in snapshot.jobs.iter().filter(|job| {
         matches!(job.status, JobStatus::Completed)
             && !job.pp_done
+            && !leased.contains(&job.id)
             && job.assigned_node.as_deref() == Some(node)
     }) {
         match engine.export_job(summary.id).await {
@@ -79,6 +88,17 @@ async fn observe_poll(
     engine: EngineHandle,
     observations: Observations,
 ) -> Response {
+    if request.uri().path() == "/cluster/v1/work/complete" {
+        let (parts, body) = request.into_parts();
+        let body = to_bytes(body, 32 * 1024 * 1024).await.unwrap();
+        let complete: Value = serde_json::from_slice(&body).unwrap();
+        let lease = complete["lease_id"].as_str().unwrap().to_owned();
+        let response = next.run(Request::from_parts(parts, Body::from(body))).await;
+        if response.status().is_success() {
+            observations.lock().unwrap().active_leases.remove(&lease);
+        }
+        return response;
+    }
     if request.uri().path() != "/cluster/v1/work/poll" {
         return next.run(request).await;
     }
@@ -108,6 +128,18 @@ async fn observe_poll(
         for grant in value["grants"].as_array().unwrap() {
             if grant["kind"] == "post" {
                 eligible.insert(serde_json::from_value(grant["job"]["id"].clone()).unwrap());
+            }
+        }
+        // A checked Completed row with an outstanding Download/Post lease is
+        // not grantable. Track actual grants and successful completion receipts
+        // so the observer applies that same scheduler boundary.
+        {
+            let mut seen = observations.lock().unwrap();
+            for grant in value["grants"].as_array().unwrap() {
+                seen.active_leases.insert(
+                    grant["lease_id"].as_str().unwrap().to_owned(),
+                    serde_json::from_value(grant["job"]["id"].clone()).unwrap(),
+                );
             }
         }
         let granted_kinds = value["grants"]
@@ -515,12 +547,54 @@ async fn mixed_worker_grants_post_while_fast_downloads_keep_slots_and_backlog_av
             >= 3,
         "PP was not repeatedly granted under continuous competing load: {eligible:?}"
     );
-    for window in eligible.windows(2) {
-        assert!(
-            window
-                .iter()
-                .any(|poll| poll.granted_kinds.iter().any(|kind| kind == "post")),
-            "two eligible polls bypassed PP: {window:?}"
-        );
+    assert_bounded_post_progress(observed);
+}
+
+fn assert_bounded_post_progress(observed: &[PollObservation]) {
+    let mut bypasses = 0;
+    for poll in observed {
+        // Every actual Post grant proves progress, including one issued while
+        // the download lane is full. Filtering those grants out first would
+        // incorrectly reject Download, Post, Download as two Post bypasses.
+        if poll.granted_kinds.iter().any(|kind| kind == "post") {
+            bypasses = 0;
+        } else if poll.free_download_slots > 0
+            && poll.free_pp_slots > 0
+            && poll.queued_backlog > 0
+            && poll.eligible_post_jobs > 0
+        {
+            bypasses += 1;
+            assert!(
+                bypasses < 2,
+                "two eligible polls bypassed PP without an intervening Post grant: {observed:?}"
+            );
+        }
     }
+}
+
+#[test]
+fn fairness_window_credits_actual_post_progress_and_refuses_repeated_bypass() {
+    let poll = |free_download_slots, kinds: &[&str]| PollObservation {
+        free_download_slots,
+        free_pp_slots: 1,
+        queued_backlog: 10,
+        eligible_post_jobs: 1,
+        granted_kinds: kinds.iter().map(|kind| (*kind).to_owned()).collect(),
+    };
+    assert_bounded_post_progress(&[
+        poll(1, &["download"]),
+        poll(0, &["post"]),
+        poll(1, &["download"]),
+    ]);
+    assert!(std::panic::catch_unwind(|| assert_bounded_post_progress(&[
+        poll(1, &["download"]),
+        poll(1, &["download"]),
+    ]))
+    .is_err());
+    assert!(std::panic::catch_unwind(|| assert_bounded_post_progress(&[
+        poll(1, &["download"]),
+        poll(0, &[]),
+        poll(1, &["download"]),
+    ]))
+    .is_err());
 }
