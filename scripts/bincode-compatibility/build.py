@@ -61,21 +61,36 @@ if a.side == "legacy":
                 f.read_text(encoding="utf-8")
                 + '\n#[cfg(feature = "validation-test-helpers")]\npub mod codec_compatibility;\n'
             )
-    # Platform durability fix carried by the oracle; it touches no codec. The
-    # baseline synced snapshot files through a read-only handle, which Windows
-    # rejects ("Access is denied", os error 5), so the prior implementation
-    # could never build a snapshot there. Apply the exact candidate fix so the
-    # Windows proof exercises the old codecs instead of that unrelated defect.
-    f = source / "vendor/hiqlite/src/store/state_machine/sqlite/snapshot_builder.rs"
-    text = f.read_text(encoding="utf-8")
-    read_only = "pub(crate) async fn sync_file(path: &str) -> StorageResult<()> {\n    let file = fs::File::open(path)\n"
-    writable = (
-        "pub(crate) async fn sync_file(path: &str) -> StorageResult<()> {\n"
-        "    let file = fs::OpenOptions::new()\n        .write(true)\n        .open(path)\n"
-    )
-    if writable not in text:
-        assert text.count(read_only) == 1, "Baseline snapshot sync changed; review the oracle fix"
-        f.write_text(text.replace(read_only, writable), encoding="utf-8")
+    # Windows platform fixes carried by the oracle; none touches a codec. The
+    # baseline (1) synced snapshot files through a read-only handle, which
+    # Windows rejects ("Access is denied", os error 5), and (2) found WAL file
+    # names by splitting on '/', so native Windows paths failed inspection.
+    # Apply the exact candidate fixes so the Windows proof exercises the old
+    # codecs instead of these unrelated defects; refuse to build if the
+    # baseline text ever differs.
+    platform_fixes = [
+        (
+            "vendor/hiqlite/src/store/state_machine/sqlite/snapshot_builder.rs",
+            "pub(crate) async fn sync_file(path: &str) -> StorageResult<()> {\n"
+            "    let file = fs::File::open(path)\n",
+            "pub(crate) async fn sync_file(path: &str) -> StorageResult<()> {\n"
+            "    let file = fs::OpenOptions::new()\n        .write(true)\n        .open(path)\n",
+        ),
+        (
+            "vendor/hiqlite-wal/src/wal.rs",
+            "        let Some((_, fname)) = path_full.rsplit_once('/') else {\n",
+            "        let Some(fname) = std::path::Path::new(&path_full)\n"
+            "            .file_name()\n"
+            "            .and_then(|name| name.to_str())\n"
+            "        else {\n",
+        ),
+    ]
+    for relative, baseline_text, fixed_text in platform_fixes:
+        f = source / relative
+        text = f.read_text(encoding="utf-8")
+        if fixed_text not in text:
+            assert text.count(baseline_text) == 1, f"Baseline {relative} changed; review the oracle fix"
+            f.write_text(text.replace(baseline_text, fixed_text), encoding="utf-8")
     f = source / "vendor/hiqlite-wal/Cargo.toml"
     if "validation-test-helpers = []" not in f.read_text(encoding="utf-8"):
         f.write_text(
