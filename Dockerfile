@@ -11,7 +11,7 @@
 # side doesn't exist yet makes Docker create a directory in its place,
 # and the first-run setup UI couldn't persist the config it writes.
 
-FROM rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS build
+FROM rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build
 # The build context deliberately excludes `.git` (see .dockerignore), so
 # the binary cannot work out its own commit — it has to be told. Without
 # this the daemon reports `<version>+unknown`, which is deliberately loud:
