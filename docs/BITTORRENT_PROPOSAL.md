@@ -688,6 +688,14 @@ production data rewrite, deployment or release operation. The retired versions
 remain only in the explicitly identified legacy validation graph; advisory
 reporting is not suppressed.
 
+The bounded peer-protocol fuzzer added with this renewal found a latent upstream
+decoder defect: a peer-supplied bencode byte-string length near `usize::MAX`
+overflowed the end-offset addition in `parse_bytes`. Debug and fuzz builds
+panicked; release builds wrapped and failed only by accident of slice bounds.
+Patch 0026 uses checked addition and returns an ordinary decode error, bringing
+the canonical series to seventeen. The crash input is a permanent fuzz seed and
+a named unit proof in the maintained derivation.
+
 
 ### 4.4 Consequences
 

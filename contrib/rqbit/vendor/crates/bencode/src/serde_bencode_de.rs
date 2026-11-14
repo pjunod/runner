@@ -51,7 +51,12 @@ impl<'de> BencodeDeserializer<'de> {
                     .parse()
                     .map_err(|e| Error::new_from_err(e).set_context(self))?;
                 let bytes_start = length_delim + 1;
-                let bytes_end = bytes_start + length;
+                let bytes_end = bytes_start.checked_add(length).ok_or_else(|| {
+                    Error::custom(format!(
+                        "byte string length {length} exceeds the addressable buffer"
+                    ))
+                    .set_context(self)
+                })?;
                 let bytes = &self.buf.get(bytes_start..bytes_end).ok_or_else(|| {
                     Error::custom(format!(
                         "could not get byte range {}..{}, data in the buffer: {:?}",
@@ -583,5 +588,18 @@ impl<'de> serde::de::SeqAccess<'de> for SeqAccess<'_, 'de> {
             return Ok(None);
         }
         Ok(Some(seed.deserialize(&mut *self.de)?))
+    }
+}
+
+#[cfg(test)]
+mod length_overflow_tests {
+    use buffers::ByteBuf;
+
+    #[test]
+    fn byte_string_length_overflowing_the_buffer_offset_is_an_error() {
+        let input = format!("{}:x", usize::MAX);
+        assert!(super::from_bytes::<ByteBuf<'_>>(input.as_bytes()).is_err());
+        let nested = format!("l{}:xe", usize::MAX);
+        assert!(super::from_bytes::<Vec<ByteBuf<'_>>>(nested.as_bytes()).is_err());
     }
 }
