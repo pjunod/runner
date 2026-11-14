@@ -55,7 +55,6 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use backoff::backoff::Backoff;
 use buffers::{ByteBuf, ByteBufOwned};
 use clone_to_owned::CloneToOwned;
 use librqbit_core::{

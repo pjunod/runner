@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use backoff::{ExponentialBackoff, ExponentialBackoffBuilder};
+use librqbit_core::retry::RetryPolicy;
 
 #[derive(Default, Debug)]
 pub(crate) struct PeerCountersAtomic {
@@ -51,19 +51,14 @@ impl PeerCountersAtomic {
 #[derive(Debug)]
 pub(crate) struct PeerStats {
     pub counters: Arc<PeerCountersAtomic>,
-    pub backoff: ExponentialBackoff,
+    pub backoff: RetryPolicy,
 }
 
 impl Default for PeerStats {
     fn default() -> Self {
         Self {
             counters: Arc::new(Default::default()),
-            backoff: ExponentialBackoffBuilder::new()
-                .with_initial_interval(Duration::from_secs(10))
-                .with_multiplier(6.)
-                .with_max_interval(Duration::from_secs(3600))
-                .with_max_elapsed_time(Some(Duration::from_secs(86400)))
-                .build(),
+            backoff: RetryPolicy::peer(),
         }
     }
 }

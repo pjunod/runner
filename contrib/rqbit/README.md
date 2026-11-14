@@ -2,7 +2,7 @@
 
 **Status:** active single-node BitTorrent engine · **Upstream base:**
 rqbit v8.1.1, commit `00b97485160ff5b5aa2b379ea0815d568ec665f0` ·
-**Stable patch delta:** exactly thirteen ordered patches ·
+**Stable patch delta:** exactly fifteen ordered patches ·
 **Production daemon:** starts it only when `[torrent].enabled = true`
 
 Companion to
@@ -46,6 +46,8 @@ The maintained series is:
 | 12 | `0021-configurable-client-identity-and-announce-lifecycle.patch` | Let the embedder set the tracker HTTP `User-Agent` and BEP 10 `v`, and make announces tracker-compliant: keep the tracker URL's own query (passkeys), send a stable `key`, echo `tracker id`, report session-relative `downloaded`, send `completed` once and promptly, back off failed announces, and send a bounded `stopped` when the torrent's tracker session ends (ordered before a restart's `started`; awaited by `Session::stop`). Peer lookups send no events. |
 | 13 | `0022-read-only-piece-verifier.patch` | Reuse the existing piece verifier against an FD-bound read-only snapshot before native processing copies; verify boundary bytes and avoid rescanning preceding files for every piece. |
 | 14 | `0023-upgrade-upnp-xml-parser.patch` | Require fixed XML parsing in both UPnP crates without enabling UPnP; lock compatible security fixes for maintained upstream proofs. |
+
+| 15 | `0024-replace-unmaintained-retry-and-sha1-backends.patch` | Replace generic unmaintained retry/clock dependencies with owned peer/bootstrap policies preserving symmetric jitter, caps, reset and elapsed deadlines; replace the optional legacy hash backend with RustCrypto SHA-1 while keeping the historical feature interface and production AWS-LC backend. |
 
 The checked-in [`vendor/`](vendor/) tree is generated from those inputs. It
 contains the derived upstream `LICENSE`, `README.md`, and `crates/` tree needed
@@ -169,3 +171,29 @@ This directory owns the derived engine boundary, not operator policy. Runtime
 configuration, admission, lifecycle, storage-fault routing, native clients and
 qBittorrent compatibility are implemented in the surrounding nzbd crates and
 documented in the project BitTorrent proposal and configuration guide.
+
+## Dependency maintenance boundaries
+
+The owned `librqbit-core::retry::RetryPolicy` has two fixed policies, with
+10-second initial delays, factors 6 (peer) and 1.5 (bootstrap), base caps of
+one hour and one minute, symmetric 50% jitter, and a 24-hour elapsed-time
+budget that includes the proposed sleep. Reset restarts both the interval
+and elapsed budget. The project maintains this small policy directly;
+backoff/instant are removed rather than renamed or suppressed. Upstream's
+backon migration changes jitter and elapsed-time accounting, so it cannot
+be imported unchanged. Arithmetic attribution remains in the source.
+
+The historical `sha1-crypto-hash` feature selects maintained RustCrypto
+`sha1`; its SHA-1 output remains mandated by BitTorrent v1. Native Linux,
+macOS and Windows M0 jobs run the retry regressions and known SHA-1 vectors
+with both this backend and AWS-LC. The daemon continues to select AWS-LC.
+
+Bincode 1.3.3 and 2.0.1 still carry RustSec's unmaintained notice. They encode
+peer protocol data and persisted Raft/WAL/state records using distinct fixed
+and variable integer configurations. There is no maintained drop-in release:
+bincode 3.0.0 is a retirement marker, and wincode's compatibility covers only
+matching schemas/configurations. A replacement needs an explicit data-format
+migration and cross-version recovery proof; this patch preserves those bytes
+and keeps the notices visible. Optional stock rqbit CLI/UI and unselected
+Hiqlite feature graphs remain provenance snapshots, separately inventoried
+from the shipped product and executed compatibility-test graphs.
