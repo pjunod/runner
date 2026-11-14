@@ -780,7 +780,19 @@ impl Inventory {
                 ));
             }
             use sha2::{Digest, Sha256};
-            let key = format!("expiry-outbox:{:x}", Sha256::digest(data.as_bytes()));
+            // Renewal/display epoch/fetched progress do not create a second
+            // notice. A genuinely new grant/source/episode gets its own key.
+            let identity = serde_json::to_vec(&(
+                job.id,
+                &checkpoint.context.lease_id,
+                &checkpoint.context.job_incarnation,
+                checkpoint.context.job_revision,
+                checkpoint.context.control_revision,
+                &checkpoint.control.instance,
+                &checkpoint.control.revision,
+                &checkpoint.source,
+            ))?;
+            let key = format!("expiry-outbox:{:x}", Sha256::digest(identity));
             tx.execute(
                 "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO NOTHING",
                 params![key, data],

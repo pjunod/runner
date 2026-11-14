@@ -585,9 +585,6 @@ async fn report_expired_holds(cfg: &ClusterConfig, engine: &EngineHandle, active
         if !lease_authority(active, &id, &state)() {
             continue;
         }
-        if control.expiry_pending {
-            continue;
-        } // its notice committed with the checkpoint
         let Ok(Some(job)) = engine.queue_job_metadata(state.job).await else {
             continue;
         };

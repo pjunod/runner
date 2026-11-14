@@ -5307,21 +5307,21 @@ impl Owner {
                     let _ = reply.send(false);
                     return;
                 };
-                // Repeating a durably prepared expiry keeps the exact identity.
-                if control.expiry_pending {
-                    let _ = reply.send(true);
-                    return;
+                // A regrant preserves the original frozen episode. Re-enqueue
+                // it under the exact current grant, without advancing the hold
+                // revision or restarting its deadline.
+                if !control.expiry_pending {
+                    let Some(next) = control
+                        .revision
+                        .parse::<u64>()
+                        .ok()
+                        .and_then(|value| value.checked_add(1))
+                    else {
+                        let _ = reply.send(false);
+                        return;
+                    };
+                    control.revision = next.to_string();
                 }
-                let Some(next) = control
-                    .revision
-                    .parse::<u64>()
-                    .ok()
-                    .and_then(|value| value.checked_add(1))
-                else {
-                    let _ = reply.send(false);
-                    return;
-                };
-                control.revision = next.to_string();
                 control.expiry_pending = true;
                 self.state.job_mut(job).unwrap().set_control(&control);
                 self.pending_control_commits.insert(job);

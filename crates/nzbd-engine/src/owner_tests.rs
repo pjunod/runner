@@ -9763,4 +9763,59 @@ async fn worker_expiry_freezes_due_revision_durably_and_refuses_stale_or_revoked
         owner.state.job(JobId(901)).unwrap().control().unwrap(),
         frozen
     );
+    assert_eq!(owner.artifacts.worker_expiry_outbox("").unwrap().len(), 1);
+    let current = owner.state.job(JobId(901)).unwrap().clone();
+    let guard = crate::hold_release::HoldReleaseGuard::prepare(
+        &current,
+        Some(&source),
+        Some(Arc::new(|| true)),
+    );
+    let (reply, result) = oneshot::channel();
+    owner.on_command(QueueCommand::PrepareWorkerHoldExpiry{job:JobId(901),revision:frozen.revision.clone(),guard,notice:serde_json::json!({"job":901,"context":context,"source":{"artifact":source.id,"generation":source.generation},"token":{"revision":99}}).to_string(),reply});
+    pump(&mut owner, &mut messages).await;
+    assert!(result.await.unwrap());
+    assert_eq!(
+        owner.artifacts.worker_expiry_outbox("").unwrap().len(),
+        1,
+        "renewal never duplicates notice"
+    );
+    let mut successor = context.clone();
+    successor.lease_id = "lease-901-new-fence".into();
+    successor.epoch += 1;
+    owner
+        .artifacts
+        .bind_worker_context(901, &successor)
+        .unwrap();
+    let current = owner.state.job_mut(JobId(901)).unwrap();
+    current
+        .params
+        .retain(|(key, _)| key != WORKER_CONTROL_CONTEXT_PARAM);
+    current.params.push((
+        WORKER_CONTROL_CONTEXT_PARAM.into(),
+        serde_json::to_string(&successor).unwrap(),
+    ));
+    owner
+        .artifacts
+        .checkpoint_worker_control(current, &frozen.revision)
+        .unwrap();
+    let current = owner.state.job(JobId(901)).unwrap().clone();
+    let guard = crate::hold_release::HoldReleaseGuard::prepare(
+        &current,
+        Some(&source),
+        Some(Arc::new(|| true)),
+    );
+    let (reply, result) = oneshot::channel();
+    owner.on_command(QueueCommand::PrepareWorkerHoldExpiry{job:JobId(901),revision:frozen.revision.clone(),guard,notice:serde_json::json!({"job":901,"context":successor,"source":{"artifact":source.id,"generation":source.generation}}).to_string(),reply});
+    pump(&mut owner, &mut messages).await;
+    assert!(result.await.unwrap());
+    assert_eq!(
+        owner.artifacts.worker_expiry_outbox("").unwrap().len(),
+        2,
+        "current regrant receives its own exact notice"
+    );
+    assert_eq!(
+        owner.state.job(JobId(901)).unwrap().control().unwrap(),
+        frozen,
+        "regrant cannot restart deadline or release episode"
+    );
 }
