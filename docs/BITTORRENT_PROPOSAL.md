@@ -632,7 +632,7 @@ add daemon config, admission, a listener, DHT, tracker work, or payload I/O.
 #### 4.3.4 Security maintenance renewal — 2026-11-13
 
 The canonical [maintained series](../contrib/rqbit/maintained-series.txt)
-now contains fifteen patches against the same checksum-pinned v8.1.1 archive.
+contained fifteen patches at this renewal against the same checksum-pinned v8.1.1 archive.
 Patches 0022 and 0023 add read-only piece verification and compatible parser/
 lockfile security fixes. Patch 0024 replaces backoff/instant with an owned
 native peer/bootstrap policy and the optional crypto-hash backend with
@@ -667,6 +667,39 @@ described as a fixed or supported runtime. Optional contribution probes
 compile the CLI without its unrelated stock web UI/npm hook and still target
 independent upstream sources, with their own upstream limitations. No
 advisory suppression is introduced.
+
+#### 4.3.5 Serialization maintenance renewal — 2026-11-13
+
+Select maintained Fugue bincode 1.3.4 for peer serialization and GroveDB bincode
+2.1.0 for Hiqlite/WAL Serde and native Cryptr key encoding. Patch 0025 extends
+the canonical series to sixteen; the archive/checksum and all admission,
+resource and discovery boundaries remain unchanged. The owned Cryptr 0.10.0
+source preserves its Apache-2.0 provenance and selects explicit untrusted native
+key decoding while retaining ordinary public derives and the legacy encoding.
+
+The [serialization contract](BINCODE_COMPATIBILITY.md) is the review surface:
+real prior implementations produce frozen production-type fixtures; independent
+old/new processes prove bytes, malformed-input/public-error behavior, actual
+bidirectional WAL/state/snapshot recovery, interrupted-write handling and mixed
+cluster snapshot transfers. Fresh hosted Linux/macOS/Windows and bounded fuzz
+proofs are required with the protected checks. Feature-dependent enum layouts
+remain scoped to matching feature profiles. There is no format migration,
+production data rewrite, deployment or release operation. The retired versions
+remain only in the explicitly identified legacy validation graph; advisory
+reporting is not suppressed.
+
+The bounded peer-protocol fuzzer added with this renewal found a latent upstream
+decoder defect: a peer-supplied bencode byte-string length near `usize::MAX`
+overflowed the end-offset addition in `parse_bytes`. Debug and fuzz builds
+panicked; release builds wrapped and failed only by accident of slice bounds.
+Patch 0026 uses checked addition and returns an ordinary decode error. Review
+of that fix found the same decoder recursed once per list/dict opener with no
+limit, and extended messages with an unknown id decode peer bytes into the
+recursive `BencodeValue`: one frame of openers overflowed the stack and aborted
+the process. Patch 0027 bounds nesting at 64 levels, bringing the canonical
+series to eighteen. Both inputs are permanent fuzz seeds and named unit proofs
+in the maintained derivation.
+
 
 ### 4.4 Consequences
 

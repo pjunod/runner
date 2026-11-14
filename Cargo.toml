@@ -19,7 +19,7 @@ members = [
     "crates/nzbd-torrent",
     "crates/nzbd-qbit-compat",
 ]
-exclude = ["contrib/rqbit/vendor", "vendor/hiqlite", "vendor/hiqlite-wal"]
+exclude = ["contrib/rqbit/vendor", "vendor/hiqlite", "vendor/hiqlite-wal", "vendor/cryptr"]
 
 [workspace.package]
 # Releases are git tags `v<this>` — see docs/DEPLOY.md, "Cutting a

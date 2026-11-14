@@ -1,10 +1,16 @@
 use buffers::ByteBuf;
 use serde::de::Error as DeError;
 
+/// Deepest list/dict nesting accepted from input. Real torrent metadata and
+/// peer extension payloads nest only a few levels; unbounded nesting lets a
+/// peer exhaust the decoding thread's stack, which aborts the process.
+pub const MAX_NESTING_DEPTH: usize = 64;
+
 pub struct BencodeDeserializer<'de> {
     buf: &'de [u8],
     field_context: Vec<ByteBuf<'de>>,
     parsing_key: bool,
+    depth: usize,
 
     // This is a f**ing hack
     pub is_torrent_info: bool,
@@ -18,6 +24,7 @@ impl<'de> BencodeDeserializer<'de> {
             buf,
             field_context: Default::default(),
             parsing_key: false,
+            depth: 0,
             is_torrent_info: false,
             torrent_info_digest: None,
             torrent_info_bytes: None,
@@ -25,6 +32,19 @@ impl<'de> BencodeDeserializer<'de> {
     }
     pub fn into_remaining(self) -> &'de [u8] {
         self.buf
+    }
+
+    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Err(Error::custom(format!(
+                "bencode nesting deeper than {MAX_NESTING_DEPTH} levels"
+            ))
+            .set_context(self));
+        }
+        self.depth += 1;
+        let result = f(self);
+        self.depth -= 1;
+        result
     }
     fn parse_integer(&mut self) -> Result<i64, Error> {
         match self.buf.iter().copied().position(|e| e == b'e') {
@@ -51,7 +71,12 @@ impl<'de> BencodeDeserializer<'de> {
                     .parse()
                     .map_err(|e| Error::new_from_err(e).set_context(self))?;
                 let bytes_start = length_delim + 1;
-                let bytes_end = bytes_start + length;
+                let bytes_end = bytes_start.checked_add(length).ok_or_else(|| {
+                    Error::custom(format!(
+                        "byte string length {length} exceeds the addressable buffer"
+                    ))
+                    .set_context(self)
+                })?;
                 let bytes = &self.buf.get(bytes_start..bytes_end).ok_or_else(|| {
                     Error::custom(format!(
                         "could not get byte range {}..{}, data in the buffer: {:?}",
@@ -439,9 +464,11 @@ impl<'de> serde::de::Deserializer<'de> for &mut BencodeDeserializer<'de> {
             )));
         }
         self.buf = self.buf.get(1..).unwrap_or_default();
-        visitor
-            .visit_seq(SeqAccess { de: self })
-            .map_err(|e: Self::Error| e.set_context(self))
+        self.nested(|de| {
+            visitor
+                .visit_seq(SeqAccess { de: &mut *de })
+                .map_err(|e: Error| e.set_context(de))
+        })
     }
 
     fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
@@ -471,9 +498,11 @@ impl<'de> serde::de::Deserializer<'de> for &mut BencodeDeserializer<'de> {
             return Err(Error::custom("expected bencode dict"));
         }
         self.buf = self.buf.get(1..).unwrap_or_default();
-        visitor
-            .visit_map(MapAccess { de: self })
-            .map_err(|e: Self::Error| e.set_context(self))
+        self.nested(|de| {
+            visitor
+                .visit_map(MapAccess { de: &mut *de })
+                .map_err(|e: Error| e.set_context(de))
+        })
     }
 
     fn deserialize_struct<V>(
@@ -583,5 +612,56 @@ impl<'de> serde::de::SeqAccess<'de> for SeqAccess<'_, 'de> {
             return Ok(None);
         }
         Ok(Some(seed.deserialize(&mut *self.de)?))
+    }
+}
+
+#[cfg(test)]
+mod length_overflow_tests {
+    use buffers::ByteBuf;
+
+    #[test]
+    fn byte_string_length_overflowing_the_buffer_offset_is_an_error() {
+        let input = format!("{}:x", usize::MAX);
+        assert!(super::from_bytes::<ByteBuf<'_>>(input.as_bytes()).is_err());
+        let nested = format!("l{}:xe", usize::MAX);
+        assert!(super::from_bytes::<Vec<ByteBuf<'_>>>(nested.as_bytes()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod nesting_depth_tests {
+    use super::MAX_NESTING_DEPTH;
+    use crate::BencodeValue;
+    use buffers::ByteBuf;
+
+    fn nested_lists(depth: usize) -> Vec<u8> {
+        let mut input = vec![b'l'; depth];
+        input.extend(std::iter::repeat_n(b'e', depth));
+        input
+    }
+
+    #[test]
+    fn nesting_at_the_limit_decodes_and_one_deeper_is_an_error() {
+        let at_limit = nested_lists(MAX_NESTING_DEPTH);
+        assert!(super::from_bytes::<BencodeValue<ByteBuf<'_>>>(&at_limit).is_ok());
+        let too_deep = nested_lists(MAX_NESTING_DEPTH + 1);
+        assert!(super::from_bytes::<BencodeValue<ByteBuf<'_>>>(&too_deep).is_err());
+    }
+
+    #[test]
+    fn hostile_nesting_is_rejected_on_a_small_stack() {
+        // A peer can send a frame of nothing but list openers; this used to
+        // recurse once per byte until the thread's stack overflowed.
+        let hostile = vec![b'l'; 1 << 20];
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                assert!(super::from_bytes::<BencodeValue<ByteBuf<'_>>>(&hostile).is_err());
+                let dict = [b"d1:a".repeat(1 << 16), vec![b'e'; 1 << 16]].concat();
+                assert!(super::from_bytes::<BencodeValue<ByteBuf<'_>>>(&dict).is_err());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
