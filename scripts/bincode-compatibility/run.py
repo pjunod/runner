@@ -1,6 +1,10 @@
 """Independent old/new bytes, encrypted keys, Raft/WAL and snapshot recovery."""
 
-import argparse, hashlib, json, pathlib, queue, shutil, socket, subprocess, threading, time
+import argparse, hashlib, json, pathlib, queue, shutil, socket, subprocess, sys, threading, time
+
+# Progress lines name old→new directions; never depend on the console code page.
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
 
 p = argparse.ArgumentParser()
 p.add_argument("--work-root", required=True)
