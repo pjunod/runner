@@ -5665,7 +5665,7 @@ fn salvage_retry_is_durable_and_pending_never_grants_disposal() {
     assert!(!db.salvage_retry_due(801).unwrap());
     assert!(!db.begin_salvage_attempt(801).unwrap());
     assert!(db.disposal_allowed(801).unwrap().is_none());
-    let op = vec![db.operation("salvage:801").unwrap()];
+    let op = [db.operation("salvage:801").unwrap()];
     assert!(op
         .iter()
         .any(|op| op.kind == "salvage" && op.attempts == 1 && op.next_retry > now()));
