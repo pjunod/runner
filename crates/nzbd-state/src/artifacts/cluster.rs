@@ -426,6 +426,21 @@ impl Inventory {
                 error: Some("this exact source is retained by its current Keep setting".into()),
             });
         }
+        // An expired environmental hold is never a W3 deletion proof.
+        // This precedes replay of any earlier automatic raw-delete journal.
+        if !copy.selected
+            && outcome == nzbd_types::FailureReason::HoldExpired.history_status()
+            && !explicit_cancellation
+            && !artifact.terminal()
+        {
+            if let Some(mut operation) = existing.clone().filter(|op| op.state != "succeeded") {
+                operation.state = "cancelled".into();
+                operation.error =
+                    Some("hold-expired source preserved; prior automatic delete superseded".into());
+                save_operation(&self.db.lock().unwrap(), &operation)?;
+            }
+            return Ok(ClusterCopyCleanup {status:"retained".into(),error:Some("hold-expired source remains under its owner's custody; failed assessment is not unusable proof".into())});
+        }
         if let Some(operation) = existing.as_ref().filter(|_| !copy.selected) {
             let request: DeleteRequest = serde_json::from_str(&operation.request)?;
             if operation.kind != "delete"

@@ -779,6 +779,29 @@ async fn failure_followup_settle(
     if terminal.disposal.is_some() {
         return Settle::Done;
     }
+    // Only the exact source owner can acknowledge this deadline-abandoned
+    // assessment. The leader cannot inspect its original and declare the
+    // worker's repaired/extracted/partial bytes absent or unusable.
+    if terminal.salvage == nzbd_state::artifacts::SalvageState::Pending
+        && terminal
+            .entry
+            .params
+            .iter()
+            .any(|(key, _)| key == "Failure:ExpiredWorkerHold")
+    {
+        return Settle::Pending;
+    }
+    // A scan, duplicate terminal event, or Retry now cannot turn an owed
+    // storage-bound salvage into a busy loop. A failed clock read fails closed.
+    if terminal.salvage == nzbd_state::artifacts::SalvageState::Pending {
+        let inventory = engine.artifacts();
+        if !matches!(
+            tokio::task::spawn_blocking(move || inventory.salvage_retry_due(job.0)).await,
+            Ok(Ok(true))
+        ) {
+            return Settle::Pending;
+        }
+    }
     // Review #280-7: the retry ladder is the disposal operation's own
     // (durable, visible on the artifact); nothing here keeps a second one.
     if !force {
@@ -881,7 +904,14 @@ async fn failure_followup_settle(
     }));
     let mut terminal = terminal;
     if terminal.salvage == nzbd_state::artifacts::SalvageState::Pending {
-        assess_and_publish_salvage(&scoped, cfg, dest_dir, &admitted_gate, &row, &terminal).await;
+        let inventory = engine.artifacts();
+        if matches!(
+            tokio::task::spawn_blocking(move || inventory.begin_salvage_attempt(job.0)).await,
+            Ok(Ok(true))
+        ) {
+            assess_and_publish_salvage(&scoped, cfg, dest_dir, &admitted_gate, &row, &terminal)
+                .await;
+        }
         if let Some(reloaded) = load_terminal(engine, job).await {
             terminal = reloaded;
         }
@@ -1024,6 +1054,8 @@ pub async fn dispose_remote_failure(
         .map(|assessment| assessment.disposition);
     let action = if nzbd_engine::terminal::keeps_failed_source(job) {
         FailureAction::None
+    } else if reason == Some(nzbd_types::FailureReason::HoldExpired) {
+        FailureAction::Park
     } else if nzbd_types::transfer_of(&job.params).is_some() {
         // W3: a curator-admitted failure follows `failure_action`.
         cfg.failure_action
@@ -1111,6 +1143,13 @@ async fn assess_and_publish_salvage(
         }
     };
     let unsettled = |error: PostError| async move {
+        let inventory = engine.artifacts();
+        let message = error.to_string();
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || inventory.note_salvage_error(job.0, &message)).await
+        {
+            tracing::warn!(job=job.0, %error, "salvage error audit worker stopped; durable clock remains");
+        }
         if storage_hold_cause(&error).is_some() {
             tracing::warn!(job = job.0, %error, "salvage waits for storage; obligation stays pending");
             None
@@ -1545,6 +1584,16 @@ fn disposal_action(
 ) -> FailureAction {
     if terminal.keep_on_failure {
         FailureAction::None
+    } else if terminal.reason == Some(nzbd_types::FailureReason::HoldExpired)
+        && (terminal.salvage != nzbd_state::artifacts::SalvageState::Published
+            || terminal.salvage_error.is_some()
+            || terminal
+                .entry
+                .params
+                .iter()
+                .any(|(key, _)| key == "Failure:ExpiredWorkerHold"))
+    {
+        FailureAction::Park
     } else if terminal.transfer.is_some() {
         cfg.failure_action
     } else if terminal.reason.is_some_and(|reason| reason.park_always()) {
@@ -2816,6 +2865,107 @@ mod post_pause_tests {
 
 #[cfg(test)]
 mod admission_tests {
+    #[tokio::test]
+    async fn pending_salvage_clock_blocks_scans_events_and_force_without_disposal() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("downloads");
+        std::fs::create_dir_all(&dest).unwrap();
+        let engine = nzbd_engine::Engine::spawn(nzbd_engine::EngineConfig::single_node(
+            vec![],
+            temp.path().join("state"),
+            dest.clone(),
+            nzbd_engine::Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let inventory = engine.artifacts();
+        let source = inventory
+            .allocate_for_delivery(907, &dest, &dest.join("salvage"), true, true)
+            .unwrap();
+        let row = nzbd_types::Job {
+            id: JobId(907),
+            kind: nzbd_types::JobKind::Nzb,
+            name: "salvage".into(),
+            dir_name: "salvage".into(),
+            name_provisional: false,
+            delivery_lifecycle: true,
+            queued_at_unix: 0,
+            original_name: String::new(),
+            category: None,
+            priority: 0,
+            dupe: Default::default(),
+            params: vec![],
+            files: vec![],
+            totals: Default::default(),
+            status: JobStatus::Failed,
+            torrent: None,
+            stages: vec![],
+        };
+        let mut terminal = nzbd_engine::terminal::failed_terminal(
+            &row,
+            nzbd_types::FailureReason::Health,
+            None,
+            "health",
+            "partial download",
+        );
+        terminal.salvage = nzbd_state::artifacts::SalvageState::Pending;
+        inventory.record_terminal(&terminal).unwrap();
+        inventory
+            .mark_terminal_step(907, &nzbd_state::artifacts::TerminalStep::Emitted)
+            .unwrap();
+        assert!(inventory.begin_salvage_attempt(907).unwrap());
+        inventory
+            .note_salvage_error(907, "extractor volume ENOSPC")
+            .unwrap();
+        let before = inventory.operation("salvage:907").unwrap();
+        for force in [false, true, true, false] {
+            assert_eq!(
+                failure_followup_settle(
+                    &engine,
+                    &PostConfig::default(),
+                    &dest,
+                    &None,
+                    JobId(907),
+                    force
+                )
+                .await,
+                Settle::Pending
+            );
+        }
+        let after = inventory.operation("salvage:907").unwrap();
+        assert_eq!(before.attempts, after.attempts);
+        assert_eq!(before.next_retry, after.next_retry);
+        assert!(inventory.disposal_allowed(907).unwrap().is_none());
+        assert_eq!(inventory.get(&source.id).unwrap().state, "active");
+        terminal.reason = Some(nzbd_types::FailureReason::HoldExpired);
+        terminal.transfer = Some("curator-transfer".into());
+        let cfg = PostConfig {
+            failure_action: FailureAction::Delete,
+            ..Default::default()
+        };
+        assert_eq!(disposal_action(&cfg, &terminal), FailureAction::Park);
+        terminal.salvage = nzbd_state::artifacts::SalvageState::Published;
+        terminal.salvage_error = Some("deadline-abandoned assessment".into());
+        assert_eq!(disposal_action(&cfg, &terminal), FailureAction::Park);
+        terminal.salvage_error = None;
+        assert_eq!(
+            disposal_action(&cfg, &terminal),
+            FailureAction::Delete,
+            "verified published salvage enters existing generation-bound Delivery retirement"
+        );
+        terminal.entry.params.push((
+            "Failure:ExpiredWorkerHold".into(),
+            "durable remote custody decision".into(),
+        ));
+        assert_eq!(
+            disposal_action(&cfg, &terminal),
+            FailureAction::Park,
+            "unresolved expiry custody cannot borrow another publication as proof"
+        );
+        engine.shutdown().await;
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -11392,6 +11542,7 @@ mod decision_tests {
             request.delivery_lifecycle = true;
             request.status = JobStatus::Paused;
             request.set_control(&nzbd_types::JobControl {
+                expiry_pending: false,
                 version: 1,
                 revision: "1".into(),
                 lifecycle: "held".into(),

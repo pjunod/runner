@@ -371,7 +371,23 @@ pause, never a hold. The NZBGet-compat shim shows both as `PAUSED`.
 `stage`, `retry_policy` (`scheduled_retry` · `resume_same_job` ·
 `reobserve_mount`), `message`, `instance`, `previous_status`,
 `manual_pause`, `retry_attempt`, `next_retry_at_unix`, `blocked_since_unix`,
-`released_at_unix`, `deadline_in_s`, `deadline_unix`.
+`released_at_unix`, `deadline_in_s`, `deadline_unix`, and optional
+`expiry_pending` (false/missing on older nodes). A selected worker expiry
+freezes that exact control revision; it cannot be resumed by a late recovery
+probe. The authenticated cluster expiry decision binds the grant, job revision,
+source generation and control episode before recording `hold_expired`.
+Terminal history/event publication does not wait on the payload mount.
+
+The source owner independently joins actual writers/processes, then parks or
+preserves every stopped source and journal-bound transform generation. A hold
+deadline that ends salvage assessment records an explicit failed-assessment
+error; it does not prove the bytes unusable. An unknown or abandoned
+`hold_expired` assessment takes Park precedence over Curator-admitted
+`failure_action=delete`, including old automatic delete replay. A successfully
+published salvage with no abandonment error or unresolved remote custody still
+uses the existing generation-bound Delivery retirement under W3. Keep, legacy enrollment and ordinary retention validators still apply.
+Unproven stop/custody remains Pending with an error and durable retry outbox;
+reboot, a timeout or a missing receipt never proves physical completion.
 
 - **One retry clock.** A timed hold is retried at 30 s, 1 m, 2 m, then every
   5 m (`HOLD_RETRY_DELAYS_SECONDS`, jittered), by the owner; nothing else
@@ -803,3 +819,18 @@ Every literal in this document — event names, field names, status strings,
 config keys — was read from the code on the branch that ships it, and the
 event tables are checked against `event_json` by a test. When a seam changes,
 this file changes in the same commit.
+
+## Inventory source-presence reconciliation
+
+A transferred row remains live while its source directory exists or custody is
+unverified. Maintenance can append `source_gone` only after two observations at
+least 600 seconds apart under the recorded, readable root identity, using a
+pinned directory descriptor and a final leaf/root recheck. Busy sources, open
+operations/intents, replaced roots and non-ENOENT errors remain visible. This
+never deletes a payload, manifest, delivery, operation or history row. Use All
+or Cleared to inspect settled source-presence audit.
+
+Pending salvage owns a durable source-bound `salvage` operation. Each attempt
+reserves its next retry before work: 30, 60, 120, then 300 seconds (capped).
+Scans, duplicate terminal events, Retry now and restarts respect the same clock.
+Storage errors retain the pending obligation and block failed-source disposal.

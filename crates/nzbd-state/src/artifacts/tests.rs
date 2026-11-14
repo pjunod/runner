@@ -5650,3 +5650,486 @@ fn a_vanished_source_of_a_live_job_is_not_settled() {
     assert_eq!(db.settle_vanished_failed_source(2711).unwrap(), None);
     assert_eq!(db.for_job(2711).unwrap().unwrap().state, "active");
 }
+
+#[test]
+fn salvage_retry_is_durable_and_pending_never_grants_disposal() {
+    let (tmp, db, root) = fixture();
+    let path = root.join("salvage");
+    db.allocate(801, &root, &path).unwrap();
+    let terminal = terminals::tests::failed(801, SalvageState::Pending);
+    db.record_terminal(&terminal).unwrap();
+    db.mark_terminal_step(801, &TerminalStep::Emitted).unwrap();
+    assert!(db.begin_salvage_attempt(801).unwrap());
+    db.note_salvage_error(801, "capacity: extractor volume full")
+        .unwrap();
+    assert!(!db.salvage_retry_due(801).unwrap());
+    assert!(!db.begin_salvage_attempt(801).unwrap());
+    assert!(db.disposal_allowed(801).unwrap().is_none());
+    let op = [db.operation("salvage:801").unwrap()];
+    assert!(op
+        .iter()
+        .any(|op| op.kind == "salvage" && op.attempts == 1 && op.next_retry > now()));
+    drop(db);
+    let db = Inventory::open(&tmp.path().join("state")).unwrap();
+    assert!(
+        !db.begin_salvage_attempt(801).unwrap(),
+        "restart respects clock"
+    );
+    db.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE operations SET data=json_set(data,'$.next_retry',0) WHERE id='salvage:801'",
+            [],
+        )
+        .unwrap();
+    assert!(db.begin_salvage_attempt(801).unwrap());
+    let before = db.terminal(801).unwrap().unwrap();
+    db.settle_salvage(801, &SalvageOutcome::None { error: None })
+        .unwrap();
+    assert!(!db.begin_salvage_attempt(801).unwrap());
+    let after = db.terminal(801).unwrap().unwrap();
+    assert_eq!(before.reason, after.reason);
+    assert_eq!(before.entry.status, after.entry.status);
+    assert!(path.exists(), "no deletion or custody transfer");
+}
+
+#[test]
+fn transferred_inventory_requires_two_verified_absences_and_keeps_audit() {
+    let (_tmp, db, root) = fixture();
+    let path = root.join("transferred");
+    db.allocate_for_delivery(802, &root, &path, true, true)
+        .unwrap();
+    std::fs::write(path.join("movie.mkv"), b"movie").unwrap();
+    db.finish(802, &path, &root, "completed").unwrap();
+    let delivery = db.create_delivery(802, true, None).unwrap();
+    let original = db.get(&delivery.artifact_id).unwrap();
+    db.reconcile_missing().unwrap();
+    assert_eq!(
+        db.get(&original.id).unwrap().state,
+        "transferred",
+        "present remains live"
+    );
+    std::fs::remove_dir_all(&path).unwrap();
+    db.reconcile_missing().unwrap(); // cursor wrap
+    db.reconcile_missing().unwrap();
+    assert_eq!(
+        db.get(&original.id).unwrap().state,
+        "transferred",
+        "first absence is not disposition"
+    );
+    let key = format!(
+        "transferred-missing:{}:{}:{}",
+        original.id, original.generation, original.revision
+    );
+    db.db
+        .lock()
+        .unwrap()
+        .execute("UPDATE meta SET value='0' WHERE key=?1", [&key])
+        .unwrap();
+    db.reconcile_missing().unwrap();
+    db.reconcile_missing().unwrap();
+    let gone = db.get(&original.id).unwrap();
+    assert_eq!(gone.state, "source_gone");
+    assert_eq!(gone.files, original.files);
+    assert_eq!(
+        serde_json::to_value(db.delivery(&delivery.delivery_id).unwrap()).unwrap(),
+        serde_json::to_value(delivery).unwrap()
+    );
+    assert_eq!(db.list_page(&ListQuery::default()).unwrap().counts.live, 0);
+    assert_eq!(
+        db.list_page(&ListQuery {
+            filter: ListFilter::All,
+            ..Default::default()
+        })
+        .unwrap()
+        .counts
+        .all,
+        1
+    );
+}
+
+#[test]
+fn transferred_inventory_preserves_reappearing_unverified_and_busy_custody() {
+    let (tmp, db, root) = fixture();
+    let path = root.join("live-transfer");
+    db.allocate_for_delivery(803, &root, &path, true, true)
+        .unwrap();
+    std::fs::write(path.join("media.mkv"), b"payload").unwrap();
+    db.finish(803, &path, &root, "completed").unwrap();
+    let delivery = db.create_delivery(803, true, None).unwrap();
+    let original = db.get(&delivery.artifact_id).unwrap();
+    let aside = tmp.path().join("aside");
+    std::fs::rename(&path, &aside).unwrap();
+    db.reconcile_missing().unwrap();
+    let key = format!(
+        "transferred-missing:{}:{}:{}",
+        original.id, original.generation, original.revision
+    );
+    db.db
+        .lock()
+        .unwrap()
+        .execute("UPDATE meta SET value='0' WHERE key=?1", [&key])
+        .unwrap();
+    std::fs::rename(&aside, &path).unwrap();
+    db.reconcile_missing().unwrap();
+    db.reconcile_missing().unwrap();
+    assert_eq!(db.get(&original.id).unwrap().state, "transferred");
+    let stamp: bool = db
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+            [&key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!stamp, "reappearance invalidates absence");
+    std::fs::rename(&root, tmp.path().join("old-root")).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    db.reconcile_missing().unwrap();
+    db.reconcile_missing().unwrap();
+    assert_eq!(
+        db.get(&original.id).unwrap().state,
+        "transferred",
+        "a remounted/replaced root is not absence proof"
+    );
+    assert_eq!(db.get(&original.id).unwrap().files, original.files);
+    assert!(tmp.path().join("old-root/live-transfer/media.mkv").exists());
+}
+
+#[test]
+fn salvage_retry_rejects_changed_generation_and_keeps_the_old_error_audit() {
+    let (_tmp, db, root) = fixture();
+    let path = root.join("salvage-replacement");
+    db.allocate(804, &root, &path).unwrap();
+    db.record_terminal(&terminals::tests::failed(804, SalvageState::Pending))
+        .unwrap();
+    db.mark_terminal_step(804, &TerminalStep::Emitted).unwrap();
+    assert!(db.begin_salvage_attempt(804).unwrap());
+    db.note_salvage_error(804, "capacity exhausted").unwrap();
+    let mut source = db.for_job(804).unwrap().unwrap();
+    source.generation = "replacement".into();
+    save_artifact(&db.db.lock().unwrap(), &source).unwrap();
+    db.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE operations SET data=json_set(data,'$.next_retry',0) WHERE id='salvage:804'",
+            [],
+        )
+        .unwrap();
+    assert!(db.begin_salvage_attempt(804).is_err());
+    assert_eq!(
+        db.operation("salvage:804").unwrap().error.as_deref(),
+        Some("capacity exhausted")
+    );
+    assert!(db.disposal_allowed(804).unwrap().is_none());
+}
+
+#[test]
+fn expired_worker_parking_preserves_unknown_bytes_keep_and_legacy_enrollment() {
+    for (owned, enrolled, keep) in [
+        (true, true, false),
+        (true, true, true),
+        (true, false, false),
+        (false, false, false),
+    ] {
+        let (_tmp, db, root) = fixture();
+        let path = root.join("stopped");
+        let mut artifact = if owned {
+            db.allocate_for_delivery(905, &root, &path, true, enrolled)
+                .unwrap()
+        } else {
+            std::fs::create_dir(&path).unwrap();
+            db.register_legacy_active(905, &root, &path).unwrap();
+            db.for_job(905).unwrap().unwrap()
+        };
+        std::fs::write(path.join("partial.rar"), b"uncertain recovery input").unwrap();
+        artifact.keep = keep;
+        artifact.automatic_cleanup_eligible = enrolled;
+        save_artifact(&db.db.lock().unwrap(), &artifact).unwrap();
+        let context = WorkerControlContext {
+            lease_id: "exact-grant".into(),
+            job_incarnation: "905".into(),
+            job_revision: 1,
+            control_revision: 1,
+            epoch: 1,
+        };
+        let request = WorkerStopRequest {
+            job: 905,
+            context,
+            owner_incarnation: "worker-boot".into(),
+            storage_instance_id: db.installation.clone(),
+            removal_revision: None,
+            authority_source_json: None,
+            start_ordered: true,
+        };
+        db.begin_worker_grant(&request).unwrap();
+        let ticket = db.prepare_worker_stop(&request).unwrap();
+        let receipt = db
+            .commit_worker_stopped(
+                &ticket,
+                &[SourceGeneration {
+                    artifact: artifact.id.clone(),
+                    generation: artifact.generation.clone(),
+                }],
+            )
+            .unwrap();
+        db.park_expired_worker_sources(&receipt).unwrap();
+        let parked = db.get(&artifact.id).unwrap();
+        assert_eq!(parked.owned, owned);
+        assert_eq!(parked.automatic_cleanup_eligible, enrolled);
+        assert_eq!(parked.keep, keep);
+        assert_eq!(
+            parked.failure_assessment.as_ref().unwrap().disposition,
+            "unknown"
+        );
+        assert_eq!(parked.failure_reason.as_deref(), Some("hold_expired"));
+        assert!(parked
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("not proven unusable"));
+        if owned && enrolled {
+            assert_eq!(parked.state, "parked_failed");
+            assert_eq!(parked.deadline.is_some(), !keep);
+        } else {
+            assert_eq!(parked.state, artifact.state);
+            assert_eq!(parked.deadline, artifact.deadline);
+        }
+        assert_eq!(
+            std::fs::read(path.join("partial.rar")).unwrap(),
+            b"uncertain recovery input"
+        );
+        let mut wrong = receipt.clone();
+        wrong.sources[0].generation = "replacement".into();
+        assert!(db.park_expired_worker_sources(&wrong).is_err());
+    }
+}
+
+#[test]
+fn expiry_checkpoint_and_outbox_are_atomic_and_empty_reboot_stop_is_rejected() {
+    let (tmp, db, root) = fixture();
+    let path = root.join("expiry");
+    let source = db
+        .allocate_for_delivery(906, &root, &path, true, true)
+        .unwrap();
+    std::fs::write(path.join("payload.part"), b"unknown bytes").unwrap();
+    let context = WorkerControlContext {
+        lease_id: "work/job/906/post@1".into(),
+        job_incarnation: "906".into(),
+        job_revision: 1,
+        control_revision: 1,
+        epoch: 1,
+    };
+    let mut job = nzbd_types::Job {
+        id: nzbd_types::JobId(906),
+        kind: nzbd_types::JobKind::Nzb,
+        name: "expiry".into(),
+        dir_name: "expiry".into(),
+        name_provisional: false,
+        delivery_lifecycle: true,
+        queued_at_unix: 0,
+        original_name: String::new(),
+        category: None,
+        priority: 0,
+        dupe: Default::default(),
+        params: vec![(
+            WORKER_CONTROL_CONTEXT_PARAM.into(),
+            serde_json::to_string(&context).unwrap(),
+        )],
+        files: vec![],
+        totals: Default::default(),
+        status: nzbd_types::JobStatus::Held,
+        torrent: None,
+        stages: vec![],
+    };
+    let mut control:nzbd_types::JobControl=serde_json::from_value(serde_json::json!({"version":1,"revision":"3","lifecycle":"held","cause":"capacity","stage":"unpack","retry_policy":"scheduled_retry","message":"full","instance":"episode","deadline_unix":0})).unwrap();
+    job.set_control(&control);
+    db.bind_worker_context(906, &context).unwrap();
+    db.checkpoint_worker_control(&job, "0").unwrap();
+    let stop = WorkerStopRequest {
+        job: 906,
+        context: context.clone(),
+        owner_incarnation: "worker-boot".into(),
+        storage_instance_id: db.installation.clone(),
+        removal_revision: None,
+        authority_source_json: None,
+        start_ordered: true,
+    };
+    db.begin_worker_grant(&stop).unwrap();
+    control.revision = "4".into();
+    control.expiry_pending = true;
+    job.set_control(&control);
+    let notice = serde_json::json!({"node":"worker","job":906,"context":context,"token":{"resource":"work/job/906/post","owner_node_id":"worker","owner_incarnation":"worker-boot","fence":1,"revision":1,"expires_at_unix_ms":100},"control":control,"source":{"artifact":source.id,"generation":source.generation},"fetched":{"success_articles":0,"total_articles":0,"bytes":0},"stop_request":stop,"stopped":null});
+    let mut bad = notice.clone();
+    bad["source"]["generation"] = "replacement".into();
+    assert!(db
+        .checkpoint_worker_hold_expiry(&job, "3", &bad.to_string())
+        .is_err());
+    assert!(
+        !db.worker_control_metadata(906, &context)
+            .unwrap()
+            .unwrap()
+            .control
+            .expiry_pending
+    );
+    assert!(db.worker_expiry_outbox("").unwrap().is_empty());
+    db.checkpoint_worker_hold_expiry(&job, "3", &notice.to_string())
+        .unwrap();
+    assert!(
+        db.worker_control_metadata(906, &context)
+            .unwrap()
+            .unwrap()
+            .control
+            .expiry_pending
+    );
+    assert_eq!(db.worker_expiry_outbox("").unwrap().len(), 1);
+    drop(db);
+    let db = Inventory::open(&tmp.path().join("state")).unwrap();
+    let ticket = db.prepare_worker_stop(&stop).unwrap();
+    assert!(ticket.recovered_session);
+    assert!(
+        db.commit_worker_stopped(&ticket, &[]).is_err(),
+        "reboot is not proof of the selected source's writer/process join"
+    );
+    assert!(
+        db.prepare_worker_stop(&stop).unwrap().receipt.is_none(),
+        "no irreversible empty receipt committed"
+    );
+    let source_ref = SourceGeneration {
+        artifact: source.id.clone(),
+        generation: source.generation.clone(),
+    };
+    db.note_worker_expiry_error(
+        &source_ref,
+        "exact joined source proof unavailable after restart",
+    )
+    .unwrap();
+    assert_eq!(
+        db.get(&source.id).unwrap().salvage.as_deref(),
+        Some("pending")
+    );
+    assert_eq!(db.worker_expiry_outbox("").unwrap().len(), 1);
+    // Once the actual actor join supplies the exact source, the receipt can
+    // advance without deleting or replacing the unresolved audit.
+    let receipt = db.commit_worker_stopped(&ticket, &[source_ref]).unwrap();
+    db.park_expired_worker_sources(&receipt).unwrap();
+    let before = db.get(&source.id).unwrap();
+    db.park_expired_worker_sources(&receipt).unwrap();
+    assert_eq!(db.get(&source.id).unwrap().revision, before.revision);
+    let deadline = before.deadline;
+    db.note_worker_expiry_error(&receipt.sources[0], "second RPC reply lost")
+        .unwrap();
+    assert_eq!(
+        db.get(&source.id).unwrap().salvage.as_deref(),
+        Some("settled_none")
+    );
+    db.park_expired_worker_sources(&receipt).unwrap();
+    let acknowledged = db.get(&source.id).unwrap();
+    assert_eq!(acknowledged.deadline, deadline);
+    assert_eq!(acknowledged.salvage.as_deref(), Some("settled_none"));
+    assert!(!acknowledged.error.unwrap().contains("pending"));
+
+    let (key, raw) = db.worker_expiry_outbox("").unwrap().pop().unwrap();
+    db.finish_worker_expiry_outbox(&key, "joined; sources preserved")
+        .unwrap();
+    assert!(db.worker_expiry_outbox("").unwrap().is_empty());
+    let saved: String = db
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [key.replacen("expiry-outbox:", "expiry-audit:", 1)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(saved.contains("joined; sources preserved"));
+    assert!(saved.contains(
+        &serde_json::from_str::<serde_json::Value>(&raw).unwrap()["source"]["generation"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    ));
+    assert!(path.join("payload.part").exists());
+}
+
+#[test]
+fn hold_expired_blocks_replay_of_old_failed_delete_without_deleting_bytes() {
+    let (_tmp, db, root) = fixture();
+    let path = root.join("expired-delete");
+    let mut source = db
+        .allocate_for_delivery(908, &root, &path, true, true)
+        .unwrap();
+    std::fs::write(path.join("payload.bin"), b"uncertain bytes").unwrap();
+    source.failure_reason = Some("hold_expired".into());
+    save_artifact(&db.db.lock().unwrap(), &source).unwrap();
+    let op = Operation {
+        id: "failed-delete-908".into(),
+        artifact: source.id.clone(),
+        kind: "delete".into(),
+        state: "queued".into(),
+        request: serde_json::to_string(&DeleteRequest::Scoped((
+            source.id.clone(),
+            source.revision,
+            0,
+            true,
+            source.generation.clone(),
+        )))
+        .unwrap(),
+        created_at: now(),
+        not_before: 0,
+        attempts: 0,
+        next_retry: 0,
+        error: None,
+    };
+    save_operation(&db.db.lock().unwrap(), &op).unwrap();
+    let cancelled = db.execute_delete(&op.id).unwrap();
+    assert_eq!(cancelled.state, "cancelled");
+    assert!(cancelled.error.unwrap().contains("hold-expired"));
+    assert_eq!(
+        std::fs::read(path.join("payload.bin")).unwrap(),
+        b"uncertain bytes"
+    );
+}
+
+#[test]
+fn hold_expired_curator_failure_keeps_failed_ttl_through_rescan_and_tick() {
+    let (_tmp, db, root) = fixture();
+    let path = root.join("expired-ttl");
+    db.allocate_for_delivery(909, &root, &path, true, true)
+        .unwrap();
+    std::fs::write(path.join("uncertain.rar"), b"still recoverable").unwrap();
+    let mut source = db.finish(909, &path, &root, "parked_failed").unwrap();
+    let future = now() + 86400;
+    source.deadline = Some(future);
+    source.failure_reason = Some("hold_expired".into());
+    source.failure_assessment = Some(FailureAssessment {
+        disposition: "unknown".into(),
+        reason: "deadline-abandoned assessment".into(),
+        assessed_at: now(),
+    });
+    save_artifact(&db.db.lock().unwrap(), &source).unwrap();
+    let mut terminal = terminals::tests::failed(909, SalvageState::SettledNone);
+    terminal.reason = Some(nzbd_types::FailureReason::HoldExpired);
+    terminal.transfer = Some("curator-admitted".into());
+    terminal.salvage_error =
+        Some("deadline-abandoned assessment; bytes not proven unusable".into());
+    db.record_terminal(&terminal).unwrap();
+    db.mark_terminal_step(909, &TerminalStep::Emitted).unwrap();
+    assert_eq!(db.expire_parked_curator_failures().unwrap(), 0);
+    assert_eq!(db.get(&source.id).unwrap().deadline, Some(future));
+    db.tick().unwrap();
+    assert_eq!(db.get(&source.id).unwrap().deadline, Some(future));
+    assert!(path.join("uncertain.rar").exists());
+    assert!(db
+        .terminal(909)
+        .unwrap()
+        .unwrap()
+        .salvage_error
+        .unwrap()
+        .contains("not proven unusable"));
+}
