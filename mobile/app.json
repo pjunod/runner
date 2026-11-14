@@ -12,7 +12,7 @@
     "scheme": "nzbd",
     "ios": {
       "bundleIdentifier": "com.pjunod.nzbd",
-      "buildNumber": "21",
+      "buildNumber": "22",
       "supportsTablet": true,
       "requireFullScreen": false,
       "config": {
@@ -29,7 +29,7 @@
     },
     "android": {
       "package": "com.pjunod.nzbd",
-      "versionCode": 20,
+      "versionCode": 21,
       "adaptiveIcon": {
         "backgroundColor": "#0a0a0c",
         "foregroundImage": "./assets/android-icon-foreground.png",
