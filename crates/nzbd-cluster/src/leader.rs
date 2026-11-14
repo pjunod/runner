@@ -2805,15 +2805,17 @@ async fn ensure_cluster_delivery(
             }
             if let Some(copy) = copy_manifest.artifact_copy {
                 let raw_files = (!copy.selected).then(|| {
-                    copy_manifest
-                        .files
-                        .iter()
-                        .map(|file| nzbd_state::artifacts::DeliveryFile {
-                            path: file.path.clone(),
-                            size_bytes: file.bytes,
-                            sha256: file.sha256.clone(),
-                        })
-                        .collect::<Vec<_>>()
+                    copy.raw_files.clone().unwrap_or_else(|| {
+                        copy_manifest
+                            .files
+                            .iter()
+                            .map(|file| nzbd_state::artifacts::DeliveryFile {
+                                path: file.path.clone(),
+                                size_bytes: file.bytes,
+                                sha256: file.sha256.clone(),
+                            })
+                            .collect::<Vec<_>>()
+                    })
                 });
                 let copy_key = format!(
                     "artifact:{}:{}:{}",

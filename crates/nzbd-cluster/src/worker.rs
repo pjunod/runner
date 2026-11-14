@@ -2377,13 +2377,25 @@ async fn seal_generation(
                 },
             );
         let selected_copy = matches!(source.as_ref(), Some(SealSource::Selected(_)));
-        let artifact_copy = match exact.filter(|_| lease.kind == LeaseKind::Post) {
+        let mut artifact_copy = match exact.filter(|_| lease.kind == LeaseKind::Post) {
             Some(source) => {
                 inventory.cluster_artifact_copy_for_generation(job.id.0, selected_copy, &source)
             }
             None => inventory.cluster_artifact_copy(job.id.0, selected_copy),
         }
         .map_err(|error| format!("capture cluster copy custody: {error}"))?;
+        // Post output may be empty (junk-only failure) or omit raw inputs.
+        // Its transfer manifest therefore cannot authorize raw-copy retirement.
+        // PP custody has already joined its writers before sealing this result.
+        if lease.kind == LeaseKind::Post {
+            if let Some(copy) = artifact_copy.as_mut().filter(|copy| !copy.selected) {
+                copy.raw_files = Some(
+                    inventory
+                        .cluster_owned_copy_file_seal(copy, &[])
+                        .map_err(|error| format!("capture exact raw copy seal: {error}"))?,
+                );
+            }
+        }
         let file_outcomes = match &artifact_copy {
             Some(copy) if copy.selected => inventory
                 .delivery_file_outcomes(&copy.publication.artifact, &copy.publication.generation)
