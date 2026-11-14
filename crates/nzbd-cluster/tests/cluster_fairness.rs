@@ -547,12 +547,54 @@ async fn mixed_worker_grants_post_while_fast_downloads_keep_slots_and_backlog_av
             >= 3,
         "PP was not repeatedly granted under continuous competing load: {eligible:?}"
     );
-    for window in eligible.windows(2) {
-        assert!(
-            window
-                .iter()
-                .any(|poll| poll.granted_kinds.iter().any(|kind| kind == "post")),
-            "two eligible polls bypassed PP: {window:?}"
-        );
+    assert_bounded_post_progress(observed);
+}
+
+fn assert_bounded_post_progress(observed: &[PollObservation]) {
+    let mut bypasses = 0;
+    for poll in observed {
+        // Every actual Post grant proves progress, including one issued while
+        // the download lane is full. Filtering those grants out first would
+        // incorrectly reject Download, Post, Download as two Post bypasses.
+        if poll.granted_kinds.iter().any(|kind| kind == "post") {
+            bypasses = 0;
+        } else if poll.free_download_slots > 0
+            && poll.free_pp_slots > 0
+            && poll.queued_backlog > 0
+            && poll.eligible_post_jobs > 0
+        {
+            bypasses += 1;
+            assert!(
+                bypasses < 2,
+                "two eligible polls bypassed PP without an intervening Post grant: {observed:?}"
+            );
+        }
     }
+}
+
+#[test]
+fn fairness_window_credits_actual_post_progress_and_refuses_repeated_bypass() {
+    let poll = |free_download_slots, kinds: &[&str]| PollObservation {
+        free_download_slots,
+        free_pp_slots: 1,
+        queued_backlog: 10,
+        eligible_post_jobs: 1,
+        granted_kinds: kinds.iter().map(|kind| (*kind).to_owned()).collect(),
+    };
+    assert_bounded_post_progress(&[
+        poll(1, &["download"]),
+        poll(0, &["post"]),
+        poll(1, &["download"]),
+    ]);
+    assert!(std::panic::catch_unwind(|| assert_bounded_post_progress(&[
+        poll(1, &["download"]),
+        poll(1, &["download"]),
+    ]))
+    .is_err());
+    assert!(std::panic::catch_unwind(|| assert_bounded_post_progress(&[
+        poll(1, &["download"]),
+        poll(0, &[]),
+        poll(1, &["download"]),
+    ]))
+    .is_err());
 }
