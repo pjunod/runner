@@ -33,7 +33,7 @@ UPSTREAM_URL="${RQBIT_UPSTREAM_URL:-https://github.com/${UPSTREAM_REPO}.git}"
 UPSTREAM_BRANCH="${RQBIT_UPSTREAM_BRANCH:-main}"
 WORKDIR="${RQBIT_SUBMIT_WORKDIR:-${XDG_CACHE_HOME:-$HOME/.cache}/rqbit-upstream-submit}"
 CLONE="$WORKDIR/rqbit"
-QUALIFIED_BASE=f4ca7d919638a7b8b031ab062a61861a9eb586e4
+QUALIFIED_BASE=f23bacdddcc5318caa813418b8eb1b1d7307faaa
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Submission order. known-peer-limit depends on session-peer-limit.
@@ -48,6 +48,15 @@ SLUGS=(
   dht-queue-bounds
   metadata-resolver-bounds
 )
+
+# Units whose patch is not qualified on QUALIFIED_BASE. They are never applied,
+# pushed or opened, even under "all"; requalify them and remove the entry first.
+held_reason() {
+  case "$1" in
+    known-peer-limit) echo "not rebased onto ${QUALIFIED_BASE}: the patch still targets f4ca7d91 and conflicts on the new base" ;;
+    *) echo "" ;;
+  esac
+}
 
 prereq_of() {
   case "$1" in
@@ -129,7 +138,7 @@ apply_patch() { # $1 = patch file, $2 = slug (for the message)
   if [ "$DRY_RUN" -eq 0 ]; then am_flags+=(--signoff); fi
   if ! git -C "$CLONE" am "${am_flags[@]}" "$1" >/dev/null 2>&1; then
     git -C "$CLONE" am --abort >/dev/null 2>&1 || true
-    die "$2: the patch no longer applies to upstream ${UPSTREAM_BRANCH} (${BASE_SHA}). Rebase it by hand (it was cut against f4ca7d919638a7b8b031ab062a61861a9eb586e4) and regenerate the .patch before submitting."
+    die "$2: the patch no longer applies to upstream ${UPSTREAM_BRANCH} (${BASE_SHA}). Rebase it by hand onto ${BASE_SHA}, requalify it and regenerate the .patch before submitting."
   fi
 }
 
@@ -182,9 +191,14 @@ push_branch() { # $1 = branch
   die "could not push $1 to ${FORK_OWNER}/${FORK_REPO}"
 }
 
-# Returns 0 = done/skipped, 3 = deferred (prerequisite not merged).
+# Returns 0 = done/skipped, 3 = deferred (prerequisite not merged), 4 = held.
 submit_one() {
-  local slug="$1" branch patch md prereq title
+  local slug="$1" branch patch md prereq title held
+  held="$(held_reason "$slug")"
+  if [ -n "$held" ]; then
+    echo "[$slug] HELD: $held. Nothing applied, pushed or opened." >&2
+    return 4
+  fi
   branch="up/${slug}"
   patch="$(patch_of "$slug")"
   md="$(md_of "$slug")"
@@ -259,6 +273,7 @@ main() {
       case "$status" in
         0) ;;
         3) echo "[$slug] deferred" ;;
+        4) ;;
         *) rc=1 ;;
       esac
     done

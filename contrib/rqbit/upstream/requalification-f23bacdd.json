@@ -1,0 +1,119 @@
+{
+ "checked_at": "2026-11-15",
+ "kind": "rerun-on-new-base",
+ "base": "f23bacdddcc5318caa813418b8eb1b1d7307faaa",
+ "previous_base": "f4ca7d919638a7b8b031ab062a61861a9eb586e4",
+ "environment": {
+  "image": "rust:1.97.1-bookworm (rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97) plus Node 22.23.5 / npm 10.9.9 copied from the official node:22-bookworm image",
+  "platform": "Linux x86_64, IPv6 loopback enabled",
+  "commands": [
+   "cargo fmt --all -- --check",
+   "cargo clippy --all-targets",
+   "cargo test --no-fail-fast"
+  ]
+ },
+ "fmt": "ok on base and all eight branches",
+ "clippy": "no warnings on base and all eight branches",
+ "results": [
+  {
+   "unit": "BASE",
+   "log_sha256": "a7d46efdd2b3250a8265c19d0628ff30f6bd206cd107bb29235b787b8ba9b27c",
+   "bytes": 134536,
+   "total_passed": 171,
+   "total_failed": 0,
+   "total_ignored": 6
+  },
+  {
+   "unit": "metadata-size-limit",
+   "log_sha256": "b3a3f28bb816f50c14abefb7f72dea4b30499867de161fd3c46a5411935e71a1",
+   "bytes": 140591,
+   "total_passed": 172,
+   "total_failed": 0,
+   "total_ignored": 6,
+   "patch_sha256": "843fcd5e3c4a7424544fcc50c8e52e05fc7693640be33a338d6dd42743f5444d"
+  },
+  {
+   "unit": "file-sizing-errors",
+   "log_sha256": "93ed288b0e5074cf5f4f6477e49a9ddb9cb9536144b4431324989a73bd23e62f",
+   "bytes": 140186,
+   "total_passed": 172,
+   "total_failed": 1,
+   "total_ignored": 6,
+   "note": "first run: upstream fake_peer upload-counter race; rerun below",
+   "patch_sha256": "65dbb9cf3c340a2f660cf76ca4397c10d99f88a3c1da6dddb6110ab45d27ac1a"
+  },
+  {
+   "unit": "file-sizing-errors (rerun)",
+   "log_sha256": "c5b8af4ca3fb31cdf83a665bad2d43eff20133e8870e0945850507be5a6f4520",
+   "bytes": 140535,
+   "total_passed": 173,
+   "total_failed": 0,
+   "total_ignored": 6,
+   "patch_sha256": "65dbb9cf3c340a2f660cf76ca4397c10d99f88a3c1da6dddb6110ab45d27ac1a"
+  },
+  {
+   "unit": "tracker-request-bounds",
+   "log_sha256": "54119320e547c88beb6d2b687b8f10cf498a2af9b5d7b33cbc77fcc23c0a9c61",
+   "bytes": 136475,
+   "total_passed": 173,
+   "total_failed": 0,
+   "total_ignored": 6,
+   "patch_sha256": "d6b1451c6a9ce879ac83fc7fce70a3bdae13573b5f371bc5c6a1c861d1a5ead1"
+  },
+  {
+   "unit": "disable-auto-restore",
+   "log_sha256": "822fd097e69f8003250bd7c812c7ceb121b1a4d52a85b2a992197fb2585e5b8e",
+   "bytes": 139222,
+   "total_passed": 172,
+   "total_failed": 0,
+   "total_ignored": 6,
+   "patch_sha256": "5973abe0b331b34b0bb607c25345215d863a89c447c20fb63ce8d67f22b703a8"
+  },
+  {
+   "unit": "session-peer-limit",
+   "log_sha256": "8865dad92ad3451e5eb5d81648ee7caf2eb383e9342ddbdf5945b2cb6f144bb0",
+   "bytes": 139456,
+   "total_passed": 174,
+   "total_failed": 0,
+   "total_ignored": 6,
+   "patch_sha256": "b9b6a3ba99786da157798c74541777985e49f6fe8e625c011a98340ad3eb0776"
+  },
+  {
+   "unit": "peer-response-budget",
+   "log_sha256": "6ac4f0e208f160ba160a0a1b9032e97d512b64e37bd3c11836c39d263ce5a344",
+   "bytes": 133207,
+   "total_passed": 173,
+   "total_failed": 0,
+   "total_ignored": 6,
+   "patch_sha256": "f284d90ba0e4da9cd71720f1475ff324b072acd099c9597ed9b3bb13efd0a177"
+  },
+  {
+   "unit": "dht-queue-bounds",
+   "log_sha256": "3ac53a45780a906105dde5f2cd0155037fb90cc6db42669a0339e4b91482c21d",
+   "bytes": 135830,
+   "total_passed": 172,
+   "total_failed": 0,
+   "total_ignored": 6,
+   "patch_sha256": "78252188462ceef4770ef4d0964bb8fb88ae9e63a8e899526bcda81d5e4d289a"
+  },
+  {
+   "unit": "metadata-resolver-bounds",
+   "log_sha256": "c04f80eab2ea99d07ae503fadb042ba8a63e9d2f437c4520a08fbbccc92b97de",
+   "bytes": 139683,
+   "total_passed": 173,
+   "total_failed": 0,
+   "total_ignored": 6,
+   "patch_sha256": "92089a2926ebaa343c6749fc3107ddb122e205a317f0aef60cec2783b0ffa770"
+  }
+ ],
+ "flake_study": {
+  "test": "tests::fake_peer::test_fake_peer_downloads_a_block_from_a_seeder",
+  "main": "50/50 pass",
+  "file-sizing-errors": "50/50 pass",
+  "cause": "not reproduced; probable cause from code reading: PeerConnection increments uploaded bytes after write_all returns, and the test reads the counter as soon as the block arrives"
+ },
+ "not_requalified": {
+  "known-peer-limit": "does not apply to f23bacdd, even on top of session-peer-limit; held"
+ },
+ "limitations": "Logs are kept in the operator archive, not in the repository. Windows, macOS, desktop and live-network DHT coverage remain unclaimed."
+}

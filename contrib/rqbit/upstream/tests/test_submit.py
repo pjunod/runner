@@ -109,6 +109,15 @@ else: sys.exit(80)
         self.assertNotIn('Signed-off-by:', message)
         self.assertEqual((self.work / 'rqbit/change').read_text(), 'fix\n')
 
+    def test_held_unit_is_refused_without_git_or_gh(self):
+        for args in (('known-peer-limit', '--dry-run'), ('known-peer-limit',)):
+            r = self.invoke(*args)
+            self.assertEqual(r.returncode, 4, r.stderr)
+            self.assertIn('HELD', r.stderr)
+        # Only the read-only login check may run; no git, fork, push or PR.
+        self.assertEqual([a for a in self.actions() if a.get('gh', [])[:2] != ['api', 'user']], [])
+        self.assertFalse((self.work / 'rqbit').exists())
+
     def test_fetch_failure_under_all_stops_before_patch_or_push(self):
         r = self.invoke('all', '--dry-run', FAIL_FETCH='1')
         self.assertNotEqual(r.returncode, 0)
@@ -137,7 +146,7 @@ else: sys.exit(80)
 
     def qualify_fixture(self):
         self.script.write_text(self.script.read_text().replace(
-            'QUALIFIED_BASE=f4ca7d919638a7b8b031ab062a61861a9eb586e4',
+            'QUALIFIED_BASE=f23bacdddcc5318caa813418b8eb1b1d7307faaa',
             'QUALIFIED_BASE=' + self.base))
 
     def test_real_path_uses_explicit_lease_with_mocked_git_and_gh(self):
