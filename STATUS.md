@@ -3,10 +3,11 @@
 ## Download throughput — 2026-11-15 (0.9.6)
 
 **Status:** branch `claude/runner-download-throughput` (from main 51d4980),
-adversarial review addressed, fast lane next. Owner: Claude (Opus 5.5
-session). Not pushed: the session has no GitHub write access. Next: fast
-lane once → push/PR → merge → Paul deploys → untraced sustained measurement
-on the runner node.
+adversarial review addressed, `make fast-check` green on the merge candidate
+(1,091 passed, 0 failed, 0 skipped, `NZBD_REQUIRE_TOOLS=1`). Owner: Claude
+(Opus 5.5 session). Not pushed: the session has no GitHub write access.
+Next: push → PR → merge → Paul deploys → untraced sustained measurement on
+the runner node.
 
 Root causes (benchmarked, [speed plan §15](docs/DOWNLOAD_SPEED_ROOT_CAUSE_PLAN.md)):
 the owner re-parsed and re-serialized each file's whole proof (every range)
