@@ -1,8 +1,8 @@
 diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
-index 75071b9c..fccf2160 100644
+index 7580248d..3b55ba18 100644
 --- a/crates/librqbit/src/session.rs
 +++ b/crates/librqbit/src/session.rs
-@@ -434,6 +434,14 @@ pub struct SessionOptions {
+@@ -441,6 +441,14 @@ pub struct SessionOptions {
      /// all remembered torrents will continue where they left off.
      pub persistence: Option<SessionPersistenceConfig>,
  
@@ -17,7 +17,7 @@ index 75071b9c..fccf2160 100644
      /// The peer ID to use. If not specified, a random one will be generated.
      pub peer_id: Option<Id20>,
  
-@@ -489,6 +497,7 @@ impl Default for SessionOptions {
+@@ -496,6 +504,7 @@ impl Default for SessionOptions {
              disable_trackers: false,
              fastresume: false,
              persistence: None,
@@ -25,7 +25,7 @@ index 75071b9c..fccf2160 100644
              peer_id: None,
              listen: None,
              connect: None,
-@@ -860,7 +869,13 @@ impl Session {
+@@ -867,7 +876,13 @@ impl Session {
  
              if let Some(persistence) = session.persistence.as_ref() {
                  info!("will use {persistence:?} for session persistence");
@@ -40,13 +40,13 @@ index 75071b9c..fccf2160 100644
                  let mut added_all = false;
                  let mut futs = FuturesUnordered::new();
 diff --git a/crates/librqbit/src/tests/mod.rs b/crates/librqbit/src/tests/mod.rs
-index 1454af07..12f733fa 100644
+index 8137831b..1ee53cfb 100644
 --- a/crates/librqbit/src/tests/mod.rs
 +++ b/crates/librqbit/src/tests/mod.rs
-@@ -1,4 +1,5 @@
- mod e2e;
- mod e2e_another_local_client;
+@@ -4,4 +4,5 @@ mod e2e_have;
+ mod e2e_padded_files;
  mod e2e_stream;
+ mod fake_peer;
 +mod persistence;
  pub mod test_util;
 diff --git a/crates/librqbit/src/tests/persistence.rs b/crates/librqbit/src/tests/persistence.rs

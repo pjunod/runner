@@ -33,7 +33,7 @@ UPSTREAM_URL="${RQBIT_UPSTREAM_URL:-https://github.com/${UPSTREAM_REPO}.git}"
 UPSTREAM_BRANCH="${RQBIT_UPSTREAM_BRANCH:-main}"
 WORKDIR="${RQBIT_SUBMIT_WORKDIR:-${XDG_CACHE_HOME:-$HOME/.cache}/rqbit-upstream-submit}"
 CLONE="$WORKDIR/rqbit"
-QUALIFIED_BASE=f4ca7d919638a7b8b031ab062a61861a9eb586e4
+QUALIFIED_BASE=f23bacdddcc5318caa813418b8eb1b1d7307faaa
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Submission order. known-peer-limit depends on session-peer-limit.
@@ -129,7 +129,7 @@ apply_patch() { # $1 = patch file, $2 = slug (for the message)
   if [ "$DRY_RUN" -eq 0 ]; then am_flags+=(--signoff); fi
   if ! git -C "$CLONE" am "${am_flags[@]}" "$1" >/dev/null 2>&1; then
     git -C "$CLONE" am --abort >/dev/null 2>&1 || true
-    die "$2: the patch no longer applies to upstream ${UPSTREAM_BRANCH} (${BASE_SHA}). Rebase it by hand (it was cut against f4ca7d919638a7b8b031ab062a61861a9eb586e4) and regenerate the .patch before submitting."
+    die "$2: the patch no longer applies to upstream ${UPSTREAM_BRANCH} (${BASE_SHA}). Rebase it by hand (it was cut against ${QUALIFIED_BASE}) and regenerate the .patch before submitting."
   fi
 }
 

@@ -1,4 +1,4 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 315b84487acacaf2a662060fff18107bbfa7ed3c Mon Sep 17 00:00:00 2001
 From: Paul Junod <donujp@gmail.com>
 Date: Tue, 27 Oct 2026 13:41:10 -0400
 Subject: [PATCH] fix(init): fail torrent initialization when a file cannot be

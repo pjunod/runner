@@ -137,7 +137,7 @@ else: sys.exit(80)
 
     def qualify_fixture(self):
         self.script.write_text(self.script.read_text().replace(
-            'QUALIFIED_BASE=f4ca7d919638a7b8b031ab062a61861a9eb586e4',
+            'QUALIFIED_BASE=f23bacdddcc5318caa813418b8eb1b1d7307faaa',
             'QUALIFIED_BASE=' + self.base))
 
     def test_real_path_uses_explicit_lease_with_mocked_git_and_gh(self):

@@ -1,7 +1,7 @@
 # Upstream rqbit submissions (ikatson/rqbit)
 
 Prepared 2026-10-27 from the Runner patches in `contrib/rqbit/`. **Nothing here has been pushed, forked, opened or sent.**
-Every branch is one clean commit by Paul Junod on upstream `main` at **f4ca7d919638a7b8b031ab062a61861a9eb586e4** (`f4ca7d91`), conventional subject, no AI trailer
+Every branch is one clean commit by Paul Junod on upstream `main` at **f23bacdddcc5318caa813418b8eb1b1d7307faaa** (`f23bacdd`, requalified 2026-11-15; first prepared on `f4ca7d91`), conventional subject, no AI trailer
 in the commit. Read `AI_POLICY.md` upstream before submitting: it requires disclosure (each description ends with an
 **AI disclosure** section) and a human submitter who can explain every line.
 
@@ -10,15 +10,15 @@ used as the PR body), and `submit.sh` (one command, see below).
 
 | # | slug | upstream base | size (own commit) | tests | status | overlap / notes |
 |---|---|---|---|---|---|---|
-| 01 | `metadata-size-limit` | `f4ca7d91` | 3 files, +39/-6 | 1 new; pass; `librqbit --lib`: 46p/4f (e2e: no IPv6); with #707: librqbit lib 50p/0f | ready / needs Paul's review | Merged #704 is on the serving side (`send_metadata_piece`): no overlap. |
-| 02 | `file-sizing-errors` | `f4ca7d91` | 3 files, +151/-31 | 2 new; pass; `librqbit --lib`: 47p/4f (e2e: no IPv6); with #707: librqbit lib 51p/0f | ready / needs Paul's review | Interacts with merged 5a52e43f (pause during initial check): upstream suppresses *every* init error while a pause is requested, which would hide a sizing failure again. The PR types the pause error so only it is suppressed. No open PR. |
-| 03 | `tracker-request-bounds` | `f4ca7d91` | 1 file, +155/-8 | 2 new; pass; `librqbit-tracker-comms --lib`: 6p/0f; with #707: librqbit lib 49p/0f | ready / needs Paul's review | No open PR. Behaviour change (60 s floor, 1 MiB, 30 s): asks maintainers. |
-| 04 | `disable-auto-restore` | `f4ca7d91` | 4 files, +160/-0 | 1 new; new test needs IPv6: fails here (os error 97), passes with #707; `librqbit --lib`: 45p/5f (e2e: no IPv6); with #707: librqbit lib 50p/0f | ready / needs Paul's review | Trivial textual adjacency with #682 (`rqbit/src/main.rs`) and #708 (`tests/mod.rs`). Test needs IPv6 or #707. |
-| 05 | `session-peer-limit` | `f4ca7d91` | 3 files, +117/-7 | 3 new; pass; `librqbit --lib`: 48p/4f (e2e: no IPv6); with #707: librqbit lib 52p/0f | ready / needs Paul's review | No open PR. Test module moved to end of file (clippy `items_after_test_module`). |
-| 06 | `peer-response-budget` | `f4ca7d91` | 3 files, +213/-31 | 2 new; pass; `librqbit --lib`: 47p/4f (e2e: no IPv6); with #707: librqbit lib 51p/0f | ready / needs Paul's review | Budget derived from `max_request_window` (merged #687) instead of the draft's fixed 128: see semantic note below. |
-| 07 | `known-peer-limit` | `f4ca7d91` | 6 files, +284/-32 | 5 new; pass; `librqbit --lib`: 53p/4f (e2e: no IPv6); with #707: librqbit lib 56p/1f (one flaky run, see below) | ready / needs Paul's review | Stacked on session-peer-limit. Overlaps open **#667** (same maps, different policy); see PR text. |
-| 08 | `dht-queue-bounds` | `f4ca7d91` | 1 file, +279/-104 | 1 new; pass; `librqbit-dht --lib`: 29p/0f; with #707: librqbit lib 49p/0f | ready / needs Paul's review | Overlaps open **#706** (same loop). LSD hunks dropped (e0e9348 merged, #713 open). |
-| 09 | `metadata-resolver-bounds` | `f4ca7d91` | 1 file, +205/-20 | 2 new; pass; `librqbit --lib`: 47p/4f (e2e: no IPv6); with #707: librqbit lib 51p/0f | ready / needs Paul's review | Overlaps open **#708** (same function in `dht_utils.rs`). |
+| 01 | `metadata-size-limit` | `f23bacdd` | 3 files, +39/-6 | f23bacdd: `cargo test` 172p/0f (main 171p/0f), fmt and clippy clean; Oct 27 on f4ca7d91: 1 new; pass; `librqbit --lib`: 46p/4f (e2e: no IPv6); with #707: librqbit lib 50p/0f | ready / needs Paul's review | Merged #704 is on the serving side (`send_metadata_piece`): no overlap. |
+| 02 | `file-sizing-errors` | `f23bacdd` | 3 files, +151/-31 | f23bacdd: `cargo test` 173p/0f (main 171p/0f), fmt and clippy clean; Oct 27 on f4ca7d91: 2 new; pass; `librqbit --lib`: 47p/4f (e2e: no IPv6); with #707: librqbit lib 51p/0f | ready / needs Paul's review | Interacts with merged 5a52e43f (pause during initial check): upstream suppresses *every* init error while a pause is requested, which would hide a sizing failure again. The PR types the pause error so only it is suppressed. No open PR. |
+| 03 | `tracker-request-bounds` | `f23bacdd` | 1 file, +155/-8 | f23bacdd: `cargo test` 173p/0f (main 171p/0f), fmt and clippy clean; Oct 27 on f4ca7d91: 2 new; pass; `librqbit-tracker-comms --lib`: 6p/0f; with #707: librqbit lib 49p/0f | ready / needs Paul's review | No open PR. Behaviour change (60 s floor, 1 MiB, 30 s): asks maintainers. |
+| 04 | `disable-auto-restore` | `f23bacdd` | 4 files, +160/-0 | f23bacdd: `cargo test` 172p/0f (main 171p/0f), fmt and clippy clean; Oct 27 on f4ca7d91: 1 new; new test needs IPv6: fails here (os error 97), passes with #707; `librqbit --lib`: 45p/5f (e2e: no IPv6); with #707: librqbit lib 50p/0f | ready / needs Paul's review | Trivial textual adjacency with #682 (`rqbit/src/main.rs`) and #708 (`tests/mod.rs`). Test needs IPv6 or #707. |
+| 05 | `session-peer-limit` | `f23bacdd` | 3 files, +117/-7 | f23bacdd: `cargo test` 174p/0f (main 171p/0f), fmt and clippy clean; Oct 27 on f4ca7d91: 3 new; pass; `librqbit --lib`: 48p/4f (e2e: no IPv6); with #707: librqbit lib 52p/0f | ready / needs Paul's review | No open PR. Test module moved to end of file (clippy `items_after_test_module`). |
+| 06 | `peer-response-budget` | `f23bacdd` | 3 files, +213/-31 | f23bacdd: `cargo test` 173p/0f (main 171p/0f), fmt and clippy clean; Oct 27 on f4ca7d91: 2 new; pass; `librqbit --lib`: 47p/4f (e2e: no IPv6); with #707: librqbit lib 51p/0f | ready / needs Paul's review | Budget derived from `max_request_window` (merged #687) instead of the draft's fixed 128: see semantic note below. |
+| 07 | `known-peer-limit` | `f4ca7d91` | 6 files, +284/-32 | 5 new; pass; `librqbit --lib`: 53p/4f (e2e: no IPv6); with #707: librqbit lib 56p/1f (one flaky run, see below) | **held**: does not apply to `f23bacdd` (conflicts even on top of 05); rebase and requalify before sending | Stacked on session-peer-limit. Overlaps open **#667** (same maps, different policy); see PR text. |
+| 08 | `dht-queue-bounds` | `f23bacdd` | 1 file, +279/-104 | f23bacdd: `cargo test` 172p/0f (main 171p/0f), fmt and clippy clean; Oct 27 on f4ca7d91: 1 new; pass; `librqbit-dht --lib`: 29p/0f; with #707: librqbit lib 49p/0f | ready / needs Paul's review | Overlaps open **#706** (same loop). LSD hunks dropped (e0e9348 merged, #713 open). |
+| 09 | `metadata-resolver-bounds` | `f23bacdd` | 1 file, +205/-20 | f23bacdd: `cargo test` 173p/0f (main 171p/0f), fmt and clippy clean; Oct 27 on f4ca7d91: 2 new; pass; `librqbit --lib`: 47p/4f (e2e: no IPv6); with #707: librqbit lib 51p/0f | ready / needs Paul's review | Overlaps open **#708** (same function in `dht_utils.rs`). |
 
 Sizes are the PR's own commit (`+added/-deleted`). Tests: "pass" means the focused tests ran and passed on the committed tree;
 `p`/`f` are passed/failed counts of the whole `--lib` suite of the crate. The numbers come from the run on 2026-10-27 in the
@@ -128,6 +128,41 @@ tests are `#[ignore]`d) — it is the PR to read hardest.
   issue first is the polite route.
 - Read every line of the PRs you send; the descriptions state facts from the runs above in the passive/neutral voice but are not a substitute for that.
 - Open PRs #667, #706, #708 overlap three of these: look at them before sending `known-peer-limit`, `dht-queue-bounds`, `metadata-resolver-bounds`.
+
+## Requalification on `f23bacdd` (2026-11-15)
+
+Upstream `main` moved six commits (to 9.1.0, with a dependency update and a new
+wire-level fake-peer test harness). The kit was requalified on the new head with
+upstream's Ubuntu CI command, `cargo test` (default workspace, web UI built),
+plus `cargo fmt --all -- --check` and `cargo clippy --all-targets`, in
+`rust:1.97.1-bookworm` with Node 22 and IPv6 loopback enabled.
+
+| branch | `cargo test` | fmt | clippy |
+|---|---|---|---|
+| upstream main `f23bacdd` | 171 / 0 | ok | no warnings |
+| metadata-size-limit | 172 / 0 | ok | no warnings |
+| file-sizing-errors | 173 / 0 (first run 172 / 1, see below) | ok | no warnings |
+| tracker-request-bounds | 173 / 0 | ok | no warnings |
+| disable-auto-restore | 172 / 0 | ok | no warnings |
+| session-peer-limit | 174 / 0 | ok | no warnings |
+| peer-response-budget | 173 / 0 | ok | no warnings |
+| dht-queue-bounds | 172 / 0 | ok | no warnings |
+| metadata-resolver-bounds | 173 / 0 | ok | no warnings |
+| known-peer-limit | not run: does not apply; **held** | | |
+
+Each branch adds exactly the tests it added on `f4ca7d91`. Seven patches
+applied cleanly. `disable-auto-restore` needed one hand resolution in
+`crates/librqbit/src/tests/mod.rs`: keep both upstream's new `mod fake_peer;`
+and this patch's `mod persistence;`. The other refreshed patch bytes differ
+only in hunk offsets and index lines.
+
+`file-sizing-errors` first failed upstream's new
+`fake_peer::test_fake_peer_downloads_a_block_from_a_seeder` once (upload counter
+read as 0). The counter is incremented after `write_all` returns, so the test
+can read it before the seeder task updates it. That is a race in the upstream
+test, not in this patch, which does not touch that path. Alone, the test passed
+50/50 on the patch and 50/50 on main, and the full suite then passed. Log hashes
+and totals: [`requalification-f23bacdd.json`](requalification-f23bacdd.json).
 
 ## Preparation review (2026-10-28)
 

@@ -1,4 +1,4 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 62a1f060e919ab1a203d39f1db51a3d198132bb5 Mon Sep 17 00:00:00 2001
 From: Paul Junod <donujp@gmail.com>
 Date: Tue, 27 Oct 2026 13:43:54 -0400
 Subject: [PATCH] feat(session): add SessionOptions::disable_auto_restore
@@ -33,7 +33,7 @@ default (both torrents come back).
  create mode 100644 crates/librqbit/src/tests/persistence.rs
 
 diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
-index 5e024154..418d1352 100644
+index 7580248d..3b55ba18 100644
 --- a/crates/librqbit/src/session.rs
 +++ b/crates/librqbit/src/session.rs
 @@ -441,6 +441,14 @@ pub struct SessionOptions {
@@ -74,13 +74,13 @@ index 5e024154..418d1352 100644
                  let mut added_all = false;
                  let mut futs = FuturesUnordered::new();
 diff --git a/crates/librqbit/src/tests/mod.rs b/crates/librqbit/src/tests/mod.rs
-index 9f6dbd16..924534a9 100644
+index 8137831b..1ee53cfb 100644
 --- a/crates/librqbit/src/tests/mod.rs
 +++ b/crates/librqbit/src/tests/mod.rs
-@@ -2,4 +2,5 @@ mod e2e;
- mod e2e_another_local_client;
+@@ -4,4 +4,5 @@ mod e2e_have;
  mod e2e_padded_files;
  mod e2e_stream;
+ mod fake_peer;
 +mod persistence;
  pub mod test_util;
 diff --git a/crates/librqbit/src/tests/persistence.rs b/crates/librqbit/src/tests/persistence.rs
