@@ -5,6 +5,7 @@ use crate::recovery::{self, ProvenRange, ValidationOutcome};
 use nzbd_state::artifacts::Identity;
 use nzbd_types::{FileId, JobId, ServerId};
 use std::{
+    collections::{BTreeMap, HashMap},
     io::SeekFrom,
     path::{Path, PathBuf},
 };
@@ -63,13 +64,12 @@ pub(crate) struct WriterScope {
 
 #[derive(Debug)]
 pub(crate) enum WriterFact {
+    /// One durability checkpoint: every segment here was written before the
+    /// shared `fdatasync` that preceded this fact, and all of them name the
+    /// same post-sync identity. The owner records the batch as one proof
+    /// update (one parse, one serialization, one totals pass).
     Written {
-        seg_number: u32,
-        offset: u64,
-        len: u32,
-        crc: u32,
-        file_size: u64,
-        server: ServerId,
+        segments: Vec<WrittenSegment>,
         identity: Identity,
     },
     Finalized {
@@ -97,7 +97,20 @@ pub(crate) enum WriterFact {
     },
 }
 
-const WRITER_QUEUE: usize = 8;
+/// Decoded segments buffered ahead of the writer. Sized so connections keep
+/// reading while a checkpoint sync is in progress instead of stalling their
+/// sockets behind one file's `fdatasync`.
+const WRITER_QUEUE: usize = 32;
+
+/// Durability checkpoint cadence (ARCHITECTURE.md §8.4). A checkpoint is one
+/// `fdatasync` plus one acknowledgement of every segment written since the
+/// last one. It is taken when this many bytes are pending, when the file is
+/// fully covered (so the owner can finalize at once), when the oldest pending
+/// write is [`CHECKPOINT_AGE`] old, or before any control command. A crash
+/// loses at most one checkpoint of unacknowledged writes per file; those
+/// ranges are still Pending in the owner and are simply downloaded again.
+const CHECKPOINT_BYTES: u64 = 32 * 1024 * 1024;
+const CHECKPOINT_AGE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Test support: an unscoped writer that reports plain `EngineMsg` facts.
 /// Every production writer is scoped ([`spawn_writer_scoped`]).
@@ -192,24 +205,25 @@ impl Reporter {
             }
         } else {
             match fact {
-                WriterFact::Written {
-                    seg_number,
-                    offset,
-                    len,
-                    crc,
-                    file_size,
-                    server,
-                    ..
-                } => EngineMsg::SegmentWritten {
-                    job: self.job,
-                    file: self.file,
-                    seg_number,
-                    offset,
-                    len,
-                    crc,
-                    file_size,
-                    server,
-                },
+                WriterFact::Written { segments, .. } => {
+                    // Test-only unscoped path: one plain message per segment.
+                    for segment in segments {
+                        let message = EngineMsg::SegmentWritten {
+                            job: self.job,
+                            file: self.file,
+                            seg_number: segment.seg_number,
+                            offset: segment.offset,
+                            len: segment.len,
+                            crc: segment.crc,
+                            file_size: segment.file_size,
+                            server: segment.server,
+                        };
+                        if self.tx.send(message).await.is_err() {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
                 WriterFact::Finalized {
                     ok,
                     final_path,
@@ -352,26 +366,124 @@ async fn ensure_open(
     Ok(())
 }
 
-// Pending facts carry no payload buffers. The existing eight-command input
-// queue bounds batching; no timer or additional payload queue is introduced.
-struct PendingWrite {
-    seg_number: u32,
-    offset: u64,
-    len: u32,
-    crc: u32,
-    file_size: u64,
-    server: ServerId,
+/// The writer's reserved ranges, indexed so each segment's duplicate and
+/// conflict checks are a lookup rather than a scan over every prior range
+/// (a large file holds tens of thousands). Reserved ranges never overlap, so
+/// only the last range starting before a candidate's end can overlap it. If
+/// the seed ever breaks that invariant the index falls back to the scan, so
+/// classification is identical either way.
+#[derive(Default)]
+struct RangeIndex {
+    ranges: Vec<ProvenRange>,
+    by_segment: HashMap<u32, usize>,
+    by_offset: BTreeMap<u64, usize>,
+    bytes: u64,
+    scan: bool,
+}
+
+impl RangeIndex {
+    fn new(seed: Vec<ProvenRange>) -> Self {
+        let mut index = Self::default();
+        for range in seed {
+            index.insert(range);
+        }
+        index
+    }
+
+    fn as_slice(&self) -> &[ProvenRange] {
+        &self.ranges
+    }
+
+    /// Distinct reserved bytes.
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn insert(&mut self, range: ProvenRange) {
+        if !self.scan && self.classify(&range).1 {
+            self.scan = true;
+        }
+        let slot = self.ranges.len();
+        self.bytes = self.bytes.saturating_add(u64::from(range.len));
+        if self.by_segment.insert(range.seg_number, slot).is_some()
+            || self.by_offset.insert(range.offset, slot).is_some()
+            || range.end().is_none()
+        {
+            self.scan = true;
+        }
+        self.ranges.push(range);
+    }
+
+    /// `(duplicate, conflict)` exactly as the scan defines them: a duplicate is
+    /// an identical reserved range; a conflict is a different range with the
+    /// same segment number or an overlapping extent.
+    fn classify(&self, range: &ProvenRange) -> (bool, bool) {
+        if self.scan {
+            let duplicate = self.ranges.contains(range);
+            let conflict = self.ranges.iter().any(|prior| {
+                (prior.seg_number == range.seg_number || prior.overlaps(range)) && prior != range
+            });
+            return (duplicate, conflict);
+        }
+        if let Some(&slot) = self.by_segment.get(&range.seg_number) {
+            let duplicate = self.ranges[slot] == *range;
+            // Non-overlapping, unique segment numbers: an identical prior is
+            // the only range this one can touch.
+            return (duplicate, !duplicate);
+        }
+        let Some(end) = range.end() else {
+            return (false, !self.ranges.is_empty());
+        };
+        let conflict = self
+            .by_offset
+            .range(..end)
+            .next_back()
+            .is_some_and(|(_, &slot)| self.ranges[slot].overlaps(range));
+        (false, conflict)
+    }
+}
+
+/// One segment acknowledged by a checkpoint. Pending facts carry no payload
+/// buffers: the bytes are already written, only the acknowledgement waits.
+#[derive(Debug, Clone)]
+pub(crate) struct WrittenSegment {
+    pub seg_number: u32,
+    pub offset: u64,
+    pub len: u32,
+    pub crc: u32,
+    pub file_size: u64,
+    pub server: ServerId,
 }
 
 #[derive(Default)]
 struct PendingWrites {
-    facts: Vec<PendingWrite>,
+    facts: Vec<WrittenSegment>,
+    /// Bytes written since the last checkpoint.
+    bytes: u64,
+    /// When the oldest pending write was accepted; bounds acknowledgement
+    /// latency while a file trickles in.
+    since: Option<tokio::time::Instant>,
     dirty: bool,
     #[cfg(test)]
     sync_fault: Option<i32>,
 }
 
 impl PendingWrites {
+    fn push(&mut self, fact: WrittenSegment) {
+        self.bytes = self.bytes.saturating_add(u64::from(fact.len));
+        self.since.get_or_insert_with(tokio::time::Instant::now);
+        self.facts.push(fact);
+    }
+
+    /// The checkpoint is due without waiting for more segments.
+    fn due(&self, covered: &RangeIndex, file_size: u64) -> bool {
+        self.bytes >= CHECKPOINT_BYTES || (file_size > 0 && covered.bytes() >= file_size)
+    }
+
+    fn deadline(&self) -> tokio::time::Instant {
+        self.since.unwrap_or_else(tokio::time::Instant::now) + CHECKPOINT_AGE
+    }
+
     async fn flush(
         &mut self,
         out: &Option<File>,
@@ -421,26 +533,15 @@ impl PendingWrites {
             return false;
         }
         *expected = Some(identity.clone());
-        // Every fact names the same post-sync identity. No member of a new
-        // batch is acknowledged before the shared durability boundary succeeds.
-        for fact in self.facts.drain(..) {
-            if !report
-                .send(WriterFact::Written {
-                    seg_number: fact.seg_number,
-                    offset: fact.offset,
-                    len: fact.len,
-                    crc: fact.crc,
-                    file_size: fact.file_size,
-                    server: fact.server,
-                    identity: identity.clone(),
-                })
-                .await
-            {
-                return false;
-            }
-        }
+        // The batch names one post-sync identity. No member of a new batch is
+        // acknowledged before the shared durability boundary succeeds.
+        let segments = std::mem::take(&mut self.facts);
+        self.bytes = 0;
+        self.since = None;
         self.dirty = false;
-        true
+        report
+            .send(WriterFact::Written { segments, identity })
+            .await
     }
 }
 
@@ -569,22 +670,38 @@ async fn writer_task(
         }
     }
     let published_only = resolved.as_ref().is_some_and(|payload| payload.published);
-    let mut ranges = scope.proven;
+    let mut ranges = RangeIndex::new(scope.proven);
     let mut out = None;
     let mut reservation = None;
     #[cfg(test)]
     let mut fault = None;
     let mut pending = PendingWrites::default();
+    // The file's size as the latest segment states it (0 = unknown), for the
+    // full-coverage checkpoint.
+    let mut file_size_hint = 0u64;
     let mut deferred = None;
     loop {
-        // Drain only an already-queued contiguous segment prefix. A control
-        // command, an empty queue, the batch bound, or cancellation flushes the
-        // accepted prefix before another command can run.
+        // Accumulate a contiguous run of segments into one checkpoint. A
+        // control command, a due checkpoint (bytes, full coverage or age),
+        // a closed queue or cancellation flushes the accepted run before
+        // another command can run.
         let cmd = if !pending.facts.is_empty() {
-            let next = if !stop.is_cancelled() && pending.facts.len() < WRITER_QUEUE {
-                rx.try_recv().ok()
-            } else {
+            let next = if stop.is_cancelled() || pending.due(&ranges, file_size_hint) {
                 None
+            } else {
+                match rx.try_recv() {
+                    Ok(command) => Some(command),
+                    Err(mpsc::error::TryRecvError::Disconnected) => None,
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        // Never cancel an in-flight seek/write/sync: only this
+                        // receive waits, bounded by the checkpoint age.
+                        tokio::select! { biased;
+                            _ = stop.cancelled() => None,
+                            command = rx.recv() => command,
+                            _ = tokio::time::sleep_until(pending.deadline()) => None,
+                        }
+                    }
+                }
             };
             match next {
                 Some(command @ WriteCmd::Segment { .. }) => command,
@@ -640,6 +757,9 @@ async fn writer_task(
                 file_size,
                 server,
             } => {
+                if file_size > 0 {
+                    file_size_hint = file_size;
+                }
                 let range = ProvenRange {
                     seg_number,
                     offset,
@@ -650,10 +770,7 @@ async fn writer_task(
                     || range.len == 0
                     || range.end().is_none()
                     || (file_size > 0 && range.end().is_some_and(|end| end > file_size));
-                let duplicate = ranges.contains(&range);
-                let conflict = ranges.iter().any(|prior| {
-                    (prior.seg_number == seg_number || prior.overlaps(&range)) && *prior != range
-                });
+                let (duplicate, conflict) = ranges.classify(&range);
                 if invalid || conflict {
                     if !pending
                         .flush(
@@ -688,12 +805,9 @@ async fn writer_task(
                 }
                 if !duplicate {
                     if reservation.is_none() && file_size > 0 {
-                        let done = ranges
-                            .iter()
-                            .map(|range| u64::from(range.len))
-                            .fold(0u64, u64::saturating_add)
-                            .min(file_size);
+                        let done = ranges.bytes().min(file_size);
                         let end = ranges
+                            .as_slice()
                             .iter()
                             .filter_map(ProvenRange::end)
                             .max()
@@ -713,7 +827,7 @@ async fn writer_task(
                     }
                     // Reserve before any mutation, including preallocation. A failed
                     // or uncertain write terminates this generation rather than releasing it.
-                    ranges.push(range.clone());
+                    ranges.insert(range.clone());
                     #[cfg(test)]
                     let injected = fault.take();
                     #[cfg(test)]
@@ -725,14 +839,19 @@ async fn writer_task(
                     }
                     let f = out.as_mut().unwrap();
                     let result = async {
-                        if file_size > 0 || device.is_none() {
-                            let metadata = f.metadata().await?;
-                            if device.is_none() {
+                        // The length comes from the identity taken after the
+                        // previous write; only the first write of this open
+                        // file needs its own stat.
+                        let length = match (&expected, device) {
+                            (Some(identity), Some(_)) => identity.bytes,
+                            _ => {
+                                let metadata = f.metadata().await?;
                                 device = nzbd_state::io_meter::device_of_metadata(&metadata);
+                                metadata.len()
                             }
-                            if file_size > 0 && metadata.len() < file_size {
-                                f.set_len(file_size).await?;
-                            }
+                        };
+                        if file_size > 0 && length < file_size {
+                            f.set_len(file_size).await?;
                         }
                         f.seek(SeekFrom::Start(offset)).await?;
                         f.write_all(&data).await?;
@@ -763,7 +882,7 @@ async fn writer_task(
                     }
                 };
                 expected = Some(identity);
-                pending.facts.push(PendingWrite {
+                pending.push(WrittenSegment {
                     seg_number,
                     offset,
                     len: range.len,
@@ -779,6 +898,7 @@ async fn writer_task(
                 let result = async {
                     if file_size == 0
                         || ranges
+                            .as_slice()
                             .iter()
                             .any(|range| range.end().is_none_or(|end| end > file_size))
                     {
@@ -824,7 +944,7 @@ async fn writer_task(
                         .await;
                     return;
                 }
-                if ranges.iter().any(|range| {
+                if ranges.as_slice().iter().any(|range| {
                     range
                         .end()
                         .is_none_or(|end| file_size > 0 && end > file_size)
@@ -1151,6 +1271,53 @@ pub(crate) fn validate_range_checked(
 
 #[cfg(test)]
 mod tests {
+
+    /// Deterministic xorshift for the range-index property checks.
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn range_index_classifies_exactly_like_the_scan() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..300 {
+            let mut index = RangeIndex::default();
+            let mut scan: Vec<ProvenRange> = Vec::new();
+            for _ in 0..40 {
+                let candidate = ProvenRange {
+                    seg_number: (xorshift(&mut state) % 24) as u32,
+                    offset: xorshift(&mut state) % 200,
+                    len: (xorshift(&mut state) % 30) as u32,
+                    crc: (xorshift(&mut state) % 2) as u32,
+                };
+                let expected = (
+                    scan.contains(&candidate),
+                    scan.iter().any(|prior| {
+                        (prior.seg_number == candidate.seg_number || prior.overlaps(&candidate))
+                            && *prior != candidate
+                    }),
+                );
+                assert_eq!(
+                    index.classify(&candidate),
+                    expected,
+                    "{candidate:?} vs {scan:?}"
+                );
+                // The writer inserts only accepted, non-duplicate, non-empty
+                // ranges; seed arbitrary ones too so the scan fallback is hit.
+                if !expected.0 && (!expected.1 || xorshift(&mut state).is_multiple_of(8)) {
+                    index.insert(candidate.clone());
+                    scan.push(candidate);
+                }
+                assert_eq!(
+                    index.bytes(),
+                    scan.iter().map(|r| u64::from(r.len)).sum::<u64>()
+                );
+            }
+        }
+    }
     use super::*;
     use tokio::sync::mpsc::channel;
 
@@ -1812,9 +1979,9 @@ mod tests {
             rx.recv().await,
             Some(EngineMsg::ScopedWriter {
                 generation: 9,
-                fact: WriterFact::Written { seg_number: 1, .. },
+                fact: WriterFact::Written { ref segments, .. },
                 ..
-            })
+            }) if segments.len() == 1 && segments[0].seg_number == 1
         ));
         assert!(matches!(
             rx.recv().await,
@@ -1826,9 +1993,9 @@ mod tests {
         assert!(matches!(
             rx.recv().await,
             Some(EngineMsg::ScopedWriter {
-                fact: WriterFact::Written { seg_number: 1, .. },
+                fact: WriterFact::Written { ref segments, .. },
                 ..
-            })
+            }) if segments.len() == 1 && segments[0].seg_number == 1
         ));
         assert_eq!(
             std::fs::read(dir.path().join(".runner-file-2.part")).unwrap(),
@@ -2003,7 +2170,33 @@ mod tests {
         (received, stop, task)
     }
 
-    async fn batch_facts(events: &mut mpsc::Receiver<EngineMsg>) -> Vec<WriterFact> {
+    /// Writer facts as the tests read them: a checkpoint is one entry per
+    /// segment it acknowledged, each carrying the checkpoint's shared
+    /// identity; every other fact is passed through.
+    #[derive(Debug)]
+    enum Seen {
+        Written { seg_number: u32, identity: Identity },
+        Other(WriterFact),
+    }
+
+    async fn batch_facts(events: &mut mpsc::Receiver<EngineMsg>) -> Vec<Seen> {
+        checkpoints(events)
+            .await
+            .into_iter()
+            .flat_map(|fact| match fact {
+                WriterFact::Written { segments, identity } => segments
+                    .into_iter()
+                    .map(|segment| Seen::Written {
+                        seg_number: segment.seg_number,
+                        identity: identity.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+                other => vec![Seen::Other(other)],
+            })
+            .collect()
+    }
+
+    async fn checkpoints(events: &mut mpsc::Receiver<EngineMsg>) -> Vec<WriterFact> {
         let mut facts = Vec::new();
         while let Some(message) = naming_writer_event(events).await {
             match message {
@@ -2012,6 +2205,106 @@ mod tests {
             }
         }
         facts
+    }
+
+    /// A writer whose input queue stays open, so only the checkpoint's own
+    /// triggers (bytes, coverage, age) can flush it.
+    fn open_writer(
+        dir: &Path,
+    ) -> (
+        mpsc::Sender<WriteCmd>,
+        mpsc::Receiver<EngineMsg>,
+        tokio_util::sync::CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = channel(WRITER_QUEUE);
+        let (events, received) = channel(32);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(writer_task(
+            JobId(1),
+            FileId(2),
+            dir.into(),
+            "out".into(),
+            rx,
+            events,
+            stop.clone(),
+            WriterScope::default(),
+            true,
+        ));
+        (tx, received, stop, task)
+    }
+
+    async fn next_checkpoint(events: &mut mpsc::Receiver<EngineMsg>) -> Vec<WrittenSegment> {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), events.recv()).await {
+            Ok(Some(EngineMsg::ScopedWriter {
+                fact: WriterFact::Written { segments, .. },
+                ..
+            })) => segments,
+            other => panic!("expected a checkpoint, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_uncovered_file_is_acknowledged_by_the_checkpoint_age() {
+        // Unknown size (0) and a known size the segments do not cover: only
+        // the age deadline can acknowledge these, and it must.
+        for file_size in [0, 64] {
+            let temp = tempfile::tempdir().unwrap();
+            let (tx, mut events, stop, task) = open_writer(temp.path());
+            let started = tokio::time::Instant::now();
+            tx.send(batch_segment(1, 0, b"ab", file_size))
+                .await
+                .unwrap();
+            tx.send(batch_segment(2, 2, b"cd", file_size))
+                .await
+                .unwrap();
+            let segments = next_checkpoint(&mut events).await;
+            assert!(
+                started.elapsed() >= CHECKPOINT_AGE - std::time::Duration::from_millis(50),
+                "acknowledged only once the checkpoint aged (file_size {file_size})"
+            );
+            assert_eq!(
+                segments.iter().map(|s| s.seg_number).collect::<Vec<_>>(),
+                [1, 2],
+                "both writes share the aged checkpoint (file_size {file_size})"
+            );
+            stop.cancel();
+            drop(tx);
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_bytes_bound_the_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let (tx, mut events, stop, task) = open_writer(temp.path());
+        let mib = vec![7u8; 1024 * 1024];
+        let count = (CHECKPOINT_BYTES / mib.len() as u64) as u32 + 1;
+        let file_size = 2 * CHECKPOINT_BYTES;
+        let sender = tokio::spawn(async move {
+            for n in 0..count {
+                tx.send(batch_segment(
+                    n + 1,
+                    u64::from(n) * mib.len() as u64,
+                    &mib,
+                    file_size,
+                ))
+                .await
+                .unwrap();
+            }
+            tx
+        });
+        let first = next_checkpoint(&mut events).await;
+        assert_eq!(
+            first.len() as u64,
+            CHECKPOINT_BYTES / (1024 * 1024),
+            "the checkpoint is due once its pending bytes reach the bound"
+        );
+        assert_eq!(next_checkpoint(&mut events).await.len(), 1);
+        let tx = sender.await.unwrap();
+        stop.cancel();
+        drop(tx);
+        task.await.unwrap();
     }
 
     #[tokio::test]
@@ -2045,10 +2338,9 @@ mod tests {
         );
         let mut first = None;
         for (index, fact) in facts.iter().enumerate() {
-            let WriterFact::Written {
+            let Seen::Written {
                 seg_number,
                 identity,
-                ..
             } = fact
             else {
                 panic!("every valid segment is acknowledged");
@@ -2109,7 +2401,7 @@ mod tests {
         assert_eq!(facts.len(), 4);
         assert!(facts
             .iter()
-            .all(|fact| matches!(fact, WriterFact::Written { .. })));
+            .all(|fact| matches!(fact, Seen::Written { .. })));
         assert!(
             !temp.path().join("out").exists(),
             "cancelled queued Finalize must not publish"
@@ -2130,7 +2422,7 @@ mod tests {
         task.await.unwrap();
         assert_eq!(facts.len(), 1);
         assert!(
-            matches!(&facts[0], WriterFact::Error { error, cause: Some(nzbd_types::HoldCause::Capacity) } if error.contains("os error 28")),
+            matches!(&facts[0], Seen::Other(WriterFact::Error { error, cause: Some(nzbd_types::HoldCause::Capacity) }) if error.contains("os error 28")),
             "a failed shared sync on a full volume holds for capacity, not failed/io: {facts:?}"
         );
         assert_eq!(
@@ -2177,9 +2469,9 @@ mod tests {
         assert!(matches!(
             &facts[..],
             [
-                WriterFact::Written { seg_number: 1, .. },
-                WriterFact::Written { seg_number: 2, .. },
-                WriterFact::Finalized { ok: true, .. }
+                Seen::Written { seg_number: 1, .. },
+                Seen::Written { seg_number: 2, .. },
+                Seen::Other(WriterFact::Finalized { ok: true, .. })
             ]
         ));
         assert_eq!(
@@ -2218,10 +2510,10 @@ mod tests {
         assert!(matches!(
             &facts[..],
             [
-                WriterFact::Written { seg_number: 1, .. },
-                WriterFact::Written { seg_number: 1, .. },
-                WriterFact::Rejected { seg_number: 9, .. },
-                WriterFact::Written { seg_number: 2, .. }
+                Seen::Written { seg_number: 1, .. },
+                Seen::Written { seg_number: 1, .. },
+                Seen::Other(WriterFact::Rejected { seg_number: 9, .. }),
+                Seen::Written { seg_number: 2, .. }
             ]
         ));
         assert_eq!(
@@ -2249,7 +2541,7 @@ mod tests {
         let facts = batch_facts(&mut events).await;
         task.await.unwrap();
         assert!(
-            matches!(&facts[..], [WriterFact::Error { error, cause: None }] if error.contains("identity"))
+            matches!(&facts[..], [Seen::Other(WriterFact::Error { error, cause: None })] if error.contains("identity"))
         );
         assert_eq!(std::fs::read(part).unwrap(), b"foreign mutation");
         assert!(!temp.path().join("out").exists());
@@ -2266,7 +2558,7 @@ mod tests {
         let facts = batch_facts(&mut events).await;
         task.await.unwrap();
         assert!(
-            matches!(&facts[..], [WriterFact::IdentityMismatch { error }] if error.contains("aliases")),
+            matches!(&facts[..], [Seen::Other(WriterFact::IdentityMismatch { error })] if error.contains("aliases")),
             "{facts:?}"
         );
         assert_eq!(std::fs::read(&part).unwrap(), b"old partial");
@@ -2279,7 +2571,7 @@ mod tests {
         let facts = batch_facts(&mut events).await;
         task.await.unwrap();
         assert!(
-            matches!(&facts[0], WriterFact::Written { seg_number: 1, .. }),
+            matches!(&facts[0], Seen::Written { seg_number: 1, .. }),
             "{facts:?}"
         );
         assert!(

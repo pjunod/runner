@@ -748,3 +748,84 @@ job changed. All reconstructed bytes matched ordinary serialization. See
 [Queue snapshot encoding](QUEUE_SNAPSHOT_ENCODING.md) for memory accounting,
 version-2 compatibility and mandatory offline conversion before downgrade.
 This establishes encoder benefit, not restored download throughput.
+
+## 15. Per-article cost that grows with the file — 2026-11-15 (0.9.7)
+
+Runner still rarely reached the link's peak after §10–§14. A release-mode
+benchmark against the in-tree mock server
+([throughput.rs](../crates/nzbd-engine/tests/throughput.rs), one large file,
+20 connections) showed the article rate falling as the file grew: 994 → 845 →
+610 articles/s at 1.5 k, 6 k and 12 k articles. Production files are larger
+still (a 40–60 GB remux is 60–85 k articles at ~716 KiB).
+
+**Cause 1 — the owner re-encoded the file's whole proof per article.** Every
+acknowledged segment parsed the `*File:proof:<file>` parameter (which holds
+every proven range of the file), scanned all of them for overlap, appended
+one, and serialized the whole document back, on the owner's single thread.
+That is O(n) per article and O(n²) per file; mid-file on a large download it
+dominates the owner, delaying `WorkRequest` replies, which is exactly when
+connections sit idle. With only that round trip skipped (an experiment, not a
+change), the same 12 k-article file ran at 1,061 articles/s — flat.
+
+**Cause 2 — one payload sync per article, still.** §10's shared sync covers
+only segments already queued when the writer looks, which in steady state is
+one or two; it batches only once the queue backs up, and a backed-up queue
+blocks the connections feeding it. §10 measured 16 ms per GlusterFS
+`fdatasync`, one per article.
+
+**Correction.** The writer's durability checkpoint is now the unit of
+acknowledgement (ARCHITECTURE.md §8.4). It syncs when 32 MiB are pending,
+when the file is fully covered, when the oldest pending write is one second
+old, or before any control command, and reports one `Written` fact for the
+whole checkpoint. The owner updates the proof, journal records and totals once
+per checkpoint; the overlap check sorts the batch and makes one pass over the
+proof. The writer's own per-segment range check is indexed instead of a scan,
+and the per-segment `metadata()` call is gone (the post-write identity already
+carries the length). Everything §5 guards is unchanged: no segment is
+acknowledged before the sync that covers it succeeds, a failed sync or a
+mutation during it acknowledges nothing, and control commands cannot overtake
+pending writes. This deliberately revisits two properties §10 recorded: the
+checkpoint age is a timer (it only delays acknowledgement, never advances it),
+and the writer input queue is 32 segments instead of 8 so connections keep
+reading while a checkpoint syncs.
+
+**Measured (release, 2 vCPU sandbox, loopback, local ext4 — not nuc hardware; 100 KiB articles, 20 connections, `NZBD_BENCH_DEPTH=8`):**
+
+| Case | Before | After |
+|---|---|---|
+| 600 MiB, 6,144 articles | 82.5 MiB/s | 125.2 MiB/s |
+| 1,200 MiB, 12,288 articles | 59.5 MiB/s | 125.2 MiB/s (flat with size) |
+
+**Adversarial review — dispositions.** A segment repeated inside one
+checkpoint (the writer re-acknowledges a duplicate delivery) was briefly an
+identity failure; the owner now treats an identical repeat as idempotent and
+only a contradicting one as a failure, as for a repeat of a Done segment.
+Tests now cover the age deadline (unknown and uncovered file size) and the
+byte bound. Accepted as-is, with reasons:
+
+- *Memory.* The writer queue holds up to 32 decoded segments (~23 MiB at
+  ~716 KiB) per file being written, up from 8; total is that times the
+  files written concurrently, which the scheduler keeps small (one active
+  job takes its files in order). A byte budget across writers is the next
+  step if a node ever shows pressure.
+- *Residual proof cost.* The proof is still parsed and serialized whole,
+  now once per checkpoint (~46 articles at 32 MiB) instead of per article:
+  a large constant factor, still O(n) per checkpoint. Caching the typed
+  proof in the owner and serializing only at persistence would remove it,
+  but touches every reader of `*File:proof:`; measure on the node first.
+- *Lag.* Progress, quota volume and the space-op success signal move at
+  acknowledgement, so they trail the disk by at most one checkpoint per file
+  (1 s or 32 MiB). Quota can overshoot by about that much per active file.
+
+**Sliding pipeline window — measured, not shipped.** Topping a connection's
+BODY commands up before each read (instead of draining each batch) gained
+~10% with 4 connections, depth 2 and a 30–60 ms RTT, was neutral at 20
+connections, and cost ~20% at ~1,000 articles/s on 2 vCPU (one owner
+`WorkRequest` per article at depth 2). At the deployed 30 connections it buys
+nothing measurable and adds lease-accounting risk, so it is left out.
+Throughput per connection is outstanding requests ÷ RTT either way; a
+high-latency provider gains more from a higher `pipeline_depth`.
+
+Local syncs are cheap, so the GlusterFS gain from far fewer syncs is not in
+these numbers. As with §10–§14, restoration to 109 MiB/s is established only
+by an untraced sustained measurement on the runner node after deployment.

@@ -92,6 +92,167 @@ fn prepare_unenrolled_payload_root(
     Ok(())
 }
 
+/// A checkpoint's distinct members, in order: an identical repeat of a
+/// segment is dropped; `None` when two members name the same segment with
+/// different extents or CRCs.
+fn checkpoint_members(
+    segments: Vec<crate::writer::WrittenSegment>,
+) -> Option<Vec<crate::writer::WrittenSegment>> {
+    let mut seen: HashMap<u32, (u64, u32, u32)> = HashMap::with_capacity(segments.len());
+    let mut members = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let extent = (segment.offset, segment.len, segment.crc);
+        match seen.insert(segment.seg_number, extent) {
+            None => members.push(segment),
+            Some(prior) if prior == extent => {}
+            Some(_) => return None,
+        }
+    }
+    Some(members)
+}
+
+/// True when any range of `batch` shares a segment number with, or overlaps,
+/// a different range — already proven or elsewhere in the batch. Sorting
+/// the (small) batch makes this one pass over the proof instead of a pass
+/// per new range.
+fn proof_overlaps(proven: &[ProvenRange], batch: &[ProvenRange]) -> bool {
+    // Empty or unbounded extents break the ordering argument below; the
+    // writer never sends them, but keep the result exact if one appears.
+    if batch
+        .iter()
+        .any(|range| range.len == 0 || range.end().is_none())
+    {
+        let mut seen = proven.to_vec();
+        for range in batch {
+            if seen
+                .iter()
+                .any(|prior| prior.seg_number == range.seg_number || prior.overlaps(range))
+            {
+                return true;
+            }
+            seen.push(range.clone());
+        }
+        return false;
+    }
+    let mut sorted: Vec<&ProvenRange> = batch.iter().collect();
+    sorted.sort_by_key(|range| range.offset);
+    let numbers: HashSet<u32> = batch.iter().map(|range| range.seg_number).collect();
+    if numbers.len() != batch.len() || sorted.windows(2).any(|pair| pair[0].overlaps(pair[1])) {
+        return true;
+    }
+    proven.iter().any(|prior| {
+        if numbers.contains(&prior.seg_number) {
+            return true;
+        }
+        let Some(prior_end) = prior.end() else {
+            return true;
+        };
+        // Batch extents are non-empty and disjoint, so sorted by offset their
+        // ends ascend too: the first one ending after `prior` starts is the
+        // only one that can overlap it.
+        let first =
+            sorted.partition_point(|range| range.end().is_some_and(|end| end <= prior.offset));
+        sorted
+            .get(first)
+            .is_some_and(|range| range.offset < prior_end && range.overlaps(prior))
+    })
+}
+
+#[cfg(test)]
+mod proof_overlap_tests {
+    use super::{proof_overlaps, ProvenRange};
+
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// The per-segment rule the checkpoint replaced: each new range, in
+    /// order, against everything already proven including earlier members.
+    fn sequential(proven: &[ProvenRange], batch: &[ProvenRange]) -> bool {
+        let mut seen = proven.to_vec();
+        for range in batch {
+            if seen
+                .iter()
+                .any(|prior| prior.seg_number == range.seg_number || prior.overlaps(range))
+            {
+                return true;
+            }
+            seen.push(range.clone());
+        }
+        false
+    }
+
+    fn member(seg_number: u32, offset: u64, crc: u32) -> crate::writer::WrittenSegment {
+        crate::writer::WrittenSegment {
+            seg_number,
+            offset,
+            len: 2,
+            crc,
+            file_size: 8,
+            server: nzbd_types::ServerId(1),
+        }
+    }
+
+    #[test]
+    fn checkpoint_repeats_are_idempotent_unless_they_contradict() {
+        let members =
+            super::checkpoint_members(vec![member(1, 0, 7), member(1, 0, 7), member(2, 2, 9)])
+                .expect("an identical re-ack inside one checkpoint is not a conflict");
+        assert_eq!(
+            members.iter().map(|m| m.seg_number).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let batch: Vec<_> = members
+            .iter()
+            .map(|m| ProvenRange {
+                seg_number: m.seg_number,
+                offset: m.offset,
+                len: m.len,
+                crc: m.crc,
+            })
+            .collect();
+        assert!(!proof_overlaps(&[], &batch));
+        assert!(super::checkpoint_members(vec![member(1, 0, 7), member(1, 0, 8)]).is_none());
+        assert!(super::checkpoint_members(vec![member(1, 0, 7), member(1, 2, 7)]).is_none());
+    }
+
+    #[test]
+    fn batch_check_matches_the_per_segment_rule() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..2000 {
+            let mut proven = Vec::new();
+            let mut cursor = 0;
+            for seg_number in 0..(next(&mut state) % 12) as u32 {
+                cursor += next(&mut state) % 5;
+                let len = 1 + (next(&mut state) % 6) as u32;
+                proven.push(ProvenRange {
+                    seg_number,
+                    offset: cursor,
+                    len,
+                    crc: 0,
+                });
+                cursor += u64::from(len);
+            }
+            let batch: Vec<_> = (0..1 + next(&mut state) % 5)
+                .map(|_| ProvenRange {
+                    seg_number: (next(&mut state) % 20) as u32,
+                    offset: next(&mut state) % (cursor + 10),
+                    len: (next(&mut state) % 6) as u32,
+                    crc: 0,
+                })
+                .collect();
+            assert_eq!(
+                proof_overlaps(&proven, &batch),
+                sequential(&proven, &batch),
+                "{proven:?} + {batch:?}"
+            );
+        }
+    }
+}
+
 fn set_owner_param(params: &mut Vec<(String, String)>, key: &str, value: Option<String>) {
     if let Some((_, old)) = params.iter_mut().find(|(name, _)| name == key) {
         if let Some(value) = value {
@@ -6483,6 +6644,174 @@ impl Owner {
 
     // -- outcomes ------------------------------------------------------------
 
+    /// One writer durability checkpoint: every segment was written before
+    /// the shared `fdatasync`, and all name the same post-sync identity. The
+    /// file's proof is parsed, checked and re-serialized once per checkpoint,
+    /// not once per segment — the proof holds every range of the file, so a
+    /// per-segment round trip is quadratic in the file's article count and
+    /// saturated the owner on large files.
+    fn on_written_checkpoint(
+        &mut self,
+        job: JobId,
+        file: FileId,
+        generation: u64,
+        segments: Vec<crate::writer::WrittenSegment>,
+        identity: nzbd_state::artifacts::Identity,
+    ) {
+        // W5a: the same file's write landed.
+        self.space_op_succeeded(&crate::space_probe::SpaceOp::Write { job, file });
+        // Segments this checkpoint still has to record. A repeat — of a Done
+        // segment or of one earlier in this checkpoint (the writer re-acks a
+        // duplicate delivery) — is idempotent when identical and an identity
+        // failure when it contradicts.
+        let Some(segments) = checkpoint_members(segments) else {
+            self.fail_job_terminal(
+                job,
+                nzbd_types::FailureReason::Identity,
+                None,
+                "download_write",
+                "writer acknowledgement contradicts completed logical segment",
+            );
+            return;
+        };
+        let mut fresh = Vec::with_capacity(segments.len());
+        for segment in segments {
+            let reference = SegRef {
+                job,
+                file,
+                seg_number: segment.seg_number,
+            };
+            let Some(state) = self.state.segment_mut(reference) else {
+                continue;
+            };
+            if let SegmentState::Done {
+                offset: old,
+                len: old_len,
+                crc: old_crc,
+            } = state.state
+            {
+                if (old, old_len, old_crc) != (segment.offset, segment.len, segment.crc) {
+                    self.fail_job_terminal(
+                        job,
+                        nzbd_types::FailureReason::Identity,
+                        None,
+                        "download_write",
+                        "writer acknowledgement contradicts completed logical segment",
+                    );
+                    return;
+                }
+                continue;
+            }
+            fresh.push(segment);
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        let Some(allocation) = self.allocation_cache.get(&job) else {
+            return;
+        };
+        let record = self.state.job(job).unwrap();
+        let key = format!("*File:proof:{}", file.0);
+        let file_generation = record
+            .params
+            .iter()
+            .find(|(key, _)| key == &format!("*File:generation:{}", file.0))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        if file_generation != generation.to_string() {
+            return;
+        }
+        let mut proof = record
+            .params
+            .iter()
+            .find(|(candidate, _)| candidate == &key)
+            .and_then(|(_, value)| serde_json::from_str::<DurableFileProof>(value).ok())
+            .filter(|proof| {
+                proof.protocol == WRITER_PROTOCOL
+                    && proof.generation == file_generation
+                    && proof.allocation_generation == allocation.generation
+                    && proof.installation == self.artifacts.installation
+                    && proof.identity.same_object(&identity)
+            })
+            .unwrap_or_else(|| DurableFileProof {
+                protocol: WRITER_PROTOCOL,
+                generation: file_generation.clone(),
+                allocation_generation: allocation.generation.clone(),
+                installation: self.artifacts.installation.clone(),
+                identity: identity.clone(),
+                ranges: vec![],
+                publication_name: None,
+            });
+        let batch: Vec<ProvenRange> = fresh
+            .iter()
+            .map(|segment| ProvenRange {
+                seg_number: segment.seg_number,
+                offset: segment.offset,
+                len: segment.len,
+                crc: segment.crc,
+            })
+            .collect();
+        if proof_overlaps(&proof.ranges, &batch) {
+            self.fail_job_terminal(
+                job,
+                nzbd_types::FailureReason::Identity,
+                None,
+                "download_write",
+                "writer acknowledgement overlaps durable evidence",
+            );
+            return;
+        }
+        proof.identity = identity;
+        let mut journal_proof = DurableFileProof {
+            ranges: vec![],
+            ..proof.clone()
+        };
+        proof.ranges.extend(batch.iter().cloned());
+        for (segment, range) in fresh.iter().zip(batch) {
+            journal_proof.ranges = vec![range];
+            self.append_journal(
+                JournalRecord {
+                    job,
+                    file,
+                    segment_number: segment.seg_number,
+                    offset: segment.offset,
+                    len: segment.len,
+                    crc32: segment.crc,
+                    file_size: segment.file_size,
+                },
+                serde_json::to_value(&journal_proof).ok(),
+            );
+            let reference = SegRef {
+                job,
+                file,
+                seg_number: segment.seg_number,
+            };
+            if let Some(state) = self.state.segment_mut(reference) {
+                state.state = SegmentState::Done {
+                    offset: segment.offset,
+                    len: segment.len,
+                    crc: segment.crc,
+                };
+            }
+            if segment.file_size > 0 {
+                self.file_sizes.insert(file, segment.file_size);
+            }
+            self.volumes.add(
+                segment.server,
+                u64::from(segment.len),
+                unix_now(),
+                self.tuning.quota_start_day,
+            );
+            self.attempts.remove(&reference);
+        }
+        if let Some(record) = self.state.job_mut(job) {
+            set_owner_param(&mut record.params, &key, serde_json::to_string(&proof).ok());
+            recompute_job_totals(record);
+        }
+        self.dirty = true;
+        self.after_file_change(job, file);
+    }
+
     fn on_scoped_writer(&mut self, job: JobId, file: FileId, generation: u64, fact: WriterFact) {
         if self.writer_epochs.get(&file) != Some(&generation)
             || self.state.job(job).is_none()
@@ -6502,132 +6831,8 @@ impl Owner {
             return;
         }
         match fact {
-            WriterFact::Written {
-                seg_number,
-                offset,
-                len,
-                crc,
-                file_size,
-                server,
-                identity,
-            } => {
-                // W5a: the same file's write landed.
-                self.space_op_succeeded(&crate::space_probe::SpaceOp::Write { job, file });
-                let reference = SegRef {
-                    job,
-                    file,
-                    seg_number,
-                };
-                let Some(segment) = self.state.segment_mut(reference) else {
-                    return;
-                };
-                if let SegmentState::Done {
-                    offset: old,
-                    len: old_len,
-                    crc: old_crc,
-                } = segment.state
-                {
-                    if (old, old_len, old_crc) != (offset, len, crc) {
-                        self.fail_job_terminal(
-                            job,
-                            nzbd_types::FailureReason::Identity,
-                            None,
-                            "download_write",
-                            "writer acknowledgement contradicts completed logical segment",
-                        );
-                    }
-                    return;
-                }
-                let Some(allocation) = self.allocation_cache.get(&job) else {
-                    return;
-                };
-                let record = self.state.job(job).unwrap();
-                let key = format!("*File:proof:{}", file.0);
-                let file_generation = record
-                    .params
-                    .iter()
-                    .find(|(key, _)| key == &format!("*File:generation:{}", file.0))
-                    .map(|(_, value)| value.clone())
-                    .unwrap_or_default();
-                if file_generation != generation.to_string() {
-                    return;
-                }
-                let mut proof = record
-                    .params
-                    .iter()
-                    .find(|(candidate, _)| candidate == &key)
-                    .and_then(|(_, value)| serde_json::from_str::<DurableFileProof>(value).ok())
-                    .filter(|proof| {
-                        proof.protocol == WRITER_PROTOCOL
-                            && proof.generation == file_generation
-                            && proof.allocation_generation == allocation.generation
-                            && proof.installation == self.artifacts.installation
-                            && proof.identity.same_object(&identity)
-                    })
-                    .unwrap_or_else(|| DurableFileProof {
-                        protocol: WRITER_PROTOCOL,
-                        generation: file_generation.clone(),
-                        allocation_generation: allocation.generation.clone(),
-                        installation: self.artifacts.installation.clone(),
-                        identity: identity.clone(),
-                        ranges: vec![],
-                        publication_name: None,
-                    });
-                let range = ProvenRange {
-                    seg_number,
-                    offset,
-                    len,
-                    crc,
-                };
-                if proof
-                    .ranges
-                    .iter()
-                    .any(|prior| prior.seg_number == seg_number || prior.overlaps(&range))
-                {
-                    self.fail_job_terminal(
-                        job,
-                        nzbd_types::FailureReason::Identity,
-                        None,
-                        "download_write",
-                        "writer acknowledgement overlaps durable evidence",
-                    );
-                    return;
-                }
-                proof.identity = identity;
-                proof.ranges.push(range.clone());
-                let mut journal_proof = proof.clone();
-                journal_proof.ranges = vec![range];
-                self.append_journal(
-                    JournalRecord {
-                        job,
-                        file,
-                        segment_number: seg_number,
-                        offset,
-                        len,
-                        crc32: crc,
-                        file_size,
-                    },
-                    serde_json::to_value(&journal_proof).ok(),
-                );
-                if let Some(segment) = self.state.segment_mut(reference) {
-                    segment.state = SegmentState::Done { offset, len, crc };
-                }
-                if let Some(record) = self.state.job_mut(job) {
-                    set_owner_param(&mut record.params, &key, serde_json::to_string(&proof).ok());
-                    recompute_job_totals(record);
-                }
-                if file_size > 0 {
-                    self.file_sizes.insert(file, file_size);
-                }
-                self.volumes.add(
-                    server,
-                    u64::from(len),
-                    unix_now(),
-                    self.tuning.quota_start_day,
-                );
-                self.attempts.remove(&reference);
-                self.dirty = true;
-                self.after_file_change(job, file);
+            WriterFact::Written { segments, identity } => {
+                self.on_written_checkpoint(job, file, generation, segments, identity)
             }
             WriterFact::Finalized {
                 ok,
