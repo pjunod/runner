@@ -43,12 +43,9 @@ pub(crate) async fn run_with_retry(
             .collect();
         attempts.retain(|job, _| pending.contains(job));
         // An operator "retry now" is the one hint that may cut a dispatch
-        // backoff short; queue epochs and worker exits never do.
-        for job in handle.url_retry_kicks.take_dispatch() {
-            if let Some(attempt) = attempts.get_mut(&job) {
-                attempt.retry_at = None;
-            }
-        }
+        // backoff short; queue epochs and worker exits never do. Applied
+        // after this pass's exit backoff, so a kick racing an exit holds.
+        let kicked = handle.url_retry_kicks.take_dispatch();
         duplicates.retain(|job, _| pending.contains(job));
         let active = handle
             .url_fetches
@@ -86,6 +83,9 @@ pub(crate) async fn run_with_retry(
                     delay_secs = delay.as_secs(),
                     "URL admission still pending after worker exit; dispatch will retry"
                 );
+            }
+            if kicked.contains(&job.id) {
+                attempt.retry_at = None;
             }
             // Paused URL submissions still acquire their NZB, exactly as the
             // former caller-owned path did. A lifecycle hold is different.

@@ -1188,6 +1188,18 @@ async fn retry_job_now(State(st): State<ApiState>, Path(id): Path<u32>) -> Respo
     if st.engine.retry_url_fetch_now(JobId(id)) {
         return Json(json!({"ok": true, "retrying": true, "fetch": true})).into_response();
     }
+    let fetching_url = st.engine.snapshot().jobs.iter().any(|job| {
+        job.id == JobId(id)
+            && job.kind == nzbd_types::JobKind::Url
+            && job.status == nzbd_types::JobStatus::Fetching
+            && !job.control.as_ref().is_some_and(|c| c.lifecycle == "held")
+    });
+    if fetching_url {
+        return error(
+            StatusCode::CONFLICT,
+            "the NZB fetch has no wait to cut short (already requesting, or not on this node)",
+        );
+    }
     if let Ok(Some(row)) = st.engine.export_job(JobId(id)).await {
         if nzbd_engine::torrent_acquisitions::is_acquisition(&row) {
             if let Some(control) = row.control().filter(|control| {

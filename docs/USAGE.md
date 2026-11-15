@@ -114,10 +114,11 @@ or 503) or doesn't answer stays in **Fetching NZB** and retries the same
 request after 1, 5, 10, then every 30 minutes until the indexer hands it over
 or answers for the item (404 and the like fail it). The row says what went
 wrong, when the next attempt is, and how long it has waited. An indexer's
-`Retry-After` is shown on the row (`indexer asked to wait 12h`) but does not
-stretch the schedule — exhausted API quotas answer with 12–22 hour values.
-**retry now** on the job (web UI detail panel, or the app's expanded card)
-sends the request immediately; a repeat refusal waits on the same step.
+`Retry-After` of up to 30 minutes is honored as a minimum for that step; a
+longer one is shown on the row (`indexer asked to wait 12h`) but not obeyed —
+exhausted API quotas answer with 12–22 hour values. **retry now** on the job
+(web UI detail panel, or the app's expanded card) sends the request
+immediately; a repeat refusal continues up the ladder.
 
 **Held jobs.** A job stopped by its environment — storage not answering, a
 full disk, an exhausted quota, a missing extractor, a mount that came back

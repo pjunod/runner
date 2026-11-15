@@ -3,8 +3,8 @@
 ## NZB fetch retry ladder + retry now — 2026-11-15 (0.9.6, app 1.1.9)
 
 **Status:** built; branch `claude/nzb-fetch-retry-ladder`, draft PR. Owner:
-Claude (Opus 5.5 session). Next: adversarial review → fast-check → CI →
-merge → deploy (Paul).
+Claude (Opus 5.5 session). Adversarial review done (5 findings, all fixed). Next:
+fast-check → CI → merge → deploy (Paul).
 
 Field report: items sat in **Fetching NZB** after an indexer 429 with the
 next retry ~12 h out and no way to move them. Root cause: the fetch ladder
@@ -15,13 +15,16 @@ only covered holds and failed-source cleanup.
 
 Changes:
 - Ladder is now 1, 5, 10, then every 30 min (429/503, timeouts, transport
-  errors). `Retry-After` no longer stretches it; when it asks for longer
-  than the step, the job's last error says so (`indexer asked to wait 12h`).
+  errors). A `Retry-After` up to 30 min is a floor for that step; a longer
+  one is not obeyed, and the job's last error says what the indexer asked
+  (`indexer asked to wait 12h`).
 - A restarted fetch clamps a persisted deadline to its step, so rows parked
   under the old policy come back within 30 min of the deploy.
 - `POST /api/v1/jobs/{id}/retry` on a fetching job ends the current wait
-  (fetch ladder or URL dispatcher backoff) and requests the NZB now; the
-  attempt count and step are kept. Web UI detail panel and the app's
+  (fetch ladder or URL dispatcher backoff) and requests the NZB now; a repeat
+  refusal continues up the ladder. A kick names the deadline it saw, so a
+  double click cannot skip a later wait; in flight, held, or without queue
+  authority it answers 409. Web UI detail panel and the app's
   expanded Fetching card (1.1.9) show **retry now** while a retry is
   scheduled.
 - Unchanged: the URL dispatcher's worker-exit backoff (30/60/120/300 s) and

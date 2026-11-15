@@ -7,10 +7,11 @@
 //! operator "retry now" (see [`http_get_observed`]'s `kick`) cuts any wait
 //! short.
 //!
-//! A provider's `Retry-After` is recorded on the job (so the UI says what the
-//! indexer asked for) but does not stretch the schedule: indexers answer an
-//! exhausted daily API quota with a Retry-After of 12–22 hours, which parked
-//! jobs for most of a day with no way to move them.
+//! A provider's `Retry-After` of up to 30 minutes is a floor on the step; a
+//! longer one is recorded on the job (so the UI says what the indexer asked
+//! for) but not obeyed: indexers answer an exhausted daily API quota with a
+//! Retry-After of 12–22 hours, which parked jobs for most of a day with no
+//! way to move them.
 
 use http_body_util::BodyExt;
 use hyper::Request;
@@ -52,6 +53,51 @@ pub enum FetchError {
     Timeout,
     #[error("URL fetch stopped because its queue job is no longer fetching")]
     Cancelled,
+}
+
+/// The operator's "retry now" for one fetch. A kick names the deadline it
+/// saw published; it lands only while the worker is waiting on exactly that
+/// deadline, so a double click, or a kick racing a wait that already ended,
+/// can never pre-arm the next wait to be skipped.
+#[derive(Debug, Default)]
+pub struct FetchKick {
+    /// The deadline (unix seconds) the worker is waiting on; 0 when not.
+    waiting_on: std::sync::Mutex<i64>,
+    notify: Notify,
+}
+
+impl FetchKick {
+    fn lock(&self) -> std::sync::MutexGuard<'_, i64> {
+        self.waiting_on
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Set before the deadline is published, so a kick that sees it matches.
+    fn arm(&self, deadline: Option<i64>) {
+        *self.lock() = deadline.unwrap_or(0);
+    }
+
+    /// Cleared, with any unconsumed permit, the moment a wait ends.
+    fn disarm(&self) {
+        let mut waiting_on = self.lock();
+        *waiting_on = 0;
+        let stale = self.notify.notified();
+        tokio::pin!(stale);
+        stale.as_mut().enable();
+    }
+
+    /// Ends the wait on `deadline` if the worker is still in it. The permit
+    /// covers a kick that lands after publication but before the sleep
+    /// starts.
+    pub fn kick(&self, deadline: i64) -> bool {
+        let waiting_on = self.lock();
+        let landed = *waiting_on != 0 && *waiting_on == deadline;
+        if landed {
+            self.notify.notify_one();
+        }
+        landed
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -105,7 +151,7 @@ pub async fn http_get(url: &str) -> Result<Vec<u8>, FetchError> {
         url,
         FetchRetryState::default(),
         |_| async { true },
-        Arc::new(Notify::new()),
+        Arc::default(),
     )
     .await
 }
@@ -114,29 +160,44 @@ pub async fn http_get(url: &str) -> Result<Vec<u8>, FetchError> {
 /// deadline and elapsed-wait origin through `on_retry`. A restart can pass
 /// the saved state back in, preserving the same token-scoped attempt and its
 /// outstanding deadline (clamped to the schedule, so a deadline written under
-/// an older, longer policy cannot outlive it). `kick.notify_one()` ends the
-/// current (or the very next) wait at once: the operator's "retry now".
+/// an older, longer policy cannot outlive it). [`FetchKick::kick`] ends the
+/// current wait at once: the operator's "retry now".
 pub async fn http_get_observed<F, Fut>(
     url: &str,
     retry_state: FetchRetryState,
-    on_retry: F,
-    kick: Arc<Notify>,
+    mut on_retry: F,
+    kick: Arc<FetchKick>,
 ) -> Result<Vec<u8>, FetchError>
 where
     F: FnMut(FetchRetryState) -> Fut,
     Fut: Future<Output = bool>,
 {
-    http_get_observed_with_sleep(url, retry_state, on_retry, move |delay| {
-        let kick = kick.clone();
-        async move {
-            tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
-                _ = kick.notified() => {
-                    tracing::info!("NZB fetch retry requested by operator");
-                }
+    // A resumed fetch waits on the deadline it was published with.
+    kick.arm(retry_state.next_retry_at);
+    let arm = kick.clone();
+    let wait = kick.clone();
+    http_get_observed_with_sleep(
+        url,
+        retry_state,
+        move |state| {
+            if state.next_retry_at.is_some() {
+                arm.arm(state.next_retry_at);
             }
-        }
-    })
+            on_retry(state)
+        },
+        move |delay| {
+            let kick = wait.clone();
+            async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = kick.notify.notified() => {
+                        tracing::info!("NZB fetch retry requested by operator");
+                    }
+                }
+                kick.disarm();
+            }
+        },
+    )
     .await
 }
 
@@ -224,7 +285,7 @@ where
     S: FnMut(Duration) -> SFut,
     SFut: Future<Output = ()>,
 {
-    let delay = retry_backoff(state.attempts);
+    let delay = retry_schedule(state.attempts, retry_after);
     let unix_deadline =
         unix_now().saturating_add(i64::try_from(delay.as_secs()).unwrap_or(i64::MAX));
     state.attempts = state.attempts.saturating_add(1);
@@ -268,9 +329,10 @@ pub fn cause_of(error: &FetchError) -> nzbd_types::FetchCause {
 
 fn retry_delay(error: &FetchError, retries: u32) -> Option<Duration> {
     match error {
-        FetchError::HttpStatus { status, .. } if matches!(status.as_u16(), 429 | 503) => {
-            Some(retry_backoff(retries))
-        }
+        FetchError::HttpStatus {
+            status,
+            retry_after,
+        } if matches!(status.as_u16(), 429 | 503) => Some(retry_schedule(retries, *retry_after)),
         FetchError::Io(_) | FetchError::Timeout | FetchError::TransientNetwork(_) => {
             Some(retry_backoff(retries))
         }
@@ -286,13 +348,32 @@ fn retry_backoff(retries: u32) -> Duration {
     )
 }
 
-/// How long a restarted fetch still waits on a persisted deadline. The
-/// deadline was written by the attempt before `attempts`, so it can never be
-/// further out than that step; anything longer came from an older policy
-/// (one that obeyed a 22-hour Retry-After) and is cut back to the step.
+/// A provider's Retry-After inside the ladder's own range (≤ 30 min) is a
+/// genuine rate-limit window: wait at least that long rather than earn a
+/// certain second refusal. Longer asks are quota resets and are not obeyed.
+fn retry_schedule(retries: u32, retry_after: Option<Duration>) -> Duration {
+    let step = retry_backoff(retries);
+    let ceiling = Duration::from_secs(RETRY_BACKOFF_SECONDS[RETRY_BACKOFF_SECONDS.len() - 1]);
+    match retry_after.filter(|asked| *asked <= ceiling) {
+        Some(asked) => step.max(asked),
+        None => step,
+    }
+}
+
+/// How long a restarted fetch still waits on a persisted deadline. This
+/// policy never schedules past the 30-minute ceiling; a deadline beyond it
+/// came from an older policy (one that obeyed a 22-hour Retry-After) and is
+/// cut back to the step of the attempt that wrote it.
 fn resume_wait(deadline: i64, attempts: u32, now: i64) -> Duration {
     let remaining = Duration::from_secs(deadline.saturating_sub(now).max(0) as u64);
-    remaining.min(retry_backoff(attempts.saturating_sub(1)))
+    let ceiling = Duration::from_secs(RETRY_BACKOFF_SECONDS[RETRY_BACKOFF_SECONDS.len() - 1]);
+    // Within the ceiling the deadline is one this policy could have written
+    // (a short Retry-After raises a step); beyond it, it cannot.
+    if remaining <= ceiling {
+        remaining
+    } else {
+        retry_backoff(attempts.saturating_sub(1))
+    }
 }
 
 fn human_wait(wait: Duration) -> String {
@@ -464,10 +545,14 @@ mod tests {
             retry_delay(&error, u32::MAX),
             Some(Duration::from_secs(1800))
         );
-        // Retry-After neither stretches nor shortens the ladder: a 12-hour
-        // quota reset still retries on the next step.
+        // Retry-After never shortens a step, raises one only within the
+        // ladder's 30-minute ceiling, and a 12-hour quota reset still retries
+        // on the next step.
         for (retry, server_seconds, expected) in [
             (0, 5, 60),
+            (0, 90, 90),
+            (0, 1800, 1800),
+            (0, 1801, 60),
             (1, 90, 300),
             (2, 12 * 3600, 600),
             (3, 22 * 3600, 1800),
@@ -548,6 +633,7 @@ mod tests {
         for (status, retry_after, expected) in [
             ("429 Too Many Requests", "0", [60, 300, 600]),
             ("503 Service Unavailable", "1", [60, 300, 600]),
+            ("503 Service Unavailable", "90", [90, 300, 600]),
             ("429 Too Many Requests", "43200", [60, 300, 600]),
         ] {
             let response = format!(
@@ -658,46 +744,68 @@ mod tests {
             resume_wait(now + 22 * 3600, 9, now),
             Duration::from_secs(1800)
         );
-        // A deadline inside its step is honored as written; a past one is due.
+        // A deadline this policy could write is honored; a past one is due.
         assert_eq!(resume_wait(now + 200, 2, now), Duration::from_secs(200));
         assert_eq!(resume_wait(now - 5, 2, now), Duration::ZERO);
         assert_eq!(resume_wait(now + 10, 0, now), Duration::from_secs(10));
+        assert_eq!(resume_wait(now + 1800, 1, now), Duration::from_secs(1800));
+        assert_eq!(resume_wait(now + 1801, 1, now), Duration::from_secs(60));
         assert_eq!(human_wait(Duration::from_secs(43_200)), "12h");
         assert_eq!(human_wait(Duration::from_secs(5_430)), "1h 31m");
         assert_eq!(human_wait(Duration::from_secs(61)), "2m");
     }
 
-    #[tokio::test]
-    async fn operator_kick_ends_the_wait_and_retries_at_once() {
-        let (url, server) = serve_responses(vec![
-            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 43200\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+    /// Serves 429 (with a 12 h Retry-After) `refusals` times, then the NZB.
+    async fn refuse_then_serve(refusals: usize) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let mut responses = vec![
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 43200\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+            refusals
+        ];
+        responses.push(
             "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n<nzb />".into(),
-        ])
-        .await;
-        let kick = Arc::new(Notify::new());
-        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
-        let waiting_tx = std::sync::Mutex::new(Some(waiting_tx));
-        let fetch_kick = kick.clone();
+        );
+        serve_responses(responses).await
+    }
+
+    /// Starts a real-sleep fetch; each published wait is sent on the channel.
+    fn spawn_fetch(
+        url: String,
+        kick: Arc<FetchKick>,
+    ) -> (
+        tokio::task::JoinHandle<Result<Vec<u8>, FetchError>>,
+        tokio::sync::mpsc::UnboundedReceiver<i64>,
+    ) {
+        let (waits_tx, waits) = tokio::sync::mpsc::unbounded_channel();
         let fetch = tokio::spawn(async move {
             http_get_observed(
                 &url,
                 FetchRetryState::default(),
                 move |state| {
-                    if state.next_retry_at.is_some() {
-                        if let Some(tx) = waiting_tx.lock().unwrap().take() {
-                            let _ = tx.send(());
-                        }
+                    if let Some(deadline) = state.next_retry_at {
+                        let _ = waits_tx.send(deadline);
                     }
                     async { true }
                 },
-                fetch_kick,
+                kick,
             )
             .await
         });
-        // Kick as soon as "waiting" is published, possibly before the sleep
+        (fetch, waits)
+    }
+
+    #[tokio::test]
+    async fn operator_kick_ends_the_wait_and_retries_at_once() {
+        let (url, server) = refuse_then_serve(1).await;
+        let kick = Arc::new(FetchKick::default());
+        let (fetch, mut waits) = spawn_fetch(url, kick.clone());
+        // Kick as soon as the wait is published, possibly before the sleep
         // has started: the permit must still end the one-minute wait.
-        waiting_rx.await.unwrap();
-        kick.notify_one();
+        let deadline = waits.recv().await.unwrap();
+        assert!(
+            !kick.kick(deadline + 1),
+            "a kick for another deadline misses"
+        );
+        assert!(kick.kick(deadline));
         let body = tokio::time::timeout(Duration::from_secs(10), fetch)
             .await
             .expect("kick did not end the wait")
@@ -705,6 +813,34 @@ mod tests {
             .unwrap();
         assert_eq!(body, b"<nzb />");
         assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_double_kick_cannot_skip_the_next_wait() {
+        let (url, server) = refuse_then_serve(2).await;
+        let kick = Arc::new(FetchKick::default());
+        let (fetch, mut waits) = spawn_fetch(url, kick.clone());
+        let first = waits.recv().await.unwrap();
+        assert!(kick.kick(first));
+        // The second click of a double click: the wait it names is over.
+        let second = loop {
+            kick.kick(first);
+            if let Ok(deadline) = waits.try_recv() {
+                break deadline;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        // The second refusal must actually wait (five minutes), not run on a
+        // permit left behind by the double kick.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!fetch.is_finished(), "a stale kick skipped the next wait");
+        assert!(kick.kick(second));
+        tokio::time::timeout(Duration::from_secs(10), fetch)
+            .await
+            .expect("kick did not end the second wait")
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.await.unwrap().len(), 3);
     }
 
     #[test]

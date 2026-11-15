@@ -943,12 +943,12 @@ pub struct EngineHandle {
 /// `dispatch`, which the dispatcher drains on its next pass.
 #[derive(Default)]
 pub(crate) struct UrlRetryKicks {
-    waiting: Mutex<HashMap<JobId, Arc<tokio::sync::Notify>>>,
+    waiting: Mutex<HashMap<JobId, Arc<crate::fetch::FetchKick>>>,
     dispatch: Mutex<HashSet<JobId>>,
 }
 
 impl UrlRetryKicks {
-    fn register(&self, job: JobId) -> Arc<tokio::sync::Notify> {
+    fn register(&self, job: JobId) -> Arc<crate::fetch::FetchKick> {
         self.waiting
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -964,20 +964,18 @@ impl UrlRetryKicks {
             .remove(&job);
     }
 
-    /// `waiting_on_ladder`: the job's published state shows a scheduled
-    /// retry. Only then is the fetch kicked, and with a stored permit, so a
-    /// kick landing between that publication and the sleep starting is not
-    /// lost; an in-flight request is never pre-armed to skip its next wait.
-    fn kick(&self, job: JobId, waiting_on_ladder: bool) {
-        if let Some(kick) = self
+    /// Ends a ladder wait on the published `deadline`, if a worker is in it.
+    fn kick_fetch(&self, job: JobId, deadline: i64) -> bool {
+        let kick = self
             .waiting
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&job)
-            .filter(|_| waiting_on_ladder)
-        {
-            kick.notify_one();
-        }
+            .cloned();
+        kick.is_some_and(|kick| kick.kick(deadline))
+    }
+
+    fn kick_dispatch(&self, job: JobId) {
         self.dispatch
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1844,30 +1842,57 @@ impl EngineHandle {
 
     /// Operator "retry now" for a URL job still fetching its NZB: ends the
     /// current backoff wait (fetch ladder or dispatcher) so the request goes
-    /// out at once; a request already in flight is left alone. The attempt count and ladder position are kept, so a
-    /// repeat refusal waits on the same step. `false` when the job is not
-    /// fetching.
+    /// out at once. A repeat refusal continues up the ladder. `false` when
+    /// nothing would happen: not a fetching URL job, held (its retry is the
+    /// hold release), a request already in flight, or no queue authority on
+    /// this node.
     pub fn retry_url_fetch_now(&self, job: JobId) -> bool {
         let snapshot = self.shared.load();
-        let Some(row) = snapshot
-            .jobs
-            .iter()
-            .find(|row| row.id == job && row.status == nzbd_types::JobStatus::Fetching)
-        else {
+        let Some(row) = snapshot.jobs.iter().find(|row| {
+            row.id == job
+                && row.kind == nzbd_types::JobKind::Url
+                && row.status == nzbd_types::JobStatus::Fetching
+        }) else {
             return false;
         };
-        let waiting = row
+        let held = row
+            .control
+            .as_ref()
+            .is_some_and(|control| control.lifecycle == "held" || control.version != 1);
+        // The dispatcher's own authority test: without it nothing fetches.
+        let authority = !self.url_outbox_external
+            || (snapshot.queue_authority
+                && self
+                    .owner_persist_guard
+                    .as_ref()
+                    .is_none_or(|guard| guard()));
+        if held || !authority {
+            return false;
+        }
+        let deadline = row
             .url_fetch
             .as_ref()
-            .is_some_and(|retry| retry.next_retry_at_unix.is_some());
+            .and_then(|retry| retry.next_retry_at_unix);
+        let has_worker = self
+            .url_fetches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&job);
+        let retried = if has_worker {
+            deadline.is_some_and(|deadline| self.url_retry_kicks.kick_fetch(job, deadline))
+        } else {
+            // No worker: the row is in (or about to enter) the dispatcher's
+            // backoff, which the dispatcher clears on its next pass.
+            self.url_retry_kicks.kick_dispatch(job);
+            self.url_fetch_wakeup.notify_one();
+            true
+        };
         tracing::info!(
             job = job.0,
-            waiting,
+            retried,
             "operator requested an immediate NZB fetch retry"
         );
-        self.url_retry_kicks.kick(job, waiting);
-        self.url_fetch_wakeup.notify_one();
-        true
+        retried
     }
 
     async fn fail_url_fetch(&self, job: JobId, error: String) -> Result<(), EngineError> {
