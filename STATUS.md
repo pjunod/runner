@@ -1,5 +1,24 @@
 # nzbd — Project Status
 
+## Download throughput — 2026-11-15 (0.9.6)
+
+**Status:** branch `claude/runner-download-throughput` (from main 51d4980),
+adversarial review addressed, fast lane next. Owner: Claude (Opus 5.5
+session). Not pushed: the session has no GitHub write access. Next: fast
+lane once → push/PR → merge → Paul deploys → untraced sustained measurement
+on the runner node.
+
+Root causes (benchmarked, [speed plan §15](docs/DOWNLOAD_SPEED_ROOT_CAUSE_PLAN.md)):
+the owner re-parsed and re-serialized each file's whole proof (every range)
+per article — quadratic in the file's article count, so throughput fell as
+files grew (994 → 610 articles/s from 1.5 k to 12 k articles) — and the
+writer still synced about once per article on GlusterFS. Fix: the writer's
+durability checkpoint (32 MiB / full coverage / 1 s / control command) is
+the unit of acknowledgement, one owner proof update per checkpoint; indexed
+range checks. (A sliding pipeline window was measured and left out — §15.)
+Durability is unchanged: nothing is acknowledged before the sync covering
+it. Bench: 59.5 → 125.2 MiB/s on a 12 k-article file, now flat with size.
+
 ## Park ENOENT (job 2710) — 2026-11-12 (0.9.4)
 
 **Status:** built; branch `claude/park-enoent` (from main 5e15dd3, pushed;
