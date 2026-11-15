@@ -749,7 +749,7 @@ job changed. All reconstructed bytes matched ordinary serialization. See
 version-2 compatibility and mandatory offline conversion before downgrade.
 This establishes encoder benefit, not restored download throughput.
 
-## 15. Per-article cost that grows with the file — 2026-11-15 (0.9.6)
+## 15. Per-article cost that grows with the file — 2026-11-15 (0.9.7)
 
 Runner still rarely reached the link's peak after §10–§14. A release-mode
 benchmark against the in-tree mock server
