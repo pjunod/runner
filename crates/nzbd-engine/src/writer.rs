@@ -2207,6 +2207,106 @@ mod tests {
         facts
     }
 
+    /// A writer whose input queue stays open, so only the checkpoint's own
+    /// triggers (bytes, coverage, age) can flush it.
+    fn open_writer(
+        dir: &Path,
+    ) -> (
+        mpsc::Sender<WriteCmd>,
+        mpsc::Receiver<EngineMsg>,
+        tokio_util::sync::CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = channel(WRITER_QUEUE);
+        let (events, received) = channel(32);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(writer_task(
+            JobId(1),
+            FileId(2),
+            dir.into(),
+            "out".into(),
+            rx,
+            events,
+            stop.clone(),
+            WriterScope::default(),
+            true,
+        ));
+        (tx, received, stop, task)
+    }
+
+    async fn next_checkpoint(events: &mut mpsc::Receiver<EngineMsg>) -> Vec<WrittenSegment> {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), events.recv()).await {
+            Ok(Some(EngineMsg::ScopedWriter {
+                fact: WriterFact::Written { segments, .. },
+                ..
+            })) => segments,
+            other => panic!("expected a checkpoint, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_uncovered_file_is_acknowledged_by_the_checkpoint_age() {
+        // Unknown size (0) and a known size the segments do not cover: only
+        // the age deadline can acknowledge these, and it must.
+        for file_size in [0, 64] {
+            let temp = tempfile::tempdir().unwrap();
+            let (tx, mut events, stop, task) = open_writer(temp.path());
+            let started = tokio::time::Instant::now();
+            tx.send(batch_segment(1, 0, b"ab", file_size))
+                .await
+                .unwrap();
+            tx.send(batch_segment(2, 2, b"cd", file_size))
+                .await
+                .unwrap();
+            let segments = next_checkpoint(&mut events).await;
+            assert!(
+                started.elapsed() >= CHECKPOINT_AGE - std::time::Duration::from_millis(50),
+                "acknowledged only once the checkpoint aged (file_size {file_size})"
+            );
+            assert_eq!(
+                segments.iter().map(|s| s.seg_number).collect::<Vec<_>>(),
+                [1, 2],
+                "both writes share the aged checkpoint (file_size {file_size})"
+            );
+            stop.cancel();
+            drop(tx);
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_bytes_bound_the_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let (tx, mut events, stop, task) = open_writer(temp.path());
+        let mib = vec![7u8; 1024 * 1024];
+        let count = (CHECKPOINT_BYTES / mib.len() as u64) as u32 + 1;
+        let file_size = 2 * CHECKPOINT_BYTES;
+        let sender = tokio::spawn(async move {
+            for n in 0..count {
+                tx.send(batch_segment(
+                    n + 1,
+                    u64::from(n) * mib.len() as u64,
+                    &mib,
+                    file_size,
+                ))
+                .await
+                .unwrap();
+            }
+            tx
+        });
+        let first = next_checkpoint(&mut events).await;
+        assert_eq!(
+            first.len() as u64,
+            CHECKPOINT_BYTES / (1024 * 1024),
+            "the checkpoint is due once its pending bytes reach the bound"
+        );
+        assert_eq!(next_checkpoint(&mut events).await.len(), 1);
+        let tx = sender.await.unwrap();
+        stop.cancel();
+        drop(tx);
+        task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn queued_segments_share_one_sync_and_post_sync_identity() {
         use std::sync::{

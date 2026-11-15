@@ -92,6 +92,25 @@ fn prepare_unenrolled_payload_root(
     Ok(())
 }
 
+/// A checkpoint's distinct members, in order: an identical repeat of a
+/// segment is dropped; `None` when two members name the same segment with
+/// different extents or CRCs.
+fn checkpoint_members(
+    segments: Vec<crate::writer::WrittenSegment>,
+) -> Option<Vec<crate::writer::WrittenSegment>> {
+    let mut seen: HashMap<u32, (u64, u32, u32)> = HashMap::with_capacity(segments.len());
+    let mut members = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let extent = (segment.offset, segment.len, segment.crc);
+        match seen.insert(segment.seg_number, extent) {
+            None => members.push(segment),
+            Some(prior) if prior == extent => {}
+            Some(_) => return None,
+        }
+    }
+    Some(members)
+}
+
 /// True when any range of `batch` shares a segment number with, or overlaps,
 /// a different range — already proven or elsewhere in the batch. Sorting
 /// the (small) batch makes this one pass over the proof instead of a pass
@@ -164,6 +183,40 @@ mod proof_overlap_tests {
             seen.push(range.clone());
         }
         false
+    }
+
+    fn member(seg_number: u32, offset: u64, crc: u32) -> crate::writer::WrittenSegment {
+        crate::writer::WrittenSegment {
+            seg_number,
+            offset,
+            len: 2,
+            crc,
+            file_size: 8,
+            server: nzbd_types::ServerId(1),
+        }
+    }
+
+    #[test]
+    fn checkpoint_repeats_are_idempotent_unless_they_contradict() {
+        let members =
+            super::checkpoint_members(vec![member(1, 0, 7), member(1, 0, 7), member(2, 2, 9)])
+                .expect("an identical re-ack inside one checkpoint is not a conflict");
+        assert_eq!(
+            members.iter().map(|m| m.seg_number).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let batch: Vec<_> = members
+            .iter()
+            .map(|m| ProvenRange {
+                seg_number: m.seg_number,
+                offset: m.offset,
+                len: m.len,
+                crc: m.crc,
+            })
+            .collect();
+        assert!(!proof_overlaps(&[], &batch));
+        assert!(super::checkpoint_members(vec![member(1, 0, 7), member(1, 0, 8)]).is_none());
+        assert!(super::checkpoint_members(vec![member(1, 0, 7), member(1, 2, 7)]).is_none());
     }
 
     #[test]
@@ -6607,8 +6660,20 @@ impl Owner {
     ) {
         // W5a: the same file's write landed.
         self.space_op_succeeded(&crate::space_probe::SpaceOp::Write { job, file });
-        // Segments this checkpoint still has to record: an identical Done is
-        // an idempotent repeat; a contradicting Done is an identity failure.
+        // Segments this checkpoint still has to record. A repeat — of a Done
+        // segment or of one earlier in this checkpoint (the writer re-acks a
+        // duplicate delivery) — is idempotent when identical and an identity
+        // failure when it contradicts.
+        let Some(segments) = checkpoint_members(segments) else {
+            self.fail_job_terminal(
+                job,
+                nzbd_types::FailureReason::Identity,
+                None,
+                "download_write",
+                "writer acknowledgement contradicts completed logical segment",
+            );
+            return;
+        };
         let mut fresh = Vec::with_capacity(segments.len());
         for segment in segments {
             let reference = SegRef {
