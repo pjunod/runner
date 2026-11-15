@@ -10,7 +10,7 @@
 //!   ordered by checked headers; split-file continuity establishes membership.
 //!   Ambiguous sets retain their names and fail explicitly.
 
-use crate::PostError;
+use crate::{FsContext, PostError};
 use md5::{Digest, Md5};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -146,7 +146,7 @@ pub(crate) fn rename_owned(
     to: PathBuf,
     custody: Custody<'_>,
 ) -> Result<Option<(PathBuf, PathBuf)>, PostError> {
-    crate::attempt::checkpoint()?;
+    crate::attempt::checkpoint().map_err(PostError::Io)?;
     if from == to {
         return Ok(None);
     }
@@ -248,7 +248,7 @@ pub fn par_rename_owned_with_candidates(
         .unwrap_or_default();
 
     for p in files_of(dir) {
-        crate::attempt::checkpoint()?;
+        crate::attempt::checkpoint().map_err(PostError::Io)?;
         if !ext_is(&p, "par2") && head(&p, 8) == PAR2_MAGIC {
             let to = dir.join(format!(
                 "{}.par2",
@@ -266,7 +266,7 @@ pub fn par_rename_owned_with_candidates(
             wanted.entry(f.md5_16k).or_default().push(f);
         }
         for p in files_of(&set.root) {
-            crate::attempt::checkpoint()?;
+            crate::attempt::checkpoint().map_err(PostError::Io)?;
             if ext_is(&p, "par2") || p.extension().is_some_and(|e| e == "part") {
                 continue;
             }
@@ -297,7 +297,7 @@ pub fn par_rename_owned_with_candidates(
                 );
                 metrics.source_hash_ms +=
                     started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                crate::attempt::checkpoint()?;
+                crate::attempt::checkpoint().map_err(PostError::Io)?;
                 read
             };
             let matches: Vec<_> = catalog
@@ -323,8 +323,9 @@ pub fn par_rename_owned_with_candidates(
                 metrics.noop_files += 1;
                 continue;
             }
-            crate::attempt::checkpoint()?;
-            create_parents(&set.root, target.parent().unwrap())?;
+            crate::attempt::checkpoint().map_err(PostError::Io)?;
+            create_parents(&set.root, target.parent().unwrap())
+                .at("create directory", target.parent().unwrap())?;
             if let Some((inventory, job)) = custody {
                 let result = if let Some(entry) = cached {
                     inventory.restore_file_expected(
@@ -578,7 +579,7 @@ pub(crate) fn split_volume_ext(ext: &str) -> bool {
 /// SFV provides the volume names that older RAR4 headers omit. Match the
 /// complete file checksum, reject ambiguous mappings, then journal each rename.
 fn sfv_restore_archives(dir: &Path, custody: Custody<'_>) -> Renames {
-    let files = crate::namespace::files(dir)?;
+    let files = crate::namespace::files(dir).at("read directory", dir)?;
     let archives: Vec<_> = files
         .iter()
         .filter(|path| {
@@ -614,10 +615,10 @@ fn sfv_restore_archives(dir: &Path, custody: Custody<'_>) -> Renames {
                 .parent()
                 .is_some_and(|parent| unresolved.contains(parent))
     }) {
-        if std::fs::metadata(sfv)?.len() > 2 * 1024 * 1024 {
+        if std::fs::metadata(sfv).at("stat", sfv)?.len() > 2 * 1024 * 1024 {
             continue;
         }
-        let bytes = std::fs::read(sfv)?;
+        let bytes = std::fs::read(sfv).at("read", sfv)?;
         for raw in bytes.split(|byte| *byte == b'\n') {
             let raw = raw.trim_ascii();
             if raw.is_empty() || raw.starts_with(b";") {
@@ -637,7 +638,7 @@ fn sfv_restore_archives(dir: &Path, custody: Custody<'_>) -> Renames {
             let Ok(crc) = u32::from_str_radix(checksum, 16) else {
                 continue;
             };
-            let relative = crate::namespace::relative(name.trim())?;
+            let relative = crate::namespace::relative(name.trim()).map_err(PostError::Io)?;
             let extension = relative
                 .extension()
                 .unwrap_or_default()
@@ -672,12 +673,14 @@ fn sfv_restore_archives(dir: &Path, custody: Custody<'_>) -> Renames {
             continue;
         }
         let mut input = nzbd_state::io_meter::Metered::new(
-            nzbd_state::fileops::open(path).map_err(std::io::Error::other)?,
+            nzbd_state::fileops::open(path)
+                .map_err(std::io::Error::other)
+                .at("open", path)?,
         );
         let mut digest = crc32fast::Hasher::new();
         let mut buffer = [0; 65536];
         loop {
-            let count = input.read(&mut buffer)?;
+            let count = input.read(&mut buffer).at("read", path)?;
             if count == 0 {
                 break;
             }

@@ -4,6 +4,7 @@
 //! files retain their names: lexical order of obfuscated names establishes
 //! neither archive order nor episode identity.
 
+use crate::FsContext;
 use std::path::{Path, PathBuf};
 
 /// Extensions never renamed (disc structures, recovery data, split
@@ -266,8 +267,7 @@ pub fn restore_media_extensions_owned(
         None
     }
     let mut plan = Vec::new();
-    let listed = crate::namespace::files(dir)
-        .map_err(|e| nzbd_state::io_context(e, format!("list {}", dir.display())))?;
+    let listed = crate::namespace::files(dir).at("list", dir)?;
     for path in listed {
         if path.extension().is_some()
             || protected.contains(
@@ -287,14 +287,16 @@ pub fn restore_media_extensions_owned(
         // whether this is a hold (a dropped mount) or `failed/io`.
         nzbd_state::fileops::open(&path)
             .map_err(|e| match e {
-                nzbd_state::artifacts::Error::Io(io) => crate::PostError::Io(
-                    nzbd_state::io_context(io, format!("open {}", path.display())),
-                ),
+                nzbd_state::artifacts::Error::Io(io) => crate::PostError::Fs {
+                    op: "open",
+                    path: path.clone(),
+                    source: io,
+                },
                 other => crate::PostError::Artifact(other),
             })?
             .take(4096)
             .read_to_end(&mut bytes)
-            .map_err(|e| nzbd_state::io_context(e, format!("read {}", path.display())))?;
+            .at("read", &path)?;
         if let Some(ext) = kind(&bytes) {
             plan.push((path.clone(), path.with_extension(ext)));
         }

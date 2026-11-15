@@ -2,7 +2,7 @@
 //! (ARCHITECTURE.md §9): argv-only, scrubbed env, timeout, output caps,
 //! kill-on-drop.
 
-use crate::{ArchiveKind, ExtractOutcome, PostError, RepairResult, VerifyResult};
+use crate::{ArchiveKind, ExtractOutcome, FsContext, PostError, RepairResult, VerifyResult};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -192,7 +192,10 @@ async fn run_tool_owned(
         }
         None => {
             crate::attempt::kill_child(&mut child, group).await?;
-            Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "tool cancelled").into())
+            Err(PostError::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "tool cancelled",
+            )))
         }
     }
 }
@@ -598,7 +601,7 @@ impl Extractors {
         dest: &Path,
         password: Option<&str>,
     ) -> Result<ExtractOutcome, PostError> {
-        std::fs::create_dir_all(dest)?;
+        std::fs::create_dir_all(dest).at("create directory", dest)?;
         let dir = archive.parent().unwrap_or(Path::new("."));
         // RAR, then 7-Zip if RAR did not deliver.
         //
@@ -649,7 +652,7 @@ impl Extractors {
                         break;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(e) => return Err(e.into()),
+                    Err(e) => return Err(e).at("create directory", &candidate),
                 }
             }
             let retry_dir = retry_dir.ok_or_else(|| {
@@ -709,7 +712,7 @@ impl Extractors {
         dest: &Path,
         password: Option<&str>,
     ) -> Result<ExtractOutcome, PostError> {
-        std::fs::create_dir_all(dest)?;
+        std::fs::create_dir_all(dest).at("create directory", dest)?;
         let dir = archive.parent().unwrap_or(Path::new("."));
         let arch = archive.to_string_lossy().into_owned();
         let dest_s = dest.to_string_lossy().into_owned();
