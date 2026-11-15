@@ -1,4 +1,4 @@
-From fd8ae7596fc30a0d17011386deca9ad445fe9e95 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Paul Junod <donujp@gmail.com>
 Date: Tue, 27 Oct 2026 13:35:37 -0400
 Subject: [PATCH] feat(peer): let callers cap the BEP 9 metadata size accepted

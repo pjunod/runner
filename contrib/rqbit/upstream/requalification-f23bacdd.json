@@ -110,7 +110,7 @@
   "test": "tests::fake_peer::test_fake_peer_downloads_a_block_from_a_seeder",
   "main": "50/50 pass",
   "file-sizing-errors": "50/50 pass",
-  "cause": "PeerConnection increments uploaded bytes after write_all returns; the test reads the counter as soon as the block arrives"
+  "cause": "not reproduced; probable cause from code reading: PeerConnection increments uploaded bytes after write_all returns, and the test reads the counter as soon as the block arrives"
  },
  "not_requalified": {
   "known-peer-limit": "does not apply to f23bacdd, even on top of session-peer-limit; held"

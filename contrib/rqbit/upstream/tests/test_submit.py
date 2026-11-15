@@ -109,6 +109,15 @@ else: sys.exit(80)
         self.assertNotIn('Signed-off-by:', message)
         self.assertEqual((self.work / 'rqbit/change').read_text(), 'fix\n')
 
+    def test_held_unit_is_refused_without_git_or_gh(self):
+        for args in (('known-peer-limit', '--dry-run'), ('known-peer-limit',)):
+            r = self.invoke(*args)
+            self.assertEqual(r.returncode, 4, r.stderr)
+            self.assertIn('HELD', r.stderr)
+        # Only the read-only login check may run; no git, fork, push or PR.
+        self.assertEqual([a for a in self.actions() if a.get('gh', [])[:2] != ['api', 'user']], [])
+        self.assertFalse((self.work / 'rqbit').exists())
+
     def test_fetch_failure_under_all_stops_before_patch_or_push(self):
         r = self.invoke('all', '--dry-run', FAIL_FETCH='1')
         self.assertNotEqual(r.returncode, 0)

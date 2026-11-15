@@ -1,4 +1,4 @@
-From 62a1f060e919ab1a203d39f1db51a3d198132bb5 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Paul Junod <donujp@gmail.com>
 Date: Tue, 27 Oct 2026 13:43:54 -0400
 Subject: [PATCH] feat(session): add SessionOptions::disable_auto_restore

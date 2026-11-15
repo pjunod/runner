@@ -1,4 +1,4 @@
-From d7e8dac81467fdda0fc55198511ebc8647f9e484 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Paul Junod <donujp@gmail.com>
 Date: Tue, 27 Oct 2026 13:49:51 -0400
 Subject: [PATCH] feat(session): add an optional session-wide cap on live peers

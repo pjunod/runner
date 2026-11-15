@@ -1,4 +1,4 @@
-From 98586b08a7fd83bbd5d397defd4d471491ef8bb4 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Paul Junod <donujp@gmail.com>
 Date: Tue, 27 Oct 2026 14:04:40 -0400
 Subject: [PATCH] fix(dht): bound the DHT worker queues and per-lookup

@@ -1,4 +1,4 @@
-From 1d56c122216c5e8f9e8923d6313a981e605d4874 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Paul Junod <donujp@gmail.com>
 Date: Tue, 27 Oct 2026 13:42:14 -0400
 Subject: [PATCH] fix(tracker): bound HTTP tracker responses and clamp announce
