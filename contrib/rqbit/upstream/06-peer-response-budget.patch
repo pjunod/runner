@@ -182,7 +182,7 @@ index ca2690c5..49888aa2 100644
 +    }
 +}
 diff --git a/crates/librqbit/src/torrent_state/live/mod.rs b/crates/librqbit/src/torrent_state/live/mod.rs
-index 804ef26a..7fe5fc9d 100644
+index aaec504b..74252ec5 100644
 --- a/crates/librqbit/src/torrent_state/live/mod.rs
 +++ b/crates/librqbit/src/torrent_state/live/mod.rs
 @@ -43,6 +43,9 @@ pub mod peer;
@@ -338,7 +338,7 @@ index 804ef26a..7fe5fc9d 100644
      // This is used to unpause chunk requester once the bitfield
      // is received.
      on_bitfield_notify: Notify,
-@@ -1254,6 +1332,8 @@ impl PeerConnectionHandler for &'_ PeerHandler {
+@@ -1248,6 +1326,8 @@ impl PeerConnectionHandler for &'_ PeerHandler {
              handshake.metadata_size = Some(len);
          }
  
@@ -347,7 +347,7 @@ index 804ef26a..7fe5fc9d 100644
          Ok(())
      }
  
-@@ -1526,10 +1606,12 @@ impl PeerHandler {
+@@ -1520,10 +1600,12 @@ impl PeerHandler {
              );
          }
  
@@ -364,7 +364,7 @@ index 804ef26a..7fe5fc9d 100644
      }
  
      fn on_have(&self, have: u32) {
-@@ -2025,13 +2107,16 @@ impl PeerHandler {
+@@ -2019,13 +2101,16 @@ impl PeerHandler {
              .try_into()
              .context("can't send metadata: len doesn't fit into u32")?;
          let data = data.slice(offset as usize..end as usize);
