@@ -534,6 +534,18 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   const fetching = job(92, { url_fetch: { attempts: 2, nextRetryAtUnix: null, blockedSinceUnix: null, lastError: "HTTP 503" } });
   ok(T.detailModel(fetching).lifecycleStatus.startsWith("NZB fetch retry 2") &&
     T.detailModel(fetching).lifecycleStatus.includes("HTTP 503"), "url_fetch retry is shown");
+  // A fetch waiting on its backoff offers "retry now"; one in flight shows
+  // the button but has nothing to cut short.
+  const now = 1_700_000_000_000;
+  const waiting = job(95, { status: "fetching", url_fetch: { attempts: 3, nextRetryAtUnix: now / 1000 + 600, blockedSinceUnix: now / 1000 - 400, lastError: "http: status 429 Too Many Requests (indexer asked to wait 12h)" } });
+  const waitingModel = T.detailModel(waiting, now);
+  ok(!waitingModel.lifecycleHidden && !waitingModel.lifecycleRetryHidden && !waitingModel.lifecycleRetryDisabled,
+    "a fetch waiting on its backoff can be retried now");
+  ok(waitingModel.lifecycleStatus.includes("indexer asked to wait 12h"), "the indexer's own ask is shown");
+  const inFlight = T.detailModel(job(96, { status: "fetching", url_fetch: { attempts: 3, nextRetryAtUnix: null, blockedSinceUnix: null, lastError: null } }), now);
+  ok(!inFlight.lifecycleRetryHidden && inFlight.lifecycleRetryDisabled, "an in-flight fetch has nothing to retry");
+  const due = T.detailModel(job(97, { status: "fetching", url_fetch: { attempts: 1, nextRetryAtUnix: now / 1000 - 1, blockedSinceUnix: null, lastError: null } }), now);
+  ok(due.lifecycleRetryDisabled, "a fetch already due is retrying on its own");
   const post = job(93, { post_timing: { startedAtUnix: 1, elapsedMs: 4000, workMs: 3000, waitMs: 1000, attempts: 1 } });
   ok(T.detailModel(post).lifecycleStatus.startsWith("Post-processing: "), "post_timing is shown");
   const cleanup = job(94, { failed_cleanup: { attempts: 3 } });

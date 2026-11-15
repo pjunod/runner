@@ -1183,6 +1183,11 @@ async fn set_keep_on_failure(
 }
 
 async fn retry_job_now(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
+    // A URL job waiting out its NZB fetch backoff (an indexer 429/503, a
+    // timeout) retries the request now.
+    if st.engine.retry_url_fetch_now(JobId(id)) {
+        return Json(json!({"ok": true, "retrying": true, "fetch": true})).into_response();
+    }
     if let Ok(Some(row)) = st.engine.export_job(JobId(id)).await {
         if nzbd_engine::torrent_acquisitions::is_acquisition(&row) {
             if let Some(control) = row.control().filter(|control| {
@@ -2620,7 +2625,7 @@ async fn openapi() -> Response {
             },
             "/api/v1/jobs/{id}": { "get": { "summary": "Job detail" } },
             "/api/v1/jobs/{id}/priority": { "put": { "summary": "Set scheduler priority; higher values run first and 900 is force" } },
-            "/api/v1/jobs/{id}/retry": { "post": { "summary": "Retry the same job's held post-processing or failed-source cleanup" } },
+            "/api/v1/jobs/{id}/retry": { "post": { "summary": "Retry the same job's NZB fetch, held post-processing or failed-source cleanup now" } },
             "/api/v1/jobs/{id}/torrent/seed-policy": { "put": { "summary": "Set stop_on_complete, positive ratio_limit/time_limit_secs (null = unlimited), or use_defaults; never starts a stopped torrent" } },
             "/api/v1/jobs/{id}/actions/{action}": { "post": { "summary": "pause|resume|delete|delete-files|move-*|post-restart-*; delete answers {ok, parked}" } },
             "/api/v1/queue/actions/{action}": { "post": { "summary": "pause|resume (downloads) · pause-post|resume-post (post-processing)" } },
