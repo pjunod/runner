@@ -3,7 +3,7 @@ use crate::{
     fingerprint::{self, FileStamp, Fingerprint},
     par2::Par2Set,
     tools::Par2Tool,
-    PostError, RepairResult, VerifyResult,
+    FsContext, PostError, RepairResult, VerifyResult,
 };
 use nzbd_state::artifacts::{Inventory, Workspace};
 use std::{
@@ -54,7 +54,7 @@ pub(crate) fn published_repair_reusable(
         .files
         .iter()
         .map(|file| {
-            let relative = crate::namespace::relative(&file.name)?;
+            let relative = crate::namespace::relative(&file.name).map_err(PostError::Io)?;
             set.root
                 .join(relative)
                 .strip_prefix(&source.path)
@@ -97,7 +97,8 @@ impl RepairSession {
             .files
             .iter()
             .map(|file| crate::namespace::relative(&file.name))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PostError::Io)?;
         let mut prefix = String::new();
         for ordinal in 0..100_001 {
             let candidate = format!("nzbd-par-{token}-{ordinal}");
@@ -143,7 +144,8 @@ impl RepairSession {
         Ok(false)
     }
     fn candidates(&self) -> Result<Vec<PathBuf>, PostError> {
-        let mut candidates = crate::namespace::files(&self.set.root)?;
+        let mut candidates =
+            crate::namespace::files(&self.set.root).at("read directory", &self.set.root)?;
         candidates.extend(
             self.partials
                 .iter()
@@ -172,7 +174,7 @@ impl RepairSession {
         Ok(candidates)
     }
     pub fn match_candidates(&mut self) -> Result<(), PostError> {
-        crate::attempt::checkpoint()?;
+        crate::attempt::checkpoint().map_err(PostError::Io)?;
         self.inventory
             .validate_workspace_source(&self.workspace)
             .map_err(state_error)?;
@@ -250,7 +252,8 @@ impl RepairSession {
         }
         let root = self.directory.as_ref().unwrap().clone();
         let _capacity =
-            nzbd_state::capacity::reserve(&root, self.set.files.iter().map(|f| f.length).sum())?;
+            nzbd_state::capacity::reserve(&root, self.set.files.iter().map(|f| f.length).sum())
+                .at("reserve space on", &root)?;
         self.mappings.clear();
         self.recovered.clear();
         let mut by_length: HashMap<u64, Vec<PathBuf>> = HashMap::new();
@@ -268,8 +271,8 @@ impl RepairSession {
             }
         }
         for file in &self.set.files {
-            crate::attempt::checkpoint()?;
-            let relative = crate::namespace::relative(&file.name)?;
+            crate::attempt::checkpoint().map_err(PostError::Io)?;
+            let relative = crate::namespace::relative(&file.name).map_err(PostError::Io)?;
             let target = root.join(&relative);
             let pool = by_digest
                 .get(&(file.length, file.md5_full))
@@ -426,8 +429,8 @@ impl RepairSession {
         // Validate every result before publishing any of them.
         let mut outputs = HashMap::new();
         for file in &self.set.files {
-            crate::attempt::checkpoint()?;
-            let output = root.join(crate::namespace::relative(&file.name)?);
+            crate::attempt::checkpoint().map_err(PostError::Io)?;
+            let output = root.join(crate::namespace::relative(&file.name).map_err(PostError::Io)?);
             let before = fingerprint::stamp(&output)?;
             if before.length != file.length
                 || crate::rename::full_md5(&output) != Some(file.md5_full)
@@ -443,7 +446,7 @@ impl RepairSession {
             }
         }
         for source in self.mappings.clone() {
-            crate::attempt::checkpoint()?;
+            crate::attempt::checkpoint().map_err(PostError::Io)?;
             if self.fingerprints.get(&source).is_none_or(|f| {
                 !fingerprint::stamp(&source).is_ok_and(|current| current == f.stamp)
             }) {
@@ -453,7 +456,7 @@ impl RepairSession {
             }
             let relative = source
                 .strip_prefix(&self.workspace.source.path)
-                .map_err(std::io::Error::other)?;
+                .map_err(|e| PostError::Io(std::io::Error::other(e)))?;
             // Keep an intact canonical original in place; preserve damaged and
             // obfuscated originals through the existing transform journal.
             let canonical_intact = self.set.files.iter().any(|f| {
@@ -467,11 +470,11 @@ impl RepairSession {
             }
         }
         for file in &self.set.files {
-            crate::attempt::checkpoint()?;
+            crate::attempt::checkpoint().map_err(PostError::Io)?;
             self.inventory
                 .validate_workspace_source(&self.workspace)
                 .map_err(state_error)?;
-            let relative = crate::namespace::relative(&file.name)?;
+            let relative = crate::namespace::relative(&file.name).map_err(PostError::Io)?;
             let target = self.set.root.join(&relative);
             if target.exists() && crate::rename::full_md5(&target) == Some(file.md5_full) {
                 continue;
@@ -511,7 +514,8 @@ impl RepairSession {
                 crate::namespace::relative(&file.name)
                     .map(|path| path.to_string_lossy().into_owned())
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PostError::Io)?;
         self.inventory
             .finish_repair_workspace(&self.workspace, &verified_output_paths)
             .map_err(state_error)?;

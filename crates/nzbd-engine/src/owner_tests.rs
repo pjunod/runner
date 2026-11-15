@@ -9823,3 +9823,86 @@ async fn worker_expiry_freezes_due_revision_durably_and_refuses_stale_or_revoked
         "regrant cannot restart deadline or release episode"
     );
 }
+
+/// The out-of-space hold names the volume and path, resolved against the
+/// same readings the storage panel shows; a report with no path says the
+/// volume is unknown rather than guessing.
+#[tokio::test]
+async fn a_latched_failure_names_its_volume_and_path() {
+    use crate::space_probe::SpaceOp;
+    use crate::volumes::{StorageMemberReading, StorageVolumeReading};
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(3));
+    owner.state.jobs.push(pending_job(4));
+    let processing = tmp.path().join("processing");
+    let reading = DiskGuardReading {
+        volumes: vec![StorageVolumeReading {
+            label: "intermediate · completed".into(),
+            path: processing.clone(),
+            available_bytes: Some(1),
+            total_bytes: Some(2),
+            device_id: None,
+            current: true,
+            roles: vec!["intermediate".into(), "completed".into()],
+            members: vec![StorageMemberReading {
+                path: processing.clone(),
+                parent_device_id: None,
+            }],
+        }],
+        ..Default::default()
+    };
+    let job_dir = processing.join("job-3");
+    owner.observe_space_failure(
+        "post-processing job 3: reserve space on …",
+        SpaceOp::Post { job: JobId(3) },
+        Some(job_dir.clone()),
+    );
+    owner.observe_space_failure(
+        "post-processing job 4: io: …",
+        SpaceOp::Post { job: JobId(4) },
+        None,
+    );
+    let mut failures = owner.space_failure_snapshots(&reading);
+    failures.sort_by(|a, b| a.detail.cmp(&b.detail));
+    assert_eq!(failures.len(), 2, "{failures:?}");
+    let named = &failures[0];
+    assert_eq!(named.operation, "post-processing");
+    assert_eq!(
+        named.path.as_deref(),
+        Some(job_dir.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        named.volume_path.as_deref(),
+        Some(processing.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        named.volume.as_deref(),
+        Some(reading.volumes[0].name().as_str())
+    );
+    let unknown = &failures[1];
+    assert_eq!(unknown.path, None);
+    assert_eq!(unknown.volume, None, "no path means no volume, not a guess");
+}
+
+/// Review #338-1: a post report's path is the directory the write went
+/// into. When that directory is a configured root itself, the probe goes
+/// there — not to its parent, which is another filesystem.
+#[tokio::test]
+async fn a_post_failure_is_probed_in_its_own_directory() {
+    use crate::space_probe::{SpaceOp, Target};
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(3));
+    owner.state.post_paused = true;
+    let root = tmp.path().join("dest");
+    owner.observe_space_failure("post", SpaceOp::Post { job: JobId(3) }, Some(root.clone()));
+    let plan = owner.space_probe_plan();
+    assert_eq!(plan.len(), 1, "{plan:?}");
+    match &plan[0].target {
+        Target::Dirs(dirs) => {
+            assert_eq!(dirs.iter().map(|(d, _)| d).collect::<Vec<_>>(), vec![&root])
+        }
+        other => panic!("unexpected target {other:?}"),
+    }
+}

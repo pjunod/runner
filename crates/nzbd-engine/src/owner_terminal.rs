@@ -205,7 +205,11 @@ impl Owner {
     /// latches out-of-space, so downloads stop filling it.
     pub(super) fn terminal_store_fault(&mut self, whence: &str, fault: &StoreFault) {
         if crate::out_of_space(fault.cause.as_ref()) {
-            self.observe_space_failure(whence, crate::space_probe::SpaceOp::Terminal, None);
+            self.observe_space_failure(
+                whence,
+                crate::space_probe::SpaceOp::Terminal,
+                Some(self.terminal_store_dir.clone()),
+            );
         }
     }
 
@@ -224,7 +228,7 @@ impl Owner {
             self.observe_space_failure(
                 "terminal record",
                 crate::space_probe::SpaceOp::Terminal,
-                None,
+                Some(self.terminal_store_dir.clone()),
             );
         }
         if self.state.job(job).is_some() {

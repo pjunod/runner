@@ -9,7 +9,7 @@
 use crate::rename::{naming_candidates, par_rename_owned_with_candidates, rar_rename_owned};
 use crate::script::{discover, ScriptHost};
 use crate::tools::{archive_input_set, detect_archives, Extractors, Par2Tool};
-use crate::{par2, DownloadEvidence, PostError, RepairResult, VerifyResult};
+use crate::{par2, DownloadEvidence, FsContext, PostError, RepairResult, VerifyResult};
 use nzbd_engine::{EngineHandle, Event};
 use nzbd_state::artifacts::{Artifact, DeliveryFileOutcome, FileEntry};
 use nzbd_state::history::HistoryDb;
@@ -1704,7 +1704,7 @@ async fn repair_failed_health_par_sets(
             Err(error) => return Err(error),
         };
         for file in &set.files {
-            let relative = crate::namespace::relative(&file.name)?;
+            let relative = crate::namespace::relative(&file.name).map_err(PostError::Io)?;
             let source_relative = set
                 .root
                 .join(relative)
@@ -1777,10 +1777,11 @@ async fn extract_complete_failed_archives(
         if inventory.extraction_published(&workspace)? {
             continue;
         }
-        let _capacity = nzbd_state::capacity::reserve(&workspace.scratch.path, job.totals.size)?;
+        let _capacity = nzbd_state::capacity::reserve(&workspace.scratch.path, job.totals.size)
+            .at("reserve space on", &workspace.scratch.path)?;
         let attempt = inventory.begin_workspace_attempt(&mut workspace)?;
         let staging = attempt.join("output");
-        std::fs::create_dir_all(&staging)?;
+        std::fs::create_dir_all(&staging).at("create directory", &staging)?;
         let result = extractors
             .extract(&archive, kind, &staging, password)
             .await?;
@@ -1788,10 +1789,14 @@ async fn extract_complete_failed_archives(
             inventory.abandon_workspace(&workspace)?;
             // The extractor reported a full volume: a capacity wait, not a
             // verdict on the bytes (the obligation stays pending).
-            return Err(PostError::Io(std::io::Error::new(
-                std::io::ErrorKind::StorageFull,
-                "archive salvage needs free capacity; retry extraction when space is available",
-            )));
+            return Err(PostError::Fs {
+                op: "extract into",
+                path: staging.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "archive salvage needs free capacity; retry extraction when space is available",
+                ),
+            });
         }
         if result.password_error {
             assessment.password_required.extend(paths);
@@ -1824,12 +1829,12 @@ async fn extract_complete_failed_archives(
         let gate_for_commit = gate.clone();
         let id = job.id;
         terminal_worker(inventory.clone(), id, move |inventory, _, checkpoint| {
-            checkpoint()?;
+            checkpoint().map_err(PostError::Io)?;
             if gate_for_commit.as_ref().is_some_and(|claim| !claim(id)) {
                 return Err(PostError::Io(std::io::ErrorKind::Interrupted.into()));
             }
             commit_staging(&output, &source_path)?;
-            checkpoint()?;
+            checkpoint().map_err(PostError::Io)?;
             inventory.finish_extraction(&workspace, &output)?;
             Ok(())
         })
@@ -1899,7 +1904,7 @@ fn salvage_failed_delivery(
     if selected.is_empty() {
         return Ok(None);
     }
-    std::fs::create_dir_all(completed_root)?;
+    std::fs::create_dir_all(completed_root).at("create directory", completed_root)?;
     let name = nzbd_engine::queue::sanitize_name(&job.name);
     let target = completed_root.join(format!(
         "{name}.job-{}.runner-{}",
@@ -2013,7 +2018,7 @@ where
 {
     for attempt in 0..3 {
         if let Some(control) = crate::attempt::current() {
-            control.checkpoint()?;
+            control.checkpoint().map_err(PostError::Io)?;
         }
         match read().await {
             Ok(job) => return Ok(job),
@@ -2535,12 +2540,18 @@ fn spawn_job(
                     // PP writes as much as the downloader does — unpack,
                     // move, script output. An ENOSPC here is the same ground
                     // truth about the volume and must stop intake too, not
-                    // just fail this job.
-                    if nzbd_engine::out_of_space(storage_hold_cause(&e).as_ref()) {
+                    // just fail this job. A refused reservation is not: it
+                    // is a forecast from statvfs, which the free-space guard
+                    // already owns for intake, so it holds this job on
+                    // capacity (its verdict above) and nothing else.
+                    if let Some(shortfall) = e.capacity_shortfall() {
+                        tracing::warn!(job = job.0, %shortfall,
+                            "post-processing waits for capacity; downloads are not held for a forecast");
+                    } else if nzbd_engine::out_of_space(storage_hold_cause(&e).as_ref()) {
                         engine.report_out_of_space_for(
                             job,
                             format!("post-processing job {}: {e}", job.0),
-                            None,
+                            e.path(),
                         );
                     }
                     tracing::error!(job = job.0, error = %e, "post-processing crashed");
@@ -2848,7 +2859,9 @@ mod post_pause_tests {
                 .expect("cancellation releases a parked stage")
                 .unwrap_err();
         assert!(
-            matches!(&error, PostError::Io(e) if e.kind() == std::io::ErrorKind::Interrupted),
+            error
+                .io()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::Interrupted),
             "{error:?}"
         );
         let row = engine.export_job(JobId(41)).await.unwrap().unwrap();
@@ -4189,9 +4202,17 @@ async fn process_job_ctx_from_inner(
                     consumed_archive_paths.extend(workspace.input_paths.iter().cloned());
                     continue;
                 }
-                let _capacity = nzbd_state::capacity::reserve(&dir, job.totals.size)?;
-                let _workspace_capacity =
-                    nzbd_state::capacity::reserve(&workspace.scratch.path, job.totals.size)?;
+                // Output lands in the workspace and is renamed into `dir`:
+                // one filesystem needs the space once, two need it on each.
+                let _capacity = nzbd_state::capacity::reserve_each(
+                    &[&dir, &workspace.scratch.path],
+                    job.totals.size,
+                )
+                .map_err(|(root, source)| PostError::Fs {
+                    op: "reserve space on",
+                    path: root.to_path_buf(),
+                    source,
+                })?;
                 let attempt = engine
                     .artifacts()
                     .begin_workspace_attempt(&mut workspace)
@@ -4200,7 +4221,7 @@ async fn process_job_ctx_from_inner(
                 // Extraction is fenced: everything lands in the lease's
                 // staging dir and is renamed into place only on success
                 // with the lease still live (double-unpack can't happen).
-                std::fs::create_dir_all(&staging)?;
+                std::fs::create_dir_all(&staging).at("create directory", &staging)?;
                 let mut r = ex.extract(archive, *kind, &staging, password).await?;
                 staging = r.output_dir.clone();
                 if r.disk_space_error {
@@ -4749,7 +4770,7 @@ async fn process_job_ctx_from_inner(
                 let diagnostics = crate::attempt::current()
                     .expect("processing control")
                     .blocking(move |control| {
-                        control.checkpoint()?;
+                        control.checkpoint().map_err(PostError::Io)?;
                         assess_file_inputs(&assessment_job, &assessment_source, &complete_paths)
                     })
                     .await?;
@@ -5091,7 +5112,7 @@ async fn process_job_ctx_from_inner(
                     }
                     let output =
                         final_inventory.observe_external_output(&final_root, &final_path)?;
-                    control.checkpoint()?;
+                    control.checkpoint().map_err(PostError::Io)?;
                     // Preserve the operator's Keep choice. Retained sources do
                     // not expire automatically; adding Keep would also prevent
                     // retirement of independently verified private scratch.
@@ -6033,6 +6054,7 @@ pub fn pp_verdict(error: &PostError, stage: Option<PostStage>) -> PpVerdict {
     }
     match error {
         PostError::Io(_)
+        | PostError::Fs { .. }
         | PostError::Artifact(
             nzbd_state::artifacts::Error::Io(_) | nzbd_state::artifacts::Error::Sql(_),
         ) => PpVerdict::Fail(FailureReason::Io),
@@ -6333,10 +6355,11 @@ fn assess_file_inputs(
                     .iter()
                     .find(|entry| !entry.identity.directory && entry.path == path),
             ) {
-                let mut input = nzbd_state::io_meter::Metered::new(std::fs::File::open(
-                    source.path.join(&path),
-                )?);
-                let before = input.metadata()?;
+                let full = source.path.join(&path);
+                let mut input = nzbd_state::io_meter::Metered::new(
+                    std::fs::File::open(&full).at("open", &full)?,
+                );
+                let before = input.metadata().at("stat", &full)?;
                 if !diagnostic_metadata_matches(&before, entry) {
                     return Err(PostError::Io(std::io::Error::other(format!(
                         "{path} changed identity during integrity assessment"
@@ -6345,14 +6368,14 @@ fn assess_file_inputs(
                 let mut crc = crc32fast::Hasher::new();
                 let mut buffer = [0u8; 64 * 1024];
                 loop {
-                    crate::attempt::checkpoint()?;
-                    let read = input.read(&mut buffer)?;
+                    crate::attempt::checkpoint().map_err(PostError::Io)?;
+                    let read = input.read(&mut buffer).at("read", &full)?;
                     if read == 0 {
                         break;
                     }
                     crc.update(&buffer[..read]);
                 }
-                let after = input.metadata()?;
+                let after = input.metadata().at("stat", &full)?;
                 if !diagnostic_metadata_unchanged(&before, &after) {
                     return Err(PostError::Io(std::io::Error::other(format!(
                         "{path} changed during integrity assessment"
@@ -6483,7 +6506,7 @@ fn par_repairable_evidence_with_partials(
         );
     }
     for set in sets {
-        checkpoint()?;
+        checkpoint().map_err(PostError::Io)?;
         if set.slice_size == 0 || set.main_path.is_none() {
             continue;
         }
@@ -6492,8 +6515,8 @@ fn par_repairable_evidence_with_partials(
         let mut members = Vec::new();
         let mut assessable = true;
         for descriptor in &set.files {
-            checkpoint()?;
-            let relative = crate::namespace::relative(&descriptor.name)?;
+            checkpoint().map_err(PostError::Io)?;
+            let relative = crate::namespace::relative(&descriptor.name).map_err(PostError::Io)?;
             let absolute = set.root.join(relative);
             let Ok(source_relative) = absolute.strip_prefix(root) else {
                 return Err(PostError::Subprocess(
@@ -6530,9 +6553,15 @@ fn par_repairable_evidence_with_partials(
             };
             let mut input = match std::fs::File::open(&absolute) {
                 Ok(input) => nzbd_state::io_meter::Metered::new(input),
-                Err(error) => return Err(PostError::Io(error)),
+                Err(error) => {
+                    return Err(PostError::Fs {
+                        op: "open",
+                        path: absolute.clone(),
+                        source: error,
+                    })
+                }
             };
-            let before = input.metadata()?;
+            let before = input.metadata().at("stat", &absolute)?;
             if !diagnostic_metadata_matches(&before, entry) {
                 return Err(PostError::Io(std::io::Error::other(format!(
                     "{} changed identity during PAR assessment",
@@ -6550,9 +6579,9 @@ fn par_repairable_evidence_with_partials(
                 let mut crc = crc32fast::Hasher::new();
                 let mut short = false;
                 while remaining > 0 {
-                    checkpoint()?;
+                    checkpoint().map_err(PostError::Io)?;
                     let amount = remaining.min(buffer.len() as u64) as usize;
-                    let read = input.read(&mut buffer[..amount])?;
+                    let read = input.read(&mut buffer[..amount]).at("read", &absolute)?;
                     if read == 0 {
                         short = true;
                         break;
@@ -6571,7 +6600,7 @@ fn par_repairable_evidence_with_partials(
                         .min(set.slice_size);
                 let zeroes = [0u8; 64 * 1024];
                 while padding > 0 {
-                    checkpoint()?;
+                    checkpoint().map_err(PostError::Io)?;
                     let amount = padding.min(zeroes.len() as u64) as usize;
                     crc.update(&zeroes[..amount]);
                     padding -= amount as u64;
@@ -6580,7 +6609,7 @@ fn par_repairable_evidence_with_partials(
                     file_damaged += 1;
                 }
             }
-            let after = input.metadata()?;
+            let after = input.metadata().at("stat", &absolute)?;
             if !diagnostic_metadata_unchanged(&before, &after) {
                 return Err(PostError::Io(std::io::Error::other(format!(
                     "{} changed during PAR assessment",
@@ -6622,7 +6651,7 @@ fn bounded_file_diagnostics(
     root: &Path,
     entries: &[FileEntry],
     complete_paths: &std::collections::HashSet<String>,
-) -> std::io::Result<std::collections::HashMap<String, FileAssessment>> {
+) -> Result<std::collections::HashMap<String, FileAssessment>, PostError> {
     bounded_file_diagnostics_with_limit(root, entries, complete_paths, 100_000)
 }
 
@@ -6631,31 +6660,31 @@ fn bounded_file_diagnostics_with_limit(
     entries: &[FileEntry],
     complete_paths: &std::collections::HashSet<String>,
     max_entries: usize,
-) -> std::io::Result<std::collections::HashMap<String, FileAssessment>> {
+) -> Result<std::collections::HashMap<String, FileAssessment>, PostError> {
     const PREFIX_BYTES: usize = 4 * 1024;
     let mut results = std::collections::HashMap::new();
     if entries.len() > max_entries {
-        return Err(std::io::Error::other(format!(
+        return Err(PostError::Io(std::io::Error::other(format!(
             "source has more than {max_entries} entries; inspect source inventory before cleanup"
+        ))));
+    }
+    if !std::fs::symlink_metadata(root).at("stat", root)?.is_dir() {
+        return Err(PostError::Io(std::io::Error::other(
+            "source root is not an accessible directory",
         )));
     }
-    if !std::fs::symlink_metadata(root)?.is_dir() {
-        return Err(std::io::Error::other(
-            "source root is not an accessible directory",
-        ));
-    }
     for entry in entries {
-        crate::attempt::checkpoint()?;
+        crate::attempt::checkpoint().map_err(PostError::Io)?;
         if entry.identity.directory {
             continue;
         }
         let path = Path::new(&entry.path);
-        let metadata = std::fs::symlink_metadata(root.join(path))?;
+        let metadata = std::fs::symlink_metadata(root.join(path)).at("stat", &root.join(path))?;
         if !metadata.is_file() || !diagnostic_metadata_matches(&metadata, entry) {
-            return Err(std::io::Error::other(format!(
+            return Err(PostError::Io(std::io::Error::other(format!(
                 "{} no longer matches the owned source inventory; refresh it before cleanup",
                 entry.path
-            )));
+            ))));
         }
         let extension = path
             .extension()
@@ -6668,23 +6697,24 @@ fn bounded_file_diagnostics_with_limit(
         {
             continue;
         }
-        let mut file = std::fs::File::open(root.join(path))?;
-        let before = file.metadata()?;
+        let full = root.join(path);
+        let mut file = std::fs::File::open(&full).at("open", &full)?;
+        let before = file.metadata().at("stat", &full)?;
         if !diagnostic_metadata_matches(&before, entry) {
-            return Err(std::io::Error::other(format!(
+            return Err(PostError::Io(std::io::Error::other(format!(
                 "{} changed identity during assessment; refresh source inventory before cleanup",
                 entry.path
-            )));
+            ))));
         }
         let mut prefix = vec![0u8; PREFIX_BYTES];
-        let read = file.read(&mut prefix)?;
+        let read = file.read(&mut prefix).at("read", &full)?;
         prefix.truncate(read);
-        let after = file.metadata()?;
+        let after = file.metadata().at("stat", &full)?;
         if !diagnostic_metadata_unchanged(&before, &after) {
-            return Err(std::io::Error::other(format!(
+            return Err(PostError::Io(std::io::Error::other(format!(
                 "{} changed during assessment; refresh source inventory before cleanup",
                 entry.path
-            )));
+            ))));
         }
         let evidence = if prefix.starts_with(b"\x1a\x45\xdf\xa3") {
             Some(
@@ -6832,8 +6862,9 @@ fn verified_direct_payload_paths_excluding(
             continue;
         };
         let path = source.path.join(actual_relative);
-        let mut input = nzbd_state::io_meter::Metered::new(std::fs::File::open(&path)?);
-        let before = input.metadata()?;
+        let mut input =
+            nzbd_state::io_meter::Metered::new(std::fs::File::open(&path).at("open", &path)?);
+        let before = input.metadata().at("stat", &path)?;
         if !diagnostic_metadata_matches(&before, entry) {
             return Err(PostError::Io(std::io::Error::other(format!(
                 "{} changed identity before CRC verification",
@@ -6843,14 +6874,14 @@ fn verified_direct_payload_paths_excluding(
         let mut crc = crc32fast::Hasher::new();
         let mut buffer = [0u8; 64 * 1024];
         loop {
-            checkpoint()?;
-            let count = input.read(&mut buffer)?;
+            checkpoint().map_err(PostError::Io)?;
+            let count = input.read(&mut buffer).at("read", &path)?;
             if count == 0 {
                 break;
             }
             crc.update(&buffer[..count]);
         }
-        let after = input.metadata()?;
+        let after = input.metadata().at("stat", &path)?;
         if !diagnostic_metadata_unchanged(&before, &after) {
             return Err(PostError::Io(std::io::Error::other(format!(
                 "{} changed during CRC verification",
@@ -7267,7 +7298,7 @@ async fn repair_isolated_loop(
     let mut needed = 1;
     let mut last_reason = "no additional recovery files remain".to_string();
     for round in 0..8 {
-        control.checkpoint()?;
+        control.checkpoint().map_err(PostError::Io)?;
         stages.enter(PostStage::ParRepair).await?;
         control
             .round(round, session.set.recovery_blocks, Some(needed))
@@ -7505,7 +7536,7 @@ async fn dispose_failed(
     }
     if cfg.failure_action == FailureAction::Delete {
         let result = terminal_worker(inventory, job, move |inventory, guard, checkpoint| {
-            checkpoint()?;
+            checkpoint().map_err(PostError::Io)?;
             inventory
                 .delete_failed_payload(guard, job.0, checkpoint)
                 .map_err(PostError::from)
@@ -7673,25 +7704,40 @@ fn remove_stale_staging(_dir: &Path, _own: &Path) {
 /// Publish staged extraction output: rename each entry into the job dir,
 /// replacing existing targets (identical content by construction — same
 /// archive, same extractor).
-fn commit_staging(staging: &Path, dir: &Path) -> std::io::Result<()> {
-    fn publish(source: &Path, target: &Path) -> std::io::Result<()> {
-        crate::attempt::checkpoint()?;
-        let meta = std::fs::symlink_metadata(source)?;
+fn commit_staging(staging: &Path, dir: &Path) -> Result<(), PostError> {
+    fn publish(source: &Path, target: &Path) -> Result<(), PostError> {
+        crate::attempt::checkpoint().map_err(PostError::Io)?;
+        let meta = std::fs::symlink_metadata(source).at("stat", source)?;
         if meta.file_type().is_symlink() {
-            return Err(std::io::Error::other("symlink extraction output"));
+            return Err(PostError::Io(std::io::Error::other(
+                "symlink extraction output",
+            )));
         }
         if meta.is_dir() {
             match std::fs::create_dir(target) {
                 Ok(()) => (),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if !std::fs::symlink_metadata(target)?.is_dir() {
-                        return Err(e);
+                    if !std::fs::symlink_metadata(target)
+                        .at("stat", target)?
+                        .is_dir()
+                    {
+                        return Err(PostError::Fs {
+                            op: "create directory",
+                            path: target.to_path_buf(),
+                            source: e,
+                        });
                     }
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    return Err(PostError::Fs {
+                        op: "create directory",
+                        path: target.to_path_buf(),
+                        source: e,
+                    })
+                }
             }
-            for entry in std::fs::read_dir(source)? {
-                let entry = entry?;
+            for entry in std::fs::read_dir(source).at("read directory", source)? {
+                let entry = entry.at("read directory", source)?;
                 publish(&entry.path(), &target.join(entry.file_name()))?;
             }
         } else if meta.is_file() {
@@ -7707,32 +7753,44 @@ fn commit_staging(staging: &Path, dir: &Path) -> std::io::Result<()> {
                 other => std::io::Error::other(other),
             }) {
                 Ok(()) => {
-                    std::fs::File::open(source)?.sync_all()?;
+                    std::fs::File::open(source)
+                        .at("open", source)?
+                        .sync_all()
+                        .at("fsync", source)?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let target_meta = std::fs::symlink_metadata(target)?;
+                    let target_meta = std::fs::symlink_metadata(target).at("stat", target)?;
                     if !target_meta.is_file()
                         || target_meta.file_type().is_symlink()
-                        || !crate::namespace::equal_files(source, target)?
+                        || !crate::namespace::equal_files(source, target).at("read", target)?
                     {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            "extraction output conflict; review required",
-                        ));
+                        return Err(PostError::Fs {
+                            op: "publish",
+                            path: target.to_path_buf(),
+                            source: std::io::Error::new(
+                                std::io::ErrorKind::AlreadyExists,
+                                "extraction output conflict; review required",
+                            ),
+                        });
                     }
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e).at("copy", target),
             }
         } else {
-            return Err(std::io::Error::other("unsupported extraction output"));
+            return Err(PostError::Io(std::io::Error::other(
+                "unsupported extraction output",
+            )));
         }
         Ok(())
     }
-    for entry in std::fs::read_dir(staging)? {
-        let entry = entry?;
+    for entry in std::fs::read_dir(staging).at("read directory", staging)? {
+        let entry = entry.at("read directory", staging)?;
         publish(&entry.path(), &dir.join(entry.file_name()))?;
     }
-    std::fs::File::open(dir)?.sync_all()?;
+    std::fs::File::open(dir)
+        .at("open", dir)?
+        .sync_all()
+        .at("fsync", dir)?;
     Ok(())
 }
 
@@ -9766,6 +9824,72 @@ mod decision_tests {
                 Some(PostStage::Unpack)
             ),
             PpVerdict::Hold(HoldCause::Quota),
+        );
+    }
+
+    /// A refused capacity forecast and a real ENOSPC both hold the job on
+    /// capacity and both reach the out-of-space report with the path they
+    /// were for; the forecast says so instead of impersonating the kernel.
+    #[test]
+    fn out_of_space_errors_keep_their_path_through_classification() {
+        let shortfall = PostError::Fs {
+            op: "reserve space on",
+            path: PathBuf::from("/processing/job-7"),
+            source: nzbd_state::capacity::CapacityShortfall {
+                root: PathBuf::from("/processing/job-7"),
+                needed: 80 << 30,
+                claimed: 90 << 30,
+                headroom: 1 << 30,
+                free: 152 << 30,
+            }
+            .into(),
+        };
+        let write = PostError::Fs {
+            op: "write",
+            path: PathBuf::from("/processing/job-8/a.mkv"),
+            source: std::io::Error::from_raw_os_error(libc::ENOSPC),
+        };
+        for (error, path) in [
+            (&shortfall, "/processing/job-7"),
+            (&write, "/processing/job-8/a.mkv"),
+        ] {
+            assert!(nzbd_engine::out_of_space(
+                storage_hold_cause(error).as_ref()
+            ));
+            assert_eq!(
+                pp_verdict(error, Some(PostStage::Unpack)),
+                PpVerdict::Hold(HoldCause::Capacity)
+            );
+            assert_eq!(error.path(), Some(std::path::Path::new(path)));
+            assert!(error.to_string().contains(path), "{error}");
+        }
+        assert!(
+            shortfall
+                .to_string()
+                .contains("not enough free space forecast"),
+            "{shortfall}"
+        );
+        assert!(
+            !shortfall.to_string().contains("os error 28"),
+            "{shortfall}"
+        );
+        // The forecast holds its job only; the real ENOSPC also stops intake.
+        assert!(shortfall.capacity_shortfall().is_some());
+        assert!(write.capacity_shortfall().is_none());
+        let wrapped = PostError::Artifact(nzbd_state::artifacts::Error::Io(
+            nzbd_state::capacity::CapacityShortfall {
+                root: PathBuf::from("/completed"),
+                needed: 1,
+                claimed: 0,
+                headroom: 1,
+                free: 0,
+            }
+            .into(),
+        ));
+        assert_eq!(
+            wrapped.capacity_shortfall().map(|s| s.root.as_path()),
+            Some(std::path::Path::new("/completed")),
+            "a relocation's refused reservation is found through the inventory error"
         );
     }
 

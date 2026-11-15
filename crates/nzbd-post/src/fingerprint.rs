@@ -1,5 +1,5 @@
 //! Stable descriptor fingerprints; payload bytes are never retained.
-use crate::PostError;
+use crate::{FsContext, PostError};
 use md5::{Digest, Md5};
 use std::{fs::Metadata, io::Read, path::Path, time::SystemTime};
 
@@ -33,7 +33,7 @@ impl FileStamp {
 pub(crate) fn stamp(path: &Path) -> Result<FileStamp, PostError> {
     let input = nzbd_state::fileops::open(path)
         .map_err(|e| PostError::Subprocess(format!("input identity {}: {e}", path.display())))?;
-    Ok(FileStamp::of(&input.metadata()?))
+    Ok(FileStamp::of(&input.metadata().at("stat", path)?))
 }
 #[derive(Debug, Clone)]
 pub(crate) struct Fingerprint {
@@ -60,7 +60,7 @@ fn scan_checked(
     }
     let mut input =
         nzbd_state::fileops::open(path).map_err(|e| PostError::Subprocess(e.to_string()))?;
-    let metadata = input.metadata()?;
+    let metadata = input.metadata().at("stat", path)?;
     let before = FileStamp::of(&metadata);
     let device = nzbd_state::io_meter::device_of_metadata(&metadata);
     let blocks = before.length.div_ceil(slice);
@@ -76,8 +76,8 @@ fn scan_checked(
     let mut read_bytes = 0u64;
     let mut buffer = [0; 65536];
     loop {
-        checkpoint()?;
-        let n = input.read(&mut buffer)?;
+        checkpoint().map_err(PostError::Io)?;
+        let n = input.read(&mut buffer).at("read", path)?;
         if n == 0 {
             break;
         }
@@ -100,7 +100,7 @@ fn scan_checked(
     if in_slice > 0 {
         let zeros = [0; 65536];
         while in_slice < slice {
-            checkpoint()?;
+            checkpoint().map_err(PostError::Io)?;
             let n = (slice - in_slice).min(zeros.len() as u64) as usize;
             crc.update(&zeros[..n]);
             in_slice += n as u64;
@@ -108,7 +108,7 @@ fn scan_checked(
         crcs.push(crc.finalize());
     }
     if read_bytes != before.length
-        || before != FileStamp::of(&input.metadata()?)
+        || before != FileStamp::of(&input.metadata().at("stat", path)?)
         || stamp(path)? != before
     {
         return Err(PostError::Subprocess(format!(
