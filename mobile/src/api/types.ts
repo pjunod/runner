@@ -178,7 +178,7 @@ export interface StatusDto {
   disk_guard_all_roots_known?: boolean;
   enospc_observed: number;
   enospc_where: string | null;
-  /** Absent on daemons before 0.9.7. */
+  /** Absent on daemons before 0.9.8. */
   enospc_failures?: SpaceFailure[];
   quota_reached: boolean;
   blocked_servers: number[];
@@ -321,7 +321,7 @@ export interface DeliveryTrace {
   sourceCopies?: { id: string; ownerNode: string; status: string; attempts: number; error?: string | null; nextRetryAt?: number | null }[];
 }
 
-/** One out-of-space failure currently holding intake (daemon 0.9.7+). */
+/** One out-of-space failure currently holding intake (daemon 0.9.8+). */
 export interface SpaceFailure {
   operation: string;
   detail: string;
