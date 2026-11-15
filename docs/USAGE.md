@@ -109,6 +109,16 @@ import receipt arrives or the handoff is cancelled. See
 [FILE_LIFECYCLE_OPERATIONS.md §2](FILE_LIFECYCLE_OPERATIONS.md) for the
 whole recovery flow.
 
+**Fetching NZB.** A URL job whose indexer refuses the NZB download (HTTP 429
+or 503) or doesn't answer stays in **Fetching NZB** and retries the same
+request after 1, 5, 10, then every 30 minutes until the indexer hands it over
+or answers for the item (404 and the like fail it). The row says what went
+wrong, when the next attempt is, and how long it has waited. An indexer's
+`Retry-After` is shown on the row (`indexer asked to wait 12h`) but does not
+stretch the schedule — exhausted API quotas answer with 12–22 hour values.
+**retry now** on the job (web UI detail panel, or the app's expanded card)
+sends the request immediately; a repeat refusal waits on the same step.
+
 **Held jobs.** A job stopped by its environment — storage not answering, a
 full disk, an exhausted quota, a missing extractor, a mount that came back
 empty, an archive waiting for a password — is **held**, not failed. The row

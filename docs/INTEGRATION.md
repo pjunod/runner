@@ -162,7 +162,7 @@ TOK=<api.token from nzbd.toml>
 | Queue | `GET` | `/api/v1/jobs` |
 | One job | `GET` | `/api/v1/jobs/{id}` |
 | Action (`pause`, `resume`, `delete`, `delete-files`, …) | `POST` | `/api/v1/jobs/{id}/actions/{action}` |
-| Retry a hold now | `POST` | `/api/v1/jobs/{id}/retry` |
+| Retry now (a hold, or an NZB fetch waiting on its backoff) | `POST` | `/api/v1/jobs/{id}/retry` |
 | Keep the source if it fails | `GET`/`PUT` | `/api/v1/jobs/{id}/failure-keep` (`{"keep": true}`) |
 | Admission lookup by transfer | `GET` | `/api/v1/request-admissions/{token}` |
 | Status | `GET` | `/api/v1/status` |
